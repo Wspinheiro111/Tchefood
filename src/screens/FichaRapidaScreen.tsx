@@ -173,6 +173,8 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
   const s = useTcheStore();
   const order = s.orders.find((o) => o.id === orderId);
   const items = s.orderItems.filter((i) => i.order_id === orderId);
+  // Combo: sai uma ficha por item do combo (cada um é retirado na praça dele), não do combo.
+  const ticketItems = items.filter((i) => !items.some((c) => c.combo_parent_item_id === i.id));
   const [method, setMethod] = useState<PaymentMethod>('CREDIT');
   const [chassis, setChassis] = useState<Chassis>('STONE');
   const [cashGiven, setCashGiven] = useState('');
@@ -213,7 +215,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
     }
     if (hold) return toast.error('Há uma cobrança sem confirmação. Confira o extrato da maquininha antes de cobrar de novo.');
     const driver = createDriver({ terminal: null, chassis, mode: 'SMARTPOS_EMBEDDED' });
-    const req: ChargeRequest = { request_id: uuid(), idempotency_key, amount, method: method as ChargeRequest['method'], table_label: 'Balcão', order_id: orderId, description: `${items.reduce((a, i) => a + i.quantity, 0)} ficha(s)` };
+    const req: ChargeRequest = { request_id: uuid(), idempotency_key, amount, method: method as ChargeRequest['method'], table_label: 'Balcão', order_id: orderId, description: `${ticketItems.reduce((a, i) => a + i.quantity, 0)} ficha(s)` };
     const lock = s.beginTerminalCharge(orderId, req.request_id, amount);
     if (!lock.ok) return toast.error(lock.error);
     setBusy(true);
@@ -284,7 +286,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
         <div className="mb-2 font-black">Fichas desta venda</div>
         <ul className="space-y-1 text-sm">
           {items.map((i) => (
-            <li key={i.id} className="flex justify-between gap-2"><span>{i.quantity}x {s.products.find((p) => p.id === i.product_id)?.name}{i.meat_doneness ? ` · ${i.meat_doneness}` : ''}{i.notes ? ` · ${i.notes}` : ''}</span><span className="tabular-nums">{formatBRL(i.total_item_price)}</span></li>
+            <li key={i.id} className="flex justify-between gap-2"><span>{i.quantity}x {s.products.find((p) => p.id === i.product_id)?.name}{i.meat_doneness ? ` · ${i.meat_doneness}` : ''}{i.notes ? ` · ${i.notes}` : ''}</span><span className="tabular-nums">{i.combo_parent_item_id ? 'no combo' : formatBRL(i.total_item_price)}</span></li>
           ))}
         </ul>
         <div className="mt-2 flex justify-between border-t border-slate-200 pt-2 text-xl font-black"><span>Total</span><span className="tabular-nums text-brasa">{formatBRL(order.remaining_balance)}</span></div>

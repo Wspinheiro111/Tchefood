@@ -440,7 +440,7 @@ describe('migração do armazenamento local', () => {
   it('v1 ganha active e listas novas sem perder dados', () => {
     const v1 = { products: [{ id: 'p', price: 10 }], tables: [{ id: 't' }], orders: [{ id: 'o' }] };
     const v2 = migratePersisted(v1, 1) as Record<string, unknown>;
-    expect(v2.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0, stock_quantity: 0, barcode: null }]);
+    expect(v2.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0, stock_quantity: 0, barcode: null, is_combo: false }]);
     expect((v2.tables as Array<{ kind: string }>).filter((t) => t.kind === 'TABLE')).toEqual([{ id: 't', active: true, kind: 'TABLE' }]);
     expect(v2.orders).toEqual([{ id: 'o', pickup_number: null, pickup_name: null, fulfillment_type: null }]);
     expect(v2.priceSchedules).toEqual([]);
@@ -457,7 +457,7 @@ describe('migração do armazenamento local', () => {
       orders: [{ id: 'o' }],
     };
     const v3 = migratePersisted(v2, 2) as Record<string, unknown>;
-    expect(v3.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0, stock_quantity: 0, barcode: null }]);
+    expect(v3.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0, stock_quantity: 0, barcode: null, is_combo: false }]);
     const tables = v3.tables as Array<{ id: string; kind: string; tenant_id: string }>;
     expect(tables[0]).toMatchObject({ id: 't', kind: 'TABLE' });
     expect(tables.filter((t) => t.kind === 'COUNTER')).toHaveLength(1);
@@ -465,7 +465,7 @@ describe('migração do armazenamento local', () => {
     expect(tables.every((t) => t.tenant_id === 'loja')).toBe(true);
     // Loja real não ganha o usuário de demonstração do totem.
     expect(v3.staff).toEqual([]);
-    expect(v3.orderItems).toEqual([{ id: 'i', weight_gross_grams: null, weight_tare_grams: null, weight_source: null, keg_volume_ml: null }]);
+    expect(v3.orderItems).toEqual([{ id: 'i', weight_gross_grams: null, weight_tare_grams: null, weight_source: null, keg_volume_ml: null, combo_parent_item_id: null }]);
     expect(v3.orders).toEqual([{ id: 'o', pickup_number: null, pickup_name: null, fulfillment_type: null }]);
     expect(v3.kegTaps).toEqual([]);
     expect(v3.cashbackLedger).toEqual([]);

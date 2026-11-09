@@ -74,7 +74,9 @@ export function conferenceLines(params: {
   waiter: StaffUser | null;
 }): string[] {
   const { order } = params;
-  const valid = params.items.filter((i) => i.order_id === order.id && i.status !== 'CANCELED');
+  const active = params.items.filter((i) => i.order_id === order.id && i.status !== 'CANCELED');
+  // O combo é a linha com preço; os componentes dele aparecem embaixo, sem valor.
+  const valid = active.filter((i) => i.combo_parent_item_id == null);
   const lines: string[] = [
     ...header(params.tenant),
     DLINE,
@@ -89,6 +91,10 @@ export function conferenceLines(params: {
   for (const it of valid) {
     const p = params.products.find((x) => x.id === it.product_id);
     lines.push(...wrap(`${formatQty(it.quantity, p?.unit)} ${p?.code ?? ''} ${p?.name ?? 'Item'}`));
+    for (const part of active.filter((c) => c.combo_parent_item_id === it.id)) {
+      const cp = params.products.find((x) => x.id === part.product_id);
+      lines.push(...wrap(`   - ${formatQty(part.quantity, cp?.unit)} ${cp?.name ?? 'Item'}`));
+    }
     if (it.meat_doneness) lines.push(`   Ponto: ${it.meat_doneness}`);
     lines.push(leftRight(`   ${it.is_paid ? '[PAGO]' : ''}`, money(it.total_item_price)));
   }

@@ -79,6 +79,7 @@ import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
 import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
+import { comboChildrenOf, comboComponents, comboNeedsDoneness, expandComboItem } from '../lib/combos';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
 import { computeNetWeight } from '../lib/scale';
@@ -285,6 +286,9 @@ export interface ModifierOptionDraft {
   group_id: UUID;
   name: string;
   additional_price: number;
+  /** Combo: produto que a opção coloca no pedido (null = adicional comum). Ausente = mantém. */
+  component_product_id?: UUID | null;
+  component_quantity?: number;
 }
 
 export interface TenantDraft {
@@ -819,24 +823,29 @@ export const useTcheStore = create<TcheState>()(
         recalculated: Order,
         orderItems: OrderItem[],
         changedItems: OrderItem[],
-        log: AuditLog,
+        log: AuditLog | AuditLog[],
         managerPin: string | null,
       ): Partial<TcheState> => {
         const ts = nowISO();
+        const logs = Array.isArray(log) ? log : [log];
         const settled = settleIfPaid(s, recalculated, orderItems, ts);
-        const allChanged = settled.closed
+        const changed = settled.closed
           ? settled.orderItems.filter((i, idx) => i !== s.orderItems[idx])
           : changedItems;
+        // Componentes de combo sobem antes do combo: cancelar o combo (que tem o preço)
+        // pode zerar a conta, e o banco então fecha a comanda e dá como pagos os itens
+        // ainda ativos, recusando o cancelamento dos componentes que viesse depois.
+        const allChanged = [...changed.filter((i) => i.combo_parent_item_id != null), ...changed.filter((i) => i.combo_parent_item_id == null)];
         return {
           orderItems: settled.orderItems,
           nfceSeq: settled.nfceSeq,
           orders: s.orders.map((o) => (o.id === recalculated.id ? settled.order : o)),
           tables: settled.table ? s.tables.map((t) => (t.id === settled.table!.id ? settled.table! : t)) : s.tables,
-          auditLogs: [log, ...s.auditLogs],
+          auditLogs: [...[...logs].reverse(), ...s.auditLogs],
           outbox: [
             ...s.outbox,
             // O audit_log sobe antes: o banco recusa o ajuste sem a autorização já gravada.
-            managerAuthEvent(log, managerPin),
+            ...logs.map((l) => managerAuthEvent(l, managerPin)),
             ...allChanged.map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
             syncEvent('orders', 'UPDATE', settled.order),
             ...(settled.table ? [tableEventForOrder(settled.table, recalculated.id)] : []),
@@ -1066,7 +1075,7 @@ export const useTcheStore = create<TcheState>()(
           const base = basePriceFor(product, draft.half_product_ids);
           if (!base.ok) return base;
           const basePrice = base.data;
-          if (product.requires_meat_doneness && !draft.meat_doneness) {
+          if ((product.requires_meat_doneness || comboNeedsDoneness(product, draft.modifiers, get())) && !draft.meat_doneness) {
             return fail('Ponto da carne é obrigatório.');
           }
           const qty = round3(draft.quantity);
@@ -1105,6 +1114,9 @@ export const useTcheStore = create<TcheState>()(
             if (chosen < min) return fail(`Escolha ${g.name}.`);
             if (chosen > g.max_selection) return fail(`${g.name}: máximo ${g.max_selection}.`);
           }
+          // Combo: os itens escolhidos precisam estar no cardápio agora (a cozinha recebe cada um).
+          const comps = comboComponents(product, draft.modifiers, get());
+          if (!comps.ok) return comps;
           // Preço dos modificadores sempre recalculado a partir do cadastro.
           const options = get().modifierOptions;
           let modsCents = 0;
@@ -1152,7 +1164,8 @@ export const useTcheStore = create<TcheState>()(
 
           const ts = nowISO();
           const products = get().products;
-          const newItems: OrderItem[] = pending.map((t) => {
+          const newItems: OrderItem[] = [];
+          for (const t of pending) {
             const product = products.find((p) => p.id === t.product_id);
             const halfNames = t.half_product_ids
               .map((id) => products.find((p) => p.id === id)?.name)
@@ -1164,7 +1177,7 @@ export const useTcheStore = create<TcheState>()(
               ...t.quick_tags,
               ...(t.free_notes.trim() ? [t.free_notes.trim()] : []),
             ];
-            return {
+            const built: OrderItem = {
               id: uuid(),
               order_id: orderId,
               product_id: t.product_id,
@@ -1189,8 +1202,14 @@ export const useTcheStore = create<TcheState>()(
               weight_tare_grams: t.weight?.tare_grams ?? null,
               weight_source: t.weight?.source ?? null,
               keg_volume_ml: resolveKegVolume(t.product_id, t.modifiers, get().kegTapProducts, get().modifierOptions),
+              combo_parent_item_id: null,
             };
-          });
+            if (!product) return fail('Produto não encontrado.');
+            // Combo: o item do combo leva o preço; cada escolha vira um item na praça dela.
+            const expanded = expandComboItem(built, product, t.modifiers, get());
+            if (!expanded.ok) return expanded;
+            newItems.push(...expanded.data);
+          }
 
           set((s) => {
             const orderItems = [...s.orderItems, ...newItems];
@@ -1238,6 +1257,7 @@ export const useTcheStore = create<TcheState>()(
           if (!item) return fail('Item não encontrado.');
           if (item.status === 'CANCELED') return fail('Item já cancelado.');
           if (item.is_paid) return fail('Item já pago. Estorno deve ser feito pelo módulo de pagamentos.');
+          if (item.combo_parent_item_id) return fail('Este item faz parte de um combo. Cancele o combo inteiro.');
           const orderRes = findEditableOrder(item.order_id);
           if (!orderRes.ok) return orderRes;
           const order = orderRes.data;
@@ -1246,14 +1266,19 @@ export const useTcheStore = create<TcheState>()(
           // Simula o novo total antes de autorizar: não pode ficar abaixo do já pago.
           const ts = nowISO();
           const user = currentUser()!;
-          const canceledItem: OrderItem = {
-            ...item,
+          const cancel = (i: OrderItem): OrderItem => ({
+            ...i,
             status: 'CANCELED',
             canceled_at: ts,
             canceled_by_user_id: user?.id ?? null,
             cancel_reason: auth.reason.trim(),
-          };
-          const simulatedItems = get().orderItems.map((i) => (i.id === itemId ? canceledItem : i));
+          });
+          const canceledItem = cancel(item);
+          // Combo: os componentes saem junto (o banco pede um audit_log por item cancelado).
+          const comboParts = comboChildrenOf(item.id, get().orderItems).filter((c) => c.status !== 'CANCELED');
+          const canceledParts = comboParts.map(cancel);
+          const canceledById = new Map([canceledItem, ...canceledParts].map((c) => [c.id, c]));
+          const simulatedItems = get().orderItems.map((i) => canceledById.get(i.id) ?? i);
           const simulated = applyOrderTotals(order, simulatedItems, get().payments);
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Cancelamento deixaria a conta abaixo do valor já pago. Estorne um pagamento primeiro.');
@@ -1284,16 +1309,45 @@ export const useTcheStore = create<TcheState>()(
               sector: item.sector,
               waiter_name: user.name,
               manager_name: manager.name,
+              ...(comboParts.length ? { combo_items: comboParts.map((c) => c.id) } : {}),
             },
+          });
+          const partLogs = comboParts.map((part) => {
+            const partProduct = get().products.find((p) => p.id === part.product_id);
+            return buildAudit({
+              order_id: order.id,
+              performed_by_user_id: user.id,
+              authorized_by_manager_id: manager.id,
+              action_type: 'ITEM_CANCELED',
+              // O valor saiu da conta no combo; o componente tem preço zero.
+              amount_impact: 0,
+              reason: auth.reason.trim(),
+              metadata: {
+                table: tableLabel(order.table_id),
+                item_id: part.id,
+                combo_item_id: item.id,
+                product_code: partProduct?.code ?? null,
+                product_name: partProduct?.name ?? null,
+                quantity: part.quantity,
+                item_total: 0,
+                item_status_before: part.status,
+                sector: part.sector,
+                waiter_name: user.name,
+                manager_name: manager.name,
+              },
+            });
           });
 
           set((s) => {
-            const orderItems = s.orderItems.map((i) => (i.id === itemId ? canceledItem : i));
+            const orderItems = s.orderItems.map((i) => canceledById.get(i.id) ?? i);
             const current = s.orders.find((o) => o.id === order.id)!;
             const recalculated = applyOrderTotals(current, orderItems, s.payments);
-            const before = s.orderItems.find((i) => i.id === itemId)!;
-            const kegTaps = applyKegCancel(s.kegTaps, s.kegTapProducts, before);
-            const patch = commitAdjustment(s, recalculated, orderItems, [canceledItem], log, auth.managerPin);
+            let kegTaps = s.kegTaps;
+            for (const id of canceledById.keys()) {
+              const before = s.orderItems.find((i) => i.id === id);
+              if (before) kegTaps = applyKegCancel(kegTaps, s.kegTapProducts, before);
+            }
+            const patch = commitAdjustment(s, recalculated, orderItems, [...canceledById.values()], [log, ...partLogs], auth.managerPin);
             return {
               ...patch,
               kegTaps,
@@ -1730,7 +1784,7 @@ export const useTcheStore = create<TcheState>()(
             const base = basePriceFor(product, d.half_product_ids);
             if (!base.ok) return base;
             const price = base.data;
-            if (product.requires_meat_doneness && !d.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
+            if ((product.requires_meat_doneness || comboNeedsDoneness(product, d.modifiers, s0)) && !d.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
             let modsCents = 0;
             for (const m of d.modifiers) {
               const opt = s0.modifierOptions.find((o) => o.id === m.option_id && o.group_id === m.group_id);
@@ -1762,31 +1816,39 @@ export const useTcheStore = create<TcheState>()(
               ...(halfNames.length ? [`1/2 ${product.name} + ${halfNames.map((n) => `1/2 ${n}`).join(' + ')}`] : []),
               ...d.modifiers.map((m) => `+ ${m.name}`),
               ...d.quick_tags, ...(d.free_notes.trim() ? [d.free_notes.trim()] : [])];
-            newItems.push({
-              id: uuid(),
-              order_id: order.id,
-              product_id: product.id,
-              waiter_id: qrUser.id,
-              quantity: qty,
-              unit_price: price,
-              modifiers_unit_price: fromCentsLocal(modsCents),
-              total_item_price: computeItemTotal(qty, price, fromCentsLocal(modsCents)),
-              meat_doneness: d.meat_doneness,
-              notes: noteParts.length ? noteParts.join(' · ') : null,
-              sector: product.sector,
-              status: 'PENDING',
-              is_paid: false,
-              origin: 'QRCODE_TABLE',
-              created_at: ts,
-              prepared_at: null,
-              canceled_at: null,
-              canceled_by_user_id: null,
-              cancel_reason: null,
-              weight_gross_grams: null,
-              weight_tare_grams: null,
-              weight_source: null,
-              keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
-            });
+            const expanded = expandComboItem(
+              {
+                id: uuid(),
+                order_id: order.id,
+                product_id: product.id,
+                waiter_id: qrUser.id,
+                quantity: qty,
+                unit_price: price,
+                modifiers_unit_price: fromCentsLocal(modsCents),
+                total_item_price: computeItemTotal(qty, price, fromCentsLocal(modsCents)),
+                meat_doneness: d.meat_doneness,
+                notes: noteParts.length ? noteParts.join(' · ') : null,
+                sector: product.sector,
+                status: 'PENDING',
+                is_paid: false,
+                origin: 'QRCODE_TABLE',
+                created_at: ts,
+                prepared_at: null,
+                canceled_at: null,
+                canceled_by_user_id: null,
+                cancel_reason: null,
+                weight_gross_grams: null,
+                weight_tare_grams: null,
+                weight_source: null,
+                keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
+                combo_parent_item_id: null,
+              },
+              product,
+              d.modifiers,
+              s0,
+            );
+            if (!expanded.ok) return expanded;
+            newItems.push(...expanded.data);
           }
           const baseOrder = order;
           set((s) => {
@@ -1910,7 +1972,7 @@ export const useTcheStore = create<TcheState>()(
             if (!product || !product.available) return fail('Produto indisponível.');
             if (product.sold_by_weight) return fail(`${product.name} é vendido por peso: lance pela balança na comanda.`);
             if (!Number.isInteger(line.quantity) || line.quantity < 1 || line.quantity > 99) return fail('Quantidade inválida (1 a 99 fichas por item).');
-            if (product.requires_meat_doneness && !line.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
+            if ((product.requires_meat_doneness || comboNeedsDoneness(product, line.modifiers, s0)) && !line.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
             const groups = s0.productModifierGroups
               .filter((l) => l.product_id === product.id)
               .map((l) => s0.modifierGroups.find((g) => g.id === l.group_id))
@@ -1928,33 +1990,41 @@ export const useTcheStore = create<TcheState>()(
             }
             const mods = fromCentsLocal(modsCents);
             const notes = [...(line.meat_doneness ? [line.meat_doneness] : []), ...line.modifiers.map((m) => `+ ${m.name}`)];
-            items.push({
-              id: uuid(),
-              order_id: order.id,
-              product_id: product.id,
-              waiter_id: user.id,
-              quantity: line.quantity,
-              // Preço sempre do cadastro, nunca do aparelho.
-              unit_price: product.price,
-              modifiers_unit_price: mods,
-              total_item_price: computeItemTotal(line.quantity, product.price, mods),
-              meat_doneness: line.meat_doneness,
-              notes: notes.length ? notes.join(' · ') : null,
-              sector: product.sector,
-              // Fica PENDING até a ficha ser resgatada no balcão (não entra no KDS).
-              status: 'PENDING',
-              is_paid: false,
-              origin: 'SMARTPOS',
-              created_at: ts,
-              prepared_at: null,
-              canceled_at: null,
-              canceled_by_user_id: null,
-              cancel_reason: null,
-              weight_gross_grams: null,
-              weight_tare_grams: null,
-              weight_source: null,
-              keg_volume_ml: resolveKegVolume(product.id, line.modifiers, s0.kegTapProducts, s0.modifierOptions),
-            });
+            const expanded = expandComboItem(
+              {
+                id: uuid(),
+                order_id: order.id,
+                product_id: product.id,
+                waiter_id: user.id,
+                quantity: line.quantity,
+                // Preço sempre do cadastro, nunca do aparelho.
+                unit_price: product.price,
+                modifiers_unit_price: mods,
+                total_item_price: computeItemTotal(line.quantity, product.price, mods),
+                meat_doneness: line.meat_doneness,
+                notes: notes.length ? notes.join(' · ') : null,
+                sector: product.sector,
+                // Fica PENDING até a ficha ser resgatada no balcão (não entra no KDS).
+                status: 'PENDING',
+                is_paid: false,
+                origin: 'SMARTPOS',
+                created_at: ts,
+                prepared_at: null,
+                canceled_at: null,
+                canceled_by_user_id: null,
+                cancel_reason: null,
+                weight_gross_grams: null,
+                weight_tare_grams: null,
+                weight_source: null,
+                keg_volume_ml: resolveKegVolume(product.id, line.modifiers, s0.kegTapProducts, s0.modifierOptions),
+                combo_parent_item_id: null,
+              },
+              product,
+              line.modifiers,
+              s0,
+            );
+            if (!expanded.ok) return expanded;
+            items.push(...expanded.data);
           }
           const recalculated = applyOrderTotals(order, items, []);
           if (!(recalculated.total_amount > 0)) return fail('Venda sem valor.');
@@ -1992,6 +2062,8 @@ export const useTcheStore = create<TcheState>()(
           const tickets: EventTicket[] = [];
           for (const item of s0.orderItems.filter((i) => i.order_id === orderId && i.status !== 'CANCELED')) {
             const product = s0.products.find((p) => p.id === item.product_id);
+            // Combo: sai uma ficha por componente (cada um é retirado na praça dele), não do combo.
+            if (product?.is_combo && comboChildrenOf(item.id, s0.orderItems).length > 0) continue;
             const name = product ? `${product.name}${item.notes ? ` (${item.notes.replace(/\+ /g, '')})` : ''}` : 'Item';
             for (let seq = 1; seq <= item.quantity; seq++) {
               let token = generateTicketToken();
@@ -2105,7 +2177,7 @@ export const useTcheStore = create<TcheState>()(
             if (!product || !product.active || !product.available) return fail('Produto indisponível.');
             if (product.sold_by_weight) return fail(`${product.name} é pesado no buffet: peça no balcão.`);
             if (!Number.isInteger(d.quantity) || d.quantity < 1 || d.quantity > 99) return fail('Quantidade inválida (1 a 99).');
-            if (product.requires_meat_doneness && !d.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
+            if ((product.requires_meat_doneness || comboNeedsDoneness(product, d.modifiers, s0)) && !d.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
             const groups = s0.productModifierGroups
               .filter((l) => l.product_id === product.id)
               .map((l) => s0.modifierGroups.find((g) => g.id === l.group_id))
@@ -2139,32 +2211,40 @@ export const useTcheStore = create<TcheState>()(
               ...d.quick_tags,
               ...(d.free_notes.trim() ? [d.free_notes.trim().slice(0, 140)] : []),
             ];
-            items.push({
-              id: uuid(),
-              order_id: order.id,
-              product_id: product.id,
-              waiter_id: user.id,
-              quantity: d.quantity,
-              unit_price: unitPrice,
-              modifiers_unit_price: mods,
-              total_item_price: computeItemTotal(d.quantity, unitPrice, mods),
-              meat_doneness: d.meat_doneness,
-              notes: noteParts.length ? noteParts.join(' · ') : null,
-              sector: product.sector,
-              // PENDING, mas o KDS só mostra depois que a conta fecha (pago).
-              status: 'PENDING',
-              is_paid: false,
-              origin: user.role === 'KIOSK' ? 'KIOSK' : 'WAITER',
-              created_at: ts,
-              prepared_at: null,
-              canceled_at: null,
-              canceled_by_user_id: null,
-              cancel_reason: null,
-              weight_gross_grams: null,
-              weight_tare_grams: null,
-              weight_source: null,
-              keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
-            });
+            const expanded = expandComboItem(
+              {
+                id: uuid(),
+                order_id: order.id,
+                product_id: product.id,
+                waiter_id: user.id,
+                quantity: d.quantity,
+                unit_price: unitPrice,
+                modifiers_unit_price: mods,
+                total_item_price: computeItemTotal(d.quantity, unitPrice, mods),
+                meat_doneness: d.meat_doneness,
+                notes: noteParts.length ? noteParts.join(' · ') : null,
+                sector: product.sector,
+                // PENDING, mas o KDS só mostra depois que a conta fecha (pago).
+                status: 'PENDING',
+                is_paid: false,
+                origin: user.role === 'KIOSK' ? 'KIOSK' : 'WAITER',
+                created_at: ts,
+                prepared_at: null,
+                canceled_at: null,
+                canceled_by_user_id: null,
+                cancel_reason: null,
+                weight_gross_grams: null,
+                weight_tare_grams: null,
+                weight_source: null,
+                keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
+                combo_parent_item_id: null,
+              },
+              product,
+              d.modifiers,
+              s0,
+            );
+            if (!expanded.ok) return expanded;
+            items.push(...expanded.data);
           }
           const recalculated = applyOrderTotals(order, items, []);
           if (!(recalculated.total_amount > 0)) return fail('Pedido sem valor.');
@@ -2540,6 +2620,7 @@ export const useTcheStore = create<TcheState>()(
             description: draft.description?.trim() || null,
             price: round2(draft.price),
             sold_by_weight: draft.sold_by_weight ?? existing?.sold_by_weight ?? false,
+            is_combo: draft.is_combo ?? existing?.is_combo ?? false,
             tare_weight_grams: draft.tare_weight_grams ?? existing?.tare_weight_grams ?? 0,
             cost_price: draft.cost_price ?? existing?.cost_price ?? 0,
             // Estoque só muda por movimento (compra/venda), nunca pelo cadastro.
@@ -2634,8 +2715,10 @@ export const useTcheStore = create<TcheState>()(
             name: draft.name.trim(),
             additional_price: round2(draft.additional_price),
             volume_ml: existing?.volume_ml ?? null,
+            component_product_id: draft.component_product_id !== undefined ? draft.component_product_id : existing?.component_product_id ?? null,
+            component_quantity: draft.component_quantity ?? existing?.component_quantity ?? 1,
           };
-          const check = validateModifierOption(row, state.modifierGroups, state.modifierOptions);
+          const check = validateModifierOption(row, state.modifierGroups, state.modifierOptions, state.products);
           if (!check.ok) return check;
           set((s) => ({
             modifierOptions: existing ? s.modifierOptions.map((o) => (o.id === row.id ? row : o)) : [...s.modifierOptions, row],
@@ -3139,8 +3222,9 @@ export const useTcheStore = create<TcheState>()(
     {
       name: 'tchefood-state-v1',
       // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback);
-      // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras).
-      version: 5,
+      // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras);
+      // v6 = combos.
+      version: 6,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -3215,6 +3299,19 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
     for (const key of ['suppliers', 'purchaseInvoices', 'purchaseInvoiceItems', 'stockMovements', 'supplierProductLinks']) {
       if (!Array.isArray(out[key])) out[key] = [];
     }
+  }
+  if (version < 6) {
+    // Combos: nada vira combo sozinho; opções e itens ficam como eram.
+    const fill = (key: string, f: (r: Record<string, unknown>) => Record<string, unknown>) => {
+      if (Array.isArray(out[key])) out[key] = (out[key] as Array<Record<string, unknown>>).map(f);
+    };
+    fill('products', (p) => ({ ...p, is_combo: p.is_combo === true }));
+    fill('modifierOptions', (o) => ({
+      ...o,
+      component_product_id: typeof o.component_product_id === 'string' ? o.component_product_id : null,
+      component_quantity: typeof o.component_quantity === 'number' ? o.component_quantity : 1,
+    }));
+    fill('orderItems', (i) => ({ ...i, combo_parent_item_id: typeof i.combo_parent_item_id === 'string' ? i.combo_parent_item_id : null }));
   }
   return out;
 }
