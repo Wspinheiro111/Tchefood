@@ -2,9 +2,10 @@ import { useEffect, useMemo, useState } from 'react';
 import { Check } from 'lucide-react';
 import { useSalePrice } from '../lib/useSalePrice';
 import { useTcheStore } from '../store/useTcheStore';
-import type { ModifierGroup, Product, SelectedModifier, TrayItem } from '../types';
+import type { ModifierGroup, ModifierOption, Product, SelectedModifier, TrayItem } from '../types';
 import { computeItemTotal, formatBRL, halfAndHalfPrice } from '../lib/money';
 import { MEAT_DONENESS_OPTIONS, QUICK_TAGS } from '../data/seed';
+import { comboNeedsDoneness } from '../lib/combos';
 import { Btn, Sheet, Stepper } from './ui';
 
 export type ProductDraft = Omit<TrayItem, 'tray_id' | 'added_at' | 'order_id'>;
@@ -41,15 +42,6 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
   const [notes, setNotes] = useState('');
   const [half, setHalf] = useState<string | null>(null);
 
-  useEffect(() => {
-    setQty(1);
-    setDoneness(null);
-    setMods([]);
-    setTags([]);
-    setNotes('');
-    setHalf(null);
-  }, [product?.id]);
-
   const groups = useMemo<ModifierGroup[]>(() => {
     if (!product) return [];
     return links
@@ -58,6 +50,16 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
       .map((l) => groupsAll.find((g) => g.id === l.group_id))
       .filter((g): g is ModifierGroup => Boolean(g));
   }, [product, links, groupsAll]);
+
+  useEffect(() => {
+    setQty(1);
+    setDoneness(null);
+    // Combo: item fixo (grupo obrigatório com uma opção só) já vem marcado.
+    setMods(product?.is_combo ? fixedComboChoices(groups, optionsAll) : []);
+    setTags([]);
+    setNotes('');
+    setHalf(null);
+  }, [product?.id]);
 
   if (!product) return null;
 
@@ -82,8 +84,9 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
     });
   };
 
+  const needsDoneness = product.requires_meat_doneness || comboNeedsDoneness(product, mods, { products, modifierOptions: optionsAll });
   const missing: string[] = [];
-  if (product.requires_meat_doneness && !doneness) missing.push('Ponto da carne');
+  if (needsDoneness && !doneness) missing.push('Ponto da carne');
   for (const g of groups) {
     const n = mods.filter((m) => m.group_id === g.id).length;
     const min = g.required ? Math.max(1, g.min_selection) : g.min_selection;
@@ -101,7 +104,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
       unit_price: unitPrice,
       modifiers: mods,
       modifiers_unit_price: modsPrice,
-      meat_doneness: doneness,
+      meat_doneness: needsDoneness ? doneness : null,
       quick_tags: tags,
       free_notes: notes,
       sector: product.sector,
@@ -129,7 +132,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
     >
       {product.description && <p className="mb-3 text-sm text-slate-500">{product.description}</p>}
 
-      {product.requires_meat_doneness && (
+      {needsDoneness && (
         <section className="mb-4">
           <h3 className="mb-2 flex items-center gap-2 font-bold">
             Ponto da Carne <span className="rounded bg-brasa px-1.5 text-[10px] font-black uppercase">Obrigatório</span>
@@ -225,4 +228,17 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
       </section>
     </Sheet>
   );
+}
+
+/** Escolhas que o combo já traz marcadas: grupos obrigatórios com uma opção só (item fixo). */
+function fixedComboChoices(groups: ModifierGroup[], options: ModifierOption[]): SelectedModifier[] {
+  const out: SelectedModifier[] = [];
+  for (const g of groups) {
+    const opts = options.filter((o) => o.group_id === g.id);
+    if (g.required && opts.length === 1) {
+      const o = opts[0]!;
+      out.push({ group_id: g.id, option_id: o.id, name: o.name, additional_price: o.additional_price });
+    }
+  }
+  return out;
 }

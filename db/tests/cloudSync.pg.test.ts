@@ -14,7 +14,7 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
-import { flushOutbox, type SyncRejection } from '../../src/lib/sync/supabaseSync';
+import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
 import { useArStore } from '../../src/store/useArStore';
 import { sampleNfeXml } from '../../src/data/sampleNfe';
 import { setReviewHold } from '../../src/lib/payments/reviewHolds';
@@ -529,6 +529,63 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     });
     expect(other.status).toBe(400);
     login(CASHIER_PIN);
+  });
+
+  it('combo: o combo leva o preço, os componentes sobem com preço zero e o banco recusa componente forjado', async () => {
+    login(OWNER_PIN);
+    const base = st().products.find((x) => x.id === productId)!;
+    const refri = ok(
+      st().saveProduct({
+        category_id: categoryId, code: '231', name: 'Refrigerante lata', description: null, price: 7.9, sector: 'BAR', available: true, active: true,
+        requires_meat_doneness: false, allows_half_and_half: false, ncm: '22021000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+        cost_price: 0, stock_quantity: 0, barcode: null,
+      }),
+    );
+    const combo = ok(
+      st().saveProduct({
+        category_id: categoryId, code: '501', name: 'Combo Executivo', description: null, price: 49.9, sector: 'NONE', available: true, active: true,
+        requires_meat_doneness: false, allows_half_and_half: false, ncm: '21069090', cfop: '5102', csosn_cst: '102', unit: 'UN',
+        cost_price: 0, stock_quantity: 0, barcode: null, is_combo: true,
+      }),
+    );
+    const prato = ok(st().saveModifierGroup({ name: 'Prato do combo', min_selection: 1, max_selection: 1, required: true }));
+    const bebida = ok(st().saveModifierGroup({ name: 'Bebida do combo', min_selection: 1, max_selection: 1, required: true }));
+    const optPrato = ok(st().saveModifierOption({ group_id: prato.id, name: base.name, additional_price: 0, component_product_id: base.id, component_quantity: 1 }));
+    const optRefri = ok(st().saveModifierOption({ group_id: bebida.id, name: refri.name, additional_price: 0, component_product_id: refri.id, component_quantity: 2 }));
+    ok(st().setProductModifierGroups(combo.id, [prato.id, bebida.id]));
+    await expectSynced('cadastro do combo');
+    expect(sql(`SELECT is_combo FROM products WHERE id = '${combo.id}'`)).toBe('t');
+
+    login(CASHIER_PIN);
+    const mesa = st().tables.find((t) => t.number === 2)!;
+    const order = ok(st().openTable(mesa.id, 1, null));
+    const mods = [optPrato, optRefri].map((o) => ({ group_id: o.group_id, option_id: o.id, name: o.name, additional_price: o.additional_price }));
+    ok(st().addToTray({ order_id: order.id, product_id: combo.id, half_product_ids: [], quantity: 1, unit_price: combo.price, modifiers: mods, modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: combo.sector }));
+    const sent = ok(st().dispatchTray(order.id)).items;
+    expect(sent).toHaveLength(3);
+    const childEvent = st().outbox.find((e) => e.table === 'order_items' && e.row_id === sent[2]!.id)!;
+    const childRow = sanitizePayload(childEvent);
+    await expectSynced('comanda com combo');
+    expect(sql(`SELECT subtotal_items FROM orders WHERE id = '${order.id}'`)).toBe('49.90');
+    expect(sql(`SELECT count(*) || ' ' || sum(quantity) FROM order_items WHERE combo_parent_item_id = '${sent[0]!.id}' AND total_item_price = 0`)).toBe('2 3.000');
+
+    // Componente a mais (quantidade fora do cadastro) e componente com preço: recusados.
+    const extra = await raw('POST', 'order_items', { ...childRow, id: crypto.randomUUID(), quantity: 5 });
+    expect(extra.status).toBe(400);
+    expect(extra.body).toMatch(/não oferece este produto/);
+    const priced = await raw('POST', 'order_items', { ...childRow, id: crypto.randomUUID(), unit_price: 7.9, total_item_price: 15.8 });
+    expect(priced.status).toBe(400);
+    expect(priced.body).toMatch(/não tem preço próprio/);
+    // Combo dentro de combo: recusado no cadastro.
+    const nested = await raw('PATCH', `modifier_options?id=eq.${optRefri.id}`, { component_product_id: combo.id });
+    expect(nested.body).toMatch(/combo não entra dentro de outro combo/);
+
+    // Cancelar o combo cancela os componentes (um audit_log por item, com PIN).
+    forgetPinFailures();
+    ok(st().cancelOrderItem(sent[0]!.id, MANAGER));
+    await expectSynced('cancelamento do combo');
+    expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${order.id}' AND status = 'CANCELED'`)).toBe('3');
+    expect(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`)).toBe('0.00');
   });
 
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {

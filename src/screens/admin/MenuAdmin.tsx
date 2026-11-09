@@ -149,6 +149,7 @@ interface ProductForm {
   active: boolean;
   requires_meat_doneness: boolean;
   allows_half_and_half: boolean;
+  is_combo: boolean;
   ncm: string;
   cfop: string;
   csosn_cst: string;
@@ -174,6 +175,7 @@ function ProductEditor({ product, onClose }: { product: Product | null; onClose:
     active: product?.active ?? true,
     requires_meat_doneness: product?.requires_meat_doneness ?? false,
     allows_half_and_half: product?.allows_half_and_half ?? false,
+    is_combo: product?.is_combo ?? false,
     // Sem padrão fiscal: NCM, CFOP e CSOSN vêm da contabilidade da loja.
     ncm: product?.ncm ?? '',
     cfop: product?.cfop ?? '',
@@ -201,6 +203,7 @@ function ProductEditor({ product, onClose }: { product: Product | null; onClose:
       active: f.active,
       requires_meat_doneness: f.requires_meat_doneness,
       allows_half_and_half: f.allows_half_and_half,
+      is_combo: f.is_combo,
       ncm: f.ncm,
       cfop: f.cfop,
       csosn_cst: f.csosn_cst,
@@ -239,7 +242,13 @@ function ProductEditor({ product, onClose }: { product: Product | null; onClose:
         <Toggle label="Ativo no cardápio" checked={f.active} onChange={(v) => up('active', v)} />
         <Toggle label="Pergunta ponto da carne" checked={f.requires_meat_doneness} onChange={(v) => up('requires_meat_doneness', v)} />
         <Toggle label="Aceita meio a meio" checked={f.allows_half_and_half} onChange={(v) => up('allows_half_and_half', v)} />
+        <Toggle label="É um combo" checked={f.is_combo} onChange={(v) => up('is_combo', v)} />
       </div>
+      {f.is_combo && (
+        <p className="mb-2 rounded-xl bg-base p-3 text-xs text-slate-500">
+          O preço acima é o do combo. Os itens saem dos grupos marcados abaixo: cada opção que aponta para um produto vira um item na praça dele (KDS e impressora), sem valor próprio. Grupo obrigatório com uma opção só é item fixo; com várias, o cliente escolhe. Na NFC-e e no cupom sai uma linha só, a do combo. Use o setor &quot;Sem produção&quot; para o combo.
+        </p>
+      )}
 
       <h4 className="mb-2 mt-2 text-sm font-bold text-slate-700">Fiscal (NFC-e)</h4>
       <div className="grid grid-cols-3 gap-x-3">
@@ -322,6 +331,7 @@ function CategoryEditor({ category, nextOrder, onClose }: { category: Category |
 // ADICIONAIS
 // ---------------------------------------------------------------------------
 function ModifiersPanel() {
+  const products = useTcheStore((s) => s.products);
   const groups = useTcheStore((s) => s.modifierGroups);
   const options = useTcheStore((s) => s.modifierOptions);
   const links = useTcheStore((s) => s.productModifierGroups);
@@ -349,7 +359,14 @@ function ModifiersPanel() {
               <div className="divide-y divide-slate-200">
                 {opts.map((o) => (
                   <div key={o.id} className="flex items-center gap-2 py-2 text-sm">
-                    <span className="flex-1">{o.name}</span>
+                    <span className="flex-1">
+                      {o.name}
+                      {o.component_product_id && (
+                        <span className="ml-2 rounded bg-slate-200 px-1.5 text-[11px] text-slate-700">
+                          combo: {o.component_quantity}× {products.find((p) => p.id === o.component_product_id)?.name ?? 'produto removido'}
+                        </span>
+                      )}
+                    </span>
                     <span className="tabular-nums text-slate-700">{o.additional_price > 0 ? `+ ${formatBRL(o.additional_price)}` : 'sem custo'}</span>
                     <Btn variant="ghost" aria-label={`Editar ${o.name}`} onClick={() => setEditingOption({ group: g, option: o })}><Pencil className="h-4 w-4" /></Btn>
                     <Btn
@@ -409,13 +426,26 @@ function GroupEditor({ group, onClose }: { group: ModifierGroup | null; onClose:
 
 function OptionEditor({ group, option, onClose }: { group: ModifierGroup; option: ModifierOption | null; onClose: () => void }) {
   const save = useTcheStore((s) => s.saveModifierOption);
+  const products = useTcheStore((s) => s.products);
   const [name, setName] = useState(option?.name ?? '');
   const [price, setPrice] = useState(option ? moneyToInput(option.additional_price) : '0,00');
+  const [component, setComponent] = useState(option?.component_product_id ?? '');
+  const [componentQty, setComponentQty] = useState(String(option?.component_quantity ?? 1));
   const [error, setError] = useState<string | null>(null);
+  const eligible = products
+    .filter((p) => p.active && !p.is_combo && !p.sold_by_weight)
+    .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
   const submit = () => {
     const p = parseMoneyInput(price);
     if (Number.isNaN(p)) return setError('Valor inválido. Use 0,00 para sem custo.');
-    const r = save({ id: option?.id, group_id: group.id, name, additional_price: p });
+    const r = save({
+      id: option?.id,
+      group_id: group.id,
+      name,
+      additional_price: p,
+      component_product_id: component || null,
+      component_quantity: Number(componentQty),
+    });
     if (!r.ok) return setError(r.error);
     toast.success(`${r.data.name} salvo em ${group.name}.`);
     onClose();
@@ -425,6 +455,21 @@ function OptionEditor({ group, option, onClose }: { group: ModifierGroup; option
       <FormError error={error} />
       <Field label="Nome"><TextInput value={name} maxLength={100} onChange={(e) => setName(e.target.value)} /></Field>
       <Field label="Valor adicional (R$)" hint="Vale para os próximos lançamentos; itens já lançados não mudam."><TextInput inputMode="decimal" value={price} onChange={(e) => setPrice(e.target.value)} /></Field>
+      <Field label="Produto do combo" hint="Só em grupo de combo: a opção coloca este produto no pedido, na praça dele. Deixe em branco para um adicional comum.">
+        <Select
+          value={component}
+          onChange={(v) => {
+            setComponent(v);
+            if (v && !name.trim()) setName(products.find((p) => p.id === v)?.name ?? '');
+          }}
+          options={[{ value: '', label: '— adicional comum —' }, ...eligible.map((p) => ({ value: p.id, label: `${p.code} ${p.name}` }))]}
+        />
+      </Field>
+      {component && (
+        <Field label="Quantidade no combo" hint="Unidades deste produto em cada combo (1 a 20).">
+          <TextInput inputMode="numeric" value={componentQty} maxLength={2} onChange={(e) => setComponentQty(e.target.value.replace(/\D/g, ''))} />
+        </Field>
+      )}
     </Sheet>
   );
 }
