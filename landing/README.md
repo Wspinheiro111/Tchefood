@@ -16,7 +16,7 @@ npm run build    # gera dist/ (site estático, pode ir para Vercel, Netlify ou q
 
 Tudo fica em `src/lib/config.ts`:
 
-- `WHATSAPP_NUMERO`: número comercial, só dígitos com DDI e DDD (ex.: `5551999998888`). Hoje é um placeholder.
+- `WHATSAPP_NUMERO`: número comercial, só dígitos com DDI e DDD (ex.: `5551999998888`). Já configurado: (55) 99653-8255.
 - `PLANOS[].precoMensal`: mensalidade de cada plano. Com `null` o card mostra "Sob consulta".
 - `EM_BREVE`: recursos anunciados que ainda não estão prontos (aparecem com selo "Em breve").
 

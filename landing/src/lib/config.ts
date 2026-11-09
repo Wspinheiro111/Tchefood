@@ -4,7 +4,7 @@
  */
 
 /** Número do WhatsApp comercial no formato internacional, só dígitos (ex.: 5551999998888). */
-export const WHATSAPP_NUMERO = '5500000000000'; // TODO(Will): número real da W9 Sistemas
+export const WHATSAPP_NUMERO = '5555996538255'; // (55) 99653-8255 — W9 Sistemas
 
 export const EMPRESA = {
   produto: 'Tchê Food',
