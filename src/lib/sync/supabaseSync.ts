@@ -197,13 +197,19 @@ export function serverOrder(events: SyncEvent[]): SyncEvent[] {
   return out;
 }
 
+/** Tabelas cujas linhas pertencem a uma comanda e mexem nela no servidor. */
+const ORDER_CHILDREN: ReadonlyArray<SyncEvent['table']> = ['order_items', 'payments', 'audit_logs'];
+
 /**
- * Registros que um evento toca, para manter a ordem por registro. Um audit_log de
- * comanda também segura a comanda: a atualização dela depende da autorização.
+ * Registros que um evento toca, para manter a ordem por registro. Tudo o que pertence
+ * a uma comanda conta também como a comanda: itens e pagamentos recalculam os totais
+ * dela por gatilho (trg_order_items_recalc, trg_payments_recalc) e o audit_log é a
+ * autorização da qual a atualização dela depende. Assim, um recusado da comanda segura
+ * tudo o que vem depois dela, e o reenvio acontece na mesma ordem em que foi gerado.
  */
 export function recordKeys(event: SyncEvent): string[] {
   const keys = [`${event.table}:${event.row_id}`];
-  if (event.table === 'audit_logs' && typeof event.payload.order_id === 'string') keys.push(`orders:${event.payload.order_id}`);
+  if (ORDER_CHILDREN.includes(event.table) && typeof event.payload.order_id === 'string') keys.push(`orders:${event.payload.order_id}`);
   return keys;
 }
 

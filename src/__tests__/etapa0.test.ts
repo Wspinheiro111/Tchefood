@@ -493,6 +493,15 @@ describe('sincronização com o Supabase', () => {
     expect(calls.some((c) => c.includes('"v":2'))).toBe(false);
   });
 
+  it('comanda recusada segura itens e pagamentos dela (os gatilhos recalculam a comanda)', async () => {
+    const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
+    const held = ev({ id: 'h', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' } });
+    const pay = ev({ id: 'p', table: 'payments', row_id: 'PAY', payload: { id: 'PAY', order_id: 'O1' } });
+    const item = ev({ id: 'i', table: 'order_items', op: 'UPDATE', row_id: 'I1', payload: { id: 'I1', order_id: 'O1' } });
+    const otherPay = ev({ id: 'q', table: 'payments', row_id: 'PAY2', payload: { id: 'PAY2', order_id: 'O2' } });
+    expect((await flushOutbox([pay, item, otherPay], cfg, fetchFn, 50, [held])).sent).toEqual(['q']);
+  });
+
   it('eventos segurados não gastam o limite da rodada', async () => {
     const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
     const held = ev({ id: 'h', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } });
