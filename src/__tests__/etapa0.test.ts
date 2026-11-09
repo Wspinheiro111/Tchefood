@@ -720,6 +720,16 @@ describe('sincronização com o Supabase', () => {
     expect((await flushOutbox([releaseA, occupyB], cfg, fetchFn, 50, [payA])).sent).toEqual([]);
   });
 
+  it('resgate de cashback numa comanda com autorização recusada: o extrato espera', async () => {
+    const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
+    const held = ev({ id: 'h', table: 'audit_logs', row_id: 'L1', payload: { id: 'L1', order_id: 'O1' } });
+    const used = ev({ id: 'u', table: 'cashback_ledger', op: 'UPDATE', row_id: 'E1', payload: { id: 'E1', order_id: 'O-antiga' }, depends_on_order_id: 'O1' });
+    const redeem = ev({ id: 'r', table: 'cashback_ledger', row_id: 'R1', payload: { id: 'R1', order_id: 'O1' }, depends_on_order_id: 'O1' });
+    const customer = ev({ id: 'c', table: 'loyalty_customers', op: 'UPDATE', row_id: 'C1', payload: { id: 'C1' }, depends_on_order_id: 'O1' });
+    const other = ev({ id: 'x', table: 'cashback_ledger', row_id: 'R2', payload: { id: 'R2', order_id: 'O2' } });
+    expect((await flushOutbox([used, redeem, customer, other], cfg, fetchFn, 50, [held])).sent).toEqual(['x']);
+  });
+
   it('eventos segurados não gastam o limite da rodada', async () => {
     const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
     const held = ev({ id: 'h', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } });

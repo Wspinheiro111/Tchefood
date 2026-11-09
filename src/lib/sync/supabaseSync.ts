@@ -312,7 +312,7 @@ const ORDER_CHILDREN: ReadonlyArray<SyncEvent['table']> = ['order_items', 'payme
  * a uma comanda conta também como a comanda: itens e pagamentos recalculam os totais
  * dela por gatilho (trg_order_items_recalc, trg_payments_recalc) e o audit_log é a
  * autorização da qual a atualização dela depende. A mesa também conta como a comanda
- * que ela mostra (ou que a liberou). Assim, um recusado da comanda segura tudo o que
+ * que ela mostra (ou que a liberou), e o extrato de cashback conta como a comanda do resgate. Assim, um recusado da comanda segura tudo o que
  * vem depois dela, inclusive a mesa ficar livre, e o reenvio acontece na mesma ordem
  * em que foi gerado.
  */
@@ -322,12 +322,11 @@ export function recordKeys(event: SyncEvent): string[] {
     if (typeof id === 'string' && !keys.includes(`orders:${id}`)) keys.push(`orders:${id}`);
   };
   if (ORDER_CHILDREN.includes(event.table)) order(event.payload.order_id);
-  // Mesa: a situação dela segue a comanda. Ocupada/aguardando conta aponta para a
-  // comanda em current_order_id; a liberação no fechamento leva depends_on_order_id.
-  if (event.table === 'dining_tables') {
-    order(event.payload.current_order_id);
-    order(event.depends_on_order_id);
-  }
+  // Mesa: a situação dela segue a comanda em current_order_id (ocupada/aguardando conta).
+  if (event.table === 'dining_tables') order(event.payload.current_order_id);
+  // Mudança que depende de uma operação da comanda sem apontar para ela no registro:
+  // a liberação da mesa no fechamento, o consumo do cashback no resgate.
+  order(event.depends_on_order_id);
   return keys;
 }
 

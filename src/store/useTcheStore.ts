@@ -2460,10 +2460,12 @@ export const useTcheStore = create<TcheState>()(
               outbox: [
                 ...s.outbox,
                 auditEvent!,
-                ...changedLedger.map((e) => syncEvent('cashback_ledger', 'UPDATE', e)),
-                syncEvent('cashback_ledger', 'INSERT', entry),
+                // O consumo dos créditos só sobe junto com a comanda do resgate: se a
+                // autorização ou o desconto dela for recusado, o extrato fica esperando.
+                ...changedLedger.map((e) => ({ ...syncEvent('cashback_ledger', 'UPDATE', e), depends_on_order_id: orderId })),
+                { ...syncEvent('cashback_ledger', 'INSERT', entry), depends_on_order_id: orderId },
                 ...orderEvents,
-                syncEvent('loyalty_customers', 'UPDATE', updatedCustomer),
+                { ...syncEvent('loyalty_customers', 'UPDATE', updatedCustomer), depends_on_order_id: orderId },
               ],
             };
           });
