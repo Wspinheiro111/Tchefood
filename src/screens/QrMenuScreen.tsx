@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react';
-import { BellRing, Minus, Plus, Receipt, ShoppingBag, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { BellRing, Minus, Plus, Receipt, Rotate3d, ShoppingBag, Trash2 } from 'lucide-react';
 import { useSalePrice } from '../lib/useSalePrice';
 import { QR_PRICE_CHANGED, useTcheStore } from '../store/useTcheStore';
 import type { Product } from '../types';
@@ -12,6 +12,8 @@ import { ITEM_STATUS_STYLE } from './StatementPanel';
 import { playDispatchChime } from '../lib/sound';
 import { printDispatchedItems } from '../components/PrintSimulator';
 import { BrandLogo } from '../components/Brand';
+import { ArProductViewer } from '../components/ar/ArProductViewer';
+import { selectActiveArModel, useArStore } from '../store/useArStore';
 
 interface CartLine extends ProductDraft {
   key: string;
@@ -72,6 +74,14 @@ function CustomerPhone({ tableId }: { tableId: string }) {
   const [cat, setCat] = useState(liveCategories[0]?.id ?? '');
   const [selected, setSelected] = useState<Product | null>(null);
   const [cart, setCart] = useState<CartLine[]>([]);
+  // Cardápio em realidade aumentada: prato aberto em 3D e os já vistos nesta visita.
+  const arModels = useArStore((a) => a.arModels);
+  const ensureDemoModel = useArStore((a) => a.ensureDemoModel);
+  const recordArEvent = useArStore((a) => a.recordArEvent);
+  const [viewing, setViewing] = useState<Product | null>(null);
+  const [seenIn3d, setSeenIn3d] = useState<string[]>([]);
+  useEffect(() => ensureDemoModel(), [ensureDemoModel]);
+  const viewingModel = viewing ? selectActiveArModel({ arModels }, viewing.id) : undefined;
 
   // Buffet a quilo é pesado no balcão, não pedido pelo celular.
   const products = s.products.filter((p) => p.active && p.category_id === cat && !p.sold_by_weight);
@@ -80,6 +90,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
 
   const addToCart = (d: ProductDraft) => {
     setCart((c) => [...c, { ...d, key: `${Date.now()}-${Math.random()}` }]);
+    if (seenIn3d.includes(d.product_id)) recordArEvent(d.product_id, 'ADD_AFTER_VIEW', tableId);
     setSelected(null);
     toast.info('Adicionado ao seu pedido.');
   };
@@ -122,7 +133,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
   };
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col">
       <div className="bg-gradient-to-r from-rose-600 to-amber-500 px-4 pb-3 pt-4 text-white">
         <div className="text-xs opacity-90">{s.tenant.name}</div>
         <div className="flex items-center justify-between">
@@ -148,10 +159,21 @@ function CustomerPhone({ tableId }: { tableId: string }) {
           <div className="flex-1 space-y-2 overflow-y-auto px-3 pb-3">
             {products.map((p) => {
               const catIcon = s.categories.find((c) => c.id === p.category_id)?.icon_name ?? null;
+              const has3d = Boolean(selectActiveArModel({ arModels }, p.id));
+              const open = () => {
+                if (!has3d) return setSelected(p);
+                setSeenIn3d((v) => (v.includes(p.id) ? v : [...v, p.id]));
+                setViewing(p);
+              };
               return (
-                <button key={p.id} disabled={!p.available} onClick={() => setSelected(p)} className="flex w-full items-center gap-3 rounded-2xl bg-white p-3 text-left shadow disabled:opacity-40">
-                  <span className="grid h-16 w-16 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-amber-100 to-rose-100 text-rose-600">
+                <button key={p.id} disabled={!p.available} onClick={open} className="flex w-full items-center gap-3 rounded-2xl bg-white p-3 text-left shadow disabled:opacity-40">
+                  <span className="relative grid h-16 w-16 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-amber-100 to-rose-100 text-rose-600">
                     <CategoryIcon name={catIcon} className="h-8 w-8" />
+                    {has3d && (
+                      <span className="absolute -bottom-1 -right-1 flex items-center gap-0.5 rounded-md bg-rose-600 px-1 py-0.5 text-[9px] font-black text-white shadow">
+                        <Rotate3d className="h-3 w-3" /> 3D
+                      </span>
+                    )}
                   </span>
                   <span className="min-w-0 flex-1">
                     <span className="block font-bold leading-tight">{p.name}</span>
@@ -217,6 +239,20 @@ function CustomerPhone({ tableId }: { tableId: string }) {
             </div>
           )}
         </div>
+      )}
+
+      {viewing && viewingModel && (
+        <ArProductViewer
+          product={viewing}
+          model={viewingModel}
+          price={priceOf(viewing)}
+          tableId={tableId}
+          onBack={() => setViewing(null)}
+          onOrder={() => {
+            setSelected(viewing);
+            setViewing(null);
+          }}
+        />
       )}
 
       {selected && (

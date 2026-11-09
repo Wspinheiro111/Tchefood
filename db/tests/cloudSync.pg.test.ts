@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
+import { useArStore } from '../../src/store/useArStore';
 import { sampleNfeXml } from '../../src/data/sampleNfe';
 import { setReviewHold } from '../../src/lib/payments/reviewHolds';
 import { createSupabaseLikeDb, pgTargetFromEnv, postgrestFetch, psql, psqlFile, type EmulatorLog, type PgTarget } from './postgrestEmulator';
@@ -275,6 +276,43 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
       ]),
     );
     await expectSynced('compra por XML');
+  });
+
+  it('cardápio 3D: modelo do prato, métricas do cliente e registro pelo QR da mesa', async () => {
+    login(OWNER_PIN);
+    const ar = () => useArStore.getState();
+    const draft = {
+      product_id: productId, usdz_url: null, scale_factor: 1, real_width_cm: 28, real_depth_cm: 28, real_height_cm: 6,
+      explode_animation: null, active: true,
+      components: [{ id: crypto.randomUUID(), label: 'Charque', detail: 'Desfiado', position: '0 0.03 0', normal: '0 1 0' }],
+    };
+    // Arquivo ainda só no aparelho: não sobe (o celular do cliente não abriria idb:).
+    ok(ar().saveArModel({ ...draft, glb_url: `idb:${crypto.randomUUID()}` }));
+    expect(st().outbox.some((e) => e.table === 'product_ar_models')).toBe(false);
+    // Depois do envio ao bucket, o link https sobe como INSERT.
+    const model = ok(ar().setArModelUrls(productId, { glb_url: `https://cloud.test/storage/v1/object/public/product-models/${TENANT}/m.glb`, usdz_url: null }));
+    ar().recordArEvent(productId, 'VIEW_3D', null);
+    ar().recordArEvent(productId, 'ADD_AFTER_VIEW', null);
+    await expectSynced('cardápio 3D');
+    expect(sql(`SELECT jsonb_array_length(components) || '/' || real_width_cm FROM product_ar_models WHERE id = '${model.id}'`)).toBe('1/28.0');
+    ok(ar().saveArModel({ ...draft, id: model.id, glb_url: model.glb_url, real_width_cm: 30 }));
+    await expectSynced('cardápio 3D editado');
+    expect(sql(`SELECT real_width_cm FROM product_ar_models WHERE id = '${model.id}'`)).toBe('30.0');
+
+    // Celular do cliente, sem login: registra pelo token do QR da mesa.
+    const token = sql(`SELECT qr_code_token FROM dining_tables WHERE tenant_id = '${TENANT}' AND kind = 'TABLE' AND qr_code_token IS NOT NULL LIMIT 1`);
+    expect(token).not.toBe('');
+    const track = (tok: string, kind: string) => psql(target!, `SET ROLE anon; SELECT tchefood_ar_track('${tok}', '${productId}', '${kind}');`, DB);
+    expect(track(token, 'AR_START').out).toMatch(/^[0-9a-f-]{36}$/);
+    expect(track('token-que-nao-existe', 'AR_START').out).toBe('');
+    expect(track(token, 'HACK').out).toBe('');
+    // anon não lê nem grava as tabelas direto.
+    expect(psql(target!, `SET ROLE anon; INSERT INTO ar_engagement_events (tenant_id, product_id, kind) VALUES ('${TENANT}', '${productId}', 'VIEW_3D');`, DB).ok).toBe(false);
+    expect(sql(`SELECT count(*) FROM ar_engagement_events WHERE product_id = '${productId}'`)).toBe('3');
+    // Métrica não se edita.
+    expect((await raw('PATCH', `ar_engagement_events?product_id=eq.${productId}`, { kind: 'AR_START' })).status).toBeGreaterThanOrEqual(400);
+    // Link que não é https (ex.: idb: forjado) é recusado pelo banco.
+    expect((await raw('POST', 'product_ar_models', { tenant_id: TENANT, product_id: productId, glb_url: 'idb:x', real_width_cm: 10, real_depth_cm: 10, real_height_cm: 1 })).status).toBeGreaterThanOrEqual(400);
   });
 
   it('travas: só o token do aparelho não grava equipe, permissão, desconto nem autorização', async () => {
