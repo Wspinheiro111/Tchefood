@@ -37,6 +37,8 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const [cashGiven, setCashGiven] = useState('');
   const [busy, setBusy] = useState(false);
   const [closedOrderId, setClosedOrderId] = useState<string | null>(null);
+  /** Cobrança com resultado incerto: bloqueia nova cobrança em maquininha até o operador conferir o extrato. */
+  const [reviewHold, setReviewHold] = useState<{ amount: number; reason: string; code: string } | null>(null);
 
   useEffect(() => {
     if (order && order.status === 'OPEN' && order.remaining_balance > 0) {
@@ -99,6 +101,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       return;
     }
 
+    if (reviewHold) return toast.error('Há uma cobrança sem confirmação. Confira o extrato da maquininha antes de cobrar de novo.');
     if (opMode === 'TEF_POS_WIRELESS' && (!terminal || !terminal.online)) return toast.error('Selecione uma maquininha online.');
     const driver = createDriver({ terminal: opMode === 'TEF_POS_WIRELESS' ? terminal : null, chassis: opMode === 'TEF_POS_WIRELESS' ? (terminal?.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE') : chassis, mode: opMode });
     const req: ChargeRequest = { request_id: uuid(), idempotency_key, amount, method, table_label: table.label, order_id: orderId, description };
@@ -106,6 +109,12 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     if (opMode === 'TEF_POS_WIRELESS') toast.info(`📡 Cobrança de ${formatBRL(amount)} enviada para ${terminal?.name} (${terminal?.serial_number}).`);
     try {
       const result = await driver.charge(req);
+      if (result.status === 'MANUAL_REVIEW') {
+        // Não registra pagamento nem recusa: o resultado é desconhecido e não pode ser repetido sozinho.
+        setReviewHold({ amount, reason: result.reason, code: result.failure_code });
+        toast.alert(`⚠️ ${result.reason}`);
+        return;
+      }
       if (result.status === 'DECLINED') {
         s.registerPayment({
           orderId, amount, method, status: 'DECLINED', terminal_id: result.terminal_id, acquirer: result.acquirer, acquirer_cnpj: null,
@@ -256,9 +265,17 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         </div>
       )}
 
+      {reviewHold && (
+        <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
+          <div className="mb-1 font-black text-ouro">Cobrança de {formatBRL(reviewHold.amount)} sem confirmação ({reviewHold.code})</div>
+          <p className="mb-3 text-slate-200">{reviewHold.reason} Se a maquininha mostra a transação aprovada, não cobre de novo: guarde o comprovante e chame o gerente. Se não houve cobrança, libere abaixo.</p>
+          <Btn variant="secondary" size="lg" onClick={() => setReviewHold(null)}>Conferi no extrato: não foi cobrado</Btn>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_2fr]">
         <Btn variant="secondary" size="lg" onClick={printPreview}>Prévia de conferência</Btn>
-        <Btn variant="success" size="lg" disabled={!amountValid || busy} onClick={charge}>
+        <Btn variant="success" size="lg" disabled={!amountValid || busy || (reviewHold !== null && method !== 'CASH')} onClick={charge}>
           {busy ? 'Aguardando maquininha…' : `${method === 'CASH' ? 'Receber' : opMode === 'TEF_POS_WIRELESS' ? 'Enviar para maquininha' : 'Cobrar na SmartPOS'} ${formatBRL(amount)}`}
         </Btn>
       </div>

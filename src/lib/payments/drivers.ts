@@ -10,6 +10,16 @@
 import { create } from 'zustand';
 import type { AcquirerType, OperationMode, PaymentMethod, PosTerminal } from '../../types';
 import { uuid } from '../ids';
+import {
+  IdempotencyRegistry,
+  SerialQueue,
+  classifyPlugPagResult,
+  manualReviewMessage,
+  missingApprovalProof,
+  parseCents,
+  terminalUserReference,
+  type PlugPagRawResult,
+} from './terminalGuard';
 
 export const ACQUIRER_CNPJ: Record<'STONE' | 'PAGBANK', string> = {
   STONE: '16501555000157',
@@ -50,7 +60,21 @@ export interface TerminalDeclined {
   terminal_id: string | null;
 }
 
-export type TerminalResult = TerminalApproved | TerminalDeclined;
+/**
+ * Resultado que não se pode afirmar nem como aprovado nem como recusado
+ * (SDK inconsistente, aprovação sem NSU/autorização, queda no meio). Não gera
+ * pagamento: o operador confere o extrato da maquininha antes de cobrar de novo.
+ */
+export interface TerminalManualReview {
+  status: 'MANUAL_REVIEW';
+  acquirer: AcquirerType;
+  reason: string;
+  failure_code: string;
+  terminal_serial: string;
+  terminal_id: string | null;
+}
+
+export type TerminalResult = TerminalApproved | TerminalDeclined | TerminalManualReview;
 
 export interface IPaymentTerminalDriver {
   readonly acquirer: AcquirerType;
@@ -232,10 +256,12 @@ export class StonePosDriver implements IPaymentTerminalDriver {
     const bridge = (window as unknown as { StoneBridge?: StoneBridge }).StoneBridge;
     if (this.mode === 'SMARTPOS_EMBEDDED' && bridge?.pay) {
       // Integração nativa: o app Android devolve o resultado via callback window.onStoneResult.
-      return new Promise<TerminalResult>((resolve) => {
-        (window as unknown as { onStoneResult?: (r: TerminalResult) => void }).onStoneResult = resolve;
-        bridge.pay?.(JSON.stringify({ deeplink: StonePosDriver.deepLink(req), ...req }));
-      });
+      return stoneQueue.run(() =>
+        new Promise<TerminalResult>((resolve) => {
+          (window as unknown as { onStoneResult?: (r: TerminalResult) => void }).onStoneResult = (r) => resolve(guardApproved(r, req));
+          bridge.pay?.(JSON.stringify({ deeplink: StonePosDriver.deepLink(req), ...req }));
+        }),
+      );
     }
     // TEF POS Sem Fio: em produção a cobrança vai para a fila do terminal
     // (serial STONE-01/02) via Stone Connect. Sem credenciais, o terminal
@@ -256,8 +282,11 @@ export class StonePosDriver implements IPaymentTerminalDriver {
 // PagBankPlugPagDriver — Moderninha Smart via window.PlugPagBridge
 // ---------------------------------------------------------------------------
 interface PlugPagBridge {
+  /** Recebe o JSON de PlugPagPaymentData e devolve o PlugPagTransactionResult cru (ver android/PlugPagJsBridge.java). */
   doPayment?: (json: string) => string;
-  printText?: (text: string) => void;
+  isServiceBusy?: () => boolean;
+  /** Devolve {"success":bool,"errorCode","message"}. Falha incerta não é reimpressa sozinha. */
+  printText?: (text: string) => string | void;
 }
 
 export class PagBankPlugPagDriver implements IPaymentTerminalDriver {
@@ -277,38 +306,80 @@ export class PagBankPlugPagDriver implements IPaymentTerminalDriver {
 
   async charge(req: ChargeRequest): Promise<TerminalResult> {
     const bridge = this.bridge();
-    if (bridge?.doPayment) {
-      // PlugPagPaymentData: type 1=crédito 2=débito 5=pix; amount em centavos.
-      const type = req.method === 'CREDIT' ? 1 : req.method === 'DEBIT' ? 2 : 5;
-      const raw = bridge.doPayment(
-        JSON.stringify({ type, amount: Math.round(req.amount * 100), installmentType: 1, installments: 1, userReference: req.idempotency_key.slice(0, 10) }),
-      );
-      const parsed = JSON.parse(raw) as { result: number; nsu?: string; autoCode?: string; cardBrand?: string; message?: string };
-      const serial = this.terminal?.serial_number ?? 'PAGBANK-EMBEDDED';
-      if (parsed.result !== 0) {
-        return { status: 'DECLINED', acquirer: 'PAGBANK', reason: parsed.message ?? 'Recusada', terminal_serial: serial, terminal_id: this.terminal?.id ?? null };
-      }
-      const brand = (parsed.cardBrand?.toUpperCase() as CardBrand | undefined) ?? (req.method === 'PIX' ? 'PIX' : 'VISA');
-      return {
-        status: 'APPROVED',
-        acquirer: 'PAGBANK',
-        acquirer_cnpj: ACQUIRER_CNPJ.PAGBANK,
-        card_brand: brand,
-        nsu: parsed.nsu ?? generateNsu(),
-        authorization_code: parsed.autoCode ?? generateAuthorizationCode(),
-        terminal_serial: serial,
-        terminal_id: this.terminal?.id ?? null,
-        masked_pan: null,
-        mode: this.mode,
-      };
-    }
-    return this.fallback.charge(req);
+    if (!bridge?.doPayment) return this.fallback.charge(req);
+    const doPayment = bridge.doPayment.bind(bridge);
+    const serial = this.terminal?.serial_number ?? 'PAGBANK-EMBEDDED';
+    const terminalId = this.terminal?.id ?? null;
+    const review = (code: string): TerminalManualReview => ({
+      status: 'MANUAL_REVIEW', acquirer: 'PAGBANK', reason: manualReviewMessage('PAGBANK', code), failure_code: code, terminal_serial: serial, terminal_id: terminalId,
+    });
+    return plugPagIdempotency.run(req.request_id, req, () =>
+      // Uma única operação bloqueante do PlugPag por vez (o SDK não aceita comandos concorrentes).
+      plugPagQueue.run(async (): Promise<TerminalResult> => {
+        if (bridge.isServiceBusy?.()) {
+          return { status: 'DECLINED', acquirer: 'PAGBANK', reason: 'Maquininha ocupada (SERVICE_BUSY). Aguarde e tente de novo.', terminal_serial: serial, terminal_id: terminalId };
+        }
+        const amountCents = Math.round(req.amount * 100);
+        const userReference = terminalUserReference(req.request_id);
+        // PlugPagPaymentData: type 1=crédito 2=débito 5=pix; amount em centavos; installmentType 1 = à vista.
+        const type = req.method === 'CREDIT' ? 1 : req.method === 'DEBIT' ? 2 : 5;
+        let raw: PlugPagRawResult;
+        try {
+          raw = JSON.parse(doPayment(JSON.stringify({ type, amount: amountCents, installmentType: 1, installments: 1, userReference }))) as PlugPagRawResult;
+        } catch {
+          // A cobrança pode ter passado antes da exceção: nunca repetir sozinho.
+          return review('WRAPPER_EXCEPTION');
+        }
+        const verdict = classifyPlugPagResult(raw);
+        if (verdict.status === 'MANUAL_REVIEW') return review(verdict.code);
+        if (verdict.status !== 'APPROVED') {
+          const reason = verdict.status === 'BUSY' ? 'Maquininha ocupada' : verdict.status === 'CANCELLED' ? 'Operação cancelada no terminal' : 'Recusada';
+          return { status: 'DECLINED', acquirer: 'PAGBANK', reason: `${verdict.message ?? reason} (${verdict.code})`, terminal_serial: serial, terminal_id: terminalId };
+        }
+        const missing = missingApprovalProof(
+          {
+            nsu: raw.hostNsu,
+            authorization_code: raw.autoCode,
+            terminal_serial: raw.terminalSerialNumber ?? serial,
+            paid_amount_cents: parseCents(raw.amount),
+            reference: raw.userReference ?? null,
+          },
+          { amount_cents: amountCents, reference: userReference },
+        );
+        if (missing) return review(missing);
+        const brandRaw = (raw.cardBrand ?? '').trim().toUpperCase();
+        const brand: CardBrand = req.method === 'PIX' ? 'PIX' : brandRaw.includes('MASTER') ? 'MASTERCARD' : brandRaw.includes('ELO') ? 'ELO' : brandRaw.includes('VISA') ? 'VISA' : (brandRaw as CardBrand);
+        return {
+          status: 'APPROVED',
+          acquirer: 'PAGBANK',
+          acquirer_cnpj: ACQUIRER_CNPJ.PAGBANK,
+          card_brand: brand,
+          nsu: (raw.hostNsu ?? '').trim(),
+          authorization_code: (raw.autoCode ?? '').trim(),
+          terminal_serial: (raw.terminalSerialNumber ?? serial).trim(),
+          terminal_id: terminalId,
+          masked_pan: null,
+          mode: this.mode,
+        };
+      }),
+      () => review('IDEMPOTENCY_CONFLICT'),
+    );
   }
 
   async print(lines: string[]): Promise<void> {
     const bridge = this.bridge();
     if (bridge?.printText) {
-      bridge.printText(lines.join('\n'));
+      const printText = bridge.printText.bind(bridge);
+      const raw = await plugPagQueue.run(async () => printText(lines.join('\n')));
+      if (typeof raw === 'string') {
+        let parsed: { success?: boolean; errorCode?: string | null; message?: string | null } = {};
+        try {
+          parsed = JSON.parse(raw) as typeof parsed;
+        } catch {
+          parsed = { success: false, errorCode: 'MALFORMED_RESPONSE' };
+        }
+        if (parsed.success !== true) throw new Error(`${parsed.message ?? 'Falha na impressão'} (${parsed.errorCode ?? 'PRINT_FAILED'})`);
+      }
       return;
     }
     return this.fallback.print(lines);
@@ -317,6 +388,30 @@ export class PagBankPlugPagDriver implements IPaymentTerminalDriver {
   abort(requestId: string): void {
     this.fallback.abort(requestId);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Regras comuns (portadas do Tchê Vendas)
+// ---------------------------------------------------------------------------
+const plugPagQueue = new SerialQueue();
+const stoneQueue = new SerialQueue();
+const plugPagIdempotency = new IdempotencyRegistry<ChargeRequest, TerminalResult>(
+  (r) => `${r.idempotency_key}|${Math.round(r.amount * 100)}|${r.method}|${r.order_id}`,
+);
+
+/** Aprovação vinda de SDK nativo sem NSU/autorização/serial vira revisão manual. */
+export function guardApproved(result: TerminalResult, req: ChargeRequest): TerminalResult {
+  if (result.status !== 'APPROVED') return result;
+  const missing = missingApprovalProof(result, { amount_cents: Math.round(req.amount * 100) });
+  if (!missing) return result;
+  return {
+    status: 'MANUAL_REVIEW',
+    acquirer: result.acquirer,
+    reason: manualReviewMessage(result.acquirer, missing),
+    failure_code: missing,
+    terminal_serial: result.terminal_serial,
+    terminal_id: result.terminal_id,
+  };
 }
 
 /** Fábrica: escolhe o driver certo para o terminal/modo selecionado. */

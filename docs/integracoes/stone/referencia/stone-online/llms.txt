@@ -1,0 +1,99 @@
+# Stone Online Documentation
+
+> Documentation for Stone Online
+
+## Docs: Introdução
+- [O que é a API Stone Online?](https://online.stone.com.br/docs/o-que-e-o-stone-online.md)
+- [Pré-requisitos](https://online.stone.com.br/docs/pré-requisitos-2.md)
+- [Processo de Integração](https://online.stone.com.br/docs/processo-de-integracao-1.md)
+- [Glossário Stone](https://online.stone.com.br/docs/glossário-stone.md)
+- [Documentação técnica](https://online.stone.com.br/docs/documentação-técnica.md)
+- [Bandeiras suportadas](https://online.stone.com.br/docs/bandeiras-suportadas.md)
+- [Códigos de retorno do Autorizador Stone](https://online.stone.com.br/docs/códigos-de-retorno-do-autorizador-stone.md)
+- [MCCs](https://online.stone.com.br/docs/mccs-1.md)
+
+## Docs: Transacional
+- [Conceito de cobranças](https://online.stone.com.br/docs/conceito-de-cobranças.md)
+- [Tipos de operações](https://online.stone.com.br/docs/fluxo-das-transacoes.md)
+- [Conceitos de Adquirência](https://online.stone.com.br/docs/conceitos-de-adquirência-1.md)
+- [Fluxo Operacional](https://online.stone.com.br/docs/fluxo-operacional.md)
+- [Modalidades e Tipos de Parcelamento](https://online.stone.com.br/docs/tipos-de-transações.md)
+
+## Docs: Funcionalidades
+- [3DS](https://online.stone.com.br/docs/3ds-1.md)
+  - [3DS Data Only](https://online.stone.com.br/docs/3ds-data-only.md)
+- [Card on File](https://online.stone.com.br/docs/card-on-file-1.md)
+- [DCC](https://online.stone.com.br/docs/dcc-1.md)
+- [E-Wallets](https://online.stone.com.br/docs/e-wallets.md)
+- [Parcelamento 18X](https://online.stone.com.br/docs/parcelamento-18x.md)
+- [Pré Autorização](https://online.stone.com.br/docs/pré-autorização-incompleta.md)
+- [Recorrência](https://online.stone.com.br/docs/recorrência-2.md)
+- [Tokenização](https://online.stone.com.br/docs/tokenização-1.md)
+
+## Docs: Dados regulatórios
+- [Limite de Retentivas](https://online.stone.com.br/docs/limite-de-retentivas.md)
+- [Custos de Registro nas Bandeiras](https://online.stone.com.br/docs/custos-de-registro-nas-bandeiras.md)
+- [Indicadores da Transação (MIT/CIT)](https://online.stone.com.br/docs/indicadores-da-transação.md)
+- Integração de Subadquirentes
+  - [Autorização de Subadquirentes com dados de sublojistas](https://online.stone.com.br/docs/indicador-de-subadquirente.md)
+  - [Regras de MCC para subadquirentes](https://online.stone.com.br/docs/regras-de-mcc-para-subadquirentes.md)
+
+## Docs: Quero ser Parceiro Stone
+- [Evolua ao nosso lado!](https://online.stone.com.br/docs/evolua-ao-nosso-lado.md)
+- [Precisa de ajuda?](https://online.stone.com.br/docs/precisa-de-ajuda.md)
+
+## API Reference: ESTRUTURA DA API
+- [Aviso](https://online.stone.com.br/reference/aviso.md)
+- [Overview da API](https://online.stone.com.br/reference/overview-da-api.md)
+- [Ambientes](https://online.stone.com.br/reference/ambientes.md)
+
+## API Reference: Autenticação
+- [Overview da Autenticação](https://online.stone.com.br/reference/overview-da-autenticação.md)
+
+## API Reference: Contratos
+- Cobranças
+  - [Autorização](https://online.stone.com.br/reference/post_charges.md): Criação de uma nova cobrança.
+  - [Consulta de transações](https://online.stone.com.br/reference/get_charges.md): Consulta (sonda) de Charges.<br> É obrigatório que ao menos um dos dois parâmetros de identificação da cobrança seja informado (`ids` ou `initiator_ids`).<br> Se os dois forem informados, será usado…
+  - [Captura posterior](https://online.stone.com.br/reference/post_charges-id-capture.md): Captura de uma charge autorizada.
+  - [Cancelamento](https://online.stone.com.br/reference/post_charges-cancel.md): Reversão ou Cancelamento de uma charge.<br> Pode ser utilizado o `id` ou o `initiator_id`.<br> Se os dois forem informados, será usado o `id`.
+- Cartões
+  - [Verificação de cartão](https://online.stone.com.br/reference/post_cards-verify.md): Validação de um novo cartão.
+- [Respostas de erro](https://online.stone.com.br/reference/respostas-de-erro.md)
+
+## API Reference: Produtos e Tipos de transação
+- Transações com cartão presente
+  - [Autorização EMV](https://online.stone.com.br/reference/autorização-emv.md)
+  - [Autorização Contactless](https://online.stone.com.br/reference/autorização-contactless.md)
+  - [Autorização Magstripe](https://online.stone.com.br/reference/autorização-megstripe.md)
+  - [Pré Autorização Magstripe](https://online.stone.com.br/reference/autorização-contactless-copy.md)
+  - [Autorização com dados de DCC](https://online.stone.com.br/reference/autorização-com-e-wallets-copy.md)
+- Transações de ecommerce
+  - [Autorização com captura automática](https://online.stone.com.br/reference/autorização-à-vista-com-captura-automática.md)
+  - [Autorização parcelada](https://online.stone.com.br/reference/autorização-parcelada.md)
+  - [Autorização voucher](https://online.stone.com.br/reference/autorização-voucher.md)
+  - [Autorização com dados de sublojistas](https://online.stone.com.br/reference/autorização-com-dados-de-subadquirente.md)
+  - [Autorização com credential on file](https://online.stone.com.br/reference/autorização-com-credential-on-file-copy.md)
+  - [Autorização com network token](https://online.stone.com.br/reference/autorização-com-dados-de-network-token.md)
+  - [Autorização com E-wallets](https://online.stone.com.br/reference/autorização-com-dados-de-e-wallets.md)
+  - [Autorização com dados de recorrência](https://online.stone.com.br/reference/autorização-com-recorrencia.md)
+  - [Autorização com dados de 3DS](https://online.stone.com.br/reference/3ds.md)
+  - [Autorização com dados de MIT/CIT](https://online.stone.com.br/reference/cit.md): Merchant Initiated Transaction/Cardholder Initiated Transaction
+  - [Pré autorização](https://online.stone.com.br/reference/pré-autorização.md)
+  - [Captura posterior](https://online.stone.com.br/reference/autorização-à-vista-com-captura-posterior.md)
+  - [Cancelamento](https://online.stone.com.br/reference/cancelamento-1.md)
+  - [Retentativa](https://online.stone.com.br/reference/retentativa.md)
+
+## API Reference: TESTE SUA INTEGRAÇÃO
+- [Cartões de Teste](https://online.stone.com.br/reference/cartões-de-teste.md)
+- [Retornos de Sandbox](https://online.stone.com.br/reference/retorno-do-sandbox-old.md)
+
+## API Reference: QUERO SER PARCEIRO STONE
+- [Evolua ao nosso lado!](https://online.stone.com.br/reference/evolua-ao-nosso-lado-ref.md)
+
+## Changelog
+- [Updates Versão 3.4](https://online.stone.com.br/changelog/updates-versão-34.md)
+- [Updates Versão 3.3](https://online.stone.com.br/changelog/updates-versão-33.md)
+- [Updates Versão 3.2](https://online.stone.com.br/changelog/updates-versão-32.md)
+- [Updates Versão 3.1](https://online.stone.com.br/changelog/updates-versão-31.md)
+- [Versão 3.0 do Stone Online](https://online.stone.com.br/changelog/versão-30-do-stone-online.md)
+- [Cartões de teste e novos códigos de retorno Sandbox](https://online.stone.com.br/changelog/cartões-de-teste-e-novos-códigos-de-retorno-sandbox.md)
