@@ -70,8 +70,11 @@ export interface NfceRepository {
   getDocument(tenantId: string, orderId: string): Promise<NfceDocumentRow | null>;
   /** INSERT em status processing; null se já existe documento da comanda (UNIQUE order_id). */
   insertProcessing(doc: NewNfceDocument): Promise<NfceDocumentRow | null>;
-  /** UPDATE ... SET status='processing' WHERE id=? AND status='rejected'; null se outra requisição venceu. */
-  claimRejected(id: string, payloadHash: string, payload: unknown): Promise<NfceDocumentRow | null>;
+  /**
+   * UPDATE ... SET status='processing', transmissions=expected+1 WHERE id=? AND status='rejected'
+   * AND transmissions=expected; null se outra requisição venceu. Cada tentativa tem número único.
+   */
+  claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown): Promise<NfceDocumentRow | null>;
   /**
    * UPDATE condicionado ao status E à tentativa (transmissions) lidos; null se mudou no meio.
    * Sem a tentativa, um GET atrasado da tentativa anterior gravaria "rejected" sobre um reenvio em curso.
@@ -279,7 +282,7 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
 
   if (doc) {
     // Rejeitada: a Focus aceita reenviar a mesma referência com o payload corrigido.
-    const claimed = await deps.repo.claimRejected(doc.id, payloadHash, payload);
+    const claimed = await deps.repo.claimRejected(doc.id, doc.transmissions, payloadHash, payload);
     if (!claimed) {
       const current = await deps.repo.getDocument(input.tenantId, input.orderId);
       return current ? respond(current, 'Outra solicitação já está emitindo esta NFC-e.') : failure(409, 'conflict', env, 'Documento NFC-e em disputa.');

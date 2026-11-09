@@ -79,14 +79,14 @@ export function supabaseNfceRepository(db: SupabaseLike): NfceRepository {
       return check(result, 'reservar o documento NFC-e');
     },
 
-    async claimRejected(id: string, payloadHash: string, payload: unknown): Promise<NfceDocumentRow | null> {
-      const current = check(await db.from('nfce_documents').select('transmissions').eq('id', id).maybeSingle(), 'ler tentativas');
+    async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown): Promise<NfceDocumentRow | null> {
       return check(
         await db
           .from('nfce_documents')
-          .update({ status: 'processing', payload_hash: payloadHash, payload, transmissions: Number(current?.transmissions ?? 0) + 1, sefaz_message: null })
+          .update({ status: 'processing', payload_hash: payloadHash, payload, transmissions: expectedTransmissions + 1, sefaz_message: null })
           .eq('id', id)
           .eq('status', 'rejected')
+          .eq('transmissions', expectedTransmissions)
           .select(DOC_COLUMNS)
           .maybeSingle(),
         'reservar o reenvio da NFC-e',

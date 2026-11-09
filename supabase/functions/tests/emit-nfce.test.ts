@@ -176,8 +176,8 @@ class MemoryRepo implements NfceRepository {
     this.doc = { id: 'd1', ...d, status: 'processing', access_key: null, protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, xml_path: null, sefaz_status: null, sefaz_message: null, offline_contingency: false, transmissions: 1 };
     return { ...this.doc };
   }
-  async claimRejected(id: string, payloadHash: string) {
-    if (!this.doc || this.doc.id !== id || this.doc.status !== 'rejected') return null;
+  async claimRejected(id: string, expectedTransmissions: number, payloadHash: string) {
+    if (!this.doc || this.doc.id !== id || this.doc.status !== 'rejected' || this.doc.transmissions !== expectedTransmissions) return null;
     this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1 };
     return { ...this.doc };
   }
@@ -313,10 +313,20 @@ describe('emitNfce', () => {
     const { focus } = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', mensagem_sefaz: 'NCM' } }]);
     await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
     const stale = { ...repo.doc! }; // leitura da tentativa 1
-    await repo.claimRejected(stale.id, 'h2'); // tentativa 2 em curso
+    await repo.claimRejected(stale.id, stale.transmissions, 'h2'); // tentativa 2 em curso
     const saved = await repo.saveProviderResult(stale.id, 'processing', stale.transmissions, { status: 'rejected' });
     expect(saved).toBeNull();
     expect(repo.doc?.status).toBe('processing');
+  });
+
+  it('reserva de reenvio com contador antigo não reutiliza o número da tentativa', async () => {
+    const repo = new MemoryRepo(source());
+    const { focus } = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', mensagem_sefaz: 'NCM' } }]);
+    await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    const read = repo.doc!.transmissions; // duas requisições leram a tentativa 1
+    expect(await repo.claimRejected('d1', read, 'a')).not.toBeNull();
+    repo.doc = { ...repo.doc!, status: 'rejected' }; // tentativa 2 rejeitada
+    expect(await repo.claimRejected('d1', read, 'b')).toBeNull();
   });
 
   it('nota em processamento cancelada na Focus é gravada como cancelada', async () => {
