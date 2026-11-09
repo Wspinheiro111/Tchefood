@@ -195,7 +195,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
                     <div className={`font-semibold ${i.status === 'CANCELED' ? 'line-through' : ''}`}>{i.quantity}x {s.products.find((p) => p.id === i.product_id)?.name}</div>
                     <Badge className={st.cls}>{st.label}</Badge>
                   </div>
-                  <span className="font-bold">{formatBRL(i.total_item_price)}</span>
+                  {i.combo_parent_item_id ? <span className="text-xs text-slate-500">no combo</span> : <span className="font-bold">{formatBRL(i.total_item_price)}</span>}
                 </div>
               );
             })}

@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
-import { Beer, CupSoda, Drumstick, Flame, IceCreamCone, Martini, Pizza, Scale, Utensils, UtensilsCrossed, type LucideIcon } from 'lucide-react';
+import { Beer, CupSoda, Drumstick, Flame, IceCreamCone, Martini, Package, Pizza, Scale, Utensils, UtensilsCrossed, type LucideIcon } from 'lucide-react';
 import { ArrowLeft, ChevronDown, ChevronUp, Minus, Plus, Search, Send, SlidersHorizontal, Trash2 } from 'lucide-react';
 import { useSalePrice } from '../lib/useSalePrice';
 import { useTcheStore } from '../store/useTcheStore';
@@ -20,7 +20,7 @@ export const SECTOR_LABEL: Record<ProductionSector, string> = {
   NONE: 'Sem preparo',
 };
 
-const CATEGORY_ICONS: Record<string, LucideIcon> = { Flame, UtensilsCrossed, Drumstick, Pizza, Beer, Martini, CupSoda, IceCreamCone, Scale };
+const CATEGORY_ICONS: Record<string, LucideIcon> = { Flame, UtensilsCrossed, Drumstick, Pizza, Beer, Martini, CupSoda, IceCreamCone, Scale, Package };
 
 export function CategoryIcon({ name, className }: { name: string | null; className?: string }) {
   const Cmp = (name && CATEGORY_ICONS[name]) || Utensils;

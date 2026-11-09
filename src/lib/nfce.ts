@@ -226,7 +226,8 @@ export function buildNfce(params: {
 }): NfceDocument | null {
   const { tenant, order } = params;
   if (!order.nfce_key) return null;
-  const items = params.items.filter((i) => i.order_id === order.id && i.status !== 'CANCELED');
+  // Componente de combo (preço zero) não é linha da nota: o combo é o item vendido.
+  const items = params.items.filter((i) => i.order_id === order.id && i.status !== 'CANCELED' && i.combo_parent_item_id == null);
   const payments = params.payments.filter((p) => p.order_id === order.id && p.status === 'APPROVED');
   const itemCents = items.map((i) => toCents(i.total_item_price));
   const otherShares = allocateCents(toCents(order.service_fee_amount), itemCents);

@@ -117,6 +117,13 @@ export interface Product {
   sold_by_weight: boolean;
   /** Tara padrão do prato/recipiente, em gramas. */
   tare_weight_grams: number;
+  // Combos (db/schema_combos.sql)
+  /**
+   * Combo: price é o preço do combo, e cada opção escolhida nos grupos do combo que
+   * aponta para um produto (ModifierOption.component_product_id) vira um item de
+   * produção à parte (preço zero, setor do componente), ligado ao item do combo.
+   */
+  is_combo: boolean;
 }
 
 export interface ModifierGroup {
@@ -135,6 +142,13 @@ export interface ModifierOption {
   additional_price: number;
   /** Volume servido por esta opção de tamanho (ex.: chopp 300/500/1000 ml). */
   volume_ml: number | null;
+  /**
+   * Combo: produto que esta opção coloca no pedido (ex.: "Refrigerante lata" no grupo
+   * "Bebida do combo"). Só vale em produto combo; additional_price é o acréscimo da troca.
+   */
+  component_product_id: UUID | null;
+  /** Quantas unidades do componente cada combo leva (inteiro, 1 a 20). */
+  component_quantity: number;
 }
 
 /**
@@ -265,6 +279,11 @@ export interface OrderItem {
   weight_source: WeightSource | null;
   /** Volume que cada unidade tira do barril (ml); null se não sai de torneira. */
   keg_volume_ml: number | null;
+  /**
+   * Combos: item de produção de um combo (preço zero) aponta para o item do combo,
+   * que leva o preço e vai para a NFC-e. null em item comum e no próprio combo.
+   */
+  combo_parent_item_id: UUID | null;
 }
 
 export type WeightSource = 'SCALE' | 'MANUAL';

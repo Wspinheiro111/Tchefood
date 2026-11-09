@@ -68,10 +68,13 @@ export function StatementPanel({ orderId, onCheckout }: { orderId: string; onChe
       )}
 
       <ul className="mb-4 space-y-2">
-        {items.map((it) => {
+        {items.filter((it) => it.combo_parent_item_id == null).map((it) => {
           const p = productOf(it.product_id);
           const st = ITEM_STATUS_STYLE[it.status];
           const canceled = it.status === 'CANCELED';
+          // Combo: a linha leva o preço; os itens dele (sem valor) aparecem embaixo, cada um na praça dele.
+          const parts = items.filter((c) => c.combo_parent_item_id === it.id);
+          const isCombo = parts.length > 0;
           return (
             <li key={it.id} className={`rounded-xl border p-3 ${canceled ? 'border-brasa/40 bg-brasa/5' : 'border-slate-200 bg-surface'}`}>
               <div className="flex items-start gap-2">
@@ -80,13 +83,40 @@ export function StatementPanel({ orderId, onCheckout }: { orderId: string; onChe
                     {formatQty(it.quantity, p?.unit)} {p?.name}
                   </div>
                   <div className="mt-1 flex flex-wrap gap-1">
-                    <Badge className={st.cls}>{st.label}</Badge>
-                    <Badge className="bg-slate-200 text-slate-800">{SECTOR_LABEL[it.sector]}</Badge>
+                    {isCombo ? (
+                      <Badge className="bg-ouro text-slate-950">Combo</Badge>
+                    ) : (
+                      <>
+                        <Badge className={st.cls}>{st.label}</Badge>
+                        <Badge className="bg-slate-200 text-slate-800">{SECTOR_LABEL[it.sector]}</Badge>
+                      </>
+                    )}
                     {it.meat_doneness && <Badge className="bg-rose-800 text-white">{it.meat_doneness}</Badge>}
                     {it.origin === 'QRCODE_TABLE' && <Badge className="bg-sky-600 text-white"><QrIcon className="h-3 w-3" /> QR Code</Badge>}
                     {it.is_paid && <Badge className="bg-stone text-white">Pago</Badge>}
                   </div>
                   {it.notes && <div className="mt-1 text-xs text-sky-600">{it.notes}</div>}
+                  {isCombo && (
+                    <ul className="mt-2 space-y-1 border-l-2 border-slate-300 pl-2">
+                      {parts.map((c) => {
+                        const cp = productOf(c.product_id);
+                        const cst = ITEM_STATUS_STYLE[c.status];
+                        return (
+                          <li key={c.id} className="flex flex-wrap items-center gap-1 text-sm">
+                            <span className={c.status === 'CANCELED' ? 'line-through opacity-60' : ''}>{formatQty(c.quantity, cp?.unit)} {cp?.name}</span>
+                            <Badge className={cst.cls}>{cst.label}</Badge>
+                            <Badge className="bg-slate-200 text-slate-800">{SECTOR_LABEL[c.sector]}</Badge>
+                            {c.meat_doneness && <Badge className="bg-rose-800 text-white">{c.meat_doneness}</Badge>}
+                            {!closed && c.status === 'READY' && (
+                              <button onClick={() => { const r = s.markItemDelivered(c.id); if (!r.ok) toast.error(r.error); }} className="inline-flex min-h-touch items-center gap-1 rounded-lg bg-stone px-2 text-xs font-bold text-white">
+                                <HandPlatter className="h-3 w-3" /> Entregar
+                              </button>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
                   <div className="mt-1 text-xs text-slate-500">
                     {new Date(it.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })} · {staffName(it.waiter_id)}
                   </div>
