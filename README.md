@@ -6,7 +6,7 @@ React 18 + TypeScript estrito + Vite + Tailwind + Zustand (persistência Indexed
 ```bash
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 109 testes: motor financeiro, anti-fraude, rachadinha, NFC-e, QR, ESC/POS, maquininhas, Stone Connect
+npm test           # motor financeiro, anti-fraude, rachadinha, NFC-e, QR, ESC/POS, maquininhas, Stone Connect, Etapa 0, Fase 5
 npm run build
 ```
 
@@ -32,6 +32,12 @@ npm run build
 8. **Emissão real de NFC-e (Supabase Edge Function + Focus NFe)** — `supabase/functions/emit-nfce`, regras portadas do Tchê Vendas. Detalhes abaixo.
 
 9. **Etapa 0 — Fundação: cadastros na tela e nuvem** (Retaguarda → Cardápio, Salão, Equipe, Loja, Nuvem). Detalhes abaixo.
+
+10. **Fase 5 — Balcão, buffet, chopp e cashback**
+   - **⚡ Ficha Rápida (Balcão & Eventos):** vende sem abrir mesa (mesa técnica `COUNTER`, sem os 10%), cobra na SmartPOS Stone/PagBank ou em dinheiro e só então imprime **uma ficha destacável por unidade** (nome em fonte gigante, data/hora, QR Code com token antifraude de 16 caracteres e dígito verificador). A aba *Validar retirada* aceita cada ficha uma única vez (“FICHA JÁ USADA às 21:14”); o item só conta como entregue quando todas as fichas dele são retiradas. Venda não paga só é cancelada com PIN de gerente.
+   - **⚖️ Buffet a Quilo:** botão na comanda, leitura de balança Toledo/Filizola (protocolo ENQ/STX…ETX pela Web Serial, ou simulador), tara por recipiente, preço do quilo vindo do cadastro (nunca do aparelho). Peso digitado fica marcado como `MANUAL`.
+   - **🍺 Monitor de barris:** cada chopp vendido baixa o nível pelo volume do tamanho (300/500 ml/1 L); cancelado antes de servir volta, depois de servir vira desperdício. Leitura real do barril gera o **Índice de Aproveitamento** e alerta vermelho quando o volume real diverge do faturado. Troca de barril com PIN de gerente e histórico. Tela *Chopp* (bar/caixa/gerência) e aba na Retaguarda.
+   - **🎁 CRM de cashback:** após o pagamento aprovado, WhatsApp do cliente com opt-in (LGPD), 5% sobre o consumo sem os 10%, válido do dia seguinte por 30 dias, resgate só de terça a quinta em até 50% da conta. Prévia da mensagem automática com o link da NFC-e e botão *Enviar no WhatsApp* (wa.me). Aba *Clientes & Cashback* na Retaguarda.
 
 ## Etapa 0: cadastros na tela e sincronização
 **Cardápio** — categorias, produtos (código único, preço com 2 casas, NCM/CFOP/CSOSN validados), grupos de adicionais e opções, vínculo produto ↔ adicionais em ordem, **preço por dia/horário** (happy hour; janela que vira a meia-noite; duas regras do mesmo produto não podem se sobrepor) e **esgotado** em um toque, também no KDS para a cozinha.
@@ -78,8 +84,14 @@ supabase functions deploy emit-nfce
 
 **Autorização de gerente no Supabase:** o cliente não grava a prova da autorização. Antes de cancelar item, tirar os 10% ou dar desconto, a sincronização chama a RPC `tchefood_authorize_manager(order_id, action_type, pin, performed_by, reason, ...)`, que confere o PIN no banco (bloqueia após 3 erros em 60s) e grava o `audit_log`. Os papéis `anon`/`authenticated` não leem `pin_code`, não alteram `staff_users` e não conseguem inserir `audit_logs` com gerente. O cadastro de equipe é feito com `service_role`, e o login por PIN no servidor ainda precisa de uma RPC própria.
 
+`db/schema_expansion.sql` (aplicar depois do `schema.sql`, idempotente) traz a Fase 5: venda por peso, barris (`keg_taps`, `keg_tap_products`, `keg_history`), fichas (`event_tickets` + `tchefood_redeem_ticket`), fidelidade (`loyalty_customers`, `cashback_ledger`, `tchefood_redeem_cashback`). O cabeçalho do arquivo lista as correções feitas sobre o rascunho original. Os cenários estão em `db/tests/fase5_cenarios.sql`.
+
 ## O que ainda é simulado
 - Stone Connect / PlugPag: sem credenciais, as cobranças caem no simulador visual (`MockTerminalDriver`). Com `window.StoneBridge`/`window.PlugPagBridge` presentes, os drivers usam o hardware. O cliente Stone Connect 2.0 está pronto em `server/`, mas falta o servidor (rotas de cobrança e webhook) e a credencial de parceiro.
 - NFC-e: o app ainda gera payload e DANFE localmente em **homologação**; a emissão real está pronta em `supabase/functions/emit-nfce`, mas as telas ainda não chamam a função e ela precisa do token Focus, certificado A1 e CSC cadastrados na Focus.
+- Balança: a leitura pela Web Serial segue o protocolo Toledo/Filizola, mas não foi testada numa balança física; sem cabo, use o simulador ou o peso digitado.
+- Barril: a leitura real é digitada (balança de barril ou medidor de vazão); não há integração com medidor físico.
+- Fichas: o QR Code sai no simulador de bobina; na impressora real o comando de QR do ESC/POS ainda precisa ser ligado ao layout da ficha.
+- Cashback no WhatsApp: a mensagem abre pronta pelo link wa.me; o envio automático depende de um provedor da API oficial.
 - Alerta de WhatsApp: registrado (`whatsapp_alert_sent = true`) e pré-visualizado; o disparo real depende de um provedor.
 - Supabase: a fila `outbox` sobe para o Supabase depois que o aparelho entra na aba Nuvem; sem conta conectada, os eventos ficam no IndexedDB. Ainda não há download (pull) da nuvem para um aparelho novo.

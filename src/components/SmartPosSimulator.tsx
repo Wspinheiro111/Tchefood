@@ -24,10 +24,11 @@ const CHASSIS_STYLE: Record<Chassis, { body: string; accent: string; brand: stri
 type Step = 'card' | 'reading' | 'pin' | 'decide' | 'processing' | 'pix';
 
 /** Papel da bobina térmica de 58mm com animação de impressão. */
-export function ThermalPaper({ job, onTear, qr, footer }: { job: Pick<PrintJob, 'lines' | 'title'>; onTear?: () => void; qr?: string; footer?: string[] }) {
+export function ThermalPaper({ job, onTear, qr, footer }: { job: Pick<PrintJob, 'lines' | 'title' | 'headline'>; onTear?: () => void; qr?: string; footer?: string[] }) {
   return (
     <div className="flex flex-col items-center">
       <div className="animate-print receipt rounded-b-md px-2 pb-2 pt-3 shadow-lg">
+        {job.headline && <div className="mb-1 max-w-[190px] break-words text-center font-mono text-2xl font-black uppercase leading-tight">{job.headline}</div>}
         <pre className="whitespace-pre text-left text-[9.5px] leading-[12px]">{job.lines.join('\n')}</pre>
         {qr && (
           <div className="mt-2 flex justify-center">

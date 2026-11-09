@@ -139,6 +139,8 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   DISCOUNT_APPLIED: 'Desconto aplicado',
   MANAGER_PIN_FAILED: 'PIN de gerente incorreto',
   MANAGER_PIN_LOCKOUT: 'PIN bloqueado (3 erros)',
+  KEG_CHANGED: 'Troca de barril de chopp',
+  CASHBACK_REDEEMED: 'Cashback resgatado',
   PRODUCT_PRICE_CHANGED: 'Preço alterado no cadastro',
   STAFF_CREATED: 'Pessoa cadastrada na equipe',
   STAFF_PIN_CHANGED: 'PIN trocado',

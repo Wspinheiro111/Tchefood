@@ -107,6 +107,8 @@ export interface PrintJob {
   title: string;
   lines: string[];
   chassis: Chassis;
+  /** Linha em fonte gigante no topo (ex.: nome do item na ficha de evento). */
+  headline?: string;
   /** QR Code impresso ao final (DANFE NFC-e). */
   qr?: string;
   /** Linhas após o QR Code. */

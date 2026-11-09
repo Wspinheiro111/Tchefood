@@ -61,7 +61,9 @@ export function validateCategory(c: Pick<Category, 'id' | 'name' | 'sort_order'>
 // ---------------------------------------------------------------------------
 // PRODUTOS
 // ---------------------------------------------------------------------------
-export type ProductDraft = Omit<Product, 'tenant_id' | 'created_at'>;
+/** Campos da Fase 5 (balança, CMV) são opcionais no cadastro: sem eles, o produto mantém o que já tinha. */
+type Fase5ProductFields = 'sold_by_weight' | 'tare_weight_grams' | 'cost_price';
+export type ProductDraft = Omit<Product, 'tenant_id' | 'created_at' | Fase5ProductFields> & Partial<Pick<Product, Fase5ProductFields>>;
 
 export function validateProduct(p: ProductDraft, products: Product[], categories: Category[]): Check {
   const code = p.code.trim();

@@ -120,6 +120,12 @@ export function applyOrderTotals(
   return { ...order, ...computeOrderTotals(order, items, payments) };
 }
 
+/** "2x" para unidades; "0,365 kg" para itens pesados (unit = KG). */
+export function formatQty(quantity: number, unit: string | null | undefined): string {
+  if (unit === 'KG') return `${round3(quantity).toLocaleString('pt-BR', { minimumFractionDigits: 3, maximumFractionDigits: 3 })} kg`;
+  return `${quantity}x`;
+}
+
 const brl = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
 
 export function formatBRL(value: number): string {

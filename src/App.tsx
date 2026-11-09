@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { BarChart3, ChefHat, CloudOff, Flame, LayoutGrid, LogOut, QrCode as QrIcon, RefreshCw, Smartphone } from 'lucide-react';
+import { BarChart3, Beer, ChefHat, CloudOff, Flame, LayoutGrid, LogOut, QrCode as QrIcon, RefreshCw, Smartphone, Ticket } from 'lucide-react';
 import { selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
 import { useTerminalBus } from './lib/payments/drivers';
@@ -10,6 +10,8 @@ import { CheckoutScreen } from './screens/CheckoutScreen';
 import { KdsScreen } from './screens/KdsScreen';
 import { QrMenuScreen } from './screens/QrMenuScreen';
 import { BackOffice, useBackOfficeTabs } from './screens/BackOffice';
+import { FichaRapidaScreen } from './screens/FichaRapidaScreen';
+import { KegMonitorScreen } from './screens/KegMonitorScreen';
 import { useCloudSync } from './lib/sync/useCloudSync';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
 import { PrintSimulatorModal } from './components/PrintSimulator';
@@ -22,13 +24,17 @@ type View =
   | { name: 'checkout'; orderId: string }
   | { name: 'kds' }
   | { name: 'qr' }
+  | { name: 'ficha' }
+  | { name: 'chopp' }
   | { name: 'backoffice' };
 
-type NavKey = 'map' | 'kds' | 'qr' | 'backoffice';
+type NavKey = 'map' | 'kds' | 'ficha' | 'chopp' | 'qr' | 'backoffice';
 
 const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: UserRole[] }> = [
   { key: 'map', label: 'Mesas', icon: LayoutGrid, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
   { key: 'kds', label: 'KDS', icon: ChefHat, roles: ['KITCHEN', 'MANAGER', 'OWNER'] },
+  { key: 'ficha', label: 'Ficha Rápida', icon: Ticket, roles: ['WAITER', 'CASHIER', 'MANAGER', 'OWNER'] },
+  { key: 'chopp', label: 'Chopp', icon: Beer, roles: ['KITCHEN', 'CASHIER', 'MANAGER', 'OWNER'] },
   { key: 'qr', label: 'QR Cliente', icon: QrIcon, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
   // Retaguarda: aparece para quem tem ao menos uma aba liberada (perfil ou permissão).
   { key: 'backoffice', label: 'Retaguarda', icon: BarChart3, roles: [] },
@@ -105,6 +111,8 @@ export default function App() {
         )}
         {view.name === 'kds' && <KdsScreen />}
         {view.name === 'qr' && <QrMenuScreen />}
+        {view.name === 'ficha' && <FichaRapidaScreen />}
+        {view.name === 'chopp' && <KegMonitorScreen />}
         {view.name === 'backoffice' && <BackOffice />}
       </main>
 

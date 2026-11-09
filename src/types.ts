@@ -101,6 +101,13 @@ export interface Product {
   /** Etapa 0: produto com venda nunca é apagado, só desativado (some do cardápio). */
   active: boolean;
   created_at: ISODateTime;
+  // Fase 5 (schema_expansion.sql)
+  /** Buffet a quilo: price é o preço do KG e a quantidade vem da balança. */
+  sold_by_weight: boolean;
+  /** Tara padrão do prato/recipiente, em gramas. */
+  tare_weight_grams: number;
+  /** Custo unitário (CMV / ficha técnica). */
+  cost_price: number;
 }
 
 export interface ModifierGroup {
@@ -117,6 +124,8 @@ export interface ModifierOption {
   group_id: UUID;
   name: string;
   additional_price: number;
+  /** Volume servido por esta opção de tamanho (ex.: chopp 300/500/1000 ml). */
+  volume_ml: number | null;
 }
 
 /**
@@ -144,6 +153,8 @@ export interface DiningTable {
   /** Etapa 0: mesa desativada some do mapa; só mesa livre pode ser desativada. */
   active: boolean;
   updated_at: ISODateTime;
+  /** COUNTER = mesa técnica da venda de balcão/eventos (nunca ocupada, fora do mapa). */
+  kind: DiningTableKind;
 }
 
 /**
@@ -181,6 +192,8 @@ export interface RolePermission {
   allowed: boolean;
   updated_at: ISODateTime;
 }
+
+export type DiningTableKind = 'TABLE' | 'COUNTER';
 
 export interface Order {
   id: UUID;
@@ -224,7 +237,16 @@ export interface OrderItem {
   canceled_at: ISODateTime | null;
   canceled_by_user_id: UUID | null;
   cancel_reason: string | null;
+  // Fase 5 (schema_expansion.sql)
+  /** Leitura bruta da balança (gramas). Só em produtos sold_by_weight. */
+  weight_gross_grams: number | null;
+  weight_tare_grams: number | null;
+  weight_source: WeightSource | null;
+  /** Volume que cada unidade tira do barril (ml); null se não sai de torneira. */
+  keg_volume_ml: number | null;
 }
+
+export type WeightSource = 'SCALE' | 'MANUAL';
 
 export interface Payment {
   id: UUID;
@@ -254,6 +276,8 @@ export type AuditActionType =
   | 'DISCOUNT_APPLIED'
   | 'MANAGER_PIN_FAILED'
   | 'MANAGER_PIN_LOCKOUT'
+  | 'KEG_CHANGED'
+  | 'CASHBACK_REDEEMED'
   // Etapa 0 — cadastros
   | 'PRODUCT_PRICE_CHANGED'
   | 'STAFF_CREATED'
@@ -275,6 +299,105 @@ export interface AuditLog {
   reason: string;
   whatsapp_alert_sent: boolean;
   metadata: Record<string, unknown> | null;
+  created_at: ISODateTime;
+}
+
+// ---------------------------------------------------------------------------
+// FASE 5 — EXPANSÃO ENTERPRISE (db/schema_expansion.sql)
+// ---------------------------------------------------------------------------
+
+export interface KegTap {
+  id: UUID;
+  tenant_id: UUID;
+  tap_number: number;
+  beer_name: string;
+  total_capacity_ml: number;
+  /** Faturado no caixa desde o engate (sem teto: passar da capacidade é alerta). */
+  billed_volume_ml: number;
+  /** Sangria, espuma e chopp servido e cancelado. */
+  wasted_foam_ml: number;
+  /** Coluna gerada: max(capacidade − faturado − desperdício, 0). */
+  remaining_volume_ml: number;
+  measured_remaining_ml: number | null;
+  measured_at: ISODateTime | null;
+  keg_cost: number;
+  active: boolean;
+  tapped_at: ISODateTime;
+}
+
+export interface KegTapProduct {
+  tap_id: UUID;
+  product_id: UUID;
+  pour_ml: number;
+}
+
+export interface KegHistory {
+  id: UUID;
+  tenant_id: UUID;
+  tap_id: UUID;
+  tap_number: number;
+  beer_name: string;
+  total_capacity_ml: number;
+  billed_volume_ml: number;
+  wasted_foam_ml: number;
+  measured_remaining_ml: number | null;
+  keg_cost: number;
+  tapped_at: ISODateTime;
+  kicked_at: ISODateTime;
+  kicked_by_user_id: UUID;
+  authorized_by_manager_id: UUID;
+}
+
+export interface EventTicket {
+  id: UUID;
+  tenant_id: UUID;
+  order_id: UUID;
+  order_item_id: UUID;
+  payment_id: UUID | null;
+  product_id: UUID;
+  product_name_snapshot: string;
+  unit_price: number;
+  ticket_seq: number;
+  barcode_token: string;
+  redeemed: boolean;
+  redeemed_at: ISODateTime | null;
+  redeemed_by_user_id: UUID | null;
+  voided_at: ISODateTime | null;
+  voided_reason: string | null;
+  created_at: ISODateTime;
+}
+
+export interface LoyaltyCustomer {
+  id: UUID;
+  tenant_id: UUID;
+  name: string | null;
+  /** 55 + DDD + número, só dígitos (ex.: 5555999991234). */
+  phone_whatsapp: string;
+  cpf: string | null;
+  whatsapp_opt_in: boolean;
+  opt_in_at: ISODateTime | null;
+  cashback_balance: number;
+  total_spent: number;
+  visits_count: number;
+  last_visit_at: ISODateTime | null;
+  created_at: ISODateTime;
+}
+
+export type CashbackEntryType = 'EARN' | 'REDEEM' | 'EXPIRE';
+
+export interface CashbackLedgerEntry {
+  id: UUID;
+  tenant_id: UUID;
+  customer_id: UUID;
+  order_id: UUID | null;
+  entry_type: CashbackEntryType;
+  amount: number;
+  remaining_amount: number;
+  base_amount: number | null;
+  pct: number | null;
+  valid_from: ISODateTime | null;
+  expires_at: ISODateTime | null;
+  created_by_user_id: UUID | null;
   created_at: ISODateTime;
 }
 
@@ -313,6 +436,8 @@ export interface TrayItem {
   free_notes: string;
   sector: ProductionSector;
   added_at: ISODateTime;
+  /** Leitura da balança (buffet a quilo). */
+  weight?: { gross_grams: number; tare_grams: number; source: WeightSource } | null;
 }
 
 /** Evento da fila offline-first, pronto para ser enviado ao Supabase. */
@@ -324,6 +449,11 @@ export interface SyncEvent {
     | 'dining_tables'
     | 'audit_logs'
     | 'payments'
+    | 'keg_taps'
+    | 'keg_history'
+    | 'event_tickets'
+    | 'loyalty_customers'
+    | 'cashback_ledger'
     // Etapa 0 — cadastros
     | 'tenants'
     | 'staff_users'

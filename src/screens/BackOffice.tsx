@@ -1,18 +1,21 @@
 import { useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { AlertTriangle, BarChart3, Cloud, FileText, LayoutGrid, MessageCircle, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
+import { AlertTriangle, BarChart3, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
 import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { formatBRL } from '../lib/money';
+import { kegStatus } from '../lib/kegs';
 import { AUDIT_LABEL, reconciliation, shiftKpis, shiftStart, waiterSplit, whatsappAlertText } from '../lib/reports';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
+import { CrmPanel } from './CrmPanel';
+import { KegMonitorScreen } from './KegMonitorScreen';
 import { MenuAdmin } from './admin/MenuAdmin';
 import { StaffAdmin, TablesAdmin } from './admin/TablesStaffAdmin';
 import { CloudAdmin, StoreAdmin } from './admin/StoreCloudAdmin';
 import type { Permission } from '../types';
 
-type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'nfce' | 'menu' | 'tables' | 'staff' | 'store' | 'cloud' | 'printers' | 'config';
+type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 'nfce' | 'menu' | 'tables' | 'staff' | 'store' | 'cloud' | 'printers' | 'config';
 
 /**
  * Abas da retaguarda. As de relatório seguem o perfil (gerente, proprietário, caixa);
@@ -23,6 +26,8 @@ const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3; needs: 'rep
   { key: 'recon', label: 'Conciliação', icon: Receipt, needs: 'reports' },
   { key: 'waiters', label: 'Rateio 10%', icon: Users, needs: 'reports' },
   { key: 'audit', label: 'Anti-Fraude', icon: ShieldAlert, needs: 'reports' },
+  { key: 'chopp', label: 'Barris de chopp', icon: Beer, needs: 'reports' },
+  { key: 'crm', label: 'Clientes & Cashback', icon: Gift, needs: 'reports' },
   { key: 'nfce', label: 'NFC-e', icon: FileText, needs: 'reports' },
   { key: 'menu', label: 'Cardápio', icon: UtensilsCrossed, needs: ['MENU_MANAGE', 'MENU_AVAILABILITY'] },
   { key: 'tables', label: 'Salão', icon: LayoutGrid, needs: 'TABLES_MANAGE' },
@@ -60,6 +65,8 @@ export function BackOffice() {
   const [picked, setTab] = useState<Tab>('dash');
   const tab: Tab | undefined = tabs.some((t) => t.key === picked) ? picked : tabs[0]?.key;
   const alerts = useTcheStore((s) => s.auditLogs.filter((l) => l.whatsapp_alert_sent).length);
+  const kegTaps = useTcheStore((s) => s.kegTaps);
+  const kegAlerts = useMemo(() => kegTaps.filter((t) => t.active && kegStatus(t).alert === 'CRITICAL').length, [kegTaps]);
   if (!tab) return <p className="p-6">Acesso restrito.</p>;
   return (
     <div className="mx-auto max-w-6xl px-3 pb-10 pt-3">
@@ -68,6 +75,7 @@ export function BackOffice() {
           <button key={t.key} onClick={() => setTab(t.key)} className={`flex min-h-touch shrink-0 items-center gap-2 rounded-xl px-4 font-bold ${tab === t.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}>
             <t.icon className="h-4 w-4" /> {t.label}
             {t.key === 'audit' && alerts > 0 && <span className="rounded-full bg-brasa px-2 text-xs text-white">{alerts}</span>}
+            {t.key === 'chopp' && kegAlerts > 0 && <span className="rounded-full bg-rose-600 px-2 text-xs text-white">{kegAlerts}</span>}
           </button>
         ))}
       </div>
@@ -75,6 +83,8 @@ export function BackOffice() {
       {tab === 'recon' && <Reconciliation />}
       {tab === 'waiters' && <WaiterSplit />}
       {tab === 'audit' && <AuditCenter />}
+      {tab === 'chopp' && <KegMonitorScreen compact />}
+      {tab === 'crm' && <CrmPanel />}
       {tab === 'nfce' && <NfceList />}
       {tab === 'menu' && <MenuAdmin />}
       {tab === 'tables' && <TablesAdmin />}

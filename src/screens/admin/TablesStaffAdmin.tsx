@@ -13,7 +13,9 @@ import { Field, FormError, Panel, Select, TextInput, Toggle, parseIntInput } fro
 // SALÃO
 // ---------------------------------------------------------------------------
 export function TablesAdmin() {
-  const tables = useTcheStore((s) => s.tables);
+  const allTables = useTcheStore((s) => s.tables);
+  // O balcão da Ficha Rápida é uma mesa técnica: não aparece no cadastro do salão.
+  const tables = allTables.filter((t) => t.kind === 'TABLE');
   const [editing, setEditing] = useState<DiningTable | 'new' | null>(null);
   const areas = Array.from(new Set(tables.map((t) => t.area)));
   const nextNumber = Math.max(0, ...tables.map((t) => t.number)) + 1;

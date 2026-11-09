@@ -17,7 +17,9 @@ const STATUS_STYLE: Record<TableStatus, { card: string; label: string; dot: stri
 
 
 export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => void }) {
-  const tables = useTcheStore((s) => s.tables);
+  // A mesa técnica do balcão (Ficha Rápida) não aparece no mapa.
+  const allTables = useTcheStore((s) => s.tables);
+  const tables = useMemo(() => allTables.filter((t) => t.kind === 'TABLE'), [allTables]);
   const orders = useTcheStore((s) => s.orders);
   const orderItems = useTcheStore((s) => s.orderItems);
   const releaseTable = useTcheStore((s) => s.releaseTable);

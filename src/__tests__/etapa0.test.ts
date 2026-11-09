@@ -316,7 +316,9 @@ describe('loja nova', () => {
     // Id novo por loja: o mesmo id da demonstração colidiria entre lojas na nuvem.
     expect(st().terminals.some((t) => seedTerminalIds.includes(t.id))).toBe(false);
     const terms = st().terminals.length;
-    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', 'staff_users', ...Array(terms).fill('pos_terminals'), 'audit_logs']);
+    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', 'staff_users', ...Array(terms).fill('pos_terminals'), 'dining_tables', 'audit_logs']);
+    // A loja nova já nasce com o balcão da Ficha Rápida.
+    expect(st().tables.map((t) => t.kind)).toEqual(['COUNTER']);
     st().logout();
     expect(st().login('4826').ok).toBe(true);
   });
@@ -334,12 +336,32 @@ describe('migração do armazenamento local', () => {
   it('v1 ganha active e listas novas sem perder dados', () => {
     const v1 = { products: [{ id: 'p', price: 10 }], tables: [{ id: 't' }], orders: [{ id: 'o' }] };
     const v2 = migratePersisted(v1, 1) as Record<string, unknown>;
-    expect(v2.products).toEqual([{ id: 'p', price: 10, active: true }]);
-    expect(v2.tables).toEqual([{ id: 't', active: true }]);
+    expect(v2.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0 }]);
+    expect(v2.tables).toEqual([{ id: 't', active: true, kind: 'TABLE' }]);
     expect(v2.orders).toEqual([{ id: 'o' }]);
     expect(v2.priceSchedules).toEqual([]);
     expect(v2.rolePermissions).toEqual([]);
     expect(v2.cloud).toBeNull();
+  });
+
+  it('v2 (Etapa 0) ganha os campos da Fase 5 e o balcão sem apagar a loja', () => {
+    const v2 = {
+      tenant: { id: 'loja' },
+      products: [{ id: 'p', price: 10, active: true }],
+      tables: [{ id: 't', tenant_id: 'loja', active: true }],
+      orderItems: [{ id: 'i' }],
+      orders: [{ id: 'o' }],
+    };
+    const v3 = migratePersisted(v2, 2) as Record<string, unknown>;
+    expect(v3.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0 }]);
+    const tables = v3.tables as Array<{ id: string; kind: string; tenant_id: string }>;
+    expect(tables[0]).toMatchObject({ id: 't', kind: 'TABLE' });
+    expect(tables.filter((t) => t.kind === 'COUNTER')).toHaveLength(1);
+    expect(tables[1]!.tenant_id).toBe('loja');
+    expect(v3.orderItems).toEqual([{ id: 'i', weight_gross_grams: null, weight_tare_grams: null, weight_source: null, keg_volume_ml: null }]);
+    expect(v3.orders).toEqual([{ id: 'o' }]);
+    expect(v3.kegTaps).toEqual([]);
+    expect(v3.cashbackLedger).toEqual([]);
   });
 });
 
