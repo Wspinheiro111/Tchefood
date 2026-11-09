@@ -93,6 +93,7 @@ export class DeliveryInbox {
   private readonly now: () => Date;
   // Um ciclo por app por vez: polling sobreposto confirmaria eventos em dobro.
   private readonly running = new Set<DeliveryChannelKey>();
+  private readonly orderLocks = new Map<string, Promise<void>>();
 
   constructor(private readonly options: DeliveryInboxOptions) {
     for (const adapter of options.adapters) {
@@ -159,10 +160,9 @@ export class DeliveryInbox {
       throw new DeliveryMarketplaceError(channel, "conflict", `Ação "${action}" não é permitida com o pedido em "${record.order.status}".`);
     }
     await adapter.performAction(externalOrderId, action);
-    // O status oficial chega pelo evento do app; aqui só registramos a tentativa para a tela.
-    record.updatedAt = this.now().toISOString();
-    await this.options.repository.saveOrder(record);
-    return record;
+    // O status oficial chega pelo evento do app; nada é gravado aqui, para que a resposta da ação nunca
+    // sobrescreva um evento processado pelo polling enquanto a chamada estava em andamento.
+    return this.requireOrder(channel, externalOrderId);
   }
 
   async listCancellationReasons(channel: DeliveryChannelKey, externalOrderId: string): Promise<DeliveryCancellationReason[]> {
@@ -181,13 +181,37 @@ export class DeliveryInbox {
       throw new DeliveryMarketplaceError(channel, "conflict", "Pedido já finalizado não pode ser cancelado.");
     }
     await adapter.requestCancellation(externalOrderId, reason, details);
-    record.cancellationPending = true;
-    record.updatedAt = this.now().toISOString();
-    await this.options.repository.saveOrder(record);
-    return record;
+    // Relê o pedido depois da resposta: o polling pode ter gravado eventos (até o próprio cancelamento) enquanto
+    // a chamada estava em andamento, e a foto lida antes não pode sobrescrever isso.
+    return this.withOrderLock(channel, externalOrderId, async () => {
+      const latest = await this.requireOrder(channel, externalOrderId);
+      if (latest.order.status !== "cancelled" && latest.order.status !== "concluded") {
+        latest.cancellationPending = true;
+        latest.updatedAt = this.now().toISOString();
+        await this.options.repository.saveOrder(latest);
+      }
+      return latest;
+    });
   }
 
   // -------------------------------------------------------------------------
+
+  // Serializa leitura-alteração-gravação de um mesmo pedido dentro deste processo.
+  private async withOrderLock<T>(channel: DeliveryChannelKey, externalOrderId: string, work: () => Promise<T>): Promise<T> {
+    const key = `${channel}:${externalOrderId}`;
+    const previous = this.orderLocks.get(key) ?? Promise.resolve();
+    const run = previous.then(work, work);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.orderLocks.set(key, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.orderLocks.get(key) === tail) this.orderLocks.delete(key);
+    }
+  }
 
   private adapter(channel: DeliveryChannelKey): DeliveryMarketplaceAdapter {
     const adapter = this.adapters.get(channel);
@@ -202,6 +226,13 @@ export class DeliveryInbox {
   }
 
   private async applyEvent(
+    adapter: DeliveryMarketplaceAdapter,
+    event: DeliveryEvent,
+  ): Promise<"duplicate" | "new_order" | "updated"> {
+    return this.withOrderLock(event.channel, event.externalOrderId, () => this.applyEventLocked(adapter, event));
+  }
+
+  private async applyEventLocked(
     adapter: DeliveryMarketplaceAdapter,
     event: DeliveryEvent,
   ): Promise<"duplicate" | "new_order" | "updated"> {

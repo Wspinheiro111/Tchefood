@@ -159,6 +159,36 @@ describe("caixa de entrada de delivery", () => {
     expect(onNewOrder).toHaveBeenCalledOnce();
   });
 
+  it("resposta de ação que chega depois do polling não volta o status do pedido", async () => {
+    const { sandbox, api, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const original = api.performAction.bind(api);
+    // O iFood confirma, o polling grava o CFM, e só então a resposta da ação volta.
+    vi.spyOn(api, "performAction").mockImplementation(async (orderId, action) => {
+      await original(orderId, action);
+      await inbox.runCycle();
+    });
+    await inbox.performAction("ifood", id, "confirm");
+    const [record] = await inbox.listOrders();
+    expect(record.order.status).toBe("confirmed");
+  });
+
+  it("cancelamento confirmado pelo polling durante a chamada não fica como pendente", async () => {
+    const { sandbox, api, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const original = api.requestCancellation.bind(api);
+    vi.spyOn(api, "requestCancellation").mockImplementation(async (orderId, reason, details) => {
+      await original(orderId, reason, details);
+      await inbox.runCycle();
+    });
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    const result = await inbox.requestCancellation("ifood", id, reason);
+    expect(result.order.status).toBe("cancelled");
+    expect(result.cancellationPending).toBe(false);
+  });
+
   it("app fora do ar não derruba o ciclo", async () => {
     const { sandbox, inbox } = setup();
     sandbox.failNext("events:polling", 500);
