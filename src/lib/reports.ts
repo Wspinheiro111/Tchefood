@@ -122,6 +122,14 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   DISCOUNT_APPLIED: 'Desconto aplicado',
   MANAGER_PIN_FAILED: 'PIN de gerente incorreto',
   MANAGER_PIN_LOCKOUT: 'PIN bloqueado (3 erros)',
+  PRODUCT_PRICE_CHANGED: 'Preço alterado no cadastro',
+  STAFF_CREATED: 'Pessoa cadastrada na equipe',
+  STAFF_PIN_CHANGED: 'PIN trocado',
+  STAFF_ROLE_CHANGED: 'Perfil alterado',
+  STAFF_DEACTIVATED: 'Acesso desativado',
+  STAFF_REACTIVATED: 'Acesso reativado',
+  PERMISSION_CHANGED: 'Permissão alterada',
+  STORE_RESET: 'Loja nova iniciada no aparelho',
 };
 
 /** Texto do alerta enviado ao WhatsApp do proprietário. */

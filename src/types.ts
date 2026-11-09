@@ -98,6 +98,8 @@ export interface Product {
   cfop: string;
   csosn_cst: string;
   unit: string;
+  /** Etapa 0: produto com venda nunca é apagado, só desativado (some do cardápio). */
+  active: boolean;
   created_at: ISODateTime;
 }
 
@@ -139,6 +141,44 @@ export interface DiningTable {
   status: TableStatus;
   qr_code_token: string | null;
   current_order_id: UUID | null;
+  /** Etapa 0: mesa desativada some do mapa; só mesa livre pode ser desativada. */
+  active: boolean;
+  updated_at: ISODateTime;
+}
+
+/**
+ * Etapa 0 — preço por dia da semana e horário (happy hour, almoço executivo).
+ * weekdays: 0 = domingo ... 6 = sábado (Date.getDay()). Horários "HH:MM" no fuso
+ * do aparelho da loja. end_time < start_time = janela que vira a meia-noite.
+ */
+export interface PriceSchedule {
+  id: UUID;
+  tenant_id: UUID;
+  product_id: UUID;
+  name: string;
+  weekdays: number[];
+  start_time: string;
+  end_time: string;
+  price: number;
+  active: boolean;
+  created_at: ISODateTime;
+}
+
+/** Etapa 0 — permissões configuráveis por perfil. */
+export type Permission =
+  | 'MENU_MANAGE'
+  | 'MENU_AVAILABILITY'
+  | 'TABLES_MANAGE'
+  | 'STAFF_MANAGE'
+  | 'STORE_SETTINGS'
+  | 'SYNC_MANAGE';
+
+/** Exceção ao padrão de permissões (tabela role_permissions). */
+export interface RolePermission {
+  tenant_id: UUID;
+  role: UserRole;
+  permission: Permission;
+  allowed: boolean;
   updated_at: ISODateTime;
 }
 
@@ -213,7 +253,16 @@ export type AuditActionType =
   | 'SERVICE_FEE_RESTORED'
   | 'DISCOUNT_APPLIED'
   | 'MANAGER_PIN_FAILED'
-  | 'MANAGER_PIN_LOCKOUT';
+  | 'MANAGER_PIN_LOCKOUT'
+  // Etapa 0 — cadastros
+  | 'PRODUCT_PRICE_CHANGED'
+  | 'STAFF_CREATED'
+  | 'STAFF_PIN_CHANGED'
+  | 'STAFF_ROLE_CHANGED'
+  | 'STAFF_DEACTIVATED'
+  | 'STAFF_REACTIVATED'
+  | 'PERMISSION_CHANGED'
+  | 'STORE_RESET';
 
 export interface AuditLog {
   id: UUID;
@@ -274,8 +323,19 @@ export interface SyncEvent {
     | 'order_items'
     | 'dining_tables'
     | 'audit_logs'
-    | 'payments';
-  op: 'INSERT' | 'UPDATE';
+    | 'payments'
+    // Etapa 0 — cadastros
+    | 'tenants'
+    | 'staff_users'
+    | 'categories'
+    | 'products'
+    | 'modifier_groups'
+    | 'modifier_options'
+    | 'product_modifier_groups'
+    | 'price_schedules'
+    | 'role_permissions';
+  /** DELETE só para linhas sem valor financeiro (vínculos e opções de adicional). */
+  op: 'INSERT' | 'UPDATE' | 'DELETE';
   row_id: UUID;
   payload: Record<string, unknown>;
   created_at: ISODateTime;

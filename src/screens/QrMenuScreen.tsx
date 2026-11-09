@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { BellRing, Minus, Plus, Receipt, ShoppingBag, Trash2, UtensilsCrossed } from 'lucide-react';
+import { useSalePrice } from '../lib/useSalePrice';
 import { useTcheStore } from '../store/useTcheStore';
 import type { Product } from '../types';
 import { computeItemTotal, formatBRL } from '../lib/money';
@@ -18,7 +19,7 @@ interface CartLine extends ProductDraft {
 /** Simulador do celular do cliente lendo o QR Code da mesa (Cardápio Digital). */
 export function QrMenuScreen() {
   const tables = useTcheStore((s) => s.tables);
-  const sorted = useMemo(() => [...tables].sort((a, b) => a.number - b.number), [tables]);
+  const sorted = useMemo(() => tables.filter((t) => t.active).sort((a, b) => a.number - b.number), [tables]);
   const [tableId, setTableId] = useState<string>(sorted.find((t) => t.number === 4)?.id ?? sorted[0]?.id ?? '');
   const table = tables.find((t) => t.id === tableId);
 
@@ -64,11 +65,13 @@ function CustomerPhone({ tableId }: { tableId: string }) {
   const table = s.tables.find((t) => t.id === tableId)!;
   const order = table.current_order_id ? s.orders.find((o) => o.id === table.current_order_id) : undefined;
   const [tab, setTab] = useState<'menu' | 'bill'>('menu');
-  const [cat, setCat] = useState(s.categories[0]?.id ?? '');
+  const priceOf = useSalePrice();
+  const liveCategories = s.categories.filter((c) => c.active).sort((a, b) => a.sort_order - b.sort_order);
+  const [cat, setCat] = useState(liveCategories[0]?.id ?? '');
   const [selected, setSelected] = useState<Product | null>(null);
   const [cart, setCart] = useState<CartLine[]>([]);
 
-  const products = s.products.filter((p) => p.category_id === cat);
+  const products = s.products.filter((p) => p.active && p.category_id === cat);
   const cartTotal = cart.reduce((a, c) => a + computeItemTotal(c.quantity, c.unit_price, c.modifiers_unit_price), 0);
   const myItems = order ? s.orderItems.filter((i) => i.order_id === order.id) : [];
 
@@ -111,7 +114,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
       {tab === 'menu' ? (
         <>
           <div className="flex gap-2 overflow-x-auto px-3 py-2">
-            {s.categories.map((c) => (
+            {liveCategories.map((c) => (
               <button key={c.id} onClick={() => setCat(c.id)} className={`flex shrink-0 flex-col items-center gap-1 rounded-xl px-3 py-2 text-[11px] font-bold ${cat === c.id ? 'bg-rose-600 text-white' : 'bg-white text-slate-700 shadow'}`}>
                 <CategoryIcon name={c.icon_name} className="h-6 w-6" />
                 {c.name}
@@ -131,7 +134,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
                     {p.description && <span className="line-clamp-2 block text-xs text-slate-500">{p.description}</span>}
                     {!p.available && <span className="text-xs font-bold text-rose-600">Esgotado</span>}
                   </span>
-                  <span className="font-black text-rose-700">{formatBRL(p.price)}</span>
+                  <span className="font-black text-rose-700">{formatBRL(priceOf(p))}</span>
                 </button>
               );
             })}
