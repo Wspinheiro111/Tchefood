@@ -8,7 +8,7 @@ import { create } from 'zustand';
 type Variant = 'primary' | 'secondary' | 'danger' | 'success' | 'ghost' | 'gold';
 
 const VARIANTS: Record<Variant, string> = {
-  primary: 'bg-brasa text-white active:bg-rose-700 disabled:bg-rose-50',
+  primary: 'bg-brasa text-white active:bg-rose-700 disabled:opacity-40',
   secondary: 'bg-slate-200 text-slate-900 active:bg-slate-300 disabled:opacity-50',
   danger: 'bg-transparent border-2 border-brasa text-rose-600 active:bg-brasa/20 disabled:opacity-40',
   success: 'bg-stone text-white active:bg-emerald-600 disabled:opacity-50',

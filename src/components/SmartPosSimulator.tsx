@@ -202,7 +202,7 @@ export function SmartPosSimulator() {
                 {step === 'pin' && (
                   <div className="flex flex-1 flex-col items-center">
                     <div className="mb-2 text-sm">Digite a senha</div>
-                    <div className="mb-2 flex gap-2">{Array.from({ length: 4 }).map((_, i) => <span key={i} className={`h-3 w-3 rounded-full ${i < pin.length ? 'bg-white' : 'bg-slate-200'}`} />)}</div>
+                    <div className="mb-2 flex gap-2">{Array.from({ length: 4 }).map((_, i) => <span key={i} className={`h-3 w-3 rounded-full ${i < pin.length ? 'bg-neutral-900' : 'bg-slate-200'}`} />)}</div>
                     <div className="grid w-full grid-cols-3 gap-1.5">
                       {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((d) => (
                         <button key={d} onClick={() => { playTap(); setPin((p) => (p.length < 4 ? p + d : p)); }} className="h-10 rounded-md bg-slate-100 font-bold">{d}</button>
