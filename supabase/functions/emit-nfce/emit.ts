@@ -182,6 +182,19 @@ function providerFields(doc: NfceDocumentRow, next: NfceDocumentStatus, response
   };
 }
 
+/**
+ * Espelho em orders.nfce_status é auxiliar: a fonte da verdade é nfce_documents. Uma falha
+ * aqui não pode impedir o POST depois da reserva (o documento ficaria em processing com a
+ * referência nunca enviada) nem transformar uma autorização gravada em erro 500.
+ */
+async function mirrorOnOrder(deps: EmitDeps, tenantId: string, orderId: string, status: string, accessKey: string | null): Promise<void> {
+  try {
+    await deps.repo.setOrderNfce(tenantId, orderId, status, accessKey);
+  } catch (error) {
+    console.error('[emit-nfce] falha ao espelhar status na comanda', error instanceof Error ? error.message : error);
+  }
+}
+
 async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceResponse): Promise<EmitResponse> {
   const next = normalizeProviderStatus(response.status, doc.status, response);
   if (!canTransition(doc.status, next)) {
@@ -198,7 +211,7 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
     const current = await deps.repo.getDocument(doc.tenant_id, doc.order_id);
     return current ? respond(current, 'O estado da NFC-e mudou durante a operação; este é o estado atual.') : failure(409, 'conflict', deps.environment, 'Documento NFC-e não encontrado após a operação.');
   }
-  await deps.repo.setOrderNfce(saved.tenant_id, saved.order_id, ORDER_STATUS[saved.status], saved.status === 'authorized' || saved.status === 'contingency' ? saved.access_key : null);
+  await mirrorOnOrder(deps, saved.tenant_id, saved.order_id, ORDER_STATUS[saved.status], saved.status === 'authorized' || saved.status === 'contingency' ? saved.access_key : null);
   return respond(saved);
 }
 
@@ -277,6 +290,6 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
     }
     doc = inserted;
   }
-  await deps.repo.setOrderNfce(doc.tenant_id, doc.order_id, ORDER_STATUS.processing, null);
+  await mirrorOnOrder(deps, doc.tenant_id, doc.order_id, ORDER_STATUS.processing, null);
   return transmit(deps, doc, token, payload);
 }

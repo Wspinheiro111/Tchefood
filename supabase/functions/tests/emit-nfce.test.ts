@@ -296,6 +296,18 @@ describe('emitNfce', () => {
     expect(r.httpStatus).toBe(409);
   });
 
+  it('falha ao atualizar a comanda não impede a transmissão', async () => {
+    const repo = new MemoryRepo(source());
+    repo.setOrderNfce = async () => {
+      throw new Error('db down');
+    };
+    const { calls, focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const r = await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(calls.map((c) => c.method)).toEqual(['POST']);
+    expect(r.body.authorized).toBe(true);
+    expect(repo.doc?.status).toBe('authorized');
+  });
+
   it('comanda de outro tenant: 404', async () => {
     const repo = new MemoryRepo(source());
     const { focus } = fakeFocus([]);
