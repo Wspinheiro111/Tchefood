@@ -14,6 +14,10 @@
  *  - A autorização de gerente (cancelamento, desconto, remoção dos 10%) NÃO é
  *    gravada direto em audit_logs: o banco só aceita esse registro vindo de
  *    tchefood_authorize_manager(), que confere o PIN de novo. A fila chama essa RPC.
+ *  - Equipe (staff_users), permissões (role_permissions) e a loja nova também não são
+ *    gravadas direto: o banco não deixa o aparelho escrever nelas. Sobem pelas funções
+ *    tchefood_save_staff, tchefood_set_role_permission e tchefood_start_store, que
+ *    conferem o PIN de quem alterou e o do gerente e gravam o audit_log junto.
  *  - Evento recusado pelo servidor (4xx) sai da fila para a lista de recusados,
  *    visível na tela, e o envio continua com os próximos. Nada é descartado sozinho:
  *    o operador reenvia os recusados depois de corrigir a causa.
@@ -31,6 +35,11 @@ export interface SyncRequest {
   method: 'POST' | 'PATCH' | 'DELETE';
   headers: Record<string, string>;
   body?: string;
+  /**
+   * Só no PATCH de um UPDATE: se nenhuma linha mudou (o registro ainda não existe na
+   * nuvem, ex.: o INSERT dele foi recusado e reenviado depois), sobe como upsert.
+   */
+  fallback?: SyncRequest;
 }
 
 /** Chave de conflito do upsert por tabela (PK no banco). */
@@ -44,6 +53,14 @@ const INSERT_ONLY: ReadonlyArray<SyncEvent['table']> = ['payments', 'audit_logs'
 /** Ações que o banco só aceita pela RPC que confere o PIN (ver tchefood_authorize_manager). */
 export const RPC_AUTHORIZED_ACTIONS: ReadonlyArray<string> = ['ITEM_CANCELED', 'SERVICE_FEE_REMOVED', 'DISCOUNT_APPLIED'];
 const AUTHORIZE_RPC = 'tchefood_authorize_manager';
+const SAVE_STAFF_RPC = 'tchefood_save_staff';
+const SET_PERMISSION_RPC = 'tchefood_set_role_permission';
+const START_STORE_RPC = 'tchefood_start_store';
+
+/** Eventos que sobem por função do servidor que confere PIN e responde null quando ele não confere. */
+export function isPinCheckedRpc(event: SyncEvent): boolean {
+  return isManagerAuthorization(event) || event.table === 'staff_users' || event.table === 'role_permissions';
+}
 
 /** audit_log de autorização de gerente que precisa subir pela RPC. */
 export function isManagerAuthorization(event: SyncEvent): boolean {
@@ -59,7 +76,9 @@ export function isManagerAuthorization(event: SyncEvent): boolean {
 const NEVER_UPLOAD: Partial<Record<SyncEvent['table'], ReadonlyArray<string>>> = {
   tenants: ['focus_nfe_token', 'csc_id', 'csc_token', 'created_at'],
   // Situação fiscal é do servidor (emit-nfce + espelho por trigger). A NFC-e local é simulação.
-  orders: ['nfce_status', 'nfce_key'],
+  // Totais da conta são do banco (tchefood_recalc_order a cada item e pagamento) e um
+  // gatilho recusa gravação direta deles; mandar o valor do aparelho só arrisca a recusa.
+  orders: ['nfce_status', 'nfce_key', 'subtotal_items', 'service_fee_amount', 'total_amount', 'paid_amount', 'remaining_balance'],
 };
 
 export function sanitizePayload(event: SyncEvent): Record<string, unknown> {
@@ -100,8 +119,66 @@ function buildAuthorizeRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   };
 }
 
+function rpcRequest(cfg: SyncConfig, fn: string, args: Record<string, unknown>): SyncRequest {
+  return {
+    url: `${cfg.url.replace(/\/+$/, '')}/rest/v1/rpc/${fn}`,
+    method: 'POST',
+    headers: baseHeaders(cfg),
+    body: JSON.stringify(args),
+  };
+}
+
+const REDO_STAFF = 'Alteração de equipe gravada antes desta versão, sem o PIN para o servidor conferir. Refaça a alteração na tela Equipe.';
+
+function buildStaffRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
+  if (event.op === 'DELETE') throw new Error('DELETE não permitido em staff_users.');
+  const p = event.payload;
+  if (event.store_start) {
+    return rpcRequest(cfg, START_STORE_RPC, {
+      p_owner_id: p.id,
+      p_owner_name: p.name,
+      p_owner_pin: p.pin_code,
+      p_qr_user_id: event.store_start.qr_user_id,
+      p_reason: event.store_start.reason,
+      p_metadata: { ...event.store_start.metadata, client_event_id: event.id },
+      p_created_at: p.created_at ?? null,
+    });
+  }
+  const a = event.staff_auth;
+  if (!a) throw new Error(REDO_STAFF);
+  return rpcRequest(cfg, SAVE_STAFF_RPC, {
+    p_staff_id: p.id,
+    p_name: p.name,
+    p_role: p.role,
+    p_pin: p.pin_code,
+    p_active: p.active,
+    p_actor_id: a.actor_id,
+    p_actor_pin: a.actor_pin,
+    p_manager_pin: a.manager_pin,
+    p_reason: a.reason,
+    p_created_at: p.created_at ?? null,
+  });
+}
+
+function buildPermissionRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
+  const a = event.staff_auth;
+  if (!a || !a.manager_pin) throw new Error('Troca de permissão gravada antes desta versão, sem o PIN para o servidor conferir. Refaça a troca na tela Loja.');
+  const p = event.payload;
+  return rpcRequest(cfg, SET_PERMISSION_RPC, {
+    p_role: p.role,
+    p_permission: p.permission,
+    p_allowed: p.allowed,
+    p_actor_id: a.actor_id,
+    p_actor_pin: a.actor_pin,
+    p_manager_pin: a.manager_pin,
+    p_reason: a.reason,
+  });
+}
+
 export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   if (isManagerAuthorization(event)) return buildAuthorizeRequest(event, cfg);
+  if (event.table === 'staff_users') return buildStaffRequest(event, cfg);
+  if (event.table === 'role_permissions') return buildPermissionRequest(event, cfg);
   const root = `${cfg.url.replace(/\/+$/, '')}/rest/v1/${event.table}`;
   const headers = baseHeaders(cfg);
 
@@ -130,7 +207,7 @@ export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest
 
   const insertOnly = INSERT_ONLY.includes(event.table);
   const conflict = CONFLICT_KEY[event.table] ?? 'id';
-  return {
+  const upsert: SyncRequest = {
     url: `${root}?on_conflict=${conflict}`,
     method: 'POST',
     headers: {
@@ -139,6 +216,31 @@ export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest
     },
     body: JSON.stringify(sanitizePayload(event)),
   };
+  // UPDATE de linha que já existe vai como PATCH: o upsert do PostgREST é um
+  // INSERT ... ON CONFLICT, que roda os gatilhos de INSERT na linha que já existe
+  // (conta nasce zerada e PAYING no totem, ficha nasce em aberto, crédito de cashback
+  // nasce inteiro) e o banco recusa a atualização.
+  if (event.op === 'UPDATE' && !insertOnly && !CONFLICT_KEY[event.table]) {
+    return {
+      url: `${root}?id=eq.${encodeURIComponent(event.row_id)}`,
+      method: 'PATCH',
+      headers: { ...headers, Prefer: 'return=representation' },
+      body: upsert.body,
+      fallback: upsert,
+    };
+  }
+  return upsert;
+}
+
+/** PATCH respondeu sem nenhuma linha: o registro não existe (ou não é visível) na nuvem. */
+function patchedNothing(req: SyncRequest, body: string): boolean {
+  if (req.method !== 'PATCH' || !req.fallback) return false;
+  try {
+    const v = JSON.parse(body) as unknown;
+    return Array.isArray(v) && v.length === 0;
+  } catch {
+    return false;
+  }
 }
 
 export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{
@@ -252,17 +354,28 @@ export async function flushOutbox(
       continue;
     }
     let res;
+    let text: string;
     try {
       res = await fetchFn(req.url, { method: req.method, headers: req.headers, body: req.body });
+      text = await res.text().catch(() => '');
+      if (res.ok && patchedNothing(req, text)) {
+        const fb = req.fallback!;
+        res = await fetchFn(fb.url, { method: fb.method, headers: fb.headers, body: fb.body });
+        text = await res.text().catch(() => '');
+      }
     } catch (e) {
       return { sent, retryLater: `Sem conexão com a nuvem: ${(e as Error).message}`, rejected };
     }
-    const text = await res.text().catch(() => '');
     if (res.ok) {
       // A RPC responde null quando o PIN não confere no servidor (ou está bloqueado):
       // nada foi autorizado, e a atualização da comanda que vem depois seria recusada.
       if (isManagerAuthorization(event) && !isUuidResponse(text)) {
         reject(event, res.status, 'O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).');
+        continue;
+      }
+      // Equipe e permissões: null = algum PIN (de quem alterou ou do gerente) não conferiu.
+      if (isPinCheckedRpc(event) && isNullResponse(text)) {
+        reject(event, res.status, 'O servidor não confirmou o PIN de quem alterou ou do gerente (PIN alterado ou bloqueado por tentativas).');
         continue;
       }
       sent.push(event.id);
@@ -275,6 +388,11 @@ export async function flushOutbox(
     reject(event, res.status, describeError(text, res.status));
   }
   return { sent, retryLater: null, rejected };
+}
+
+function isNullResponse(body: string): boolean {
+  const t = body.trim();
+  return t === '' || t === 'null';
 }
 
 function isUuidResponse(body: string): boolean {

@@ -870,12 +870,14 @@ export const useTcheStore = create<TcheState>()(
             orderItems,
             kegTaps,
             orders: s.orders.map((o) => (o.id === orderId ? updated : o)),
-            auditLogs: [...logs.reverse(), ...s.auditLogs],
+            auditLogs: [...[...logs].reverse(), ...s.auditLogs],
             outbox: [
               ...s.outbox,
+              // As autorizações sobem antes, pela RPC que confere o PIN: o banco só aceita
+              // o cancelamento de cada item com o audit_log dele já gravado.
+              ...logs.map((l) => managerAuthEvent(l, auth.managerPin)),
               ...[...canceled.values()].map((i) => syncEvent('order_items', 'UPDATE', i)),
               syncEvent('orders', 'UPDATE', updated),
-              ...logs.map((l) => syncEvent('audit_logs', 'INSERT', l)),
               ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
             ],
           };
@@ -2396,7 +2398,16 @@ export const useTcheStore = create<TcheState>()(
               action_type: 'CASHBACK_REDEEMED',
               amount_impact: -amount,
               reason: 'Cashback de fidelidade resgatado',
-              metadata: { table: tableLabel(order.table_id), customer_id: customer.id, phone, amount },
+              // discount_before/discount_after: o banco só aceita o aumento do desconto da
+              // comanda que bate com este resgate (mesma regra do DISCOUNT_APPLIED).
+              metadata: {
+                table: tableLabel(order.table_id),
+                customer_id: customer.id,
+                phone,
+                amount,
+                discount_before: order.discount_amount,
+                discount_after: round2(order.discount_amount + amount),
+              },
             }),
             whatsapp_alert_sent: false,
           };
@@ -2405,15 +2416,20 @@ export const useTcheStore = create<TcheState>()(
             const recalculated = applyOrderTotals({ ...current, discount_amount: round2(current.discount_amount + amount) }, s.orderItems, s.payments);
             const changedLedger = ledger.filter((e, i) => e !== s.cashbackLedger[i] && e.entry_type === 'EARN');
             const patch = commitAdjustment(s, recalculated, s.orderItems, [], log, null);
+            // Ordem no servidor: audit_log e extrato (REDEEM) antes do desconto da comanda,
+            // porque a trava do desconto confere os dois.
+            const [auditEvent, ...orderEvents] = patch.outbox!.slice(s.outbox.length);
             return {
               ...patch,
               auditLogs: patch.auditLogs,
               cashbackLedger: ledger,
               loyaltyCustomers: s.loyaltyCustomers.map((c) => (c.id === customer.id ? updatedCustomer : c)),
               outbox: [
-                ...patch.outbox!,
+                ...s.outbox,
+                auditEvent!,
                 ...changedLedger.map((e) => syncEvent('cashback_ledger', 'UPDATE', e)),
                 syncEvent('cashback_ledger', 'INSERT', entry),
+                ...orderEvents,
                 syncEvent('loyalty_customers', 'UPDATE', updatedCustomer),
               ],
             };
@@ -2737,14 +2753,21 @@ export const useTcheStore = create<TcheState>()(
               },
             }),
           );
+          // No servidor, equipe só muda por tchefood_save_staff: confere o PIN de quem alterou
+          // e o do gerente, grava a pessoa e os audit_logs juntos. Por isso os logs não sobem à parte.
+          const staffEvent: SyncEvent = {
+            ...syncEvent('staff_users', existing ? 'UPDATE' : 'INSERT', row),
+            staff_auth: {
+              actor_id: actor.id,
+              actor_pin: actor.pin_code,
+              manager_pin: manager ? auth!.managerPin : null,
+              reason: manager ? reason : null,
+            },
+          };
           set((s) => ({
             staff: existing ? s.staff.map((u) => (u.id === row.id ? row : u)) : [...s.staff, row],
             auditLogs: [...logs, ...s.auditLogs],
-            outbox: [
-              ...s.outbox,
-              syncEvent('staff_users', existing ? 'UPDATE' : 'INSERT', row),
-              ...logs.map((l) => syncEvent('audit_logs', 'INSERT', l)),
-            ],
+            outbox: [...s.outbox, staffEvent],
           }));
           return { ok: true, data: row };
         },
@@ -2766,10 +2789,15 @@ export const useTcheStore = create<TcheState>()(
             reason: auth.reason.trim(),
             metadata: { role, permission, allowed_before: before, allowed_after: allowed },
           });
+          // Sobe por tchefood_set_role_permission (confere os PINs e grava o audit_log junto).
+          const event: SyncEvent = {
+            ...permissionEvent(row),
+            staff_auth: { actor_id: user.id, actor_pin: user.pin_code, manager_pin: auth.managerPin, reason: auth.reason.trim() },
+          };
           set((s) => ({
             rolePermissions: [...s.rolePermissions.filter((r) => !(r.role === role && r.permission === permission)), row],
             auditLogs: [log, ...s.auditLogs],
-            outbox: [...s.outbox, permissionEvent(row), syncEvent('audit_logs', 'INSERT', log)],
+            outbox: [...s.outbox, event],
           }));
           return { ok: true, data: row };
         },
@@ -2884,12 +2912,15 @@ export const useTcheStore = create<TcheState>()(
             tray: [],
             outbox: [
               syncEvent('tenants', 'UPDATE', tenant),
-              syncEvent('staff_users', 'INSERT', owner),
-              syncEvent('staff_users', 'INSERT', qrUser),
+              // Proprietário, usuário do QR e o STORE_RESET sobem juntos por tchefood_start_store
+              // (só numa loja da nuvem ainda sem equipe).
+              {
+                ...syncEvent('staff_users', 'INSERT', owner),
+                store_start: { qr_user_id: qrUser.id, reason: log.reason, metadata: log.metadata ?? {} },
+              },
               ...terminals.map((t) => syncEvent('pos_terminals', 'INSERT', t)),
               syncEvent('dining_tables', 'INSERT', counter),
               syncEvent('dining_tables', 'INSERT', kiosk),
-              syncEvent('audit_logs', 'INSERT', log),
             ],
             currentUserId: owner.id,
             cloud: linkedCloud ?? null,

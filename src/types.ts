@@ -603,6 +603,30 @@ export interface SyncEvent {
    * Fica só neste evento da fila (nunca no audit_log) e sai do aparelho junto com ele.
    */
   manager_pin?: string;
+  /**
+   * Só em staff_users e role_permissions: o banco não aceita gravação direta da equipe
+   * nem das permissões. O evento sobe pela função do servidor (tchefood_save_staff,
+   * tchefood_set_role_permission), que confere o PIN de quem alterou e, quando a
+   * mudança pede, o PIN do gerente. Como manager_pin, fica só na fila.
+   */
+  staff_auth?: StaffSyncAuth;
+  /** Só no proprietário da loja nova: sobe por tchefood_start_store, com o usuário do QR. */
+  store_start?: StoreStartSync;
+}
+
+export interface StaffSyncAuth {
+  actor_id: UUID;
+  /** PIN atual de quem fez a alteração (prova para o servidor de que foi essa pessoa). */
+  actor_pin: string;
+  /** PIN do gerente/proprietário que autorizou; null quando a mudança não pede. */
+  manager_pin: string | null;
+  reason: string | null;
+}
+
+export interface StoreStartSync {
+  qr_user_id: UUID | null;
+  reason: string;
+  metadata: Record<string, unknown>;
 }
 
 /** Evento que o servidor recusou (4xx): sai da fila para não travar o resto e espera revisão. */
