@@ -58,6 +58,8 @@ export interface PurchaseNfeItem {
   fcp_st_amount: number;
   /** Custo total do item que entra no CMV (fórmula do cabeçalho), 2 casas. */
   landed_amount: number;
+  /** indTot = 1: o valor do item compõe o total da nota. indTot = 0 fica fora dos totais (ICMSTot). */
+  in_invoice_total: boolean;
 }
 
 export interface PurchaseNfeTotals {
@@ -301,6 +303,7 @@ export function parsePurchaseNfeXml(xml: string): PurchaseNfe {
       icms_st_amount: icmsSt,
       fcp_st_amount: fcpSt,
       landed_amount: landedCents / 100,
+      in_invoice_total: text(prod, 'indTot', 1) !== '0',
     };
   });
 
@@ -319,7 +322,10 @@ export function parsePurchaseNfeXml(xml: string): PurchaseNfe {
   };
 
   // Os itens precisam fechar com o total da nota: se não fecham, o custo gravado estaria errado.
-  if (sumCents(items.map((i) => i.gross_amount)) !== toCents(totals.products_amount)) {
+  // Itens com indTot = 0 não entram no ICMSTot; continuam na nota para a conferência decidir.
+  const totalled = items.filter((i) => i.in_invoice_total);
+  for (const i of items) if (!i.in_invoice_total) warnings.push(`O item ${i.n_item} não compõe o total da nota (indTot = 0). Confira se ele foi cobrado antes de dar entrada.`);
+  if (sumCents(totalled.map((i) => i.gross_amount)) !== toCents(totals.products_amount)) {
     throw new NfeImportError('A soma dos itens não bate com o total dos produtos da nota (vProd); o arquivo não foi importado.');
   }
   const checks: Array<[keyof PurchaseNfeItem, keyof PurchaseNfeTotals, string]> = [
@@ -331,11 +337,11 @@ export function parsePurchaseNfeXml(xml: string): PurchaseNfe {
     ['icms_st_amount', 'icms_st_amount', 'ICMS-ST'],
   ];
   for (const [itemKey, totalKey, label] of checks) {
-    if (sumCents(items.map((i) => i[itemKey] as number)) !== toCents(totals[totalKey])) {
+    if (sumCents(totalled.map((i) => i[itemKey] as number)) !== toCents(totals[totalKey])) {
       warnings.push(`O ${label} dos itens não fecha com o total da nota. O custo usa os valores de cada item.`);
     }
   }
-  const landedTotal = sumCents(items.map((i) => i.landed_amount));
+  const landedTotal = sumCents(totalled.map((i) => i.landed_amount));
   if (landedTotal !== toCents(totals.invoice_amount)) {
     warnings.push(`O custo somado dos itens (${(landedTotal / 100).toFixed(2)}) difere do valor da nota (${totals.invoice_amount.toFixed(2)}), por exemplo por ICMS desonerado ou II. Confira.`);
   }

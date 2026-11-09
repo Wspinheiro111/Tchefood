@@ -85,6 +85,17 @@ describe('leitura do XML da NF-e', () => {
     reject(sampleNfeXml().replace('<vProd>998.75</vProd>', '<vProd>998.76</vProd>'), /não bate/);
   });
 
+  it('item com indTot = 0 fica fora da conferência do total, mas continua na nota', () => {
+    const xml = sampleNfeXml()
+      .replace('<vUnTrib>22.5000000000</vUnTrib><indTot>1</indTot>', '<vUnTrib>22.5000000000</vUnTrib><indTot>0</indTot>')
+      .replace('<vProd>1165.55</vProd>', '<vProd>1075.55</vProd>')
+      .replace('<vNF>1169.60</vNF>', '<vNF>1079.60</vNF>');
+    const nfe = parsePurchaseNfeXml(xml);
+    expect(nfe.items).toHaveLength(3);
+    expect(nfe.items[2]!.in_invoice_total).toBe(false);
+    expect(nfe.warnings).toEqual([expect.stringMatching(/item 3 não compõe o total/)]);
+  });
+
   it('recusa valor não numérico em vez de tratar como zero', () => {
     reject(sampleNfeXml().replace('<vDesc>18.75</vDesc>', '<vDesc>18,75</vDesc>'), /desconto do item 2 inválido/);
   });
