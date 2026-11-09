@@ -421,6 +421,11 @@ export interface AuditLog {
   whatsapp_alert_sent: boolean;
   metadata: Record<string, unknown> | null;
   created_at: ISODateTime;
+  /**
+   * Ordem de gravação no servidor (db/schema_expansion.sql). Dada pelo banco, nunca
+   * pelo aparelho: o registro local não tem, e a fila não envia.
+   */
+  server_seq?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +602,51 @@ export interface SyncEvent {
   row_id: UUID;
   payload: Record<string, unknown>;
   created_at: ISODateTime;
+  /**
+   * Só na autorização de gerente (cancelamento, desconto, remoção dos 10%): o PIN
+   * digitado, para o servidor conferir de novo em tchefood_authorize_manager().
+   * Fica só neste evento da fila (nunca no audit_log) e sai do aparelho junto com ele.
+   */
+  manager_pin?: string;
+  /**
+   * Só em staff_users e role_permissions: o banco não aceita gravação direta da equipe
+   * nem das permissões. O evento sobe pela função do servidor (tchefood_save_staff,
+   * tchefood_set_role_permission), que confere o PIN de quem alterou e, quando a
+   * mudança pede, o PIN do gerente. Como manager_pin, fica só na fila.
+   */
+  staff_auth?: StaffSyncAuth;
+  /** Só no proprietário da loja nova: sobe por tchefood_start_store, com o usuário do QR. */
+  store_start?: StoreStartSync;
+  /**
+   * Comanda de que esta mudança depende, quando o registro não aponta para ela: a
+   * mesa mudada pelo pagamento ou fechamento (inclusive liberada, já sem
+   * current_order_id) e o extrato/cliente do cashback resgatado naquela comanda. Se o pagamento ou a autorização daquela
+   * comanda for recusado, a mesa fica segurada junto e não aparece livre na nuvem.
+   */
+  depends_on_order_id?: UUID;
+}
+
+export interface StaffSyncAuth {
+  actor_id: UUID;
+  /** PIN atual de quem fez a alteração (prova para o servidor de que foi essa pessoa). */
+  actor_pin: string;
+  /** PIN do gerente/proprietário que autorizou; null quando a mudança não pede. */
+  manager_pin: string | null;
+  reason: string | null;
+}
+
+export interface StoreStartSync {
+  qr_user_id: UUID | null;
+  reason: string;
+  metadata: Record<string, unknown>;
+}
+
+/** Evento que o servidor recusou (4xx): sai da fila para não travar o resto e espera revisão. */
+export interface RejectedSyncEvent {
+  event: SyncEvent;
+  status: number;
+  message: string;
+  rejected_at: ISODateTime;
 }
 
 /** Resultado padrão das ações do store que podem ser recusadas. */

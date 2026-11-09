@@ -38,6 +38,10 @@
 --  9. Balança: o preço e a quantidade do item pesado vinham do aparelho. O
 --     banco agora recalcula quantity = (bruto − tara) / 1000 e usa o preço do
 --     quilo do cadastro.
+-- 10. Desconto/10%: a versão do rascunho voltava a usar a janela de 5 minutos da
+--     autorização, que a Etapa 0 já tinha trocado (a fila offline sobe depois).
+--     Agora vale a regra da Etapa 0, com a exceção do cashback presa ao mesmo
+--     discount_before/discount_after.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -102,8 +106,14 @@ CREATE TRIGGER trg_order_items_00_weight BEFORE INSERT OR UPDATE OF quantity, un
 -- orders.table_id é NOT NULL no blueprint. A venda de balcão usa uma "mesa"
 -- técnica do tipo COUNTER, que nunca é ocupada e não aparece no mapa.
 ALTER TABLE dining_tables ADD COLUMN IF NOT EXISTS kind VARCHAR(10) NOT NULL DEFAULT 'TABLE';
-ALTER TABLE dining_tables DROP CONSTRAINT IF EXISTS dining_tables_kind_check;
-ALTER TABLE dining_tables ADD CONSTRAINT dining_tables_kind_check CHECK (kind IN ('TABLE', 'COUNTER'));
+-- Só cria a regra se ainda não existe: schema_kiosk.sql a amplia com 'KIOSK' e rodar
+-- este arquivo de novo (supabase db push) não pode voltar à regra antiga.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'dining_tables_kind_check') THEN
+        ALTER TABLE dining_tables ADD CONSTRAINT dining_tables_kind_check CHECK (kind IN ('TABLE', 'COUNTER'));
+    END IF;
+END $$;
 
 -- -----------------------------------------------------------------------------
 -- 3. TORNEIRAS E BARRIS DE CHOPP (ANTI-DESPERDÍCIO)
@@ -528,7 +538,8 @@ BEGIN
                             reason, whatsapp_alert_sent, metadata)
     VALUES (v_order.tenant_id, p_order_id, p_user_id, NULL, 'CASHBACK_REDEEMED', -v_amount,
             'Cashback de fidelidade resgatado', FALSE,
-            jsonb_build_object('customer_id', p_customer_id, 'phone', v_customer.phone_whatsapp, 'amount', v_amount));
+            jsonb_build_object('customer_id', p_customer_id, 'phone', v_customer.phone_whatsapp, 'amount', v_amount,
+                               'discount_before', v_order.discount_amount, 'discount_after', v_order.discount_amount + v_amount));
     UPDATE orders SET discount_amount = discount_amount + v_amount WHERE id = p_order_id;
     RETURN v_amount;
 END;
@@ -536,32 +547,63 @@ $$;
 
 -- O desconto da conta continua exigindo gerente, EXCETO quando o aumento é
 -- exatamente o cashback resgatado (registrado no extrato e em audit_logs).
+-- Mesma regra da Etapa 0 (db/schema.sql, seção 4): a autorização fica presa à
+-- operação, sem janela de 5 minutos, porque a fila offline pode subir horas depois.
+--  - remover os 10%: o último registro de 10% da comanda (pela ordem de gravação no
+--    servidor, server_seq) tem de ser SERVICE_FEE_REMOVED autorizado por gerente ativo;
+--  - desconto: o último DISCOUNT_APPLIED da comanda tem de ser exatamente desta
+--    mudança (discount_before = valor atual, discount_after = valor novo), ou o
+--    aumento tem de ser o cashback desta conta: REDEEM no extrato com o valor do
+--    aumento e audit_log CASHBACK_REDEEMED com o mesmo discount_before/discount_after.
+--  - um UPDATE que tira os 10% e aumenta o desconto precisa das duas autorizações.
+-- Ordem real de gravação dos audit_logs no servidor. created_at é a hora do
+-- aparelho (a fila offline sobe horas depois, e o aparelho escolhe esse valor),
+-- enquanto as autorizações gravadas por função ficam com a hora do servidor:
+-- comparar as duas deixaria um SERVICE_FEE_RESTORED antigo perder para a remoção
+-- que veio antes dele. server_seq é dado pelo banco e não aceita valor do cliente
+-- (GENERATED ALWAYS), e a fila sobe na ordem em que as ações aconteceram.
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS server_seq BIGINT GENERATED ALWAYS AS IDENTITY;
+CREATE INDEX IF NOT EXISTS idx_audit_logs_order_seq ON audit_logs(order_id, server_seq DESC);
+
 CREATE OR REPLACE FUNCTION tchefood_require_order_audit()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
-DECLARE v_action TEXT; v_ok BOOLEAN;
+DECLARE v_ok BOOLEAN;
 BEGIN
     IF OLD.charge_service_fee AND NOT NEW.charge_service_fee THEN
-        v_action := 'SERVICE_FEE_REMOVED';
-    ELSIF NEW.discount_amount > OLD.discount_amount THEN
-        v_action := 'DISCOUNT_APPLIED';
-        SELECT EXISTS (
-            SELECT 1 FROM cashback_ledger c JOIN audit_logs a ON a.order_id = c.order_id AND a.action_type = 'CASHBACK_REDEEMED'
-             WHERE c.order_id = NEW.id AND c.entry_type = 'REDEEM'
-               AND c.amount = NEW.discount_amount - OLD.discount_amount
-               AND c.created_at >= NOW() - INTERVAL '5 minutes'
-        ) INTO v_ok;
-        IF v_ok THEN RETURN NULL; END IF;
-    ELSE
-        RETURN NULL;
+        v_ok := FALSE;
+        SELECT (a.action_type = 'SERVICE_FEE_REMOVED' AND m.role IN ('MANAGER', 'OWNER') AND m.active)
+          INTO v_ok
+          FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id
+         WHERE a.order_id = NEW.id AND a.action_type IN ('SERVICE_FEE_REMOVED', 'SERVICE_FEE_RESTORED')
+         ORDER BY a.server_seq DESC
+         LIMIT 1;
+        IF NOT COALESCE(v_ok, FALSE) THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: SERVICE_FEE_REMOVED sem PIN de gerente registrado em audit_logs.';
+        END IF;
     END IF;
-    SELECT EXISTS (
-        SELECT 1 FROM audit_logs a JOIN staff_users m ON m.id = a.authorized_by_manager_id
-         WHERE a.order_id = NEW.id AND a.action_type = v_action
-           AND a.created_at >= NOW() - INTERVAL '5 minutes'
-           AND m.role IN ('MANAGER', 'OWNER') AND m.active
-    ) INTO v_ok;
-    IF NOT v_ok THEN
-        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % sem PIN de gerente registrado em audit_logs.', v_action;
+    IF NEW.discount_amount > OLD.discount_amount THEN
+        v_ok := FALSE;
+        SELECT ((a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
+                AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
+                AND m.role IN ('MANAGER', 'OWNER') AND m.active)
+          INTO v_ok
+          FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id
+         WHERE a.order_id = NEW.id AND a.action_type = 'DISCOUNT_APPLIED'
+         ORDER BY a.server_seq DESC
+         LIMIT 1;
+        IF NOT COALESCE(v_ok, FALSE) THEN
+            SELECT EXISTS (
+                SELECT 1 FROM cashback_ledger c
+                  JOIN audit_logs a ON a.order_id = c.order_id AND a.action_type = 'CASHBACK_REDEEMED'
+                 WHERE c.order_id = NEW.id AND c.entry_type = 'REDEEM'
+                   AND c.amount = NEW.discount_amount - OLD.discount_amount
+                   AND (a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
+                   AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
+            ) INTO v_ok;
+        END IF;
+        IF NOT COALESCE(v_ok, FALSE) THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: DISCOUNT_APPLIED sem PIN de gerente registrado em audit_logs.';
+        END IF;
     END IF;
     RETURN NULL;
 END;

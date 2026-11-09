@@ -191,7 +191,10 @@ describe('permissões', () => {
     const r = st().setRolePermission('CASHIER', 'MENU_MANAGE', true, { managerPin: OWNER, reason: 'Cobertura de turno' });
     expect(r.ok).toBe(true);
     expect(st().auditLogs[0]).toMatchObject({ action_type: 'PERMISSION_CHANGED', metadata: { role: 'CASHIER', allowed_before: false, allowed_after: true } });
-    expect(st().outbox.slice(-2).map((e) => e.table)).toEqual(['role_permissions', 'audit_logs']);
+    // Um evento só: a função do servidor confere os PINs e grava a permissão e o audit_log juntos.
+    const ev = st().outbox[st().outbox.length - 1]!;
+    expect(ev.table).toBe('role_permissions');
+    expect(ev.staff_auth).toEqual({ actor_id: staffByPin(OWNER).id, actor_pin: OWNER, manager_pin: OWNER, reason: 'Cobertura de turno' });
     login(CASHIER);
     expect(selectCan(st(), 'MENU_MANAGE')).toBe(true);
   });
@@ -271,6 +274,11 @@ describe('equipe no store', () => {
     expect(log.action_type).toBe('STAFF_PIN_CHANGED');
     expect(JSON.stringify(log)).not.toContain('4826');
     expect(JSON.stringify(log)).not.toContain(WAITER);
+    // Sobe só a pessoa, com os PINs para o servidor conferir (o audit_log nasce lá).
+    const ev = st().outbox[st().outbox.length - 1]!;
+    expect(ev).toMatchObject({ table: 'staff_users', op: 'UPDATE', row_id: tiao.id });
+    expect(ev.staff_auth).toEqual({ actor_id: staffByPin(MANAGER).id, actor_pin: MANAGER, manager_pin: MANAGER, reason: 'Esqueceu o PIN' });
+    expect(st().outbox.some((e) => e.table === 'audit_logs' && e.payload.action_type === 'STAFF_PIN_CHANGED')).toBe(false);
     expect(st().login('4826').ok).toBe(true);
   });
 
@@ -279,6 +287,83 @@ describe('equipe no store', () => {
     const me = staffByPin(MANAGER);
     expect(st().saveStaff({ id: me.id, name: me.name, role: me.role, pin_code: '4826', active: true }).ok).toBe(true);
     expect(st().auditLogs[0]!.action_type).toBe('STAFF_PIN_CHANGED');
+    // Prova para o servidor: o PIN antigo de quem trocou; sem PIN de gerente.
+    expect(st().outbox[st().outbox.length - 1]!.staff_auth).toEqual({ actor_id: me.id, actor_pin: MANAGER, manager_pin: null, reason: null });
+  });
+
+  it('autorização recusada (sem PIN ou PIN antigo): o mesmo gerente digita o PIN atual e ela volta a poder subir', () => {
+    const cfg = { url: 'https://abc.supabase.co/', anonKey: 'anon', accessToken: 'jwt' };
+    login(WAITER);
+    const manager = staffByPin(MANAGER);
+    const owner = staffByPin(OWNER);
+    const payload = { id: 'L-velho', order_id: 'O1', performed_by_user_id: staffByPin(WAITER).id, authorized_by_manager_id: manager.id, action_type: 'DISCOUNT_APPLIED', reason: 'Cliente antigo', amount_impact: -5, metadata: {} };
+    const legacy: SyncEvent = { id: 'auth-velha', table: 'audit_logs', op: 'INSERT', row_id: 'L-velho', payload, created_at: '2026-11-01T12:00:00.000Z' };
+    useTcheStore.setState({ syncRejected: [{ event: legacy, status: 400, message: 'sem PIN', rejected_at: legacy.created_at }] });
+    expect(() => buildSyncRequest(legacy, cfg)).toThrow(/digite o PIN do gerente/);
+    // PIN de outro gerente conhecido não serve; formato errado também não.
+    expect(st().confirmRejectedAuthorization('auth-velha', owner.pin_code)).toMatchObject({ ok: false, error: expect.stringContaining(manager.name) });
+    expect(st().confirmRejectedAuthorization('auth-velha', '12')).toMatchObject({ ok: false });
+    expect(st().syncRejected[0]!.event.manager_pin).toBeUndefined();
+    expect(st().confirmRejectedAuthorization('auth-velha', MANAGER).ok).toBe(true);
+    // PIN trocado em outro aparelho (ainda não conhecido aqui): fica para o servidor conferir.
+    expect(st().confirmRejectedAuthorization('auth-velha', '3719').ok).toBe(true);
+    expect(st().syncRejected[0]!.event.manager_pin).toBe('3719');
+    expect(st().confirmRejectedAuthorization('auth-velha', MANAGER).ok).toBe(true);
+    const fixed = st().syncRejected[0]!.event;
+    expect(fixed.manager_pin).toBe(MANAGER);
+    expect(JSON.parse(buildSyncRequest(fixed, cfg).body!).p_manager_pin).toBe(MANAGER);
+    st().retryRejectedSync();
+    expect(st().outbox[0]!.id).toBe('auth-velha');
+  });
+
+  it('salvar de novo substitui o evento de equipe antigo, sem PIN, que a nuvem recusou', () => {
+    login(MANAGER);
+    const me = staffByPin(MANAGER);
+    const legacy: SyncEvent = { id: 'legado', table: 'staff_users', op: 'UPDATE', row_id: me.id, payload: { ...me }, created_at: '2026-11-01T12:00:00.000Z' };
+    const queued: SyncEvent = { ...legacy, id: 'legado-na-fila' };
+    const other: SyncEvent = { ...legacy, id: 'outra-pessoa', row_id: 'outra', payload: { id: 'outra' } };
+    useTcheStore.setState({ outbox: [queued, other], syncRejected: [{ event: legacy, status: 400, message: 'Refaça', rejected_at: legacy.created_at }] });
+    expect(st().saveStaff({ id: me.id, name: me.name, role: me.role, pin_code: '4826', active: true }).ok).toBe(true);
+    expect(st().syncRejected).toEqual([]);
+    expect(st().outbox.map((e) => e.id).slice(0, 1)).toEqual(['outra-pessoa']);
+    expect(st().outbox).toHaveLength(2);
+    expect(st().outbox[1]!.staff_auth).toBeDefined();
+  });
+
+  it('PIN repetido recusado pela nuvem: corrigir na tela Equipe substitui o recusado', () => {
+    login(OWNER);
+    const waiter = staffByPin(WAITER);
+    const auth = { actor_id: staffByPin(OWNER).id, actor_pin: OWNER, manager_pin: null, reason: null };
+    const refused: SyncEvent = { id: 'pin-repetido', table: 'staff_users', op: 'INSERT', row_id: waiter.id, payload: { ...waiter }, created_at: '2026-11-09T12:00:00.000Z', staff_auth: auth };
+    const owner: SyncEvent = { id: 'dono-loja-nova', table: 'staff_users', op: 'INSERT', row_id: 'dono', payload: { id: 'dono' }, created_at: refused.created_at, store_start: { qr_user_id: null, reason: 'Loja nova', metadata: {} } };
+    const pending: SyncEvent = { ...refused, id: 'na-fila-com-pin' };
+    useTcheStore.setState({
+      outbox: [pending],
+      syncRejected: [
+        { event: refused, status: 200, message: 'recusou o PIN novo', rejected_at: refused.created_at },
+        { event: owner, status: 400, message: 'x', rejected_at: refused.created_at },
+      ],
+    });
+    expect(st().saveStaff({ id: waiter.id, name: waiter.name, role: waiter.role, pin_code: '3719', active: true }, { managerPin: MANAGER, reason: 'PIN repetido em outro aparelho' }).ok).toBe(true);
+    expect(st().syncRejected.map((r) => r.event.id)).toEqual(['dono-loja-nova']);
+    // O da fila, já com prova de PIN, continua e sobe antes do novo.
+    expect(st().outbox.map((e) => e.id).slice(0, 1)).toEqual(['na-fila-com-pin']);
+    expect(st().outbox[1]!.payload.pin_code).toBe('3719');
+  });
+
+  it('próprio PIN recusado pela nuvem: a correção prova quem é com o PIN que a nuvem conhece', () => {
+    login(MANAGER);
+    const me = staffByPin(MANAGER);
+    expect(st().saveStaff({ id: me.id, name: me.name, role: me.role, pin_code: '4826', active: true }).ok).toBe(true);
+    const refused = st().outbox[st().outbox.length - 1]!;
+    expect(refused.staff_auth!.actor_pin).toBe(MANAGER);
+    st().rejectSyncEvents([{ eventId: refused.id, status: 200, message: 'recusou o PIN novo' }]);
+    // O aparelho já usa 4826; a nuvem ainda tem 9999.
+    expect(st().saveStaff({ id: me.id, name: me.name, role: me.role, pin_code: '3719', active: true }).ok).toBe(true);
+    const fixed = st().outbox[st().outbox.length - 1]!;
+    expect(fixed.payload.pin_code).toBe('3719');
+    expect(fixed.staff_auth!.actor_pin).toBe(MANAGER);
+    expect(st().syncRejected).toEqual([]);
   });
 
   it('usuário técnico do QR não é editável', () => {
@@ -316,11 +401,30 @@ describe('loja nova', () => {
     // Id novo por loja: o mesmo id da demonstração colidiria entre lojas na nuvem.
     expect(st().terminals.some((t) => seedTerminalIds.includes(t.id))).toBe(false);
     const terms = st().terminals.length;
-    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', 'staff_users', ...Array(terms).fill('pos_terminals'), 'dining_tables', 'dining_tables', 'audit_logs']);
+    // Proprietário, usuário do QR e STORE_RESET sobem juntos (tchefood_start_store).
+    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', ...Array(terms).fill('pos_terminals'), 'dining_tables', 'dining_tables']);
+    const qr = st().staff.find(isQrSelfService)!;
+    expect(st().outbox[1]!.store_start).toMatchObject({ qr_user_id: qr.id, reason: 'Sair da demonstração' });
+    expect(st().auditLogs.map((l) => l.action_type)).toEqual(['STORE_RESET']);
     // A loja nova já nasce com o balcão da Ficha Rápida e a mesa técnica do totem.
     expect(st().tables.map((t) => t.kind)).toEqual(['COUNTER', 'KIOSK']);
     st().logout();
     expect(st().login('4826').ok).toBe(true);
+  });
+
+  it('com nuvem ligada, não inicia loja nova enquanto houver evento recusado', () => {
+    useTcheStore.setState({ orders: st().orders.map((o) => (o.status === 'OPEN' || o.status === 'PAYING' ? { ...o, status: 'CLOSED' as const } : o)) });
+    login(OWNER);
+    const event: SyncEvent = { id: 'e', table: 'products', op: 'UPDATE', row_id: 'p', payload: { id: 'p' }, created_at: '' };
+    useTcheStore.setState({
+      outbox: [],
+      syncRejected: [{ event, status: 403, message: 'x', rejected_at: '' }],
+      cloud: { url: 'u', anon_key: 'k', email: 'e', access_token: 'a', refresh_token: 'r', expires_at: 0, tenant_id: st().tenant.id },
+    });
+    const r = st().startNewStore({ tenant, owner_name: 'Zé', owner_pin: '4826' }, { managerPin: OWNER, reason: 'Sair da demonstração' });
+    expect(r).toMatchObject({ ok: false });
+    if (!r.ok) expect(r.error).toContain('recusado');
+    expect(st().syncRejected).toHaveLength(1);
   });
 
   it('CNPJ com dígito errado é recusado', () => {
@@ -394,9 +498,67 @@ describe('sincronização com o Supabase', () => {
     expect(del).toMatchObject({ method: 'DELETE', url: 'https://abc.supabase.co/rest/v1/product_modifier_groups?product_id=eq.p&group_id=eq.g' });
     expect(() => buildSyncRequest(ev({ table: 'payments', op: 'DELETE' }), cfg)).toThrow();
     expect(sanitizePayload(ev({ table: 'orders', payload: { a: 1, nfce_status: 'AUTORIZADA', nfce_key: '4326' } }))).toEqual({ a: 1 });
+    // Totais da conta são do banco.
+    expect(sanitizePayload(ev({ table: 'orders', payload: { a: 1, subtotal_items: 1, service_fee_amount: 1, total_amount: 1, paid_amount: 1, remaining_balance: 0 } }))).toEqual({ a: 1 });
   });
 
-  it('envia na ordem e para no primeiro 4xx sem descartar', async () => {
+  it('UPDATE vai como PATCH pelo id e vira upsert só se a linha não existir na nuvem', async () => {
+    const upd = buildSyncRequest(ev({ table: 'event_tickets', op: 'UPDATE', row_id: 'T9', payload: { id: 'T9', redeemed: true } }), cfg);
+    expect(upd).toMatchObject({ method: 'PATCH', url: 'https://abc.supabase.co/rest/v1/event_tickets?id=eq.T9' });
+    expect(upd.headers.Prefer).toBe('return=representation');
+    expect(upd.fallback).toMatchObject({ method: 'POST', url: 'https://abc.supabase.co/rest/v1/event_tickets?on_conflict=id' });
+    // Chave composta e tabelas só de inserção continuam como antes.
+    expect(buildSyncRequest(ev({ table: 'product_modifier_groups', op: 'UPDATE', payload: { product_id: 'p', group_id: 'g' } }), cfg).method).toBe('POST');
+    expect(buildSyncRequest(ev({ table: 'orders', op: 'INSERT' }), cfg).method).toBe('POST');
+
+    const calls: string[] = [];
+    const reply = (body: string): FetchLike => async (url, init) => {
+      calls.push(`${init.method} ${url}`);
+      return { ok: true, status: 200, text: async () => (init.method === 'PATCH' ? body : '') };
+    };
+    const one = [ev({ id: 'a', table: 'orders', op: 'UPDATE', row_id: 'o1', payload: { id: 'o1' } })];
+    expect((await flushOutbox(one, cfg, reply('[{"id":"o1"}]'))).sent).toEqual(['a']);
+    expect(calls).toEqual(['PATCH https://abc.supabase.co/rest/v1/orders?id=eq.o1']);
+    calls.length = 0;
+    expect((await flushOutbox(one, cfg, reply('[]'))).sent).toEqual(['a']);
+    expect(calls).toEqual(['PATCH https://abc.supabase.co/rest/v1/orders?id=eq.o1', 'POST https://abc.supabase.co/rest/v1/orders?on_conflict=id']);
+  });
+
+  it('equipe, permissão e loja nova sobem pelas funções que conferem os PINs', async () => {
+    const staffPayload = { id: 'S1', tenant_id: 'T', name: 'Bia', role: 'CASHIER', pin_code: '5162', active: true, created_at: '2026-11-09T10:00:00.000Z' };
+    const auth = { actor_id: 'A1', actor_pin: '9999', manager_pin: '9999', reason: 'Troca de turno' };
+    const save = buildSyncRequest(ev({ table: 'staff_users', op: 'UPDATE', row_id: 'S1', payload: staffPayload, staff_auth: auth }), cfg);
+    expect(save).toMatchObject({ method: 'POST', url: 'https://abc.supabase.co/rest/v1/rpc/tchefood_save_staff' });
+    expect(JSON.parse(save.body!)).toEqual({
+      p_staff_id: 'S1', p_name: 'Bia', p_role: 'CASHIER', p_pin: '5162', p_active: true, p_actor_id: 'A1', p_actor_pin: '9999',
+      p_manager_pin: '9999', p_reason: 'Troca de turno', p_created_at: '2026-11-09T10:00:00.000Z',
+    });
+    // Fila antiga, sem os PINs: recusa com instrução, nunca grava direto.
+    expect(() => buildSyncRequest(ev({ table: 'staff_users', op: 'UPDATE', payload: staffPayload }), cfg)).toThrow(/Refaça/);
+
+    const perm = buildSyncRequest(
+      ev({ table: 'role_permissions', op: 'UPDATE', row_id: 'T:CASHIER:MENU_MANAGE', payload: { tenant_id: 'T', role: 'CASHIER', permission: 'MENU_MANAGE', allowed: true }, staff_auth: auth }),
+      cfg,
+    );
+    expect(perm.url).toBe('https://abc.supabase.co/rest/v1/rpc/tchefood_set_role_permission');
+    expect(JSON.parse(perm.body!)).toMatchObject({ p_role: 'CASHIER', p_permission: 'MENU_MANAGE', p_allowed: true, p_manager_pin: '9999' });
+    expect(() => buildSyncRequest(ev({ table: 'role_permissions', op: 'UPDATE', payload: {} }), cfg)).toThrow(/Refaça/);
+
+    const start = buildSyncRequest(
+      ev({ table: 'staff_users', op: 'INSERT', payload: { ...staffPayload, role: 'OWNER' }, store_start: { qr_user_id: 'Q1', reason: 'Sair da demonstração', metadata: { previous_tenant_id: 'D' } } }),
+      cfg,
+    );
+    expect(start.url).toBe('https://abc.supabase.co/rest/v1/rpc/tchefood_start_store');
+    expect(JSON.parse(start.body!)).toMatchObject({ p_owner_id: 'S1', p_owner_pin: '5162', p_qr_user_id: 'Q1', p_metadata: { previous_tenant_id: 'D', client_event_id: 'e1' } });
+
+    // PIN que não confere no servidor: a função responde null e o evento é recusado.
+    const nullFetch: FetchLike = async () => ({ ok: true, status: 200, text: async () => 'null' });
+    const res = await flushOutbox([ev({ id: 's', table: 'staff_users', op: 'UPDATE', row_id: 'S1', payload: staffPayload, staff_auth: auth })], cfg, nullFetch);
+    expect(res.sent).toEqual([]);
+    expect(res.rejected[0]!.message).toMatch(/não confirmou o PIN/);
+  });
+
+  it('evento recusado (4xx) não trava a fila: os próximos continuam subindo', async () => {
     const calls: string[] = [];
     const fetchFn: FetchLike = async (url) => {
       calls.push(url);
@@ -405,42 +567,238 @@ describe('sincronização com o Supabase', () => {
     };
     const events = [ev({ id: 'a' }), ev({ id: 'b', table: 'order_items' }), ev({ id: 'c' })];
     const r = await flushOutbox(events, cfg, fetchFn);
-    expect(r.sent).toEqual(['a']);
-    expect(r.rejected).toEqual({ eventId: 'b', status: 409, message: 'violates check — x' });
-    expect(calls).toHaveLength(2);
+    expect(r.sent).toEqual(['a', 'c']);
+    expect(r.rejected).toEqual([{ eventId: 'b', status: 409, message: 'violates check — x' }]);
+    expect(r.retryLater).toBeNull();
+    expect(calls).toHaveLength(3);
   });
 
   it('erro de rede, 5xx e 401 ficam para depois', async () => {
     const down: FetchLike = async () => {
       throw new Error('offline');
     };
-    expect(await flushOutbox([ev({})], cfg, down)).toMatchObject({ sent: [], rejected: null, retryLater: expect.stringContaining('offline') });
+    expect(await flushOutbox([ev({})], cfg, down)).toMatchObject({ sent: [], rejected: [], retryLater: expect.stringContaining('offline') });
     const s503: FetchLike = async () => ({ ok: false, status: 503, text: async () => '' });
-    expect(await flushOutbox([ev({})], cfg, s503)).toMatchObject({ rejected: null, retryLater: expect.stringContaining('503') });
+    expect(await flushOutbox([ev({})], cfg, s503)).toMatchObject({ rejected: [], retryLater: expect.stringContaining('503') });
     const s401: FetchLike = async () => ({ ok: false, status: 401, text: async () => '' });
-    expect(await flushOutbox([ev({})], cfg, s401)).toMatchObject({ rejected: null });
+    expect(await flushOutbox([ev({})], cfg, s401)).toMatchObject({ rejected: [] });
+  });
+
+  const authLog = (over: Record<string, unknown> = {}) => ({
+    id: 'A1',
+    tenant_id: 'T1',
+    order_id: 'O1',
+    performed_by_user_id: 'U1',
+    authorized_by_manager_id: 'M1',
+    action_type: 'DISCOUNT_APPLIED',
+    amount_impact: -10,
+    reason: 'Cliente fiel da casa',
+    whatsapp_alert_sent: true,
+    metadata: { discount_before: 0, discount_after: 10 },
+    created_at: '2026-11-09T19:00:00.000Z',
+    ...over,
+  });
+
+  it('autorização de gerente sobe pela RPC que confere o PIN, não direto em audit_logs', () => {
+    const req = buildSyncRequest(ev({ id: 'e', table: 'audit_logs', row_id: 'A1', payload: authLog(), manager_pin: '9999' }), cfg);
+    expect(req.method).toBe('POST');
+    expect(req.url).toBe('https://abc.supabase.co/rest/v1/rpc/tchefood_authorize_manager');
+    expect(JSON.parse(req.body!)).toEqual({
+      p_order_id: 'O1',
+      p_action_type: 'DISCOUNT_APPLIED',
+      p_manager_pin: '9999',
+      p_performed_by: 'U1',
+      p_reason: 'Cliente fiel da casa',
+      p_amount_impact: -10,
+      p_metadata: { discount_before: 0, discount_after: 10, client_audit_id: 'A1' },
+    });
+    for (const action_type of ['ITEM_CANCELED', 'SERVICE_FEE_REMOVED']) {
+      expect(buildSyncRequest(ev({ table: 'audit_logs', payload: authLog({ action_type }), manager_pin: '9999' }), cfg).url).toContain('/rpc/tchefood_authorize_manager');
+    }
+    // Log sem gerente (PIN errado, taxa reativada) continua sendo INSERT comum.
+    const failed = buildSyncRequest(ev({ table: 'audit_logs', payload: authLog({ authorized_by_manager_id: null, action_type: 'MANAGER_PIN_FAILED' }) }), cfg);
+    expect(failed.url).toBe('https://abc.supabase.co/rest/v1/audit_logs?on_conflict=id');
+    // Fila antiga, sem o PIN guardado: não há como o servidor conferir.
+    expect(() => buildSyncRequest(ev({ table: 'audit_logs', payload: authLog() }), cfg)).toThrow(/PIN/);
+  });
+
+  it('RPC que devolve null (PIN não confere no servidor) é recusa, segura a comanda e o resto segue', async () => {
+    const auth = ev({ id: 'a', table: 'audit_logs', row_id: 'A1', payload: authLog(), manager_pin: '0000', created_at: '2026-11-09T19:00:00.000Z' });
+    const upd = ev({ id: 'u', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1', discount_amount: 10 }, created_at: '2026-11-09T19:00:00.000Z' });
+    const other = ev({ id: 'x', table: 'products', op: 'UPDATE', row_id: 'P1', payload: { id: 'P1' }, created_at: '2026-11-09T19:00:05.000Z' });
+    const fetchFn: FetchLike = async (url) => {
+      if (url.includes('/rpc/')) return { ok: true, status: 200, text: async () => 'null' };
+      if (url.includes('/orders')) return { ok: false, status: 400, text: async () => JSON.stringify({ message: 'TCHEFOOD_ANTIFRAUDE: DISCOUNT_APPLIED sem PIN de gerente registrado em audit_logs.' }) };
+      return { ok: true, status: 201, text: async () => '' };
+    };
+    const r = await flushOutbox([auth, upd, other], cfg, fetchFn);
+    // A comanda nem sobe: espera a autorização recusada ser resolvida.
+    expect(r.sent).toEqual(['x']);
+    expect(r.rejected.map((x) => x.eventId)).toEqual(['a']);
+    expect(r.rejected[0]!.message).toContain('PIN do gerente');
+
+    const okRpc: FetchLike = async (url) =>
+      url.includes('/rpc/') ? { ok: true, status: 200, text: async () => '"3f1c2b9e-1d2a-4c55-9a77-0e8f6d5b4a21"' } : { ok: true, status: 204, text: async () => '' };
+    expect(await flushOutbox([auth, upd], cfg, okRpc)).toEqual({ sent: ['a', 'u'], retryLater: null, rejected: [] });
+  });
+
+  it('depois de um recusado, eventos do mesmo registro esperam e não sobrescrevem a nuvem', async () => {
+    const calls: string[] = [];
+    const fetchFn: FetchLike = async (url, init) => {
+      calls.push(`${url} ${init.body ?? ''}`);
+      if (init.body?.includes('"v":1')) return { ok: false, status: 403, text: async () => '' };
+      return { ok: true, status: 204, text: async () => '' };
+    };
+    const p1 = ev({ id: 'p1', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P', v: 1 } });
+    const p2 = ev({ id: 'p2', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P', v: 2 } });
+    const q = ev({ id: 'q', table: 'products', op: 'UPDATE', row_id: 'Q', payload: { id: 'Q' } });
+    const r = await flushOutbox([p1, p2, q], cfg, fetchFn);
+    expect(r.sent).toEqual(['q']);
+    expect(r.rejected.map((x) => x.eventId)).toEqual(['p1']);
+    // Rodada seguinte: p1 está nos recusados, p2 continua esperando na fila.
+    const next = await flushOutbox([p2], cfg, fetchFn, 50, [p1]);
+    expect(next).toEqual({ sent: [], retryLater: null, rejected: [] });
+    // Autorização recusada segura a atualização da comanda.
+    const auth = ev({ id: 'a', table: 'audit_logs', row_id: 'A1', payload: authLog(), manager_pin: '9999' });
+    const order = ev({ id: 'o', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' } });
+    expect((await flushOutbox([order], cfg, fetchFn, 50, [auth])).sent).toEqual([]);
+    expect(calls.some((c) => c.includes('"v":2'))).toBe(false);
+  });
+
+  it('comanda recusada segura itens e pagamentos dela (os gatilhos recalculam a comanda)', async () => {
+    const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
+    const held = ev({ id: 'h', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' } });
+    const pay = ev({ id: 'p', table: 'payments', row_id: 'PAY', payload: { id: 'PAY', order_id: 'O1' } });
+    const item = ev({ id: 'i', table: 'order_items', op: 'UPDATE', row_id: 'I1', payload: { id: 'I1', order_id: 'O1' } });
+    const otherPay = ev({ id: 'q', table: 'payments', row_id: 'PAY2', payload: { id: 'PAY2', order_id: 'O2' } });
+    expect((await flushOutbox([pay, item, otherPay], cfg, fetchFn, 50, [held])).sent).toEqual(['q']);
+  });
+
+  it('pagamento recusado segura a mesa: ela não aparece livre na nuvem', async () => {
+    login(CASHIER);
+    const opened = st().openTable(table(1).id, 1, null);
+    if (!opened.ok) throw new Error(opened.error);
+    const orderId = opened.data.id;
+    const p = product('311');
+    const added = st().addToTray({ order_id: orderId, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector });
+    if (!added.ok) throw new Error(added.error);
+    const sentTray = st().dispatchTray(orderId);
+    if (!sentTray.ok) throw new Error(sentTray.error);
+    const total = st().orders.find((o) => o.id === orderId)!.remaining_balance;
+    const paid = st().registerPayment({ orderId, amount: total, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'mesa-livre', item_ids: [] });
+    if (!paid.ok) throw new Error(paid.error);
+    expect(paid.data.closed).toBe(true);
+    const freed = st().outbox.filter((e) => e.table === 'dining_tables' && e.row_id === table(1).id).pop()!;
+    expect(freed.payload.current_order_id).toBeNull();
+    expect(freed.depends_on_order_id).toBe(orderId);
+    expect(buildSyncRequest(freed, cfg).body).not.toContain('depends_on_order_id');
+
+    const payEvent = st().outbox.find((e) => e.table === 'payments' && e.payload.order_id === orderId)!;
+    const fetchFn: FetchLike = async (url) =>
+      url.includes('/payments') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
+    const tail = st().outbox.slice(st().outbox.indexOf(payEvent));
+    const r = await flushOutbox(tail, cfg, fetchFn);
+    expect(r.rejected.map((x) => x.eventId)).toEqual([payEvent.id]);
+    expect(r.sent).not.toContain(freed.id);
+    // Rodada seguinte, com o pagamento nos recusados: a mesa continua esperando.
+    const next = await flushOutbox([freed], cfg, fetchFn, 50, [payEvent]);
+    expect(next.sent).toEqual([]);
+    // Sem nada recusado, a mesa sobe.
+    expect((await flushOutbox([freed], cfg, fetchFn)).sent).toEqual([freed.id]);
+  });
+
+  it('mesa liberada segurada não é ultrapassada pela ocupação da mesma mesa por outra comanda', async () => {
+    const fetchFn: FetchLike = async (url) =>
+      url.includes('/payments') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
+    const payA = ev({ id: 'pa', table: 'payments', row_id: 'PA', payload: { id: 'PA', order_id: 'A' } });
+    const releaseA = ev({ id: 'ra', table: 'dining_tables', op: 'UPDATE', row_id: 'T1', payload: { id: 'T1', status: 'FREE', current_order_id: null }, depends_on_order_id: 'A' });
+    const occupyB = ev({ id: 'ob', table: 'dining_tables', op: 'UPDATE', row_id: 'T1', payload: { id: 'T1', status: 'OCCUPIED', current_order_id: 'B' } });
+    const other = ev({ id: 'x', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } });
+    const r = await flushOutbox([payA, releaseA, occupyB, other], cfg, fetchFn);
+    expect(r.rejected.map((x) => x.eventId)).toEqual(['pa']);
+    expect(r.sent).toEqual(['x']);
+    expect((await flushOutbox([releaseA, occupyB], cfg, fetchFn, 50, [payA])).sent).toEqual([]);
+  });
+
+  it('resgate de cashback numa comanda com autorização recusada: o extrato espera', async () => {
+    const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
+    const held = ev({ id: 'h', table: 'audit_logs', row_id: 'L1', payload: { id: 'L1', order_id: 'O1' } });
+    const used = ev({ id: 'u', table: 'cashback_ledger', op: 'UPDATE', row_id: 'E1', payload: { id: 'E1', order_id: 'O-antiga' }, depends_on_order_id: 'O1' });
+    const redeem = ev({ id: 'r', table: 'cashback_ledger', row_id: 'R1', payload: { id: 'R1', order_id: 'O1' }, depends_on_order_id: 'O1' });
+    const customer = ev({ id: 'c', table: 'loyalty_customers', op: 'UPDATE', row_id: 'C1', payload: { id: 'C1' }, depends_on_order_id: 'O1' });
+    const other = ev({ id: 'x', table: 'cashback_ledger', row_id: 'R2', payload: { id: 'R2', order_id: 'O2' } });
+    expect((await flushOutbox([used, redeem, customer, other], cfg, fetchFn, 50, [held])).sent).toEqual(['x']);
+  });
+
+  it('eventos segurados não gastam o limite da rodada', async () => {
+    const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
+    const held = ev({ id: 'h', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } });
+    const blocked = Array.from({ length: 50 }, (_, i) => ev({ id: `b${i}`, table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } }));
+    const free = ev({ id: 'f', table: 'products', op: 'UPDATE', row_id: 'Q', payload: { id: 'Q' } });
+    expect((await flushOutbox([...blocked, free], cfg, fetchFn, 50, [held])).sent).toEqual(['f']);
+  });
+
+  it('o store guarda o PIN só no evento da fila e não no audit_log', () => {
+    login(WAITER);
+    const opened = st().openTable(table(1).id, 2, null);
+    if (!opened.ok) throw new Error(opened.error);
+    const n = st().outbox.length;
+    expect(st().removeServiceFee(opened.data.id, { managerPin: MANAGER, reason: 'Cliente não aceitou os 10%' }).ok).toBe(true);
+    const authEvent = st().outbox.slice(n).find((e) => e.table === 'audit_logs')!;
+    expect(authEvent.manager_pin).toBe(MANAGER);
+    expect(JSON.stringify(authEvent.payload)).not.toContain(MANAGER);
+    expect(JSON.stringify(st().auditLogs)).not.toContain(`"${MANAGER}"`);
+    expect(buildSyncRequest(authEvent, cfg).url).toContain('/rpc/tchefood_authorize_manager');
+  });
+
+  it('recusados saem da fila, ficam guardados e voltam na ordem ao reenviar', () => {
+    login(KITCHEN);
+    st().setProductAvailable(product('101').id, false);
+    st().setProductAvailable(product('201').id, false);
+    st().setProductAvailable(product('101').id, true);
+    const all = [...st().outbox];
+    const [a, b] = all.slice(-3);
+    st().rejectSyncEvents([
+      { eventId: b!.id, status: 400, message: 'trava' },
+      { eventId: a!.id, status: 403, message: 'permissão' },
+    ]);
+    expect(st().outbox.map((e) => e.id)).toEqual(all.filter((e) => e !== a && e !== b).map((e) => e.id));
+    expect(st().syncRejected.map((r) => [r.event.id, r.status, r.message])).toEqual([
+      [a!.id, 403, 'permissão'],
+      [b!.id, 400, 'trava'],
+    ]);
+    st().retryRejectedSync();
+    expect(st().syncRejected).toEqual([]);
+    expect(st().outbox.slice(0, 2).map((e) => e.id)).toEqual([a!.id, b!.id]);
+    expect(st().outbox).toHaveLength(all.length);
   });
 
   it('audit_log de pedido sobe antes das atualizações daquele pedido (filas antigas)', () => {
     const t0 = '2026-11-09T19:00:00.000Z';
     const items = ev({ id: 'i', table: 'order_items', op: 'UPDATE', row_id: 'item1', payload: { id: 'item1', order_id: 'O1' }, created_at: t0 });
     const order = ev({ id: 'o', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' }, created_at: t0 });
-    const audit = ev({ id: 'a', table: 'audit_logs', row_id: 'L1', payload: { id: 'L1', order_id: 'O1' }, created_at: '2026-11-09T19:00:00.001Z' });
+    const grant = { authorized_by_manager_id: 'M1', action_type: 'DISCOUNT_APPLIED' };
+    const audit = ev({ id: 'a', table: 'audit_logs', row_id: 'L1', payload: { id: 'L1', order_id: 'O1', ...grant }, created_at: '2026-11-09T19:00:00.001Z' });
     const insert = ev({ id: 'n', table: 'orders', op: 'INSERT', row_id: 'O1', payload: { id: 'O1' }, created_at: t0 });
     const other = ev({ id: 'x', table: 'orders', op: 'UPDATE', row_id: 'O2', payload: { id: 'O2' }, created_at: t0 });
     expect(serverOrder([insert, items, order, audit]).map((e) => e.id)).toEqual(['n', 'a', 'i', 'o']);
     expect(serverOrder([order, other, audit]).map((e) => e.id)).toEqual(['o', 'x', 'a']);
     // Fila nova (autorização primeiro) com dois descontos seguidos: nada muda de lugar.
     const at = (sec: number) => `2026-11-09T19:0${sec}:00.000Z`;
-    const a1 = ev({ id: 'a1', table: 'audit_logs', payload: { order_id: 'O1' }, created_at: at(1) });
+    const a1 = ev({ id: 'a1', table: 'audit_logs', payload: { order_id: 'O1', ...grant }, created_at: at(1) });
     const u1 = ev({ id: 'u1', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' }, created_at: at(1) });
-    const a2 = ev({ id: 'a2', table: 'audit_logs', payload: { order_id: 'O1' }, created_at: at(2) });
+    const a2 = ev({ id: 'a2', table: 'audit_logs', payload: { order_id: 'O1', ...grant }, created_at: at(2) });
     const u2 = ev({ id: 'u2', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' }, created_at: at(2) });
     expect(serverOrder([a1, u1, a2, u2]).map((e) => e.id)).toEqual(['a1', 'u1', 'a2', 'u2']);
     // Fila antiga com dois descontos: cada autorização só passa a frente da própria mudança.
     expect(serverOrder([u1, a1, u2, a2]).map((e) => e.id)).toEqual(['a1', 'u1', 'a2', 'u2']);
     const catalog = ev({ id: 'c', table: 'audit_logs', payload: { order_id: null } });
     expect(serverOrder([order, catalog]).map((e) => e.id)).toEqual(['o', 'c']);
+    // Registro sem gerente (a volta dos 10%) não passa a frente da remoção: a ordem
+    // de gravação no banco decide qual registro de 10% é o último.
+    const removed = ev({ id: 'u', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1', charge_service_fee: false }, created_at: t0 });
+    const restored = ev({ id: 'r', table: 'audit_logs', payload: { order_id: 'O1', action_type: 'SERVICE_FEE_RESTORED', authorized_by_manager_id: null }, created_at: t0 });
+    expect(serverOrder([removed, restored]).map((e) => e.id)).toEqual(['u', 'r']);
   });
 
   it('o store enfileira a autorização antes do desconto e do cancelamento', () => {
