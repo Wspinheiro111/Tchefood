@@ -185,3 +185,12 @@ describe('cardápio AR: modelo de demonstração', () => {
     expect(Math.round(maxX * 200)).toBe(PIZZA_DEMO_DIAMETER_CM);
   });
 });
+
+describe('cardápio AR: fila da nuvem', () => {
+  it('evento de engajamento reenviado não vira UPDATE (a métrica é imutável no banco)', async () => {
+    const { buildSyncRequest } = await import('../lib/sync/supabaseSync');
+    const ev = { id: 'e1', table: 'ar_engagement_events' as const, op: 'INSERT' as const, row_id: 'r1', payload: { id: 'r1', kind: 'VIEW_3D' }, created_at: '2026-11-09T21:00:00.000Z' };
+    const req = buildSyncRequest(ev, { url: 'https://p.supabase.co', anonKey: 'a', accessToken: 'j' });
+    expect(req.headers.Prefer).toMatch(/ignore-duplicates/);
+  });
+});

@@ -10,6 +10,7 @@ import type { ArComponent, Product, ProductArModel } from '../../types';
 import { AR_DETAIL_MAX, AR_LABEL_MAX, AR_MAX_COMPONENTS, arEngagement, formatArSize, formatCm, scaleFactorFor } from '../../lib/ar/arModels';
 import { checkModelFile, readModelFile, storeModelFile } from '../../lib/ar/modelFiles';
 import { storagePath, uploadModelFile } from '../../lib/ar/modelUpload';
+import { needsRefresh, refreshDevice } from '../../lib/sync/supabaseSync';
 import { uuid } from '../../lib/ids';
 import { ModelViewer, type ModelInfo } from '../../components/ar/ModelViewer';
 import { Badge, Btn, Sheet, toast } from '../../components/ui';
@@ -21,9 +22,17 @@ const DAYS = 30;
 async function publishToCloud(model: ProductArModel, files: { glb?: Blob | null; usdz?: Blob | null } = {}): Promise<string | null> {
   const cloud = useTcheStore.getState().cloud;
   if (!cloud) return 'Conecte a loja à nuvem (aba Nuvem) para os celulares dos clientes abrirem o 3D.';
-  const target = { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token };
   const fetchFn = (u: string, init: { method: string; headers: Record<string, string>; body: Blob }) => fetch(u, init);
   try {
+    // Sem nada na fila, o laço de sincronização não renova o token: renova aqui antes do envio.
+    let accessToken = cloud.access_token;
+    if (needsRefresh(cloud.expires_at)) {
+      const t = await refreshDevice(cloud.url, cloud.anon_key, cloud.refresh_token, (u, init) => fetch(u, init));
+      const saved = useTcheStore.getState().setCloudSession({ ...cloud, ...t });
+      if (!saved.ok) return saved.error;
+      accessToken = t.access_token;
+    }
+    const target = { url: cloud.url, anonKey: cloud.anon_key, accessToken };
     let glb = model.glb_url;
     let usdz = model.usdz_url;
     if (glb.startsWith('idb:')) {
