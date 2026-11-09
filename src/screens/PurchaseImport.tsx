@@ -101,18 +101,18 @@ export function PurchaseImport() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded-2xl border border-slate-700 bg-surface p-4">
+      <div className="rounded-2xl border border-slate-200 bg-surface p-4">
         <div className="flex flex-wrap items-center gap-3">
           <div className="mr-auto">
             <h2 className="text-lg font-black">Entrada de nota de compra (XML)</h2>
-            <p className="text-sm text-slate-400">Envie o XML da NF-e do fornecedor. Os itens viram estoque e o custo vai para o CMV.</p>
+            <p className="text-sm text-slate-500">Envie o XML da NF-e do fornecedor. Os itens viram estoque e o custo vai para o CMV.</p>
           </div>
           <input ref={fileRef} type="file" accept=".xml,text/xml,application/xml" className="hidden" onChange={(e) => void onFile(e.target.files?.[0])} />
           <Btn variant="gold" disabled={!canImport} onClick={() => fileRef.current?.click()}><FileUp className="h-5 w-5" /> Enviar XML</Btn>
           <Btn variant="secondary" disabled={!canImport} onClick={() => load(sampleNfeXml(), 'exemplo.xml')}>XML de exemplo</Btn>
         </div>
-        {!canImport && <p className="mt-3 text-sm text-ouro">Só gerente ou proprietário pode dar entrada em nota de compra.</p>}
-        {error && <p className="mt-3 flex items-start gap-2 rounded-xl bg-brasa/15 p-3 text-sm text-rose-200"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> {error}</p>}
+        {!canImport && <p className="mt-3 text-sm text-brasa">Só gerente ou proprietário pode dar entrada em nota de compra.</p>}
+        {error && <p className="mt-3 flex items-start gap-2 rounded-xl bg-brasa/15 p-3 text-sm text-rose-700"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> {error}</p>}
       </div>
 
       {analysis && (
@@ -148,21 +148,21 @@ function Review({ analysis, fileName, drafts, patch, products, categories, onCan
   const blocked = analysis.blocker ?? (analysis.duplicate ? `Esta NF-e já foi importada em ${new Date(analysis.duplicate.imported_at).toLocaleString('pt-BR')}.` : null);
   return (
     <div className="space-y-3">
-      <div className="rounded-2xl border border-slate-700 bg-surface p-4 text-sm">
+      <div className="rounded-2xl border border-slate-200 bg-surface p-4 text-sm">
         <div className="flex flex-wrap items-start gap-3">
           <div className="mr-auto">
-            <div className="text-xs uppercase tracking-wide text-slate-400">Fornecedor {analysis.supplier ? '' : '(novo)'}</div>
+            <div className="text-xs uppercase tracking-wide text-slate-500">Fornecedor {analysis.supplier ? '' : '(novo)'}</div>
             <div className="text-lg font-bold">{nfe.supplier.trade_name ?? nfe.supplier.legal_name}</div>
-            <div className="text-slate-400">{nfe.supplier.legal_name} · {formatDoc(nfe.supplier.document)}{nfe.supplier.city ? ` · ${nfe.supplier.city}/${nfe.supplier.state ?? ''}` : ''}</div>
+            <div className="text-slate-500">{nfe.supplier.legal_name} · {formatDoc(nfe.supplier.document)}{nfe.supplier.city ? ` · ${nfe.supplier.city}/${nfe.supplier.state ?? ''}` : ''}</div>
           </div>
           <div className="text-right">
-            <div className="text-xs uppercase tracking-wide text-slate-400">NF-e nº {nfe.number} · série {nfe.series}</div>
+            <div className="text-xs uppercase tracking-wide text-slate-500">NF-e nº {nfe.number} · série {nfe.series}</div>
             <div className="text-2xl font-black tabular-nums">{formatBRL(nfe.totals.invoice_amount)}</div>
-            <div className="text-slate-400">{nfe.issued_at ? new Date(nfe.issued_at).toLocaleDateString('pt-BR') : 'sem data'} · {fileName}</div>
+            <div className="text-slate-500">{nfe.issued_at ? new Date(nfe.issued_at).toLocaleDateString('pt-BR') : 'sem data'} · {fileName}</div>
           </div>
         </div>
-        <div className="mt-2 font-mono text-xs text-slate-400">{formatAccessKey(nfe.access_key)}</div>
-        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-300">
+        <div className="mt-2 font-mono text-xs text-slate-500">{formatAccessKey(nfe.access_key)}</div>
+        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-700">
           <span>Produtos {formatBRL(nfe.totals.products_amount)}</span>
           {nfe.totals.discount_amount > 0 && <span>Desconto −{formatBRL(nfe.totals.discount_amount)}</span>}
           {nfe.totals.freight_amount > 0 && <span>Frete {formatBRL(nfe.totals.freight_amount)}</span>}
@@ -171,9 +171,9 @@ function Review({ analysis, fileName, drafts, patch, products, categories, onCan
           {nfe.authorization_protocol && <span>Protocolo {nfe.authorization_protocol}</span>}
         </div>
         {nfe.warnings.map((w) => (
-          <p key={w} className="mt-2 flex items-start gap-2 rounded-xl bg-ouro/15 p-2 text-ouro"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> {w}</p>
+          <p key={w} className="mt-2 flex items-start gap-2 rounded-xl bg-ouro/15 p-2 text-brasa"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> {w}</p>
         ))}
-        {blocked && <p className="mt-2 flex items-start gap-2 rounded-xl bg-brasa/15 p-3 font-bold text-rose-200"><Ban className="mt-0.5 h-4 w-4 shrink-0" /> {blocked}</p>}
+        {blocked && <p className="mt-2 flex items-start gap-2 rounded-xl bg-brasa/15 p-3 font-bold text-rose-700"><Ban className="mt-0.5 h-4 w-4 shrink-0" /> {blocked}</p>}
       </div>
 
       {!blocked && analysis.items.map(({ item, suggestion, factor_source }) => {
@@ -183,11 +183,11 @@ function Review({ analysis, fileName, drafts, patch, products, categories, onCan
         const linked = products.find((p) => p.id === d.product_id);
         const stockUnit = d.action === 'LINK' ? linked?.unit ?? '' : d.unit;
         return (
-          <div key={item.n_item} className={`rounded-2xl border bg-surface p-4 text-sm ${d.action === 'IGNORE' ? 'border-dashed border-slate-700 opacity-70' : 'border-slate-700'}`}>
+          <div key={item.n_item} className={`rounded-2xl border bg-surface p-4 text-sm ${d.action === 'IGNORE' ? 'border-dashed border-slate-200 opacity-70' : 'border-slate-200'}`}>
             <div className="flex flex-wrap items-start gap-2">
               <div className="mr-auto min-w-0">
                 <div className="font-bold">{item.n_item}. {item.description}</div>
-                <div className="text-xs text-slate-400">
+                <div className="text-xs text-slate-500">
                   Cód. {item.supplier_code || '—'}{item.barcode ? ` · EAN ${item.barcode}` : ''}{item.ncm ? ` · NCM ${item.ncm}` : ''}{item.cfop ? ` · CFOP ${item.cfop}` : ''}
                 </div>
               </div>
@@ -203,7 +203,7 @@ function Review({ analysis, fileName, drafts, patch, products, categories, onCan
                 ['CREATE', 'Criar produto', PackagePlus],
                 ['IGNORE', 'Ignorar', Ban],
               ] as const).map(([key, label, Icon]) => (
-                <button key={key} onClick={() => patch(item.n_item, { action: key })} className={`flex min-h-touch items-center justify-center gap-1 rounded-xl text-xs font-bold sm:text-sm ${d.action === key ? 'bg-ouro text-slate-950' : 'bg-base text-slate-300'}`}>
+                <button key={key} onClick={() => patch(item.n_item, { action: key })} className={`flex min-h-touch items-center justify-center gap-1 rounded-xl text-xs font-bold sm:text-sm ${d.action === key ? 'bg-ouro text-slate-950' : 'bg-base text-slate-700'}`}>
                   <Icon className="h-4 w-4" /> {label}
                 </button>
               ))}
@@ -211,22 +211,22 @@ function Review({ analysis, fileName, drafts, patch, products, categories, onCan
 
             {d.action === 'LINK' && (
               <div className="mt-3">
-                <select value={d.product_id} onChange={(e) => patch(item.n_item, { product_id: e.target.value })} className="min-h-touch w-full rounded-xl border border-slate-600 bg-base px-3">
+                <select value={d.product_id} onChange={(e) => patch(item.n_item, { product_id: e.target.value })} className="min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3">
                   <option value="">Escolha o produto…</option>
                   {products.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.unit}) · saldo {qty(p.stock_quantity)}</option>)}
                 </select>
-                {suggestion && suggestion.product_id === d.product_id && <Badge className="mt-2 bg-stone/20 text-stone">{VIA_LABEL[suggestion.via]}</Badge>}
+                {suggestion && suggestion.product_id === d.product_id && <Badge className="mt-2 bg-stone/20 text-verde">{VIA_LABEL[suggestion.via]}</Badge>}
               </div>
             )}
 
             {d.action === 'CREATE' && (
               <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_6rem_12rem]">
-                <input value={d.name} onChange={(e) => patch(item.n_item, { name: e.target.value })} placeholder="Nome do produto" className="min-h-touch rounded-xl border border-slate-600 bg-base px-3" />
-                <input value={d.unit} onChange={(e) => patch(item.n_item, { unit: e.target.value.toUpperCase() })} placeholder="UN" aria-label="Unidade de estoque" className="min-h-touch rounded-xl border border-slate-600 bg-base px-3" />
-                <select value={d.category_id} onChange={(e) => patch(item.n_item, { category_id: e.target.value })} aria-label="Categoria" className="min-h-touch rounded-xl border border-slate-600 bg-base px-3">
+                <input value={d.name} onChange={(e) => patch(item.n_item, { name: e.target.value })} placeholder="Nome do produto" className="min-h-touch rounded-xl border border-slate-300 bg-base px-3" />
+                <input value={d.unit} onChange={(e) => patch(item.n_item, { unit: e.target.value.toUpperCase() })} placeholder="UN" aria-label="Unidade de estoque" className="min-h-touch rounded-xl border border-slate-300 bg-base px-3" />
+                <select value={d.category_id} onChange={(e) => patch(item.n_item, { category_id: e.target.value })} aria-label="Categoria" className="min-h-touch rounded-xl border border-slate-300 bg-base px-3">
                   {categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
-                <p className="text-xs text-slate-400 sm:col-span-3">Entra sem preço e fora da venda. Defina o preço e libere quando for vender.</p>
+                <p className="text-xs text-slate-500 sm:col-span-3">Entra sem preço e fora da venda. Defina o preço e libere quando for vender.</p>
               </div>
             )}
 
@@ -234,13 +234,13 @@ function Review({ analysis, fileName, drafts, patch, products, categories, onCan
               <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
                 <label className="flex items-center gap-2">
                   1 {item.commercial_unit} =
-                  <input value={d.factor} onChange={(e) => patch(item.n_item, { factor: e.target.value })} inputMode="decimal" aria-label="Fator de embalagem" className="min-h-touch w-24 rounded-xl border border-slate-600 bg-base px-3 text-right tabular-nums" />
+                  <input value={d.factor} onChange={(e) => patch(item.n_item, { factor: e.target.value })} inputMode="decimal" aria-label="Fator de embalagem" className="min-h-touch w-24 rounded-xl border border-slate-300 bg-base px-3 text-right tabular-nums" />
                   {stockUnit || 'un. de estoque'}
                 </label>
-                {factor_source === 'INVOICE' && <Badge className="bg-slate-700">fator pela nota</Badge>}
-                {factor_source === 'SUPPLIER_LINK' && <Badge className="bg-slate-700">fator da última compra</Badge>}
-                <span className="ml-auto tabular-nums text-slate-300">
-                  Entra <b className="text-white">{qty(stockQty)} {stockUnit}</b> a <b className="text-white">{unitCost(unitCostOf(item.landed_amount, stockQty))}</b>
+                {factor_source === 'INVOICE' && <Badge className="bg-slate-200">fator pela nota</Badge>}
+                {factor_source === 'SUPPLIER_LINK' && <Badge className="bg-slate-200">fator da última compra</Badge>}
+                <span className="ml-auto tabular-nums text-slate-700">
+                  Entra <b className="text-slate-900">{qty(stockQty)} {stockUnit}</b> a <b className="text-slate-900">{unitCost(unitCostOf(item.landed_amount, stockQty))}</b>
                 </span>
               </div>
             )}
@@ -261,15 +261,15 @@ function History() {
   const suppliers = useTcheStore((s) => s.suppliers);
   if (!invoices.length) return null;
   return (
-    <div className="scroll-thin overflow-x-auto rounded-2xl border border-slate-700 bg-surface">
-      <div className="px-4 pt-3 text-xs font-semibold uppercase tracking-wide text-slate-400">Notas lançadas</div>
+    <div className="scroll-thin overflow-x-auto rounded-2xl border border-slate-200 bg-surface">
+      <div className="px-4 pt-3 text-xs font-semibold uppercase tracking-wide text-slate-500">Notas lançadas</div>
       <table className="w-full min-w-[560px] text-sm">
-        <thead className="text-left text-slate-400"><tr><th className="p-3">Lançada em</th><th className="p-3">Fornecedor</th><th className="p-3">NF-e</th><th className="p-3 text-right">Itens</th><th className="p-3 text-right">Valor</th><th className="p-3 text-right">No estoque</th></tr></thead>
+        <thead className="text-left text-slate-500"><tr><th className="p-3">Lançada em</th><th className="p-3">Fornecedor</th><th className="p-3">NF-e</th><th className="p-3 text-right">Itens</th><th className="p-3 text-right">Valor</th><th className="p-3 text-right">No estoque</th></tr></thead>
         <tbody>
           {invoices.map((i) => {
             const s = suppliers.find((x) => x.id === i.supplier_id);
             return (
-              <tr key={i.id} className="border-t border-slate-700">
+              <tr key={i.id} className="border-t border-slate-200">
                 <td className="p-3">{new Date(i.imported_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' })}</td>
                 <td className="p-3">{s?.trade_name ?? s?.legal_name ?? '?'}</td>
                 <td className="p-3">{i.number}/{i.series}</td>
@@ -294,14 +294,14 @@ function StockList() {
   const totalCents = rows.reduce((acc, p) => acc + toCents(Math.max(0, p.stock_quantity) * preciseUnitCost(p, movements)), 0);
   const total = totalCents / 100;
   return (
-    <div className="scroll-thin overflow-x-auto rounded-2xl border border-slate-700 bg-surface">
-      <div className="flex justify-between px-4 pt-3 text-xs font-semibold uppercase tracking-wide text-slate-400"><span>Estoque e custo médio</span><span>Valor em estoque {formatBRL(total)}</span></div>
+    <div className="scroll-thin overflow-x-auto rounded-2xl border border-slate-200 bg-surface">
+      <div className="flex justify-between px-4 pt-3 text-xs font-semibold uppercase tracking-wide text-slate-500"><span>Estoque e custo médio</span><span>Valor em estoque {formatBRL(total)}</span></div>
       <table className="w-full min-w-[480px] text-sm">
-        <thead className="text-left text-slate-400"><tr><th className="p-3">Produto</th><th className="p-3 text-right">Saldo</th><th className="p-3 text-right">Custo médio</th><th className="p-3 text-right">Preço de venda</th></tr></thead>
+        <thead className="text-left text-slate-500"><tr><th className="p-3">Produto</th><th className="p-3 text-right">Saldo</th><th className="p-3 text-right">Custo médio</th><th className="p-3 text-right">Preço de venda</th></tr></thead>
         <tbody>
           {rows.map((p) => (
-            <tr key={p.id} className="border-t border-slate-700">
-              <td className="p-3">{p.name}{!p.available && <Badge className="ml-2 bg-slate-700">fora da venda</Badge>}</td>
+            <tr key={p.id} className="border-t border-slate-200">
+              <td className="p-3">{p.name}{!p.available && <Badge className="ml-2 bg-slate-200">fora da venda</Badge>}</td>
               <td className="p-3 text-right tabular-nums">{qty(p.stock_quantity)} {p.unit}</td>
               <td className="p-3 text-right tabular-nums">{unitCost(preciseUnitCost(p, movements))}</td>
               <td className="p-3 text-right tabular-nums">{p.price > 0 ? formatBRL(p.price) : '—'}</td>

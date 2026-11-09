@@ -48,8 +48,8 @@ export function FichaRapidaScreen() {
   return (
     <div className="mx-auto max-w-5xl px-3 pb-10 pt-3">
       <div className="mb-3 grid grid-cols-2 gap-2">
-        <button onClick={() => setTab('sell')} className={`flex min-h-touch-lg items-center justify-center gap-2 rounded-xl font-black ${tab === 'sell' ? 'bg-brasa text-white' : 'bg-surface text-slate-300'}`}><Ticket className="h-5 w-5" /> Vender fichas</button>
-        <button onClick={() => setTab('redeem')} className={`flex min-h-touch-lg items-center justify-center gap-2 rounded-xl font-black ${tab === 'redeem' ? 'bg-brasa text-white' : 'bg-surface text-slate-300'}`}><ScanLine className="h-5 w-5" /> Validar retirada</button>
+        <button onClick={() => setTab('sell')} className={`flex min-h-touch-lg items-center justify-center gap-2 rounded-xl font-black ${tab === 'sell' ? 'bg-brasa text-white' : 'bg-surface text-slate-700'}`}><Ticket className="h-5 w-5" /> Vender fichas</button>
+        <button onClick={() => setTab('redeem')} className={`flex min-h-touch-lg items-center justify-center gap-2 rounded-xl font-black ${tab === 'redeem' ? 'bg-brasa text-white' : 'bg-surface text-slate-700'}`}><ScanLine className="h-5 w-5" /> Validar retirada</button>
       </div>
       {tab === 'sell' ? <SellPanel /> : <RedeemPanel />}
     </div>
@@ -119,18 +119,18 @@ function SellPanel() {
       <div className="min-w-0">
         <div className="scroll-thin -mx-3 mb-3 flex gap-2 overflow-x-auto px-3 pb-1">
           {cats.map((c) => (
-            <button key={c.id} onClick={() => setCat(c.id)} className={`flex min-h-touch shrink-0 items-center gap-2 rounded-full px-4 font-semibold ${activeCat === c.id ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}>
+            <button key={c.id} onClick={() => setCat(c.id)} className={`flex min-h-touch shrink-0 items-center gap-2 rounded-full px-4 font-semibold ${activeCat === c.id ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}>
               <CategoryIcon name={c.icon_name} className="h-4 w-4" /> {c.name}
             </button>
           ))}
         </div>
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
           {list.map((p) => (
-            <button key={p.id} onClick={() => tap(p)} disabled={!p.available} className="flex min-h-[88px] flex-col justify-between rounded-2xl border border-slate-700 bg-surface p-3 text-left active:bg-slate-700 disabled:opacity-40">
+            <button key={p.id} onClick={() => tap(p)} disabled={!p.available} className="flex min-h-[88px] flex-col justify-between rounded-2xl border border-slate-200 bg-surface p-3 text-left active:bg-slate-200 disabled:opacity-40">
               <span className="line-clamp-2 font-bold leading-tight">{p.name}</span>
               <span className="flex items-center justify-between">
-                <span className="text-lg font-black tabular-nums text-ouro">{formatBRL(p.price)}</span>
-                {needsSheet(p) && <Badge className="bg-slate-700">opções</Badge>}
+                <span className="text-lg font-black tabular-nums text-brasa">{formatBRL(p.price)}</span>
+                {needsSheet(p) && <Badge className="bg-slate-200">opções</Badge>}
               </span>
             </button>
           ))}
@@ -140,7 +140,7 @@ function SellPanel() {
       </div>
 
       <aside className="h-fit rounded-2xl border-2 border-ouro/60 bg-surface p-3 lg:sticky lg:top-[72px]">
-        <div className="mb-2 flex items-center justify-between font-black"><span>Venda de balcão</span><span className="text-sm text-slate-400">{units} ficha(s)</span></div>
+        <div className="mb-2 flex items-center justify-between font-black"><span>Venda de balcão</span><span className="text-sm text-slate-500">{units} ficha(s)</span></div>
         {cart.length === 0 ? (
           <p className="py-6 text-center text-sm text-slate-500">Toque nos produtos. Cada unidade sai numa ficha separada.</p>
         ) : (
@@ -149,16 +149,16 @@ function SellPanel() {
               <li key={l.key} className="flex items-center gap-2 rounded-xl bg-base p-2">
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-semibold">{l.label}</div>
-                  <div className="text-xs text-slate-400">{formatBRL(computeItemTotal(l.quantity, l.unitTotal, 0))}</div>
+                  <div className="text-xs text-slate-500">{formatBRL(computeItemTotal(l.quantity, l.unitTotal, 0))}</div>
                 </div>
-                <button aria-label="Menos" onClick={() => setQty(l.key, l.quantity - 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700">{l.quantity === 1 ? <Trash2 className="h-4 w-4" /> : <Minus className="h-5 w-5" />}</button>
+                <button aria-label="Menos" onClick={() => setQty(l.key, l.quantity - 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-200">{l.quantity === 1 ? <Trash2 className="h-4 w-4" /> : <Minus className="h-5 w-5" />}</button>
                 <span className="w-6 text-center font-bold">{l.quantity}</span>
-                <button aria-label="Mais" onClick={() => setQty(l.key, l.quantity + 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700"><Plus className="h-5 w-5" /></button>
+                <button aria-label="Mais" onClick={() => setQty(l.key, l.quantity + 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-200"><Plus className="h-5 w-5" /></button>
               </li>
             ))}
           </ul>
         )}
-        <div className="mb-3 flex items-end justify-between"><span className="text-slate-400">Total</span><span className="text-3xl font-black tabular-nums text-ouro">{formatBRL(total)}</span></div>
+        <div className="mb-3 flex items-end justify-between"><span className="text-slate-500">Total</span><span className="text-3xl font-black tabular-nums text-brasa">{formatBRL(total)}</span></div>
         <Btn block size="lg" variant="success" disabled={cart.length === 0} onClick={goPay}>Cobrar {formatBRL(total)}</Btn>
         <p className="mt-2 text-center text-[11px] text-slate-500">Sem os 10% do garçom. As fichas só são impressas com o pagamento aprovado.</p>
       </aside>
@@ -256,9 +256,9 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
   if (order.status === 'CLOSED') {
     return (
       <div className="mx-auto max-w-xl space-y-3 text-center">
-        <CheckCircle2 className="mx-auto h-16 w-16 text-stone" />
+        <CheckCircle2 className="mx-auto h-16 w-16 text-verde" />
         <div className="text-2xl font-black">Pago · {formatBRL(order.total_amount)}</div>
-        <p className="text-slate-400">{tickets.length} ficha(s) impressas. Destaque e entregue ao cliente.</p>
+        <p className="text-slate-500">{tickets.length} ficha(s) impressas. Destaque e entregue ao cliente.</p>
         <div className="grid grid-cols-2 gap-2">
           <Btn variant="secondary" size="lg" onClick={() => { if (tickets.length) printTickets(tickets, chassis); else finish(null, null); }}><Printer className="h-5 w-5" /> {tickets.length ? 'Reimprimir fichas' : 'Imprimir fichas'}</Btn>
           <Btn size="lg" variant="success" onClick={onDone}>Nova venda</Btn>
@@ -271,7 +271,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
   if (order.status === 'CANCELED') {
     return (
       <div className="mx-auto max-w-xl space-y-3 text-center">
-        <XCircle className="mx-auto h-16 w-16 text-rose-400" />
+        <XCircle className="mx-auto h-16 w-16 text-rose-600" />
         <div className="text-xl font-black">Venda cancelada</div>
         <Btn size="lg" onClick={onDone}>Nova venda</Btn>
       </div>
@@ -280,33 +280,33 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
 
   return (
     <div className="mx-auto max-w-xl">
-      <div className="mb-3 rounded-2xl border border-slate-700 bg-surface p-3">
+      <div className="mb-3 rounded-2xl border border-slate-200 bg-surface p-3">
         <div className="mb-2 font-black">Fichas desta venda</div>
         <ul className="space-y-1 text-sm">
           {items.map((i) => (
             <li key={i.id} className="flex justify-between gap-2"><span>{i.quantity}x {s.products.find((p) => p.id === i.product_id)?.name}{i.meat_doneness ? ` · ${i.meat_doneness}` : ''}{i.notes ? ` · ${i.notes}` : ''}</span><span className="tabular-nums">{formatBRL(i.total_item_price)}</span></li>
           ))}
         </ul>
-        <div className="mt-2 flex justify-between border-t border-slate-700 pt-2 text-xl font-black"><span>Total</span><span className="tabular-nums text-ouro">{formatBRL(order.remaining_balance)}</span></div>
+        <div className="mt-2 flex justify-between border-t border-slate-200 pt-2 text-xl font-black"><span>Total</span><span className="tabular-nums text-brasa">{formatBRL(order.remaining_balance)}</span></div>
       </div>
 
       <div className="mb-3 grid grid-cols-4 gap-2">
         {METHODS.map((m) => (
-          <button key={m.key} onClick={() => setMethod(m.key)} className={`flex min-h-touch-lg flex-col items-center justify-center gap-1 rounded-xl text-sm font-bold ${method === m.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}><m.icon className="h-5 w-5" /> {m.label}</button>
+          <button key={m.key} onClick={() => setMethod(m.key)} className={`flex min-h-touch-lg flex-col items-center justify-center gap-1 rounded-xl text-sm font-bold ${method === m.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}><m.icon className="h-5 w-5" /> {m.label}</button>
         ))}
       </div>
       {method === 'CASH' ? (
-        <input inputMode="decimal" value={cashGiven} onChange={(e) => setCashGiven(e.target.value.replace(/[^\d.,]/g, ''))} placeholder="Valor recebido (para troco)" className="mb-3 min-h-touch-lg w-full rounded-xl border border-slate-600 bg-base px-3 text-lg outline-none focus:border-ouro" />
+        <input inputMode="decimal" value={cashGiven} onChange={(e) => setCashGiven(e.target.value.replace(/[^\d.,]/g, ''))} placeholder="Valor recebido (para troco)" className="mb-3 min-h-touch-lg w-full rounded-xl border border-slate-300 bg-base px-3 text-lg outline-none focus:border-ouro" />
       ) : (
         <div className="mb-3 grid grid-cols-2 gap-2">
-          <button onClick={() => setChassis('STONE')} className={`min-h-touch-lg rounded-xl font-bold ${chassis === 'STONE' ? 'bg-stone text-slate-950' : 'bg-base'}`}>SmartPOS Stone</button>
+          <button onClick={() => setChassis('STONE')} className={`min-h-touch-lg rounded-xl font-bold ${chassis === 'STONE' ? 'bg-stone text-white' : 'bg-base'}`}>SmartPOS Stone</button>
           <button onClick={() => setChassis('PAGBANK')} className={`min-h-touch-lg rounded-xl font-bold ${chassis === 'PAGBANK' ? 'bg-pagbank text-slate-950' : 'bg-base'}`}>SmartPOS PagBank</button>
         </div>
       )}
 
       {hold ? (
         <div className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
-          <p className="mb-2 font-bold text-ouro">⚠️ {hold.reason}</p>
+          <p className="mb-2 font-bold text-brasa">⚠️ {hold.reason}</p>
           <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de tentar de novo.</p>
           <div className="grid gap-2">
             <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
@@ -359,7 +359,7 @@ function PendingCounterSales({ onResume }: { onResume: (id: string) => void }) {
   if (pending.length === 0) return null;
   return (
     <div className="mt-4 rounded-2xl border border-ouro/50 bg-ouro/10 p-3">
-      <div className="mb-2 text-sm font-black text-ouro">Vendas aguardando pagamento</div>
+      <div className="mb-2 text-sm font-black text-brasa">Vendas aguardando pagamento</div>
       {pending.map((o) => (
         <button key={o.id} onClick={() => onResume(o.id)} className="mb-1 flex min-h-touch w-full items-center justify-between rounded-xl bg-base px-3 text-sm">
           <span>{new Date(o.opened_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</span>
@@ -375,7 +375,7 @@ function RecentCounterSales() {
   const tickets = useTcheStore((s) => s.eventTickets);
   if (closed.length === 0) return null;
   return (
-    <div className="mt-4 rounded-2xl border border-slate-700 bg-surface p-3">
+    <div className="mt-4 rounded-2xl border border-slate-200 bg-surface p-3">
       <div className="mb-2 text-sm font-black">Últimas vendas de balcão</div>
       {closed.map((o) => {
         const list = tickets.filter((t) => t.order_id === o.id);
@@ -384,7 +384,7 @@ function RecentCounterSales() {
           <div key={o.id} className="mb-1 flex items-center gap-2 rounded-xl bg-base px-3 py-2 text-sm">
             <span className="flex-1">{new Date(o.closed_at ?? o.opened_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })} · {formatBRL(o.total_amount)} · {used}/{list.length} retiradas</span>
             {list.length > 0 && (
-              <button onClick={() => printTickets(list.filter((t) => !t.redeemed && !t.voided_at), useTerminalBus.getState().chassis)} className="flex min-h-touch items-center gap-1 rounded-lg bg-slate-700 px-3 font-bold"><Printer className="h-4 w-4" /> Reimprimir</button>
+              <button onClick={() => printTickets(list.filter((t) => !t.redeemed && !t.voided_at), useTerminalBus.getState().chassis)} className="flex min-h-touch items-center gap-1 rounded-lg bg-slate-200 px-3 font-bold"><Printer className="h-4 w-4" /> Reimprimir</button>
             )}
           </div>
         );
@@ -421,7 +421,7 @@ function RedeemPanel() {
           onChange={(e) => setCode(e.target.value.toUpperCase())}
           onKeyDown={(e) => e.key === 'Enter' && redeem()}
           placeholder="Leia o QR ou digite o código da ficha"
-          className="min-h-touch-lg flex-1 rounded-xl border border-slate-600 bg-surface px-3 font-mono text-lg uppercase tracking-wider outline-none focus:border-ouro"
+          className="min-h-touch-lg flex-1 rounded-xl border border-slate-300 bg-surface px-3 font-mono text-lg uppercase tracking-wider outline-none focus:border-ouro"
         />
         <Btn size="lg" variant="gold" onClick={redeem}><ScanLine className="h-5 w-5" /> Validar</Btn>
       </div>
@@ -442,7 +442,7 @@ function RedeemPanel() {
           )}
         </div>
       )}
-      <p className="text-center text-sm text-slate-400">Hoje: {redeemed} de {today.length} ficha(s) retiradas.</p>
+      <p className="text-center text-sm text-slate-500">Hoje: {redeemed} de {today.length} ficha(s) retiradas.</p>
     </div>
   );
 }

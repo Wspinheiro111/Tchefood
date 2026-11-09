@@ -1,6 +1,6 @@
 -- =============================================================================
 -- Tchê Food — cardápio em realidade aumentada (3D por produto)
--- Aplicar depois de db/schema_autorizacao.sql. Idempotente: pode rodar de novo.
+-- Aplicar depois de db/schema_gerente_nuvem.sql. Idempotente: pode rodar de novo.
 --
 --  * product_ar_models: um modelo 3D (GLB + USDZ opcional) por produto, com o fator
 --    de escala para o tamanho real e as etiquetas dos itens do prato (components).

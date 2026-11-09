@@ -31,11 +31,11 @@ export function QrMenuScreen() {
     <div className="mx-auto grid max-w-5xl gap-6 px-3 pb-10 pt-3 lg:grid-cols-[1fr_380px]">
       <div className="order-2 lg:order-1">
         <h2 className="mb-2 text-xl font-black">Cardápio Digital QR Code na Mesa</h2>
-        <p className="mb-3 text-sm text-slate-400">
+        <p className="mb-3 text-sm text-slate-500">
           Cada mesa tem um QR Code único (<code>qr_code_token</code>). Escolha qual QR o cliente está lendo. Os pedidos caem direto no KDS e na comanda do garçom com <code>origin = 'QRCODE_TABLE'</code>.
         </p>
         <label className="mb-1 block text-sm font-semibold">QR Code lido</label>
-        <select value={tableId} onChange={(e) => setTableId(e.target.value)} className="mb-4 min-h-touch w-full rounded-xl border border-slate-600 bg-surface px-3 text-lg">
+        <select value={tableId} onChange={(e) => setTableId(e.target.value)} className="mb-4 min-h-touch w-full rounded-xl border border-slate-300 bg-surface px-3 text-lg">
           {sorted.map((t) => (
             <option key={t.id} value={t.id}>{t.label} · {t.area}</option>
           ))}
@@ -45,15 +45,15 @@ export function QrMenuScreen() {
             <div className="rounded-xl bg-white p-2"><QrCode value={`https://tche.food/m/${table.qr_code_token}`} size={128} /></div>
             <div className="text-sm">
               <div className="text-lg font-bold">{table.label}</div>
-              <div className="break-all font-mono text-xs text-slate-400">tche.food/m/{table.qr_code_token}</div>
-              <div className="mt-2 text-xs text-slate-400">Adesivo para colar na mesa</div>
+              <div className="break-all font-mono text-xs text-slate-500">tche.food/m/{table.qr_code_token}</div>
+              <div className="mt-2 text-xs text-slate-500">Adesivo para colar na mesa</div>
             </div>
           </div>
         )}
       </div>
 
       <div className="order-1 mx-auto w-full max-w-[380px] lg:order-2">
-        <div className="rounded-[2.5rem] border-[10px] border-slate-950 bg-slate-950 shadow-2xl">
+        <div className="rounded-[2.5rem] border-[10px] border-slate-200 bg-white shadow-2xl">
           <div className="mx-auto mb-1 h-5 w-28 rounded-b-xl bg-black" />
           <div className="h-[720px] overflow-hidden rounded-[1.8rem] bg-slate-50 text-slate-900">
             {table ? <CustomerPhone key={table.id} tableId={table.id} /> : null}
@@ -232,7 +232,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
               {table.status === 'WAITING_BILL' ? (
                 <div className="mt-2 flex min-h-touch-lg items-center justify-center gap-2 rounded-xl bg-amber-100 font-bold text-amber-800"><BellRing className="h-5 w-5" /> Garçom a caminho com a maquininha</div>
               ) : (
-                <button onClick={callBill} disabled={table.status !== 'OCCUPIED'} className="mt-2 flex min-h-touch-lg w-full items-center justify-center gap-2 rounded-xl bg-slate-900 font-black text-white disabled:opacity-40">
+                <button onClick={callBill} disabled={table.status !== 'OCCUPIED'} className="mt-2 flex min-h-touch-lg w-full items-center justify-center gap-2 rounded-xl bg-verde font-black text-white disabled:opacity-40">
                   <Receipt className="h-5 w-5" /> Pedir a Conta / Chamar Maquininha
                 </button>
               )}
@@ -256,7 +256,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
       )}
 
       {selected && (
-        <div className="text-slate-100">
+        <div className="text-slate-900">
           <ProductSheet product={selected} onClose={() => setSelected(null)} onConfirm={addToCart} confirmLabel="Adicionar" audience="customer" />
         </div>
       )}

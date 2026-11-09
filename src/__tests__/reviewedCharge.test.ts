@@ -78,7 +78,10 @@ describe('cobrança incerta aprovada na maquininha', () => {
     expect(log).toMatchObject({ order_id: id, action_type: 'CHARGE_CONFIRMED_MANUALLY', amount_impact: amount, reason: MANAGER.reason });
     expect(log.authorized_by_manager_id).toBe(st().staff.find((u) => u.pin_code === '9999')!.id);
     expect(log.metadata).toMatchObject({ payment_id: r.data.payment.id, nsu: '004512', authorization_code: 'A1B2C3', review_code: 'WRAPPER_EXCEPTION' });
-    expect(st().outbox.some((e) => e.table === 'audit_logs' && (e.payload as { id: string }).id === log.id)).toBe(true);
+    // Sobe com o PIN, para o servidor conferir (tchefood_authorize_manager), depois do pagamento.
+    const queuedLog = st().outbox.findIndex((e) => e.table === 'audit_logs' && (e.payload as { id: string }).id === log.id);
+    expect(st().outbox[queuedLog]!.manager_pin).toBe('9999');
+    expect(st().outbox.findIndex((e) => e.table === 'payments' && e.row_id === r.data.payment.id)).toBeLessThan(queuedLog);
     expect(whatsappAlertText(log, st().staff, st().tables, st().orders)).toContain('NSU 004512');
   });
 

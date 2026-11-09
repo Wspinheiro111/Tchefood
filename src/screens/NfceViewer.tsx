@@ -22,7 +22,7 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
   if (!order || !doc) {
     return (
       <Sheet open onClose={onClose} title="NFC-e">
-        <p className="text-slate-400">A NFC-e é gerada quando a conta é totalmente liquidada.</p>
+        <p className="text-slate-500">A NFC-e é gerada quando a conta é totalmente liquidada.</p>
       </Sheet>
     );
   }
@@ -54,7 +54,7 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
       open
       wide
       onClose={onClose}
-      title={<span className="flex items-center gap-2"><Receipt className="h-5 w-5 text-stone" /> NFC-e nº {doc.payload.numero} · {table?.label}</span>}
+      title={<span className="flex items-center gap-2"><Receipt className="h-5 w-5 text-verde" /> NFC-e nº {doc.payload.numero} · {table?.label}</span>}
       footer={
         <div className="grid grid-cols-2 gap-2">
           <Btn variant="gold" onClick={printDanfe}><Printer className="h-5 w-5" /> Imprimir DANFE na bobina</Btn>
@@ -65,18 +65,18 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
       <div className="mb-3 rounded-xl bg-base p-3 text-xs">
         <div><b>Chave de acesso:</b> <span className="font-mono">{formatAccessKey(doc.access_key)}</span></div>
         <div><b>Protocolo SEFAZ-RS:</b> {doc.protocol} · <b>Status:</b> {order.nfce_status} (homologação)</div>
-        <div className="break-all"><b>QR consulta:</b> {doc.qr_url}{!qrValid && <b className="text-rose-300"> (inválido para esta nota)</b>}</div>
+        <div className="break-all"><b>QR consulta:</b> {doc.qr_url}{!qrValid && <b className="text-rose-600"> (inválido para esta nota)</b>}</div>
       </div>
       <div className="mb-3 grid grid-cols-2 gap-2">
         <button onClick={() => setTab('danfe')} className={`min-h-touch rounded-xl font-bold ${tab === 'danfe' ? 'bg-brasa' : 'bg-base'}`}>DANFE 58mm</button>
         <button onClick={() => setTab('json')} className={`flex min-h-touch items-center justify-center gap-1 rounded-xl font-bold ${tab === 'json' ? 'bg-brasa' : 'bg-base'}`}><FileJson className="h-4 w-4" /> Payload Focus NFe</button>
       </div>
       {tab === 'danfe' ? (
-        <div className="flex justify-center rounded-xl bg-slate-900 py-4">
+        <div className="flex justify-center rounded-xl bg-slate-50 py-4">
           <ThermalPaper job={{ title: 'DANFE', lines: danfe.top }} qr={doc.qr_url} footer={danfe.bottom} />
         </div>
       ) : (
-        <pre className="scroll-thin max-h-[55vh] overflow-auto rounded-xl bg-black p-3 text-[11px] leading-4 text-emerald-300">{json}</pre>
+        <pre className="scroll-thin max-h-[55vh] overflow-auto rounded-xl border border-slate-200 bg-slate-50 p-3 text-[11px] leading-4 text-emerald-800">{json}</pre>
       )}
     </Sheet>
   );

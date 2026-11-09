@@ -71,7 +71,7 @@ export function ArAdmin() {
   return (
     <div className="space-y-3">
       <Panel title={<span className="flex items-center gap-2"><Rotate3d className="h-5 w-5" /> Cardápio em realidade aumentada</span>}>
-        <p className="mb-3 text-sm text-slate-400">
+        <p className="mb-3 text-sm text-slate-500">
           O cliente toca no prato pelo QR da mesa, vê em 3D, coloca na mesa no tamanho real e abre os itens que vêm nele. Funciona no navegador do Android e do iPhone, sem instalar app.
           Cada prato precisa do seu modelo 3D (.glb): veja em <b>docs/cardapio-ar.md</b> como fazer pelo celular.
         </p>
@@ -84,7 +84,7 @@ export function ArAdmin() {
 
       <Panel title={`Pratos (${models.filter((m) => m.active).length} com 3D ativo)`}>
         <TextInput placeholder="Buscar por nome ou código" value={q} onChange={(e) => setQ(e.target.value)} className="mb-3" />
-        <div className="divide-y divide-slate-700 rounded-xl bg-base">
+        <div className="divide-y divide-slate-200 rounded-xl bg-base">
           {list.map((p) => {
             const m = models.find((x) => x.product_id === p.id);
             const st = byProduct.get(p.id);
@@ -94,12 +94,12 @@ export function ArAdmin() {
                 <div className="min-w-0 flex-1">
                   <div className="font-bold">
                     {p.name}
-                    {m && (m.active ? <Badge className="ml-2 bg-stone text-slate-950">3D ativo</Badge> : <Badge className="ml-2 bg-slate-600 text-white">3D desligado</Badge>)}
+                    {m && (m.active ? <Badge className="ml-2 bg-stone text-white">3D ativo</Badge> : <Badge className="ml-2 bg-slate-200 text-slate-700">3D desligado</Badge>)}
                     {m && isLocalOnly(m) && <Badge className="ml-2 bg-ouro text-slate-950">só neste aparelho</Badge>}
-                    {m?.glb_url.startsWith('ar/') && <Badge className="ml-2 bg-slate-600 text-white">demonstração</Badge>}
+                    {m?.glb_url.startsWith('ar/') && <Badge className="ml-2 bg-slate-200 text-slate-700">demonstração</Badge>}
                   </div>
                   {m ? (
-                    <div className="text-xs text-slate-400">
+                    <div className="text-xs text-slate-500">
                       {formatArSize(m)} · {m.components.length} item(ns) com etiqueta
                       {st && ` · ${st.views3d} aberturas · ${st.arStarts} na mesa · ${st.explodes} viram os itens · ${st.addsAfterView} pedidos${st.conversionPct !== null ? ` (${st.conversionPct}%)` : ''}`}
                     </div>
@@ -123,8 +123,8 @@ function Kpi({ label, value, hint }: { label: string; value: number; hint?: stri
   return (
     <div className="rounded-xl bg-base p-3">
       <div className="text-2xl font-black">{value}</div>
-      <div className="text-xs text-slate-400">{label}</div>
-      {hint && <div className="text-xs font-bold text-ouro">{hint}</div>}
+      <div className="text-xs text-slate-500">{label}</div>
+      {hint && <div className="text-xs font-bold text-brasa">{hint}</div>}
     </div>
   );
 }
@@ -277,13 +277,13 @@ function ArModelEditor({ product, model, onClose }: { product: Product; model: P
               // o atributo scale de um modelo já carregado fora do AR.
               <ModelViewer key={`${previewRef}|${factor}`} model={previewModel} alt={product.name} variant="admin" onInfo={onInfo} onPick={placing ? onPick : undefined} highlightId={placing} className="h-full" />
             ) : (
-              <div className="grid h-full place-items-center bg-base p-6 text-center text-sm text-slate-400">Escolha o arquivo .glb do prato para ver aqui.</div>
+              <div className="grid h-full place-items-center bg-base p-6 text-center text-sm text-slate-500">Escolha o arquivo .glb do prato para ver aqui.</div>
             )}
             {placing && <div className="pointer-events-none absolute inset-x-2 bottom-2 rounded-lg bg-ouro px-2 py-1 text-center text-xs font-black text-slate-950"><Crosshair className="mr-1 inline h-4 w-4" />Toque no modelo onde fica a etiqueta</div>}
           </div>
           {info && (
-            <p className="mt-2 text-xs text-slate-400">
-              O arquivo mede {formatCm(info.rawCm.x)} × {formatCm(info.rawCm.z)} × {formatCm(info.rawCm.y)} cm. No cardápio: <b className="text-slate-200">{dims && formatArSize(dims)}</b>
+            <p className="mt-2 text-xs text-slate-500">
+              O arquivo mede {formatCm(info.rawCm.x)} × {formatCm(info.rawCm.z)} × {formatCm(info.rawCm.y)} cm. No cardápio: <b className="text-slate-800">{dims && formatArSize(dims)}</b>
               {factor !== 1 && ` (escala ${String(factor).replace('.', ',')}×)`}.
             </p>
           )}
@@ -291,7 +291,7 @@ function ArModelEditor({ product, model, onClose }: { product: Product; model: P
 
         <div>
           <Field label="Modelo 3D (.glb)" hint="Até 15 MB. Exporte em metros: 1 unidade = 1 metro.">
-            <label className="flex min-h-touch cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-600 px-3 text-sm font-bold">
+            <label className="flex min-h-touch cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-300 px-3 text-sm font-bold">
               <Upload className="h-4 w-4" /> {glbFile ? glbFile.name : 'Escolher arquivo .glb'}
               <input type="file" accept=".glb,model/gltf-binary" className="hidden" onChange={(e) => pickGlb(e.target.files?.[0])} />
             </label>
@@ -303,11 +303,11 @@ function ArModelEditor({ product, model, onClose }: { product: Product; model: P
             </div>
           </Field>
           <Field label="iPhone (.usdz, opcional)" hint="Sem ele, o iPhone gera o USDZ a partir do .glb.">
-            <label className="flex min-h-touch cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-600 px-3 text-sm font-bold">
+            <label className="flex min-h-touch cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-300 px-3 text-sm font-bold">
               <Upload className="h-4 w-4" /> {usdzFile ? usdzFile.name : usdzUrl ? 'Trocar .usdz' : 'Escolher arquivo .usdz'}
               <input type="file" accept=".usdz,model/vnd.usdz+zip" className="hidden" onChange={(e) => pickUsdz(e.target.files?.[0])} />
             </label>
-            {(usdzUrl || usdzFile) && <button className="mt-1 text-xs text-rose-300 underline" onClick={() => { setUsdzUrl(null); setUsdzFile(null); }}>Tirar o .usdz</button>}
+            {(usdzUrl || usdzFile) && <button className="mt-1 text-xs text-rose-600 underline" onClick={() => { setUsdzUrl(null); setUsdzFile(null); }}>Tirar o .usdz</button>}
           </Field>
           <Field label="Maior medida real do prato (cm)" hint="Ex.: pizza de 35 cm, prato de 28 cm. O 3D é ajustado para ficar desse tamanho na mesa.">
             <TextInput inputMode="decimal" value={realMax} onChange={(e) => setRealMax(e.target.value)} placeholder="35" />
@@ -321,7 +321,7 @@ function ArModelEditor({ product, model, onClose }: { product: Product; model: P
         </div>
       </div>
 
-      <h4 className="mb-2 mt-3 text-sm font-bold text-slate-300">Itens do prato (etiquetas no 3D)</h4>
+      <h4 className="mb-2 mt-3 text-sm font-bold text-slate-700">Itens do prato (etiquetas no 3D)</h4>
       <p className="mb-2 text-xs text-slate-500">Toque em “Posicionar” e depois no ponto do modelo. Com animação, posicione com os itens já separados (como o 3D aparece aqui).</p>
       <div className="space-y-2">
         {items.map((c, i) => (

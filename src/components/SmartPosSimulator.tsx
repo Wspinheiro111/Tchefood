@@ -18,8 +18,8 @@ import printLogoUrl from '../assets/brand/logo-print.png';
 import { playDeniedBuzz, playDispatchChime, playTap } from '../lib/sound';
 
 const CHASSIS_STYLE: Record<Chassis, { body: string; accent: string; brand: string; text: string; key: string }> = {
-  STONE: { body: 'bg-gradient-to-b from-emerald-500 to-emerald-700', accent: 'bg-stone', brand: 'stone', text: 'text-emerald-950', key: 'bg-emerald-900/40' },
-  PAGBANK: { body: 'bg-gradient-to-b from-yellow-300 to-yellow-500', accent: 'bg-pagbank', brand: 'PagBank', text: 'text-yellow-950', key: 'bg-yellow-900/20' },
+  STONE: { body: 'bg-gradient-to-b from-emerald-500 to-emerald-700', accent: 'bg-stone', brand: 'stone', text: 'text-emerald-950', key: 'bg-emerald-50' },
+  PAGBANK: { body: 'bg-gradient-to-b from-yellow-300 to-yellow-500', accent: 'bg-pagbank', brand: 'PagBank', text: 'text-yellow-950', key: 'bg-yellow-50' },
 };
 
 type Step = 'card' | 'reading' | 'pin' | 'decide' | 'processing' | 'pix';
@@ -44,7 +44,7 @@ export function ThermalPaper({ job, onTear, qr, footer }: { job: Pick<PrintJob, 
         <div className="mt-2 border-t border-dashed border-slate-400" />
       </div>
       {onTear && (
-        <button onClick={onTear} className="mt-1 inline-flex min-h-touch items-center gap-1 rounded-lg bg-slate-800 px-3 text-xs font-bold text-white">
+        <button onClick={onTear} className="mt-1 inline-flex min-h-touch items-center gap-1 rounded-lg bg-slate-200 px-3 text-xs font-bold text-slate-900">
           <Scissors className="h-4 w-4" /> Destacar papel
         </button>
       )}
@@ -130,26 +130,26 @@ export function SmartPosSimulator() {
     <div className="fixed inset-0 z-[80] flex items-start justify-center overflow-y-auto bg-black/80 px-3 py-4">
       <div className="flex w-full max-w-[340px] flex-col items-center">
         <div className="mb-2 flex w-full items-center justify-between">
-          <div className="flex gap-1 rounded-xl bg-slate-800 p-1">
+          <div className="flex gap-1 rounded-xl bg-slate-100 p-1">
             {(['STONE', 'PAGBANK'] as Chassis[]).map((c) => (
               <button
                 key={c}
                 disabled={!canSwitchChassis}
                 onClick={() => bus.setChassis(c)}
-                className={`min-h-touch rounded-lg px-3 text-sm font-bold disabled:opacity-40 ${chassis === c ? (c === 'STONE' ? 'bg-stone text-slate-950' : 'bg-pagbank text-slate-950') : 'text-slate-300'}`}
+                className={`min-h-touch rounded-lg px-3 text-sm font-bold disabled:opacity-40 ${chassis === c ? (c === 'STONE' ? 'bg-stone text-white' : 'bg-pagbank text-slate-950') : 'text-slate-700'}`}
               >
                 {c === 'STONE' ? 'Stone Verde' : 'PagBank Amarelo'}
               </button>
             ))}
           </div>
-          <button aria-label="Fechar maquininha" onClick={bus.closeSimulator} className="grid h-12 w-12 place-items-center rounded-full bg-slate-800 text-white">
+          <button aria-label="Fechar maquininha" onClick={bus.closeSimulator} className="grid h-12 w-12 place-items-center rounded-full bg-slate-200 text-slate-900">
             <X className="h-6 w-6" />
           </button>
         </div>
 
         {/* Saída da impressora térmica no topo da maquininha */}
         <div className="relative z-10 -mb-3 flex min-h-[12px] w-[230px] flex-col items-center">
-          <div className="h-3 w-full rounded-t-md bg-slate-900" />
+          <div className="h-3 w-full rounded-t-md bg-slate-50" />
           {job && <ThermalPaper key={job.id} job={job} onTear={() => bus.dismissPrint(job.id)} qr={job.qr} footer={job.footer} />}
         </div>
 
@@ -160,8 +160,8 @@ export function SmartPosSimulator() {
           </div>
 
           {/* Visor 5.5" */}
-          <div className="min-h-[360px] overflow-hidden rounded-2xl text-left border-4 border-slate-900 bg-slate-950 text-white">
-            <div className="flex items-center justify-between bg-slate-900 px-3 py-1 text-[10px] text-slate-400">
+          <div className="min-h-[360px] overflow-hidden rounded-2xl text-left border-4 border-slate-200 bg-white text-slate-900">
+            <div className="flex items-center justify-between bg-slate-50 px-3 py-1 text-[10px] text-slate-500">
               <span>{serial}</span>
               <span className="flex items-center gap-1"><Signal className="h-3 w-3" /><Wifi className="h-3 w-3" /><BatteryMedium className="h-3 w-3" /> {pending?.terminal?.battery_level ?? 88}%</span>
             </div>
@@ -170,18 +170,18 @@ export function SmartPosSimulator() {
               <div className="flex h-[330px] flex-col items-center justify-center gap-2 p-4 text-center">
                 <div className={`grid h-14 w-14 place-items-center rounded-2xl ${style.accent}`}><CreditCard className="h-8 w-8 text-slate-950" /></div>
                 <div className="font-bold">Tchê Food SmartPOS</div>
-                <div className="text-xs text-slate-400">{job ? 'Imprimindo na bobina de 58mm…' : 'Aguardando cobrança'}</div>
+                <div className="text-xs text-slate-500">{job ? 'Imprimindo na bobina de 58mm…' : 'Aguardando cobrança'}</div>
               </div>
             )}
 
             {pending && (
               <div className="flex min-h-[330px] flex-col p-3">
-                <div className="mb-1 text-center text-[11px] text-slate-400">
+                <div className="mb-1 text-center text-[11px] text-slate-500">
                   {pending.mode === 'TEF_POS_WIRELESS' ? `TEF POS Sem Fio · recebido via ${chassis === 'STONE' ? 'Stone Connect' : 'PagBank Connect'}` : 'SmartPOS Embarcado'}
                 </div>
-                <div className="text-center text-xs text-slate-300">{pending.request.table_label} · {pending.request.description}</div>
+                <div className="text-center text-xs text-slate-700">{pending.request.table_label} · {pending.request.description}</div>
                 <div className="my-1 text-center text-3xl font-black tabular-nums">{formatBRL(pending.request.amount)}</div>
-                <div className="mb-2 text-center text-xs font-bold uppercase tracking-widest text-ouro">
+                <div className="mb-2 text-center text-xs font-bold uppercase tracking-widest text-brasa">
                   {pending.request.method === 'CREDIT' ? 'Crédito à vista' : pending.request.method === 'DEBIT' ? 'Débito' : 'Pix'}
                 </div>
 
@@ -189,29 +189,29 @@ export function SmartPosSimulator() {
                   <div className="flex flex-1 flex-col items-center justify-center gap-3">
                     <div className="relative grid h-20 w-20 place-items-center">
                       <span className="animate-nfc absolute inset-0 rounded-full border-2 border-sky-400" />
-                      <Nfc className="h-12 w-12 text-sky-400" />
+                      <Nfc className="h-12 w-12 text-sky-600" />
                     </div>
                     <div className="text-center text-sm">Aproxime, insira ou passe o cartão</div>
                     <div className="grid w-full grid-cols-2 gap-2">
                       <button onClick={() => { setEntry('NFC'); setStep('reading'); setTimeout(() => setStep('pin'), 900); }} className="min-h-touch rounded-lg bg-sky-600 text-sm font-bold">Aproximar (NFC)</button>
-                      <button onClick={() => { setEntry('CHIP'); setStep('reading'); setTimeout(() => setStep('pin'), 1300); }} className="min-h-touch rounded-lg bg-slate-700 text-sm font-bold">Inserir chip</button>
+                      <button onClick={() => { setEntry('CHIP'); setStep('reading'); setTimeout(() => setStep('pin'), 1300); }} className="min-h-touch rounded-lg bg-slate-200 text-sm font-bold">Inserir chip</button>
                     </div>
                   </div>
                 )}
-                {step === 'reading' && <div className="flex flex-1 items-center justify-center text-sm text-slate-300">{entry === 'NFC' ? 'Lendo cartão por aproximação…' : 'Lendo chip… não remova o cartão'}</div>}
+                {step === 'reading' && <div className="flex flex-1 items-center justify-center text-sm text-slate-700">{entry === 'NFC' ? 'Lendo cartão por aproximação…' : 'Lendo chip… não remova o cartão'}</div>}
                 {step === 'pin' && (
                   <div className="flex flex-1 flex-col items-center">
                     <div className="mb-2 text-sm">Digite a senha</div>
-                    <div className="mb-2 flex gap-2">{Array.from({ length: 4 }).map((_, i) => <span key={i} className={`h-3 w-3 rounded-full ${i < pin.length ? 'bg-white' : 'bg-slate-700'}`} />)}</div>
+                    <div className="mb-2 flex gap-2">{Array.from({ length: 4 }).map((_, i) => <span key={i} className={`h-3 w-3 rounded-full ${i < pin.length ? 'bg-neutral-900' : 'bg-slate-200'}`} />)}</div>
                     <div className="grid w-full grid-cols-3 gap-1.5">
                       {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((d) => (
-                        <button key={d} onClick={() => { playTap(); setPin((p) => (p.length < 4 ? p + d : p)); }} className="h-10 rounded-md bg-slate-800 font-bold">{d}</button>
+                        <button key={d} onClick={() => { playTap(); setPin((p) => (p.length < 4 ? p + d : p)); }} className="h-10 rounded-md bg-slate-100 font-bold">{d}</button>
                       ))}
                       <button onClick={() => setPin('')} className="h-10 rounded-md bg-brasa text-xs font-bold">LIMPA</button>
-                      <button onClick={() => { playTap(); setPin((p) => (p.length < 4 ? p + '0' : p)); }} className="h-10 rounded-md bg-slate-800 font-bold">0</button>
-                      <button onClick={() => setPin((p) => p.slice(0, -1))} className="grid h-10 place-items-center rounded-md bg-slate-700"><Delete className="h-4 w-4" /></button>
+                      <button onClick={() => { playTap(); setPin((p) => (p.length < 4 ? p + '0' : p)); }} className="h-10 rounded-md bg-slate-100 font-bold">0</button>
+                      <button onClick={() => setPin((p) => p.slice(0, -1))} className="grid h-10 place-items-center rounded-md bg-slate-200"><Delete className="h-4 w-4" /></button>
                     </div>
-                    <button disabled={pin.length < 4} onClick={() => setStep('decide')} className="mt-2 min-h-touch w-full rounded-lg bg-stone font-bold text-slate-950 disabled:opacity-40">CONFIRMA</button>
+                    <button disabled={pin.length < 4} onClick={() => setStep('decide')} className="mt-2 min-h-touch w-full rounded-lg bg-stone font-bold text-white disabled:opacity-40">CONFIRMA</button>
                   </div>
                 )}
                 {(step === 'decide' || step === 'pix') && (
@@ -219,17 +219,17 @@ export function SmartPosSimulator() {
                     {step === 'pix' && (
                       <>
                         <div className="rounded-lg bg-white p-1"><QrCode value={pixCode} size={128} /></div>
-                        <div className="text-xs text-slate-300">Expira em {Math.floor(pixLeft / 60)}:{(pixLeft % 60).toString().padStart(2, '0')}</div>
+                        <div className="text-xs text-slate-700">Expira em {Math.floor(pixLeft / 60)}:{(pixLeft % 60).toString().padStart(2, '0')}</div>
                       </>
                     )}
-                    {step === 'decide' && <div className="text-center text-sm text-slate-300">Senha verificada. Enviando para autorização…</div>}
+                    {step === 'decide' && <div className="text-center text-sm text-slate-700">Senha verificada. Enviando para autorização…</div>}
                     <div className="grid w-full grid-cols-1 gap-2">
-                      <button onClick={approve} className="min-h-touch rounded-lg bg-stone font-bold text-slate-950">{step === 'pix' ? 'Simular Pix recebido' : 'Aprovar Transação'}</button>
+                      <button onClick={approve} className="min-h-touch rounded-lg bg-stone font-bold text-white">{step === 'pix' ? 'Simular Pix recebido' : 'Aprovar Transação'}</button>
                       <button onClick={() => decline('Saldo insuficiente')} className="min-h-touch rounded-lg bg-brasa font-bold">Recusar (Saldo Insuficiente)</button>
                     </div>
                   </div>
                 )}
-                {step === 'processing' && <div className="flex flex-1 items-center justify-center text-sm text-slate-300">Processando com a adquirente…</div>}
+                {step === 'processing' && <div className="flex flex-1 items-center justify-center text-sm text-slate-700">Processando com a adquirente…</div>}
               </div>
             )}
           </div>

@@ -606,8 +606,9 @@ export interface SyncEvent {
   payload: Record<string, unknown>;
   created_at: ISODateTime;
   /**
-   * Só na autorização de gerente (cancelamento, desconto, remoção dos 10%): o PIN
-   * digitado, para o servidor conferir de novo em tchefood_authorize_manager().
+   * Só na autorização de gerente (cancelamento, desconto, remoção dos 10%, cobrança
+   * incerta pelo comprovante, saída do totem, troca de barril): o PIN digitado, para
+   * o servidor conferir de novo em tchefood_authorize_manager() / tchefood_change_keg().
    * Fica só neste evento da fila (nunca no audit_log) e sai do aparelho junto com ele.
    */
   manager_pin?: string;
@@ -618,6 +619,17 @@ export interface SyncEvent {
    * mudança pede, o PIN do gerente. Como manager_pin, fica só na fila.
    */
   staff_auth?: StaffSyncAuth;
+  /**
+   * Só no barril encerrado (keg_history) da troca de barril: o barril novo e o
+   * audit_log da troca. Sobe por tchefood_change_keg(), que confere o PIN do gerente
+   * (manager_pin) e grava histórico, audit_log e barril novo juntos.
+   */
+  keg_change?: KegChangeSync;
+  /**
+   * Item de chopp: a torneira de onde sai. Segura o item atrás de uma troca de barril
+   * recusada da mesma torneira (recordKeys). Não vai para o banco.
+   */
+  keg_tap_id?: UUID;
   /** Só no proprietário da loja nova: sobe por tchefood_start_store, com o usuário do QR. */
   store_start?: StoreStartSync;
   /**
@@ -627,6 +639,15 @@ export interface SyncEvent {
    * comanda for recusado, a mesa fica segurada junto e não aparece livre na nuvem.
    */
   depends_on_order_id?: UUID;
+}
+
+export interface KegChangeSync {
+  /** id do audit_log KEG_CHANGED no aparelho (o servidor grava com o mesmo id). */
+  audit_id: UUID;
+  beer_name: string;
+  total_capacity_ml: number;
+  keg_cost: number;
+  reason: string;
 }
 
 export interface StaffSyncAuth {

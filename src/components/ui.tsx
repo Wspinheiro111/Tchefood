@@ -8,11 +8,11 @@ import { create } from 'zustand';
 type Variant = 'primary' | 'secondary' | 'danger' | 'success' | 'ghost' | 'gold';
 
 const VARIANTS: Record<Variant, string> = {
-  primary: 'bg-brasa text-white active:bg-rose-700 disabled:bg-rose-900/50',
-  secondary: 'bg-slate-700 text-slate-100 active:bg-slate-600 disabled:opacity-50',
-  danger: 'bg-transparent border-2 border-brasa text-rose-300 active:bg-brasa/20 disabled:opacity-40',
-  success: 'bg-stone text-slate-950 active:bg-emerald-600 disabled:opacity-50',
-  ghost: 'bg-transparent text-slate-300 active:bg-slate-800 disabled:opacity-40',
+  primary: 'bg-brasa text-white active:bg-rose-700 disabled:opacity-40',
+  secondary: 'bg-slate-200 text-slate-900 active:bg-slate-300 disabled:opacity-50',
+  danger: 'bg-transparent border-2 border-brasa text-rose-600 active:bg-brasa/20 disabled:opacity-40',
+  success: 'bg-stone text-white active:bg-emerald-600 disabled:opacity-50',
+  ghost: 'bg-transparent text-slate-700 active:bg-slate-100 disabled:opacity-40',
   gold: 'bg-ouro text-slate-950 active:bg-amber-600 disabled:opacity-50',
 };
 
@@ -63,16 +63,16 @@ export function Sheet({ open, onClose, title, children, footer, wide, tone = 'de
         onClick={(e) => e.stopPropagation()}
         className={`animate-slide-up flex max-h-[94vh] w-full flex-col rounded-t-2xl border-t bg-surface sm:rounded-2xl sm:border ${
           wide ? 'sm:max-w-3xl' : 'sm:max-w-lg'
-        } ${tone === 'danger' ? 'border-brasa' : 'border-slate-700'}`}
+        } ${tone === 'danger' ? 'border-brasa' : 'border-slate-200'}`}
       >
-        <div className="flex items-center justify-between gap-2 border-b border-slate-700 px-4 py-3">
+        <div className="flex items-center justify-between gap-2 border-b border-slate-200 px-4 py-3">
           <h2 className="text-lg font-bold">{title}</h2>
-          <button aria-label="Fechar" onClick={onClose} className="grid h-11 w-11 place-items-center rounded-full active:bg-slate-700">
+          <button aria-label="Fechar" onClick={onClose} className="grid h-11 w-11 place-items-center rounded-full active:bg-slate-200">
             <X className="h-6 w-6" />
           </button>
         </div>
         <div className="scroll-thin flex-1 overflow-y-auto px-4 py-3">{children}</div>
-        {footer && <div className="border-t border-slate-700 px-4 py-3">{footer}</div>}
+        {footer && <div className="border-t border-slate-200 px-4 py-3">{footer}</div>}
       </div>
     </div>
   );
@@ -122,9 +122,9 @@ export const toast = {
 };
 
 const TOAST_STYLE: Record<ToastKind, string> = {
-  success: 'bg-stone text-slate-950',
+  success: 'bg-stone text-white',
   error: 'bg-brasa text-white',
-  info: 'bg-slate-700 text-white',
+  info: 'bg-neutral-800 text-white',
   alert: 'bg-ouro text-slate-950',
 };
 
@@ -153,7 +153,7 @@ export function Stepper({ value, onChange, min = 1, max = 99 }: { value: number;
     <div className="flex items-center gap-2">
       <button
         aria-label="Diminuir"
-        className="grid h-14 w-14 place-items-center rounded-xl bg-slate-700 text-2xl font-bold active:bg-slate-600 disabled:opacity-40"
+        className="grid h-14 w-14 place-items-center rounded-xl bg-slate-200 text-2xl font-bold active:bg-slate-300 disabled:opacity-40"
         disabled={value <= min}
         onClick={() => onChange(Math.max(min, value - 1))}
       >
@@ -162,7 +162,7 @@ export function Stepper({ value, onChange, min = 1, max = 99 }: { value: number;
       <span className="w-14 text-center text-3xl font-black tabular-nums">{value}</span>
       <button
         aria-label="Aumentar"
-        className="grid h-14 w-14 place-items-center rounded-xl bg-slate-700 text-2xl font-bold active:bg-slate-600 disabled:opacity-40"
+        className="grid h-14 w-14 place-items-center rounded-xl bg-slate-200 text-2xl font-bold active:bg-slate-300 disabled:opacity-40"
         disabled={value >= max}
         onClick={() => onChange(Math.min(max, value + 1))}
       >

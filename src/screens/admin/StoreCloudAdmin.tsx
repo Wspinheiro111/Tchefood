@@ -107,10 +107,10 @@ function PermissionsMatrix() {
   const [pending, setPending] = useState<{ role: UserRole; permission: Permission; allowed: boolean } | null>(null);
   return (
     <Panel title="Permissões por perfil">
-      <p className="mb-3 text-xs text-slate-400">O proprietário sempre pode tudo. Cada mudança pede o seu PIN e motivo e fica na auditoria.</p>
+      <p className="mb-3 text-xs text-slate-500">O proprietário sempre pode tudo. Cada mudança pede o seu PIN e motivo e fica na auditoria.</p>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[560px] text-sm">
-          <thead className="text-left text-xs uppercase text-slate-400">
+          <thead className="text-left text-xs uppercase text-slate-500">
             <tr>
               <th className="p-2">Permissão</th>
               {CONFIGURABLE_ROLES.map((r) => <th key={r} className="p-2 text-center">{ROLE_LABEL[r]}</th>)}
@@ -118,7 +118,7 @@ function PermissionsMatrix() {
           </thead>
           <tbody>
             {PERMISSIONS.map((p) => (
-              <tr key={p} className="border-t border-slate-700">
+              <tr key={p} className="border-t border-slate-200">
                 <td className="p-2">{PERMISSION_LABEL[p]}</td>
                 {CONFIGURABLE_ROLES.map((r) => {
                   const on = can(r, p, overrides);
@@ -127,7 +127,7 @@ function PermissionsMatrix() {
                       <button
                         aria-label={`${PERMISSION_LABEL[p]} para ${ROLE_LABEL[r]}: ${on ? 'permitido' : 'bloqueado'}`}
                         onClick={() => setPending({ role: r, permission: p, allowed: !on })}
-                        className={`h-11 w-16 rounded-lg text-xs font-bold ${on ? 'bg-stone text-slate-950' : 'bg-slate-700 text-slate-400'}`}
+                        className={`h-11 w-16 rounded-lg text-xs font-bold ${on ? 'bg-stone text-white' : 'bg-slate-200 text-slate-500'}`}
                       >
                         {on ? 'Sim' : 'Não'}
                       </button>
@@ -183,7 +183,7 @@ function NewStorePanel({ cloud, onDone }: { cloud?: CloudSession; onDone?: () =>
 
   return (
     <Panel title={cloud ? 'Começar a loja desta conta' : 'Iniciar loja nova neste aparelho'} action={<Btn variant="danger" onClick={() => setOpen(true)}>{cloud ? 'Começar' : 'Iniciar loja nova'}</Btn>}>
-      <p className="text-sm text-slate-400">
+      <p className="text-sm text-slate-500">
         Apaga deste aparelho o cardápio, as mesas, a equipe e o histórico de demonstração, e começa a loja do zero com você como proprietário. Contas abertas impedem. {cloud ? 'A loja fica ligada à conta da nuvem que você acabou de entrar.' : ''}
       </p>
       <Sheet open={open && !auth} onClose={() => setOpen(false)} wide title="Dados da loja nova" footer={<Btn block size="lg" variant="primary" onClick={next}>Continuar</Btn>}>
@@ -261,7 +261,7 @@ function CloudLogin() {
   return (
     <div className="space-y-3">
       <Panel title={<span className="flex items-center gap-2"><CloudOff className="h-4 w-4" /> Conectar este aparelho à nuvem</span>}>
-        <p className="mb-3 text-sm text-slate-400">Use a conta do aparelho criada no Supabase da loja (e-mail e senha). Sem conexão, tudo continua funcionando offline e a fila espera.</p>
+        <p className="mb-3 text-sm text-slate-500">Use a conta do aparelho criada no Supabase da loja (e-mail e senha). Sem conexão, tudo continua funcionando offline e a fila espera.</p>
         <FormError error={error} />
         <Field label="Endereço do projeto" hint={env.url ? 'Preenchido pelo build (.env).' : 'Ex.: https://xxxx.supabase.co'}><TextInput value={url} onChange={(e) => setUrl(e.target.value)} /></Field>
         <Field label="Chave pública (anon key)"><TextInput value={anonKey} onChange={(e) => setAnonKey(e.target.value)} /></Field>
@@ -275,16 +275,17 @@ function CloudLogin() {
       </Panel>
       {otherStore && (
         <div className="space-y-3 rounded-2xl border border-ouro p-3">
-          <p className="text-sm text-ouro">Esta conta é de outra loja (id {otherStore.tenant_id.slice(0, 8)}…). Os dados deste aparelho são de {useTcheStore.getState().tenant.name}. Para usar esta conta, comece a loja dela neste aparelho.</p>
-          {isOwner ? <NewStorePanel cloud={otherStore} onDone={() => setOtherStore(null)} /> : <p className="text-sm text-slate-400">Peça ao proprietário para fazer isso.</p>}
+          <p className="text-sm text-brasa">Esta conta é de outra loja (id {otherStore.tenant_id.slice(0, 8)}…). Os dados deste aparelho são de {useTcheStore.getState().tenant.name}. Para usar esta conta, comece a loja dela neste aparelho.</p>
+          {isOwner ? <NewStorePanel cloud={otherStore} onDone={() => setOtherStore(null)} /> : <p className="text-sm text-slate-500">Peça ao proprietário para fazer isso.</p>}
         </div>
       )}
     </div>
   );
 }
 
-/** Autorização de gerente recusada: fila antiga sem PIN, ou PIN que mudou antes de subir. */
+/** Autorização de gerente (ou troca de barril) recusada: fila antiga sem PIN, ou PIN que mudou antes de subir. */
 function needsManagerPin(e: SyncEvent): boolean {
+  if (e.table === 'keg_history') return e.keg_change != null;
   return e.table === 'audit_logs' && typeof e.payload.authorized_by_manager_id === 'string';
 }
 
@@ -300,7 +301,7 @@ function RejectedAuthPin({ eventId }: { eventId: string }) {
         value={pin}
         onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
         placeholder="PIN atual do gerente"
-        className="w-28 rounded-lg border border-slate-600 bg-slate-900 px-2 py-1 text-xs"
+        className="w-28 rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-xs"
       />
       <Btn
         disabled={pin.length !== 4}
@@ -340,31 +341,31 @@ function CloudStatus() {
   };
   return (
     <Panel
-      title={<span className="flex items-center gap-2"><Cloud className="h-4 w-4 text-stone" /> Nuvem conectada</span>}
+      title={<span className="flex items-center gap-2"><Cloud className="h-4 w-4 text-verde" /> Nuvem conectada</span>}
       action={<Btn disabled={busy || !online} onClick={() => void now()}>{busy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Sincronizar agora</Btn>}
     >
       <dl className="mb-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-        <dt className="text-slate-400">Conta</dt><dd>{cloud.email}</dd>
-        <dt className="text-slate-400">Projeto</dt><dd className="break-all">{cloud.url}</dd>
-        <dt className="text-slate-400">Fila</dt><dd>{outbox.length} evento(s){outbox.length > 0 && ` · ${Object.entries(byTable).map(([t, n]) => `${t} ${n}`).join(', ')}`}</dd>
-        <dt className="text-slate-400">Último envio</dt><dd>{status.last_success_at ? new Date(status.last_success_at).toLocaleString('pt-BR') : 'ainda não'}</dd>
-        {!online && (<><dt className="text-slate-400">Conexão</dt><dd className="text-ouro">Sem internet: a fila espera e sobe sozinha quando voltar.</dd></>)}
+        <dt className="text-slate-500">Conta</dt><dd>{cloud.email}</dd>
+        <dt className="text-slate-500">Projeto</dt><dd className="break-all">{cloud.url}</dd>
+        <dt className="text-slate-500">Fila</dt><dd>{outbox.length} evento(s){outbox.length > 0 && ` · ${Object.entries(byTable).map(([t, n]) => `${t} ${n}`).join(', ')}`}</dd>
+        <dt className="text-slate-500">Último envio</dt><dd>{status.last_success_at ? new Date(status.last_success_at).toLocaleString('pt-BR') : 'ainda não'}</dd>
+        {!online && (<><dt className="text-slate-500">Conexão</dt><dd className="text-brasa">Sem internet: a fila espera e sobe sozinha quando voltar.</dd></>)}
       </dl>
       {status.last_error && (
         <div className="mb-3 rounded-xl border border-brasa/60 bg-brasa/10 p-3 text-sm">
-          <div className="font-bold text-rose-200">{status.last_error}</div>
-          {status.last_error_at && <div className="text-xs text-slate-400">{new Date(status.last_error_at).toLocaleString('pt-BR')}</div>}
+          <div className="font-bold text-rose-700">{status.last_error}</div>
+          {status.last_error_at && <div className="text-xs text-slate-500">{new Date(status.last_error_at).toLocaleString('pt-BR')}</div>}
         </div>
       )}
       {rejected.length > 0 && (
         <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm">
-          <div className="mb-2 font-bold text-ouro">{rejected.length} evento(s) recusado(s) pela nuvem</div>
-          <p className="mb-2 text-xs text-slate-300">
+          <div className="mb-2 font-bold text-brasa">{rejected.length} evento(s) recusado(s) pela nuvem</div>
+          <p className="mb-2 text-xs text-slate-700">
             Eles saíram da fila para não travar o resto do envio; as mudanças seguintes dos mesmos registros esperam na fila até o reenvio. Nada foi descartado. Corrija a causa no servidor (permissão, PIN do gerente ou trava) e toque em Reenviar recusados.
           </p>
           <ul className="mb-2 max-h-48 space-y-1 overflow-y-auto text-xs">
             {rejected.map((r) => (
-              <li key={r.event.id} className="text-slate-300">
+              <li key={r.event.id} className="text-slate-700">
                 <b>{r.event.table}</b> {r.event.op} (registro {r.event.row_id.slice(0, 8)}…) · HTTP {r.status}: {r.message}
                 {needsManagerPin(r.event) && <RejectedAuthPin eventId={r.event.id} />}
               </li>

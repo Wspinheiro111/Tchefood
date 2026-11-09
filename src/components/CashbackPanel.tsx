@@ -59,9 +59,9 @@ export function CashbackCapture({ orderId }: { orderId: string }) {
   if (earned && customer && message) {
     return (
       <div className="w-full rounded-2xl border border-stone/50 bg-stone/10 p-4 text-left">
-        <div className="mb-2 flex items-center gap-2 font-black text-stone"><Gift className="h-5 w-5" /> {formatBRL(earned.amount)} de cashback para {customer.name ?? formatWhatsapp(customer.phone_whatsapp)}</div>
+        <div className="mb-2 flex items-center gap-2 font-black text-verde"><Gift className="h-5 w-5" /> {formatBRL(earned.amount)} de cashback para {customer.name ?? formatWhatsapp(customer.phone_whatsapp)}</div>
         <div className="mb-3 rounded-xl bg-[#0b141a] p-3 text-sm">
-          <div className="mb-1 text-[11px] font-bold text-emerald-400">WhatsApp · {formatWhatsapp(customer.phone_whatsapp)}</div>
+          <div className="mb-1 text-[11px] font-bold text-emerald-600">WhatsApp · {formatWhatsapp(customer.phone_whatsapp)}</div>
           <div className="whitespace-pre-wrap rounded-lg rounded-tl-none bg-[#005c4b] p-2 text-[13px] leading-snug text-white">{message}</div>
         </div>
         <div className="grid grid-cols-2 gap-2">
@@ -81,12 +81,12 @@ export function CashbackCapture({ orderId }: { orderId: string }) {
   };
 
   return (
-    <div className="w-full rounded-2xl border border-slate-700 bg-surface p-4 text-left">
-      <div className="mb-1 flex items-center gap-2 font-black text-ouro"><Gift className="h-5 w-5" /> Cashback de {formatBRL(preview)} ({CASHBACK_PCT}%)</div>
-      <p className="mb-3 text-xs text-slate-400">Para usar na próxima visita, de {CASHBACK_DAYS_LABEL}. O cliente recebe o cupom fiscal no WhatsApp.</p>
+    <div className="w-full rounded-2xl border border-slate-200 bg-surface p-4 text-left">
+      <div className="mb-1 flex items-center gap-2 font-black text-brasa"><Gift className="h-5 w-5" /> Cashback de {formatBRL(preview)} ({CASHBACK_PCT}%)</div>
+      <p className="mb-3 text-xs text-slate-500">Para usar na próxima visita, de {CASHBACK_DAYS_LABEL}. O cliente recebe o cupom fiscal no WhatsApp.</p>
       <div className="grid gap-2 sm:grid-cols-2">
-        <input inputMode="tel" value={phone} onChange={(e) => setPhone(maskPhone(e.target.value))} placeholder="WhatsApp (55) 99999-1234" className="min-h-touch rounded-xl border border-slate-600 bg-base px-3 text-lg outline-none focus:border-ouro" />
-        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome (opcional)" className="min-h-touch rounded-xl border border-slate-600 bg-base px-3 outline-none focus:border-ouro" />
+        <input inputMode="tel" value={phone} onChange={(e) => setPhone(maskPhone(e.target.value))} placeholder="WhatsApp (55) 99999-1234" className="min-h-touch rounded-xl border border-slate-300 bg-base px-3 text-lg outline-none focus:border-ouro" />
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome (opcional)" className="min-h-touch rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
       </div>
       <label className="my-3 flex min-h-touch items-center gap-3 text-sm">
         <input type="checkbox" checked={optIn} onChange={(e) => setOptIn(e.target.checked)} className="h-6 w-6 accent-emerald-500" />
@@ -111,15 +111,15 @@ export function CashbackRedeem({ orderId }: { orderId: string }) {
   if (!order) return null;
 
   if (used) {
-    return <div className="mb-3 rounded-2xl border border-stone/50 bg-stone/10 p-3 text-sm font-bold text-stone">🎁 Cashback de {formatBRL(used.amount)} abatido desta conta.</div>;
+    return <div className="mb-3 rounded-2xl border border-stone/50 bg-stone/10 p-3 text-sm font-bold text-verde">🎁 Cashback de {formatBRL(used.amount)} abatido desta conta.</div>;
   }
   const today = isCashbackDay(now);
   return (
-    <details className="mb-3 rounded-2xl border border-slate-700 bg-surface p-3">
-      <summary className="flex min-h-touch cursor-pointer items-center gap-2 font-bold"><Gift className="h-5 w-5 text-ouro" /> Usar cashback do cliente</summary>
-      {!today && <p className="mt-2 text-sm text-ouro">Hoje não é dia de cashback: o resgate vale de {CASHBACK_DAYS_LABEL}.</p>}
+    <details className="mb-3 rounded-2xl border border-slate-200 bg-surface p-3">
+      <summary className="flex min-h-touch cursor-pointer items-center gap-2 font-bold"><Gift className="h-5 w-5 text-brasa" /> Usar cashback do cliente</summary>
+      {!today && <p className="mt-2 text-sm text-brasa">Hoje não é dia de cashback: o resgate vale de {CASHBACK_DAYS_LABEL}.</p>}
       <div className="mt-2 flex gap-2">
-        <input inputMode="tel" value={phone} onChange={(e) => setPhone(maskPhone(e.target.value))} placeholder="WhatsApp do cliente" className="min-h-touch flex-1 rounded-xl border border-slate-600 bg-base px-3 text-lg outline-none focus:border-ouro" />
+        <input inputMode="tel" value={phone} onChange={(e) => setPhone(maskPhone(e.target.value))} placeholder="WhatsApp do cliente" className="min-h-touch flex-1 rounded-xl border border-slate-300 bg-base px-3 text-lg outline-none focus:border-ouro" />
         <Btn
           variant="gold"
           disabled={!today || !(usable > 0)}
@@ -133,7 +133,7 @@ export function CashbackRedeem({ orderId }: { orderId: string }) {
         </Btn>
       </div>
       {normalized && (
-        <p className="mt-2 text-xs text-slate-400">
+        <p className="mt-2 text-xs text-slate-500">
           {customer
             ? `${customer.name ?? formatWhatsapp(customer.phone_whatsapp)}: ${formatBRL(available)} liberado hoje · limite de ${CASHBACK_MAX_USAGE_PCT}% da conta.`
             : 'Cliente não cadastrado no programa.'}
