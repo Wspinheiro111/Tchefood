@@ -17,8 +17,16 @@ import type {
   ActionResult,
   AuditActionType,
   AuditLog,
+  CashbackLedgerEntry,
   Category,
   DiningTable,
+  EventTicket,
+  KegHistory,
+  KegTap,
+  KegTapProduct,
+  LoyaltyCustomer,
+  SelectedModifier,
+  WeightSource,
   HalfAndHalfPricing,
   ModifierGroup,
   ModifierOption,
@@ -40,6 +48,22 @@ import { idbStorage } from '../lib/idbStorage';
 import { createSeedData, QR_SELF_SERVICE_USER_ID } from '../data/seed';
 import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
+import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
+import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
+import { computeNetWeight } from '../lib/scale';
+import {
+  availableCashback,
+  balanceCashback,
+  CASHBACK_DAYS_LABEL,
+  CASHBACK_PCT,
+  cashbackBase,
+  cashbackEarnAmount,
+  cashbackUsable,
+  cashbackValidity,
+  consumeCashbackFifo,
+  isCashbackDay,
+  normalizeWhatsapp,
+} from '../lib/loyalty';
 
 export const MANAGER_PIN_MAX_ATTEMPTS = 3;
 export const MANAGER_PIN_LOCK_MS = 60_000;
@@ -89,6 +113,30 @@ export interface PaymentOutcome {
   closed: boolean;
 }
 
+/** Linha da venda de balcão (Ficha Rápida): unidades inteiras, uma ficha por unidade. */
+export interface CounterLine {
+  product_id: UUID;
+  quantity: number;
+  modifiers: SelectedModifier[];
+  meat_doneness: string | null;
+}
+
+export interface LoyaltyInput {
+  phone: string;
+  name: string | null;
+  cpf: string | null;
+  optIn: boolean;
+}
+
+export interface CashbackEarnOutcome {
+  customer: LoyaltyCustomer;
+  entry: CashbackLedgerEntry;
+  balance: number;
+}
+
+/** Venda de balcão sem resposta definitiva da maquininha (aguarda conferência). */
+export const COUNTER_EVENT_LABEL = 'Ficha de Balcão';
+
 export interface DispatchSummary {
   count: number;
   sectors: OrderItem['sector'][];
@@ -110,6 +158,13 @@ interface DataSlice {
   payments: Payment[];
   auditLogs: AuditLog[];
   printers: PrinterConfig[];
+  // Fase 5
+  kegTaps: KegTap[];
+  kegTapProducts: KegTapProduct[];
+  kegHistory: KegHistory[];
+  eventTickets: EventTicket[];
+  loyaltyCustomers: LoyaltyCustomer[];
+  cashbackLedger: CashbackLedgerEntry[];
 }
 
 interface DeviceSlice {
@@ -169,6 +224,26 @@ interface Actions {
   removePrinter: (printerId: string) => void;
   setShowPrintSimulator: (v: boolean) => void;
 
+  // Fase 5 — Buffet a quilo (balança)
+  addWeighedToTray: (orderId: UUID, productId: UUID, grossGrams: number, tareGrams: number, source: WeightSource) => ActionResult<TrayItem>;
+
+  // Fase 5 — Ficha Rápida / Balcão & Eventos
+  createCounterSale: (lines: CounterLine[]) => ActionResult<Order>;
+  /** Desiste de uma venda de balcão ainda não paga (PIN de gerente: os itens viram CANCELED auditados). */
+  voidCounterSale: (orderId: UUID, auth: ManagerAuthInput) => ActionResult;
+  /** Emite (ou devolve as já emitidas) as fichas de uma venda de balcão paga. Idempotente. */
+  issueEventTickets: (orderId: UUID) => ActionResult<EventTicket[]>;
+  redeemEventTicket: (rawToken: string) => ActionResult<EventTicket>;
+
+  // Fase 5 — Barris de chopp
+  registerKegWaste: (tapId: UUID, ml: number, reason: string) => ActionResult<KegTap>;
+  recordKegReading: (tapId: UUID, remainingMl: number) => ActionResult<KegTap>;
+  tapNewKeg: (tapId: UUID, keg: { beer_name: string; total_capacity_ml: number; keg_cost: number }, auth: ManagerAuthInput) => ActionResult<KegTap>;
+
+  // Fase 5 — CRM de cashback
+  earnCashback: (orderId: UUID, input: LoyaltyInput) => ActionResult<CashbackEarnOutcome>;
+  redeemCashback: (orderId: UUID, phone: string) => ActionResult<{ amount: number; customer: LoyaltyCustomer }>;
+
   setSoundEnabled: (enabled: boolean) => void;
   setHalfAndHalfPricing: (rule: HalfAndHalfPricing) => void;
   resetDemo: () => void;
@@ -214,6 +289,21 @@ function fail(error: string): { ok: false; error: string } {
 const fromCentsLocal = (c: number) => c / 100;
 
 const EDITABLE_ORDER_STATUSES: ReadonlyArray<Order['status']> = ['OPEN', 'PAYING'];
+
+/** "Peso 645 g − tara 280 g = 0,365 kg" (vai para a nota do item e para a cozinha). */
+export function weightNote(w: { gross_grams: number; tare_grams: number; source: WeightSource }): string {
+  const kg = ((w.gross_grams - w.tare_grams) / 1000).toLocaleString('pt-BR', { minimumFractionDigits: 3 });
+  return `Peso ${w.gross_grams} g − tara ${w.tare_grams} g = ${kg} kg${w.source === 'MANUAL' ? ' (peso digitado)' : ''}`;
+}
+
+function changedTaps(before: readonly KegTap[], after: readonly KegTap[]): KegTap[] {
+  return after.filter((t, i) => t !== before[i]);
+}
+
+/** Perfis que vendem no balcão e conferem fichas. */
+const COUNTER_ROLES: ReadonlyArray<StaffUser['role']> = ['WAITER', 'CASHIER', 'MANAGER', 'OWNER'];
+/** Perfis que operam o bar (sangria, leitura do barril). */
+const BAR_ROLES: ReadonlyArray<StaffUser['role']> = ['KITCHEN', 'CASHIER', 'MANAGER', 'OWNER'];
 
 export const useTcheStore = create<TcheState>()(
   persist(
@@ -529,6 +619,28 @@ export const useTcheStore = create<TcheState>()(
           }
           const qty = round3(draft.quantity);
           if (!(qty > 0)) return fail('Quantidade deve ser maior que zero.');
+          if (product.sold_by_weight) {
+            // Item pesado: quantidade e preço vêm da balança e do cadastro (igual ao trigger do banco).
+            const w = draft.weight;
+            if (!w) return fail(`${product.name} é vendido por peso. Use a balança.`);
+            const net = computeNetWeight(w.gross_grams, w.tare_grams);
+            if ('error' in net) return fail(net.error);
+            const item: TrayItem = {
+              ...draft,
+              half_product_ids: [],
+              modifiers: [],
+              modifiers_unit_price: 0,
+              quantity: round3(net.quantityKg),
+              unit_price: product.price,
+              sector: product.sector,
+              weight: { ...w },
+              tray_id: uuid(),
+              added_at: nowISO(),
+            };
+            set((s) => ({ tray: [...s.tray, item] }));
+            return { ok: true, data: item };
+          }
+          if (draft.weight) return fail(`${product.name} não é vendido por peso.`);
 
           // Validação de grupos obrigatórios / limites (mesma regra do modal).
           const groups = get()
@@ -566,7 +678,11 @@ export const useTcheStore = create<TcheState>()(
         updateTrayQty: (trayId, quantity) => {
           const qty = round3(quantity);
           set((s) => ({
-            tray: qty > 0 ? s.tray.map((t) => (t.tray_id === trayId ? { ...t, quantity: qty } : t)) : s.tray.filter((t) => t.tray_id !== trayId),
+            tray:
+              qty > 0
+                ? // Prato pesado não muda de quantidade na mão: remove e pesa de novo.
+                  s.tray.map((t) => (t.tray_id === trayId && !t.weight ? { ...t, quantity: qty } : t))
+                : s.tray.filter((t) => t.tray_id !== trayId),
           }));
         },
 
@@ -591,6 +707,7 @@ export const useTcheStore = create<TcheState>()(
               .filter((n): n is string => Boolean(n));
             const noteParts = [
               ...(halfNames.length && product ? [`1/2 ${product.name} + ${halfNames.map((n) => `1/2 ${n}`).join(' + ')}`] : []),
+              ...(t.weight ? [weightNote(t.weight)] : []),
               ...t.modifiers.map((m) => `+ ${m.name}`),
               ...t.quick_tags,
               ...(t.free_notes.trim() ? [t.free_notes.trim()] : []),
@@ -607,7 +724,8 @@ export const useTcheStore = create<TcheState>()(
               meat_doneness: t.meat_doneness,
               notes: noteParts.length ? noteParts.join(' · ') : null,
               sector: t.sector,
-              status: 'PENDING',
+              // Prato pesado já está com o cliente (ele se serve no buffet): não vai para a produção.
+              status: t.weight ? 'DELIVERED' : 'PENDING',
               is_paid: false,
               origin: 'WAITER',
               created_at: ts,
@@ -615,6 +733,10 @@ export const useTcheStore = create<TcheState>()(
               canceled_at: null,
               canceled_by_user_id: null,
               cancel_reason: null,
+              weight_gross_grams: t.weight?.gross_grams ?? null,
+              weight_tare_grams: t.weight?.tare_grams ?? null,
+              weight_source: t.weight?.source ?? null,
+              keg_volume_ml: resolveKegVolume(t.product_id, t.modifiers, get().kegTapProducts, get().modifierOptions),
             };
           });
 
@@ -626,14 +748,17 @@ export const useTcheStore = create<TcheState>()(
             // Novo pedido numa mesa que pediu a conta volta a "ocupada".
             const updatedTable =
               table && table.status === 'WAITING_BILL' ? { ...table, status: 'OCCUPIED' as const, updated_at: ts } : null;
+            const kegTaps = applyKegSale(s.kegTaps, s.kegTapProducts, newItems);
             return {
               orderItems,
+              kegTaps,
               orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
               tables: updatedTable ? s.tables.map((t) => (t.id === updatedTable.id ? updatedTable : t)) : s.tables,
               tray: s.tray.filter((t) => t.order_id !== orderId),
               outbox: [
                 ...s.outbox,
                 ...newItems.map((i) => syncEvent('order_items', 'INSERT', i)),
+                ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
                 syncEvent('orders', 'UPDATE', recalculated),
                 ...(updatedTable ? [syncEvent('dining_tables', 'UPDATE', updatedTable)] : []),
               ],
@@ -712,7 +837,14 @@ export const useTcheStore = create<TcheState>()(
             const orderItems = s.orderItems.map((i) => (i.id === itemId ? canceledItem : i));
             const current = s.orders.find((o) => o.id === order.id)!;
             const recalculated = applyOrderTotals(current, orderItems, s.payments);
-            return commitAdjustment(s, recalculated, orderItems, [canceledItem], log);
+            const before = s.orderItems.find((i) => i.id === itemId)!;
+            const kegTaps = applyKegCancel(s.kegTaps, s.kegTapProducts, before);
+            const patch = commitAdjustment(s, recalculated, orderItems, [canceledItem], log);
+            return {
+              ...patch,
+              kegTaps,
+              outbox: [...patch.outbox!, ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k))],
+            };
           });
           return { ok: true, data: log };
         },
@@ -789,6 +921,10 @@ export const useTcheStore = create<TcheState>()(
           const discount = round2(amount);
           if (!(discount > 0)) return fail('Informe um desconto maior que zero.');
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          // O desconto manual substitui o valor; com cashback já abatido ele apagaria o resgate.
+          if (get().cashbackLedger.some((e) => e.order_id === orderId && e.entry_type === 'REDEEM')) {
+            return fail('Esta conta já usou cashback. Desconto manual não pode ser combinado.');
+          }
           const gross = round2(order.subtotal_items + order.service_fee_amount);
           if (toCents(discount) > toCents(gross)) return fail('Desconto maior que o valor da conta.');
           const simulated = applyOrderTotals({ ...order, discount_amount: discount }, get().orderItems, get().payments);
@@ -1024,6 +1160,7 @@ export const useTcheStore = create<TcheState>()(
           for (const d of drafts) {
             const product = products.find((p) => p.id === d.product_id);
             if (!product || !product.available) return fail('Produto indisponível.');
+            if (product.sold_by_weight) return fail(`${product.name} é pesado no buffet. Chame o garçom.`);
             if (product.requires_meat_doneness && !d.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
             let modsCents = 0;
             for (const m of d.modifiers) {
@@ -1071,6 +1208,10 @@ export const useTcheStore = create<TcheState>()(
               canceled_at: null,
               canceled_by_user_id: null,
               cancel_reason: null,
+              weight_gross_grams: null,
+              weight_tare_grams: null,
+              weight_source: null,
+              keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
             });
           }
           const baseOrder = order;
@@ -1084,8 +1225,10 @@ export const useTcheStore = create<TcheState>()(
               current_order_id: recalculated.id,
               updated_at: ts,
             };
+            const kegTaps = applyKegSale(s.kegTaps, s.kegTapProducts, newItems);
             return {
               orderItems,
+              kegTaps,
               orders: newOrder ? [...s.orders, recalculated] : s.orders.map((o) => (o.id === recalculated.id ? recalculated : o)),
               tables: s.tables.map((t) => (t.id === table.id ? updatedTable : t)),
               outbox: [
@@ -1093,6 +1236,7 @@ export const useTcheStore = create<TcheState>()(
                 ...(newOrder ? [syncEvent('orders', 'INSERT', recalculated)] : [syncEvent('orders', 'UPDATE', recalculated)]),
                 ...newItems.map((i) => syncEvent('order_items', 'INSERT', i)),
                 syncEvent('dining_tables', 'UPDATE', updatedTable),
+                ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
               ],
             };
           });
@@ -1126,6 +1270,532 @@ export const useTcheStore = create<TcheState>()(
         removePrinter: (printerId) => set((s) => ({ printers: s.printers.filter((p) => p.id !== printerId) })),
         setShowPrintSimulator: (v) => set({ showPrintSimulator: v }),
 
+        // ---------------------------------------------------------------------
+        // Fase 5 — Buffet a quilo
+        // ---------------------------------------------------------------------
+        addWeighedToTray: (orderId, productId, grossGrams, tareGrams, source) => {
+          const product = get().products.find((p) => p.id === productId);
+          if (!product) return fail('Produto não encontrado.');
+          if (!product.sold_by_weight) return fail(`${product.name} não é vendido por peso.`);
+          return get().addToTray({
+            order_id: orderId,
+            product_id: product.id,
+            half_product_ids: [],
+            quantity: 1,
+            unit_price: product.price,
+            modifiers: [],
+            modifiers_unit_price: 0,
+            meat_doneness: null,
+            quick_tags: [],
+            free_notes: '',
+            sector: product.sector,
+            weight: { gross_grams: Math.round(grossGrams), tare_grams: Math.round(tareGrams), source },
+          });
+        },
+
+        // ---------------------------------------------------------------------
+        // Fase 5 — Ficha Rápida / Balcão & Eventos
+        // ---------------------------------------------------------------------
+        createCounterSale: (lines) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          if (!COUNTER_ROLES.includes(user.role)) return fail('Seu perfil não vende no balcão.');
+          if (lines.length === 0) return fail('Toque nos produtos para montar a venda.');
+          const s0 = get();
+          const counter = s0.tables.find((t) => t.kind === 'COUNTER');
+          if (!counter) return fail('Balcão não configurado.');
+          const ts = nowISO();
+          const order: Order = {
+            id: uuid(),
+            tenant_id: s0.tenant.id,
+            table_id: counter.id,
+            opened_by_user_id: user.id,
+            status: 'PAYING',
+            customer_count: 1,
+            customer_cpf: null,
+            subtotal_items: 0,
+            // Balcão / evento não cobra os 10% do garçom.
+            charge_service_fee: false,
+            service_fee_pct: s0.tenant.default_service_fee_pct,
+            service_fee_amount: 0,
+            discount_amount: 0,
+            total_amount: 0,
+            paid_amount: 0,
+            remaining_balance: 0,
+            nfce_status: 'PENDING',
+            nfce_key: null,
+            opened_at: ts,
+            closed_at: null,
+          };
+          const items: OrderItem[] = [];
+          for (const line of lines) {
+            const product = s0.products.find((p) => p.id === line.product_id);
+            if (!product || !product.available) return fail('Produto indisponível.');
+            if (product.sold_by_weight) return fail(`${product.name} é vendido por peso: lance pela balança na comanda.`);
+            if (!Number.isInteger(line.quantity) || line.quantity < 1 || line.quantity > 99) return fail('Quantidade inválida (1 a 99 fichas por item).');
+            if (product.requires_meat_doneness && !line.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
+            const groups = s0.productModifierGroups
+              .filter((l) => l.product_id === product.id)
+              .map((l) => s0.modifierGroups.find((g) => g.id === l.group_id))
+              .filter((g): g is ModifierGroup => Boolean(g));
+            for (const g of groups) {
+              const chosen = line.modifiers.filter((m) => m.group_id === g.id).length;
+              const min = g.required ? Math.max(1, g.min_selection) : g.min_selection;
+              if (chosen < min || chosen > g.max_selection) return fail(`${product.name}: verifique ${g.name}.`);
+            }
+            let modsCents = 0;
+            for (const m of line.modifiers) {
+              const opt = s0.modifierOptions.find((o) => o.id === m.option_id && o.group_id === m.group_id);
+              if (!opt) return fail('Adicional inválido.');
+              modsCents += toCents(opt.additional_price);
+            }
+            const mods = fromCentsLocal(modsCents);
+            const notes = [...(line.meat_doneness ? [line.meat_doneness] : []), ...line.modifiers.map((m) => `+ ${m.name}`)];
+            items.push({
+              id: uuid(),
+              order_id: order.id,
+              product_id: product.id,
+              waiter_id: user.id,
+              quantity: line.quantity,
+              // Preço sempre do cadastro, nunca do aparelho.
+              unit_price: product.price,
+              modifiers_unit_price: mods,
+              total_item_price: computeItemTotal(line.quantity, product.price, mods),
+              meat_doneness: line.meat_doneness,
+              notes: notes.length ? notes.join(' · ') : null,
+              sector: product.sector,
+              // Fica PENDING até a ficha ser resgatada no balcão (não entra no KDS).
+              status: 'PENDING',
+              is_paid: false,
+              origin: 'SMARTPOS',
+              created_at: ts,
+              prepared_at: null,
+              canceled_at: null,
+              canceled_by_user_id: null,
+              cancel_reason: null,
+              weight_gross_grams: null,
+              weight_tare_grams: null,
+              weight_source: null,
+              keg_volume_ml: resolveKegVolume(product.id, line.modifiers, s0.kegTapProducts, s0.modifierOptions),
+            });
+          }
+          const recalculated = applyOrderTotals(order, items, []);
+          if (!(recalculated.total_amount > 0)) return fail('Venda sem valor.');
+          set((s) => {
+            const kegTaps = applyKegSale(s.kegTaps, s.kegTapProducts, items);
+            return {
+              orders: [...s.orders, recalculated],
+              orderItems: [...s.orderItems, ...items],
+              kegTaps,
+              outbox: [
+                ...s.outbox,
+                syncEvent('orders', 'INSERT', recalculated),
+                ...items.map((i) => syncEvent('order_items', 'INSERT', i)),
+                ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
+              ],
+            };
+          });
+          return { ok: true, data: recalculated };
+        },
+
+        voidCounterSale: (orderId, auth) => {
+          const res = findEditableOrder(orderId);
+          if (!res.ok) return res;
+          const order = res.data;
+          const table = get().tables.find((t) => t.id === order.table_id);
+          if (table?.kind !== 'COUNTER') return fail('Só vendas de balcão podem ser desfeitas aqui.');
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (toCents(order.paid_amount) > 0) return fail('Venda já tem pagamento aprovado. Estorne pela maquininha.');
+          const authRes = authorizeManager(auth, { orderId, action: 'ITEM_CANCELED' });
+          if (!authRes.ok) return authRes;
+          const user = currentUser()!;
+          const manager = authRes.data;
+          const ts = nowISO();
+          const reason = auth.reason.trim();
+          const targets = get().orderItems.filter((i) => i.order_id === orderId && i.status !== 'CANCELED');
+          // Um audit_log por item: o banco exige o vínculo item ↔ autorização do gerente.
+          const logs = targets.map((item) => {
+            const product = get().products.find((p) => p.id === item.product_id);
+            return buildAudit({
+              order_id: orderId,
+              performed_by_user_id: user.id,
+              authorized_by_manager_id: manager.id,
+              action_type: 'ITEM_CANCELED',
+              amount_impact: -item.total_item_price,
+              reason,
+              metadata: {
+                table: table.label,
+                item_id: item.id,
+                product_code: product?.code ?? null,
+                product_name: product?.name ?? null,
+                quantity: item.quantity,
+                item_total: item.total_item_price,
+                item_status_before: item.status,
+                counter_sale_voided: true,
+                waiter_name: user.name,
+                manager_name: manager.name,
+              },
+            });
+          });
+          set((s) => {
+            let kegTaps = s.kegTaps;
+            const canceled = new Map<UUID, OrderItem>();
+            for (const item of targets) {
+              kegTaps = applyKegCancel(kegTaps, s.kegTapProducts, item);
+              canceled.set(item.id, { ...item, status: 'CANCELED', canceled_at: ts, canceled_by_user_id: user.id, cancel_reason: reason });
+            }
+            const orderItems = s.orderItems.map((i) => canceled.get(i.id) ?? i);
+            const current = s.orders.find((o) => o.id === orderId)!;
+            const updated: Order = { ...applyOrderTotals(current, orderItems, s.payments), status: 'CANCELED', closed_at: ts, nfce_status: null };
+            return {
+              orderItems,
+              kegTaps,
+              orders: s.orders.map((o) => (o.id === orderId ? updated : o)),
+              auditLogs: [...logs.reverse(), ...s.auditLogs],
+              outbox: [
+                ...s.outbox,
+                ...[...canceled.values()].map((i) => syncEvent('order_items', 'UPDATE', i)),
+                syncEvent('orders', 'UPDATE', updated),
+                ...logs.map((l) => syncEvent('audit_logs', 'INSERT', l)),
+                ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
+              ],
+            };
+          });
+          return { ok: true, data: undefined };
+        },
+
+        issueEventTickets: (orderId) => {
+          const s0 = get();
+          const order = s0.orders.find((o) => o.id === orderId);
+          if (!order) return fail('Venda não encontrada.');
+          const table = s0.tables.find((t) => t.id === order.table_id);
+          if (table?.kind !== 'COUNTER') return fail('Fichas só existem na venda de balcão.');
+          if (order.status !== 'CLOSED' || toCents(order.remaining_balance) !== 0) return fail('Ficha só é impressa depois da venda paga.');
+          const existing = s0.eventTickets.filter((t) => t.order_id === orderId);
+          if (existing.length > 0) return { ok: true, data: existing };
+          const payment = [...s0.payments].reverse().find((p) => p.order_id === orderId && p.status === 'APPROVED') ?? null;
+          const ts = nowISO();
+          const used = new Set(s0.eventTickets.map((t) => t.barcode_token));
+          const tickets: EventTicket[] = [];
+          for (const item of s0.orderItems.filter((i) => i.order_id === orderId && i.status !== 'CANCELED')) {
+            const product = s0.products.find((p) => p.id === item.product_id);
+            const name = product ? `${product.name}${item.notes ? ` (${item.notes.replace(/\+ /g, '')})` : ''}` : 'Item';
+            for (let seq = 1; seq <= item.quantity; seq++) {
+              let token = generateTicketToken();
+              while (used.has(token)) token = generateTicketToken();
+              used.add(token);
+              tickets.push({
+                id: uuid(),
+                tenant_id: s0.tenant.id,
+                order_id: orderId,
+                order_item_id: item.id,
+                payment_id: payment?.id ?? null,
+                product_id: item.product_id,
+                product_name_snapshot: name.slice(0, 120),
+                unit_price: round2(item.unit_price + item.modifiers_unit_price),
+                ticket_seq: seq,
+                barcode_token: token,
+                redeemed: false,
+                redeemed_at: null,
+                redeemed_by_user_id: null,
+                voided_at: null,
+                voided_reason: null,
+                created_at: ts,
+              });
+            }
+          }
+          set((s) => ({
+            eventTickets: [...s.eventTickets, ...tickets],
+            outbox: [...s.outbox, ...tickets.map((t) => syncEvent('event_tickets', 'INSERT', t))],
+          }));
+          return { ok: true, data: tickets };
+        },
+
+        redeemEventTicket: (rawToken) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const token = normalizeTicketToken(rawToken);
+          if (!isValidTicketToken(token)) return fail('Código inválido. Confira os 16 caracteres impressos na ficha.');
+          const ticket = get().eventTickets.find((t) => t.barcode_token === token);
+          if (!ticket) return fail('Ficha não encontrada neste estabelecimento.');
+          if (ticket.voided_at) return fail(`Ficha anulada: ${ticket.voided_reason ?? ''}`.trim());
+          if (ticket.redeemed) {
+            const who = get().staff.find((u) => u.id === ticket.redeemed_by_user_id)?.name ?? '?';
+            const when = new Date(ticket.redeemed_at!).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+            return fail(`FICHA JÁ USADA às ${when} (${who}). Não entregue.`);
+          }
+          const ts = nowISO();
+          const redeemed: EventTicket = { ...ticket, redeemed: true, redeemed_at: ts, redeemed_by_user_id: user.id };
+          set((s) => {
+            const eventTickets = s.eventTickets.map((t) => (t.id === ticket.id ? redeemed : t));
+            const open = eventTickets.some((t) => t.order_item_id === ticket.order_item_id && !t.redeemed && !t.voided_at);
+            const item = s.orderItems.find((i) => i.id === ticket.order_item_id);
+            const delivered: OrderItem | null =
+              !open && item && item.status !== 'CANCELED' && item.status !== 'DELIVERED'
+                ? { ...item, status: 'DELIVERED', prepared_at: item.prepared_at ?? ts }
+                : null;
+            return {
+              eventTickets,
+              orderItems: delivered ? s.orderItems.map((i) => (i.id === delivered.id ? delivered : i)) : s.orderItems,
+              outbox: [
+                ...s.outbox,
+                syncEvent('event_tickets', 'UPDATE', redeemed),
+                ...(delivered ? [syncEvent('order_items', 'UPDATE', delivered)] : []),
+              ],
+            };
+          });
+          return { ok: true, data: redeemed };
+        },
+
+        // ---------------------------------------------------------------------
+        // Fase 5 — Barris de chopp
+        // ---------------------------------------------------------------------
+        registerKegWaste: (tapId, ml, reason) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          if (!BAR_ROLES.includes(user.role)) return fail('Só o bar, o caixa ou a gerência registram desperdício.');
+          const tap = get().kegTaps.find((t) => t.id === tapId);
+          if (!tap || !tap.active) return fail('Torneira não encontrada.');
+          const value = Math.round(ml);
+          if (!(value > 0) || value > tap.total_capacity_ml) return fail('Volume inválido.');
+          if (reason.trim().length < MIN_REASON_LENGTH) return fail(`Informe o motivo (mínimo ${MIN_REASON_LENGTH} caracteres).`);
+          const updated = withRemaining({ ...tap, wasted_foam_ml: tap.wasted_foam_ml + value });
+          set((s) => ({
+            kegTaps: s.kegTaps.map((t) => (t.id === tapId ? updated : t)),
+            outbox: [...s.outbox, syncEvent('keg_taps', 'UPDATE', updated)],
+          }));
+          return { ok: true, data: updated };
+        },
+
+        recordKegReading: (tapId, remainingMl) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          if (!BAR_ROLES.includes(user.role)) return fail('Só o bar, o caixa ou a gerência registram a leitura.');
+          const tap = get().kegTaps.find((t) => t.id === tapId);
+          if (!tap || !tap.active) return fail('Torneira não encontrada.');
+          const value = Math.round(remainingMl);
+          if (!Number.isFinite(value) || value < 0 || value > tap.total_capacity_ml) return fail(`Leitura deve estar entre 0 e ${tap.total_capacity_ml / 1000} L.`);
+          const updated = withRemaining({ ...tap, measured_remaining_ml: value, measured_at: nowISO() });
+          set((s) => ({
+            kegTaps: s.kegTaps.map((t) => (t.id === tapId ? updated : t)),
+            outbox: [...s.outbox, syncEvent('keg_taps', 'UPDATE', updated)],
+          }));
+          return { ok: true, data: updated };
+        },
+
+        tapNewKeg: (tapId, keg, auth) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const tap = get().kegTaps.find((t) => t.id === tapId);
+          if (!tap) return fail('Torneira não encontrada.');
+          const beer = keg.beer_name.trim();
+          if (beer.length < 3) return fail('Informe o chopp do barril novo.');
+          const capacity = Math.round(keg.total_capacity_ml);
+          if (!(capacity >= 5000 && capacity <= 100000)) return fail('Capacidade entre 5 L e 100 L.');
+          const cost = round2(keg.keg_cost);
+          if (!(cost >= 0)) return fail('Custo inválido.');
+          const authRes = authorizeManager(auth, { orderId: null, action: 'KEG_CHANGED' });
+          if (!authRes.ok) return authRes;
+          const ts = nowISO();
+          const history: KegHistory = {
+            id: uuid(),
+            tenant_id: tap.tenant_id,
+            tap_id: tap.id,
+            tap_number: tap.tap_number,
+            beer_name: tap.beer_name,
+            total_capacity_ml: tap.total_capacity_ml,
+            billed_volume_ml: tap.billed_volume_ml,
+            wasted_foam_ml: tap.wasted_foam_ml,
+            measured_remaining_ml: tap.measured_remaining_ml,
+            keg_cost: tap.keg_cost,
+            tapped_at: tap.tapped_at,
+            kicked_at: ts,
+            kicked_by_user_id: user.id,
+            authorized_by_manager_id: authRes.data.id,
+          };
+          const log = buildAudit({
+            order_id: null,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: authRes.data.id,
+            action_type: 'KEG_CHANGED',
+            amount_impact: 0,
+            reason: auth.reason.trim(),
+            metadata: {
+              tap_number: tap.tap_number,
+              beer_before: tap.beer_name,
+              beer_after: beer,
+              billed_ml: tap.billed_volume_ml,
+              wasted_ml: tap.wasted_foam_ml,
+              measured_remaining_ml: tap.measured_remaining_ml,
+              manager_name: authRes.data.name,
+            },
+          });
+          const updated = withRemaining({
+            ...tap,
+            beer_name: beer,
+            total_capacity_ml: capacity,
+            keg_cost: cost,
+            billed_volume_ml: 0,
+            wasted_foam_ml: 0,
+            measured_remaining_ml: null,
+            measured_at: null,
+            active: true,
+            tapped_at: ts,
+          });
+          set((s) => ({
+            kegTaps: s.kegTaps.map((t) => (t.id === tapId ? updated : t)),
+            kegHistory: [history, ...s.kegHistory],
+            auditLogs: [{ ...log, whatsapp_alert_sent: false }, ...s.auditLogs],
+            outbox: [
+              ...s.outbox,
+              syncEvent('keg_history', 'INSERT', history),
+              syncEvent('audit_logs', 'INSERT', log),
+              syncEvent('keg_taps', 'UPDATE', updated),
+            ],
+          }));
+          return { ok: true, data: updated };
+        },
+
+        // ---------------------------------------------------------------------
+        // Fase 5 — CRM de cashback
+        // ---------------------------------------------------------------------
+        earnCashback: (orderId, input) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const order = get().orders.find((o) => o.id === orderId);
+          if (!order) return fail('Conta não encontrada.');
+          if (order.status !== 'CLOSED') return fail('O cashback é creditado depois da conta paga.');
+          if (get().cashbackLedger.some((e) => e.order_id === orderId && e.entry_type === 'EARN')) {
+            return fail('Esta conta já gerou cashback.');
+          }
+          const phone = normalizeWhatsapp(input.phone);
+          if (!phone) return fail('WhatsApp inválido. Use DDD + número, ex.: (55) 99999-1234.');
+          const cpf = input.cpf ? input.cpf.replace(/\D/g, '') : null;
+          if (cpf && cpf.length !== 11) return fail('CPF deve ter 11 dígitos.');
+          if (!input.optIn) return fail('Peça a autorização do cliente para receber mensagens no WhatsApp (LGPD).');
+          const amount = cashbackEarnAmount(order);
+          if (!(amount > 0)) return fail('Conta sem valor para gerar cashback.');
+          const now = new Date();
+          const ts = now.toISOString();
+          const tenantId = get().tenant.id;
+          const existing = get().loyaltyCustomers.find((c) => c.phone_whatsapp === phone);
+          const validity = cashbackValidity(now);
+          const entry: CashbackLedgerEntry = {
+            id: uuid(),
+            tenant_id: tenantId,
+            customer_id: existing?.id ?? uuid(),
+            order_id: orderId,
+            entry_type: 'EARN',
+            amount,
+            remaining_amount: amount,
+            base_amount: cashbackBase(order),
+            pct: CASHBACK_PCT,
+            valid_from: validity.valid_from,
+            expires_at: validity.expires_at,
+            created_by_user_id: user.id,
+            created_at: ts,
+          };
+          const ledger = [...get().cashbackLedger, entry];
+          const customer: LoyaltyCustomer = {
+            id: entry.customer_id,
+            tenant_id: tenantId,
+            name: input.name?.trim() || existing?.name || null,
+            phone_whatsapp: phone,
+            cpf: cpf ?? existing?.cpf ?? null,
+            whatsapp_opt_in: true,
+            opt_in_at: existing?.whatsapp_opt_in ? existing.opt_in_at : ts,
+            cashback_balance: balanceCashback(ledger, entry.customer_id, now),
+            total_spent: round2((existing?.total_spent ?? 0) + order.total_amount),
+            visits_count: (existing?.visits_count ?? 0) + 1,
+            last_visit_at: ts,
+            created_at: existing?.created_at ?? ts,
+          };
+          set((s) => ({
+            cashbackLedger: [...s.cashbackLedger, entry],
+            loyaltyCustomers: existing ? s.loyaltyCustomers.map((c) => (c.id === customer.id ? customer : c)) : [...s.loyaltyCustomers, customer],
+            outbox: [
+              ...s.outbox,
+              syncEvent('loyalty_customers', existing ? 'UPDATE' : 'INSERT', customer),
+              syncEvent('cashback_ledger', 'INSERT', entry),
+            ],
+          }));
+          return { ok: true, data: { customer, entry, balance: customer.cashback_balance } };
+        },
+
+        redeemCashback: (orderId, rawPhone) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const res = findEditableOrder(orderId);
+          if (!res.ok) return res;
+          const order = res.data;
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          const now = new Date();
+          if (!isCashbackDay(now)) return fail(`Cashback só pode ser usado de ${CASHBACK_DAYS_LABEL}.`);
+          if (get().cashbackLedger.some((e) => e.order_id === orderId && e.entry_type === 'REDEEM')) return fail('Esta conta já usou cashback.');
+          const phone = normalizeWhatsapp(rawPhone);
+          if (!phone) return fail('WhatsApp inválido.');
+          const customer = get().loyaltyCustomers.find((c) => c.phone_whatsapp === phone);
+          if (!customer) return fail('Cliente não cadastrado no programa de cashback.');
+          const available = availableCashback(get().cashbackLedger, customer.id, now);
+          if (!(available > 0)) return fail('Sem cashback liberado para hoje (o crédito vale a partir do dia seguinte à visita).');
+          const amount = cashbackUsable(available, order);
+          if (!(amount > 0)) return fail('Conta sem saldo para abater.');
+          const ts = now.toISOString();
+          const entry: CashbackLedgerEntry = {
+            id: uuid(),
+            tenant_id: order.tenant_id,
+            customer_id: customer.id,
+            order_id: orderId,
+            entry_type: 'REDEEM',
+            amount,
+            remaining_amount: 0,
+            base_amount: null,
+            pct: null,
+            valid_from: null,
+            expires_at: null,
+            created_by_user_id: user.id,
+            created_at: ts,
+          };
+          let ledger: CashbackLedgerEntry[];
+          try {
+            ledger = [...consumeCashbackFifo(get().cashbackLedger, customer.id, amount, now), entry];
+          } catch (e) {
+            return fail((e as Error).message);
+          }
+          const updatedCustomer: LoyaltyCustomer = { ...customer, cashback_balance: balanceCashback(ledger, customer.id, now) };
+          const log: AuditLog = {
+            ...buildAudit({
+              order_id: orderId,
+              performed_by_user_id: user.id,
+              authorized_by_manager_id: null,
+              action_type: 'CASHBACK_REDEEMED',
+              amount_impact: -amount,
+              reason: 'Cashback de fidelidade resgatado',
+              metadata: { table: tableLabel(order.table_id), customer_id: customer.id, phone, amount },
+            }),
+            whatsapp_alert_sent: false,
+          };
+          set((s) => {
+            const current = s.orders.find((o) => o.id === orderId)!;
+            const recalculated = applyOrderTotals({ ...current, discount_amount: round2(current.discount_amount + amount) }, s.orderItems, s.payments);
+            const changedLedger = ledger.filter((e, i) => e !== s.cashbackLedger[i] && e.entry_type === 'EARN');
+            const patch = commitAdjustment(s, recalculated, s.orderItems, [], log);
+            return {
+              ...patch,
+              auditLogs: patch.auditLogs,
+              cashbackLedger: ledger,
+              loyaltyCustomers: s.loyaltyCustomers.map((c) => (c.id === customer.id ? updatedCustomer : c)),
+              outbox: [
+                ...patch.outbox!,
+                ...changedLedger.map((e) => syncEvent('cashback_ledger', 'UPDATE', e)),
+                syncEvent('cashback_ledger', 'INSERT', entry),
+                syncEvent('loyalty_customers', 'UPDATE', updatedCustomer),
+              ],
+            };
+          });
+          return { ok: true, data: { amount, customer: updatedCustomer } };
+        },
+
         setSoundEnabled: (enabled) => set({ soundEnabled: enabled }),
         setHalfAndHalfPricing: (rule) => set({ halfAndHalfPricing: rule }),
 
@@ -1134,7 +1804,23 @@ export const useTcheStore = create<TcheState>()(
     },
     {
       name: 'tchefood-state-v1',
-      version: 1,
+      // v2 = Fase 5 (barril, fichas, balança, cashback). Os dados da demonstração
+      // são recriados a partir do seed porque produtos, mesas e itens ganharam
+      // colunas obrigatórias; impressoras e preferências do aparelho são mantidas.
+      version: 2,
+      migrate: (persisted, version) => {
+        const p = (persisted ?? {}) as Partial<TcheState>;
+        if (version >= 2) return p as TcheState;
+        return {
+          ...p,
+          ...createSeedData(),
+          printers: p.printers ?? createSeedData().printers,
+          tray: [],
+          outbox: [],
+          pendingCharges: [],
+          currentUserId: null,
+        } as TcheState;
+      },
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
         // Persistimos dados + estado do aparelho; funções e flag de hidratação ficam de fora.

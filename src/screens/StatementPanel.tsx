@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Ban, BadgePercent, CheckCheck, CreditCard, HandPlatter, Lock, Printer, QrCode as QrIcon, Receipt, RotateCcw } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import type { ItemStatus, OrderItem } from '../types';
-import { formatBRL, round2 } from '../lib/money';
+import { formatBRL, formatQty, round2 } from '../lib/money';
 import { conferenceLines } from '../lib/receipts';
 import { useTerminalBus } from '../lib/payments/drivers';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
@@ -64,7 +64,7 @@ export function StatementPanel({ orderId, onCheckout }: { orderId: string; onChe
               <div className="flex items-start gap-2">
                 <div className="min-w-0 flex-1">
                   <div className={`font-semibold ${canceled ? 'line-through opacity-60' : ''}`}>
-                    {it.quantity}x {p?.name}
+                    {formatQty(it.quantity, p?.unit)} {p?.name}
                   </div>
                   <div className="mt-1 flex flex-wrap gap-1">
                     <Badge className={st.cls}>{st.label}</Badge>

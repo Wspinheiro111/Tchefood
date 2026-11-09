@@ -61,8 +61,14 @@ export function KdsScreen() {
   const now = useNow(1000);
   const [filter, setFilter] = useState<Filter>('ALL');
 
+  // Venda de balcão (Ficha Rápida) é entregue pela ficha no balcão, fora do KDS.
+  const counterOrderIds = useMemo(() => {
+    const counterTables = new Set(tables.filter((t) => t.kind === 'COUNTER').map((t) => t.id));
+    return new Set(orders.filter((o) => counterTables.has(o.table_id)).map((o) => o.id));
+  }, [orders, tables]);
+
   // Alerta sonoro quando chega item novo na fila
-  const pendingCount = items.filter((i) => i.status === 'PENDING').length;
+  const pendingCount = items.filter((i) => i.status === 'PENDING' && !counterOrderIds.has(i.order_id)).length;
   const prev = useRef(pendingCount);
   useEffect(() => {
     if (pendingCount > prev.current) {
@@ -78,7 +84,7 @@ export function KdsScreen() {
     for (const i of active) {
       const order = orders.find((o) => o.id === i.order_id);
       // Conta paga não tira o item da produção: só o status do item decide.
-      if (!order || order.status === 'CANCELED') continue;
+      if (!order || order.status === 'CANCELED' || counterOrderIds.has(order.id)) continue;
       // Um ticket por comanda + lote de origem (QR Code separado do garçom)
       const fromQr = i.origin === 'QRCODE_TABLE';
       const key = `${i.order_id}:${fromQr ? 'qr' : i.waiter_id}`;
@@ -100,7 +106,7 @@ export function KdsScreen() {
       if (i.created_at < t.oldest) t.oldest = i.created_at;
     }
     return [...map.values()].sort((a, b) => a.oldest.localeCompare(b.oldest));
-  }, [items, orders, tables, staff, filter]);
+  }, [items, orders, tables, staff, filter, counterOrderIds]);
 
   const bump = (ids: string[], fromStatus: ItemStatus) => {
     const r = advanceItems(ids);

@@ -6,8 +6,14 @@
  * carregado no Supabase (db/seed.sql pode ser gerado a partir deste arquivo).
  */
 import type {
+  CashbackLedgerEntry,
   Category,
   DiningTable,
+  EventTicket,
+  KegHistory,
+  KegTap,
+  KegTapProduct,
+  LoyaltyCustomer,
   ModifierGroup,
   ModifierOption,
   Order,
@@ -22,6 +28,7 @@ import type {
 } from '../types';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { applyOrderTotals, computeItemTotal } from '../lib/money';
+import { applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
 import { minutesAgoISO } from '../lib/ids';
 
 let counter = 0;
@@ -149,6 +156,7 @@ export const SEED_CATEGORIES: Category[] = [
   category('drinks', 'Drinks', 6, 'Martini'),
   category('sem-alcool', 'Sem Álcool', 7, 'CupSoda'),
   category('sobremesas', 'Sobremesas', 8, 'IceCreamCone'),
+  category('buffet', 'Buffet a Quilo', 9, 'Scale'),
 ];
 
 interface ProductSpec {
@@ -163,6 +171,9 @@ interface ProductSpec {
   ncm?: string;
   unit?: string;
   available?: boolean;
+  /** Fase 5: vendido por peso (preço do KG) e tara padrão do prato. */
+  weight?: { tare: number };
+  cost?: number;
 }
 
 const PRODUCT_SPECS: ProductSpec[] = [
@@ -206,7 +217,15 @@ const PRODUCT_SPECS: ProductSpec[] = [
   { code: '601', name: 'Sagu com Creme', cat: 'sobremesas', price: 18.9, sector: 'DESSERT' },
   { code: '602', name: 'Pudim de Leite', cat: 'sobremesas', price: 16.9, sector: 'DESSERT' },
   { code: '603', name: 'Ambrosia Gaúcha', cat: 'sobremesas', price: 17.9, sector: 'DESSERT' },
+  // Buffet a quilo (balança Toledo/Filizola)
+  { code: '901', name: 'Buffet Livre a Quilo', cat: 'buffet', price: 79.9, sector: 'NONE', weight: { tare: 280 }, cost: 31.5, description: 'Preço por kg. Tara do prato raso: 280 g.' },
+  { code: '902', name: 'Sobremesas a Quilo', cat: 'buffet', price: 59.9, sector: 'NONE', weight: { tare: 120 }, cost: 22, description: 'Preço por kg. Tara da taça: 120 g.' },
 ];
+
+/** CMV de referência (ficha técnica) dos itens mais vendidos. */
+const COST_BY_CODE: Record<string, number> = {
+  '101': 48.6, '102': 31.2, '201': 3.1, '202': 5.4, '203': 5.9, '204': 8.2, '211': 6.3, '313': 9.8, '401': 18.5, '601': 4.2,
+};
 
 export const SEED_PRODUCTS: Product[] = PRODUCT_SPECS.map((p) => ({
   id: seedId(`product:${p.code}`),
@@ -223,8 +242,11 @@ export const SEED_PRODUCTS: Product[] = PRODUCT_SPECS.map((p) => ({
   ncm: p.ncm ?? '21069090',
   cfop: '5102',
   csosn_cst: '102',
-  unit: p.unit ?? 'UN',
+  unit: p.weight ? 'KG' : p.unit ?? 'UN',
   created_at: created,
+  sold_by_weight: Boolean(p.weight),
+  tare_weight_grams: p.weight?.tare ?? 0,
+  cost_price: p.cost ?? COST_BY_CODE[p.code] ?? 0,
 }));
 
 // ---------------------------------------------------------------------------
@@ -233,8 +255,8 @@ export const SEED_PRODUCTS: Product[] = PRODUCT_SPECS.map((p) => ({
 function group(key: string, name: string, min: number, max: number, required: boolean): ModifierGroup {
   return { id: seedId(`mg:${key}`), tenant_id: T, name, min_selection: min, max_selection: max, required };
 }
-function option(groupKey: string, key: string, name: string, price: number): ModifierOption {
-  return { id: seedId(`mo:${groupKey}:${key}`), group_id: seedId(`mg:${groupKey}`), name, additional_price: price };
+function option(groupKey: string, key: string, name: string, price: number, volumeMl: number | null = null): ModifierOption {
+  return { id: seedId(`mo:${groupKey}:${key}`), group_id: seedId(`mg:${groupKey}`), name, additional_price: price, volume_ml: volumeMl };
 }
 
 export const SEED_MODIFIER_GROUPS: ModifierGroup[] = [
@@ -256,9 +278,9 @@ export const SEED_MODIFIER_OPTIONS: ModifierOption[] = [
   option('molhos', 'chimichurri', 'Chimichurri', 0),
   option('molhos', 'campeiro', 'Molho Campeiro', 0),
   option('molhos', 'alho', 'Pasta de Alho', 4.9),
-  option('tamanho-chopp', '300', '300 ml', 0),
-  option('tamanho-chopp', '500', '500 ml', 6),
-  option('tamanho-chopp', 'caneca', 'Caneca 1 L', 16),
+  option('tamanho-chopp', '300', '300 ml', 0, 300),
+  option('tamanho-chopp', '500', '500 ml', 6, 500),
+  option('tamanho-chopp', 'caneca', 'Caneca 1 L', 16, 1000),
   option('base-caipira', 'cachaca', 'Cachaça', 0),
   option('base-caipira', 'vodka', 'Vodka', 5),
   option('base-caipira', 'sake', 'Saquê', 7),
@@ -287,6 +309,27 @@ export const SEED_PRODUCT_MODIFIER_GROUPS: ProductModifierGroup[] = [
   link('211', 'fruta-caipira', 2),
   ...['401', '402', '403', '404', '405'].map((c) => link(c, 'borda', 1)),
   link('221', 'sabor-refri', 1),
+];
+
+// ---------------------------------------------------------------------------
+// TORNEIRAS DE CHOPP (Fase 5)
+// ---------------------------------------------------------------------------
+const KEG_TAPPED_AT = minutesAgoISO(180);
+export const SEED_KEG_TAPS_BASE: KegTap[] = [
+  withRemaining({
+    id: seedId('keg:1'), tenant_id: T, tap_number: 1, beer_name: 'Chopp Pilsen 50L', total_capacity_ml: 50000,
+    billed_volume_ml: 0, wasted_foam_ml: 600, remaining_volume_ml: 0, measured_remaining_ml: null, measured_at: null,
+    keg_cost: 480, active: true, tapped_at: KEG_TAPPED_AT,
+  }),
+  withRemaining({
+    id: seedId('keg:2'), tenant_id: T, tap_number: 2, beer_name: 'IPA Missioneira 30L', total_capacity_ml: 30000,
+    billed_volume_ml: 0, wasted_foam_ml: 400, remaining_volume_ml: 0, measured_remaining_ml: 26300, measured_at: minutesAgoISO(10),
+    keg_cost: 540, active: true, tapped_at: KEG_TAPPED_AT,
+  }),
+];
+export const SEED_KEG_TAP_PRODUCTS: KegTapProduct[] = [
+  { tap_id: seedId('keg:1'), product_id: seedId('product:201'), pour_ml: 300 },
+  { tap_id: seedId('keg:2'), product_id: seedId('product:202'), pour_ml: 300 },
 ];
 
 /** Tags de 1 toque por setor de produção. */
@@ -318,13 +361,31 @@ function table(n: number, area: (typeof AREAS)[number], capacity: number): Dinin
     qr_code_token: `tchefood-galpao-${n.toString().padStart(3, '0')}-${(n * 7919).toString(36)}`,
     current_order_id: null,
     updated_at: created,
+    kind: 'TABLE',
   };
 }
+
+/** Mesa técnica da venda de balcão / eventos (Ficha Rápida): nunca é ocupada. */
+export const COUNTER_TABLE_ID = seedId('table:counter');
+const COUNTER_TABLE: DiningTable = {
+  id: COUNTER_TABLE_ID,
+  tenant_id: T,
+  number: 900,
+  label: 'Balcão / Eventos',
+  area: 'Balcão & Eventos',
+  capacity: 1,
+  status: 'FREE',
+  qr_code_token: null,
+  current_order_id: null,
+  updated_at: created,
+  kind: 'COUNTER',
+};
 
 const BASE_TABLES: DiningTable[] = [
   ...[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => table(n, 'Salão Principal', n % 3 === 0 ? 6 : 4)),
   ...[21, 22, 23, 24, 25, 26].map((n) => table(n, 'Deck', n % 2 === 0 ? 8 : 4)),
   ...[31, 32, 33, 34].map((n) => table(n, 'Parrilla', 2)),
+  COUNTER_TABLE,
 ];
 
 // ---------------------------------------------------------------------------
@@ -355,6 +416,7 @@ function buildItem(orderId: string, line: SeedLine, idx: number): OrderItem {
   const modsPrice = mods.reduce((acc, m) => acc + m.additional_price, 0);
   const noteParts = [...mods.map((m) => `+ ${m.name}`), ...(line.notes ? [line.notes] : [])];
   const createdAt = minutesAgoISO(line.minutesAgo);
+  const kegVolume = resolveKegVolume(product.id, mods.map((m) => ({ option_id: m.id })), SEED_KEG_TAP_PRODUCTS, SEED_MODIFIER_OPTIONS);
   return {
     id: seedId(`item:${orderId}:${idx}`),
     order_id: orderId,
@@ -375,6 +437,10 @@ function buildItem(orderId: string, line: SeedLine, idx: number): OrderItem {
     canceled_at: null,
     canceled_by_user_id: null,
     cancel_reason: null,
+    weight_gross_grams: null,
+    weight_tare_grams: null,
+    weight_source: null,
+    keg_volume_ml: kegVolume,
   };
 }
 
@@ -532,7 +598,10 @@ function buildSeedState() {
   const dirty = tables.find((x) => x.number === 7);
   if (dirty) dirty.status = 'DIRTY';
 
-  return { tables, orders, items, payments };
+  // Torneiras com o volume já faturado pelos chopps das comandas do seed.
+  const kegTaps = applyKegSale(SEED_KEG_TAPS_BASE, SEED_KEG_TAP_PRODUCTS, items);
+
+  return { tables, orders, items, payments, kegTaps };
 }
 
 export function createSeedData() {
@@ -552,5 +621,11 @@ export function createSeedData() {
     payments: dyn.payments,
     auditLogs: [],
     printers: SEED_PRINTERS.map((p) => ({ ...p })),
+    kegTaps: dyn.kegTaps,
+    kegTapProducts: SEED_KEG_TAP_PRODUCTS,
+    kegHistory: [] as KegHistory[],
+    eventTickets: [] as EventTicket[],
+    loyaltyCustomers: [] as LoyaltyCustomer[],
+    cashbackLedger: [] as CashbackLedgerEntry[],
   };
 }
