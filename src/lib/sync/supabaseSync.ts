@@ -11,8 +11,12 @@
  *  - Os demais são upsert pelo id (merge-duplicates).
  *  - Segredos da loja (token Focus, CSC) e a situação fiscal da comanda
  *    (nfce_status, nfce_key) nunca saem do aparelho por aqui: o servidor é a fonte deles.
- *  - Evento recusado pelo servidor (4xx) PARA a fila e fica visível na tela.
- *    Nada é descartado sozinho.
+ *  - A autorização de gerente (cancelamento, desconto, remoção dos 10%) NÃO é
+ *    gravada direto em audit_logs: o banco só aceita esse registro vindo de
+ *    tchefood_authorize_manager(), que confere o PIN de novo. A fila chama essa RPC.
+ *  - Evento recusado pelo servidor (4xx) sai da fila para a lista de recusados,
+ *    visível na tela, e o envio continua com os próximos. Nada é descartado sozinho:
+ *    o operador reenvia os recusados depois de corrigir a causa.
  */
 import type { SyncEvent } from '../../types';
 
@@ -37,6 +41,20 @@ const CONFLICT_KEY: Partial<Record<SyncEvent['table'], string>> = {
 
 const INSERT_ONLY: ReadonlyArray<SyncEvent['table']> = ['payments', 'audit_logs'];
 
+/** Ações que o banco só aceita pela RPC que confere o PIN (ver tchefood_authorize_manager). */
+export const RPC_AUTHORIZED_ACTIONS: ReadonlyArray<string> = ['ITEM_CANCELED', 'SERVICE_FEE_REMOVED', 'DISCOUNT_APPLIED'];
+const AUTHORIZE_RPC = 'tchefood_authorize_manager';
+
+/** audit_log de autorização de gerente que precisa subir pela RPC. */
+export function isManagerAuthorization(event: SyncEvent): boolean {
+  return (
+    event.table === 'audit_logs' &&
+    event.op === 'INSERT' &&
+    event.payload.authorized_by_manager_id != null &&
+    RPC_AUTHORIZED_ACTIONS.includes(String(event.payload.action_type))
+  );
+}
+
 /** Campos que nunca sobem do aparelho para a nuvem. */
 const NEVER_UPLOAD: Partial<Record<SyncEvent['table'], ReadonlyArray<string>>> = {
   tenants: ['focus_nfe_token', 'csc_id', 'csc_token', 'created_at'],
@@ -59,7 +77,31 @@ function baseHeaders(cfg: SyncConfig): Record<string, string> {
   };
 }
 
+function buildAuthorizeRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
+  if (!event.manager_pin) {
+    // Fila gravada antes desta correção: sem o PIN, o servidor não tem como conferir.
+    throw new Error('Autorização de gerente sem PIN para o servidor conferir. Refaça a operação com o PIN do gerente.');
+  }
+  const p = event.payload;
+  const metadata = { ...((p.metadata as Record<string, unknown> | null | undefined) ?? {}), client_audit_id: event.row_id };
+  return {
+    url: `${cfg.url.replace(/\/+$/, '')}/rest/v1/rpc/${AUTHORIZE_RPC}`,
+    method: 'POST',
+    headers: baseHeaders(cfg),
+    body: JSON.stringify({
+      p_order_id: p.order_id ?? null,
+      p_action_type: p.action_type,
+      p_manager_pin: event.manager_pin,
+      p_performed_by: p.performed_by_user_id,
+      p_reason: p.reason,
+      p_amount_impact: p.amount_impact ?? 0,
+      p_metadata: metadata,
+    }),
+  };
+}
+
 export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
+  if (isManagerAuthorization(event)) return buildAuthorizeRequest(event, cfg);
   const root = `${cfg.url.replace(/\/+$/, '')}/rest/v1/${event.table}`;
   const headers = baseHeaders(cfg);
 
@@ -105,18 +147,20 @@ export type FetchLike = (url: string, init: { method: string; headers: Record<st
   text: () => Promise<string>;
 }>;
 
-export interface FlushResult {
-  sent: string[];
-  /** Erro de rede ou 5xx: tentar de novo depois, sem culpa do evento. */
-  retryLater: string | null;
-  /** 4xx: o servidor recusou este evento; a fila para nele. */
-  rejected: { eventId: string; status: number; message: string } | null;
+export interface SyncRejection {
+  eventId: string;
+  status: number;
+  message: string;
 }
 
-/**
- * Envia a fila em ordem até acabar, até o primeiro erro, ou até `limit` eventos.
- * Não altera o estado: quem chama confirma os enviados (ackSyncedEvents).
- */
+export interface FlushResult {
+  sent: string[];
+  /** Erro de rede ou 5xx: tentar de novo depois, sem culpa do evento. Para o envio. */
+  retryLater: string | null;
+  /** 4xx: o servidor recusou estes eventos. O envio seguiu com os demais. */
+  rejected: SyncRejection[];
+}
+
 /**
  * Ordem de envio para o servidor. Igual à da fila, exceto que um audit_log de pedido
  * sobe antes das atualizações daquele pedido que vieram logo antes dele: as travas do
@@ -153,33 +197,93 @@ export function serverOrder(events: SyncEvent[]): SyncEvent[] {
   return out;
 }
 
-export async function flushOutbox(events: SyncEvent[], cfg: SyncConfig, fetchFn: FetchLike, limit = 50): Promise<FlushResult> {
+/** Tabelas cujas linhas pertencem a uma comanda e mexem nela no servidor. */
+const ORDER_CHILDREN: ReadonlyArray<SyncEvent['table']> = ['order_items', 'payments', 'audit_logs'];
+
+/**
+ * Registros que um evento toca, para manter a ordem por registro. Tudo o que pertence
+ * a uma comanda conta também como a comanda: itens e pagamentos recalculam os totais
+ * dela por gatilho (trg_order_items_recalc, trg_payments_recalc) e o audit_log é a
+ * autorização da qual a atualização dela depende. Assim, um recusado da comanda segura
+ * tudo o que vem depois dela, e o reenvio acontece na mesma ordem em que foi gerado.
+ */
+export function recordKeys(event: SyncEvent): string[] {
+  const keys = [`${event.table}:${event.row_id}`];
+  if (ORDER_CHILDREN.includes(event.table) && typeof event.payload.order_id === 'string') keys.push(`orders:${event.payload.order_id}`);
+  return keys;
+}
+
+/**
+ * Envia a fila em ordem até acabar, até um erro de rede/servidor, ou até `limit` envios
+ * (eventos segurados não contam).
+ * Um evento recusado (4xx) não para o envio: vai para `rejected` e o próximo segue.
+ * Eventos posteriores do MESMO registro de um recusado (nesta rodada ou em `held`, os
+ * recusados guardados) não sobem: ficam na fila até o recusado ser reenviado, para uma
+ * versão antiga nunca sobrescrever uma mais nova na nuvem.
+ * Não altera o estado: quem chama confirma os enviados (ackSyncedEvents) e tira os
+ * recusados da fila (rejectSyncEvents), para não reenviá-los a cada rodada.
+ */
+export async function flushOutbox(
+  events: SyncEvent[],
+  cfg: SyncConfig,
+  fetchFn: FetchLike,
+  limit = 50,
+  held: SyncEvent[] = [],
+): Promise<FlushResult> {
   const sent: string[] = [];
-  for (const event of serverOrder(events).slice(0, limit)) {
+  const rejected: SyncRejection[] = [];
+  const blocked = new Set(held.flatMap(recordKeys));
+  const reject = (event: SyncEvent, status: number, message: string) => {
+    rejected.push({ eventId: event.id, status, message });
+    for (const k of recordKeys(event)) blocked.add(k);
+  };
+  let attempts = 0;
+  for (const event of serverOrder(events)) {
+    // Eventos segurados não contam no limite: senão um bloco segurado no começo da fila
+    // impediria para sempre que registros sem relação subissem.
+    if (recordKeys(event).some((k) => blocked.has(k))) continue;
+    if (attempts >= limit) break;
+    attempts++;
     let req: SyncRequest;
     try {
       req = buildSyncRequest(event, cfg);
     } catch (e) {
-      return { sent, retryLater: null, rejected: { eventId: event.id, status: 0, message: (e as Error).message } };
+      reject(event, 0, (e as Error).message);
+      continue;
     }
     let res;
     try {
       res = await fetchFn(req.url, { method: req.method, headers: req.headers, body: req.body });
     } catch (e) {
-      return { sent, retryLater: `Sem conexão com a nuvem: ${(e as Error).message}`, rejected: null };
+      return { sent, retryLater: `Sem conexão com a nuvem: ${(e as Error).message}`, rejected };
     }
+    const text = await res.text().catch(() => '');
     if (res.ok) {
+      // A RPC responde null quando o PIN não confere no servidor (ou está bloqueado):
+      // nada foi autorizado, e a atualização da comanda que vem depois seria recusada.
+      if (isManagerAuthorization(event) && !isUuidResponse(text)) {
+        reject(event, res.status, 'O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).');
+        continue;
+      }
       sent.push(event.id);
       continue;
     }
-    const text = await res.text().catch(() => '');
-    if (res.status === 401) return { sent, retryLater: 'Sessão da nuvem expirada. Renovando o acesso.', rejected: null };
+    if (res.status === 401) return { sent, retryLater: 'Sessão da nuvem expirada. Renovando o acesso.', rejected };
     if (res.status >= 500 || res.status === 408 || res.status === 429) {
-      return { sent, retryLater: `Nuvem indisponível (HTTP ${res.status}).`, rejected: null };
+      return { sent, retryLater: `Nuvem indisponível (HTTP ${res.status}).`, rejected };
     }
-    return { sent, retryLater: null, rejected: { eventId: event.id, status: res.status, message: describeError(text, res.status) } };
+    reject(event, res.status, describeError(text, res.status));
   }
-  return { sent, retryLater: null, rejected: null };
+  return { sent, retryLater: null, rejected };
+}
+
+function isUuidResponse(body: string): boolean {
+  try {
+    const v = JSON.parse(body) as unknown;
+    return typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v);
+  } catch {
+    return false;
+  }
 }
 
 function describeError(body: string, status: number): string {

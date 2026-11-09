@@ -50,6 +50,7 @@ import type {
   Tenant,
   TrayItem,
   UUID,
+  RejectedSyncEvent,
 } from '../types';
 import { applyOrderTotals, computeItemTotal, formatBRL, halfAndHalfPrice, round2, round3, toCents } from '../lib/money';
 import {
@@ -312,6 +313,8 @@ interface DeviceSlice {
   currentUserId: UUID | null;
   tray: TrayItem[];
   outbox: SyncEvent[];
+  /** Eventos que a nuvem recusou: fora da fila (não travam o resto) até alguém reenviar. */
+  syncRejected: RejectedSyncEvent[];
   managerPinFailures: number;
   managerPinLockedUntil: number | null;
   soundEnabled: boolean;
@@ -427,6 +430,10 @@ interface Actions {
   setCloudSession: (session: CloudSession | null) => ActionResult;
   ackSyncedEvents: (eventIds: UUID[]) => void;
   setSyncError: (message: string | null, blockedEventId: UUID | null) => void;
+  /** Tira da fila os eventos recusados pela nuvem e guarda em syncRejected. */
+  rejectSyncEvents: (rejections: Array<{ eventId: UUID; status: number; message: string }>) => void;
+  /** Devolve os recusados para o começo da fila, na ordem original, para nova tentativa. */
+  retryRejectedSync: () => void;
 }
 
 export type TcheState = DataSlice & DeviceSlice & Actions;
@@ -475,6 +482,7 @@ function initialDevice(): DeviceSlice {
     currentUserId: null,
     tray: [],
     outbox: [],
+    syncRejected: [],
     managerPinFailures: 0,
     managerPinLockedUntil: null,
     soundEnabled: true,
@@ -520,6 +528,16 @@ function syncEvent(table: SyncEvent['table'], op: SyncEvent['op'], row: { id: UU
     payload: { ...row } as Record<string, unknown>,
     created_at: nowISO(),
   };
+}
+
+/**
+ * audit_log de autorização de gerente para a fila: leva o PIN digitado para o servidor
+ * conferir de novo (tchefood_authorize_manager). O PIN não entra no audit_log.
+ */
+function managerAuthEvent(log: AuditLog, managerPin: string | null): SyncEvent {
+  const event = syncEvent('audit_logs', 'INSERT', log);
+  // Sem gerente (ex.: resgate de cashback), o audit_log sobe direto, sem RPC.
+  return managerPin === null ? event : { ...event, manager_pin: managerPin };
 }
 
 function fail(error: string): { ok: false; error: string } {
@@ -758,6 +776,7 @@ export const useTcheStore = create<TcheState>()(
         orderItems: OrderItem[],
         changedItems: OrderItem[],
         log: AuditLog,
+        managerPin: string | null,
       ): Partial<TcheState> => {
         const ts = nowISO();
         const settled = settleIfPaid(s, recalculated, orderItems, ts);
@@ -773,7 +792,7 @@ export const useTcheStore = create<TcheState>()(
           outbox: [
             ...s.outbox,
             // O audit_log sobe antes: o banco recusa o ajuste sem a autorização já gravada.
-            syncEvent('audit_logs', 'INSERT', log),
+            managerAuthEvent(log, managerPin),
             ...allChanged.map((i) => syncEvent('order_items', 'UPDATE', i)),
             syncEvent('orders', 'UPDATE', settled.order),
             ...(settled.table ? [syncEvent('dining_tables', 'UPDATE', settled.table)] : []),
@@ -1228,7 +1247,7 @@ export const useTcheStore = create<TcheState>()(
             const recalculated = applyOrderTotals(current, orderItems, s.payments);
             const before = s.orderItems.find((i) => i.id === itemId)!;
             const kegTaps = applyKegCancel(s.kegTaps, s.kegTapProducts, before);
-            const patch = commitAdjustment(s, recalculated, orderItems, [canceledItem], log);
+            const patch = commitAdjustment(s, recalculated, orderItems, [canceledItem], log, auth.managerPin);
             return {
               ...patch,
               kegTaps,
@@ -1271,7 +1290,7 @@ export const useTcheStore = create<TcheState>()(
           set((s) => {
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, charge_service_fee: false }, s.orderItems, s.payments);
-            return commitAdjustment(s, recalculated, s.orderItems, [], log);
+            return commitAdjustment(s, recalculated, s.orderItems, [], log, auth.managerPin);
           });
           return { ok: true, data: log };
         },
@@ -1345,7 +1364,7 @@ export const useTcheStore = create<TcheState>()(
           set((s) => {
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, discount_amount: discount }, s.orderItems, s.payments);
-            return commitAdjustment(s, recalculated, s.orderItems, [], log);
+            return commitAdjustment(s, recalculated, s.orderItems, [], log, auth.managerPin);
           });
           return { ok: true, data: log };
         },
@@ -2385,7 +2404,7 @@ export const useTcheStore = create<TcheState>()(
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, discount_amount: round2(current.discount_amount + amount) }, s.orderItems, s.payments);
             const changedLedger = ledger.filter((e, i) => e !== s.cashbackLedger[i] && e.entry_type === 'EARN');
-            const patch = commitAdjustment(s, recalculated, s.orderItems, [], log);
+            const patch = commitAdjustment(s, recalculated, s.orderItems, [], log, null);
             return {
               ...patch,
               auditLogs: patch.auditLogs,
@@ -2776,6 +2795,10 @@ export const useTcheStore = create<TcheState>()(
           if (state.cloud && state.outbox.length > 0) {
             return fail(`Ainda há ${state.outbox.length} evento(s) sem enviar para a nuvem. Sincronize antes.`);
           }
+          const rejectedCount = (state.syncRejected ?? []).length;
+          if (state.cloud && rejectedCount > 0) {
+            return fail(`Há ${rejectedCount} evento(s) recusado(s) pela nuvem. Resolva e reenvie antes de iniciar uma loja nova.`);
+          }
           const check = validateTenantDraft(input.tenant);
           if (!check.ok) return check;
           const authRes = authorizeManager(auth, { orderId: null, action: 'STORE_RESET' });
@@ -2897,6 +2920,30 @@ export const useTcheStore = create<TcheState>()(
             syncStatus: { last_success_at: nowISO(), last_error: null, last_error_at: null, blocked_event_id: null },
           }));
         },
+
+        rejectSyncEvents: (rejections) => {
+          if (rejections.length === 0) return;
+          const byId = new Map(rejections.map((r) => [r.eventId, r]));
+          const at = nowISO();
+          set((s) => ({
+            outbox: s.outbox.filter((e) => !byId.has(e.id)),
+            syncRejected: [
+              ...(s.syncRejected ?? []),
+              ...s.outbox
+                .filter((e) => byId.has(e.id))
+                .map((event) => ({ event, status: byId.get(event.id)!.status, message: byId.get(event.id)!.message, rejected_at: at })),
+            ],
+          }));
+        },
+
+        retryRejectedSync: () =>
+          set((s) => {
+            const back = (s.syncRejected ?? []).map((r) => r.event);
+            if (back.length === 0) return {};
+            // Voltam na frente: são mais antigos que tudo o que entrou na fila depois.
+            back.sort((a, b) => a.created_at.localeCompare(b.created_at));
+            return { outbox: [...back, ...s.outbox], syncRejected: [] };
+          }),
 
         setSyncError: (message, blockedEventId) =>
           set((s) => ({
