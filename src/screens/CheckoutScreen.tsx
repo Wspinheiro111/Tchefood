@@ -6,6 +6,7 @@ import { computeEqualShare, computeItemsShare, formatBRL, round2, toCents } from
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest } from '../lib/payments/drivers';
 import { cardReceiptLines, conferenceLines } from '../lib/receipts';
 import { uuid } from '../lib/ids';
+import { clearReviewHold, getReviewHold, setReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
 import { Btn, Stepper, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 
@@ -38,7 +39,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const [busy, setBusy] = useState(false);
   const [closedOrderId, setClosedOrderId] = useState<string | null>(null);
   /** Cobrança com resultado incerto: bloqueia nova cobrança em maquininha até o operador conferir o extrato. */
-  const [reviewHold, setReviewHold] = useState<{ amount: number; reason: string; code: string } | null>(null);
+  const [reviewHold, setReviewHoldState] = useState<ReviewHold | null>(() => getReviewHold(orderId));
 
   useEffect(() => {
     if (order && order.status === 'OPEN' && order.remaining_balance > 0) {
@@ -111,7 +112,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       const result = await driver.charge(req);
       if (result.status === 'MANUAL_REVIEW') {
         // Não registra pagamento nem recusa: o resultado é desconhecido e não pode ser repetido sozinho.
-        setReviewHold({ amount, reason: result.reason, code: result.failure_code });
+        setReviewHoldState(setReviewHold({ order_id: orderId, amount, reason: result.reason, code: result.failure_code }));
         toast.alert(`⚠️ ${result.reason}`);
         return;
       }
@@ -269,7 +270,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
           <div className="mb-1 font-black text-ouro">Cobrança de {formatBRL(reviewHold.amount)} sem confirmação ({reviewHold.code})</div>
           <p className="mb-3 text-slate-200">{reviewHold.reason} Se a maquininha mostra a transação aprovada, não cobre de novo: guarde o comprovante e chame o gerente. Se não houve cobrança, libere abaixo.</p>
-          <Btn variant="secondary" size="lg" onClick={() => setReviewHold(null)}>Conferi no extrato: não foi cobrado</Btn>
+          <Btn variant="secondary" size="lg" onClick={() => { clearReviewHold(orderId); setReviewHoldState(null); }}>Conferi no extrato: não foi cobrado</Btn>
         </div>
       )}
 

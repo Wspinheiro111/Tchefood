@@ -451,7 +451,8 @@ export class StoneConnectProvider implements PaymentTerminalProvider {
       : methodType === "credit_card" || methodType === "debit_card" ? 1 : null;
     if (status === "approved") {
       // "paid" sem NSU, autorização, maquininha ou com valor pago diferente do pedido não conclui a venda.
-      if (!nsu || !authorizationCode || !serial || paidAmount === null || paidAmount !== asCents(charge.amount)) status = "manual_review";
+      // Pago a menos que o pedido (charge parcial) também não conclui: o pedido inteiro precisa estar pago.
+      if (!nsu || !authorizationCode || !serial || paidAmount === null || paidAmount !== asCents(charge.amount) || paidAmount !== base.amountCents) status = "manual_review";
     }
     return {
       ...base,

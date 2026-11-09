@@ -256,6 +256,8 @@ describe("StoneConnectProvider", () => {
       paidCharge({}, { terminal_serial_number: null }),
       paidCharge({ paid_amount: 12000 }),
       paidCharge({ paid_amount: null }),
+      // Charge parcial: paga tudo o que ela própria cobra, mas menos que o pedido.
+      paidCharge({ amount: 5000, paid_amount: 5000 }),
     ];
     for (const charge of incomplete) {
       const result = await makeProvider(paidOrderFetch(charge)).getCharge(ORDER);
