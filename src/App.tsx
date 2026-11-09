@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { BarChart3, Bike, ChefHat, CloudOff, Flame, LayoutGrid, LogOut, QrCode as QrIcon, RefreshCw, Smartphone } from 'lucide-react';
+import { BarChart3, Bike, ChefHat, MonitorPlay, CloudOff, Flame, LayoutGrid, LogOut, QrCode as QrIcon, RefreshCw, Smartphone } from 'lucide-react';
 import { isManagerRole, selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
 import { useTerminalBus } from './lib/payments/drivers';
@@ -11,6 +11,7 @@ import { KdsScreen } from './screens/KdsScreen';
 import { QrMenuScreen } from './screens/QrMenuScreen';
 import { BackOffice } from './screens/BackOffice';
 import { DeliveryScreen } from './screens/DeliveryScreen';
+import { OrderBoardScreen } from './screens/OrderBoardScreen';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
 import { PrintSimulatorModal } from './components/PrintSimulator';
 import { ToastHost } from './components/ui';
@@ -23,15 +24,17 @@ type View =
   | { name: 'kds' }
   | { name: 'qr' }
   | { name: 'delivery' }
+  | { name: 'board' }
   | { name: 'backoffice' };
 
-type NavKey = 'map' | 'kds' | 'qr' | 'delivery' | 'backoffice';
+type NavKey = 'map' | 'kds' | 'qr' | 'delivery' | 'board' | 'backoffice';
 
 const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: UserRole[] }> = [
   { key: 'map', label: 'Mesas', icon: LayoutGrid, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
   { key: 'kds', label: 'KDS', icon: ChefHat, roles: ['KITCHEN', 'MANAGER', 'OWNER'] },
   { key: 'qr', label: 'QR Cliente', icon: QrIcon, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
   { key: 'delivery', label: 'Delivery', icon: Bike, roles: ['MANAGER', 'OWNER', 'CASHIER'] },
+  { key: 'board', label: 'Painel TV', icon: MonitorPlay, roles: ['MANAGER', 'OWNER', 'CASHIER', 'KITCHEN'] },
   { key: 'backoffice', label: 'Retaguarda', icon: BarChart3, roles: ['MANAGER', 'OWNER', 'CASHIER'] },
 ];
 
@@ -104,6 +107,7 @@ export default function App() {
         {view.name === 'kds' && <KdsScreen />}
         {view.name === 'qr' && <QrMenuScreen />}
         {view.name === 'delivery' && <DeliveryScreen />}
+        {view.name === 'board' && <OrderBoardScreen />}
         {view.name === 'backoffice' && (isManagerRole(user.role) || user.role === 'CASHIER' ? <BackOffice /> : <p className="p-6">Acesso restrito.</p>)}
       </main>
 

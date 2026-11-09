@@ -6,7 +6,7 @@ React 18 + TypeScript estrito + Vite + Tailwind + Zustand (persistência Indexed
 ```bash
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 110 testes: motor financeiro, anti-fraude, rachadinha, NFC-e, QR, ESC/POS, maquininhas, Stone Connect, delivery iFood
+npm test           # 121 testes: motor financeiro, anti-fraude, rachadinha, NFC-e, QR, ESC/POS, maquininhas, Stone Connect, delivery iFood
 npm run build
 ```
 
@@ -31,6 +31,7 @@ npm run build
 7. **Stone Connect 2.0 (servidor)** — `server/payments/stoneConnect.ts`, cliente do Pagar.me v5 portado do Tchê Vendas com testes. Guia completo e documentação oficial em `docs/integracoes/stone/`. Roda em servidor porque a Secret Key da loja nunca vai para o navegador.
 
 8. **Pedidos de delivery** — caixa de entrada única para apps de delivery com interface comum (`server/delivery/`). **iFood** (Merchant API) pronto e rodando contra um iFood simulado; tela **Delivery** para aceitar, preparar, marcar pronto, despachar e cancelar. 99Food, Keeta (Open Delivery), Delivery Much, Aiqfome, Anota AI e Rappi já estão no catálogo, aguardando credenciais/parceria. Guia em `docs/integracoes/delivery/`.
+9. **Painel de senhas na TV** — aba **Painel TV**: colunas "Preparando" e "Pronto" no estilo fast-food, com pedidos de delivery/retirada (número do app + primeiro nome) e pedidos feitos pelo QR da mesa. Quando um pedido fica pronto, o número pisca, toca o sinal e a TV fala o número (voz do navegador, dá para desligar). Botão de tela cheia. Não mostra telefone, endereço nem valores.
 
 ## Banco de dados
 `db/schema.sql` contém a modelagem do blueprint sem alterações, mais: `product_modifier_groups`, `printers`, recálculo financeiro em PL/pgSQL idêntico a `src/lib/money.ts`, travas anti-fraude (DELETE bloqueado, cancelamento/10%/desconto só com audit_log de gerente, `audit_logs` imutável), fechamento automático e RLS multi-tenant.

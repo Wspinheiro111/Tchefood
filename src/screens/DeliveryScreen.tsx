@@ -1,12 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { AlertTriangle, Bike, CheckCircle2, Clock, Plus, RefreshCw, ShoppingBag, XCircle } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import { formatBRL, fromCents } from '../lib/money';
 import { playDispatchChime } from '../lib/sound';
 import { Badge, Btn, Sheet, toast } from '../components/ui';
-import { DeliveryInbox, InMemoryDeliveryRepository, type DeliveryOrderRecord } from '../../server/delivery/deliveryInbox';
-import { IfoodMerchantApi } from '../../server/delivery/ifood/ifoodMerchantApi';
-import { IfoodSandbox, type IfoodSandboxOrderInput } from '../../server/delivery/ifood/ifoodSandbox';
+import type { DeliveryCycleReport, DeliveryOrderRecord } from '../../server/delivery/deliveryInbox';
+import type { IfoodSandboxOrderInput } from '../../server/delivery/ifood/ifoodSandbox';
+import { getDeliveryDemo as getDemo, syncDeliveryOrders, useDeliveryOrders, useDeliveryPolling } from '../lib/deliveryDemo';
 import {
   DELIVERY_CHANNEL_CATALOG,
   allowedDeliveryActions,
@@ -15,27 +15,6 @@ import {
   type DeliveryOrderStatus,
 } from '../../server/delivery/marketplace';
 import type { Product } from '../types';
-
-// Modo simulador: o mesmo adapter do iFood e a mesma caixa de entrada do servidor rodam no navegador contra
-// um iFood falso em memória. Em produção a caixa de entrada roda no servidor (o client_secret não vem ao
-// navegador) e esta tela lê os pedidos do Supabase.
-const DEMO_POLL_MS = 5_000;
-
-let demo: { sandbox: IfoodSandbox; inbox: DeliveryInbox } | null = null;
-function getDemo() {
-  if (!demo) {
-    const sandbox = new IfoodSandbox();
-    const api = new IfoodMerchantApi({
-      credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret },
-      merchantIds: [sandbox.merchantId],
-      baseUrl: sandbox.baseUrl,
-      fetchImpl: sandbox.fetch,
-    });
-    const inbox = new DeliveryInbox({ adapters: [api], repository: new InMemoryDeliveryRepository() });
-    demo = { sandbox, inbox };
-  }
-  return demo;
-}
 
 const STATUS_LABEL: Record<DeliveryOrderStatus, string> = {
   placed: 'Novo: aceitar',
@@ -97,17 +76,15 @@ function randomDemoOrder(products: Product[]): IfoodSandboxOrderInput {
 export function DeliveryScreen() {
   const products = useTcheStore((s) => s.products);
   const sound = useTcheStore((s) => s.soundEnabled);
-  const [orders, setOrders] = useState<DeliveryOrderRecord[]>([]);
+  const orders = useDeliveryOrders((s) => s.orders);
+  const lastSync = useDeliveryOrders((s) => s.lastSync);
   const [busy, setBusy] = useState<string | null>(null);
-  const [lastSync, setLastSync] = useState<string | null>(null);
   const [cancelFor, setCancelFor] = useState<DeliveryOrderRecord | null>(null);
   const [reasons, setReasons] = useState<DeliveryCancellationReason[]>([]);
   const [showFinished, setShowFinished] = useState(false);
   const productByCode = useMemo(() => new Map(products.map((product) => [product.code, product])), [products]);
 
-  const sync = useCallback(async () => {
-    const { inbox } = getDemo();
-    const reports = await inbox.runCycle();
+  const onCycle = useCallback((reports: DeliveryCycleReport[]) => {
     const fresh = reports.reduce((sum, report) => sum + report.newOrders.length, 0);
     const failed = reports.find((report) => report.error);
     if (fresh > 0) {
@@ -115,15 +92,9 @@ export function DeliveryScreen() {
       toast.success(`${fresh} pedido(s) novo(s) do iFood`);
     }
     if (failed?.error) toast.error(`iFood: ${failed.error}`);
-    setOrders(await inbox.listOrders());
-    setLastSync(new Date().toLocaleTimeString('pt-BR'));
   }, [sound]);
-
-  useEffect(() => {
-    void sync();
-    const timer = window.setInterval(() => void sync(), DEMO_POLL_MS);
-    return () => window.clearInterval(timer);
-  }, [sync]);
+  useDeliveryPolling(onCycle);
+  const sync = useCallback(async () => onCycle(await syncDeliveryOrders()), [onCycle]);
 
   const simulateOrder = async () => {
     getDemo().sandbox.placeOrder(randomDemoOrder(products));
