@@ -21,7 +21,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_ar.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -38,6 +38,7 @@ describe('supabase/migrations', () => {
     expect(idx('schema_gerente_nuvem.sql')).toBeGreaterThan(idx('schema_autorizacao.sql'));
     expect(idx('schema_combos.sql')).toBeGreaterThan(idx('schema_gerente_nuvem.sql'));
     expect(idx('schema_baixar_loja.sql')).toBeGreaterThan(idx('schema_combos.sql'));
+    expect(idx('schema_ar.sql')).toBeGreaterThan(idx('schema_baixar_loja.sql'));
   });
 
   it('permissões padrão do banco iguais às do app (src/lib/permissions.ts)', async () => {
