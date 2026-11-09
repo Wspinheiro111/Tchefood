@@ -131,16 +131,19 @@ function PickupQueue({ onCharge }: { onCharge: (orderId: string) => void }) {
   const tables = useTcheStore((s) => s.tables);
   const orders = useTcheStore((s) => s.orders);
   const items = useTcheStore((s) => s.orderItems);
-  const today = useMemo(() => {
+  const { waiting, others } = useMemo(() => {
     const ids = kioskTableIds(tables);
     const day = brasiliaDate(new Date());
-    return orders
-      .filter((o) => ids.has(o.table_id) && o.pickup_number !== null && brasiliaDate(o.opened_at) === day)
+    const pickup = orders
+      .filter((o) => ids.has(o.table_id) && o.pickup_number !== null)
       .sort((a, b) => (a.opened_at < b.opened_at ? 1 : -1));
+    return {
+      // Senha não paga continua na fila mesmo depois da meia-noite: é a única entrada para cobrar ou cancelar.
+      waiting: pickup.filter((o) => o.status === 'PAYING'),
+      others: pickup.filter((o) => o.status !== 'PAYING' && brasiliaDate(o.opened_at) === day).slice(0, 12),
+    };
   }, [tables, orders]);
-  const waiting = today.filter((o) => o.status === 'PAYING');
-  const others = today.filter((o) => o.status !== 'PAYING').slice(0, 12);
-  if (today.length === 0) return null;
+  if (waiting.length === 0 && others.length === 0) return null;
   return (
     <div className="mt-4 space-y-3">
       {waiting.length > 0 && (
@@ -290,7 +293,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
       {hold ? (
         <div className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
           <p className="mb-2 font-bold text-ouro">⚠️ {hold.reason}</p>
-          <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de receber de novo, em qualquer forma de pagamento.</p>
+          <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de receber de novo, em qualquer forma de pagamento. Se a maquininha mostra a transação aprovada, não cobre de novo: guarde o comprovante e chame o gerente.</p>
           <Btn variant="secondary" block onClick={() => { clearReviewHold(orderId); setHold(null); }}>Conferi no extrato: não foi cobrado</Btn>
         </div>
       ) : (
