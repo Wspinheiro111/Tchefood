@@ -259,6 +259,7 @@ CREATE TABLE delivery_orders (
     review_reasons TEXT[] NOT NULL DEFAULT '{}',
     -- Aviso de pedido novo (cozinha, KDS, alerta) já tentado; falso = reprocessar avisa de novo.
     new_order_notified BOOLEAN NOT NULL DEFAULT FALSE,
+    last_cancellation_event_at TIMESTAMPTZ,
     total_amount NUMERIC(10,2) NOT NULL CHECK (total_amount >= 0),
     -- Pedido normalizado completo (DeliveryOrder): itens, pagamentos, endereço.
     payload JSONB NOT NULL,

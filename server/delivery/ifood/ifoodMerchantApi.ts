@@ -188,7 +188,7 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter {
     if (response.status === 400 || response.status === 401 || response.status === 403) {
       throw new DeliveryMarketplaceError("ifood", "auth_failed", "O iFood recusou as credenciais do app.", response.status);
     }
-    const body = await this.readBody(response);
+    const body = this.readBody(response);
     const record = asRecord(body);
     const value = optionalString(record?.accessToken);
     const expiresIn = typeof record?.expiresIn === "number" ? record.expiresIn : null;
@@ -218,33 +218,50 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter {
     throw new DeliveryMarketplaceError("ifood", "auth_failed", "O iFood recusou o token renovado.", 401);
   }
 
-  private async send(path: string, init: RequestInit): Promise<Response> {
+  // Faz a chamada E lê o corpo inteiro dentro do mesmo prazo: um iFood que manda o cabeçalho e trava no corpo
+  // não pode prender o polling para sempre.
+  private async send(path: string, init: RequestInit): Promise<RawResponse> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new DeliveryMarketplaceError("ifood", "unavailable", "iFood indisponível (tempo esgotado)."));
+      }, this.timeoutMs);
+    });
+    const exchange = (async (): Promise<RawResponse> => {
+      const response = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, signal: controller.signal });
+      const text = response.status === 204 ? "" : await response.text();
+      return { status: response.status, ok: response.ok, text };
+    })();
     try {
-      return await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, signal: controller.signal });
+      return await Promise.race([exchange, deadline]);
     } catch (error) {
+      if (error instanceof DeliveryMarketplaceError) throw error;
       const reason = error instanceof Error && error.name === "AbortError" ? "tempo esgotado" : "falha de rede";
       throw new DeliveryMarketplaceError("ifood", "unavailable", `iFood indisponível (${reason}).`);
     } finally {
       clearTimeout(timer);
+      // A corrida perdida não pode virar "unhandled rejection".
+      exchange.catch(() => undefined);
     }
   }
 
-  private async readBody(response: Response): Promise<unknown> {
+  private readBody(response: RawResponse): unknown {
     if (response.status === 204) return null;
-    const text = await response.text();
     if (!response.ok) {
-      throw new DeliveryMarketplaceError("ifood", errorCodeForStatus(response.status), describeIfoodError(response.status, text), response.status);
+      throw new DeliveryMarketplaceError("ifood", errorCodeForStatus(response.status), describeIfoodError(response.status, response.text), response.status);
     }
-    if (!text.trim()) return null;
+    if (!response.text.trim()) return null;
     try {
-      return JSON.parse(text) as unknown;
+      return JSON.parse(response.text) as unknown;
     } catch {
       throw this.invalid("O iFood respondeu algo que não é JSON.");
     }
   }
 }
+
+type RawResponse = { status: number; ok: boolean; text: string };
 
 function errorCodeForStatus(status: number): DeliveryMarketplaceErrorCode {
   if (status === 401 || status === 403) return "auth_failed";

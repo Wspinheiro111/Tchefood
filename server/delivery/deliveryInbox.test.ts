@@ -2,7 +2,18 @@ import { describe, expect, it, vi } from "vitest";
 import { DeliveryInbox, InMemoryDeliveryRepository, type DeliveryOrderRecord } from "./deliveryInbox";
 import { IfoodMerchantApi } from "./ifood/ifoodMerchantApi";
 import { IfoodSandbox } from "./ifood/ifoodSandbox";
-import { allowedDeliveryActions, mergeDeliveryStatus } from "./marketplace";
+import { allowedDeliveryActions, mergeDeliveryStatus, type DeliveryEvent, type DeliveryOrder } from "./marketplace";
+
+async function baseOrder(): Promise<DeliveryOrder> {
+  const sandbox = new IfoodSandbox();
+  const api = new IfoodMerchantApi({
+    credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret },
+    baseUrl: sandbox.baseUrl,
+    fetchImpl: sandbox.fetch,
+  });
+  const order = await api.getOrder(sandbox.placeOrder({ items: [{ name: "Xis", externalCode: "301", quantity: 1, unitPrice: 38 }] }));
+  return { ...order, externalId: "o1" };
+}
 
 function setup(options: { onNewOrder?: (record: DeliveryOrderRecord) => void | Promise<void> } = {}) {
   const sandbox = new IfoodSandbox();
@@ -187,6 +198,31 @@ describe("caixa de entrada de delivery", () => {
     const result = await inbox.requestCancellation("ifood", id, reason);
     expect(result.order.status).toBe("cancelled");
     expect(result.cancellationPending).toBe(false);
+  });
+
+  it("pedido de cancelamento atrasado não reabre o cancelamento já recusado", async () => {
+    const repository = new InMemoryDeliveryRepository();
+    const adapter = {
+      channel: "ifood" as const,
+      queue: [] as DeliveryEvent[],
+      pollEvents: async () => adapter.queue.splice(0),
+      acknowledge: async () => undefined,
+      getOrder: async () => ({ ...(await baseOrder()), status: "placed" as const }),
+      performAction: async () => undefined,
+      listCancellationReasons: async () => [],
+      requestCancellation: async () => undefined,
+    };
+    const custom = new DeliveryInbox({ adapters: [adapter], repository });
+    const event = (id: string, signal: DeliveryEvent["signal"], createdAt: string): DeliveryEvent => ({
+      channel: "ifood", externalEventId: id, externalOrderId: "o1", merchantExternalId: "m", rawCode: id, signal, createdAt,
+    });
+    adapter.queue.push(event("e1", "placed", "2026-11-09T10:00:00Z"), event("e3", "cancellation_denied", "2026-11-09T10:02:00Z"));
+    await custom.runCycle();
+    adapter.queue.push(event("e2", "cancellation_requested", "2026-11-09T10:01:00Z"));
+    await custom.runCycle();
+    const [record] = await custom.listOrders();
+    expect(record.cancellationPending).toBe(false);
+    expect(allowedDeliveryActions(record.order, record.cancellationPending)).toContain("confirm");
   });
 
   it("app fora do ar não derruba o ciclo", async () => {

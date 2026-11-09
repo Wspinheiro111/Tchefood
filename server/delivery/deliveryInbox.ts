@@ -26,6 +26,8 @@ export type DeliveryOrderRecord = {
   // false até o aviso de pedido novo (cozinha, KDS, alerta) ter sido tentado. Fica gravado junto do pedido para
   // que uma falha entre salvar o pedido e salvar o evento não pule o aviso no reprocessamento.
   newOrderNotified: boolean;
+  // Horário do último evento de cancelamento (pedido/recusa) aplicado; evento mais antigo que ele é ignorado.
+  lastCancellationEventAt: string | null;
   lastEventAt: string;
   updatedAt: string;
 };
@@ -249,6 +251,7 @@ export class DeliveryInbox {
         needsReview: order.warnings.length > 0,
         reviewReasons: [...order.warnings],
         newOrderNotified: false,
+        lastCancellationEventAt: null,
         lastEventAt: event.createdAt,
         updatedAt: this.now().toISOString(),
       };
@@ -277,9 +280,15 @@ export class DeliveryInbox {
 
 function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
   if (event.createdAt > record.lastEventAt) record.lastEventAt = event.createdAt;
+  const isCancellationSignal = event.signal === "cancellation_requested" || event.signal === "cancellation_denied";
+  if (isCancellationSignal) {
+    // Evento de cancelamento atrasado (ex.: o pedido chegando depois da recusa) não reabre nada.
+    if (record.lastCancellationEventAt !== null && event.createdAt < record.lastCancellationEventAt) return;
+    record.lastCancellationEventAt = event.createdAt;
+  }
   switch (event.signal) {
     case "cancellation_requested":
-      record.cancellationPending = true;
+      if (record.order.status !== "cancelled" && record.order.status !== "concluded") record.cancellationPending = true;
       return;
     case "cancellation_denied":
       record.cancellationPending = false;

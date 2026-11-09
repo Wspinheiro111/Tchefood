@@ -145,6 +145,18 @@ describe("iFood: chamadas HTTP", () => {
     expect(reasons[0]).toEqual({ code: "501", description: "Problemas de sistema" });
   });
 
+  it("iFood que manda cabeçalho e trava no corpo cai no prazo e não prende o polling", async () => {
+    const sandbox = new IfoodSandbox();
+    const stalled = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (!url.includes("events:polling")) return sandbox.fetch(input, init);
+      const body = new ReadableStream({ start() {} });
+      return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const api = makeApi(sandbox, { fetchImpl: stalled, timeoutMs: 30 });
+    await expect(api.pollEvents()).rejects.toMatchObject({ code: "unavailable", message: expect.stringMatching(/tempo esgotado/) });
+  });
+
   it("recusa id de pedido com caractere estranho sem chamar a rede", async () => {
     const sandbox = new IfoodSandbox();
     const spy = vi.fn(sandbox.fetch);
