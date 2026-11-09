@@ -23,6 +23,7 @@ import type {
   PriceSchedule,
   Product,
   ProductModifierGroup,
+  PurchaseInvoice,
   RolePermission,
   StaffUser,
   Supplier,
@@ -51,6 +52,8 @@ export interface CloudSnapshot {
   rolePermissions: RolePermission[];
   suppliers: Supplier[];
   supplierProductLinks: SupplierProductLink[];
+  /** Notas de compra já importadas: sem elas um aparelho novo importaria a mesma NF-e de novo e somaria o estoque duas vezes. */
+  purchaseInvoices: PurchaseInvoice[];
 }
 
 const TENANT_COLUMNS = ['id', 'name', 'legal_name', 'cnpj', 'state_registration', 'city', 'state', 'default_service_fee_pct', 'default_acquirer', 'default_mode', 'created_at'] as const;
@@ -79,6 +82,15 @@ const TABLES = {
     table: 'supplier_product_links',
     order: 'id',
     columns: ['id', 'tenant_id', 'supplier_id', 'supplier_code', 'product_id', 'packaging_factor', 'commercial_unit', 'updated_at'],
+  },
+  purchaseInvoices: {
+    table: 'purchase_invoices',
+    order: 'id',
+    columns: [
+      'id', 'tenant_id', 'supplier_id', 'access_key', 'number', 'series', 'issued_at', 'environment', 'authorization_protocol', 'products_amount',
+      'discount_amount', 'freight_amount', 'insurance_amount', 'other_amount', 'ipi_amount', 'icms_st_amount', 'invoice_amount', 'stocked_amount',
+      'items_count', 'imported_by_user_id', 'imported_at',
+    ],
   },
 } as const;
 
@@ -138,6 +150,7 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
   const rolePermissions = await read('rolePermissions');
   const suppliers = await read('suppliers');
   const supplierProductLinks = await read('supplierProductLinks');
+  const purchaseInvoices = await read('purchaseInvoices');
   return {
     tenant,
     staff,
@@ -152,6 +165,7 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
     rolePermissions: rolePermissions as RolePermission[],
     suppliers: suppliers as Supplier[],
     supplierProductLinks: supplierProductLinks as SupplierProductLink[],
+    purchaseInvoices: purchaseInvoices as PurchaseInvoice[],
   };
 }
 
@@ -219,8 +233,10 @@ export function mergeRows<T>(local: readonly T[], cloud: readonly T[], pending: 
 
 /** A mesa vem da nuvem só com o cadastro: a ocupação é de cada aparelho (contas ainda não descem). */
 export function adaptTable(cloud: DiningTable, local: DiningTable | undefined): DiningTable {
+  // Mesa com conta aberta aqui continua ativa mesmo que outro aparelho a tenha desativado
+  // (lá estava livre): senão ela some do mapa e a conta fica sem entrada para cobrar.
   return local
-    ? { ...cloud, status: local.status, current_order_id: local.current_order_id, updated_at: local.updated_at }
+    ? { ...cloud, status: local.status, current_order_id: local.current_order_id, updated_at: local.updated_at, active: local.status === 'FREE' ? cloud.active : local.active }
     : { ...cloud, status: 'FREE', current_order_id: null };
 }
 
@@ -236,6 +252,7 @@ export const MERGE = {
   rolePermissions: { table: 'role_permissions', key: (r: RolePermission) => `${r.tenant_id}:${r.role}:${r.permission}`, dropMissing: false },
   suppliers: { table: 'suppliers', key: (r: Supplier) => r.id, dropMissing: false },
   supplierProductLinks: { table: 'supplier_product_links', key: (r: SupplierProductLink) => r.id, dropMissing: false },
+  purchaseInvoices: { table: 'purchase_invoices', key: (r: PurchaseInvoice) => r.id, dropMissing: false },
 } satisfies { [K in keyof typeof TABLES]: MergeSpec<CloudSnapshot[K][number]> };
 
 /**

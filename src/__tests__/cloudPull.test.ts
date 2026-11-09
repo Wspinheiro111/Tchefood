@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { adaptTable, MERGE, mergeRows, mergeStaffWithoutPins, pendingRowKeys, type CloudSnapshot } from '../lib/sync/cloudPull';
 import { useTcheStore, type CloudSession } from '../store/useTcheStore';
-import type { DiningTable, ModifierOption, Product, StaffUser } from '../types';
+import type { DiningTable, ModifierOption, Product, PurchaseInvoice, StaffUser } from '../types';
 
 const st = () => useTcheStore.getState();
 const T = '22222222-2222-4222-8222-222222222222';
@@ -23,6 +23,7 @@ function snapshotOfDemo(tenantId = st().tenant.id): CloudSnapshot {
     rolePermissions: s.rolePermissions,
     suppliers: s.suppliers,
     supplierProductLinks: s.supplierProductLinks,
+    purchaseInvoices: s.purchaseInvoices,
   };
 }
 
@@ -59,6 +60,13 @@ describe('mesclar o que veio da nuvem', () => {
     expect(adaptTable(cloud, local)).toMatchObject({ label: 'Mesa 9', status: 'PAYING', current_order_id: 'o-daqui' });
   });
 
+  it('mesa ocupada aqui continua ativa mesmo desativada em outro aparelho', () => {
+    const cloud = { id: 'm', label: 'Mesa 9', status: 'FREE', current_order_id: null, active: false } as unknown as DiningTable;
+    const busy = { ...cloud, status: 'OCCUPIED', current_order_id: 'o1', active: true } as DiningTable;
+    expect(adaptTable(cloud, busy)).toMatchObject({ status: 'OCCUPIED', active: true });
+    expect(adaptTable(cloud, { ...busy, status: 'FREE', current_order_id: null })).toMatchObject({ active: false });
+  });
+
   it('equipe sem PIN: atualiza quem já está aqui e conta quem é novo', () => {
     const u = (id: string, over: Partial<StaffUser> = {}) => ({ id, tenant_id: T, name: id, role: 'WAITER', pin_code: '1234', active: true, created_at: '', ...over }) as StaffUser;
     const cloud = [u('a', { active: false }), u('n')].map(({ pin_code: _p, ...x }) => x);
@@ -81,6 +89,17 @@ describe('baixar a loja da nuvem', () => {
     expect(st().orders).toEqual([]);
     expect(st().cloud?.tenant_id).toBe(T);
     expect(st().tables.every((t) => t.status === 'FREE' && t.current_order_id === null)).toBe(true);
+  });
+
+  it('baixar a loja traz as notas de compra já importadas (a mesma NF-e não soma o estoque de novo)', () => {
+    expect(st().login('8888').ok).toBe(true);
+    const snap = snapshotOfDemo(T);
+    const staff = st().staff.map((u) => ({ ...u, tenant_id: T }));
+    const manager = staff.find((u) => u.role === 'MANAGER')!;
+    const invoice = { id: 'inv-1', tenant_id: T, access_key: '3'.repeat(44) } as unknown as PurchaseInvoice;
+    const r = st().joinCloudStore({ session: session(T), snapshot: { ...snap, purchaseInvoices: [invoice] }, staff, userId: manager.id });
+    if (!r.ok) throw new Error(r.error);
+    expect(st().purchaseInvoices.map((i) => i.access_key)).toEqual(['3'.repeat(44)]);
   });
 
   it('recusa: quem não é proprietário aqui, loja de outra conta, ou quem confirma não é gerente', () => {
