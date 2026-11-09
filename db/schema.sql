@@ -28,7 +28,7 @@ CREATE TABLE tenants (
     state_registration VARCHAR(20),
     city VARCHAR(100) DEFAULT 'Santo Ângelo',
     state CHAR(2) DEFAULT 'RS',
-    default_service_fee_pct NUMERIC(5,2) NOT NULL DEFAULT 10.00,
+    default_service_fee_pct NUMERIC(5,2) NOT NULL DEFAULT 10.00 CHECK (default_service_fee_pct BETWEEN 0 AND 100),
     default_acquirer acquirer_type NOT NULL DEFAULT 'STONE',
     default_mode operation_mode NOT NULL DEFAULT 'TEF_POS_WIRELESS',
     focus_nfe_token TEXT,
@@ -127,7 +127,7 @@ CREATE TABLE orders (
     customer_cpf VARCHAR(14),
     subtotal_items NUMERIC(10,2) NOT NULL DEFAULT 0.00,
     charge_service_fee BOOLEAN NOT NULL DEFAULT TRUE,
-    service_fee_pct NUMERIC(5,2) NOT NULL DEFAULT 10.00,
+    service_fee_pct NUMERIC(5,2) NOT NULL DEFAULT 10.00 CHECK (service_fee_pct BETWEEN 0 AND 100),
     service_fee_amount NUMERIC(10,2) NOT NULL DEFAULT 0.00,
     discount_amount NUMERIC(10,2) NOT NULL DEFAULT 0.00,
     total_amount NUMERIC(10,2) NOT NULL DEFAULT 0.00,
@@ -604,3 +604,18 @@ END;
 $$;
 CREATE TRIGGER trg_order_items_lock_financials BEFORE UPDATE ON order_items
     FOR EACH ROW EXECUTE FUNCTION tchefood_lock_item_financials();
+
+-- O percentual dos 10% é fixado quando a conta abre (vem do tenant). Mudá-lo numa
+-- conta existente reduziria a taxa sem PIN do gerente; para dispensar a taxa o
+-- caminho é charge_service_fee = false, que exige SERVICE_FEE_REMOVED.
+CREATE OR REPLACE FUNCTION tchefood_lock_service_fee_pct()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.service_fee_pct IS DISTINCT FROM OLD.service_fee_pct THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: percentual da taxa de serviço da conta % não pode ser alterado depois de aberta.', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_orders_lock_service_fee_pct BEFORE UPDATE OF service_fee_pct ON orders
+    FOR EACH ROW EXECUTE FUNCTION tchefood_lock_service_fee_pct();

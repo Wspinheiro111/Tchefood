@@ -1190,7 +1190,9 @@ export const useTcheStore = create<TcheState>()(
         return data as Partial<TcheState>;
       },
       onRehydrateStorage: () => () => {
-        useTcheStore.setState({ hydrated: true });
+        // Com o fallback síncrono (localStorage), este callback roda ainda dentro de
+        // create(), antes de useTcheStore existir; adiamos para depois da atribuição.
+        queueMicrotask(() => useTcheStore.setState({ hydrated: true }));
       },
     },
   ),
