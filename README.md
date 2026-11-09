@@ -6,7 +6,7 @@ React 18 + TypeScript estrito + Vite + Tailwind + Zustand (persistência Indexed
 ```bash
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 84 testes: motor financeiro, anti-fraude, rachadinha, NFC-e, QR, ESC/POS, maquininhas, Stone Connect
+npm test           # 109 testes: motor financeiro, anti-fraude, rachadinha, NFC-e, QR, ESC/POS, maquininhas, Stone Connect
 npm run build
 ```
 
@@ -29,12 +29,27 @@ npm run build
 
 6. **Regras de maquininha do Tchê Vendas** (mesmo autor) — aprovado só com prova completa (código `0000`, NSU, autorização, serial e valor batendo); resultado incerto vira **revisão manual** e trava nova cobrança em maquininha até o operador conferir o extrato; o sistema nunca inventa NSU/autorização; idempotência por `request_id`; comandos PlugPag serializados com `isServiceBusy()` (`src/lib/payments/terminalGuard.ts`, `android/PlugPagJsBridge.java`). Impressão de cozinha com ledger `STARTED/COMPLETE` (não reimprime sozinho se o resultado for incerto) e QR Code da NFC-e validado contra a chave de acesso.
 7. **Stone Connect 2.0 (servidor)** — `server/payments/stoneConnect.ts`, cliente do Pagar.me v5 portado do Tchê Vendas com testes. Guia completo e documentação oficial em `docs/integracoes/stone/`. Roda em servidor porque a Secret Key da loja nunca vai para o navegador.
+8. **Emissão real de NFC-e (Supabase Edge Function + Focus NFe)** — `supabase/functions/emit-nfce`, regras portadas do Tchê Vendas. Detalhes abaixo.
+
+## NFC-e real: `supabase/functions/emit-nfce`
+```bash
+supabase db push                                   # aplica supabase/migrations (tabela nfce_documents)
+supabase secrets set FOCUS_AMBIENTE=homologacao    # "producao" (exato) liga produção
+supabase functions deploy emit-nfce
+```
+`POST /functions/v1/emit-nfce` com o JWT do app (claim `tenant_id`) e corpo `{ "order_id": "<uuid>" }`.
+- O corpo só traz o `order_id`. Itens, valores, pagamentos e o token Focus (`tenants.focus_nfe_token`) são lidos do banco; o cliente não altera o valor da nota nem vê o token. A comanda só é encontrada se o RLS do chamador permitir.
+- Um documento por comanda (`nfce_documents`, referência `tchefood<uuid>`). Reserva atômica antes do POST: duas abas não emitem duas vezes. Autorizada/cancelada → devolve o que está gravado; em processamento/contingência → só consulta (GET).
+- `authorized: true` somente com chave + protocolo da SEFAZ. Falha de rede/timeout fica `processing` (HTTP 202) e a próxima chamada consulta a mesma referência; nunca vira "contingência" ou "sucesso" inventados. Contingência offline da Focus aparece como `contingency` até ser efetivada.
+- Taxa de serviço em `valor_outras_despesas` e desconto em `valor_desconto`, rateados por item; qualquer divergência de centavo entre itens, total e pagamentos bloqueia a emissão (HTTP 422) sem chamar a Focus.
+- `tipo_integracao: 1` só com prova da maquininha (CNPJ da credenciadora Stone/PagBank coerente com o adquirente do pagamento + código de autorização); sem prova, `2`. Pix da maquininha sai `2`, como no Tchê Vendas.
+- Banco: transições inválidas (ex.: autorizada → rejeitada), DELETE e alteração de nota autorizada são barrados por trigger.
 
 ## Banco de dados
 `db/schema.sql` contém a modelagem do blueprint sem alterações, mais: `product_modifier_groups`, `printers`, recálculo financeiro em PL/pgSQL idêntico a `src/lib/money.ts`, travas anti-fraude (DELETE bloqueado, cancelamento/10%/desconto só com audit_log de gerente, `audit_logs` imutável), fechamento automático e RLS multi-tenant.
 
 ## O que ainda é simulado
 - Stone Connect / PlugPag: sem credenciais, as cobranças caem no simulador visual (`MockTerminalDriver`). Com `window.StoneBridge`/`window.PlugPagBridge` presentes, os drivers usam o hardware. O cliente Stone Connect 2.0 está pronto em `server/`, mas falta o servidor (rotas de cobrança e webhook) e a credencial de parceiro.
-- NFC-e: payload e DANFE gerados localmente em **homologação**; o envio à Focus NFe precisa de token, certificado e CSC reais.
+- NFC-e: o app ainda gera payload e DANFE localmente em **homologação**; a emissão real está pronta em `supabase/functions/emit-nfce`, mas as telas ainda não chamam a função e ela precisa do token Focus, certificado A1 e CSC cadastrados na Focus.
 - Alerta de WhatsApp: registrado (`whatsapp_alert_sent = true`) e pré-visualizado; o disparo real depende de um provedor.
 - Supabase: os eventos ficam na fila `outbox` (IndexedDB) prontos para sincronizar; o cliente Supabase ainda não está ligado.
