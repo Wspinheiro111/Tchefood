@@ -1,0 +1,400 @@
+/**
+ * HAL — Camada de Abstração de Hardware de pagamento (Stone & PagBank).
+ *
+ * Todas as cobranças passam por IPaymentTerminalDriver. Os drivers reais
+ * (StonePosDriver / PagBankPlugPagDriver) tentam primeiro o hardware/SDK
+ * nativo; quando ele não existe (navegador comum, demonstração), delegam ao
+ * MockTerminalDriver, que renderiza a maquininha interativa na tela e
+ * devolve NSU, cAut e bandeira gerados como na adquirente real.
+ */
+import { create } from 'zustand';
+import type { AcquirerType, OperationMode, PaymentMethod, PosTerminal } from '../../types';
+import { uuid } from '../ids';
+import { UniversalEscPosBuilder } from '../../services/printer/escposBuilder';
+
+export const ACQUIRER_CNPJ: Record<'STONE' | 'PAGBANK', string> = {
+  STONE: '16501555000157',
+  PAGBANK: '08561701000101',
+};
+
+export type CardBrand = 'VISA' | 'MASTERCARD' | 'ELO' | 'PIX';
+
+export interface ChargeRequest {
+  request_id: string;
+  idempotency_key: string;
+  amount: number;
+  method: Exclude<PaymentMethod, 'CASH' | 'VOUCHER'>;
+  table_label: string;
+  order_id: string;
+  /** Mensagem extra exibida no visor (ex.: "Cota 2 de 4"). */
+  description: string;
+}
+
+export interface TerminalApproved {
+  status: 'APPROVED';
+  acquirer: AcquirerType;
+  acquirer_cnpj: string;
+  card_brand: CardBrand;
+  nsu: string;
+  authorization_code: string;
+  terminal_serial: string;
+  terminal_id: string | null;
+  masked_pan: string | null;
+  mode: OperationMode;
+}
+
+export interface TerminalDeclined {
+  status: 'DECLINED';
+  acquirer: AcquirerType;
+  reason: string;
+  terminal_serial: string;
+  terminal_id: string | null;
+}
+
+export type TerminalResult = TerminalApproved | TerminalDeclined;
+
+export interface IPaymentTerminalDriver {
+  readonly acquirer: AcquirerType;
+  readonly mode: OperationMode;
+  readonly terminal: PosTerminal | null;
+  /** Dispara a cobrança e resolve quando a maquininha aprova/recusa. */
+  charge(req: ChargeRequest): Promise<TerminalResult>;
+  /** Imprime texto puro na bobina térmica de 58mm (32 colunas). */
+  print(lines: string[]): Promise<void>;
+  /** Cancela uma cobrança pendente no terminal. */
+  abort(requestId: string): void;
+}
+
+// ---------------------------------------------------------------------------
+// Barramento entre drivers e o simulador visual
+// ---------------------------------------------------------------------------
+export type Chassis = 'STONE' | 'PAGBANK';
+
+export interface PendingCharge {
+  request: ChargeRequest;
+  chassis: Chassis;
+  mode: OperationMode;
+  terminal: PosTerminal | null;
+  resolve: (r: TerminalResult) => void;
+}
+
+export interface PrintJob {
+  id: string;
+  title: string;
+  lines: string[];
+  chassis: Chassis;
+  /** QR Code impresso ao final (DANFE NFC-e). */
+  qr?: string;
+  /** Linhas após o QR Code. */
+  footer?: string[];
+}
+
+interface TerminalBus {
+  pending: PendingCharge | null;
+  printQueue: PrintJob[];
+  simulatorOpen: boolean;
+  chassis: Chassis;
+  setChassis: (c: Chassis) => void;
+  openSimulator: (c?: Chassis) => void;
+  closeSimulator: () => void;
+  submit: (p: PendingCharge) => void;
+  finish: (r: TerminalResult) => void;
+  enqueuePrint: (job: Omit<PrintJob, 'id'>) => void;
+  dismissPrint: (id: string) => void;
+}
+
+export const useTerminalBus = create<TerminalBus>((set, get) => ({
+  pending: null,
+  printQueue: [],
+  simulatorOpen: false,
+  chassis: 'STONE',
+  setChassis: (c) => set({ chassis: c }),
+  openSimulator: (c) => set({ simulatorOpen: true, ...(c ? { chassis: c } : {}) }),
+  closeSimulator: () => {
+    const p = get().pending;
+    if (p) {
+      p.resolve({
+        status: 'DECLINED',
+        acquirer: p.chassis,
+        reason: 'Operação cancelada no terminal',
+        terminal_serial: p.terminal?.serial_number ?? `${p.chassis}-EMBEDDED`,
+        terminal_id: p.terminal?.id ?? null,
+      });
+    }
+    set({ simulatorOpen: false, pending: null });
+  },
+  submit: (p) => set({ pending: p, simulatorOpen: true, chassis: p.chassis }),
+  finish: (r) => {
+    const p = get().pending;
+    set({ pending: null });
+    p?.resolve(r);
+  },
+  enqueuePrint: (job) => set({ printQueue: [...get().printQueue, { ...job, id: uuid() }], simulatorOpen: true, chassis: job.chassis }),
+  dismissPrint: (id) => set({ printQueue: get().printQueue.filter((j) => j.id !== id) }),
+}));
+
+/**
+ * Imprime um documento (DANFE, conferência) na bobina física do aparelho quando
+ * existe ponte nativa; no navegador, cai no simulador visual.
+ *  - SmartPosNative.printInternalEscPos: ESC/POS 58mm com QR Code nativo (GS ( k)
+ *  - PlugPagBridge.printText: texto puro; o QR vira a URL de consulta impressa
+ */
+export function printDocument(job: Omit<PrintJob, 'id'>): 'NATIVE' | 'SIMULATOR' {
+  const w = window as unknown as {
+    SmartPosNative?: { printInternalEscPos?: (b64: string) => string };
+    PlugPagBridge?: { printText?: (text: string) => void };
+  };
+  if (w.SmartPosNative?.printInternalEscPos) {
+    const b = new UniversalEscPosBuilder('58MM');
+    for (const l of job.lines) b.line(l);
+    if (job.qr) b.qrCode(job.qr);
+    for (const l of job.footer ?? []) b.line(l);
+    b.cut(false);
+    const r = JSON.parse(w.SmartPosNative.printInternalEscPos(b.toBase64())) as { success: boolean; error?: string };
+    if (!r.success) throw new Error(r.error ?? 'Falha na impressora interna');
+    return 'NATIVE';
+  }
+  if (w.PlugPagBridge?.printText) {
+    w.PlugPagBridge.printText([...job.lines, ...(job.qr ? ['', job.qr, ''] : []), ...(job.footer ?? [])].join('\n'));
+    return 'NATIVE';
+  }
+  useTerminalBus.getState().enqueuePrint(job);
+  return 'SIMULATOR';
+}
+
+// ---------------------------------------------------------------------------
+// Geradores de metadados (iguais aos formatos das adquirentes)
+// ---------------------------------------------------------------------------
+function randomDigits(n: number): string {
+  let s = '';
+  for (let i = 0; i < n; i++) s += Math.floor(Math.random() * 10).toString();
+  return s;
+}
+
+export function generateNsu(): string {
+  return randomDigits(6);
+}
+
+export function generateAuthorizationCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ0123456789';
+  let s = '';
+  for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
+export function randomCardBrand(): Exclude<CardBrand, 'PIX'> {
+  const r = Math.random();
+  return r < 0.45 ? 'VISA' : r < 0.85 ? 'MASTERCARD' : 'ELO';
+}
+
+const BIN_BY_BRAND: Record<Exclude<CardBrand, 'PIX'>, string> = {
+  VISA: '4',
+  MASTERCARD: '5',
+  ELO: '6',
+};
+
+export function maskedPan(brand: CardBrand): string | null {
+  if (brand === 'PIX') return null;
+  return `${BIN_BY_BRAND[brand]}${randomDigits(5)}******${randomDigits(4)}`;
+}
+
+// ---------------------------------------------------------------------------
+// MockTerminalDriver — simulação visual completa
+// ---------------------------------------------------------------------------
+export class MockTerminalDriver implements IPaymentTerminalDriver {
+  readonly acquirer: AcquirerType;
+  constructor(
+    readonly chassis: Chassis,
+    readonly mode: OperationMode,
+    readonly terminal: PosTerminal | null,
+  ) {
+    this.acquirer = chassis;
+  }
+
+  charge(request: ChargeRequest): Promise<TerminalResult> {
+    return new Promise<TerminalResult>((resolve) => {
+      useTerminalBus.getState().submit({ request, chassis: this.chassis, mode: this.mode, terminal: this.terminal, resolve });
+    });
+  }
+
+  async print(lines: string[]): Promise<void> {
+    useTerminalBus.getState().enqueuePrint({ title: 'Impressão', lines, chassis: this.chassis });
+  }
+
+  abort(_requestId: string): void {
+    useTerminalBus.getState().closeSimulator();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// StonePosDriver — TEF POS Sem Fio (Stone Connect) + DeepLink local
+// ---------------------------------------------------------------------------
+interface StoneBridge {
+  pay?: (json: string) => void;
+}
+
+type StoneNativeResult = TerminalResult & { request_id?: string };
+
+/**
+ * Cobranças nativas da Stone em andamento. A maquininha processa uma por vez,
+ * e cada resultado do callback window.onStoneResult é entregue à cobrança
+ * que o originou (pelo request_id), nunca à última que foi iniciada.
+ */
+const stoneInFlight = new Map<string, (r: TerminalResult) => void>();
+
+function installStoneCallback(): void {
+  const w = window as unknown as { onStoneResult?: (r: StoneNativeResult) => void };
+  w.onStoneResult = (r) => {
+    const id = r.request_id ?? (stoneInFlight.size === 1 ? stoneInFlight.keys().next().value : undefined);
+    const resolve = id ? stoneInFlight.get(id) : undefined;
+    if (!id || !resolve) return; // resultado sem cobrança correspondente: ignorado
+    stoneInFlight.delete(id);
+    resolve(r);
+  };
+}
+
+export class StonePosDriver implements IPaymentTerminalDriver {
+  readonly acquirer: AcquirerType = 'STONE';
+  private readonly fallback: MockTerminalDriver;
+
+  constructor(
+    readonly mode: OperationMode,
+    readonly terminal: PosTerminal | null,
+  ) {
+    this.fallback = new MockTerminalDriver('STONE', mode, terminal);
+  }
+
+  /** URL do DeepLink usada quando o app roda embarcado na Stone (stone-sdk://pay). */
+  static deepLink(req: ChargeRequest): string {
+    const type = req.method === 'CREDIT' ? 'credit' : req.method === 'DEBIT' ? 'debit' : 'pix';
+    const params = new URLSearchParams({
+      amount: Math.round(req.amount * 100).toString(),
+      editable_amount: '0',
+      transaction_type: type,
+      installment_type: 'none',
+      order_id: req.idempotency_key,
+      return_scheme: 'tchefood',
+    });
+    return `stone-sdk://pay?${params.toString()}`;
+  }
+
+  async charge(req: ChargeRequest): Promise<TerminalResult> {
+    const bridge = (window as unknown as { StoneBridge?: StoneBridge }).StoneBridge;
+    if (this.mode === 'SMARTPOS_EMBEDDED' && bridge?.pay) {
+      // Integração nativa: o app Android devolve o resultado via callback window.onStoneResult.
+      if (stoneInFlight.size > 0) {
+        return {
+          status: 'DECLINED',
+          acquirer: 'STONE',
+          reason: 'Maquininha ocupada com outra cobrança. Aguarde a resposta.',
+          terminal_serial: this.terminal?.serial_number ?? 'STONE-EMBEDDED',
+          terminal_id: this.terminal?.id ?? null,
+        };
+      }
+      installStoneCallback();
+      return new Promise<TerminalResult>((resolve) => {
+        stoneInFlight.set(req.request_id, resolve);
+        bridge.pay?.(JSON.stringify({ deeplink: StonePosDriver.deepLink(req), ...req }));
+      });
+    }
+    // TEF POS Sem Fio: em produção a cobrança vai para a fila do terminal
+    // (serial STONE-01/02) via Stone Connect. Sem credenciais, o terminal
+    // físico é simulado na tela pelo MockTerminalDriver.
+    return this.fallback.charge(req);
+  }
+
+  async print(lines: string[]): Promise<void> {
+    // Stone embarcada: bobina interna pela ponte ESC/POS do app Android (SmartPosJsBridge).
+    const native = (window as unknown as { SmartPosNative?: { printInternalEscPos?: (b64: string) => string } }).SmartPosNative;
+    if (this.mode === 'SMARTPOS_EMBEDDED' && native?.printInternalEscPos) {
+      const b = new UniversalEscPosBuilder('58MM');
+      for (const l of lines) b.line(l);
+      b.cut(false);
+      const r = JSON.parse(native.printInternalEscPos(b.toBase64())) as { success: boolean; error?: string };
+      if (!r.success) throw new Error(r.error ?? 'Falha na impressora interna');
+      return;
+    }
+    return this.fallback.print(lines);
+  }
+
+  abort(requestId: string): void {
+    this.fallback.abort(requestId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PagBankPlugPagDriver — Moderninha Smart via window.PlugPagBridge
+// ---------------------------------------------------------------------------
+interface PlugPagBridge {
+  doPayment?: (json: string) => string;
+  printText?: (text: string) => void;
+}
+
+export class PagBankPlugPagDriver implements IPaymentTerminalDriver {
+  readonly acquirer: AcquirerType = 'PAGBANK';
+  private readonly fallback: MockTerminalDriver;
+
+  constructor(
+    readonly mode: OperationMode,
+    readonly terminal: PosTerminal | null,
+  ) {
+    this.fallback = new MockTerminalDriver('PAGBANK', mode, terminal);
+  }
+
+  private bridge(): PlugPagBridge | undefined {
+    return (window as unknown as { PlugPagBridge?: PlugPagBridge }).PlugPagBridge;
+  }
+
+  async charge(req: ChargeRequest): Promise<TerminalResult> {
+    const bridge = this.bridge();
+    // A ponte PlugPag cobra no próprio aparelho: só vale no modo SmartPOS embarcado.
+    // Em TEF POS Sem Fio a cobrança vai para a maquininha escolhida (simulada sem credenciais).
+    if (this.mode === 'SMARTPOS_EMBEDDED' && bridge?.doPayment) {
+      // PlugPagPaymentData: type 1=crédito 2=débito 5=pix; amount em centavos.
+      const type = req.method === 'CREDIT' ? 1 : req.method === 'DEBIT' ? 2 : 5;
+      const raw = bridge.doPayment(
+        JSON.stringify({ type, amount: Math.round(req.amount * 100), installmentType: 1, installments: 1, userReference: req.idempotency_key.slice(0, 10) }),
+      );
+      const parsed = JSON.parse(raw) as { result: number; nsu?: string; autoCode?: string; cardBrand?: string; message?: string };
+      const serial = this.terminal?.serial_number ?? 'PAGBANK-EMBEDDED';
+      if (parsed.result !== 0) {
+        return { status: 'DECLINED', acquirer: 'PAGBANK', reason: parsed.message ?? 'Recusada', terminal_serial: serial, terminal_id: this.terminal?.id ?? null };
+      }
+      const brand = (parsed.cardBrand?.toUpperCase() as CardBrand | undefined) ?? (req.method === 'PIX' ? 'PIX' : 'VISA');
+      return {
+        status: 'APPROVED',
+        acquirer: 'PAGBANK',
+        acquirer_cnpj: ACQUIRER_CNPJ.PAGBANK,
+        card_brand: brand,
+        nsu: parsed.nsu ?? generateNsu(),
+        authorization_code: parsed.autoCode ?? generateAuthorizationCode(),
+        terminal_serial: serial,
+        terminal_id: this.terminal?.id ?? null,
+        masked_pan: null,
+        mode: this.mode,
+      };
+    }
+    return this.fallback.charge(req);
+  }
+
+  async print(lines: string[]): Promise<void> {
+    const bridge = this.bridge();
+    if (bridge?.printText) {
+      bridge.printText(lines.join('\n'));
+      return;
+    }
+    return this.fallback.print(lines);
+  }
+
+  abort(requestId: string): void {
+    this.fallback.abort(requestId);
+  }
+}
+
+/** Fábrica: escolhe o driver certo para o terminal/modo selecionado. */
+export function createDriver(params: { terminal: PosTerminal | null; chassis: Chassis; mode: OperationMode }): IPaymentTerminalDriver {
+  const acquirer = params.terminal?.acquirer ?? params.chassis;
+  if (acquirer === 'PAGBANK') return new PagBankPlugPagDriver(params.mode, params.terminal);
+  if (acquirer === 'STONE') return new StonePosDriver(params.mode, params.terminal);
+  return new MockTerminalDriver(params.chassis, params.mode, params.terminal);
+}
