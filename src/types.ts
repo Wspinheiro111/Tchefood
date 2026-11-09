@@ -99,6 +99,16 @@ export interface Product {
   cfop: string;
   csosn_cst: string;
   unit: string;
+  /**
+   * Custo unitário (CMV) em reais, NUMERIC(10,2). Mesmo campo da Fase 5.
+   * A importação de XML grava aqui o custo médio ponderado arredondado em 2 casas;
+   * o custo com 4 casas fica em stock_movements.unit_cost / avg_cost_after.
+   */
+  cost_price: number;
+  /** Saldo em estoque na unidade do produto (unit), NUMERIC(12,3). */
+  stock_quantity: number;
+  /** GTIN/EAN do produto (cEAN da NF-e), usado para casar itens de compra. */
+  barcode: string | null;
   /** Etapa 0: produto com venda nunca é apagado, só desativado (some do cardápio). */
   active: boolean;
   created_at: ISODateTime;
@@ -107,8 +117,6 @@ export interface Product {
   sold_by_weight: boolean;
   /** Tara padrão do prato/recipiente, em gramas. */
   tare_weight_grams: number;
-  /** Custo unitário (CMV / ficha técnica). */
-  cost_price: number;
 }
 
 export interface ModifierGroup {
@@ -279,6 +287,104 @@ export interface Payment {
   terminal_serial: string | null;
   idempotency_key: string | null;
   created_at: ISODateTime;
+}
+
+// ---------------------------------------------------------------------------
+// COMPRAS E ESTOQUE (db/schema_purchases.sql)
+// ---------------------------------------------------------------------------
+
+export interface Supplier {
+  id: UUID;
+  tenant_id: UUID;
+  /** CNPJ (14) ou CPF (11), sem máscara. UNIQUE(tenant_id, document). */
+  document: string;
+  legal_name: string;
+  trade_name: string | null;
+  state_registration: string | null;
+  city: string | null;
+  state: string | null;
+  created_at: ISODateTime;
+}
+
+/** NF-e de compra importada. UNIQUE(tenant_id, access_key) impede importar a mesma nota duas vezes. */
+export interface PurchaseInvoice {
+  id: UUID;
+  tenant_id: UUID;
+  supplier_id: UUID;
+  access_key: string;
+  number: string;
+  series: string;
+  issued_at: ISODateTime | null;
+  environment: 'PRODUCTION' | 'HOMOLOGATION';
+  authorization_protocol: string | null;
+  products_amount: number;
+  discount_amount: number;
+  freight_amount: number;
+  insurance_amount: number;
+  other_amount: number;
+  ipi_amount: number;
+  icms_st_amount: number;
+  invoice_amount: number;
+  /** Soma do custo dos itens que entraram no estoque (itens ignorados ficam fora). */
+  stocked_amount: number;
+  items_count: number;
+  imported_by_user_id: UUID;
+  imported_at: ISODateTime;
+}
+
+export type PurchaseItemAction = 'LINK' | 'CREATE' | 'IGNORE';
+
+export interface PurchaseInvoiceItem {
+  id: UUID;
+  invoice_id: UUID;
+  n_item: number;
+  supplier_code: string;
+  barcode: string | null;
+  description: string;
+  ncm: string | null;
+  cfop: string | null;
+  commercial_unit: string;
+  commercial_quantity: number;
+  commercial_unit_price: number;
+  gross_amount: number;
+  /** Custo total do item (produto − desconto + frete + seguro + outras + IPI + ICMS-ST + FCP-ST). */
+  landed_amount: number;
+  action: PurchaseItemAction;
+  product_id: UUID | null;
+  /** Quantas unidades de estoque vêm em cada unidade comercial (CX com 12 = 12). */
+  packaging_factor: number;
+  stock_quantity: number;
+  /** Custo por unidade de estoque, NUMERIC(12,4). */
+  unit_cost: number;
+}
+
+export type StockMovementType = 'PURCHASE_IN';
+
+/** Livro de estoque: só INSERT (o saldo do produto é a soma dos movimentos). */
+export interface StockMovement {
+  id: UUID;
+  tenant_id: UUID;
+  product_id: UUID;
+  type: StockMovementType;
+  quantity: number;
+  unit_cost: number;
+  balance_after: number;
+  avg_cost_after: number;
+  purchase_invoice_item_id: UUID | null;
+  performed_by_user_id: UUID;
+  created_at: ISODateTime;
+}
+
+/** Vínculo "código do fornecedor → produto", lembrado para as próximas notas. */
+export interface SupplierProductLink {
+  id: UUID;
+  tenant_id: UUID;
+  supplier_id: UUID;
+  supplier_code: string;
+  product_id: UUID;
+  packaging_factor: number;
+  commercial_unit: string;
+  updated_at: ISODateTime;
 }
 
 /** Tipos de ação gravados em audit_logs.action_type (VARCHAR(50)). */
@@ -475,6 +581,12 @@ export interface SyncEvent {
     | 'pos_terminals'
     | 'categories'
     | 'products'
+    // Compras por XML
+    | 'suppliers'
+    | 'purchase_invoices'
+    | 'purchase_invoice_items'
+    | 'stock_movements'
+    | 'supplier_product_links'
     | 'modifier_groups'
     | 'modifier_options'
     | 'product_modifier_groups'

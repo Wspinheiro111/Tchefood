@@ -185,6 +185,7 @@ interface ProductSpec {
   ncm?: string;
   unit?: string;
   available?: boolean;
+  barcode?: string;
   /** Fase 5: vendido por peso (preço do KG) e tara padrão do prato. */
   weight?: { tare: number };
   cost?: number;
@@ -224,7 +225,7 @@ const PRODUCT_SPECS: ProductSpec[] = [
   { code: '212', name: 'Gin Tônica', cat: 'drinks', price: 32.9, sector: 'BAR', ncm: '22089000' },
   { code: '213', name: 'Quentão de Vinho', cat: 'drinks', price: 18.9, sector: 'BAR', ncm: '22042100' },
   // Sem álcool (BAR)
-  { code: '221', name: 'Refrigerante Lata', cat: 'sem-alcool', price: 7.9, sector: 'BAR', ncm: '22021000' },
+  { code: '221', name: 'Refrigerante Lata', cat: 'sem-alcool', price: 7.9, sector: 'BAR', ncm: '22021000', barcode: '7890000000017' },
   { code: '222', name: 'Água Mineral 500ml', cat: 'sem-alcool', price: 5.9, sector: 'BAR', ncm: '22011000' },
   { code: '223', name: 'Suco Natural', cat: 'sem-alcool', price: 12.9, sector: 'BAR', ncm: '20098990' },
   // Sobremesas (DESSERT)
@@ -258,6 +259,8 @@ export const SEED_PRODUCTS: Product[] = PRODUCT_SPECS.map((p) => ({
   cfop: '5102',
   csosn_cst: '102',
   unit: p.weight ? 'KG' : p.unit ?? 'UN',
+  stock_quantity: 0,
+  barcode: p.barcode ?? null,
   created_at: created,
   sold_by_weight: Boolean(p.weight),
   tare_weight_grams: p.weight?.tare ?? 0,
@@ -659,6 +662,11 @@ export function createSeedData() {
     payments: dyn.payments,
     auditLogs: [],
     printers: SEED_PRINTERS.map((p) => ({ ...p })),
+    suppliers: [],
+    purchaseInvoices: [],
+    purchaseInvoiceItems: [],
+    stockMovements: [],
+    supplierProductLinks: [],
     kegTaps: dyn.kegTaps,
     kegTapProducts: SEED_KEG_TAP_PRODUCTS,
     kegHistory: [] as KegHistory[],

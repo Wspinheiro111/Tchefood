@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { AlertTriangle, BarChart3, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
+import { AlertTriangle, BarChart3, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
 import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { formatBRL } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
@@ -9,13 +9,14 @@ import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
 import { CrmPanel } from './CrmPanel';
+import { PurchaseImport } from './PurchaseImport';
 import { KegMonitorScreen } from './KegMonitorScreen';
 import { MenuAdmin } from './admin/MenuAdmin';
 import { StaffAdmin, TablesAdmin } from './admin/TablesStaffAdmin';
 import { CloudAdmin, StoreAdmin } from './admin/StoreCloudAdmin';
 import type { Permission } from '../types';
 
-type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 'nfce' | 'menu' | 'tables' | 'staff' | 'store' | 'cloud' | 'printers' | 'config';
+type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 'nfce' | 'purchases' | 'menu' | 'tables' | 'staff' | 'store' | 'cloud' | 'printers' | 'config';
 
 /**
  * Abas da retaguarda. As de relatório seguem o perfil (gerente, proprietário, caixa);
@@ -29,6 +30,7 @@ const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3; needs: 'rep
   { key: 'chopp', label: 'Barris de chopp', icon: Beer, needs: 'reports' },
   { key: 'crm', label: 'Clientes & Cashback', icon: Gift, needs: 'reports' },
   { key: 'nfce', label: 'NFC-e', icon: FileText, needs: 'reports' },
+  { key: 'purchases', label: 'Compras / Estoque', icon: PackageOpen, needs: 'reports' },
   { key: 'menu', label: 'Cardápio', icon: UtensilsCrossed, needs: ['MENU_MANAGE', 'MENU_AVAILABILITY'] },
   { key: 'tables', label: 'Salão', icon: LayoutGrid, needs: 'TABLES_MANAGE' },
   { key: 'staff', label: 'Equipe', icon: UserCog, needs: 'STAFF_MANAGE' },
@@ -86,6 +88,7 @@ export function BackOffice() {
       {tab === 'chopp' && <KegMonitorScreen compact />}
       {tab === 'crm' && <CrmPanel />}
       {tab === 'nfce' && <NfceList />}
+      {tab === 'purchases' && <PurchaseImport />}
       {tab === 'menu' && <MenuAdmin />}
       {tab === 'tables' && <TablesAdmin />}
       {tab === 'staff' && <StaffAdmin />}

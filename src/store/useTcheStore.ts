@@ -39,8 +39,13 @@ import type {
   PriceSchedule,
   Product,
   ProductModifierGroup,
+  PurchaseInvoice,
+  PurchaseInvoiceItem,
   RolePermission,
   StaffUser,
+  StockMovement,
+  Supplier,
+  SupplierProductLink,
   SyncEvent,
   Tenant,
   TrayItem,
@@ -71,6 +76,8 @@ import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
+import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
+import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
 import { computeNetWeight } from '../lib/scale';
@@ -218,6 +225,11 @@ interface DataSlice {
   payments: Payment[];
   auditLogs: AuditLog[];
   printers: PrinterConfig[];
+  suppliers: Supplier[];
+  purchaseInvoices: PurchaseInvoice[];
+  purchaseInvoiceItems: PurchaseInvoiceItem[];
+  stockMovements: StockMovement[];
+  supplierProductLinks: SupplierProductLink[];
   // Fase 5
   kegTaps: KegTap[];
   kegTapProducts: KegTapProduct[];
@@ -393,6 +405,9 @@ interface Actions {
   setHalfAndHalfPricing: (rule: HalfAndHalfPricing) => void;
   resetDemo: () => void;
 
+  // Compras / estoque
+  /** Importa a NF-e de compra (XML) com as decisões da conferência. Só gerente/proprietário. */
+  importPurchaseInvoice: (xml: string, decisions: PurchaseItemDecision[]) => ActionResult<PurchaseImportPlan>;
   // Etapa 0 — cadastros
   saveCategory: (draft: CategoryDraft) => ActionResult<Category>;
   saveProduct: (draft: Omit<ProductDraft, 'id'> & { id?: UUID }) => ActionResult<Product>;
@@ -2438,6 +2453,9 @@ export const useTcheStore = create<TcheState>()(
             sold_by_weight: draft.sold_by_weight ?? existing?.sold_by_weight ?? false,
             tare_weight_grams: draft.tare_weight_grams ?? existing?.tare_weight_grams ?? 0,
             cost_price: draft.cost_price ?? existing?.cost_price ?? 0,
+            // Estoque só muda por movimento (compra/venda), nunca pelo cadastro.
+            stock_quantity: existing?.stock_quantity ?? 0,
+            barcode: draft.barcode ?? existing?.barcode ?? null,
             sector: draft.sector,
             available: draft.available,
             active: draft.active,
@@ -2891,13 +2909,73 @@ export const useTcheStore = create<TcheState>()(
           })),
 
         resetDemo: () => set({ ...initialData(), ...initialDevice(), hydrated: true }),
+
+        importPurchaseInvoice: (xml, decisions) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!MANAGER_ROLES.includes(user.role)) return fail('Só gerente ou proprietário pode dar entrada em nota de compra.');
+          let plan: PurchaseImportPlan;
+          try {
+            // O XML é lido de novo aqui: o que entra no estoque é o que está na nota, não o que estava na tela.
+            const nfe = parsePurchaseNfeXml(xml);
+            const s = get();
+            plan = planPurchaseImport(
+              {
+                tenant: s.tenant,
+                categories: s.categories,
+                products: s.products,
+                suppliers: s.suppliers,
+                purchaseInvoices: s.purchaseInvoices,
+                supplierProductLinks: s.supplierProductLinks,
+                stockMovements: s.stockMovements,
+              },
+              nfe,
+              decisions,
+              { userId: user.id, now: nowISO(), newId: uuid, nextProductCode: nextPurchaseProductCode },
+            );
+          } catch (e) {
+            return fail(e instanceof NfeImportError || e instanceof Error ? e.message : 'Falha ao ler o XML.');
+          }
+          const p = plan;
+          let duplicated = false;
+          set((s) => {
+            // Mesma checagem dentro do set(): duas confirmações seguidas não gravam a nota duas vezes.
+            if (s.purchaseInvoices.some((i) => i.tenant_id === p.invoice.tenant_id && i.access_key === p.invoice.access_key)) {
+              duplicated = true;
+              return {};
+            }
+            const updatedById = new Map(p.updatedProducts.map((u) => [u.id, u]));
+            const linkIds = new Set(p.links.map((l) => l.id));
+            const existingLinkIds = new Set(s.supplierProductLinks.map((l) => l.id));
+            return {
+              suppliers: p.supplierIsNew ? [...s.suppliers, p.supplier] : s.suppliers,
+              products: [...s.products.map((prod) => updatedById.get(prod.id) ?? prod), ...p.createdProducts],
+              purchaseInvoices: [p.invoice, ...s.purchaseInvoices],
+              purchaseInvoiceItems: [...s.purchaseInvoiceItems, ...p.items],
+              stockMovements: [...s.stockMovements, ...p.movements],
+              supplierProductLinks: [...s.supplierProductLinks.filter((l) => !linkIds.has(l.id)), ...p.links],
+              outbox: [
+                ...s.outbox,
+                ...(p.supplierIsNew ? [syncEvent('suppliers', 'INSERT', p.supplier)] : []),
+                ...p.createdProducts.map((prod) => syncEvent('products', 'INSERT', prod)),
+                ...p.updatedProducts.map((prod) => syncEvent('products', 'UPDATE', prod)),
+                syncEvent('purchase_invoices', 'INSERT', p.invoice),
+                ...p.items.map((i) => syncEvent('purchase_invoice_items', 'INSERT', i)),
+                ...p.movements.map((m) => syncEvent('stock_movements', 'INSERT', m)),
+                ...p.links.map((l) => syncEvent('supplier_product_links', existingLinkIds.has(l.id) ? 'UPDATE' : 'INSERT', l)),
+              ],
+            };
+          });
+          if (duplicated) return fail('Esta NF-e já foi importada.');
+          return { ok: true, data: p };
+        },
       };
     },
     {
       name: 'tchefood-state-v1',
       // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback);
-      // v4 = totem / pedido com senha.
-      version: 4,
+      // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras).
+      version: 5,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -2954,11 +3032,26 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       st[key] = Array.isArray(st[key]) ? st[key] : [];
     }
   }
+  let out: Record<string, unknown> = st;
   if (version < 4) {
     // Totem: comandas ganham os campos de senha (null) e a loja ganha a mesa técnica KIOSK.
-    return migrateToKiosk(st as Partial<TcheState>);
+    out = migrateToKiosk(st as Partial<TcheState>) as Record<string, unknown>;
   }
-  return st;
+  if (version < 5) {
+    // Compras por XML: produtos ganham estoque e código de barras; listas de compra vazias.
+    if (Array.isArray(out.products)) {
+      out.products = (out.products as Array<Record<string, unknown>>).map((p) => ({
+        ...p,
+        cost_price: typeof p.cost_price === 'number' ? p.cost_price : 0,
+        stock_quantity: typeof p.stock_quantity === 'number' ? p.stock_quantity : 0,
+        barcode: typeof p.barcode === 'string' ? p.barcode : null,
+      }));
+    }
+    for (const key of ['suppliers', 'purchaseInvoices', 'purchaseInvoiceItems', 'stockMovements', 'supplierProductLinks']) {
+      if (!Array.isArray(out[key])) out[key] = [];
+    }
+  }
+  return out;
 }
 
 /** Mesa técnica da venda de balcão (Ficha Rápida) de uma loja. */

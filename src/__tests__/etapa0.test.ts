@@ -336,7 +336,7 @@ describe('migração do armazenamento local', () => {
   it('v1 ganha active e listas novas sem perder dados', () => {
     const v1 = { products: [{ id: 'p', price: 10 }], tables: [{ id: 't' }], orders: [{ id: 'o' }] };
     const v2 = migratePersisted(v1, 1) as Record<string, unknown>;
-    expect(v2.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0 }]);
+    expect(v2.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0, stock_quantity: 0, barcode: null }]);
     expect((v2.tables as Array<{ kind: string }>).filter((t) => t.kind === 'TABLE')).toEqual([{ id: 't', active: true, kind: 'TABLE' }]);
     expect(v2.orders).toEqual([{ id: 'o', pickup_number: null, pickup_name: null, fulfillment_type: null }]);
     expect(v2.priceSchedules).toEqual([]);
@@ -353,7 +353,7 @@ describe('migração do armazenamento local', () => {
       orders: [{ id: 'o' }],
     };
     const v3 = migratePersisted(v2, 2) as Record<string, unknown>;
-    expect(v3.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0 }]);
+    expect(v3.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0, stock_quantity: 0, barcode: null }]);
     const tables = v3.tables as Array<{ id: string; kind: string; tenant_id: string }>;
     expect(tables[0]).toMatchObject({ id: 't', kind: 'TABLE' });
     expect(tables.filter((t) => t.kind === 'COUNTER')).toHaveLength(1);
