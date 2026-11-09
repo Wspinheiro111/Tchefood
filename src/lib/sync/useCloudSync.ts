@@ -1,22 +1,51 @@
 /**
  * Etapa 0 — laço de sincronização: a cada 5 s, com internet e sessão da nuvem,
- * envia a fila na ordem e confirma o que o servidor aceitou.
+ * envia a fila na ordem e confirma o que o servidor aceitou. Com a fila vazia, a
+ * cada minuto lê os cadastros da nuvem (mudanças feitas em outro aparelho).
  */
 import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
-import { flushOutbox, needsRefresh, refreshDevice, type FetchLike } from './supabaseSync';
+import { flushOutbox, needsRefresh, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
+import { fetchCloudSnapshot } from './cloudPull';
 
 const INTERVAL_MS = 5_000;
+/** Leitura dos cadastros da nuvem (só com a fila vazia: o que é daqui sobe antes). */
+export const PULL_EVERY_MS = 60_000;
 let running = false;
 
 const browserFetch: FetchLike = (url, init) => fetch(url, init);
 
-/** Uma rodada de envio. Exportada para o botão "Sincronizar agora" e para testes. */
-export async function syncOnce(fetchFn: FetchLike = browserFetch): Promise<void> {
+function pullDue(lastPullAt: string | null | undefined, nowMs: number): boolean {
+  return !lastPullAt || nowMs - Date.parse(lastPullAt) >= PULL_EVERY_MS;
+}
+
+/** Lê os cadastros da nuvem e aplica (o store deixa como está o que ainda não subiu daqui). */
+async function pullOnce(cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
+  const tenantId = useTcheStore.getState().tenant.id;
+  try {
+    const snapshot = await fetchCloudSnapshot(cfg, tenantId, fetchFn);
+    const st = useTcheStore.getState();
+    // Trocou de loja ou desconectou enquanto lia: descarta.
+    if (!st.cloud || st.tenant.id !== tenantId) return;
+    const r = st.applyCloudSnapshot(snapshot);
+    if (!r.ok) st.setPullError(r.error);
+  } catch (e) {
+    useTcheStore.getState().setPullError((e as Error).message);
+  }
+}
+
+/**
+ * Uma rodada: envia a fila e, com ela vazia, lê os cadastros da nuvem quando passou
+ * um minuto da última leitura (ou sempre, com forcePull). Exportada para o botão
+ * "Sincronizar agora" e para testes.
+ */
+export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forcePull?: boolean } = {}): Promise<void> {
   if (running) return;
   const state = useTcheStore.getState();
   const session = state.cloud;
-  if (!session || state.outbox.length === 0) return;
+  if (!session) return;
+  const wantsPull = opts.forcePull === true || pullDue(state.pullStatus?.last_pull_at, Date.now());
+  if (state.outbox.length === 0 && !wantsPull) return;
   running = true;
   try {
     let token = session.access_token;
@@ -34,9 +63,14 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch): Promise<void>
         return;
       }
     }
+    const cfg: SyncConfig = { url: session.url, anonKey: session.anon_key, accessToken: token };
     const { outbox: events, syncRejected } = useTcheStore.getState();
+    if (events.length === 0) {
+      await pullOnce(cfg, fetchFn);
+      return;
+    }
     const held = (syncRejected ?? []).map((r) => r.event);
-    const result = await flushOutbox(events, { url: session.url, anonKey: session.anon_key, accessToken: token }, fetchFn, 50, held);
+    const result = await flushOutbox(events, cfg, fetchFn, 50, held);
     const st = useTcheStore.getState();
     st.ackSyncedEvents(result.sent);
     // Recusados saem da fila (o resto continua subindo) e ficam na lista para revisão.
@@ -47,6 +81,8 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch): Promise<void>
       const more = result.rejected.length > 1 ? ` (+${result.rejected.length - 1})` : '';
       st.setSyncError(`Servidor recusou um evento${more} (HTTP ${first.status}): ${first.message}`, null);
     }
+    // Fila zerou nesta rodada: lê a nuvem agora, se estava na hora.
+    if (wantsPull && useTcheStore.getState().outbox.length === 0 && !result.retryLater) await pullOnce(cfg, fetchFn);
   } finally {
     running = false;
   }

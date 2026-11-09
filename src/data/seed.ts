@@ -46,7 +46,9 @@ export function seedId(key: string): string {
   return id;
 }
 
-const T = seedId('tenant:galpao');
+/** Loja de demonstração (dados de exemplo que vêm no aparelho). */
+export const DEMO_TENANT_ID = seedId('tenant:galpao');
+const T = DEMO_TENANT_ID;
 const created = '2026-01-15T12:00:00.000Z';
 
 export const SEED_TENANT: Tenant = {

@@ -70,7 +70,7 @@ import {
 import { can, PERMISSION_LABEL } from '../lib/permissions';
 import { nowISO, uuid } from '../lib/ids';
 import { idbStorage } from '../lib/idbStorage';
-import { createSeedData, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
+import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
 import { clearReviewHold, getReviewHold } from '../lib/payments/reviewHolds';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
@@ -80,6 +80,7 @@ import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
 import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
 import { comboChildrenOf, comboComponents, comboNeedsDoneness, expandComboItem } from '../lib/combos';
+import { adaptTable, MERGE, mergeRows, mergeStaffWithoutPins, mergeStaffWithPins, pendingRowKeys, type CloudSnapshot } from '../lib/sync/cloudPull';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
 import { computeNetWeight } from '../lib/scale';
@@ -265,6 +266,24 @@ export interface SyncStatus {
   blocked_event_id: UUID | null;
 }
 
+export interface PullStatus {
+  last_pull_at: string | null;
+  last_error: string | null;
+  /** Pessoas ativas na equipe da nuvem que este aparelho ainda não tem (entram com "Atualizar equipe"). */
+  cloud_staff_unknown: number;
+}
+
+export const EMPTY_PULL_STATUS: PullStatus = { last_pull_at: null, last_error: null, cloud_staff_unknown: 0 };
+
+export interface JoinCloudStoreInput {
+  session: CloudSession;
+  snapshot: CloudSnapshot;
+  /** Equipe com os PINs, entregue pelo servidor depois de conferir o PIN de quem está entrando. */
+  staff: StaffUser[];
+  /** Gerente ou proprietário que confirmou com o PIN: entra logado. */
+  userId: UUID;
+}
+
 export interface CategoryDraft {
   id?: UUID;
   name: string;
@@ -330,6 +349,8 @@ interface DeviceSlice {
   showPrintSimulator: boolean;
   cloud: CloudSession | null;
   syncStatus: SyncStatus;
+  /** Nuvem → aparelho: última leitura dos cadastros (ver src/lib/sync/cloudPull.ts). */
+  pullStatus: PullStatus;
   /** Cobranças em andamento na maquininha (persistidas para sobreviver a recarga). */
   pendingCharges: PendingCharge[];
 }
@@ -432,6 +453,13 @@ interface Actions {
 
   // Etapa 0 — nuvem
   setCloudSession: (session: CloudSession | null) => ActionResult;
+  /** Aparelho novo: troca os dados deste aparelho pelos cadastros da loja da nuvem. */
+  joinCloudStore: (input: JoinCloudStoreInput) => ActionResult<Tenant>;
+  /** Aplica os cadastros lidos da nuvem; o que ainda não subiu daqui fica como está. */
+  applyCloudSnapshot: (snapshot: CloudSnapshot) => ActionResult<{ unknownStaff: number }>;
+  /** Equipe com PIN vinda do servidor ("Atualizar equipe"). */
+  applyCloudStaff: (staff: StaffUser[]) => ActionResult<{ added: number }>;
+  setPullError: (message: string) => void;
   ackSyncedEvents: (eventIds: UUID[]) => void;
   setSyncError: (message: string | null, blockedEventId: UUID | null) => void;
   /** Tira da fila os eventos recusados pela nuvem e guarda em syncRejected. */
@@ -503,6 +531,7 @@ function initialDevice(): DeviceSlice {
     cloud: null,
     pendingCharges: [],
     syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
+    pullStatus: EMPTY_PULL_STATUS,
   };
 }
 
@@ -3071,6 +3100,7 @@ export const useTcheStore = create<TcheState>()(
             managerPinLockedUntil: null,
             nfceSeq: 1,
             syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
+            pullStatus: EMPTY_PULL_STATUS,
           });
           return { ok: true, data: tenant };
         },
@@ -3085,6 +3115,125 @@ export const useTcheStore = create<TcheState>()(
           set({ cloud: session });
           return { ok: true, data: undefined };
         },
+
+        joinCloudStore: ({ session, snapshot, staff, userId }) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (user.role !== 'OWNER') return fail('Só o proprietário troca a loja deste aparelho.');
+          const state = get();
+          // As contas de exemplo da demonstração não seguram: são apagadas junto.
+          if (state.tenant.id !== DEMO_TENANT_ID && state.orders.some((o) => o.status === 'OPEN' || o.status === 'PAYING')) {
+            return fail('Há contas abertas. Feche todas antes de trocar a loja deste aparelho.');
+          }
+          if (state.cloud && state.outbox.length > 0) {
+            return fail(`Ainda há ${state.outbox.length} evento(s) sem enviar para a nuvem. Sincronize antes.`);
+          }
+          if (state.cloud && (state.syncRejected ?? []).length > 0) {
+            return fail('Há eventos recusados pela nuvem. Resolva e reenvie antes de trocar a loja deste aparelho.');
+          }
+          const tenantId = snapshot.tenant.id;
+          if (session.tenant_id !== tenantId) return fail('Os dados baixados não são da loja desta conta.');
+          if (staff.some((u) => u.tenant_id !== tenantId)) return fail('A equipe baixada não é da loja desta conta.');
+          const who = staff.find((u) => u.id === userId);
+          if (!who || !who.active || !isManagerRole(who.role)) return fail('Quem confirma precisa ser gerente ou proprietário ativo da loja.');
+
+          const ts = nowISO();
+          const tables = snapshot.tables.map((t) => adaptTable(t, undefined));
+          // Loja sem a mesa técnica do balcão ou do totem (criada antes delas): cria e sobe.
+          const extraTables: DiningTable[] = [
+            ...(tables.some((t) => t.kind === 'COUNTER') ? [] : [counterTable(tenantId)]),
+            ...(tables.some((t) => t.kind === 'KIOSK') ? [] : [kioskTable(tenantId)]),
+          ];
+          const tenant: Tenant = { ...snapshot.tenant, focus_nfe_token: null, csc_id: null, csc_token: null };
+          set({
+            tenant,
+            staff: [...staff],
+            terminals: [...snapshot.terminals],
+            categories: [...snapshot.categories],
+            products: [...snapshot.products],
+            modifierGroups: [...snapshot.modifierGroups],
+            modifierOptions: [...snapshot.modifierOptions],
+            productModifierGroups: [...snapshot.productModifierGroups],
+            priceSchedules: [...snapshot.priceSchedules],
+            rolePermissions: [...snapshot.rolePermissions],
+            suppliers: [...snapshot.suppliers],
+            supplierProductLinks: [...snapshot.supplierProductLinks],
+            tables: [...tables, ...extraTables],
+            orders: [],
+            orderItems: [],
+            payments: [],
+            auditLogs: [],
+            printers: [],
+            purchaseInvoices: [],
+            purchaseInvoiceItems: [],
+            stockMovements: [],
+            kegTaps: [],
+            kegTapProducts: [],
+            kegHistory: [],
+            eventTickets: [],
+            loyaltyCustomers: [],
+            cashbackLedger: [],
+            tray: [],
+            pendingCharges: [],
+            outbox: extraTables.map((t) => syncEvent('dining_tables', 'INSERT', t)),
+            syncRejected: [],
+            currentUserId: who.id,
+            cloud: session,
+            managerPinFailures: 0,
+            managerPinLockedUntil: null,
+            nfceSeq: 1,
+            syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
+            pullStatus: { last_pull_at: ts, last_error: null, cloud_staff_unknown: 0 },
+          });
+          return { ok: true, data: tenant };
+        },
+
+        applyCloudSnapshot: (snapshot) => {
+          const state = get();
+          if (!state.cloud || snapshot.tenant.id !== state.tenant.id || state.cloud.tenant_id !== state.tenant.id) {
+            return fail('Os dados da nuvem não são da loja deste aparelho.');
+          }
+          const pending = pendingRowKeys([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]);
+          const tenant: Tenant = pending.has(`tenants:${state.tenant.id}`) ? state.tenant : { ...state.tenant, ...snapshot.tenant };
+          const team = mergeStaffWithoutPins(state.staff, snapshot.staff, pending);
+          const currentStillActive = team.staff.some((u) => u.id === state.currentUserId && u.active);
+          set({
+            tenant,
+            staff: team.staff,
+            terminals: mergeRows(state.terminals, snapshot.terminals, pending, MERGE.terminals),
+            categories: mergeRows(state.categories, snapshot.categories, pending, MERGE.categories),
+            products: mergeRows(state.products, snapshot.products, pending, MERGE.products),
+            modifierGroups: mergeRows(state.modifierGroups, snapshot.modifierGroups, pending, MERGE.modifierGroups),
+            modifierOptions: mergeRows(state.modifierOptions, snapshot.modifierOptions, pending, MERGE.modifierOptions),
+            productModifierGroups: mergeRows(state.productModifierGroups, snapshot.productModifierGroups, pending, MERGE.productModifierGroups),
+            priceSchedules: mergeRows(state.priceSchedules, snapshot.priceSchedules, pending, MERGE.priceSchedules),
+            tables: mergeRows(state.tables, snapshot.tables, pending, MERGE.tables),
+            rolePermissions: mergeRows(state.rolePermissions, snapshot.rolePermissions, pending, MERGE.rolePermissions),
+            suppliers: mergeRows(state.suppliers, snapshot.suppliers, pending, MERGE.suppliers),
+            supplierProductLinks: mergeRows(state.supplierProductLinks, snapshot.supplierProductLinks, pending, MERGE.supplierProductLinks),
+            // Desativado em outro aparelho: sai da sessão aqui também.
+            currentUserId: currentStillActive ? state.currentUserId : null,
+            pullStatus: { last_pull_at: nowISO(), last_error: null, cloud_staff_unknown: team.unknown },
+          });
+          return { ok: true, data: { unknownStaff: team.unknown } };
+        },
+
+        applyCloudStaff: (cloudStaff) => {
+          const state = get();
+          if (cloudStaff.some((u) => u.tenant_id !== state.tenant.id)) return fail('A equipe baixada não é da loja deste aparelho.');
+          const pending = pendingRowKeys([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]);
+          const before = new Set(state.staff.map((u) => u.id));
+          const staff = mergeStaffWithPins(state.staff, cloudStaff, pending);
+          const currentStillActive = staff.some((u) => u.id === state.currentUserId && u.active);
+          set({
+            staff,
+            currentUserId: currentStillActive ? state.currentUserId : null,
+            pullStatus: { ...(state.pullStatus ?? EMPTY_PULL_STATUS), cloud_staff_unknown: 0 },
+          });
+          return { ok: true, data: { added: staff.filter((u) => !before.has(u.id)).length } };
+        },
+
+        setPullError: (message) => set((s) => ({ pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), last_error: message } })),
 
         ackSyncedEvents: (eventIds) => {
           if (eventIds.length === 0) return;
@@ -3223,8 +3372,8 @@ export const useTcheStore = create<TcheState>()(
       name: 'tchefood-state-v1',
       // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback);
       // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras);
-      // v6 = combos.
-      version: 6,
+      // v6 = combos; v7 = nuvem → aparelho (pullStatus).
+      version: 7,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -3312,6 +3461,9 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       component_quantity: typeof o.component_quantity === 'number' ? o.component_quantity : 1,
     }));
     fill('orderItems', (i) => ({ ...i, combo_parent_item_id: typeof i.combo_parent_item_id === 'string' ? i.combo_parent_item_id : null }));
+  }
+  if (version < 7) {
+    out.pullStatus = out.pullStatus ?? EMPTY_PULL_STATUS;
   }
   return out;
 }
