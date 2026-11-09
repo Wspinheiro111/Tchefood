@@ -29,7 +29,9 @@
 --     60 s) e fica em audit_logs; a função devolve NULL (sem RAISE, para o registro
 --     da falha não ser desfeito).
 --  8. Reenvio da mesma mudança (a resposta se perdeu na rede) não grava nada de
---     novo e devolve sucesso.
+--     novo e devolve sucesso, mas só depois da prova de PIN: a comparação com o
+--     PIN gravado nunca acontece antes de uma conferência que conta no bloqueio
+--     (senão a função viraria um oráculo de PIN sem limite de tentativas).
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -59,10 +61,13 @@ $$;
 -- Conferência de PIN com o bloqueio de tchefood_authorize_manager.
 -- Devolve a pessoa (ou NULL, gravando MANAGER_PIN_FAILED / MANAGER_PIN_LOCKOUT).
 -- p_expected: quando informado, o PIN precisa ser exatamente desta pessoa.
+-- p_pins: PINs aceitos como prova (um só, ou o antigo e o novo no reenvio da troca
+-- do próprio PIN). Nenhum confere = uma falha no bloqueio.
 -- -----------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS tchefood_check_pin(UUID, VARCHAR, user_role[], UUID, UUID, VARCHAR, TEXT);
 CREATE OR REPLACE FUNCTION tchefood_check_pin(
     p_tenant UUID,
-    p_pin VARCHAR,
+    p_pins VARCHAR[],
     p_roles user_role[],
     p_expected UUID,
     p_performed_by UUID,
@@ -82,7 +87,7 @@ BEGIN
         RETURN NULL;
     END IF;
     SELECT * INTO v_user FROM staff_users u
-     WHERE u.tenant_id = p_tenant AND u.pin_code = p_pin AND u.active AND u.role = ANY (p_roles)
+     WHERE u.tenant_id = p_tenant AND u.pin_code = ANY (p_pins) AND u.active AND u.role = ANY (p_roles)
        AND (p_expected IS NULL OR u.id = p_expected);
     IF NOT FOUND THEN
         INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
@@ -147,12 +152,6 @@ BEGIN
     IF NOT v_is_new AND v_existing.tenant_id <> v_tenant THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: pessoa não pertence a esta loja.';
     END IF;
-    -- Reenvio: a mudança já está gravada.
-    IF NOT v_is_new AND v_existing.name = v_name AND v_existing.role = p_role
-       AND v_existing.pin_code = p_pin AND v_existing.active = p_active THEN
-        RETURN v_existing.id;
-    END IF;
-
     SELECT * INTO v_actor FROM staff_users u WHERE u.id = p_actor_id AND u.tenant_id = v_tenant AND u.active;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_EQUIPE: operador inválido.'; END IF;
 
@@ -164,9 +163,17 @@ BEGIN
     END IF;
     v_action := CASE WHEN v_is_new THEN 'STAFF_CREATED' WHEN cardinality(v_changes) > 0 THEN v_changes[1] ELSE 'STAFF_UPDATED' END;
 
-    -- 1) Quem altera prova que é ele.
-    IF tchefood_check_pin(v_tenant, p_actor_pin, enum_range(NULL::user_role), v_actor.id, v_actor.id, v_action, 'actor') IS NULL THEN
+    -- 1) Quem altera prova que é ele. No reenvio da troca do próprio PIN, o PIN
+    --    gravado já é o novo (p_pin), então ele também vale como prova.
+    IF tchefood_check_pin(v_tenant,
+                          CASE WHEN p_actor_id = p_staff_id THEN ARRAY[p_actor_pin, p_pin] ELSE ARRAY[p_actor_pin] END,
+                          enum_range(NULL::user_role), v_actor.id, v_actor.id, v_action, 'actor') IS NULL THEN
         RETURN NULL;
+    END IF;
+    -- Reenvio: a mudança já está gravada (só depois da prova acima).
+    IF NOT v_is_new AND v_existing.name = v_name AND v_existing.role = p_role
+       AND v_existing.pin_code = p_pin AND v_existing.active = p_active THEN
+        RETURN v_existing.id;
     END IF;
     IF NOT tchefood_can(v_tenant, v_actor.role, 'STAFF_MANAGE') THEN
         RAISE EXCEPTION 'TCHEFOOD_EQUIPE: sem permissão para cadastrar equipe.';
@@ -207,7 +214,7 @@ BEGIN
         IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
             RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: motivo obrigatório (mínimo 5 caracteres).';
         END IF;
-        v_manager := tchefood_check_pin(v_tenant, p_manager_pin, ARRAY['MANAGER', 'OWNER']::user_role[], NULL, v_actor.id, v_action, 'manager');
+        v_manager := tchefood_check_pin(v_tenant, ARRAY[p_manager_pin], ARRAY['MANAGER', 'OWNER']::user_role[], NULL, v_actor.id, v_action, 'manager');
         IF v_manager.id IS NULL THEN RETURN NULL; END IF;
         v_reason := trim(p_reason);
     ELSIF v_own_pin_only THEN
@@ -272,10 +279,10 @@ BEGIN
     IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: motivo obrigatório (mínimo 5 caracteres).';
     END IF;
-    IF tchefood_check_pin(v_tenant, p_actor_pin, ARRAY['OWNER']::user_role[], v_actor.id, v_actor.id, 'PERMISSION_CHANGED', 'actor') IS NULL THEN
+    IF tchefood_check_pin(v_tenant, ARRAY[p_actor_pin], ARRAY['OWNER']::user_role[], v_actor.id, v_actor.id, 'PERMISSION_CHANGED', 'actor') IS NULL THEN
         RETURN NULL;
     END IF;
-    v_manager := tchefood_check_pin(v_tenant, p_manager_pin, ARRAY['MANAGER', 'OWNER']::user_role[], NULL, v_actor.id, 'PERMISSION_CHANGED', 'manager');
+    v_manager := tchefood_check_pin(v_tenant, ARRAY[p_manager_pin], ARRAY['MANAGER', 'OWNER']::user_role[], NULL, v_actor.id, 'PERMISSION_CHANGED', 'manager');
     IF v_manager.id IS NULL THEN RETURN NULL; END IF;
 
     v_before := tchefood_can(v_tenant, p_role, p_permission);
@@ -315,14 +322,18 @@ BEGIN
     PERFORM 1 FROM tenants WHERE id = v_tenant FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_EQUIPE: loja não encontrada na nuvem.'; END IF;
 
-    -- Reenvio: o mesmo proprietário já foi criado por esta chamada.
+    -- Reenvio: o mesmo proprietário já foi criado por esta chamada. O PIN é conferido
+    -- por tchefood_check_pin (conta no bloqueio), nunca comparado direto.
     SELECT * INTO v_owner FROM staff_users WHERE id = p_owner_id;
     IF FOUND THEN
-        IF v_owner.tenant_id = v_tenant AND v_owner.role = 'OWNER' AND v_owner.pin_code = p_owner_pin
-           AND EXISTS (SELECT 1 FROM audit_logs a WHERE a.tenant_id = v_tenant AND a.action_type = 'STORE_RESET' AND a.authorized_by_manager_id = p_owner_id) THEN
-            RETURN p_owner_id;
+        IF v_owner.tenant_id <> v_tenant OR v_owner.role <> 'OWNER'
+           OR NOT EXISTS (SELECT 1 FROM audit_logs a WHERE a.tenant_id = v_tenant AND a.action_type = 'STORE_RESET' AND a.authorized_by_manager_id = p_owner_id) THEN
+            RAISE EXCEPTION 'TCHEFOOD_EQUIPE: este proprietário já existe na nuvem.';
         END IF;
-        RAISE EXCEPTION 'TCHEFOOD_EQUIPE: este proprietário já existe na nuvem.';
+        IF tchefood_check_pin(v_tenant, ARRAY[p_owner_pin], ARRAY['OWNER']::user_role[], p_owner_id, p_owner_id, 'STORE_RESET', 'actor') IS NULL THEN
+            RETURN NULL;
+        END IF;
+        RETURN p_owner_id;
     END IF;
     IF EXISTS (SELECT 1 FROM staff_users WHERE tenant_id = v_tenant) THEN
         RAISE EXCEPTION 'TCHEFOOD_EQUIPE: a loja na nuvem já tem equipe cadastrada. Loja nova só numa conta de loja vazia.';
@@ -360,7 +371,7 @@ BEGIN
         REVOKE INSERT, UPDATE, DELETE ON role_permissions FROM anon, authenticated;
         GRANT SELECT ON role_permissions TO authenticated;
 
-        REVOKE ALL ON FUNCTION tchefood_check_pin(UUID, VARCHAR, user_role[], UUID, UUID, VARCHAR, TEXT) FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_check_pin(UUID, VARCHAR[], user_role[], UUID, UUID, VARCHAR, TEXT) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_can(UUID, user_role, app_permission) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_save_staff(UUID, TEXT, user_role, VARCHAR, BOOLEAN, UUID, VARCHAR, VARCHAR, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon;
         GRANT EXECUTE ON FUNCTION tchefood_save_staff(UUID, TEXT, user_role, VARCHAR, BOOLEAN, UUID, VARCHAR, VARCHAR, TEXT, TIMESTAMPTZ) TO authenticated;

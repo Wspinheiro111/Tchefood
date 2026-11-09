@@ -305,11 +305,20 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     expect(await save({})).toEqual({ status: 200, body: 'null' });
     expect(sql(`SELECT count(*) > 0 FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_LOCKOUT'`)).toBe('t');
     expect(sql(`SELECT pin_code FROM staff_users WHERE id = '${cashier.id}'`)).toBe(CASHIER_PIN);
+    // Sem oráculo de PIN: chutar o PIN gravado de alguém (sem provar quem altera) nunca
+    // devolve sucesso sem passar pela conferência que conta no bloqueio.
+    const attempts = () => Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type IN ('MANAGER_PIN_FAILED', 'MANAGER_PIN_LOCKOUT')`));
+    const ownerRow = { p_staff_id: owner.id, p_name: owner.name, p_role: 'OWNER', p_active: true, p_manager_pin: null, p_reason: null };
+    const before = attempts();
+    expect(await save({ ...ownerRow, p_pin: owner.pin_code, p_actor_id: cashier.id, p_actor_pin: '0000' })).toEqual({ status: 200, body: 'null' });
+    expect(await save({ ...ownerRow, p_pin: '0001', p_actor_id: owner.id, p_actor_pin: '0002' })).toEqual({ status: 200, body: 'null' });
+    expect((await rpc('tchefood_start_store', { p_owner_id: owner.id, p_owner_name: owner.name, p_owner_pin: '0003', p_qr_user_id: null, p_reason: 'Tentar de novo' })).body).toBe('null');
+    expect(attempts()).toBe(before + 3);
     // O PIN nunca vai para o audit_log.
     expect(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND (metadata::text LIKE '%${CASHIER_PIN}%' OR metadata::text LIKE '%${MANAGER_PIN}%')`)).toBe('0');
     // anon não chama as funções.
     expect(sql(`SELECT has_function_privilege('anon', 'tchefood_save_staff(uuid,text,user_role,varchar,boolean,uuid,varchar,varchar,text,timestamptz)', 'EXECUTE')`)).toBe('f');
-    expect(sql(`SELECT has_function_privilege('authenticated', 'tchefood_check_pin(uuid,varchar,user_role[],uuid,uuid,varchar,text)', 'EXECUTE')`)).toBe('f');
+    expect(sql(`SELECT has_function_privilege('authenticated', 'tchefood_check_pin(uuid,varchar[],user_role[],uuid,uuid,varchar,text)', 'EXECUTE')`)).toBe('f');
   });
 
   it('travas: desconto forjado na comanda é recusado', async () => {
