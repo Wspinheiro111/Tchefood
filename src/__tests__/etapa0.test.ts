@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { migratePersisted, selectCan, useTcheStore } from '../store/useTcheStore';
+import { migratePersisted, QR_PRICE_CHANGED, selectCan, useTcheStore } from '../store/useTcheStore';
 import { activeSchedule, effectivePrice, scheduleIntervals, validatePriceSchedule, validateProduct, validateStaff } from '../lib/catalog';
 import { can } from '../lib/permissions';
 import { buildSyncRequest, flushOutbox, serverOrder, needsRefresh, sanitizePayload, signInDevice, tenantFromJwt, type FetchLike } from '../lib/sync/supabaseSync';
@@ -421,6 +421,22 @@ describe('sincronização com o Supabase', () => {
     expect(st().removeServiceFee(id, { managerPin: MANAGER, reason: 'Cliente não aceitou os 10%' }).ok).toBe(true);
     expect(st().cancelOrderItem(item.id, { managerPin: MANAGER, reason: 'Cliente desistiu' }).ok).toBe(true);
     expect(st().outbox.slice(n).map((e) => e.table)).toEqual(['audit_logs', 'orders', 'audit_logs', 'order_items', 'orders']);
+  });
+
+  it('Cardápio QR não envia com preço diferente do que o cliente viu', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 10, 9, 19, 0));
+    login(OWNER);
+    const p = product('105');
+    expect(st().savePriceSchedule({ product_id: p.id, name: 'Happy hour', weekdays: [1], start_time: '18:00', end_time: '20:00', price: 20, active: true }).ok).toBe(true);
+    st().logout();
+    const line = { product_id: p.id, half_product_ids: [], quantity: 1, unit_price: 20, modifiers: [], modifiers_unit_price: 0, meat_doneness: p.requires_meat_doneness ? 'Ao Ponto' : null, quick_tags: [], free_notes: '', sector: p.sector };
+    // O happy hour acabou entre montar o carrinho e enviar.
+    vi.setSystemTime(new Date(2026, 10, 9, 20, 1));
+    const r = st().qrPlaceOrder(table(4).id, [line]);
+    expect(r).toMatchObject({ ok: false });
+    if (!r.ok) expect(r.error).toContain(QR_PRICE_CHANGED);
+    expect(st().qrPlaceOrder(table(4).id, [{ ...line, unit_price: p.price }]).ok).toBe(true);
   });
 
   it('lê tenant_id do JWT e exige a loja na conta', async () => {

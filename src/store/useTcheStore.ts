@@ -37,7 +37,7 @@ import type {
   TrayItem,
   UUID,
 } from '../types';
-import { applyOrderTotals, computeItemTotal, halfAndHalfPrice, round2, round3, toCents } from '../lib/money';
+import { applyOrderTotals, computeItemTotal, formatBRL, halfAndHalfPrice, round2, round3, toCents } from '../lib/money';
 import {
   effectivePrice,
   validateCategory,
@@ -62,6 +62,9 @@ import type { PrinterConfig } from '../services/printer/escposBuilder';
 export const MANAGER_PIN_MAX_ATTEMPTS = 3;
 export const MANAGER_PIN_LOCK_MS = 60_000;
 export const MIN_REASON_LENGTH = 5;
+
+/** Início da mensagem do Cardápio QR quando o preço do carrinho ficou diferente do atual. */
+export const QR_PRICE_CHANGED = 'Preço atualizado:';
 
 const MANAGER_ROLES: ReadonlyArray<StaffUser['role']> = ['MANAGER', 'OWNER'];
 
@@ -472,6 +475,22 @@ export const useTcheStore = create<TcheState>()(
       /** Preço de venda agora (cadastro + regra de horário). */
       const salePrice = (product: Product): number => effectivePrice(product, get().priceSchedules, new Date());
 
+      /** Preço base do item: cadastro + regra de horário, e a regra do meio a meio quando houver sabores. */
+      const basePriceFor = (product: Product, halfIds: UUID[]): ActionResult<number> => {
+        const halves: Product[] = [];
+        for (const hid of halfIds) {
+          const h = get().products.find((p) => p.id === hid);
+          if (!h || !h.active) return fail('Sabor do meio-a-meio não encontrado.');
+          if (!h.available) return fail(`${h.name} está em falta.`);
+          if (!product.allows_half_and_half || !h.allows_half_and_half) return fail(`${h.name} não pode ser servido meio-a-meio.`);
+          halves.push(h);
+        }
+        return {
+          ok: true,
+          data: halves.length ? halfAndHalfPrice([salePrice(product), ...halves.map(salePrice)], get().halfAndHalfPricing) : salePrice(product),
+        };
+      };
+
       const tableLabel = (tableId: UUID): string => get().tables.find((t) => t.id === tableId)?.label ?? '?';
 
       const buildAudit = (
@@ -609,17 +628,9 @@ export const useTcheStore = create<TcheState>()(
           if (!product || !product.active) return fail('Produto não encontrado.');
           if (!product.available) return fail(`${product.name} está em falta.`);
           // Preço base sempre do cadastro (com regra de horário), nunca o que a tela mandou.
-          const halves: Product[] = [];
-          for (const hid of draft.half_product_ids) {
-            const h = get().products.find((p) => p.id === hid);
-            if (!h || !h.active) return fail('Sabor do meio-a-meio não encontrado.');
-            if (!h.available) return fail(`${h.name} está em falta.`);
-            if (!product.allows_half_and_half || !h.allows_half_and_half) return fail(`${h.name} não pode ser servido meio-a-meio.`);
-            halves.push(h);
-          }
-          const basePrice = halves.length
-            ? halfAndHalfPrice([salePrice(product), ...halves.map(salePrice)], get().halfAndHalfPricing)
-            : salePrice(product);
+          const base = basePriceFor(product, draft.half_product_ids);
+          if (!base.ok) return base;
+          const basePrice = base.data;
           if (product.requires_meat_doneness && !draft.meat_doneness) {
             return fail('Ponto da carne é obrigatório.');
           }
@@ -1114,7 +1125,9 @@ export const useTcheStore = create<TcheState>()(
           for (const d of drafts) {
             const product = products.find((p) => p.id === d.product_id);
             if (!product || !product.active || !product.available) return fail('Produto indisponível.');
-            const price = salePrice(product);
+            const base = basePriceFor(product, d.half_product_ids);
+            if (!base.ok) return base;
+            const price = base.data;
             if (product.requires_meat_doneness && !d.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
             let modsCents = 0;
             for (const m of d.modifiers) {
@@ -1133,7 +1146,16 @@ export const useTcheStore = create<TcheState>()(
             }
             const qty = round3(d.quantity);
             if (!(qty > 0)) return fail('Quantidade inválida.');
-            const noteParts = [...d.modifiers.map((m) => `+ ${m.name}`), ...d.quick_tags, ...(d.free_notes.trim() ? [d.free_notes.trim()] : [])];
+            // O cliente confirma o preço que viu. Se a regra de horário (ou o cadastro) mudou
+            // desde que ele montou o carrinho, o pedido não sai com outro valor sem ele ver.
+            if (toCents(d.unit_price) !== toCents(price) || toCents(d.modifiers_unit_price) !== modsCents) {
+              return fail(`${QR_PRICE_CHANGED} ${product.name} agora custa ${formatBRL(price)}${modsCents > 0 ? ` + ${formatBRL(fromCentsLocal(modsCents))} de adicionais` : ''}. Confira o pedido e envie de novo.`);
+            }
+            const halfNames = d.half_product_ids.map((id) => products.find((p) => p.id === id)?.name).filter((n): n is string => Boolean(n));
+            const noteParts = [
+              ...(halfNames.length ? [`1/2 ${product.name} + ${halfNames.map((n) => `1/2 ${n}`).join(' + ')}`] : []),
+              ...d.modifiers.map((m) => `+ ${m.name}`),
+              ...d.quick_tags, ...(d.free_notes.trim() ? [d.free_notes.trim()] : [])];
             newItems.push({
               id: uuid(),
               order_id: order.id,

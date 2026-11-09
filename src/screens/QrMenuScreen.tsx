@@ -1,9 +1,9 @@
 import { useMemo, useState } from 'react';
 import { BellRing, Minus, Plus, Receipt, ShoppingBag, Trash2, UtensilsCrossed } from 'lucide-react';
 import { useSalePrice } from '../lib/useSalePrice';
-import { useTcheStore } from '../store/useTcheStore';
+import { QR_PRICE_CHANGED, useTcheStore } from '../store/useTcheStore';
 import type { Product } from '../types';
-import { computeItemTotal, formatBRL } from '../lib/money';
+import { computeItemTotal, formatBRL, fromCents, halfAndHalfPrice, toCents } from '../lib/money';
 import { ProductSheet, type ProductDraft } from '../components/ProductSheet';
 import { QrCode } from '../components/QrCode';
 import { Badge, toast } from '../components/ui';
@@ -81,9 +81,30 @@ function CustomerPhone({ tableId }: { tableId: string }) {
     toast.info('Adicionado ao seu pedido.');
   };
 
+  /** Recalcula o carrinho com o preço de agora (regra de horário e adicionais atuais). */
+  const repriced = (lines: CartLine[]): CartLine[] =>
+    lines.map((c) => {
+      const p = s.products.find((x) => x.id === c.product_id);
+      const modifiers = c.modifiers.map((m) => ({ ...m, additional_price: s.modifierOptions.find((o) => o.id === m.option_id)?.additional_price ?? m.additional_price }));
+      const mods = fromCents(modifiers.reduce((a, m) => a + toCents(m.additional_price), 0));
+      const halves = c.half_product_ids.map((id) => s.products.find((x) => x.id === id)).filter((x): x is Product => Boolean(x));
+      const unit = !p ? c.unit_price : halves.length ? halfAndHalfPrice([priceOf(p), ...halves.map(priceOf)], s.halfAndHalfPricing) : priceOf(p);
+      return { ...c, unit_price: unit, modifiers, modifiers_unit_price: mods };
+    });
+
   const send = () => {
+    const fresh = repriced(cart);
+    const changed = fresh.some((c, i) => toCents(c.unit_price) !== toCents(cart[i]!.unit_price) || toCents(c.modifiers_unit_price) !== toCents(cart[i]!.modifiers_unit_price));
+    if (changed) {
+      // Nunca enviar com valor diferente do que o cliente viu: atualiza e pede para conferir.
+      setCart(fresh);
+      return toast.alert('O preço de algum item mudou (horário de promoção). Confira o total e toque em Pedir de novo.');
+    }
     const r = s.qrPlaceOrder(tableId, cart.map(({ key: _k, ...d }) => d));
-    if (!r.ok) return toast.error(r.error);
+    if (!r.ok) {
+      if (r.error.startsWith(QR_PRICE_CHANGED)) setCart(fresh);
+      return toast.error(r.error);
+    }
     if (s.soundEnabled) playDispatchChime();
     printDispatchedItems(r.data.items);
     toast.success(`📱 Pedido enviado para a cozinha da ${table.label}!`);

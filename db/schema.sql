@@ -578,41 +578,40 @@ DROP TRIGGER IF EXISTS trg_tenants_secrets ON tenants;
 CREATE TRIGGER trg_tenants_secrets BEFORE UPDATE ON tenants
     FOR EACH ROW EXECUTE FUNCTION tchefood_tenant_secrets_guard();
 
--- Fila offline: o audit_log de desconto/remoção dos 10% pode subir horas depois de
--- gravado no aparelho (sem internet). A janela de 5 minutos passa a contar da
--- chegada no servidor (received_at, sempre preenchido pelo banco), não do
--- created_at do aparelho; a autorização continua tendo de chegar junto da mudança.
-ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-
-CREATE OR REPLACE FUNCTION tchefood_audit_received_at()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-    NEW.received_at := NOW();
-    RETURN NEW;
-END;
-$$;
-DROP TRIGGER IF EXISTS trg_audit_logs_received_at ON audit_logs;
-CREATE TRIGGER trg_audit_logs_received_at BEFORE INSERT ON audit_logs
-    FOR EACH ROW EXECUTE FUNCTION tchefood_audit_received_at();
-
+-- Fila offline: a autorização do gerente (audit_log) pode subir horas depois de dada,
+-- e a atualização da comanda pode subir numa tentativa seguinte. Em vez da janela de
+-- 5 minutos (que recusaria esse reenvio para sempre), a autorização fica presa à
+-- própria operação:
+--  - remover os 10%: o último registro de 10% da comanda tem de ser SERVICE_FEE_REMOVED
+--    (depois de restaurar, uma nova remoção precisa de nova autorização);
+--  - desconto: o último DISCOUNT_APPLIED da comanda tem de ser exatamente desta
+--    mudança (discount_before = valor atual, discount_after = valor novo).
 CREATE OR REPLACE FUNCTION tchefood_require_order_audit()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
-DECLARE v_action TEXT; v_ok BOOLEAN;
+DECLARE v_ok BOOLEAN := FALSE; v_action TEXT;
 BEGIN
     IF OLD.charge_service_fee AND NOT NEW.charge_service_fee THEN
         v_action := 'SERVICE_FEE_REMOVED';
+        SELECT (a.action_type = 'SERVICE_FEE_REMOVED' AND m.role IN ('MANAGER', 'OWNER') AND m.active)
+          INTO v_ok
+          FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id
+         WHERE a.order_id = NEW.id AND a.action_type IN ('SERVICE_FEE_REMOVED', 'SERVICE_FEE_RESTORED')
+         ORDER BY a.created_at DESC, a.id DESC
+         LIMIT 1;
     ELSIF NEW.discount_amount > OLD.discount_amount THEN
         v_action := 'DISCOUNT_APPLIED';
+        SELECT ((a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
+                AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
+                AND m.role IN ('MANAGER', 'OWNER') AND m.active)
+          INTO v_ok
+          FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id
+         WHERE a.order_id = NEW.id AND a.action_type = 'DISCOUNT_APPLIED'
+         ORDER BY a.created_at DESC, a.id DESC
+         LIMIT 1;
     ELSE
         RETURN NULL;
     END IF;
-    SELECT EXISTS (
-        SELECT 1 FROM audit_logs a JOIN staff_users m ON m.id = a.authorized_by_manager_id
-         WHERE a.order_id = NEW.id AND a.action_type = v_action
-           AND a.received_at >= NOW() - INTERVAL '5 minutes'
-           AND m.role IN ('MANAGER', 'OWNER') AND m.active
-    ) INTO v_ok;
-    IF NOT v_ok THEN
+    IF NOT COALESCE(v_ok, FALSE) THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % sem PIN de gerente registrado em audit_logs.', v_action;
     END IF;
     RETURN NULL;
