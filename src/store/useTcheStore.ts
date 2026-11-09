@@ -1763,6 +1763,10 @@ export const useTcheStore = create<TcheState>()(
           if (state.cloud && state.outbox.length > 0) {
             return fail(`Ainda há ${state.outbox.length} evento(s) sem enviar para a nuvem. Sincronize antes.`);
           }
+          const rejectedCount = (state.syncRejected ?? []).length;
+          if (state.cloud && rejectedCount > 0) {
+            return fail(`Há ${rejectedCount} evento(s) recusado(s) pela nuvem. Resolva e reenvie antes de iniciar uma loja nova.`);
+          }
           const check = validateTenantDraft(input.tenant);
           if (!check.ok) return check;
           const authRes = authorizeManager(auth, { orderId: null, action: 'STORE_RESET' });

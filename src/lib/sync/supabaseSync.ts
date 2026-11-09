@@ -198,20 +198,45 @@ export function serverOrder(events: SyncEvent[]): SyncEvent[] {
 }
 
 /**
+ * Registros que um evento toca, para manter a ordem por registro. Um audit_log de
+ * comanda também segura a comanda: a atualização dela depende da autorização.
+ */
+export function recordKeys(event: SyncEvent): string[] {
+  const keys = [`${event.table}:${event.row_id}`];
+  if (event.table === 'audit_logs' && typeof event.payload.order_id === 'string') keys.push(`orders:${event.payload.order_id}`);
+  return keys;
+}
+
+/**
  * Envia a fila em ordem até acabar, até um erro de rede/servidor, ou até `limit` eventos.
  * Um evento recusado (4xx) não para o envio: vai para `rejected` e o próximo segue.
+ * Eventos posteriores do MESMO registro de um recusado (nesta rodada ou em `held`, os
+ * recusados guardados) não sobem: ficam na fila até o recusado ser reenviado, para uma
+ * versão antiga nunca sobrescrever uma mais nova na nuvem.
  * Não altera o estado: quem chama confirma os enviados (ackSyncedEvents) e tira os
  * recusados da fila (rejectSyncEvents), para não reenviá-los a cada rodada.
  */
-export async function flushOutbox(events: SyncEvent[], cfg: SyncConfig, fetchFn: FetchLike, limit = 50): Promise<FlushResult> {
+export async function flushOutbox(
+  events: SyncEvent[],
+  cfg: SyncConfig,
+  fetchFn: FetchLike,
+  limit = 50,
+  held: SyncEvent[] = [],
+): Promise<FlushResult> {
   const sent: string[] = [];
   const rejected: SyncRejection[] = [];
+  const blocked = new Set(held.flatMap(recordKeys));
+  const reject = (event: SyncEvent, status: number, message: string) => {
+    rejected.push({ eventId: event.id, status, message });
+    for (const k of recordKeys(event)) blocked.add(k);
+  };
   for (const event of serverOrder(events).slice(0, limit)) {
+    if (recordKeys(event).some((k) => blocked.has(k))) continue;
     let req: SyncRequest;
     try {
       req = buildSyncRequest(event, cfg);
     } catch (e) {
-      rejected.push({ eventId: event.id, status: 0, message: (e as Error).message });
+      reject(event, 0, (e as Error).message);
       continue;
     }
     let res;
@@ -225,11 +250,7 @@ export async function flushOutbox(events: SyncEvent[], cfg: SyncConfig, fetchFn:
       // A RPC responde null quando o PIN não confere no servidor (ou está bloqueado):
       // nada foi autorizado, e a atualização da comanda que vem depois seria recusada.
       if (isManagerAuthorization(event) && !isUuidResponse(text)) {
-        rejected.push({
-          eventId: event.id,
-          status: res.status,
-          message: 'O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).',
-        });
+        reject(event, res.status, 'O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).');
         continue;
       }
       sent.push(event.id);
@@ -239,7 +260,7 @@ export async function flushOutbox(events: SyncEvent[], cfg: SyncConfig, fetchFn:
     if (res.status >= 500 || res.status === 408 || res.status === 429) {
       return { sent, retryLater: `Nuvem indisponível (HTTP ${res.status}).`, rejected };
     }
-    rejected.push({ eventId: event.id, status: res.status, message: describeError(text, res.status) });
+    reject(event, res.status, describeError(text, res.status));
   }
   return { sent, retryLater: null, rejected };
 }

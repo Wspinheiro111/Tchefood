@@ -34,8 +34,9 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch): Promise<void>
         return;
       }
     }
-    const events = useTcheStore.getState().outbox;
-    const result = await flushOutbox(events, { url: session.url, anonKey: session.anon_key, accessToken: token }, fetchFn);
+    const { outbox: events, syncRejected } = useTcheStore.getState();
+    const held = (syncRejected ?? []).map((r) => r.event);
+    const result = await flushOutbox(events, { url: session.url, anonKey: session.anon_key, accessToken: token }, fetchFn, 50, held);
     const st = useTcheStore.getState();
     st.ackSyncedEvents(result.sent);
     // Recusados saem da fila (o resto continua subindo) e ficam na lista para revisão.

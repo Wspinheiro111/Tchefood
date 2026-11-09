@@ -326,7 +326,7 @@ function CloudStatus() {
         <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm">
           <div className="mb-2 font-bold text-ouro">{rejected.length} evento(s) recusado(s) pela nuvem</div>
           <p className="mb-2 text-xs text-slate-300">
-            Eles saíram da fila para não travar o resto do envio. Nada foi descartado. Corrija a causa no servidor (permissão, PIN do gerente ou trava) e toque em Reenviar recusados.
+            Eles saíram da fila para não travar o resto do envio; as mudanças seguintes dos mesmos registros esperam na fila até o reenvio. Nada foi descartado. Corrija a causa no servidor (permissão, PIN do gerente ou trava) e toque em Reenviar recusados.
           </p>
           <ul className="mb-2 max-h-48 space-y-1 overflow-y-auto text-xs">
             {rejected.map((r) => (

@@ -321,6 +321,21 @@ describe('loja nova', () => {
     expect(st().login('4826').ok).toBe(true);
   });
 
+  it('com nuvem ligada, não inicia loja nova enquanto houver evento recusado', () => {
+    useTcheStore.setState({ orders: st().orders.map((o) => (o.status === 'OPEN' || o.status === 'PAYING' ? { ...o, status: 'CLOSED' as const } : o)) });
+    login(OWNER);
+    const event: SyncEvent = { id: 'e', table: 'products', op: 'UPDATE', row_id: 'p', payload: { id: 'p' }, created_at: '' };
+    useTcheStore.setState({
+      outbox: [],
+      syncRejected: [{ event, status: 403, message: 'x', rejected_at: '' }],
+      cloud: { url: 'u', anon_key: 'k', email: 'e', access_token: 'a', refresh_token: 'r', expires_at: 0, tenant_id: st().tenant.id },
+    });
+    const r = st().startNewStore({ tenant, owner_name: 'Zé', owner_pin: '4826' }, { managerPin: OWNER, reason: 'Sair da demonstração' });
+    expect(r).toMatchObject({ ok: false });
+    if (!r.ok) expect(r.error).toContain('recusado');
+    expect(st().syncRejected).toHaveLength(1);
+  });
+
   it('CNPJ com dígito errado é recusado', () => {
     login(OWNER);
     expect(st().updateTenant({ ...tenant, cnpj: '11222333000182' })).toMatchObject({ ok: false });
@@ -435,7 +450,7 @@ describe('sincronização com o Supabase', () => {
     expect(() => buildSyncRequest(ev({ table: 'audit_logs', payload: authLog() }), cfg)).toThrow(/PIN/);
   });
 
-  it('RPC que devolve null (PIN não confere no servidor) é recusa, e o resto da fila segue', async () => {
+  it('RPC que devolve null (PIN não confere no servidor) é recusa, segura a comanda e o resto segue', async () => {
     const auth = ev({ id: 'a', table: 'audit_logs', row_id: 'A1', payload: authLog(), manager_pin: '0000', created_at: '2026-11-09T19:00:00.000Z' });
     const upd = ev({ id: 'u', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1', discount_amount: 10 }, created_at: '2026-11-09T19:00:00.000Z' });
     const other = ev({ id: 'x', table: 'products', op: 'UPDATE', row_id: 'P1', payload: { id: 'P1' }, created_at: '2026-11-09T19:00:05.000Z' });
@@ -445,13 +460,37 @@ describe('sincronização com o Supabase', () => {
       return { ok: true, status: 201, text: async () => '' };
     };
     const r = await flushOutbox([auth, upd, other], cfg, fetchFn);
+    // A comanda nem sobe: espera a autorização recusada ser resolvida.
     expect(r.sent).toEqual(['x']);
-    expect(r.rejected.map((x) => x.eventId)).toEqual(['a', 'u']);
+    expect(r.rejected.map((x) => x.eventId)).toEqual(['a']);
     expect(r.rejected[0]!.message).toContain('PIN do gerente');
 
     const okRpc: FetchLike = async (url) =>
       url.includes('/rpc/') ? { ok: true, status: 200, text: async () => '"3f1c2b9e-1d2a-4c55-9a77-0e8f6d5b4a21"' } : { ok: true, status: 204, text: async () => '' };
     expect(await flushOutbox([auth, upd], cfg, okRpc)).toEqual({ sent: ['a', 'u'], retryLater: null, rejected: [] });
+  });
+
+  it('depois de um recusado, eventos do mesmo registro esperam e não sobrescrevem a nuvem', async () => {
+    const calls: string[] = [];
+    const fetchFn: FetchLike = async (url, init) => {
+      calls.push(`${url} ${init.body ?? ''}`);
+      if (init.body?.includes('"v":1')) return { ok: false, status: 403, text: async () => '' };
+      return { ok: true, status: 204, text: async () => '' };
+    };
+    const p1 = ev({ id: 'p1', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P', v: 1 } });
+    const p2 = ev({ id: 'p2', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P', v: 2 } });
+    const q = ev({ id: 'q', table: 'products', op: 'UPDATE', row_id: 'Q', payload: { id: 'Q' } });
+    const r = await flushOutbox([p1, p2, q], cfg, fetchFn);
+    expect(r.sent).toEqual(['q']);
+    expect(r.rejected.map((x) => x.eventId)).toEqual(['p1']);
+    // Rodada seguinte: p1 está nos recusados, p2 continua esperando na fila.
+    const next = await flushOutbox([p2], cfg, fetchFn, 50, [p1]);
+    expect(next).toEqual({ sent: [], retryLater: null, rejected: [] });
+    // Autorização recusada segura a atualização da comanda.
+    const auth = ev({ id: 'a', table: 'audit_logs', row_id: 'A1', payload: authLog(), manager_pin: '9999' });
+    const order = ev({ id: 'o', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' } });
+    expect((await flushOutbox([order], cfg, fetchFn, 50, [auth])).sent).toEqual([]);
+    expect(calls.some((c) => c.includes('"v":2'))).toBe(false);
   });
 
   it('o store guarda o PIN só no evento da fila e não no audit_log', () => {
