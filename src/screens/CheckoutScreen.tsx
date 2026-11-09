@@ -3,7 +3,7 @@ import { ArrowLeft, Banknote, CheckCircle2, CreditCard, Divide, ListChecks, QrCo
 import { useTcheStore } from '../store/useTcheStore';
 import type { OperationMode, Payment } from '../types';
 import { computeEqualShare, computeItemsShare, formatBRL, round2, toCents } from '../lib/money';
-import { createDriver, useTerminalBus, type Chassis, type ChargeRequest } from '../lib/payments/drivers';
+import { createDriver, useTerminalBus, type Chassis, type ChargeRequest, type IPaymentTerminalDriver } from '../lib/payments/drivers';
 import { cardReceiptLines, conferenceLines } from '../lib/receipts';
 import { uuid } from '../lib/ids';
 import { Btn, Stepper, toast } from '../components/ui';
@@ -66,13 +66,11 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const description =
     mode === 'EQUAL' ? `Cota ${order.customer_count - peopleLeft + 1} de ${order.customer_count}` : mode === 'FREE' ? 'Valor parcial livre' : `${selected.length} item(ns) consumido(s)`;
 
-  const afterApproved = (payment: Payment, closed: boolean, pan: string | null) => {
-    if (payment.method !== 'CASH') {
-      useTerminalBus.getState().enqueuePrint({
-        title: 'Comprovante TEF',
-        lines: cardReceiptLines({ tenant: s.tenant, payment, tableLabel: table.label, maskedPan: pan }),
-        chassis: payment.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE',
-      });
+  const afterApproved = (payment: Payment, closed: boolean, pan: string | null, driver: IPaymentTerminalDriver | null) => {
+    if (payment.method !== 'CASH' && driver) {
+      // Bobina da própria maquininha quando há ponte nativa; no navegador, o simulador visual.
+      const lines = cardReceiptLines({ tenant: s.tenant, payment, tableLabel: table.label, maskedPan: pan });
+      driver.print(lines).catch(() => toast.error('Comprovante não impresso. Reimprima pela maquininha.'));
     }
     toast.success(`✅ ${formatBRL(payment.amount)} aprovado${payment.authorization_code ? ` · cAut ${payment.authorization_code}` : ''}`);
     if (mode === 'EQUAL') setPeopleLeft((n) => Math.max(1, n - 1));
@@ -95,7 +93,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       });
       if (!r.ok) return toast.error(r.error);
       if (change > 0) toast.info(`Troco: ${formatBRL(change)}`);
-      afterApproved(r.data.payment, r.data.closed, null);
+      afterApproved(r.data.payment, r.data.closed, null, null);
       return;
     }
 
@@ -123,7 +121,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         terminal_serial: result.terminal_serial, idempotency_key, item_ids: itemIds, charge_request_id: req.request_id,
       });
       if (!r.ok) return toast.error(r.error);
-      afterApproved(r.data.payment, r.data.closed, result.masked_pan);
+      afterApproved(r.data.payment, r.data.closed, result.masked_pan, driver);
     } finally {
       useTcheStore.getState().endTerminalCharge(req.request_id);
       setBusy(false);
