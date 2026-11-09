@@ -40,3 +40,40 @@ describe('Stone nativa', () => {
     await expect(p1).resolves.toMatchObject({ status: 'APPROVED', nsu: '123456' });
   });
 });
+
+describe('DANFE e bandeja', () => {
+  it('ESC/POS gera o QR Code nativo (GS ( k) com o tamanho certo', async () => {
+    const { UniversalEscPosBuilder } = await import('../services/printer/escposBuilder');
+    const data = 'https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=123';
+    const bytes = Array.from(new UniversalEscPosBuilder('58MM').qrCode(data).toBytes());
+    const store = bytes.findIndex((b, i) => b === 0x1d && bytes[i + 1] === 0x28 && bytes[i + 2] === 0x6b && bytes[i + 5] === 0x31 && bytes[i + 6] === 0x50);
+    expect(store).toBeGreaterThan(-1);
+    expect(bytes[store + 3]! + bytes[store + 4]! * 256).toBe(data.length + 3);
+  });
+
+  it('DANFE vai para a bobina interna com QR quando existe ponte nativa', async () => {
+    const { printDocument } = await import('../lib/payments/drivers');
+    const sent: string[] = [];
+    g.window = { SmartPosNative: { printInternalEscPos: (b64: string) => { sent.push(b64); return JSON.stringify({ success: true }); } } };
+    expect(printDocument({ title: 'DANFE', lines: ['NFC-e'], qr: 'https://x', footer: ['fim'], chassis: 'STONE' })).toBe('NATIVE');
+    expect(atob(sent[0]!)).toContain('https://x');
+  });
+
+  it('não recebe pagamento com itens na bandeja sem enviar', async () => {
+    const { useTcheStore } = await import('../store/useTcheStore');
+    const st = useTcheStore.getState;
+    st().resetDemo();
+    st().login('1111');
+    const t = st().tables.find((x) => x.number === 1)!;
+    const o = st().openTable(t.id, 1, null);
+    if (!o.ok) throw new Error(o.error);
+    const p = st().products.find((x) => x.code === '311')!;
+    const draft = { order_id: o.data.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector };
+    st().addToTray(draft);
+    st().dispatchTray(o.data.id);
+    st().addToTray(draft);
+    const pay = st().registerPayment({ orderId: o.data.id, amount: 1, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'z', item_ids: [] });
+    expect(pay.ok).toBe(false);
+    expect(st().beginTerminalCharge(o.data.id, 'r', 1).ok).toBe(false);
+  });
+});

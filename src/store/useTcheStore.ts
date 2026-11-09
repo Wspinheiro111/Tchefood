@@ -846,6 +846,9 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(input.orderId);
           if (!res.ok) return res;
           const order = res.data;
+          if (input.status === 'APPROVED' && get().tray.some((t) => t.order_id === order.id)) {
+            return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
+          }
           const lock = activeCharge(order.id);
           const fromLockedCharge = Boolean(lock && input.charge_request_id && lock.request_id === input.charge_request_id);
           if (lock && !fromLockedCharge) return fail(CHARGE_LOCK_ERROR);
@@ -942,6 +945,7 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(orderId);
           if (!res.ok) return res;
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (get().tray.some((t) => t.order_id === orderId)) return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
           const value = round2(amount);
           if (!(value > 0) || toCents(value) > toCents(res.data.remaining_balance)) return fail('Valor maior que o saldo restante da mesa.');
           set((s) => ({

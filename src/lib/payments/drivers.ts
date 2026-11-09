@@ -133,6 +133,35 @@ export const useTerminalBus = create<TerminalBus>((set, get) => ({
   dismissPrint: (id) => set({ printQueue: get().printQueue.filter((j) => j.id !== id) }),
 }));
 
+/**
+ * Imprime um documento (DANFE, conferência) na bobina física do aparelho quando
+ * existe ponte nativa; no navegador, cai no simulador visual.
+ *  - SmartPosNative.printInternalEscPos: ESC/POS 58mm com QR Code nativo (GS ( k)
+ *  - PlugPagBridge.printText: texto puro; o QR vira a URL de consulta impressa
+ */
+export function printDocument(job: Omit<PrintJob, 'id'>): 'NATIVE' | 'SIMULATOR' {
+  const w = window as unknown as {
+    SmartPosNative?: { printInternalEscPos?: (b64: string) => string };
+    PlugPagBridge?: { printText?: (text: string) => void };
+  };
+  if (w.SmartPosNative?.printInternalEscPos) {
+    const b = new UniversalEscPosBuilder('58MM');
+    for (const l of job.lines) b.line(l);
+    if (job.qr) b.qrCode(job.qr);
+    for (const l of job.footer ?? []) b.line(l);
+    b.cut(false);
+    const r = JSON.parse(w.SmartPosNative.printInternalEscPos(b.toBase64())) as { success: boolean; error?: string };
+    if (!r.success) throw new Error(r.error ?? 'Falha na impressora interna');
+    return 'NATIVE';
+  }
+  if (w.PlugPagBridge?.printText) {
+    w.PlugPagBridge.printText([...job.lines, ...(job.qr ? ['', job.qr, ''] : []), ...(job.footer ?? [])].join('\n'));
+    return 'NATIVE';
+  }
+  useTerminalBus.getState().enqueuePrint(job);
+  return 'SIMULATOR';
+}
+
 // ---------------------------------------------------------------------------
 // Geradores de metadados (iguais aos formatos das adquirentes)
 // ---------------------------------------------------------------------------

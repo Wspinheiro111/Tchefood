@@ -59,6 +59,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const amount =
     mode === 'EQUAL' ? computeEqualShare(remaining, peopleLeft) : mode === 'FREE' ? freeValue : itemShare.share;
   const amountValid = amount > 0 && toCents(amount) <= toCents(remaining);
+  const trayPending = s.tray.some((t) => t.order_id === orderId);
   const cashGivenValue = round2(Number(cashGiven.replace(',', '.')) || 0);
   const change = method === 'CASH' && cashGivenValue > amount ? round2(cashGivenValue - amount) : 0;
 
@@ -81,7 +82,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   };
 
   const charge = async () => {
-    if (!amountValid || busy) return;
+    if (!amountValid || busy || trayPending) return;
     const idempotency_key = uuid();
     const itemIds = mode === 'ITEMS' ? selected : [];
 
@@ -258,9 +259,12 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         </div>
       )}
 
+      {trayPending && (
+        <p className="mb-2 rounded-xl border border-rose-500 bg-rose-950/60 p-3 text-sm text-rose-100">Há itens na bandeja desta mesa que ainda não foram enviados. Volte e envie ou remova antes de cobrar.</p>
+      )}
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_2fr]">
         <Btn variant="secondary" size="lg" onClick={printPreview}>Prévia de conferência</Btn>
-        <Btn variant="success" size="lg" disabled={!amountValid || busy} onClick={charge}>
+        <Btn variant="success" size="lg" disabled={!amountValid || busy || trayPending} onClick={charge}>
           {busy ? 'Aguardando maquininha…' : `${method === 'CASH' ? 'Receber' : opMode === 'TEF_POS_WIRELESS' ? 'Enviar para maquininha' : 'Cobrar na SmartPOS'} ${formatBRL(amount)}`}
         </Btn>
       </div>

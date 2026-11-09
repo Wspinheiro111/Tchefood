@@ -3,7 +3,7 @@ import { Copy, FileJson, Printer, Receipt } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import { buildNfce, formatAccessKey } from '../lib/nfce';
 import { danfeLines } from '../lib/receipts';
-import { useTerminalBus } from '../lib/payments/drivers';
+import { printDocument } from '../lib/payments/drivers';
 import { Btn, Sheet, toast } from '../components/ui';
 import { ThermalPaper } from '../components/SmartPosSimulator';
 
@@ -31,7 +31,12 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
   const json = JSON.stringify(doc.payload, null, 2);
   const printDanfe = () => {
     const first = s.payments.find((p) => p.order_id === orderId && p.status === 'APPROVED' && p.acquirer === 'PAGBANK');
-    useTerminalBus.getState().enqueuePrint({ title: `DANFE NFC-e ${doc.payload.numero}`, lines: danfe.top, qr: doc.qr_url, footer: danfe.bottom, chassis: first ? 'PAGBANK' : 'STONE' });
+    try {
+      const via = printDocument({ title: `DANFE NFC-e ${doc.payload.numero}`, lines: danfe.top, qr: doc.qr_url, footer: danfe.bottom, chassis: first ? 'PAGBANK' : 'STONE' });
+      if (via === 'NATIVE') toast.success('DANFE enviado para a bobina.');
+    } catch (e) {
+      toast.error(`DANFE não impresso: ${e instanceof Error ? e.message : 'falha na impressora'}`);
+    }
   };
   const copy = async () => {
     try {
