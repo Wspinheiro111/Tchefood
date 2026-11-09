@@ -389,11 +389,17 @@ BEGIN
     ELSE
         RETURN NULL;
     END IF;
+    -- A autorização vale só para a mudança exata que o gerente aprovou: no desconto,
+    -- discount_before/discount_after do audit_log precisam bater com OLD/NEW, então
+    -- uma aprovação pequena não serve para aumentar o desconto de novo.
     SELECT EXISTS (
         SELECT 1 FROM audit_logs a JOIN staff_users m ON m.id = a.authorized_by_manager_id
          WHERE a.order_id = NEW.id AND a.action_type = v_action
            AND a.created_at >= NOW() - INTERVAL '5 minutes'
            AND m.role IN ('MANAGER', 'OWNER') AND m.active
+           AND (v_action <> 'DISCOUNT_APPLIED' OR (
+                (a.metadata->>'discount_before')::numeric = OLD.discount_amount
+            AND (a.metadata->>'discount_after')::numeric = NEW.discount_amount))
     ) INTO v_ok;
     IF NOT v_ok THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % sem PIN de gerente registrado em audit_logs.', v_action;
@@ -522,6 +528,14 @@ BEGIN
     IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: motivo obrigatório (mínimo 5 caracteres).';
     END IF;
+    IF p_action_type = 'DISCOUNT_APPLIED' AND (
+        (p_metadata->>'discount_before') IS NULL OR (p_metadata->>'discount_after') IS NULL
+        OR (p_metadata->>'discount_after')::numeric <= (p_metadata->>'discount_before')::numeric) THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: desconto precisa de discount_before e discount_after (maior) no metadata.';
+    END IF;
+    IF p_action_type = 'ITEM_CANCELED' AND (p_metadata->>'item_id') IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: cancelamento precisa do item_id no metadata.';
+    END IF;
     PERFORM 1 FROM orders o WHERE o.id = p_order_id AND o.tenant_id = v_tenant;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: conta não pertence ao tenant.';
@@ -567,3 +581,22 @@ BEGIN
         GRANT EXECUTE ON FUNCTION tchefood_authorize_manager(UUID, VARCHAR, VARCHAR, UUID, TEXT, NUMERIC, JSONB) TO authenticated;
     END IF;
 END $$;
+
+-- Item já gravado (despachado) não muda de preço, quantidade nem produto: a única
+-- forma de reduzir a conta por item é o cancelamento autorizado. Assim o cliente
+-- não zera o unit_price nem baixa a quantidade para escapar das travas.
+CREATE OR REPLACE FUNCTION tchefood_lock_item_financials()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.unit_price IS DISTINCT FROM OLD.unit_price
+       OR NEW.modifiers_unit_price IS DISTINCT FROM OLD.modifiers_unit_price
+       OR NEW.quantity IS DISTINCT FROM OLD.quantity
+       OR NEW.product_id IS DISTINCT FROM OLD.product_id
+       OR NEW.order_id IS DISTINCT FROM OLD.order_id THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: item % já enviado não pode ter preço, quantidade ou produto alterados. Cancele com PIN do gerente e lance de novo.', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_order_items_lock_financials BEFORE UPDATE ON order_items
+    FOR EACH ROW EXECUTE FUNCTION tchefood_lock_item_financials();

@@ -117,3 +117,25 @@ describe('PagBank em TEF POS Sem Fio', () => {
     expect(called).toBe(false);
   });
 });
+
+describe('ajuste que quita a conta com bandeja pendente', () => {
+  it('recusa o ajuste em vez de apagar os itens da bandeja', async () => {
+    const { useTcheStore } = await import('../store/useTcheStore');
+    const st = useTcheStore.getState;
+    st().resetDemo();
+    st().login('1111');
+    const t = st().tables.find((x) => x.number === 1)!;
+    const o = st().openTable(t.id, 1, null);
+    if (!o.ok) throw new Error(o.error);
+    const p = st().products.find((x) => x.code === '311')!;
+    const draft = { order_id: o.data.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector };
+    st().addToTray(draft);
+    st().dispatchTray(o.data.id);
+    const ord = st().orders.find((x) => x.id === o.data.id)!;
+    st().registerPayment({ orderId: o.data.id, amount: ord.subtotal_items, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'a', item_ids: [] });
+    st().addToTray(draft);
+    const r = st().removeServiceFee(o.data.id, { managerPin: '9999', reason: 'Cliente reclamou do serviço' });
+    expect(r.ok).toBe(false);
+    expect(st().tray.filter((x) => x.order_id === o.data.id)).toHaveLength(1);
+  });
+});

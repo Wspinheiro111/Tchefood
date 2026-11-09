@@ -333,6 +333,15 @@ export const useTcheStore = create<TcheState>()(
         };
       };
 
+      /**
+       * Um ajuste que vai encerrar a conta não pode descartar itens ainda na bandeja:
+       * o operador precisa enviar ou remover antes.
+       */
+      const blocksSettleWithTray = (simulated: Order): string | null =>
+        toCents(simulated.paid_amount) > 0 && toCents(simulated.remaining_balance) === 0 && get().tray.some((t) => t.order_id === simulated.id)
+          ? 'Este ajuste quita a conta, mas há itens na bandeja não enviados. Envie ou remova antes.'
+          : null;
+
       /** Resultado de um ajuste financeiro: aplica totais e encerra se o saldo zerou. */
       const commitAdjustment = (
         s: TcheState,
@@ -351,7 +360,6 @@ export const useTcheStore = create<TcheState>()(
           nfceSeq: settled.nfceSeq,
           orders: s.orders.map((o) => (o.id === recalculated.id ? settled.order : o)),
           tables: settled.table ? s.tables.map((t) => (t.id === settled.table!.id ? settled.table! : t)) : s.tables,
-          tray: settled.closed ? s.tray.filter((t) => t.order_id !== recalculated.id) : s.tray,
           auditLogs: [log, ...s.auditLogs],
           outbox: [
             ...s.outbox,
@@ -683,6 +691,8 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Cancelamento deixaria a conta abaixo do valor já pago. Estorne um pagamento primeiro.');
           }
+          const trayBlock = blocksSettleWithTray(simulated);
+          if (trayBlock) return fail(trayBlock);
 
           const authRes = authorizeManager(auth, { orderId: order.id, action: 'ITEM_CANCELED' });
           if (!authRes.ok) return authRes;
@@ -729,6 +739,8 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Remover a taxa deixaria a conta abaixo do valor já pago.');
           }
+          const trayBlock = blocksSettleWithTray(simulated);
+          if (trayBlock) return fail(trayBlock);
           const authRes = authorizeManager(auth, { orderId, action: 'SERVICE_FEE_REMOVED' });
           if (!authRes.ok) return authRes;
           const user = currentUser()!;
@@ -797,6 +809,8 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Desconto deixaria a conta abaixo do valor já pago.');
           }
+          const trayBlock = blocksSettleWithTray(simulated);
+          if (trayBlock) return fail(trayBlock);
           const authRes = authorizeManager(auth, { orderId, action: 'DISCOUNT_APPLIED' });
           if (!authRes.ok) return authRes;
           const user = currentUser()!;
