@@ -31,6 +31,34 @@ npm run build
 7. **Stone Connect 2.0 (servidor)** — `server/payments/stoneConnect.ts`, cliente do Pagar.me v5 portado do Tchê Vendas com testes. Guia completo e documentação oficial em `docs/integracoes/stone/`. Roda em servidor porque a Secret Key da loja nunca vai para o navegador.
 8. **Emissão real de NFC-e (Supabase Edge Function + Focus NFe)** — `supabase/functions/emit-nfce`, regras portadas do Tchê Vendas. Detalhes abaixo.
 
+9. **Etapa 0 — Fundação: cadastros na tela e nuvem** (Retaguarda → Cardápio, Salão, Equipe, Loja, Nuvem). Detalhes abaixo.
+
+## Etapa 0: cadastros na tela e sincronização
+**Cardápio** — categorias, produtos (código único, preço com 2 casas, NCM/CFOP/CSOSN validados), grupos de adicionais e opções, vínculo produto ↔ adicionais em ordem, **preço por dia/horário** (happy hour; janela que vira a meia-noite; duas regras do mesmo produto não podem se sobrepor) e **esgotado** em um toque, também no KDS para a cozinha.
+- O preço da bandeja é recalculado no store a partir do cardápio (regra de horário + meio a meio). O valor que a tela manda é ignorado.
+- Trocar preço grava `PRODUCT_PRICE_CHANGED` na auditoria e não muda item já lançado (o `order_items.unit_price` fica como foi vendido).
+- Produto e mesa nunca são apagados: são desativados e somem da venda e do mapa. Mesa com conta aberta não desativa (também no banco, por trigger).
+
+**Equipe** — PIN de 4 dígitos, único e não trivial. Trocar o PIN de outra pessoa, mudar perfil, desativar ou reativar pede PIN de gerente + motivo e grava `STAFF_*` na auditoria; o PIN nunca vai para o log. Gerente não mexe em gerente/proprietário; ninguém desativa a si mesmo; a loja nunca fica sem proprietário ativo.
+
+**Loja** — dados cadastrais (CNPJ com dígito verificador, UF, taxa de serviço 0–20% com 2 casas). **Permissões por perfil** (`role_permissions` guarda só as exceções ao padrão de `src/lib/permissions.ts`; o proprietário pode tudo e só ele muda permissões, com PIN e motivo). **Iniciar loja nova** tira o aparelho da demonstração: exige o PIN do proprietário, nenhuma conta aberta e a fila vazia se já houver nuvem. As maquininhas cadastradas no aparelho continuam, com id novo, e sobem para a nuvem antes de qualquer pagamento. Ainda não há tela para cadastrar maquininha: o número de série é único no banco, então os seriais de demonstração (STONE-01…) só servem para uma loja na nuvem.
+
+**Nuvem** — o aparelho entra com uma conta do Supabase Auth (e-mail e senha) e a fila `outbox` sobe sozinha a cada 5 s quando há internet (`src/lib/sync/`):
+- Envio em ordem, um evento por vez. O `audit_log` de cancelamento, remoção dos 10% ou desconto sobe **antes** da mudança que ele autoriza (as travas do banco exigem a autorização já gravada). Para um desconto dado sem internet ainda subir horas depois (mesmo em outra tentativa), a trava deixou de usar a janela de 5 minutos: a autorização fica presa à operação. Remover os 10% exige que o último registro de 10% da comanda seja `SERVICE_FEE_REMOVED` (depois de restaurar, nova remoção pede nova autorização); desconto exige um `DISCOUNT_APPLIED` com `discount_before`/`discount_after` iguais à mudança. `payments` e `audit_logs` são só INSERT (`ignore-duplicates`); o resto é upsert pelo id. DELETE só existe para vínculo produto ↔ adicional e opção de adicional.
+- Erro de rede, 5xx e 401 ficam para depois (401 renova o token). 4xx **para a fila** naquele evento e mostra o motivo na aba Nuvem; nada é descartado sozinho.
+- Token da Focus e CSC nunca sobem do aparelho; um trigger no banco também impede o app de trocá-los. `nfce_status` e `nfce_key` da comanda também não sobem: a NFC-e do aparelho é simulação e a situação real vem da `emit-nfce`.
+
+Configuração:
+```bash
+supabase db push    # aplica supabase/migrations/20261109070000_etapa0_cadastros.sql
+```
+1. No painel do Supabase: Authentication → Hooks → **Custom Access Token** → `public.tchefood_access_token_hook`. Ele copia `app_metadata.tenant_id` para a claim `tenant_id` que o RLS (`tchefood_tenant()`) lê.
+2. Crie a linha da loja em `tenants` e uma conta de usuário para o aparelho com `app_metadata = {"tenant_id": "<id da loja>"}` (pelo painel ou pela API admin; o app não cria lojas na nuvem).
+3. Build com `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY` (ou digite os dois na aba Nuvem).
+4. No aparelho: Retaguarda → Nuvem → entrar. Se a conta for de outra loja que a deste aparelho (ex.: ainda na demonstração), a própria tela oferece começar a loja da conta.
+
+Limites conhecidos desta etapa: a sincronização é **só de envio** (um aparelho novo ainda não baixa o cardápio da nuvem) e, fora das tabelas imutáveis, conflito entre dois aparelhos é "o último que gravou vale". **Combos** ficam para o próximo PR da Etapa 0.
+
 ## NFC-e real: `supabase/functions/emit-nfce`
 ```bash
 supabase db push                                   # aplica supabase/migrations (tabela nfce_documents)
@@ -54,4 +82,4 @@ supabase functions deploy emit-nfce
 - Stone Connect / PlugPag: sem credenciais, as cobranças caem no simulador visual (`MockTerminalDriver`). Com `window.StoneBridge`/`window.PlugPagBridge` presentes, os drivers usam o hardware. O cliente Stone Connect 2.0 está pronto em `server/`, mas falta o servidor (rotas de cobrança e webhook) e a credencial de parceiro.
 - NFC-e: o app ainda gera payload e DANFE localmente em **homologação**; a emissão real está pronta em `supabase/functions/emit-nfce`, mas as telas ainda não chamam a função e ela precisa do token Focus, certificado A1 e CSC cadastrados na Focus.
 - Alerta de WhatsApp: registrado (`whatsapp_alert_sent = true`) e pré-visualizado; o disparo real depende de um provedor.
-- Supabase: os eventos ficam na fila `outbox` (IndexedDB) prontos para sincronizar; o cliente Supabase ainda não está ligado.
+- Supabase: a fila `outbox` sobe para o Supabase depois que o aparelho entra na aba Nuvem; sem conta conectada, os eventos ficam no IndexedDB. Ainda não há download (pull) da nuvem para um aparelho novo.

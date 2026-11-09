@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { BellRing, ChefHat, Flame, GlassWater, LayoutGrid, Smartphone } from 'lucide-react';
-import { useTcheStore } from '../store/useTcheStore';
+import { Ban, BellRing, ChefHat, Flame, GlassWater, LayoutGrid, Smartphone } from 'lucide-react';
+import { selectCan, useTcheStore } from '../store/useTcheStore';
 import type { ItemStatus, OrderItem, ProductionSector } from '../types';
 import { playDispatchChime } from '../lib/sound';
 import { useNow } from '../lib/useOnline';
-import { Badge, toast } from '../components/ui';
-import { QR_SELF_SERVICE_USER_ID } from '../data/seed';
+import { Badge, Btn, Sheet, toast } from '../components/ui';
 
 type Filter = 'ALL' | 'GRILL' | 'KITCHEN' | 'BAR';
 const FILTERS: Array<{ key: Filter; label: string; icon: typeof Flame }> = [
@@ -60,6 +59,9 @@ export function KdsScreen() {
   const sound = useTcheStore((s) => s.soundEnabled);
   const now = useNow(1000);
   const [filter, setFilter] = useState<Filter>('ALL');
+  const canSoldOut = useTcheStore((s) => selectCan(s, 'MENU_AVAILABILITY'));
+  const [soldOutOpen, setSoldOutOpen] = useState(false);
+  const soldOutCount = products.filter((p) => p.active && !p.available).length;
 
   // Alerta sonoro quando chega item novo na fila
   const pendingCount = items.filter((i) => i.status === 'PENDING').length;
@@ -131,7 +133,13 @@ export function KdsScreen() {
             {f.label} <span className="rounded-full bg-black/30 px-2 text-sm">{counts[f.key]}</span>
           </button>
         ))}
+        {canSoldOut && (
+          <button onClick={() => setSoldOutOpen(true)} className="ml-auto flex min-h-touch-lg shrink-0 items-center gap-2 rounded-xl bg-surface px-5 text-lg font-bold text-rose-300">
+            <Ban className="h-5 w-5" /> Esgotados <span className="rounded-full bg-black/30 px-2 text-sm">{soldOutCount}</span>
+          </button>
+        )}
       </div>
+      {soldOutOpen && <SoldOutSheet filter={filter} onClose={() => setSoldOutOpen(false)} />}
 
       {tickets.length === 0 && (
         <div className="flex flex-col items-center py-20 text-slate-500">
@@ -166,7 +174,7 @@ export function KdsScreen() {
                 {t.fromQr ? (
                   <Badge className="bg-sky-500 text-white"><Smartphone className="h-3 w-3" /> 📱 Pedido via QR Code</Badge>
                 ) : (
-                  <span className="font-semibold">Garçom: {t.waiterName === staff.find((u) => u.id === QR_SELF_SERVICE_USER_ID)?.name ? '-' : t.waiterName}</span>
+                  <span className="font-semibold">Garçom: {t.fromQr ? '-' : t.waiterName}</span>
                 )}
                 <span className="text-slate-400">{new Date(t.oldest).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</span>
               </div>
@@ -208,5 +216,39 @@ export function KdsScreen() {
         })}
       </div>
     </div>
+  );
+}
+
+/** Etapa 0 — a cozinha marca o que acabou; some do pedido do garçom e do cardápio QR. */
+function SoldOutSheet({ filter, onClose }: { filter: Filter; onClose: () => void }) {
+  const products = useTcheStore((s) => s.products);
+  const setAvailable = useTcheStore((s) => s.setProductAvailable);
+  const [q, setQ] = useState('');
+  const term = q.trim().toLowerCase();
+  const list = products
+    .filter((p) => p.active && p.sector !== 'NONE' && matchFilter(p.sector, filter))
+    .filter((p) => !term || p.name.toLowerCase().includes(term) || p.code.toLowerCase().includes(term))
+    .sort((a, b) => Number(a.available) - Number(b.available) || a.name.localeCompare(b.name, 'pt-BR'));
+  return (
+    <Sheet open onClose={onClose} title="Marcar esgotado">
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar produto" className="mb-3 min-h-touch w-full rounded-xl border border-slate-600 bg-base px-3 text-[1rem] text-slate-100 outline-none focus:border-ouro" />
+      <div className="divide-y divide-slate-700 rounded-xl bg-base">
+        {list.map((p) => (
+          <div key={p.id} className="flex items-center gap-3 p-3">
+            <div className="flex-1 font-bold">{p.name}{!p.available && <Badge className="ml-2 bg-brasa text-white">esgotado</Badge>}</div>
+            <Btn
+              variant={p.available ? 'secondary' : 'success'}
+              onClick={() => {
+                const r = setAvailable(p.id, !p.available);
+                if (!r.ok) toast.error(r.error);
+              }}
+            >
+              {p.available ? 'Esgotar' : 'Voltou'}
+            </Btn>
+          </div>
+        ))}
+        {list.length === 0 && <p className="p-4 text-center text-sm text-slate-500">Nenhum produto neste setor.</p>}
+      </div>
+    </Sheet>
   );
 }

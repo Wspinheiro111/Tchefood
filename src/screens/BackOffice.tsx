@@ -1,31 +1,70 @@
 import { useMemo, useState } from 'react';
-import { AlertTriangle, BarChart3, FileText, MessageCircle, Printer, Receipt, Settings, ShieldAlert, Users } from 'lucide-react';
-import { useTcheStore } from '../store/useTcheStore';
+import { useShallow } from 'zustand/react/shallow';
+import { AlertTriangle, BarChart3, Cloud, FileText, LayoutGrid, MessageCircle, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
+import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { formatBRL } from '../lib/money';
 import { AUDIT_LABEL, reconciliation, shiftKpis, shiftStart, waiterSplit, whatsappAlertText } from '../lib/reports';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
+import { MenuAdmin } from './admin/MenuAdmin';
+import { StaffAdmin, TablesAdmin } from './admin/TablesStaffAdmin';
+import { CloudAdmin, StoreAdmin } from './admin/StoreCloudAdmin';
+import type { Permission } from '../types';
 
-type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'nfce' | 'printers' | 'config';
+type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'nfce' | 'menu' | 'tables' | 'staff' | 'store' | 'cloud' | 'printers' | 'config';
 
-const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3 }> = [
-  { key: 'dash', label: 'Dashboard', icon: BarChart3 },
-  { key: 'recon', label: 'Conciliação', icon: Receipt },
-  { key: 'waiters', label: 'Rateio 10%', icon: Users },
-  { key: 'audit', label: 'Anti-Fraude', icon: ShieldAlert },
-  { key: 'nfce', label: 'NFC-e', icon: FileText },
-  { key: 'printers', label: 'Impressoras', icon: Printer },
-  { key: 'config', label: 'Ajustes', icon: Settings },
+/**
+ * Abas da retaguarda. As de relatório seguem o perfil (gerente, proprietário, caixa);
+ * as de cadastro (Etapa 0) seguem a permissão configurável do perfil.
+ */
+const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3; needs: 'reports' | Permission | Permission[] }> = [
+  { key: 'dash', label: 'Dashboard', icon: BarChart3, needs: 'reports' },
+  { key: 'recon', label: 'Conciliação', icon: Receipt, needs: 'reports' },
+  { key: 'waiters', label: 'Rateio 10%', icon: Users, needs: 'reports' },
+  { key: 'audit', label: 'Anti-Fraude', icon: ShieldAlert, needs: 'reports' },
+  { key: 'nfce', label: 'NFC-e', icon: FileText, needs: 'reports' },
+  { key: 'menu', label: 'Cardápio', icon: UtensilsCrossed, needs: ['MENU_MANAGE', 'MENU_AVAILABILITY'] },
+  { key: 'tables', label: 'Salão', icon: LayoutGrid, needs: 'TABLES_MANAGE' },
+  { key: 'staff', label: 'Equipe', icon: UserCog, needs: 'STAFF_MANAGE' },
+  { key: 'store', label: 'Loja', icon: Store, needs: 'STORE_SETTINGS' },
+  { key: 'cloud', label: 'Nuvem', icon: Cloud, needs: 'SYNC_MANAGE' },
+  { key: 'printers', label: 'Impressoras', icon: Printer, needs: 'reports' },
+  { key: 'config', label: 'Ajustes', icon: Settings, needs: 'reports' },
 ];
 
+/** Abas que o usuário logado enxerga. Exportada para o App decidir se mostra a Retaguarda. */
+export function useBackOfficeTabs(): typeof TABS {
+  const user = useTcheStore(selectCurrentUser);
+  const perms = useTcheStore(useShallow((s) => ({
+    MENU_MANAGE: selectCan(s, 'MENU_MANAGE'),
+    MENU_AVAILABILITY: selectCan(s, 'MENU_AVAILABILITY'),
+    TABLES_MANAGE: selectCan(s, 'TABLES_MANAGE'),
+    STAFF_MANAGE: selectCan(s, 'STAFF_MANAGE'),
+    STORE_SETTINGS: selectCan(s, 'STORE_SETTINGS'),
+    SYNC_MANAGE: selectCan(s, 'SYNC_MANAGE'),
+  })));
+  const reports = isManagerRole(user?.role) || user?.role === 'CASHIER';
+  return TABS.filter((t) => {
+    if (t.needs === 'reports') return reports;
+    const list = Array.isArray(t.needs) ? t.needs : [t.needs];
+    // Quem não vê relatórios só entra em cadastro se puder editar algo além do "esgotado"
+    // (o esgotado da cozinha fica no próprio KDS).
+    if (!reports && list.length > 1) return perms.MENU_MANAGE;
+    return list.some((p) => perms[p]);
+  });
+}
+
 export function BackOffice() {
-  const [tab, setTab] = useState<Tab>('dash');
+  const tabs = useBackOfficeTabs();
+  const [picked, setTab] = useState<Tab>('dash');
+  const tab: Tab | undefined = tabs.some((t) => t.key === picked) ? picked : tabs[0]?.key;
   const alerts = useTcheStore((s) => s.auditLogs.filter((l) => l.whatsapp_alert_sent).length);
+  if (!tab) return <p className="p-6">Acesso restrito.</p>;
   return (
     <div className="mx-auto max-w-6xl px-3 pb-10 pt-3">
       <div className="scroll-thin -mx-3 mb-4 flex gap-2 overflow-x-auto px-3">
-        {TABS.map((t) => (
+        {tabs.map((t) => (
           <button key={t.key} onClick={() => setTab(t.key)} className={`flex min-h-touch shrink-0 items-center gap-2 rounded-xl px-4 font-bold ${tab === t.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}>
             <t.icon className="h-4 w-4" /> {t.label}
             {t.key === 'audit' && alerts > 0 && <span className="rounded-full bg-brasa px-2 text-xs text-white">{alerts}</span>}
@@ -37,6 +76,11 @@ export function BackOffice() {
       {tab === 'waiters' && <WaiterSplit />}
       {tab === 'audit' && <AuditCenter />}
       {tab === 'nfce' && <NfceList />}
+      {tab === 'menu' && <MenuAdmin />}
+      {tab === 'tables' && <TablesAdmin />}
+      {tab === 'staff' && <StaffAdmin />}
+      {tab === 'store' && <StoreAdmin />}
+      {tab === 'cloud' && <CloudAdmin />}
       {tab === 'printers' && <PrinterSettings />}
       {tab === 'config' && <Config />}
     </div>
@@ -177,7 +221,9 @@ function AuditCenter() {
         const waiter = staff.find((s) => s.id === l.performed_by_user_id)?.name ?? '?';
         const manager = l.authorized_by_manager_id ? staff.find((s) => s.id === l.authorized_by_manager_id)?.name : null;
         const order = orders.find((o) => o.id === l.order_id);
-        const table = (l.metadata?.table as string | undefined) ?? tables.find((t) => t.id === order?.table_id)?.label ?? '?';
+        // Etapa 0: logs de cadastro (preço, equipe, permissão) não têm mesa.
+        const table = l.order_id === null && l.metadata?.table === undefined ? 'Cadastro' : (l.metadata?.table as string | undefined) ?? tables.find((t) => t.id === order?.table_id)?.label ?? '?';
+        const subject = typeof l.metadata?.staff_name === 'string' ? l.metadata.staff_name : typeof l.metadata?.product_code === 'string' ? `${l.metadata.product_code}` : null;
         const danger = l.action_type.startsWith('MANAGER_PIN');
         return (
           <article key={l.id} className={`grid gap-3 rounded-2xl border p-4 lg:grid-cols-[1fr_340px] ${danger ? 'border-brasa bg-brasa/10' : 'border-slate-700 bg-surface'}`}>
@@ -189,9 +235,11 @@ function AuditCenter() {
               </div>
               <dl className="grid grid-cols-2 gap-x-4 gap-y-1">
                 <dt className="text-slate-400">Mesa</dt><dd className="font-bold">{table}</dd>
-                <dt className="text-slate-400">Garçom solicitante</dt><dd>{waiter}</dd>
+                <dt className="text-slate-400">{l.order_id ? 'Garçom solicitante' : 'Feito por'}</dt><dd>{waiter}</dd>
                 <dt className="text-slate-400">Gerente (PIN)</dt><dd>{manager ?? <span className="text-rose-300">não autorizado</span>}</dd>
                 <dt className="text-slate-400">Impacto</dt><dd className="font-bold tabular-nums text-rose-300">{formatBRL(l.amount_impact)}</dd>
+                {subject && (<><dt className="text-slate-400">Cadastro de</dt><dd>{subject}</dd></>)}
+                {l.action_type === 'PRODUCT_PRICE_CHANGED' && (<><dt className="text-slate-400">Preço</dt><dd className="tabular-nums">{formatBRL(Number(l.metadata?.price_before))} → {formatBRL(Number(l.metadata?.price_after))}</dd></>)}
                 <dt className="text-slate-400">Justificativa</dt><dd>{l.reason}</dd>
                 {typeof l.metadata?.product_name === 'string' && (<><dt className="text-slate-400">Item</dt><dd>{String(l.metadata.quantity)}x {l.metadata.product_name} ({String(l.metadata.item_status_before)})</dd></>)}
               </dl>
@@ -250,12 +298,16 @@ function Config() {
       </div>
       <div className="rounded-2xl border border-slate-700 bg-surface p-4">
         <h3 className="mb-1 font-bold">Fila offline-first</h3>
-        <p className="mb-2 text-sm text-slate-400">{s.outbox.length} evento(s) gravados no IndexedDB prontos para sincronizar com o Supabase.</p>
+        <p className="mb-2 text-sm text-slate-400">{s.outbox.length} evento(s) gravados no IndexedDB {s.cloud ? 'aguardando envio ao Supabase (aba Nuvem).' : 'prontos para sincronizar. Conecte o aparelho na aba Nuvem.'}</p>
       </div>
       <div className="rounded-2xl border border-brasa/50 bg-surface p-4">
         <h3 className="mb-1 font-bold">Demonstração</h3>
         <p className="mb-2 text-sm text-slate-400">Volta ao seed do Galpão Crioulo (apaga comandas, pagamentos e auditoria deste aparelho).</p>
-        <Btn variant="danger" onClick={() => { if (window.confirm('Restaurar dados de demonstração?')) { s.resetDemo(); toast.info('Dados de demonstração restaurados.'); } }}>Restaurar seed</Btn>
+        {s.cloud ? (
+          <p className="text-sm text-ouro">Aparelho ligado à nuvem de uma loja real: a demonstração fica bloqueada. Desconecte na aba Nuvem primeiro.</p>
+        ) : (
+          <Btn variant="danger" onClick={() => { if (window.confirm('Restaurar dados de demonstração?')) { s.resetDemo(); toast.info('Dados de demonstração restaurados.'); } }}>Restaurar seed</Btn>
+        )}
       </div>
     </div>
   );

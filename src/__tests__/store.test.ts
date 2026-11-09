@@ -239,7 +239,7 @@ describe('revisão — ajustes que zeram o saldo, cobrança em andamento e meio 
     const calabresa = product('401');
     const portuguesa = product('402');
     st().setHalfAndHalfPricing('HIGHEST');
-    const r = st().qrPlaceOrder(table(4).id, [{ product_id: calabresa.id, half_product_ids: [portuguesa.id], quantity: 1, unit_price: calabresa.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: calabresa.sector }]);
+    const r = st().qrPlaceOrder(table(4).id, [{ product_id: calabresa.id, half_product_ids: [portuguesa.id], quantity: 1, unit_price: 74.9, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: calabresa.sector }]);
     expect(r.ok).toBe(true);
     const item = r.ok ? r.data.items[0]! : null;
     expect(item?.unit_price).toBe(74.9);

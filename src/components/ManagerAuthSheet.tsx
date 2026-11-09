@@ -16,13 +16,17 @@ interface Props<T> {
   confirmLabel: string;
   onSubmit: (managerPin: string, reason: string) => ActionResult<T>;
   onSuccess: (data: T) => void;
+  /** Mensagem depois de autorizado (padrão: alerta anti-fraude enviado ao proprietário). */
+  successMessage?: string;
+  /** Motivos rápidos da tela (padrão: os do salão). */
+  quickReasons?: string[];
 }
 
 /**
  * Modal de PIN do Gerente + Motivo Obrigatório.
  * A validação real do PIN acontece no store (authorizeManager); aqui só coletamos.
  */
-export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabel, onSubmit, onSuccess }: Props<T>) {
+export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabel, onSubmit, onSuccess, successMessage, quickReasons = QUICK_REASONS }: Props<T>) {
   const [pin, setPin] = useState('');
   const [reason, setReason] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -50,7 +54,7 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
       vibrate([80, 40, 80]);
       return;
     }
-    toast.alert('🔔 Registrado em audit_logs e alerta enviado ao WhatsApp do proprietário.');
+    toast.alert(successMessage ?? '🔔 Registrado em audit_logs e alerta enviado ao WhatsApp do proprietário.');
     onSuccess(res.data);
     onClose();
   };
@@ -75,7 +79,7 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
 
       <label className="mb-1 block text-sm font-semibold text-slate-300">Motivo obrigatório</label>
       <div className="mb-2 flex flex-wrap gap-2">
-        {QUICK_REASONS.map((r) => (
+        {quickReasons.map((r) => (
           <button
             key={r}
             onClick={() => setReason(r)}
@@ -90,7 +94,7 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
         onChange={(e) => setReason(e.target.value)}
         rows={2}
         placeholder="Descreva o motivo…"
-        className="mb-4 w-full rounded-xl border border-slate-600 bg-base p-3 text-base outline-none focus:border-ouro"
+        className="mb-4 w-full rounded-xl border border-slate-600 bg-base p-3 text-[1rem] text-slate-100 outline-none focus:border-ouro"
       />
 
       <p className="mb-2 text-center text-sm font-semibold text-slate-300">PIN do Gerente</p>

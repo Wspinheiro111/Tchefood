@@ -6,7 +6,6 @@ import { formatBRL } from '../lib/money';
 import { elapsedLabel } from '../lib/ids';
 import { useNow } from '../lib/useOnline';
 import { Btn, Sheet, Stepper, toast } from '../components/ui';
-import { AREAS } from '../data/seed';
 
 const STATUS_STYLE: Record<TableStatus, { card: string; label: string; dot: string }> = {
   FREE: { card: 'border-slate-700 bg-surface', label: 'Livre', dot: 'bg-stone' },
@@ -16,7 +15,6 @@ const STATUS_STYLE: Record<TableStatus, { card: string; label: string; dot: stri
   DIRTY: { card: 'border-slate-600 bg-slate-800/60 border-dashed', label: 'Limpeza', dot: 'bg-slate-400' },
 };
 
-const FILTERS = [{ key: 'ALL', label: 'Todas' }, ...AREAS.map((a) => ({ key: a, label: a === 'Salão Principal' ? 'Salão' : a }))];
 
 export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => void }) {
   const tables = useTcheStore((s) => s.tables);
@@ -27,13 +25,18 @@ export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => vo
   const [area, setArea] = useState<string>('ALL');
   const [opening, setOpening] = useState<DiningTable | null>(null);
 
+  // Áreas vêm do cadastro de mesas (Retaguarda > Salão), na ordem em que aparecem.
+  const filters = useMemo(() => {
+    const areas = Array.from(new Set(tables.filter((t) => t.active).map((t) => t.area)));
+    return [{ key: 'ALL', label: 'Todas' }, ...areas.map((a) => ({ key: a, label: a === 'Salão Principal' ? 'Salão' : a }))];
+  }, [tables]);
   const visible = useMemo(
-    () => tables.filter((t) => area === 'ALL' || t.area === area).sort((a, b) => a.number - b.number),
+    () => tables.filter((t) => t.active && (area === 'ALL' || t.area === area)).sort((a, b) => a.number - b.number),
     [tables, area],
   );
   const counts = useMemo(() => {
     const c: Record<TableStatus, number> = { FREE: 0, OCCUPIED: 0, WAITING_BILL: 0, PAYING: 0, DIRTY: 0 };
-    for (const t of tables) c[t.status] += 1;
+    for (const t of tables) if (t.active) c[t.status] += 1;
     return c;
   }, [tables]);
 
@@ -51,7 +54,7 @@ export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => vo
   return (
     <div className="mx-auto max-w-5xl px-3 pb-24 pt-3">
       <div className="scroll-thin -mx-3 mb-3 flex gap-2 overflow-x-auto px-3">
-        {FILTERS.map((f) => (
+        {filters.map((f) => (
           <button
             key={f.key}
             onClick={() => setArea(f.key)}
