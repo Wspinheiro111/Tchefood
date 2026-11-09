@@ -32,9 +32,9 @@ export default function Header() {
         <a href="#topo" aria-label="Tchê Food, início">
           <Logo />
         </a>
-        <nav className="hidden items-center gap-7 text-sm text-slate-300 md:flex">
+        <nav className="hidden items-center gap-7 text-sm text-slate-700 md:flex">
           {LINKS.map((l) => (
-            <a key={l.href} href={l.href} className="transition hover:text-white">
+            <a key={l.href} href={l.href} className="transition hover:text-slate-900">
               {l.label}
             </a>
           ))}
@@ -65,7 +65,7 @@ export default function Header() {
               key={l.href}
               href={l.href}
               onClick={() => setAberto(false)}
-              className="rounded-lg px-2 py-3 text-slate-200 hover:bg-surface"
+              className="rounded-lg px-2 py-3 text-slate-800 hover:bg-surface"
             >
               {l.label}
             </a>

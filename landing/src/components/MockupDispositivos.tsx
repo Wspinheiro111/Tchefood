@@ -51,8 +51,8 @@ export default function MockupDispositivos() {
       <div className="flex items-end justify-center gap-2 sm:gap-6">
         {/* Celular do garçom */}
         <div className="w-[46%] max-w-[220px] rounded-[2rem] border border-slate-700 bg-slate-950 p-2 shadow-2xl shadow-black/50">
-          <div className="overflow-hidden rounded-[1.6rem] bg-surface">
-            <div className="flex items-center justify-between bg-fundo px-3 py-2 text-[10px] text-slate-400">
+          <div className="overflow-hidden rounded-[1.6rem] bg-[#131c2e]">
+            <div className="flex items-center justify-between bg-[#0b1120] px-3 py-2 text-[10px] text-slate-400">
               <span className="flex items-center gap-1">
                 <Smartphone className="h-3 w-3" aria-hidden /> Garçom: Rafa
               </span>
@@ -71,7 +71,7 @@ export default function MockupDispositivos() {
                   </li>
                 ))}
               </ul>
-              <div className="mt-3 space-y-0.5 border-t border-borda pt-2 text-[11px]">
+              <div className="mt-3 space-y-0.5 border-t border-[#22304a] pt-2 text-[11px]">
                 <div className="flex justify-between text-slate-400">
                   <span>Serviço 10%</span>
                   <span>{brl(servico)}</span>
@@ -94,7 +94,7 @@ export default function MockupDispositivos() {
             <span className="h-1.5 w-10 rounded-full bg-slate-700" />
             <Nfc className="h-4 w-4 text-slate-500" aria-hidden />
           </div>
-          <div className="rounded-2xl bg-fundo p-3" aria-live="polite">
+          <div className="rounded-2xl bg-[#0b1120] p-3" aria-live="polite">
             <p className="text-[10px] uppercase tracking-wider text-ouro">Rachadinha · Mesa 12</p>
             <p className="mt-1 font-display text-xl font-extrabold text-white">
               {brl(total)}
@@ -111,7 +111,7 @@ export default function MockupDispositivos() {
                         ? 'bg-emerald-500/15 text-emerald-300'
                         : atual
                           ? 'bg-ouro/15 text-amber-200'
-                          : 'bg-surface text-slate-400'
+                          : 'bg-[#131c2e] text-slate-400'
                     }`}
                   >
                     <span>Pessoa {idx + 1}</span>

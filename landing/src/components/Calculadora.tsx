@@ -20,10 +20,10 @@ function Slider({ rotulo, valor, min, max, passo, formatar, onChange }: SliderPr
   return (
     <div>
       <div className="flex items-baseline justify-between gap-4">
-        <label htmlFor={id} className="text-sm font-medium text-slate-300">
+        <label htmlFor={id} className="text-sm font-medium text-slate-700">
           {rotulo}
         </label>
-        <output htmlFor={id} className="font-display text-xl font-bold text-white">
+        <output htmlFor={id} className="font-display text-xl font-bold text-slate-900">
           {formatar(valor)}
         </output>
       </div>
@@ -36,7 +36,7 @@ function Slider({ rotulo, valor, min, max, passo, formatar, onChange }: SliderPr
         value={valor}
         onChange={(e) => onChange(Number(e.target.value))}
         className="slider mt-3"
-        style={{ background: `linear-gradient(90deg,#e11d48 ${pct}%,#334155 ${pct}%)` }}
+        style={{ background: `linear-gradient(90deg,#e11d48 ${pct}%,#e2e8f0 ${pct}%)` }}
       />
       <div className="mt-1 flex justify-between text-[11px] text-slate-500">
         <span>{formatar(min)}</span>
@@ -56,12 +56,12 @@ interface CardResultadoProps {
 function CardResultado({ icone: Icone, titulo, valor, detalhe }: CardResultadoProps) {
   return (
     <div className="rounded-xl border border-borda bg-fundo/60 p-4">
-      <div className="flex items-center gap-2 text-sm text-slate-400">
-        <Icone className="h-4 w-4 text-ouro" aria-hidden />
+      <div className="flex items-center gap-2 text-sm text-slate-600">
+        <Icone className="h-4 w-4 text-amber-600" aria-hidden />
         {titulo}
       </div>
-      <p className="mt-2 font-display text-2xl font-extrabold text-white">{valor}</p>
-      <p className="mt-1 text-xs leading-relaxed text-slate-400">{detalhe}</p>
+      <p className="mt-2 font-display text-2xl font-extrabold text-slate-900">{valor}</p>
+      <p className="mt-1 text-xs leading-relaxed text-slate-600">{detalhe}</p>
     </div>
   );
 }
@@ -90,7 +90,7 @@ export default function Calculadora() {
         <div className="max-w-2xl">
           <p className="eyebrow">Calculadora de economia</p>
           <h2 className="mt-3 text-3xl font-bold sm:text-4xl">Quanto o seu restaurante ganha com o Tchê Food?</h2>
-          <p className="mt-4 text-slate-400">
+          <p className="mt-4 text-slate-600">
             Ajuste os números do seu salão. O cálculo é feito na hora, com premissas conservadoras que você pode conferir
             logo abaixo.
           </p>
@@ -117,8 +117,8 @@ export default function Calculadora() {
               className="pointer-events-none absolute -right-24 -top-24 h-64 w-64 rounded-full bg-[radial-gradient(closest-side,rgba(245,158,11,0.18),transparent)]"
             />
             <div className="relative" aria-live="polite">
-              <p className="text-sm text-slate-400">Ganho estimado no primeiro ano</p>
-              <p className="mt-1 bg-gradient-to-r from-ouro to-amber-200 bg-clip-text font-display text-4xl font-extrabold text-transparent sm:text-5xl">
+              <p className="text-sm text-slate-600">Ganho estimado no primeiro ano</p>
+              <p className="mt-1 bg-gradient-to-r from-brasa to-amber-500 bg-clip-text font-display text-4xl font-extrabold text-transparent sm:text-5xl">
                 {formatarBRL(r.ganhoPrimeiroAno)}
               </p>
               <div className="mt-6 grid gap-3 sm:grid-cols-3">
@@ -156,7 +156,7 @@ export default function Calculadora() {
 
         <div className="mt-6">
           <button
-            className="inline-flex items-center gap-2 text-sm text-slate-400 transition hover:text-white"
+            className="inline-flex items-center gap-2 text-sm text-slate-600 transition hover:text-slate-900"
             onClick={() => setPremissasAbertas((v) => !v)}
             aria-expanded={premissasAbertas}
           >
@@ -164,7 +164,7 @@ export default function Calculadora() {
             {premissasAbertas ? 'Esconder premissas do cálculo' : 'Ver premissas do cálculo'}
           </button>
           {premissasAbertas && (
-            <div className="card mt-3 grid gap-x-8 gap-y-2 p-5 text-sm text-slate-400 sm:grid-cols-2">
+            <div className="card mt-3 grid gap-x-8 gap-y-2 p-5 text-sm text-slate-600 sm:grid-cols-2">
               <p>
                 <Clock className="mr-1 inline h-3.5 w-3.5" aria-hidden />
                 {formatarNumero(PREMISSAS.minutosEconomizadosPorFechamento)} min economizados por fechamento de conta

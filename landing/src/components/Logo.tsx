@@ -7,8 +7,8 @@ export default function Logo({ compacto = false }: { compacto?: boolean }) {
         <Flame className="h-5 w-5 text-white" aria-hidden />
       </span>
       <span className="leading-tight">
-        <span className="block font-display text-lg font-extrabold text-white">Tchê Food</span>
-        {!compacto && <span className="block text-[11px] text-slate-400">um produto W9 Sistemas</span>}
+        <span className="block font-display text-lg font-extrabold text-slate-900">Tchê Food</span>
+        {!compacto && <span className="block text-[11px] text-slate-600">um produto W9 Sistemas</span>}
       </span>
     </span>
   );

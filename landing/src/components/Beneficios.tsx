@@ -60,12 +60,12 @@ export default function Beneficios() {
         </div>
         <div className="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {BENEFICIOS.map(({ icone: Icone, titulo, texto }) => (
-            <article key={titulo} className="card p-5 transition hover:border-slate-600">
-              <span className="grid h-10 w-10 place-items-center rounded-lg bg-brasa/15 text-rose-300">
+            <article key={titulo} className="card p-5 transition hover:border-slate-300">
+              <span className="grid h-10 w-10 place-items-center rounded-lg bg-brasa/15 text-brasa">
                 <Icone className="h-5 w-5" aria-hidden />
               </span>
               <h3 className="mt-4 text-base font-semibold">{titulo}</h3>
-              <p className="mt-2 text-sm leading-relaxed text-slate-400">{texto}</p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-600">{texto}</p>
             </article>
           ))}
         </div>

@@ -32,11 +32,11 @@ export default function Faq() {
         <div className="mt-10 space-y-3">
           {PERGUNTAS.map(({ p, r }) => (
             <details key={p} className="card group p-5 [&_summary::-webkit-details-marker]:hidden">
-              <summary className="flex cursor-pointer list-none items-center justify-between gap-4 font-semibold text-white">
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-4 font-semibold text-slate-900">
                 {p}
-                <ChevronDown className="h-5 w-5 shrink-0 text-slate-400 transition group-open:rotate-180" aria-hidden />
+                <ChevronDown className="h-5 w-5 shrink-0 text-slate-600 transition group-open:rotate-180" aria-hidden />
               </summary>
-              <p className="mt-3 text-sm leading-relaxed text-slate-400">{r}</p>
+              <p className="mt-3 text-sm leading-relaxed text-slate-600">{r}</p>
             </details>
           ))}
         </div>

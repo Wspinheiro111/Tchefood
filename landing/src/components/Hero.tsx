@@ -13,11 +13,11 @@ export default function Hero() {
     <section id="topo" className="relative overflow-hidden">
       <div
         aria-hidden
-        className="pointer-events-none absolute -top-40 left-1/2 h-[520px] w-[900px] -translate-x-1/2 animate-brasa rounded-full bg-[radial-gradient(closest-side,rgba(225,29,72,0.35),transparent)]"
+        className="pointer-events-none absolute -top-40 left-1/2 h-[520px] w-[900px] -translate-x-1/2 animate-brasa rounded-full bg-[radial-gradient(closest-side,rgba(225,29,72,0.14),transparent)]"
       />
       <div
         aria-hidden
-        className="pointer-events-none absolute right-[-200px] top-40 h-[420px] w-[420px] rounded-full bg-[radial-gradient(closest-side,rgba(245,158,11,0.18),transparent)]"
+        className="pointer-events-none absolute right-[-200px] top-40 h-[420px] w-[420px] rounded-full bg-[radial-gradient(closest-side,rgba(245,158,11,0.14),transparent)]"
       />
       <div className="container-lp relative grid items-center gap-12 pb-20 pt-10 md:pt-16 lg:grid-cols-[1.1fr_1fr] lg:pb-28">
         <div className="animate-fade-up">
@@ -27,7 +27,7 @@ export default function Hero() {
             <span className="bg-gradient-to-r from-brasa to-ouro bg-clip-text text-transparent">Stone e PagBank</span>{' '}
             que você já tem no sistema mais rápido para o seu salão.
           </h1>
-          <p className="mt-6 max-w-xl text-lg leading-relaxed text-slate-300">
+          <p className="mt-6 max-w-xl text-lg leading-relaxed text-slate-700">
             Elimine a compra de tablets caros, faça a “rachadinha” na mesa em 45 segundos, emita a NFC-e automática na
             SEFAZ-RS e receba alertas de cancelamento direto no seu WhatsApp.
           </p>
@@ -46,10 +46,10 @@ export default function Hero() {
               <ArrowRight className="h-5 w-5" aria-hidden />
             </a>
           </div>
-          <ul className="mt-8 grid gap-2 text-sm text-slate-300 sm:grid-cols-3 sm:gap-4">
+          <ul className="mt-8 grid gap-2 text-sm text-slate-700 sm:grid-cols-3 sm:gap-4">
             {PROVAS.map((p) => (
               <li key={p} className="flex items-start gap-2">
-                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-ouro" aria-hidden />
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" aria-hidden />
                 {p}
               </li>
             ))}

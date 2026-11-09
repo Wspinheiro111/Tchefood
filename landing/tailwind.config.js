@@ -4,9 +4,9 @@ export default {
   theme: {
     extend: {
       colors: {
-        fundo: '#0b1120',
-        surface: '#131c2e',
-        borda: '#22304a',
+        fundo: '#ffffff',
+        surface: '#f8fafc',
+        borda: '#e2e8f0',
         brasa: '#e11d48',
         ouro: '#f59e0b',
       },

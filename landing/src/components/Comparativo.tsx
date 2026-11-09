@@ -58,7 +58,7 @@ export default function Comparativo() {
         <div className="max-w-2xl">
           <p className="eyebrow">Comparativo</p>
           <h2 className="mt-3 text-3xl font-bold sm:text-4xl">Tchê Food vs. sistemas tradicionais</h2>
-          <p className="mt-4 text-slate-400">
+          <p className="mt-4 text-slate-600">
             Sistemas antigos foram feitos para o computador do caixa. O Tchê Food foi feito para a maquininha que anda pelo
             salão.
           </p>
@@ -69,28 +69,28 @@ export default function Comparativo() {
           <table className="w-full text-left text-sm">
             <caption className="sr-only">Comparação entre o Tchê Food e sistemas tradicionais</caption>
             <thead>
-              <tr className="border-b border-borda text-xs uppercase tracking-wider text-slate-400">
+              <tr className="border-b border-borda text-xs uppercase tracking-wider text-slate-600">
                 <th scope="col" className="w-48 px-5 py-4 font-medium">Critério</th>
-                <th scope="col" className="bg-brasa/10 px-5 py-4 font-semibold text-white">Tchê Food</th>
+                <th scope="col" className="bg-brasa/10 px-5 py-4 font-semibold text-slate-900">Tchê Food</th>
                 <th scope="col" className="px-5 py-4 font-medium">Sistemas tradicionais</th>
               </tr>
             </thead>
             <tbody>
               {LINHAS.map((l) => (
                 <tr key={l.criterio} className="border-b border-borda/60 last:border-0">
-                  <th scope="row" className="px-5 py-4 font-medium text-slate-200">{l.criterio}</th>
-                  <td className="bg-brasa/5 px-5 py-4 text-slate-100">
+                  <th scope="row" className="px-5 py-4 font-medium text-slate-800">{l.criterio}</th>
+                  <td className="bg-brasa/5 px-5 py-4 text-slate-900">
                     <span className="flex items-start gap-2">
-                      <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" aria-hidden />
+                      <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" aria-hidden />
                       <span>
                         {l.tche}
                         {l.emBreve && <SeloEmBreve />}
                       </span>
                     </span>
                   </td>
-                  <td className="px-5 py-4 text-slate-400">
+                  <td className="px-5 py-4 text-slate-600">
                     <span className="flex items-start gap-2">
-                      <Minus className="mt-0.5 h-4 w-4 shrink-0 text-slate-600" aria-hidden />
+                      <Minus className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" aria-hidden />
                       {l.tradicional}
                     </span>
                   </td>
@@ -104,18 +104,18 @@ export default function Comparativo() {
         <div className="mt-10 space-y-3 md:hidden">
           {LINHAS.map((l) => (
             <div key={l.criterio} className="card p-4">
-              <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">{l.criterio}</p>
-              <p className="mt-2 flex items-start gap-2 text-sm text-slate-100">
-                <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" aria-hidden />
+              <p className="text-xs font-semibold uppercase tracking-wider text-slate-600">{l.criterio}</p>
+              <p className="mt-2 flex items-start gap-2 text-sm text-slate-900">
+                <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" aria-hidden />
                 <span>
-                  <strong className="text-white">Tchê Food:</strong> {l.tche}
+                  <strong className="text-slate-900">Tchê Food:</strong> {l.tche}
                   {l.emBreve && <SeloEmBreve />}
                 </span>
               </p>
-              <p className="mt-2 flex items-start gap-2 text-sm text-slate-400">
-                <Minus className="mt-0.5 h-4 w-4 shrink-0 text-slate-600" aria-hidden />
+              <p className="mt-2 flex items-start gap-2 text-sm text-slate-600">
+                <Minus className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" aria-hidden />
                 <span>
-                  <strong className="text-slate-300">Tradicionais:</strong> {l.tradicional}
+                  <strong className="text-slate-700">Tradicionais:</strong> {l.tradicional}
                 </span>
               </p>
             </div>
@@ -128,7 +128,7 @@ export default function Comparativo() {
 
 export function SeloEmBreve() {
   return (
-    <span className="ml-2 inline-block rounded-full border border-ouro/40 bg-ouro/10 px-2 py-0.5 align-middle text-[10px] font-semibold uppercase tracking-wider text-amber-300">
+    <span className="ml-2 inline-block rounded-full border border-ouro/40 bg-ouro/10 px-2 py-0.5 align-middle text-[10px] font-semibold uppercase tracking-wider text-amber-700">
       Em breve
     </span>
   );
