@@ -829,9 +829,13 @@ export const useTcheStore = create<TcheState>()(
         const ts = nowISO();
         const logs = Array.isArray(log) ? log : [log];
         const settled = settleIfPaid(s, recalculated, orderItems, ts);
-        const allChanged = settled.closed
+        const changed = settled.closed
           ? settled.orderItems.filter((i, idx) => i !== s.orderItems[idx])
           : changedItems;
+        // Componentes de combo sobem antes do combo: cancelar o combo (que tem o preço)
+        // pode zerar a conta, e o banco então fecha a comanda e dá como pagos os itens
+        // ainda ativos, recusando o cancelamento dos componentes que viesse depois.
+        const allChanged = [...changed.filter((i) => i.combo_parent_item_id != null), ...changed.filter((i) => i.combo_parent_item_id == null)];
         return {
           orderItems: settled.orderItems,
           nfceSeq: settled.nfceSeq,

@@ -129,6 +129,36 @@ describe('combo na mesa', () => {
     expect(authEvents.every((e) => e.manager_pin === '9999')).toBe(true);
   });
 
+  it('cancelar o combo que zera a conta: os componentes sobem antes do combo', () => {
+    const orderId = openTable();
+    const [parent, ...children] = launchCombo(orderId) as [OrderItem, ...OrderItem[]];
+    const p = product('301');
+    const extra = st().addToTray({
+      order_id: orderId, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [],
+      modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector,
+    });
+    if (!extra.ok) throw new Error(extra.error);
+    if (!st().dispatchTray(orderId).ok) throw new Error('dispatch');
+    const order = st().orders.find((o) => o.id === orderId)!;
+    const pay = st().registerPayment({
+      orderId, amount: Math.round((order.remaining_balance - 74.69) * 100) / 100, method: 'CASH', status: 'APPROVED', terminal_id: null,
+      acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null,
+      idempotency_key: 'combo-parcial', item_ids: [],
+    });
+    if (!pay.ok) throw new Error(pay.error);
+    const before = st().outbox.length;
+    const r = st().cancelOrderItem(parent.id, MANAGER);
+    if (!r.ok) throw new Error(r.error);
+    expect(st().orders.find((o) => o.id === orderId)!.status).toBe('CLOSED');
+    const ids = st().outbox.slice(before).filter((e) => e.table === 'order_items').map((e) => e.row_id);
+    const parentAt = ids.indexOf(parent.id);
+    expect(parentAt).toBeGreaterThan(-1);
+    for (const c of children) {
+      expect(ids.indexOf(c.id)).toBeGreaterThan(-1);
+      expect(ids.indexOf(c.id)).toBeLessThan(parentAt);
+    }
+  });
+
   it('NFC-e e cupom: o combo é a linha com preço, os componentes aparecem embaixo sem valor', () => {
     const orderId = openTable();
     launchCombo(orderId);
