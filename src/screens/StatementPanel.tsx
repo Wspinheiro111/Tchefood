@@ -176,7 +176,11 @@ export function StatementPanel({ orderId, onCheckout }: { orderId: string; onChe
               <Receipt className="h-5 w-5" /> Pedir a conta
             </Btn>
           )}
-          <Btn variant="success" size="lg" disabled={order.remaining_balance <= 0} onClick={onCheckout}><CreditCard className="h-5 w-5" /> Fechar / Cobrar</Btn>
+          {order.remaining_balance <= 0 && order.paid_amount <= 0 ? (
+            <Btn variant="success" size="lg" onClick={() => { const r = s.closeZeroOrder(orderId); if (!r.ok) toast.error(r.error); else toast.success(`Conta zerada encerrada. ${table.label} liberada.`); }}><CheckCheck className="h-5 w-5" /> Encerrar conta zerada</Btn>
+          ) : (
+            <Btn variant="success" size="lg" disabled={order.remaining_balance <= 0} onClick={onCheckout}><CreditCard className="h-5 w-5" /> Fechar / Cobrar</Btn>
+          )}
         </div>
       )}
 

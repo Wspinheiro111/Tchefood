@@ -77,3 +77,32 @@ describe('DANFE e bandeja', () => {
     expect(st().beginTerminalCharge(o.data.id, 'r', 1).ok).toBe(false);
   });
 });
+
+describe('conta zerada sem pagamento', () => {
+  it('cancelar tudo ou dar 100% de desconto permite encerrar e liberar a mesa', async () => {
+    const { useTcheStore } = await import('../store/useTcheStore');
+    const st = useTcheStore.getState;
+    const auth = { managerPin: '9999', reason: 'Cortesia da casa ao cliente' };
+    for (const mode of ['cancel', 'discount'] as const) {
+      st().resetDemo();
+      st().login('1111');
+      const t = st().tables.find((x) => x.number === 1)!;
+      const o = st().openTable(t.id, 1, null);
+      if (!o.ok) throw new Error(o.error);
+      const p = st().products.find((x) => x.code === '311')!;
+      st().addToTray({ order_id: o.data.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector });
+      st().dispatchTray(o.data.id);
+      expect(st().closeZeroOrder(o.data.id).ok).toBe(false); // ainda tem saldo
+      if (mode === 'cancel') {
+        const item = st().orderItems.find((i) => i.order_id === o.data.id)!;
+        expect(st().cancelOrderItem(item.id, auth).ok).toBe(true);
+      } else {
+        const ord = st().orders.find((x) => x.id === o.data.id)!;
+        expect(st().applyDiscount(o.data.id, ord.subtotal_items + ord.service_fee_amount, auth).ok).toBe(true);
+      }
+      const r = st().closeZeroOrder(o.data.id);
+      expect(r.ok && r.data.status).toBe(mode === 'cancel' ? 'CANCELED' : 'CLOSED');
+      expect(st().tables.find((x) => x.id === t.id)!.status).toBe('FREE');
+    }
+  });
+});

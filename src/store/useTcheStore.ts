@@ -156,6 +156,8 @@ interface Actions {
   registerPayment: (input: PaymentInput) => ActionResult<PaymentOutcome>;
   /** Reserva a conta enquanto a maquininha processa: bloqueia descontos, cancelamentos e outros pagamentos. */
   beginTerminalCharge: (orderId: UUID, requestId: string, amount: number) => ActionResult;
+  /** Encerra conta zerada sem nenhum pagamento (tudo cancelado ou 100% de desconto) e libera a mesa. */
+  closeZeroOrder: (orderId: UUID) => ActionResult<Order>;
   endTerminalCharge: (requestId: string) => void;
 
   // Fase 3 — KDS e QR Code
@@ -955,6 +957,32 @@ export const useTcheStore = create<TcheState>()(
             ],
           }));
           return { ok: true, data: undefined };
+        },
+
+        closeZeroOrder: (orderId) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const res = findEditableOrder(orderId);
+          if (!res.ok) return res;
+          const order = res.data;
+          if (toCents(order.remaining_balance) !== 0 || toCents(order.paid_amount) !== 0) return fail('Só contas zeradas e sem pagamento podem ser encerradas assim.');
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (get().tray.some((t) => t.order_id === orderId)) return fail('Há itens na bandeja não enviados. Envie ou remova antes de encerrar.');
+          const ts = nowISO();
+          const hasItems = get().orderItems.some((i) => i.order_id === orderId && i.status !== 'CANCELED');
+          // Nada consumido: conta cancelada, sem NFC-e. Consumo com 100% de desconto
+          // (já autorizado por gerente): conta fechada, NFC-e fica pendente para o fiscal.
+          const closed: Order = hasItems
+            ? { ...order, status: 'CLOSED', closed_at: ts, nfce_status: 'PENDING' }
+            : { ...order, status: 'CANCELED', closed_at: ts, nfce_status: 'DISPENSADA' };
+          const table = get().tables.find((t) => t.id === order.table_id);
+          const freed: DiningTable | null = table && table.current_order_id === orderId ? { ...table, status: 'FREE', current_order_id: null, updated_at: ts } : null;
+          set((s) => ({
+            orders: s.orders.map((o) => (o.id === orderId ? closed : o)),
+            tables: freed ? s.tables.map((t) => (t.id === freed.id ? freed : t)) : s.tables,
+            outbox: [...s.outbox, syncEvent('orders', 'UPDATE', closed), ...(freed ? [syncEvent('dining_tables', 'UPDATE', freed)] : [])],
+          }));
+          return { ok: true, data: closed };
         },
 
         endTerminalCharge: (requestId) => set((s) => ({ pendingCharges: s.pendingCharges.filter((c) => c.request_id !== requestId) })),
