@@ -289,7 +289,8 @@ BEGIN
     RETURN NEW;
 END;
 $$;
-CREATE TRIGGER trg_order_items_total BEFORE INSERT OR UPDATE OF quantity, unit_price, modifiers_unit_price
+-- Dispara em QUALQUER update: total_item_price nunca aceita valor vindo do cliente.
+CREATE TRIGGER trg_order_items_total BEFORE INSERT OR UPDATE
     ON order_items FOR EACH ROW EXECUTE FUNCTION tchefood_item_total();
 
 CREATE OR REPLACE FUNCTION tchefood_after_item_change()
@@ -380,30 +381,33 @@ CREATE CONSTRAINT TRIGGER trg_order_items_cancel_audit AFTER UPDATE OF status ON
 -- 3) Remover os 10% ou dar desconto também exige audit_log autorizado por gerente.
 CREATE OR REPLACE FUNCTION tchefood_require_order_audit()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
-DECLARE v_action TEXT; v_ok BOOLEAN;
+DECLARE v_action TEXT; v_ok BOOLEAN; v_actions TEXT[] := ARRAY[]::TEXT[];
 BEGIN
+    -- Cada mudança protegida é conferida por conta própria: um UPDATE que tira os
+    -- 10% E aumenta o desconto precisa das duas autorizações.
     IF OLD.charge_service_fee AND NOT NEW.charge_service_fee THEN
-        v_action := 'SERVICE_FEE_REMOVED';
-    ELSIF NEW.discount_amount > OLD.discount_amount THEN
-        v_action := 'DISCOUNT_APPLIED';
-    ELSE
-        RETURN NULL;
+        v_actions := array_append(v_actions, 'SERVICE_FEE_REMOVED'::TEXT);
     END IF;
-    -- A autorização vale só para a mudança exata que o gerente aprovou: no desconto,
-    -- discount_before/discount_after do audit_log precisam bater com OLD/NEW, então
-    -- uma aprovação pequena não serve para aumentar o desconto de novo.
-    SELECT EXISTS (
-        SELECT 1 FROM audit_logs a JOIN staff_users m ON m.id = a.authorized_by_manager_id
-         WHERE a.order_id = NEW.id AND a.action_type = v_action
-           AND a.created_at >= NOW() - INTERVAL '5 minutes'
-           AND m.role IN ('MANAGER', 'OWNER') AND m.active
-           AND (v_action <> 'DISCOUNT_APPLIED' OR (
-                (a.metadata->>'discount_before')::numeric = OLD.discount_amount
-            AND (a.metadata->>'discount_after')::numeric = NEW.discount_amount))
-    ) INTO v_ok;
-    IF NOT v_ok THEN
-        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % sem PIN de gerente registrado em audit_logs.', v_action;
+    IF NEW.discount_amount > OLD.discount_amount THEN
+        v_actions := array_append(v_actions, 'DISCOUNT_APPLIED'::TEXT);
     END IF;
+    FOREACH v_action IN ARRAY v_actions LOOP
+        -- A autorização vale só para a mudança exata que o gerente aprovou: no desconto,
+        -- discount_before/discount_after do audit_log precisam bater com OLD/NEW, então
+        -- uma aprovação pequena não serve para aumentar o desconto de novo.
+        SELECT EXISTS (
+            SELECT 1 FROM audit_logs a JOIN staff_users m ON m.id = a.authorized_by_manager_id
+             WHERE a.order_id = NEW.id AND a.action_type = v_action
+               AND a.created_at >= NOW() - INTERVAL '5 minutes'
+               AND m.role IN ('MANAGER', 'OWNER') AND m.active
+               AND (v_action <> 'DISCOUNT_APPLIED' OR (
+                    (a.metadata->>'discount_before')::numeric = OLD.discount_amount
+                AND (a.metadata->>'discount_after')::numeric = NEW.discount_amount))
+        ) INTO v_ok;
+        IF NOT v_ok THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % sem PIN de gerente registrado em audit_logs.', v_action;
+        END IF;
+    END LOOP;
     RETURN NULL;
 END;
 $$;
