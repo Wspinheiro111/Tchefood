@@ -38,8 +38,14 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch): Promise<void>
     const result = await flushOutbox(events, { url: session.url, anonKey: session.anon_key, accessToken: token }, fetchFn);
     const st = useTcheStore.getState();
     st.ackSyncedEvents(result.sent);
-    if (result.rejected) st.setSyncError(`Servidor recusou um evento (HTTP ${result.rejected.status}): ${result.rejected.message}`, result.rejected.eventId);
-    else if (result.retryLater) st.setSyncError(result.retryLater, null);
+    // Recusados saem da fila (o resto continua subindo) e ficam na lista para revisão.
+    st.rejectSyncEvents(result.rejected);
+    const first = result.rejected[0];
+    if (result.retryLater) st.setSyncError(result.retryLater, null);
+    else if (first) {
+      const more = result.rejected.length > 1 ? ` (+${result.rejected.length - 1})` : '';
+      st.setSyncError(`Servidor recusou um evento${more} (HTTP ${first.status}): ${first.message}`, null);
+    }
   } finally {
     running = false;
   }

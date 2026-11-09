@@ -340,6 +340,20 @@ export interface SyncEvent {
   row_id: UUID;
   payload: Record<string, unknown>;
   created_at: ISODateTime;
+  /**
+   * Só na autorização de gerente (cancelamento, desconto, remoção dos 10%): o PIN
+   * digitado, para o servidor conferir de novo em tchefood_authorize_manager().
+   * Fica só neste evento da fila (nunca no audit_log) e sai do aparelho junto com ele.
+   */
+  manager_pin?: string;
+}
+
+/** Evento que o servidor recusou (4xx): sai da fila para não travar o resto e espera revisão. */
+export interface RejectedSyncEvent {
+  event: SyncEvent;
+  status: number;
+  message: string;
+  rejected_at: ISODateTime;
 }
 
 /** Resultado padrão das ações do store que podem ser recusadas. */
