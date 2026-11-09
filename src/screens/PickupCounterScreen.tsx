@@ -301,7 +301,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
       )}
       <div className="mt-3 grid grid-cols-2 gap-2">
         <Btn variant="secondary" onClick={onDone}>Voltar (fica pendente)</Btn>
-        <Btn variant="danger" disabled={busy} onClick={() => setVoidOpen(true)}>Cancelar senha</Btn>
+        <Btn variant="danger" disabled={busy || hold !== null} onClick={() => setVoidOpen(true)}>Cancelar senha</Btn>
       </div>
 
       <ManagerAuthSheet

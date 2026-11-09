@@ -48,6 +48,7 @@ import { nowISO, uuid } from '../lib/ids';
 import { idbStorage } from '../lib/idbStorage';
 import { createSeedData, KIOSK_TABLE, QR_SELF_SERVICE_USER_ID, SEED_STAFF } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
+import { getReviewHold } from '../lib/payments/reviewHolds';
 import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
@@ -1722,7 +1723,13 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: recalculated };
         },
 
-        voidPickupOrder: (orderId, auth) => voidTechnicalSale(orderId, auth, 'KIOSK'),
+        voidPickupOrder: (orderId, auth) => {
+          // Cobrança incerta pode ter sido aprovada: cancelar agora sumiria com um pedido pago.
+          if (getReviewHold(orderId)) {
+            return fail('Há uma cobrança sem confirmação nesta senha. Confira o extrato da maquininha antes de cancelar.');
+          }
+          return voidTechnicalSale(orderId, auth, 'KIOSK');
+        },
 
         exitKioskMode: (auth) => {
           const user = currentUser();

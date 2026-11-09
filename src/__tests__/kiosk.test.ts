@@ -184,6 +184,20 @@ describe('pedido com senha no totem', () => {
     expect(st().voidCounterSale(counter.data.id, MANAGER).ok).toBe(true);
   });
 
+  it('senha com cobrança incerta não pode ser cancelada antes da conferência', () => {
+    const o = kioskOrder();
+    setReviewHold({ order_id: o.id, amount: o.remaining_balance, reason: 'Sem NSU', code: 'NO_NSU' });
+    try {
+      st().logout();
+      expect(st().login('5555').ok).toBe(true);
+      expect(st().voidPickupOrder(o.id, MANAGER).ok).toBe(false);
+      expect(st().orders.find((x) => x.id === o.id)!.status).toBe('PAYING');
+    } finally {
+      clearReviewHold(o.id);
+    }
+    expect(st().voidPickupOrder(o.id, MANAGER).ok).toBe(true);
+  });
+
   it('senha paga não pode ser cancelada pelo caixa', () => {
     const o = kioskOrder();
     payCash(o.id);
