@@ -16,6 +16,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
 import { flushOutbox, type SyncRejection } from '../../src/lib/sync/supabaseSync';
 import { sampleNfeXml } from '../../src/data/sampleNfe';
+import { setReviewHold } from '../../src/lib/payments/reviewHolds';
 import { createSupabaseLikeDb, pgTargetFromEnv, postgrestFetch, psql, psqlFile, type EmulatorLog, type PgTarget } from './postgrestEmulator';
 
 const target = pgTargetFromEnv();
@@ -389,6 +390,107 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     expect(res.body).toMatch(/operador inválido/);
     expect(Date.now() - started).toBeGreaterThanOrEqual(800);
     await done;
+  });
+
+  /** Tira do bloqueio de 3 erros em 60 s as falhas de PIN dos testes de trava anteriores. */
+  function forgetPinFailures() {
+    sql(`ALTER TABLE audit_logs DISABLE TRIGGER USER;
+         UPDATE audit_logs SET created_at = created_at - INTERVAL '5 minutes' WHERE action_type IN ('MANAGER_PIN_FAILED', 'MANAGER_PIN_LOCKOUT');
+         ALTER TABLE audit_logs ENABLE TRIGGER USER;`);
+  }
+
+  it('troca de barril com PIN de gerente: histórico, audit_log e barril novo pela função do servidor', async () => {
+    forgetPinFailures();
+    const tapId = crypto.randomUUID();
+    const tappedAt = new Date(Date.now() - 3_600_000).toISOString();
+    sql(`INSERT INTO keg_taps (id, tenant_id, tap_number, beer_name, total_capacity_ml, billed_volume_ml, wasted_foam_ml, keg_cost, tapped_at)
+         VALUES ('${tapId}', '${TENANT}', 1, 'Chopp Pilsen 50L', 50000, 42000, 1500, 480, '${tappedAt}');`);
+    useTcheStore.setState((s) => ({
+      kegTaps: [
+        ...s.kegTaps,
+        { id: tapId, tenant_id: TENANT, tap_number: 1, beer_name: 'Chopp Pilsen 50L', total_capacity_ml: 50000, billed_volume_ml: 42000,
+          wasted_foam_ml: 1500, remaining_volume_ml: 6500, measured_remaining_ml: null, measured_at: null, keg_cost: 480, active: true, tapped_at: tappedAt },
+      ],
+    }));
+    login(CASHIER_PIN);
+    ok(st().recordKegReading(tapId, 4000));
+    await expectSynced('leitura do barril');
+    ok(st().tapNewKeg(tapId, { beer_name: 'Chopp IPA 30L', total_capacity_ml: 30000, keg_cost: 390 }, { managerPin: MANAGER_PIN, reason: 'Barril da Pilsen acabou' }));
+    const history = st().kegHistory[0]!;
+    await expectSynced('troca de barril');
+    expect(sql(`SELECT beer_name || ' ' || billed_volume_ml || ' ' || wasted_foam_ml || ' ' || measured_remaining_ml FROM keg_history WHERE id = '${history.id}'`)).toBe('Chopp Pilsen 50L 42000 1500 4000');
+    expect(sql(`SELECT beer_name || ' ' || total_capacity_ml || ' ' || billed_volume_ml || ' ' || keg_cost FROM keg_taps WHERE id = '${tapId}'`)).toBe('Chopp IPA 30L 30000 0 390.00');
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'KEG_CHANGED' AND (metadata->>'server_verified')::boolean AND metadata->>'keg_history_id' = '${history.id}'`)).toBe('1');
+    // Reenvio (resposta perdida): devolve o mesmo barril encerrado, sem duplicar.
+    const again = await raw('POST', 'rpc/tchefood_change_keg', {
+      p_history_id: history.id, p_audit_id: crypto.randomUUID(), p_tap_id: tapId, p_beer_name: 'Chopp IPA 30L', p_capacity_ml: 30000, p_keg_cost: 390,
+      p_performed_by: history.kicked_by_user_id, p_manager_pin: MANAGER_PIN, p_reason: 'Reenvio da fila', p_kicked_at: history.kicked_at,
+    });
+    expect(again.body).toBe(JSON.stringify(history.id));
+    expect(sql(`SELECT count(*) FROM keg_history WHERE tap_id = '${tapId}'`)).toBe('1');
+    // PIN errado: nada muda e a fila segura a torneira até o reenvio com o PIN certo.
+    ok(st().tapNewKeg(tapId, { beer_name: 'Chopp Weiss 30L', total_capacity_ml: 30000, keg_cost: 400 }, { managerPin: MANAGER_PIN, reason: 'Troca para a Weiss' }));
+    const ev = st().outbox.find((e) => e.table === 'keg_history')!;
+    useTcheStore.setState((s) => ({ outbox: s.outbox.map((e) => (e.id === ev.id ? { ...e, manager_pin: '0000' } : e)) }));
+    const rejected = await sync();
+    expect(rejected.map((r) => r.eventId)).toEqual([ev.id]);
+    expect(st().outbox.map((e) => e.table)).toEqual(['keg_taps']);
+    expect(sql(`SELECT beer_name FROM keg_taps WHERE id = '${tapId}'`)).toBe('Chopp IPA 30L');
+    ok(st().confirmRejectedAuthorization(ev.id, MANAGER_PIN));
+    st().retryRejectedSync();
+    await expectSynced('troca de barril reenviada com o PIN certo');
+    expect(sql(`SELECT beer_name FROM keg_taps WHERE id = '${tapId}'`)).toBe('Chopp Weiss 30L');
+    // Duas trocas, dois registros KEG_CHANGED conferidos pelo servidor (o reenvio não duplicou).
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'KEG_CHANGED'`)).toBe('2');
+  });
+
+  it('cobrança incerta registrada pelo comprovante sobe com o pagamento e o PIN do gerente', async () => {
+    forgetPinFailures();
+    login(OWNER_PIN);
+    ok(st().saveTable({ number: 2, label: 'Mesa 2', area: 'Salão', capacity: 4, active: true }));
+    login(CASHIER_PIN);
+    const mesa = st().tables.find((t) => t.number === 2)!;
+    const order = ok(st().openTable(mesa.id, 2, null));
+    const p = st().products.find((x) => x.id === productId)!;
+    ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order.id));
+    ok(st().startCheckout(order.id));
+    const amount = st().orders.find((o) => o.id === order.id)!.remaining_balance;
+    setReviewHold({
+      order_id: order.id, amount, reason: 'Queda no meio da cobrança', code: 'WRAPPER_EXCEPTION', method: 'CREDIT', acquirer: 'STONE',
+      terminal_id: null, terminal_serial: 'STONE-01', idempotency_key: `hold-${order.id}`,
+    });
+    const pay = ok(st().confirmReviewedCharge({ orderId: order.id, nsu: '004512', authorization_code: 'A1B2C3', card_brand: 'VISA' }, MANAGER));
+    await expectSynced('cobrança incerta');
+    expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 0.00');
+    expect(sql(`SELECT nsu FROM payments WHERE id = '${pay.payment.id}'`)).toBe('004512');
+    expect(sql(`SELECT amount_impact || ' ' || (metadata->>'nsu') FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'CHARGE_CONFIRMED_MANUALLY' AND (metadata->>'server_verified')::boolean`)).toBe(`${amount.toFixed(2)} 004512`);
+    // Registro sem o pagamento do comprovante (NSU diferente): recusado.
+    const cashier = st().staff.find((u) => u.pin_code === CASHIER_PIN)!;
+    const forged = await raw('POST', 'rpc/tchefood_authorize_manager', {
+      p_order_id: order.id, p_action_type: 'CHARGE_CONFIRMED_MANUALLY', p_manager_pin: MANAGER_PIN, p_performed_by: cashier.id,
+      p_reason: 'Comprovante de outra conta', p_amount_impact: amount, p_metadata: { payment_id: pay.payment.id, nsu: '999999', client_audit_id: crypto.randomUUID() },
+    });
+    expect(forged.status).toBe(400);
+    expect(forged.body).toMatch(/pagamento do comprovante/);
+  });
+
+  it('saída do totem com PIN de gerente', async () => {
+    forgetPinFailures();
+    login(OWNER_PIN);
+    const kiosk = ok(st().saveStaff({ name: 'Totem 1', role: 'KIOSK', pin_code: '6082', active: true }));
+    await expectSynced('usuário do totem');
+    login('6082');
+    ok(st().exitKioskMode(MANAGER));
+    await expectSynced('saída do totem');
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE performed_by_user_id = '${kiosk.id}' AND action_type = 'KIOSK_EXIT' AND order_id IS NULL AND (metadata->>'server_verified')::boolean`)).toBe('1');
+    // Só o aparelho do totem registra a saída.
+    const cashier = st().staff.find((u) => u.pin_code === CASHIER_PIN)!;
+    const other = await raw('POST', 'rpc/tchefood_authorize_manager', {
+      p_order_id: null, p_action_type: 'KIOSK_EXIT', p_manager_pin: MANAGER_PIN, p_performed_by: cashier.id, p_reason: 'Saída forjada', p_metadata: {},
+    });
+    expect(other.status).toBe(400);
+    login(CASHIER_PIN);
   });
 
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
