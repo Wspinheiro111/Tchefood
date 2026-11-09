@@ -397,13 +397,23 @@ describe('sincronização com o Supabase', () => {
   });
 
   it('audit_log de pedido sobe antes das atualizações daquele pedido (filas antigas)', () => {
-    const items = ev({ id: 'i', table: 'order_items', op: 'UPDATE', row_id: 'item1', payload: { id: 'item1', order_id: 'O1' } });
-    const order = ev({ id: 'o', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' } });
-    const audit = ev({ id: 'a', table: 'audit_logs', row_id: 'L1', payload: { id: 'L1', order_id: 'O1' } });
-    const insert = ev({ id: 'n', table: 'orders', op: 'INSERT', row_id: 'O1', payload: { id: 'O1' } });
-    const other = ev({ id: 'x', table: 'orders', op: 'UPDATE', row_id: 'O2', payload: { id: 'O2' } });
+    const t0 = '2026-11-09T19:00:00.000Z';
+    const items = ev({ id: 'i', table: 'order_items', op: 'UPDATE', row_id: 'item1', payload: { id: 'item1', order_id: 'O1' }, created_at: t0 });
+    const order = ev({ id: 'o', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' }, created_at: t0 });
+    const audit = ev({ id: 'a', table: 'audit_logs', row_id: 'L1', payload: { id: 'L1', order_id: 'O1' }, created_at: '2026-11-09T19:00:00.001Z' });
+    const insert = ev({ id: 'n', table: 'orders', op: 'INSERT', row_id: 'O1', payload: { id: 'O1' }, created_at: t0 });
+    const other = ev({ id: 'x', table: 'orders', op: 'UPDATE', row_id: 'O2', payload: { id: 'O2' }, created_at: t0 });
     expect(serverOrder([insert, items, order, audit]).map((e) => e.id)).toEqual(['n', 'a', 'i', 'o']);
     expect(serverOrder([order, other, audit]).map((e) => e.id)).toEqual(['o', 'x', 'a']);
+    // Fila nova (autorização primeiro) com dois descontos seguidos: nada muda de lugar.
+    const at = (sec: number) => `2026-11-09T19:0${sec}:00.000Z`;
+    const a1 = ev({ id: 'a1', table: 'audit_logs', payload: { order_id: 'O1' }, created_at: at(1) });
+    const u1 = ev({ id: 'u1', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' }, created_at: at(1) });
+    const a2 = ev({ id: 'a2', table: 'audit_logs', payload: { order_id: 'O1' }, created_at: at(2) });
+    const u2 = ev({ id: 'u2', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' }, created_at: at(2) });
+    expect(serverOrder([a1, u1, a2, u2]).map((e) => e.id)).toEqual(['a1', 'u1', 'a2', 'u2']);
+    // Fila antiga com dois descontos: cada autorização só passa a frente da própria mudança.
+    expect(serverOrder([u1, a1, u2, a2]).map((e) => e.id)).toEqual(['a1', 'u1', 'a2', 'u2']);
     const catalog = ev({ id: 'c', table: 'audit_logs', payload: { order_id: null } });
     expect(serverOrder([order, catalog]).map((e) => e.id)).toEqual(['o', 'c']);
   });

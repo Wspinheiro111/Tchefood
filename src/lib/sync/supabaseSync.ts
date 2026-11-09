@@ -123,19 +123,26 @@ export interface FlushResult {
  * banco (cancelamento, remoção dos 10%, desconto) exigem a autorização já gravada.
  * Cobre filas antigas, gravadas antes de o store enfileirar o audit_log primeiro.
  */
+const LEGACY_MAX_MUTATIONS = 2;
+const LEGACY_SAME_ACTION_MS = 2_000;
+
 export function serverOrder(events: SyncEvent[]): SyncEvent[] {
   const out = [...events];
   for (let i = 0; i < out.length; i++) {
     const ev = out[i]!;
     const orderId = ev.table === 'audit_logs' ? (ev.payload.order_id as string | null | undefined) : null;
     if (!orderId) continue;
+    // Só atravessa as atualizações da MESMA ação (gravadas no mesmo instante, no máximo
+    // item + comanda). Uma operação anterior, com a sua própria autorização, nunca é ultrapassada.
+    const at = Date.parse(ev.created_at);
     let j = i;
-    while (j > 0) {
+    while (j > 0 && i - j < LEGACY_MAX_MUTATIONS) {
       const prev = out[j - 1]!;
       const sameOrder =
         prev.op === 'UPDATE' &&
         ((prev.table === 'orders' && prev.row_id === orderId) || (prev.table === 'order_items' && prev.payload.order_id === orderId));
-      if (!sameOrder) break;
+      const sameAction = Number.isFinite(at) && Math.abs(at - Date.parse(prev.created_at)) <= LEGACY_SAME_ACTION_MS;
+      if (!sameOrder || !sameAction) break;
       j--;
     }
     if (j < i) {
