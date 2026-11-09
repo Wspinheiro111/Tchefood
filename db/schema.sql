@@ -145,8 +145,11 @@ CREATE TABLE order_items (
     product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
     waiter_id UUID NOT NULL REFERENCES staff_users(id),
     quantity NUMERIC(10,3) NOT NULL DEFAULT 1 CHECK (quantity > 0),
-    unit_price NUMERIC(10,2) NOT NULL,
+    unit_price NUMERIC(10,2) NOT NULL CHECK (unit_price >= 0),
+    -- Adicional pode ser negativo (ex.: "sem queijo"), mas o item nunca vale menos que zero:
+    -- item com preço negativo funcionaria como desconto sem PIN do gerente.
     modifiers_unit_price NUMERIC(10,2) NOT NULL DEFAULT 0.00,
+    CONSTRAINT order_items_effective_price_check CHECK (unit_price + modifiers_unit_price >= 0),
     total_item_price NUMERIC(10,2) NOT NULL,
     meat_doneness VARCHAR(40),
     notes TEXT,
