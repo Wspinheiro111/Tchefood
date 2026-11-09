@@ -813,9 +813,10 @@ export const useTcheStore = create<TcheState>()(
               auditLogs: [log, ...s.auditLogs],
               outbox: [
                 ...s.outbox,
+                // O audit_log sobe antes: o banco recusa o cancelamento sem a autorização já gravada.
+                syncEvent('audit_logs', 'INSERT', log),
                 syncEvent('order_items', 'UPDATE', canceledItem),
                 syncEvent('orders', 'UPDATE', recalculated),
-                syncEvent('audit_logs', 'INSERT', log),
               ],
             };
           });
@@ -855,7 +856,7 @@ export const useTcheStore = create<TcheState>()(
             return {
               orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
               auditLogs: [log, ...s.auditLogs],
-              outbox: [...s.outbox, syncEvent('orders', 'UPDATE', recalculated), syncEvent('audit_logs', 'INSERT', log)],
+              outbox: [...s.outbox, syncEvent('audit_logs', 'INSERT', log), syncEvent('orders', 'UPDATE', recalculated)],
             };
           });
           return { ok: true, data: log };
@@ -884,7 +885,7 @@ export const useTcheStore = create<TcheState>()(
             return {
               orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
               auditLogs: [{ ...log, whatsapp_alert_sent: false }, ...s.auditLogs],
-              outbox: [...s.outbox, syncEvent('orders', 'UPDATE', recalculated), syncEvent('audit_logs', 'INSERT', log)],
+              outbox: [...s.outbox, syncEvent('audit_logs', 'INSERT', log), syncEvent('orders', 'UPDATE', recalculated)],
             };
           });
           return { ok: true, data: get().auditLogs[0]! };
@@ -926,7 +927,7 @@ export const useTcheStore = create<TcheState>()(
             return {
               orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
               auditLogs: [log, ...s.auditLogs],
-              outbox: [...s.outbox, syncEvent('orders', 'UPDATE', recalculated), syncEvent('audit_logs', 'INSERT', log)],
+              outbox: [...s.outbox, syncEvent('audit_logs', 'INSERT', log), syncEvent('orders', 'UPDATE', recalculated)],
             };
           });
           return { ok: true, data: log };
@@ -1629,7 +1630,9 @@ export const useTcheStore = create<TcheState>()(
           set({
             tenant,
             staff: [owner, qrUser],
-            terminals: [],
+            // As maquininhas deste aparelho continuam cadastradas (passam para a loja nova);
+            // sem elas o modo TEF POS Sem Fio não cobraria cartão.
+            terminals: state.terminals.map((t) => ({ ...t, tenant_id: tenantId })),
             categories: [],
             products: [],
             modifierGroups: [],

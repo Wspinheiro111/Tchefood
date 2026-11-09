@@ -4,8 +4,8 @@
  * Usa o PostgREST direto (fetch), sem SDK, para rodar igual no navegador e na
  * WebView da maquininha. Regras:
  *  - A fila é enviada NA ORDEM em que foi gerada, um evento por vez. O banco tem
- *    triggers que exigem o audit_log antes do cancelamento/desconto, e a ordem
- *    da fila já é a ordem certa.
+ *    triggers que exigem o audit_log antes do cancelamento/desconto: o store
+ *    enfileira o audit_log primeiro e serverOrder() corrige filas antigas.
  *  - payments e audit_logs são só INSERT com "ignore-duplicates": reenviar o
  *    mesmo evento nunca altera um pagamento ou um log já gravado.
  *  - Os demais são upsert pelo id (merge-duplicates).
@@ -115,9 +115,38 @@ export interface FlushResult {
  * Envia a fila em ordem até acabar, até o primeiro erro, ou até `limit` eventos.
  * Não altera o estado: quem chama confirma os enviados (ackSyncedEvents).
  */
+/**
+ * Ordem de envio para o servidor. Igual à da fila, exceto que um audit_log de pedido
+ * sobe antes das atualizações daquele pedido que vieram logo antes dele: as travas do
+ * banco (cancelamento, remoção dos 10%, desconto) exigem a autorização já gravada.
+ * Cobre filas antigas, gravadas antes de o store enfileirar o audit_log primeiro.
+ */
+export function serverOrder(events: SyncEvent[]): SyncEvent[] {
+  const out = [...events];
+  for (let i = 0; i < out.length; i++) {
+    const ev = out[i]!;
+    const orderId = ev.table === 'audit_logs' ? (ev.payload.order_id as string | null | undefined) : null;
+    if (!orderId) continue;
+    let j = i;
+    while (j > 0) {
+      const prev = out[j - 1]!;
+      const sameOrder =
+        prev.op === 'UPDATE' &&
+        ((prev.table === 'orders' && prev.row_id === orderId) || (prev.table === 'order_items' && prev.payload.order_id === orderId));
+      if (!sameOrder) break;
+      j--;
+    }
+    if (j < i) {
+      out.splice(i, 1);
+      out.splice(j, 0, ev);
+    }
+  }
+  return out;
+}
+
 export async function flushOutbox(events: SyncEvent[], cfg: SyncConfig, fetchFn: FetchLike, limit = 50): Promise<FlushResult> {
   const sent: string[] = [];
-  for (const event of events.slice(0, limit)) {
+  for (const event of serverOrder(events).slice(0, limit)) {
     let req: SyncRequest;
     try {
       req = buildSyncRequest(event, cfg);

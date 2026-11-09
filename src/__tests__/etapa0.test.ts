@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { migratePersisted, selectCan, useTcheStore } from '../store/useTcheStore';
 import { activeSchedule, effectivePrice, scheduleIntervals, validatePriceSchedule, validateProduct, validateStaff } from '../lib/catalog';
 import { can } from '../lib/permissions';
-import { buildSyncRequest, flushOutbox, needsRefresh, sanitizePayload, signInDevice, tenantFromJwt, type FetchLike } from '../lib/sync/supabaseSync';
+import { buildSyncRequest, flushOutbox, serverOrder, needsRefresh, sanitizePayload, signInDevice, tenantFromJwt, type FetchLike } from '../lib/sync/supabaseSync';
 import { parseMoneyInput } from '../screens/admin/fields';
 import { isQrSelfService } from '../data/seed';
 import type { PriceSchedule, Product, SyncEvent } from '../types';
@@ -309,6 +309,9 @@ describe('loja nova', () => {
     expect(st().staff.map((u) => u.role).sort()).toEqual(['OWNER', 'WAITER']);
     expect(st().staff.some(isQrSelfService)).toBe(true);
     expect(st().staff.every((u) => u.tenant_id === st().tenant.id)).toBe(true);
+    // Maquininhas do aparelho continuam (sem elas o TEF POS Sem Fio não cobra cartão).
+    expect(st().terminals.length).toBeGreaterThan(0);
+    expect(st().terminals.every((t) => t.tenant_id === st().tenant.id)).toBe(true);
     expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', 'staff_users', 'audit_logs']);
     st().logout();
     expect(st().login('4826').ok).toBe(true);
@@ -387,6 +390,33 @@ describe('sincronização com o Supabase', () => {
     expect(await flushOutbox([ev({})], cfg, s503)).toMatchObject({ rejected: null, retryLater: expect.stringContaining('503') });
     const s401: FetchLike = async () => ({ ok: false, status: 401, text: async () => '' });
     expect(await flushOutbox([ev({})], cfg, s401)).toMatchObject({ rejected: null });
+  });
+
+  it('audit_log de pedido sobe antes das atualizações daquele pedido (filas antigas)', () => {
+    const items = ev({ id: 'i', table: 'order_items', op: 'UPDATE', row_id: 'item1', payload: { id: 'item1', order_id: 'O1' } });
+    const order = ev({ id: 'o', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1' } });
+    const audit = ev({ id: 'a', table: 'audit_logs', row_id: 'L1', payload: { id: 'L1', order_id: 'O1' } });
+    const insert = ev({ id: 'n', table: 'orders', op: 'INSERT', row_id: 'O1', payload: { id: 'O1' } });
+    const other = ev({ id: 'x', table: 'orders', op: 'UPDATE', row_id: 'O2', payload: { id: 'O2' } });
+    expect(serverOrder([insert, items, order, audit]).map((e) => e.id)).toEqual(['n', 'a', 'i', 'o']);
+    expect(serverOrder([order, other, audit]).map((e) => e.id)).toEqual(['o', 'x', 'a']);
+    const catalog = ev({ id: 'c', table: 'audit_logs', payload: { order_id: null } });
+    expect(serverOrder([order, catalog]).map((e) => e.id)).toEqual(['o', 'c']);
+  });
+
+  it('o store enfileira a autorização antes do desconto e do cancelamento', () => {
+    login(WAITER);
+    const opened = st().openTable(table(1).id, 2, null);
+    if (!opened.ok) throw new Error(opened.error);
+    const id = opened.data.id;
+    const p = product('105');
+    expect(st().addToTray({ order_id: id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: p.requires_meat_doneness ? 'Ao Ponto' : null, quick_tags: [], free_notes: '', sector: p.sector }).ok).toBe(true);
+    expect(st().dispatchTray(id).ok).toBe(true);
+    const item = st().orderItems.find((i) => i.order_id === id)!;
+    const n = st().outbox.length;
+    expect(st().removeServiceFee(id, { managerPin: MANAGER, reason: 'Cliente não aceitou os 10%' }).ok).toBe(true);
+    expect(st().cancelOrderItem(item.id, { managerPin: MANAGER, reason: 'Cliente desistiu' }).ok).toBe(true);
+    expect(st().outbox.slice(n).map((e) => e.table)).toEqual(['audit_logs', 'orders', 'audit_logs', 'order_items', 'orders']);
   });
 
   it('lê tenant_id do JWT e exige a loja na conta', async () => {

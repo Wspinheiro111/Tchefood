@@ -41,10 +41,10 @@ npm run build
 
 **Equipe** — PIN de 4 dígitos, único e não trivial. Trocar o PIN de outra pessoa, mudar perfil, desativar ou reativar pede PIN de gerente + motivo e grava `STAFF_*` na auditoria; o PIN nunca vai para o log. Gerente não mexe em gerente/proprietário; ninguém desativa a si mesmo; a loja nunca fica sem proprietário ativo.
 
-**Loja** — dados cadastrais (CNPJ com dígito verificador, UF, taxa de serviço 0–20% com 2 casas). **Permissões por perfil** (`role_permissions` guarda só as exceções ao padrão de `src/lib/permissions.ts`; o proprietário pode tudo e só ele muda permissões, com PIN e motivo). **Iniciar loja nova** tira o aparelho da demonstração: exige o PIN do proprietário, nenhuma conta aberta e a fila vazia se já houver nuvem.
+**Loja** — dados cadastrais (CNPJ com dígito verificador, UF, taxa de serviço 0–20% com 2 casas). **Permissões por perfil** (`role_permissions` guarda só as exceções ao padrão de `src/lib/permissions.ts`; o proprietário pode tudo e só ele muda permissões, com PIN e motivo). **Iniciar loja nova** tira o aparelho da demonstração: exige o PIN do proprietário, nenhuma conta aberta e a fila vazia se já houver nuvem. As maquininhas cadastradas no aparelho continuam (ainda não há tela para cadastrar maquininha).
 
 **Nuvem** — o aparelho entra com uma conta do Supabase Auth (e-mail e senha) e a fila `outbox` sobe sozinha a cada 5 s quando há internet (`src/lib/sync/`):
-- Envio em ordem, um evento por vez (as travas do banco exigem o `audit_log` antes do cancelamento/desconto). `payments` e `audit_logs` são só INSERT (`ignore-duplicates`); o resto é upsert pelo id. DELETE só existe para vínculo produto ↔ adicional e opção de adicional.
+- Envio em ordem, um evento por vez. O `audit_log` de cancelamento, remoção dos 10% ou desconto sobe **antes** da mudança que ele autoriza (as travas do banco exigem a autorização já gravada). A janela de 5 minutos dessas travas conta de `audit_logs.received_at`, a hora em que o servidor recebeu, para um desconto dado sem internet ainda subir horas depois. `payments` e `audit_logs` são só INSERT (`ignore-duplicates`); o resto é upsert pelo id. DELETE só existe para vínculo produto ↔ adicional e opção de adicional.
 - Erro de rede, 5xx e 401 ficam para depois (401 renova o token). 4xx **para a fila** naquele evento e mostra o motivo na aba Nuvem; nada é descartado sozinho.
 - Token da Focus e CSC nunca sobem do aparelho; um trigger no banco também impede o app de trocá-los.
 

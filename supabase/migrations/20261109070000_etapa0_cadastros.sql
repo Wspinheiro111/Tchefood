@@ -111,6 +111,47 @@ DROP TRIGGER IF EXISTS trg_tenants_secrets ON tenants;
 CREATE TRIGGER trg_tenants_secrets BEFORE UPDATE ON tenants
     FOR EACH ROW EXECUTE FUNCTION tchefood_tenant_secrets_guard();
 
+-- Fila offline: o audit_log de desconto/remoção dos 10% pode subir horas depois de
+-- gravado no aparelho (sem internet). A janela de 5 minutos passa a contar da
+-- chegada no servidor (received_at, sempre preenchido pelo banco), não do
+-- created_at do aparelho; a autorização continua tendo de chegar junto da mudança.
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE OR REPLACE FUNCTION tchefood_audit_received_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.received_at := NOW();
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_audit_logs_received_at ON audit_logs;
+CREATE TRIGGER trg_audit_logs_received_at BEFORE INSERT ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION tchefood_audit_received_at();
+
+CREATE OR REPLACE FUNCTION tchefood_require_order_audit()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_action TEXT; v_ok BOOLEAN;
+BEGIN
+    IF OLD.charge_service_fee AND NOT NEW.charge_service_fee THEN
+        v_action := 'SERVICE_FEE_REMOVED';
+    ELSIF NEW.discount_amount > OLD.discount_amount THEN
+        v_action := 'DISCOUNT_APPLIED';
+    ELSE
+        RETURN NULL;
+    END IF;
+    SELECT EXISTS (
+        SELECT 1 FROM audit_logs a JOIN staff_users m ON m.id = a.authorized_by_manager_id
+         WHERE a.order_id = NEW.id AND a.action_type = v_action
+           AND a.received_at >= NOW() - INTERVAL '5 minutes'
+           AND m.role IN ('MANAGER', 'OWNER') AND m.active
+    ) INTO v_ok;
+    IF NOT v_ok THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % sem PIN de gerente registrado em audit_logs.', v_action;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
 -- Hook de access token do Supabase Auth: claim tenant_id = app_metadata.tenant_id.
 -- Ativar em Authentication > Hooks > Customize Access Token, função public.tchefood_access_token_hook.
 CREATE OR REPLACE FUNCTION public.tchefood_access_token_hook(event JSONB)
