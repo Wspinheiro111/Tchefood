@@ -301,8 +301,8 @@ function Config() {
       <div className="rounded-2xl border border-slate-200 bg-surface p-4">
         <h3 className="mb-2 font-bold">Pizza meio-a-meio</h3>
         <div className="grid grid-cols-2 gap-2">
-          <Btn variant={s.halfAndHalfPricing === 'HIGHEST' ? 'gold' : 'secondary'} onClick={() => s.setHalfAndHalfPricing('HIGHEST')}>Cobrar o maior</Btn>
-          <Btn variant={s.halfAndHalfPricing === 'AVERAGE' ? 'gold' : 'secondary'} onClick={() => s.setHalfAndHalfPricing('AVERAGE')}>Cobrar a média</Btn>
+          <Btn variant={s.tenant.half_and_half_pricing === 'HIGHEST' ? 'gold' : 'secondary'} onClick={() => s.setHalfAndHalfPricing('HIGHEST')}>Cobrar o maior</Btn>
+          <Btn variant={s.tenant.half_and_half_pricing === 'AVERAGE' ? 'gold' : 'secondary'} onClick={() => s.setHalfAndHalfPricing('AVERAGE')}>Cobrar a média</Btn>
         </div>
       </div>
       <div className="rounded-2xl border border-slate-200 bg-surface p-4">

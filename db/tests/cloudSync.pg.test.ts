@@ -590,6 +590,94 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`)).toBe('0.00');
   });
 
+  it('dinheiro no servidor: preço de horário e meio a meio conferem; item com preço forjado vira alerta', async () => {
+    forgetPinFailures();
+    login(OWNER_PIN);
+    const pizza = (code: string, name: string, price: number) =>
+      ok(
+        st().saveProduct({
+          category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+          requires_meat_doneness: false, allows_half_and_half: true, ncm: '19052090', cfop: '5102', csosn_cst: '102', unit: 'UN',
+          cost_price: 0, stock_quantity: 0, barcode: null,
+        }),
+      );
+    const calabresa = pizza('701', 'Pizza Calabresa', 60);
+    const marguerita = pizza('702', 'Pizza Marguerita', 55.15);
+    // Regra de horário o dia todo, todos os dias (o banco usa o fuso de São Paulo).
+    ok(st().savePriceSchedule({ product_id: productId, name: 'Promoção do dia', weekdays: [0, 1, 2, 3, 4, 5, 6], start_time: '00:01', end_time: '00:00', price: 39.9, active: true }));
+    st().setHalfAndHalfPricing('AVERAGE');
+    ok(st().saveTable({ number: 3, label: 'Mesa 3', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('pizzas, regra de horário e meio a meio pela média');
+    expect(sql(`SELECT half_and_half_pricing FROM tenants WHERE id = '${TENANT}'`)).toBe('AVERAGE');
+
+    login(CASHIER_PIN);
+    const mesa = st().tables.find((t) => t.number === 3)!;
+    const order = ok(st().openTable(mesa.id, 2, null));
+    const carreteiro = st().products.find((x) => x.id === productId)!;
+    ok(st().addToTray({ order_id: order.id, product_id: carreteiro.id, half_product_ids: [], quantity: 2, unit_price: carreteiro.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: carreteiro.sector }));
+    ok(st().addToTray({ order_id: order.id, product_id: calabresa.id, half_product_ids: [marguerita.id], quantity: 1, unit_price: 0, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: calabresa.sector }));
+    const items = ok(st().dispatchTray(order.id)).items;
+    expect(items.map((i) => i.unit_price)).toEqual([39.9, 57.58]); // média em centavos, arredondada
+    await expectSynced('itens com preço de horário e meio a meio');
+    const mismatches = () => Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'PRICE_MISMATCH'`));
+    // Nada lançado pelo app até aqui (em nenhum teste) ficou diferente do cadastro.
+    expect(mismatches()).toBe(0);
+    expect(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`)).toBe(st().orders.find((o) => o.id === order.id)!.total_amount.toFixed(2));
+
+    // Item gravado direto com preço menor que o do cadastro: entra, e o alerta fica para o gerente.
+    const forged = await raw('POST', 'order_items', {
+      id: crypto.randomUUID(), order_id: order.id, product_id: calabresa.id, waiter_id: st().currentUserId, quantity: 2, unit_price: 1, modifiers_unit_price: 0,
+      sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER', priced_at: new Date().toISOString(),
+    });
+    expect(forged.status).toBe(201);
+    expect(mismatches()).toBe(1);
+    expect(sql(`SELECT amount_impact || ' ' || (metadata->>'expected_unit_price') FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}'`)).toBe('118.00 60.00');
+  });
+
+  it('dinheiro no servidor: pagamento só pela função, com saldo, NSU e caixa conferidos; conta só fecha zerada', async () => {
+    login(CASHIER_PIN);
+    const mesa = st().tables.find((t) => t.number === 3)!;
+    const order = st().orders.find((o) => o.table_id === mesa.id && o.status === 'OPEN')!;
+    const cashier = st().staff.find((u) => u.pin_code === CASHIER_PIN)!;
+    const server = () => sql(`SELECT remaining_balance FROM orders WHERE id = '${order.id}'`);
+    const pay = (over: Record<string, unknown>) => ({
+      id: crypto.randomUUID(), order_id: order.id, tenant_id: TENANT, waiter_id: cashier.id, terminal_id: null, amount: 10, tip_amount: 0,
+      method: 'CREDIT', status: 'APPROVED', acquirer: 'STONE', acquirer_cnpj: null, card_brand: 'VISA', nsu: '778899', authorization_code: 'AB12',
+      terminal_serial: 'STONE-01', idempotency_key: crypto.randomUUID(), created_at: new Date().toISOString(), ...over,
+    });
+    const rpc = (p: Record<string, unknown>) => raw('POST', 'rpc/tchefood_register_payment', { p_payment: p });
+
+    // Gravar direto em payments: sem permissão.
+    expect((await raw('POST', 'payments', pay({}))).status).toBe(403);
+    // Fechar a conta com saldo: recusado.
+    expect((await raw('PATCH', `orders?id=eq.${order.id}`, { status: 'CLOSED' })).body).toMatch(/ainda deve/);
+    // Cartão aprovado sem NSU, dinheiro fora do caixa, valor acima do saldo: recusados.
+    expect((await rpc(pay({ nsu: null }))).body).toMatch(/sem o NSU/);
+    expect((await rpc(pay({ method: 'CASH', acquirer: 'STONE', nsu: null }))).body).toMatch(/caixa/);
+    expect((await rpc(pay({ amount: 99999 }))).body).toMatch(/passa do saldo/);
+    // Pagamento parcial com cartão; reenvio do mesmo id não duplica; o mesmo NSU não paga de novo.
+    const first = pay({});
+    expect((await rpc(first)).status).toBe(200);
+    expect((await rpc(first)).status).toBe(200);
+    expect(sql(`SELECT count(*) FROM payments WHERE id = '${first.id}'`)).toBe('1');
+    expect((await rpc(pay({}))).body).toMatch(/já pagou outra conta/);
+    // Recusado na maquininha: não mexe no saldo e não precisa de NSU.
+    expect((await rpc(pay({ status: 'DECLINED', nsu: null, amount: 99999 }))).status).toBe(200);
+    const left = server();
+    expect(Number(left)).toBeGreaterThan(0);
+    // O resto em dinheiro no caixa fecha a conta (fechamento automático do banco).
+    expect((await rpc(pay({ method: 'CASH', acquirer: 'CASH_DESK', nsu: null, card_brand: null, terminal_serial: null, amount: Number(left) }))).status).toBe(200);
+    expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 0.00');
+    // Conta fechada não recebe mais pagamento nem reabre.
+    expect((await rpc(pay({ method: 'CASH', acquirer: 'CASH_DESK', nsu: null, amount: 1 }))).body).toMatch(/fechada/);
+    expect((await raw('PATCH', `orders?id=eq.${order.id}`, { status: 'OPEN' })).body).toMatch(/não reabre/);
+    // O aparelho ficou com a conta aberta (os pagamentos acima foram direto no servidor): fecha aqui sem subir.
+    useTcheStore.setState((s) => ({
+      orders: s.orders.map((o) => (o.id === order.id ? { ...o, status: 'CLOSED' as const } : o)),
+      tables: s.tables.map((t) => (t.id === mesa.id ? { ...t, status: 'FREE' as const, current_order_id: null } : t)),
+    }));
+  });
+
   it('aparelho novo baixa a loja: cadastros pela RLS, equipe com PIN só com o PIN do gerente', async () => {
     forgetPinFailures();
     const cfg = { url: 'http://cloud.test', anonKey: 'anon', accessToken: 'jwt' };

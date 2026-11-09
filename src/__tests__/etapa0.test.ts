@@ -465,7 +465,7 @@ describe('migração do armazenamento local', () => {
     expect(tables.every((t) => t.tenant_id === 'loja')).toBe(true);
     // Loja real não ganha o usuário de demonstração do totem.
     expect(v3.staff).toEqual([]);
-    expect(v3.orderItems).toEqual([{ id: 'i', weight_gross_grams: null, weight_tare_grams: null, weight_source: null, keg_volume_ml: null, combo_parent_item_id: null }]);
+    expect(v3.orderItems).toEqual([{ id: 'i', weight_gross_grams: null, weight_tare_grams: null, weight_source: null, keg_volume_ml: null, combo_parent_item_id: null, priced_at: null, half_product_ids: [], modifier_option_ids: [] }]);
     expect(v3.orders).toEqual([{ id: 'o', pickup_number: null, pickup_name: null, fulfillment_type: null }]);
     expect(v3.kegTaps).toEqual([]);
     expect(v3.cashbackLedger).toEqual([]);
@@ -483,8 +483,10 @@ describe('sincronização com o Supabase', () => {
     expect(up.headers.Prefer).toContain('merge-duplicates');
     expect(up.headers.Authorization).toBe('Bearer jwt');
 
-    const pay = buildSyncRequest(ev({ table: 'payments' }), cfg);
-    expect(pay.headers.Prefer).toContain('ignore-duplicates');
+    // Pagamento sobe pela função do banco que confere saldo e NSU.
+    const pay = buildSyncRequest(ev({ table: 'payments', payload: { id: 'P1', amount: 10 } }), cfg);
+    expect(pay.url).toBe('https://abc.supabase.co/rest/v1/rpc/tchefood_register_payment');
+    expect(JSON.parse(pay.body!)).toEqual({ p_payment: { id: 'P1', amount: 10 } });
 
     const link = buildSyncRequest(ev({ table: 'product_modifier_groups', payload: { product_id: 'p', group_id: 'g' } }), cfg);
     expect(link.url).toContain('on_conflict=product_id,group_id');
@@ -737,7 +739,7 @@ describe('sincronização com o Supabase', () => {
 
     const payEvent = st().outbox.find((e) => e.table === 'payments' && e.payload.order_id === orderId)!;
     const fetchFn: FetchLike = async (url) =>
-      url.includes('/payments') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
+      url.includes('/tchefood_register_payment') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
     const tail = st().outbox.slice(st().outbox.indexOf(payEvent));
     const r = await flushOutbox(tail, cfg, fetchFn);
     expect(r.rejected.map((x) => x.eventId)).toEqual([payEvent.id]);
@@ -751,7 +753,7 @@ describe('sincronização com o Supabase', () => {
 
   it('mesa liberada segurada não é ultrapassada pela ocupação da mesma mesa por outra comanda', async () => {
     const fetchFn: FetchLike = async (url) =>
-      url.includes('/payments') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
+      url.includes('/tchefood_register_payment') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
     const payA = ev({ id: 'pa', table: 'payments', row_id: 'PA', payload: { id: 'PA', order_id: 'A' } });
     const releaseA = ev({ id: 'ra', table: 'dining_tables', op: 'UPDATE', row_id: 'T1', payload: { id: 'T1', status: 'FREE', current_order_id: null }, depends_on_order_id: 'A' });
     const occupyB = ev({ id: 'ob', table: 'dining_tables', op: 'UPDATE', row_id: 'T1', payload: { id: 'T1', status: 'OCCUPIED', current_order_id: 'B' } });
