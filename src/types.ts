@@ -327,6 +327,7 @@ export interface SyncEvent {
     // Etapa 0 — cadastros
     | 'tenants'
     | 'staff_users'
+    | 'pos_terminals'
     | 'categories'
     | 'products'
     | 'modifier_groups'

@@ -9,8 +9,8 @@
  *  - payments e audit_logs são só INSERT com "ignore-duplicates": reenviar o
  *    mesmo evento nunca altera um pagamento ou um log já gravado.
  *  - Os demais são upsert pelo id (merge-duplicates).
- *  - Segredos da loja (token Focus, CSC) nunca saem do aparelho por aqui: o
- *    servidor é a fonte deles.
+ *  - Segredos da loja (token Focus, CSC) e a situação fiscal da comanda
+ *    (nfce_status, nfce_key) nunca saem do aparelho por aqui: o servidor é a fonte deles.
  *  - Evento recusado pelo servidor (4xx) PARA a fila e fica visível na tela.
  *    Nada é descartado sozinho.
  */
@@ -40,6 +40,8 @@ const INSERT_ONLY: ReadonlyArray<SyncEvent['table']> = ['payments', 'audit_logs'
 /** Campos que nunca sobem do aparelho para a nuvem. */
 const NEVER_UPLOAD: Partial<Record<SyncEvent['table'], ReadonlyArray<string>>> = {
   tenants: ['focus_nfe_token', 'csc_id', 'csc_token', 'created_at'],
+  // Situação fiscal é do servidor (emit-nfce + espelho por trigger). A NFC-e local é simulação.
+  orders: ['nfce_status', 'nfce_key'],
 };
 
 export function sanitizePayload(event: SyncEvent): Record<string, unknown> {

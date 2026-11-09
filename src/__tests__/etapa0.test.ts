@@ -299,6 +299,7 @@ describe('loja nova', () => {
   });
 
   it('começa do zero com o proprietário e o usuário do QR', () => {
+    const seedTerminalIds = st().terminals.map((t) => t.id);
     useTcheStore.setState({ orders: st().orders.map((o) => (o.status === 'OPEN' || o.status === 'PAYING' ? { ...o, status: 'CLOSED' as const } : o)) });
     login(OWNER);
     expect(st().startNewStore({ tenant, owner_name: 'Zé', owner_pin: '4826' }, { managerPin: MANAGER, reason: 'Sair da demonstração' })).toMatchObject({ ok: false });
@@ -312,7 +313,10 @@ describe('loja nova', () => {
     // Maquininhas do aparelho continuam (sem elas o TEF POS Sem Fio não cobra cartão).
     expect(st().terminals.length).toBeGreaterThan(0);
     expect(st().terminals.every((t) => t.tenant_id === st().tenant.id)).toBe(true);
-    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', 'staff_users', 'audit_logs']);
+    // Id novo por loja: o mesmo id da demonstração colidiria entre lojas na nuvem.
+    expect(st().terminals.some((t) => seedTerminalIds.includes(t.id))).toBe(false);
+    const terms = st().terminals.length;
+    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', 'staff_users', ...Array(terms).fill('pos_terminals'), 'audit_logs']);
     st().logout();
     expect(st().login('4826').ok).toBe(true);
   });
@@ -364,7 +368,7 @@ describe('sincronização com o Supabase', () => {
     const del = buildSyncRequest(ev({ table: 'product_modifier_groups', op: 'DELETE', payload: { product_id: 'p', group_id: 'g' } }), cfg);
     expect(del).toMatchObject({ method: 'DELETE', url: 'https://abc.supabase.co/rest/v1/product_modifier_groups?product_id=eq.p&group_id=eq.g' });
     expect(() => buildSyncRequest(ev({ table: 'payments', op: 'DELETE' }), cfg)).toThrow();
-    expect(sanitizePayload(ev({ table: 'orders', payload: { a: 1 } }))).toEqual({ a: 1 });
+    expect(sanitizePayload(ev({ table: 'orders', payload: { a: 1, nfce_status: 'AUTORIZADA', nfce_key: '4326' } }))).toEqual({ a: 1 });
   });
 
   it('envia na ordem e para no primeiro 4xx sem descartar', async () => {

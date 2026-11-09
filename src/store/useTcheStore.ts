@@ -1604,6 +1604,7 @@ export const useTcheStore = create<TcheState>()(
           };
           const ownerCheck = validateStaff(owner, [], { ...owner });
           if (!ownerCheck.ok) return ownerCheck;
+          const terminals: PosTerminal[] = state.terminals.map((t) => ({ ...t, id: uuid(), tenant_id: tenantId }));
           // Cada loja tem o seu usuário técnico do Cardápio QR (id próprio, mesmo PIN não digitável).
           const qrUser: StaffUser = {
             id: uuid(),
@@ -1630,9 +1631,9 @@ export const useTcheStore = create<TcheState>()(
           set({
             tenant,
             staff: [owner, qrUser],
-            // As maquininhas deste aparelho continuam cadastradas (passam para a loja nova);
-            // sem elas o modo TEF POS Sem Fio não cobraria cartão.
-            terminals: state.terminals.map((t) => ({ ...t, tenant_id: tenantId })),
+            // As maquininhas deste aparelho continuam cadastradas (sem elas o modo TEF POS
+            // Sem Fio não cobraria cartão), com id novo e enviadas à nuvem antes de qualquer pagamento.
+            terminals,
             categories: [],
             products: [],
             modifierGroups: [],
@@ -1647,7 +1648,13 @@ export const useTcheStore = create<TcheState>()(
             priceSchedules: [],
             rolePermissions: [],
             tray: [],
-            outbox: [syncEvent('tenants', 'UPDATE', tenant), syncEvent('staff_users', 'INSERT', owner), syncEvent('staff_users', 'INSERT', qrUser), syncEvent('audit_logs', 'INSERT', log)],
+            outbox: [
+              syncEvent('tenants', 'UPDATE', tenant),
+              syncEvent('staff_users', 'INSERT', owner),
+              syncEvent('staff_users', 'INSERT', qrUser),
+              ...terminals.map((t) => syncEvent('pos_terminals', 'INSERT', t)),
+              syncEvent('audit_logs', 'INSERT', log),
+            ],
             currentUserId: owner.id,
             cloud: linkedCloud ?? null,
             managerPinFailures: 0,
