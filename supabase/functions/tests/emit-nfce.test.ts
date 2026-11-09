@@ -181,8 +181,8 @@ class MemoryRepo implements NfceRepository {
     this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1 };
     return { ...this.doc };
   }
-  async saveProviderResult(id: string, expected: string, fields: Partial<NfceDocumentRow>) {
-    if (!this.doc || this.doc.id !== id || this.doc.status !== expected) return null;
+  async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
+    if (!this.doc || this.doc.id !== id || this.doc.status !== expected || this.doc.transmissions !== expectedTransmissions) return null;
     this.doc = { ...this.doc, ...fields };
     return { ...this.doc };
   }
@@ -306,6 +306,27 @@ describe('emitNfce', () => {
     expect(calls.map((c) => c.method)).toEqual(['POST']);
     expect(r.body.authorized).toBe(true);
     expect(repo.doc?.status).toBe('authorized');
+  });
+
+  it('GET atrasado da tentativa anterior não grava rejeição sobre o reenvio em curso', async () => {
+    const repo = new MemoryRepo(source());
+    const { focus } = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', mensagem_sefaz: 'NCM' } }]);
+    await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    const stale = { ...repo.doc! }; // leitura da tentativa 1
+    await repo.claimRejected(stale.id, 'h2'); // tentativa 2 em curso
+    const saved = await repo.saveProviderResult(stale.id, 'processing', stale.transmissions, { status: 'rejected' });
+    expect(saved).toBeNull();
+    expect(repo.doc?.status).toBe('processing');
+  });
+
+  it('nota em processamento cancelada na Focus é gravada como cancelada', async () => {
+    const repo = new MemoryRepo(source());
+    const { focus } = fakeFocus(['network', { status: 200, body: { ...AUTHORIZED, status: 'cancelado' } }]);
+    const deps = { repo, environment: 'homologacao' as const, focus, sha256Hex };
+    await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
+    const r = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
+    expect(r.body.status).toBe('cancelled');
+    expect(repo.orderStatus).toBe('CANCELADA');
   });
 
   it('comanda de outro tenant: 404', async () => {

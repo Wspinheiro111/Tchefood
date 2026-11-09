@@ -93,9 +93,9 @@ export function supabaseNfceRepository(db: SupabaseLike): NfceRepository {
       );
     },
 
-    async saveProviderResult(id: string, expectedStatus: NfceDocumentStatus, fields: ProviderFields): Promise<NfceDocumentRow | null> {
+    async saveProviderResult(id: string, expectedStatus: NfceDocumentStatus, expectedTransmissions: number, fields: ProviderFields): Promise<NfceDocumentRow | null> {
       return check(
-        await db.from('nfce_documents').update(fields).eq('id', id).eq('status', expectedStatus).select(DOC_COLUMNS).maybeSingle(),
+        await db.from('nfce_documents').update(fields).eq('id', id).eq('status', expectedStatus).eq('transmissions', expectedTransmissions).select(DOC_COLUMNS).maybeSingle(),
         'gravar o retorno da Focus',
       );
     },

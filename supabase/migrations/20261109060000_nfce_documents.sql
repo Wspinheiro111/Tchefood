@@ -41,9 +41,9 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_FISCAL: documento NFC-e % não pode ser excluído.', OLD.id;
     END IF;
     IF NEW.status IS DISTINCT FROM OLD.status AND NOT (
-        (OLD.status = 'processing'  AND NEW.status IN ('authorized', 'rejected', 'contingency')) OR
+        (OLD.status = 'processing'  AND NEW.status IN ('authorized', 'rejected', 'contingency', 'cancelled')) OR
         (OLD.status = 'rejected'    AND NEW.status IN ('processing', 'authorized', 'contingency')) OR
-        (OLD.status = 'contingency' AND NEW.status IN ('processing', 'authorized', 'rejected')) OR
+        (OLD.status = 'contingency' AND NEW.status IN ('processing', 'authorized', 'rejected', 'cancelled')) OR
         (OLD.status = 'authorized'  AND NEW.status = 'cancelled')
     ) THEN
         RAISE EXCEPTION 'TCHEFOOD_FISCAL: transição NFC-e inválida % -> %.', OLD.status, NEW.status;

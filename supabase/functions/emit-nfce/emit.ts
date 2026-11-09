@@ -72,8 +72,11 @@ export interface NfceRepository {
   insertProcessing(doc: NewNfceDocument): Promise<NfceDocumentRow | null>;
   /** UPDATE ... SET status='processing' WHERE id=? AND status='rejected'; null se outra requisição venceu. */
   claimRejected(id: string, payloadHash: string, payload: unknown): Promise<NfceDocumentRow | null>;
-  /** UPDATE condicionado ao status lido; null se o status mudou no meio. */
-  saveProviderResult(id: string, expectedStatus: NfceDocumentStatus, fields: ProviderFields): Promise<NfceDocumentRow | null>;
+  /**
+   * UPDATE condicionado ao status E à tentativa (transmissions) lidos; null se mudou no meio.
+   * Sem a tentativa, um GET atrasado da tentativa anterior gravaria "rejected" sobre um reenvio em curso.
+   */
+  saveProviderResult(id: string, expectedStatus: NfceDocumentStatus, expectedTransmissions: number, fields: ProviderFields): Promise<NfceDocumentRow | null>;
   /** Espelha o estado na comanda (orders.nfce_status / nfce_key) para as telas atuais. */
   setOrderNfce(tenantId: string, orderId: string, status: string, accessKey: string | null): Promise<void>;
 }
@@ -206,7 +209,7 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
     // "autorizado" sem protocolo/chave não é prova de autorização: fica em processamento.
     fields = { ...fields, status: 'processing', sefaz_message: 'Focus respondeu autorizado sem protocolo ou chave. Consulte novamente.' };
   }
-  const saved = await deps.repo.saveProviderResult(doc.id, doc.status, fields);
+  const saved = await deps.repo.saveProviderResult(doc.id, doc.status, doc.transmissions, fields);
   if (!saved) {
     const current = await deps.repo.getDocument(doc.tenant_id, doc.order_id);
     return current ? respond(current, 'O estado da NFC-e mudou durante a operação; este é o estado atual.') : failure(409, 'conflict', deps.environment, 'Documento NFC-e não encontrado após a operação.');

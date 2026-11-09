@@ -177,9 +177,10 @@ export function normalizeProviderStatus(
 }
 
 const ALLOWED: Record<NfceDocumentStatus, NfceDocumentStatus[]> = {
-  processing: ['authorized', 'rejected', 'contingency'],
+  // Cancelado visto na Focus vale de qualquer estado não resolvido (ex.: autorizada com resposta perdida e cancelada no painel).
+  processing: ['authorized', 'rejected', 'contingency', 'cancelled'],
   rejected: ['processing', 'authorized', 'contingency'],
-  contingency: ['processing', 'authorized', 'rejected'],
+  contingency: ['processing', 'authorized', 'rejected', 'cancelled'],
   authorized: ['cancelled'],
   cancelled: [],
 };
