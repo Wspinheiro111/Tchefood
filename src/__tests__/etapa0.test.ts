@@ -191,7 +191,10 @@ describe('permissões', () => {
     const r = st().setRolePermission('CASHIER', 'MENU_MANAGE', true, { managerPin: OWNER, reason: 'Cobertura de turno' });
     expect(r.ok).toBe(true);
     expect(st().auditLogs[0]).toMatchObject({ action_type: 'PERMISSION_CHANGED', metadata: { role: 'CASHIER', allowed_before: false, allowed_after: true } });
-    expect(st().outbox.slice(-2).map((e) => e.table)).toEqual(['role_permissions', 'audit_logs']);
+    // Um evento só: a função do servidor confere os PINs e grava a permissão e o audit_log juntos.
+    const ev = st().outbox[st().outbox.length - 1]!;
+    expect(ev.table).toBe('role_permissions');
+    expect(ev.staff_auth).toEqual({ actor_id: staffByPin(OWNER).id, actor_pin: OWNER, manager_pin: OWNER, reason: 'Cobertura de turno' });
     login(CASHIER);
     expect(selectCan(st(), 'MENU_MANAGE')).toBe(true);
   });
@@ -271,6 +274,11 @@ describe('equipe no store', () => {
     expect(log.action_type).toBe('STAFF_PIN_CHANGED');
     expect(JSON.stringify(log)).not.toContain('4826');
     expect(JSON.stringify(log)).not.toContain(WAITER);
+    // Sobe só a pessoa, com os PINs para o servidor conferir (o audit_log nasce lá).
+    const ev = st().outbox[st().outbox.length - 1]!;
+    expect(ev).toMatchObject({ table: 'staff_users', op: 'UPDATE', row_id: tiao.id });
+    expect(ev.staff_auth).toEqual({ actor_id: staffByPin(MANAGER).id, actor_pin: MANAGER, manager_pin: MANAGER, reason: 'Esqueceu o PIN' });
+    expect(st().outbox.some((e) => e.table === 'audit_logs' && e.payload.action_type === 'STAFF_PIN_CHANGED')).toBe(false);
     expect(st().login('4826').ok).toBe(true);
   });
 
@@ -279,6 +287,8 @@ describe('equipe no store', () => {
     const me = staffByPin(MANAGER);
     expect(st().saveStaff({ id: me.id, name: me.name, role: me.role, pin_code: '4826', active: true }).ok).toBe(true);
     expect(st().auditLogs[0]!.action_type).toBe('STAFF_PIN_CHANGED');
+    // Prova para o servidor: o PIN antigo de quem trocou; sem PIN de gerente.
+    expect(st().outbox[st().outbox.length - 1]!.staff_auth).toEqual({ actor_id: me.id, actor_pin: MANAGER, manager_pin: null, reason: null });
   });
 
   it('usuário técnico do QR não é editável', () => {
@@ -316,7 +326,11 @@ describe('loja nova', () => {
     // Id novo por loja: o mesmo id da demonstração colidiria entre lojas na nuvem.
     expect(st().terminals.some((t) => seedTerminalIds.includes(t.id))).toBe(false);
     const terms = st().terminals.length;
-    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', 'staff_users', ...Array(terms).fill('pos_terminals'), 'dining_tables', 'dining_tables', 'audit_logs']);
+    // Proprietário, usuário do QR e STORE_RESET sobem juntos (tchefood_start_store).
+    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', ...Array(terms).fill('pos_terminals'), 'dining_tables', 'dining_tables']);
+    const qr = st().staff.find(isQrSelfService)!;
+    expect(st().outbox[1]!.store_start).toMatchObject({ qr_user_id: qr.id, reason: 'Sair da demonstração' });
+    expect(st().auditLogs.map((l) => l.action_type)).toEqual(['STORE_RESET']);
     // A loja nova já nasce com o balcão da Ficha Rápida e a mesa técnica do totem.
     expect(st().tables.map((t) => t.kind)).toEqual(['COUNTER', 'KIOSK']);
     st().logout();
@@ -409,6 +423,64 @@ describe('sincronização com o Supabase', () => {
     expect(del).toMatchObject({ method: 'DELETE', url: 'https://abc.supabase.co/rest/v1/product_modifier_groups?product_id=eq.p&group_id=eq.g' });
     expect(() => buildSyncRequest(ev({ table: 'payments', op: 'DELETE' }), cfg)).toThrow();
     expect(sanitizePayload(ev({ table: 'orders', payload: { a: 1, nfce_status: 'AUTORIZADA', nfce_key: '4326' } }))).toEqual({ a: 1 });
+    // Totais da conta são do banco.
+    expect(sanitizePayload(ev({ table: 'orders', payload: { a: 1, subtotal_items: 1, service_fee_amount: 1, total_amount: 1, paid_amount: 1, remaining_balance: 0 } }))).toEqual({ a: 1 });
+  });
+
+  it('UPDATE vai como PATCH pelo id e vira upsert só se a linha não existir na nuvem', async () => {
+    const upd = buildSyncRequest(ev({ table: 'event_tickets', op: 'UPDATE', row_id: 'T9', payload: { id: 'T9', redeemed: true } }), cfg);
+    expect(upd).toMatchObject({ method: 'PATCH', url: 'https://abc.supabase.co/rest/v1/event_tickets?id=eq.T9' });
+    expect(upd.headers.Prefer).toBe('return=representation');
+    expect(upd.fallback).toMatchObject({ method: 'POST', url: 'https://abc.supabase.co/rest/v1/event_tickets?on_conflict=id' });
+    // Chave composta e tabelas só de inserção continuam como antes.
+    expect(buildSyncRequest(ev({ table: 'product_modifier_groups', op: 'UPDATE', payload: { product_id: 'p', group_id: 'g' } }), cfg).method).toBe('POST');
+    expect(buildSyncRequest(ev({ table: 'orders', op: 'INSERT' }), cfg).method).toBe('POST');
+
+    const calls: string[] = [];
+    const reply = (body: string): FetchLike => async (url, init) => {
+      calls.push(`${init.method} ${url}`);
+      return { ok: true, status: 200, text: async () => (init.method === 'PATCH' ? body : '') };
+    };
+    const one = [ev({ id: 'a', table: 'orders', op: 'UPDATE', row_id: 'o1', payload: { id: 'o1' } })];
+    expect((await flushOutbox(one, cfg, reply('[{"id":"o1"}]'))).sent).toEqual(['a']);
+    expect(calls).toEqual(['PATCH https://abc.supabase.co/rest/v1/orders?id=eq.o1']);
+    calls.length = 0;
+    expect((await flushOutbox(one, cfg, reply('[]'))).sent).toEqual(['a']);
+    expect(calls).toEqual(['PATCH https://abc.supabase.co/rest/v1/orders?id=eq.o1', 'POST https://abc.supabase.co/rest/v1/orders?on_conflict=id']);
+  });
+
+  it('equipe, permissão e loja nova sobem pelas funções que conferem os PINs', async () => {
+    const staffPayload = { id: 'S1', tenant_id: 'T', name: 'Bia', role: 'CASHIER', pin_code: '5162', active: true, created_at: '2026-11-09T10:00:00.000Z' };
+    const auth = { actor_id: 'A1', actor_pin: '9999', manager_pin: '9999', reason: 'Troca de turno' };
+    const save = buildSyncRequest(ev({ table: 'staff_users', op: 'UPDATE', row_id: 'S1', payload: staffPayload, staff_auth: auth }), cfg);
+    expect(save).toMatchObject({ method: 'POST', url: 'https://abc.supabase.co/rest/v1/rpc/tchefood_save_staff' });
+    expect(JSON.parse(save.body!)).toEqual({
+      p_staff_id: 'S1', p_name: 'Bia', p_role: 'CASHIER', p_pin: '5162', p_active: true, p_actor_id: 'A1', p_actor_pin: '9999',
+      p_manager_pin: '9999', p_reason: 'Troca de turno', p_created_at: '2026-11-09T10:00:00.000Z',
+    });
+    // Fila antiga, sem os PINs: recusa com instrução, nunca grava direto.
+    expect(() => buildSyncRequest(ev({ table: 'staff_users', op: 'UPDATE', payload: staffPayload }), cfg)).toThrow(/Refaça/);
+
+    const perm = buildSyncRequest(
+      ev({ table: 'role_permissions', op: 'UPDATE', row_id: 'T:CASHIER:MENU_MANAGE', payload: { tenant_id: 'T', role: 'CASHIER', permission: 'MENU_MANAGE', allowed: true }, staff_auth: auth }),
+      cfg,
+    );
+    expect(perm.url).toBe('https://abc.supabase.co/rest/v1/rpc/tchefood_set_role_permission');
+    expect(JSON.parse(perm.body!)).toMatchObject({ p_role: 'CASHIER', p_permission: 'MENU_MANAGE', p_allowed: true, p_manager_pin: '9999' });
+    expect(() => buildSyncRequest(ev({ table: 'role_permissions', op: 'UPDATE', payload: {} }), cfg)).toThrow(/Refaça/);
+
+    const start = buildSyncRequest(
+      ev({ table: 'staff_users', op: 'INSERT', payload: { ...staffPayload, role: 'OWNER' }, store_start: { qr_user_id: 'Q1', reason: 'Sair da demonstração', metadata: { previous_tenant_id: 'D' } } }),
+      cfg,
+    );
+    expect(start.url).toBe('https://abc.supabase.co/rest/v1/rpc/tchefood_start_store');
+    expect(JSON.parse(start.body!)).toMatchObject({ p_owner_id: 'S1', p_owner_pin: '5162', p_qr_user_id: 'Q1', p_metadata: { previous_tenant_id: 'D', client_event_id: 'e1' } });
+
+    // PIN que não confere no servidor: a função responde null e o evento é recusado.
+    const nullFetch: FetchLike = async () => ({ ok: true, status: 200, text: async () => 'null' });
+    const res = await flushOutbox([ev({ id: 's', table: 'staff_users', op: 'UPDATE', row_id: 'S1', payload: staffPayload, staff_auth: auth })], cfg, nullFetch);
+    expect(res.sent).toEqual([]);
+    expect(res.rejected[0]!.message).toMatch(/não confirmou o PIN/);
   });
 
   it('evento recusado (4xx) não trava a fila: os próximos continuam subindo', async () => {
