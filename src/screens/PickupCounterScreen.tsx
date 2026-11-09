@@ -4,11 +4,12 @@ import { useTcheStore } from '../store/useTcheStore';
 import type { FulfillmentType, Order, Product } from '../types';
 import { computeItemTotal, formatBRL, round2 } from '../lib/money';
 import { FULFILLMENT_LABEL, formatPickupNumber, kioskStage, kioskTableIds, brasiliaDate, type KioskStage } from '../lib/kiosk';
-import { chargePickupOrder, printPickupKitchen, printPickupReceipt } from '../lib/pickupCharge';
+import { chargePickupOrder, finishPaidPickup, printPickupKitchen, printPickupReceipt } from '../lib/pickupCharge';
 import { useTerminalBus, type Chassis } from '../lib/payments/drivers';
 import { clearReviewHold, getReviewHold } from '../lib/payments/reviewHolds';
 import { ProductSheet } from '../components/ProductSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
+import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
 import { usePickupCart, usePickupMenu } from '../components/pickup/usePickupCart';
 import { Badge, Btn, toast } from '../components/ui';
 import { CategoryIcon } from './OrderScreen';
@@ -204,6 +205,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
   const [busy, setBusy] = useState(false);
   const [hold, setHold] = useState(() => getReviewHold(orderId));
   const [voidOpen, setVoidOpen] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   if (!order) return null;
   const number = formatPickupNumber(order.pickup_number);
@@ -294,7 +296,21 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
         <div className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
           <p className="mb-2 font-bold text-ouro">⚠️ {hold.reason}</p>
           <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de receber de novo, em qualquer forma de pagamento. Se a maquininha mostra a transação aprovada, não cobre de novo: guarde o comprovante e chame o gerente.</p>
-          <Btn variant="secondary" block onClick={() => { clearReviewHold(orderId); setHold(null); }}>Conferi no extrato: não foi cobrado</Btn>
+          <div className="grid gap-2">
+            <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
+            <Btn variant="secondary" block onClick={() => { clearReviewHold(orderId); setHold(null); }}>Conferi no extrato: não foi cobrado</Btn>
+          </div>
+          <ConfirmReviewedChargeSheet
+            open={confirmOpen}
+            onClose={() => setConfirmOpen(false)}
+            hold={hold}
+            label={`Senha ${number}`}
+            onSuccess={(outcome) => {
+              setHold(null);
+              // O comprovante TEF já saiu da maquininha: imprime a senha e manda para a cozinha.
+              if (outcome.closed) finishPaidPickup(orderId, chassis, null, null);
+            }}
+          />
         </div>
       ) : (
         <Btn block size="lg" variant="success" disabled={busy} onClick={() => void charge()}>{busy ? 'Aguardando a maquininha…' : `Cobrar ${formatBRL(order.remaining_balance)}`}</Btn>

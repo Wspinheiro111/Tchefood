@@ -48,7 +48,9 @@ import { nowISO, uuid } from '../lib/ids';
 import { idbStorage } from '../lib/idbStorage';
 import { createSeedData, KIOSK_TABLE, QR_SELF_SERVICE_USER_ID, SEED_STAFF } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
-import { getReviewHold } from '../lib/payments/reviewHolds';
+import { clearReviewHold, getReviewHold } from '../lib/payments/reviewHolds';
+import { checkReceiptProof } from '../lib/payments/terminalGuard';
+import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
@@ -83,6 +85,9 @@ export interface PendingCharge {
   started_at: number;
 }
 
+/** Bandeiras que o gerente pode marcar ao registrar o comprovante (null = não informada). */
+export const RECEIPT_CARD_BRANDS: ReadonlyArray<string> = ['VISA', 'MASTERCARD', 'ELO', 'AMEX', 'HIPERCARD'];
+
 const MANAGER_ROLES: ReadonlyArray<StaffUser['role']> = ['MANAGER', 'OWNER'];
 
 export interface ManagerAuthInput {
@@ -114,6 +119,20 @@ export interface PaymentOutcome {
   payment: Payment;
   order: Order;
   closed: boolean;
+}
+
+/**
+ * Cobrança incerta (MANUAL_REVIEW) que o comprovante da maquininha mostra
+ * aprovada. NSU e autorização são digitados do papel, nunca gerados. Forma e
+ * adquirente vêm da trava; só são aceitos aqui quando a trava é antiga e não os tem.
+ */
+export interface ReviewedChargeInput {
+  orderId: UUID;
+  nsu: string;
+  authorization_code: string;
+  card_brand: string | null;
+  method?: 'CREDIT' | 'DEBIT' | 'PIX';
+  acquirer?: 'STONE' | 'PAGBANK';
 }
 
 /** Linha da venda de balcão (Ficha Rápida): unidades inteiras, uma ficha por unidade. */
@@ -232,6 +251,11 @@ interface Actions {
   /** Reserva a conta enquanto a maquininha processa: bloqueia descontos, cancelamentos e outros pagamentos. */
   beginTerminalCharge: (orderId: UUID, requestId: string, amount: number) => ActionResult;
   endTerminalCharge: (requestId: string) => void;
+  /**
+   * Registra a cobrança incerta que a maquininha aprovou (NSU + autorização do comprovante,
+   * PIN de gerente, audit_log) sem cobrar de novo. Libera a trava e fecha a conta se quitou.
+   */
+  confirmReviewedCharge: (input: ReviewedChargeInput, auth: ManagerAuthInput) => ActionResult<PaymentOutcome>;
 
   // Fase 3 — KDS e QR Code
   advanceItemStatus: (itemId: UUID) => ActionResult<OrderItem>;
@@ -1205,6 +1229,79 @@ export const useTcheStore = create<TcheState>()(
         },
 
         endTerminalCharge: (requestId) => set((s) => ({ pendingCharges: s.pendingCharges.filter((c) => c.request_id !== requestId) })),
+
+        confirmReviewedCharge: (input, auth) => {
+          const hold = getReviewHold(input.orderId);
+          if (!hold) return fail('Não há cobrança sem confirmação para esta conta.');
+          const res = findEditableOrder(input.orderId);
+          if (!res.ok) return res;
+          const order = res.data;
+          if (activeCharge(order.id)) return fail(CHARGE_LOCK_ERROR);
+          const method = hold.method ?? input.method;
+          const acquirer = hold.acquirer ?? input.acquirer;
+          if (method !== 'CREDIT' && method !== 'DEBIT' && method !== 'PIX') return fail('Informe a forma de pagamento que aparece no comprovante.');
+          if (acquirer !== 'STONE' && acquirer !== 'PAGBANK') return fail('Informe a maquininha (Stone ou PagBank) do comprovante.');
+          if (input.card_brand !== null && !RECEIPT_CARD_BRANDS.includes(input.card_brand)) return fail('Bandeira do cartão inválida.');
+          const proof = checkReceiptProof({ nsu: input.nsu, authorization_code: input.authorization_code });
+          if (!proof.ok) return fail(proof.error);
+          // O mesmo comprovante não pode quitar duas contas.
+          const reused = get().payments.find((p) => p.status === 'APPROVED' && p.acquirer === acquirer && p.nsu === proof.nsu);
+          if (reused) return fail(`O NSU ${proof.nsu} já está registrado em outro pagamento. Confira o comprovante.`);
+          const amount = round2(hold.amount);
+          if (!(amount > 0) || toCents(amount) > toCents(order.remaining_balance)) return fail('Valor da cobrança incerta maior que o saldo restante.');
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+
+          const authRes = authorizeManager(auth, { orderId: order.id, action: 'CHARGE_CONFIRMED_MANUALLY' });
+          if (!authRes.ok) return authRes;
+          const manager = authRes.data;
+
+          const pay = get().registerPayment({
+            orderId: order.id,
+            amount,
+            method,
+            status: 'APPROVED',
+            terminal_id: hold.terminal_id ?? null,
+            acquirer,
+            acquirer_cnpj: ACQUIRER_CNPJ[acquirer],
+            card_brand: method === 'PIX' ? 'PIX' : input.card_brand,
+            nsu: proof.nsu,
+            authorization_code: proof.authorization_code,
+            terminal_serial: hold.terminal_serial || null,
+            idempotency_key: hold.idempotency_key ?? uuid(),
+            item_ids: hold.item_ids ?? [],
+          });
+          if (!pay.ok) return pay;
+
+          const log = buildAudit({
+            order_id: order.id,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: manager.id,
+            action_type: 'CHARGE_CONFIRMED_MANUALLY',
+            amount_impact: amount,
+            reason: auth.reason.trim(),
+            metadata: {
+              table: tableLabel(order.table_id),
+              pickup_number: order.pickup_number ?? null,
+              payment_id: pay.data.payment.id,
+              method,
+              acquirer,
+              nsu: proof.nsu,
+              authorization_code: proof.authorization_code,
+              card_brand: pay.data.payment.card_brand,
+              terminal_serial: pay.data.payment.terminal_serial,
+              review_code: hold.code,
+              review_reason: hold.reason,
+              review_started_at: hold.created_at,
+              order_closed: pay.data.closed,
+              operator_name: user.name,
+              manager_name: manager.name,
+            },
+          });
+          set((s) => ({ auditLogs: [log, ...s.auditLogs], outbox: [...s.outbox, syncEvent('audit_logs', 'INSERT', log)] }));
+          clearReviewHold(order.id);
+          return pay;
+        },
 
         advanceItemStatus: (itemId) => {
           const res = get().advanceItems([itemId]);

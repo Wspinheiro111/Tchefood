@@ -98,6 +98,25 @@ export function missingApprovalProof(
   return null;
 }
 
+/**
+ * Comprovante da maquininha digitado pelo gerente (cobrança incerta que a
+ * maquininha mostra aprovada). O NSU e a autorização são SEMPRE os do papel:
+ * aqui só se confere o formato, nada é completado ou gerado.
+ *  - NSU: 6 a 12 dígitos, sem ser um único dígito repetido (000000, 111111…);
+ *  - autorização (cAut): 4 a 12 letras/dígitos, sem ser um único caractere repetido.
+ */
+export function checkReceiptProof(input: { nsu: string; authorization_code: string }):
+  | { ok: true; nsu: string; authorization_code: string }
+  | { ok: false; error: string } {
+  const nsu = input.nsu.replace(/\s+/g, '');
+  const auth = input.authorization_code.replace(/\s+/g, '').toUpperCase();
+  if (!/^\d{6,12}$/.test(nsu)) return { ok: false, error: 'NSU inválido: digite os 6 a 12 números do comprovante da maquininha.' };
+  if (/^(\d)\1+$/.test(nsu)) return { ok: false, error: 'NSU inválido: confira o número no comprovante da maquininha.' };
+  if (!/^[A-Z0-9]{4,12}$/.test(auth)) return { ok: false, error: 'Código de autorização inválido: digite as 4 a 12 letras/números do comprovante.' };
+  if (/^(.)\1+$/.test(auth)) return { ok: false, error: 'Código de autorização inválido: confira no comprovante da maquininha.' };
+  return { ok: true, nsu, authorization_code: auth };
+}
+
 /** Converte o valor do PlugPag (texto ou número, em centavos) sem aceitar lixo. */
 export function parseCents(value: string | number | null | undefined): number | null {
   if (value === null || value === undefined || value === '') return null;

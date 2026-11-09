@@ -65,7 +65,10 @@ export async function chargePickupOrder(params: {
     const result = await driver.charge(req);
     const st = useTcheStore.getState();
     if (result.status === 'MANUAL_REVIEW') {
-      setReviewHold({ order_id: order.id, amount, reason: result.reason, code: result.failure_code });
+      setReviewHold({
+        order_id: order.id, amount, reason: result.reason, code: result.failure_code, method: params.method,
+        acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
+      });
       return { status: 'MANUAL_REVIEW', reason: result.reason };
     }
     if (result.status === 'DECLINED') {
@@ -79,7 +82,10 @@ export async function chargePickupOrder(params: {
     });
     if (!r.ok) {
       // A maquininha aprovou mas o registro falhou: trata como conferência manual, nunca cobra de novo.
-      setReviewHold({ order_id: order.id, amount, reason: `Aprovado na maquininha, mas não registrado: ${r.error}`, code: 'REGISTER_FAILED' });
+      setReviewHold({
+        order_id: order.id, amount, reason: `Aprovado na maquininha, mas não registrado: ${r.error}`, code: 'REGISTER_FAILED', method: params.method,
+        acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
+      });
       return { status: 'MANUAL_REVIEW', reason: r.error };
     }
     finishPaidPickup(order.id, params.chassis, result.masked_pan, r.data.payment.id, preview);

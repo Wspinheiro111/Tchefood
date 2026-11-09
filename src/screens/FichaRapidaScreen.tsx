@@ -10,6 +10,7 @@ import { cardReceiptLines } from '../lib/receipts';
 import { formatTicketToken, ticketPrint } from '../lib/eventTickets';
 import { ProductSheet, type ProductDraft } from '../components/ProductSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
+import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
 import { CashbackCapture } from '../components/CashbackPanel';
 import { Badge, Btn, toast } from '../components/ui';
 import { CategoryIcon } from './OrderScreen';
@@ -178,6 +179,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
   const [busy, setBusy] = useState(false);
   const [hold, setHold] = useState<ReviewHold | null>(() => getReviewHold(orderId));
   const [voidOpen, setVoidOpen] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const printed = useRef(false);
 
   if (!order) return null;
@@ -218,7 +220,10 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
     try {
       const result = await driver.charge(req);
       if (result.status === 'MANUAL_REVIEW') {
-        setHold(setReviewHold({ order_id: orderId, amount, reason: result.reason, code: result.failure_code }));
+        setHold(setReviewHold({
+          order_id: orderId, amount, reason: result.reason, code: result.failure_code, method: req.method,
+          acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
+        }));
         toast.alert(`⚠️ ${result.reason}`);
         return;
       }
@@ -295,7 +300,21 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
         <div className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
           <p className="mb-2 font-bold text-ouro">⚠️ {hold.reason}</p>
           <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de tentar de novo.</p>
-          <Btn variant="secondary" block onClick={() => { clearReviewHold(orderId); setHold(null); }}>Conferi no extrato: não foi cobrado</Btn>
+          <div className="grid gap-2">
+            <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
+            <Btn variant="secondary" block onClick={() => { clearReviewHold(orderId); setHold(null); }}>Conferi no extrato: não foi cobrado</Btn>
+          </div>
+          <ConfirmReviewedChargeSheet
+            open={confirmOpen}
+            onClose={() => setConfirmOpen(false)}
+            hold={hold}
+            label="Balcão"
+            onSuccess={(outcome) => {
+              setHold(null);
+              // O comprovante TEF já saiu da maquininha: imprime só as fichas.
+              if (outcome.closed) finish(null, null);
+            }}
+          />
         </div>
       ) : (
         <Btn block size="lg" variant="success" disabled={busy} onClick={() => void charge()}>{busy ? 'Aguardando a maquininha…' : `Cobrar ${formatBRL(order.remaining_balance)}`}</Btn>

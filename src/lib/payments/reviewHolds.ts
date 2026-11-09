@@ -10,6 +10,19 @@ export interface ReviewHold {
   reason: string;
   code: string;
   created_at: string;
+  /**
+   * Contexto da cobrança incerta, para o gerente registrar a aprovação que a
+   * maquininha mostrou sem cobrar de novo. Opcional: travas gravadas antes
+   * desta versão não têm esses campos e o gerente informa forma e adquirente.
+   */
+  method?: 'CREDIT' | 'DEBIT' | 'PIX';
+  acquirer?: 'STONE' | 'PAGBANK';
+  terminal_id?: string | null;
+  terminal_serial?: string | null;
+  /** Mesma chave da cobrança enviada à maquininha: o registro manual nunca duplica. */
+  idempotency_key?: string;
+  /** Mesa "por item consumido": itens que a cobrança incerta quitaria. */
+  item_ids?: string[];
 }
 
 const STORAGE_KEY = 'tchefood.paymentReviewHolds.v1';

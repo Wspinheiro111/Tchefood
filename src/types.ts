@@ -251,7 +251,8 @@ export type AuditActionType =
   | 'MANAGER_PIN_LOCKOUT'
   | 'KEG_CHANGED'
   | 'CASHBACK_REDEEMED'
-  | 'KIOSK_EXIT';
+  | 'KIOSK_EXIT'
+  | 'CHARGE_CONFIRMED_MANUALLY';
 
 export interface AuditLog {
   id: UUID;
