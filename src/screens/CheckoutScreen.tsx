@@ -10,6 +10,7 @@ import { clearReviewHold, getReviewHold, setReviewHold, type ReviewHold } from '
 import { Btn, Stepper, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { CashbackCapture, CashbackRedeem } from '../components/CashbackPanel';
+import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
 
 type SplitMode = 'EQUAL' | 'FREE' | 'ITEMS';
 type Method = 'CREDIT' | 'DEBIT' | 'PIX' | 'CASH';
@@ -41,6 +42,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const [closedOrderId, setClosedOrderId] = useState<string | null>(null);
   /** Cobrança com resultado incerto: bloqueia nova cobrança em maquininha até o operador conferir o extrato. */
   const [reviewHold, setReviewHoldState] = useState<ReviewHold | null>(() => getReviewHold(orderId));
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   useEffect(() => {
     if (order && order.status === 'OPEN' && order.remaining_balance > 0) {
@@ -114,7 +116,11 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       const result = await driver.charge(req);
       if (result.status === 'MANUAL_REVIEW') {
         // Não registra pagamento nem recusa: o resultado é desconhecido e não pode ser repetido sozinho.
-        setReviewHoldState(setReviewHold({ order_id: orderId, amount, reason: result.reason, code: result.failure_code }));
+        setReviewHoldState(setReviewHold({
+          order_id: orderId, amount, reason: result.reason, code: result.failure_code, method,
+          acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
+          idempotency_key, item_ids: itemIds,
+        }));
         toast.alert(`⚠️ ${result.reason}`);
         return;
       }
@@ -132,7 +138,16 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         acquirer_cnpj: result.acquirer_cnpj, card_brand: result.card_brand, nsu: result.nsu, authorization_code: result.authorization_code,
         terminal_serial: result.terminal_serial, idempotency_key, item_ids: itemIds, charge_request_id: req.request_id,
       });
-      if (!r.ok) return toast.error(r.error);
+      if (!r.ok) {
+        // A maquininha aprovou mas o registro falhou: trava a conta (nunca cobra de novo) e o gerente registra pelo comprovante.
+        setReviewHoldState(setReviewHold({
+          order_id: orderId, amount, reason: `Aprovado na maquininha, mas não registrado: ${r.error}`, code: 'REGISTER_FAILED', method,
+          acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
+          idempotency_key, item_ids: itemIds,
+        }));
+        toast.alert(`⚠️ Aprovado na maquininha, mas não registrado: ${r.error}`);
+        return;
+      }
       afterApproved(r.data.payment, r.data.closed, result.masked_pan, driver);
     } finally {
       useTcheStore.getState().endTerminalCharge(req.request_id);
@@ -275,8 +290,26 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       {reviewHold && (
         <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
           <div className="mb-1 font-black text-ouro">Cobrança de {formatBRL(reviewHold.amount)} sem confirmação ({reviewHold.code})</div>
-          <p className="mb-3 text-slate-200">{reviewHold.reason} Se a maquininha mostra a transação aprovada, não cobre de novo: guarde o comprovante e chame o gerente. Se não houve cobrança, libere abaixo.</p>
-          <Btn variant="secondary" size="lg" onClick={() => { clearReviewHold(orderId); setReviewHoldState(null); }}>Conferi no extrato: não foi cobrado</Btn>
+          <p className="mb-3 text-slate-200">{reviewHold.reason} Se a maquininha mostra a transação aprovada, não cobre de novo: o gerente registra pelo comprovante. Se não houve cobrança, libere abaixo.</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Btn variant="success" size="lg" onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
+            <Btn variant="secondary" size="lg" onClick={() => { clearReviewHold(orderId); setReviewHoldState(null); }}>Conferi no extrato: não foi cobrado</Btn>
+          </div>
+          <ConfirmReviewedChargeSheet
+            open={confirmOpen}
+            onClose={() => setConfirmOpen(false)}
+            hold={reviewHold}
+            label={table.label}
+            onSuccess={(outcome) => {
+              // Mesmos ajustes de afterApproved, sem reimprimir o comprovante TEF (a maquininha já imprimiu).
+              setReviewHoldState(null);
+              if (mode === 'EQUAL') setPeopleLeft((n) => Math.max(1, n - 1));
+              setSelected([]);
+              setFreeRaw('');
+              setCashGiven('');
+              if (outcome.closed) setClosedOrderId(order.id);
+            }}
+          />
         </div>
       )}
 

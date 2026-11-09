@@ -292,6 +292,7 @@ export type AuditActionType =
   | 'KEG_CHANGED'
   | 'CASHBACK_REDEEMED'
   | 'KIOSK_EXIT'
+  | 'CHARGE_CONFIRMED_MANUALLY'
   // Etapa 0 — cadastros
   | 'PRODUCT_PRICE_CHANGED'
   | 'STAFF_CREATED'

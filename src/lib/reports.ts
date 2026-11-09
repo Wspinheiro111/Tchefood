@@ -142,6 +142,7 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   KEG_CHANGED: 'Troca de barril de chopp',
   CASHBACK_REDEEMED: 'Cashback resgatado',
   KIOSK_EXIT: 'Totem fechado',
+  CHARGE_CONFIRMED_MANUALLY: 'Cobrança incerta registrada pelo comprovante',
   PRODUCT_PRICE_CHANGED: 'Preço alterado no cadastro',
   STAFF_CREATED: 'Pessoa cadastrada na equipe',
   STAFF_PIN_CHANGED: 'PIN trocado',
@@ -161,5 +162,6 @@ export function whatsappAlertText(log: AuditLog, staff: readonly StaffUser[], ta
   const impact = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(log.amount_impact);
   const hour = new Date(log.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
   const product = log.metadata?.product_name ? `\n🍖 Item: ${String(log.metadata.quantity ?? '')}x ${String(log.metadata.product_name)}` : '';
-  return `🚨 *Tchê Food — Alerta Anti-Fraude*\n⏰ ${hour} · 🪑 ${table}\n📌 ${AUDIT_LABEL[log.action_type]}${product}\n🙋 Garçom: ${waiter}\n🔐 Autorizado por: ${manager}\n💰 Impacto: ${impact}\n📝 Motivo: "${log.reason}"`;
+  const receipt = log.metadata?.nsu ? `\n🧾 NSU ${String(log.metadata.nsu)} · AUT ${String(log.metadata.authorization_code ?? '')}` : '';
+  return `🚨 *Tchê Food — Alerta Anti-Fraude*\n⏰ ${hour} · 🪑 ${table}\n📌 ${AUDIT_LABEL[log.action_type]}${product}${receipt}\n🙋 Garçom: ${waiter}\n🔐 Autorizado por: ${manager}\n💰 Impacto: ${impact}\n📝 Motivo: "${log.reason}"`;
 }
