@@ -208,7 +208,8 @@ export function recordKeys(event: SyncEvent): string[] {
 }
 
 /**
- * Envia a fila em ordem até acabar, até um erro de rede/servidor, ou até `limit` eventos.
+ * Envia a fila em ordem até acabar, até um erro de rede/servidor, ou até `limit` envios
+ * (eventos segurados não contam).
  * Um evento recusado (4xx) não para o envio: vai para `rejected` e o próximo segue.
  * Eventos posteriores do MESMO registro de um recusado (nesta rodada ou em `held`, os
  * recusados guardados) não sobem: ficam na fila até o recusado ser reenviado, para uma
@@ -230,8 +231,13 @@ export async function flushOutbox(
     rejected.push({ eventId: event.id, status, message });
     for (const k of recordKeys(event)) blocked.add(k);
   };
-  for (const event of serverOrder(events).slice(0, limit)) {
+  let attempts = 0;
+  for (const event of serverOrder(events)) {
+    // Eventos segurados não contam no limite: senão um bloco segurado no começo da fila
+    // impediria para sempre que registros sem relação subissem.
     if (recordKeys(event).some((k) => blocked.has(k))) continue;
+    if (attempts >= limit) break;
+    attempts++;
     let req: SyncRequest;
     try {
       req = buildSyncRequest(event, cfg);

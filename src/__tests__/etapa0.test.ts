@@ -493,6 +493,14 @@ describe('sincronização com o Supabase', () => {
     expect(calls.some((c) => c.includes('"v":2'))).toBe(false);
   });
 
+  it('eventos segurados não gastam o limite da rodada', async () => {
+    const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
+    const held = ev({ id: 'h', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } });
+    const blocked = Array.from({ length: 50 }, (_, i) => ev({ id: `b${i}`, table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } }));
+    const free = ev({ id: 'f', table: 'products', op: 'UPDATE', row_id: 'Q', payload: { id: 'Q' } });
+    expect((await flushOutbox([...blocked, free], cfg, fetchFn, 50, [held])).sent).toEqual(['f']);
+  });
+
   it('o store guarda o PIN só no evento da fila e não no audit_log', () => {
     login(WAITER);
     const opened = st().openTable(table(1).id, 2, null);
