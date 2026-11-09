@@ -171,6 +171,7 @@ export const SEED_CATEGORIES: Category[] = [
   category('sem-alcool', 'Sem Álcool', 7, 'CupSoda'),
   category('sobremesas', 'Sobremesas', 8, 'IceCreamCone'),
   category('buffet', 'Buffet a Quilo', 9, 'Scale'),
+  category('combos', 'Combos', 10, 'Package'),
 ];
 
 interface ProductSpec {
@@ -189,6 +190,8 @@ interface ProductSpec {
   /** Fase 5: vendido por peso (preço do KG) e tara padrão do prato. */
   weight?: { tare: number };
   cost?: number;
+  /** Combo: os itens saem dos grupos do combo (opções com component_product_id). */
+  combo?: boolean;
 }
 
 const PRODUCT_SPECS: ProductSpec[] = [
@@ -235,6 +238,8 @@ const PRODUCT_SPECS: ProductSpec[] = [
   // Buffet a quilo (balança Toledo/Filizola)
   { code: '901', name: 'Buffet Livre a Quilo', cat: 'buffet', price: 79.9, sector: 'NONE', weight: { tare: 280 }, cost: 31.5, description: 'Preço por kg. Tara do prato raso: 280 g.' },
   { code: '902', name: 'Sobremesas a Quilo', cat: 'buffet', price: 59.9, sector: 'NONE', weight: { tare: 120 }, cost: 22, description: 'Preço por kg. Tara da taça: 120 g.' },
+  // Combos: o combo não vai para a produção; cada escolha vira um item na praça dela.
+  { code: '501', name: 'Combo Campeiro', cat: 'combos', price: 64.9, sector: 'NONE', combo: true, description: 'Carreteiro + bebida + sobremesa.' },
 ];
 
 /** CMV de referência (ficha técnica) dos itens mais vendidos. */
@@ -265,6 +270,7 @@ export const SEED_PRODUCTS: Product[] = PRODUCT_SPECS.map((p) => ({
   sold_by_weight: Boolean(p.weight),
   tare_weight_grams: p.weight?.tare ?? 0,
   cost_price: p.cost ?? COST_BY_CODE[p.code] ?? 0,
+  is_combo: p.combo ?? false,
 }));
 
 // ---------------------------------------------------------------------------
@@ -274,7 +280,14 @@ function group(key: string, name: string, min: number, max: number, required: bo
   return { id: seedId(`mg:${key}`), tenant_id: T, name, min_selection: min, max_selection: max, required };
 }
 function option(groupKey: string, key: string, name: string, price: number, volumeMl: number | null = null): ModifierOption {
-  return { id: seedId(`mo:${groupKey}:${key}`), group_id: seedId(`mg:${groupKey}`), name, additional_price: price, volume_ml: volumeMl };
+  return {
+    id: seedId(`mo:${groupKey}:${key}`), group_id: seedId(`mg:${groupKey}`), name, additional_price: price, volume_ml: volumeMl,
+    component_product_id: null, component_quantity: 1,
+  };
+}
+/** Opção de combo: coloca o produto `code` no pedido. */
+function comboOption(groupKey: string, code: string, name: string, price: number): ModifierOption {
+  return { ...option(groupKey, code, name, price), component_product_id: seedId(`product:${code}`) };
 }
 
 export const SEED_MODIFIER_GROUPS: ModifierGroup[] = [
@@ -285,6 +298,9 @@ export const SEED_MODIFIER_GROUPS: ModifierGroup[] = [
   group('fruta-caipira', 'Fruta da Caipirinha', 1, 1, true),
   group('borda', 'Borda Recheada', 0, 1, false),
   group('sabor-refri', 'Sabor do Refrigerante', 1, 1, true),
+  group('combo-prato', 'Prato do combo', 1, 1, true),
+  group('combo-bebida', 'Bebida do combo', 1, 1, true),
+  group('combo-sobremesa', 'Sobremesa do combo', 1, 1, true),
 ];
 
 export const SEED_MODIFIER_OPTIONS: ModifierOption[] = [
@@ -311,6 +327,13 @@ export const SEED_MODIFIER_OPTIONS: ModifierOption[] = [
   option('sabor-refri', 'cola', 'Cola', 0),
   option('sabor-refri', 'guarana', 'Guaraná', 0),
   option('sabor-refri', 'laranja', 'Laranja', 0),
+  comboOption('combo-prato', '301', 'Arroz Carreteiro', 0),
+  comboOption('combo-prato', '302', 'Galeto Primo Canto', 9),
+  comboOption('combo-bebida', '222', 'Água Mineral 500ml', 0),
+  comboOption('combo-bebida', '223', 'Suco Natural', 4),
+  comboOption('combo-bebida', '201', 'Chopp Pilsen', 3),
+  comboOption('combo-sobremesa', '601', 'Sagu com Creme', 0),
+  comboOption('combo-sobremesa', '602', 'Pudim de Leite', 0),
 ];
 
 function link(code: string, groupKey: string, sort: number): ProductModifierGroup {
@@ -327,6 +350,9 @@ export const SEED_PRODUCT_MODIFIER_GROUPS: ProductModifierGroup[] = [
   link('211', 'fruta-caipira', 2),
   ...['401', '402', '403', '404', '405'].map((c) => link(c, 'borda', 1)),
   link('221', 'sabor-refri', 1),
+  link('501', 'combo-prato', 1),
+  link('501', 'combo-bebida', 2),
+  link('501', 'combo-sobremesa', 3),
 ];
 
 // ---------------------------------------------------------------------------
@@ -479,6 +505,7 @@ function buildItem(orderId: string, line: SeedLine, idx: number): OrderItem {
     weight_tare_grams: null,
     weight_source: null,
     keg_volume_ml: kegVolume,
+    combo_parent_item_id: null,
   };
 }
 
