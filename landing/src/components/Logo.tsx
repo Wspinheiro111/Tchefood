@@ -1,15 +1,27 @@
-import { Flame } from 'lucide-react';
+import iconUrl from '../assets/brand/icon.png';
+import logoUrl from '../assets/brand/logo.png';
 
+/**
+ * Logo oficial do Tchê Food.
+ * - padrão: logo horizontal completa (símbolo + nome + "Sistema para restaurantes e delivery")
+ * - `compacto`: só o símbolo + nome em texto, para espaços pequenos
+ */
 export default function Logo({ compacto = false }: { compacto?: boolean }) {
+  if (compacto) {
+    return (
+      <span className="inline-flex items-center gap-2">
+        <img src={iconUrl} alt="" aria-hidden className="h-9 w-9 object-contain" />
+        <span className="font-display text-lg font-extrabold">
+          <span className="text-verde">Tchê</span>
+          <span className="text-brasa">Food</span>
+        </span>
+      </span>
+    );
+  }
   return (
-    <span className="inline-flex items-center gap-2">
-      <span className="grid h-9 w-9 place-items-center rounded-xl bg-gradient-to-br from-brasa to-ouro shadow-lg shadow-brasa/30">
-        <Flame className="h-5 w-5 text-white" aria-hidden />
-      </span>
-      <span className="leading-tight">
-        <span className="block font-display text-lg font-extrabold text-slate-900">Tchê Food</span>
-        {!compacto && <span className="block text-[11px] text-slate-600">um produto W9 Sistemas</span>}
-      </span>
+    <span className="inline-flex flex-col items-start">
+      <img src={logoUrl} alt="Tchê Food — Sistema para restaurantes e delivery" className="h-10 w-auto object-contain sm:h-11" />
+      <span className="sr-only">um produto W9 Sistemas</span>
     </span>
   );
 }

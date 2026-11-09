@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { Flame, Wifi, WifiOff } from 'lucide-react';
+import { Wifi, WifiOff } from 'lucide-react';
+import { BrandLogo } from '../components/Brand';
 import { PinPad } from '../components/PinPad';
 import { useTcheStore } from '../store/useTcheStore';
 import { playDeniedBuzz, vibrate } from '../lib/sound';
@@ -25,11 +26,8 @@ export function LoginScreen() {
   return (
     <div className="flex min-h-full flex-col items-center justify-center bg-gradient-to-b from-base to-surface px-4 py-8">
       <div className="mb-6 flex flex-col items-center text-center">
-        <div className="mb-3 grid h-16 w-16 place-items-center rounded-2xl bg-brasa shadow-lg shadow-brasa/30">
-          <Flame className="h-9 w-9 text-white" />
-        </div>
-        <h1 className="text-3xl font-black tracking-tight">
-          Tchê <span className="text-ouro">Food</span>
+        <h1 className="mb-2">
+          <BrandLogo variant="dark" className="h-20 w-auto max-w-[min(90vw,360px)] sm:h-24" />
         </h1>
         <p className="text-sm text-slate-400">{tenant.name} · {tenant.city}/{tenant.state}</p>
         <span className={`mt-2 inline-flex items-center gap-1 text-xs ${online ? 'text-stone' : 'text-ouro'}`}>

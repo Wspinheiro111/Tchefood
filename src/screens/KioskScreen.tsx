@@ -6,7 +6,6 @@ import {
   ChevronRight,
   CreditCard,
   Delete,
-  Flame,
   Hand,
   Loader2,
   Minus,
@@ -17,6 +16,7 @@ import {
   TriangleAlert,
   UtensilsCrossed,
 } from 'lucide-react';
+import { BrandMark } from '../components/Brand';
 import { useTcheStore } from '../store/useTcheStore';
 import type { FulfillmentType, Order, Product } from '../types';
 import { computeItemTotal, formatBRL } from '../lib/money';
@@ -179,8 +179,8 @@ export function KioskScreen() {
       {/* Topo */}
       {step.name !== 'welcome' && (
         <header className="flex items-center gap-3 border-b border-orange-200 bg-white/70 px-5 py-3">
-          <button aria-label="Logo" onClick={tapLogo} className="grid h-12 w-12 place-items-center rounded-2xl bg-brasa text-white">
-            <Flame className="h-7 w-7" />
+          <button aria-label="Logo" onClick={tapLogo} className="grid h-12 w-12 place-items-center">
+            <BrandMark className="h-12 w-12" />
           </button>
           <div className="mr-auto leading-tight">
             <div className="text-xl font-black">{tenant.name}</div>
@@ -423,8 +423,8 @@ function Welcome({ name, onStart, onLogo }: { name: string; onStart: () => void;
     <div className="relative flex h-full flex-col items-center justify-between overflow-hidden bg-gradient-to-b from-brasa to-[#7f1d1d] p-8 text-white" onClick={onStart}>
       <div className="pointer-events-none absolute -right-24 -top-24 h-96 w-96 rounded-full bg-ouro/30 blur-3xl" />
       <div className="pointer-events-none absolute -bottom-32 -left-24 h-96 w-96 rounded-full bg-orange-400/30 blur-3xl" />
-      <button aria-label="Logo" onClick={(e) => { e.stopPropagation(); onLogo(); }} className="relative mt-6 grid h-24 w-24 place-items-center rounded-[2rem] bg-white/15">
-        <Flame className="h-14 w-14" />
+      <button aria-label="Logo" onClick={(e) => { e.stopPropagation(); onLogo(); }} className="relative mt-6 grid h-28 w-28 place-items-center rounded-[2rem] bg-white p-3 shadow-xl">
+        <BrandMark className="h-full w-full" />
       </button>
       <div className="relative text-center">
         <div className="text-2xl font-bold uppercase tracking-[0.3em] text-orange-200">Bem-vindo ao</div>

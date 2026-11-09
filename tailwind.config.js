@@ -6,7 +6,9 @@ export default {
       colors: {
         base: '#0f172a',
         surface: '#1e293b',
-        brasa: '#e11d48',
+        brasa: '#D2232A', // vermelho oficial da marca
+        verde: '#0B7A3B', // verde oficial da marca
+        amarelo: '#FFCB05', // amarelo oficial da marca
         ouro: '#f59e0b',
         stone: '#10b981',
         pagbank: '#eab308',
@@ -14,8 +16,8 @@ export default {
       minHeight: { touch: '48px', 'touch-lg': '56px' },
       keyframes: {
         'pulse-ring': {
-          '0%': { boxShadow: '0 0 0 0 rgba(225,29,72,0.6)' },
-          '100%': { boxShadow: '0 0 0 14px rgba(225,29,72,0)' },
+          '0%': { boxShadow: '0 0 0 0 rgba(210,35,42,0.6)' },
+          '100%': { boxShadow: '0 0 0 14px rgba(210,35,42,0)' },
         },
         'slide-up': {
           '0%': { transform: 'translateY(100%)' },
