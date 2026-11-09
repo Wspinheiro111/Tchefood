@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { migratePersistedState, useTcheStore } from '../store/useTcheStore';
+import { migratePersisted, useTcheStore } from '../store/useTcheStore';
 import {
   NfeImportError,
   packagingFactorFromInvoice,
@@ -221,8 +221,8 @@ describe('importação para o estoque', () => {
 });
 
 describe('migração do estado salvo', () => {
-  it('v1 → v2 preenche custo, estoque e tabelas novas', () => {
-    const migrated = migratePersistedState({ products: [{ id: 'x', name: 'A' }] }, 1);
+  it('v4 → v5 preenche custo, estoque e tabelas novas', () => {
+    const migrated = migratePersisted({ products: [{ id: 'x', name: 'A' }] }, 4) as Record<string, unknown>;
     expect(migrated.products).toEqual([{ id: 'x', name: 'A', cost_price: 0, stock_quantity: 0, barcode: null }]);
     expect(migrated.purchaseInvoices).toEqual([]);
     expect(migrated.stockMovements).toEqual([]);

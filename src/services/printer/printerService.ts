@@ -9,6 +9,7 @@
  */
 import { create } from 'zustand';
 import type { OrderItem, Product, ProductionSector, StaffUser } from '../../types';
+import { printLedgerGet, printLedgerMark } from './printLedger';
 import { UniversalEscPosBuilder, type PaperWidth, type PreviewEvent, type PrinterConfig, type PrinterSector } from './escposBuilder';
 
 export interface NativePrinterBridge {
@@ -24,7 +25,7 @@ export interface RenderedTicket {
   byteLength: number;
   /** Mesmo conteúdo renderizado em 80mm e em 58mm para a comparação lado a lado. */
   preview: Record<PaperWidth, PreviewEvent[]>;
-  delivery: { ok: boolean; via: 'NATIVE' | 'SIMULATOR'; error?: string };
+  delivery: { ok: boolean; via: 'NATIVE' | 'SIMULATOR'; error?: string; skipped?: 'ALREADY_PRINTED' | 'PRINT_RESULT_UNCERTAIN' };
 }
 
 /** Praça da impressora que atende cada setor de produção. */
@@ -41,13 +42,15 @@ export interface KitchenTicketData {
   fromQr: boolean;
   createdAt: string;
   items: Array<{ quantity: number; name: string; code: string; doneness: string | null; notes: string | null }>;
+  /** Título gigante no lugar de "MESA n" (ex.: "SENHA 042" no pedido do totem). */
+  headline?: string;
 }
 
 /** Ticket de produção: mesa gigante, quantidade/ponto em dupla altura. */
 export function buildKitchenTicket(width: PaperWidth, data: KitchenTicketData, opts: { beep: boolean; cut: boolean }): UniversalEscPosBuilder {
   const b = new UniversalEscPosBuilder(width);
   if (opts.beep) b.beep();
-  b.align('CENTER').size('LARGE').bold(true).line(`MESA ${data.tableNumber}`);
+  b.align('CENTER').size('LARGE').bold(true).line(data.headline ?? `MESA ${data.tableNumber}`);
   b.size('DOUBLE_HEIGHT').line(data.sectorLabel.toUpperCase());
   b.size('NORMAL').bold(false).align('LEFT').divider('=');
   b.leftRight(data.fromQr ? 'PEDIDO VIA QR CODE' : `Garcom: ${data.waiterName}`, new Date(data.createdAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }));
@@ -91,28 +94,60 @@ export function buildTestPage(width: PaperWidth, printer: PrinterConfig): Univer
   return b;
 }
 
-function sendNative(printer: PrinterConfig, base64: string): RenderedTicket['delivery'] {
+type NativeCall = () => string;
+
+function nativeCall(printer: PrinterConfig, base64: string): NativeCall | null {
   const bridge = (window as unknown as { SmartPosNative?: NativePrinterBridge }).SmartPosNative;
-  try {
-    if (printer.connection === 'NETWORK_TCP' && bridge?.printNetworkEscPos && printer.ipAddress) {
-      const r = JSON.parse(bridge.printNetworkEscPos(printer.ipAddress, printer.port ?? 9100, base64)) as { success: boolean; error?: string };
-      return { ok: r.success, via: 'NATIVE', error: r.error };
-    }
-    if (printer.connection === 'BLUETOOTH' && bridge?.printBluetoothEscPos && printer.macAddress) {
-      const r = JSON.parse(bridge.printBluetoothEscPos(printer.macAddress, base64)) as { success: boolean; error?: string };
-      return { ok: r.success, via: 'NATIVE', error: r.error };
-    }
-    if (printer.connection === 'SMARTPOS_INTERNAL' && bridge?.printInternalEscPos) {
-      const r = JSON.parse(bridge.printInternalEscPos(base64)) as { success: boolean; error?: string };
-      return { ok: r.success, via: 'NATIVE', error: r.error };
-    }
-  } catch (e) {
-    return { ok: false, via: 'NATIVE', error: e instanceof Error ? e.message : String(e) };
+  if (printer.connection === 'NETWORK_TCP' && bridge?.printNetworkEscPos && printer.ipAddress) {
+    const fn = bridge.printNetworkEscPos.bind(bridge);
+    return () => fn(printer.ipAddress!, printer.port ?? 9100, base64);
   }
-  return { ok: true, via: 'SIMULATOR' };
+  if (printer.connection === 'BLUETOOTH' && bridge?.printBluetoothEscPos && printer.macAddress) {
+    const fn = bridge.printBluetoothEscPos.bind(bridge);
+    return () => fn(printer.macAddress!, base64);
+  }
+  if (printer.connection === 'SMARTPOS_INTERNAL' && bridge?.printInternalEscPos) {
+    const fn = bridge.printInternalEscPos.bind(bridge);
+    return () => fn(base64);
+  }
+  return null;
 }
 
-function render(printer: PrinterConfig, title: string, make: (w: PaperWidth) => UniversalEscPosBuilder): RenderedTicket {
+/**
+ * Envia pela ponte nativa. Com `ledgerKey`, aplica o ledger STARTED/COMPLETE:
+ * ticket já impresso não sai de novo, e ticket com resultado incerto não é
+ * reimpresso sozinho.
+ */
+function sendNative(printer: PrinterConfig, base64: string, ledgerKey?: string): RenderedTicket['delivery'] {
+  if (typeof window === 'undefined') return { ok: true, via: 'SIMULATOR' };
+  const call = nativeCall(printer, base64);
+  if (!call) return { ok: true, via: 'SIMULATOR' };
+  if (ledgerKey) {
+    const previous = printLedgerGet(ledgerKey);
+    if (previous?.state === 'COMPLETE') return { ok: true, via: 'NATIVE', skipped: 'ALREADY_PRINTED' };
+    if (previous?.state === 'STARTED') {
+      return { ok: false, via: 'NATIVE', skipped: 'PRINT_RESULT_UNCERTAIN', error: 'A impressão anterior pode ter saído. Confira o papel antes de reimprimir.' };
+    }
+    printLedgerMark(ledgerKey, 'STARTED');
+  }
+  let raw: string;
+  try {
+    raw = call();
+  } catch (e) {
+    // A ponte caiu depois de receber os bytes? Sem prova: fica STARTED (incerto).
+    return { ok: false, via: 'NATIVE', error: e instanceof Error ? e.message : String(e) };
+  }
+  let r: { success: boolean; error?: string };
+  try {
+    r = JSON.parse(raw) as { success: boolean; error?: string };
+  } catch {
+    return { ok: false, via: 'NATIVE', error: 'Resposta inválida da impressora' };
+  }
+  if (ledgerKey) printLedgerMark(ledgerKey, r.success ? 'COMPLETE' : 'FAILED');
+  return { ok: r.success, via: 'NATIVE', error: r.error };
+}
+
+function render(printer: PrinterConfig, title: string, make: (w: PaperWidth) => UniversalEscPosBuilder, ledgerKey?: string): RenderedTicket {
   const real = make(printer.paperWidth);
   const base64 = real.toBase64();
   return {
@@ -121,7 +156,7 @@ function render(printer: PrinterConfig, title: string, make: (w: PaperWidth) => 
     base64,
     byteLength: real.toBytes().length,
     preview: { '80MM': make('80MM').preview, '58MM': make('58MM').preview },
-    delivery: sendNative(printer, base64),
+    delivery: sendNative(printer, base64, ledgerKey),
   };
 }
 
@@ -138,6 +173,7 @@ export function routeDispatch(params: {
   staff: readonly StaffUser[];
   tableLabel: string;
   tableNumber: number;
+  headline?: string;
 }): RenderedTicket[] {
   const bySector = new Map<ProductionSector, OrderItem[]>();
   for (const i of params.items) bySector.set(i.sector, [...(bySector.get(i.sector) ?? []), i]);
@@ -153,13 +189,16 @@ export function routeDispatch(params: {
       waiterName: params.staff.find((s) => s.id === first.waiter_id)?.name ?? '-',
       fromQr: first.origin === 'QRCODE_TABLE',
       createdAt: first.created_at,
+      ...(params.headline ? { headline: params.headline } : {}),
       items: items.map((i) => {
         const p = params.products.find((x) => x.id === i.product_id);
         return { quantity: i.quantity, name: p?.name ?? 'Item', code: p?.code ?? '', doneness: i.meat_doneness, notes: i.notes };
       }),
     };
     for (const printer of fallback) {
-      out.push(render(printer, `${SECTOR_TITLE[sector]} · ${params.tableLabel}`, (w) => buildKitchenTicket(w, data, { beep: printer.beepOnPrint, cut: printer.cutPaper })));
+      // Mesmo lote de itens na mesma impressora = mesmo ticket físico.
+      const ledgerKey = `kitchen:${printer.id}:${items.map((i) => i.id).sort().join(',')}`;
+      out.push(render(printer, `${SECTOR_TITLE[sector]} · ${params.tableLabel}`, (w) => buildKitchenTicket(w, data, { beep: printer.beepOnPrint, cut: printer.cutPaper }), ledgerKey));
     }
   }
   return out;

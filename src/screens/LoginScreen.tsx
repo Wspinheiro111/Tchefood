@@ -46,6 +46,7 @@ export function LoginScreen() {
         <span>9999 · Gerente</span>
         <span>8888 · Dono</span>
         <span>5555 · Caixa</span>
+        <span>4444 · Totem (cliente)</span>
       </div>
     </div>
   );

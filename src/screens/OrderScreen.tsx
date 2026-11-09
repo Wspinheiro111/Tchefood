@@ -1,14 +1,16 @@
 import { useMemo, useRef, useState } from 'react';
-import { Beer, CupSoda, Drumstick, Flame, IceCreamCone, Martini, Pizza, Utensils, UtensilsCrossed, type LucideIcon } from 'lucide-react';
+import { Beer, CupSoda, Drumstick, Flame, IceCreamCone, Martini, Pizza, Scale, Utensils, UtensilsCrossed, type LucideIcon } from 'lucide-react';
 import { ArrowLeft, ChevronDown, ChevronUp, Minus, Plus, Search, Send, SlidersHorizontal, Trash2 } from 'lucide-react';
+import { useSalePrice } from '../lib/useSalePrice';
 import { useTcheStore } from '../store/useTcheStore';
 import type { Product, ProductionSector } from '../types';
-import { computeItemTotal, formatBRL } from '../lib/money';
+import { computeItemTotal, formatBRL, formatQty } from '../lib/money';
 import { playDispatchChime, vibrate } from '../lib/sound';
 import { ProductSheet, type ProductDraft } from '../components/ProductSheet';
 import { Badge, Btn, toast } from '../components/ui';
 import { StatementPanel } from './StatementPanel';
 import { printDispatchedItems } from '../components/PrintSimulator';
+import { ScaleSheet } from '../components/ScaleSheet';
 
 export const SECTOR_LABEL: Record<ProductionSector, string> = {
   GRILL: '🔥 Parrilla',
@@ -18,7 +20,7 @@ export const SECTOR_LABEL: Record<ProductionSector, string> = {
   NONE: 'Sem preparo',
 };
 
-const CATEGORY_ICONS: Record<string, LucideIcon> = { Flame, UtensilsCrossed, Drumstick, Pizza, Beer, Martini, CupSoda, IceCreamCone };
+const CATEGORY_ICONS: Record<string, LucideIcon> = { Flame, UtensilsCrossed, Drumstick, Pizza, Beer, Martini, CupSoda, IceCreamCone, Scale };
 
 export function CategoryIcon({ name, className }: { name: string | null; className?: string }) {
   const Cmp = (name && CATEGORY_ICONS[name]) || Utensils;
@@ -75,16 +77,20 @@ function MenuPanel({ orderId }: { orderId: string }) {
   const products = useTcheStore((s) => s.products);
   const links = useTcheStore((s) => s.productModifierGroups);
   const addToTray = useTcheStore((s) => s.addToTray);
-  const [cat, setCat] = useState<string>(categories[0]?.id ?? '');
+  const priceOf = useSalePrice();
+  const [cat, setCat] = useState<string>(categories.find((c) => c.active)?.id ?? '');
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Product | null>(null);
+  const [scaleOpen, setScaleOpen] = useState(false);
+  const hasWeighable = products.some((p) => p.sold_by_weight && p.available);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const list = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (q) return products.filter((p) => p.code.startsWith(q) || p.name.toLowerCase().includes(q));
-    return products.filter((p) => p.category_id === cat);
-  }, [products, cat, query]);
+    const live = products.filter((p) => p.active && categories.some((c) => c.id === p.category_id && c.active));
+    if (q) return live.filter((p) => p.code.toLowerCase().startsWith(q) || p.name.toLowerCase().includes(q));
+    return live.filter((p) => p.category_id === cat);
+  }, [products, categories, cat, query]);
 
   const needsSheet = (p: Product) => p.requires_meat_doneness || p.allows_half_and_half || links.some((l) => l.product_id === p.id);
 
@@ -98,12 +104,13 @@ function MenuPanel({ orderId }: { orderId: string }) {
 
   const tapProduct = (p: Product, forceSheet = false) => {
     if (!p.available) return toast.error(`${p.name} em falta hoje.`);
+    if (p.sold_by_weight) return setScaleOpen(true);
     if (forceSheet || needsSheet(p)) return setSelected(p);
-    add({ product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector });
+    add({ product_id: p.id, half_product_ids: [], quantity: 1, unit_price: priceOf(p), modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector });
   };
 
   const submitCode = () => {
-    const exact = products.find((p) => p.code === query.trim());
+    const exact = list.find((p) => p.code === query.trim());
     if (exact) {
       tapProduct(exact);
       setQuery('');
@@ -125,6 +132,11 @@ function MenuPanel({ orderId }: { orderId: string }) {
           className="min-h-touch-lg w-full rounded-xl border border-slate-700 bg-surface pl-11 pr-3 text-lg outline-none focus:border-ouro"
         />
       </div>
+      {hasWeighable && (
+        <Btn block size="lg" variant="gold" className="mb-3" onClick={() => setScaleOpen(true)}>
+          <Scale className="h-5 w-5" /> ⚖️ Lançar Buffet a Quilo (Balança)
+        </Btn>
+      )}
       {!query && (
         <div className="scroll-thin -mx-3 mb-3 flex gap-2 overflow-x-auto px-3 pb-1">
           {categories.filter((c) => c.active).sort((a, b) => a.sort_order - b.sort_order).map((c) => (
@@ -149,12 +161,13 @@ function MenuPanel({ orderId }: { orderId: string }) {
                   {SECTOR_LABEL[p.sector]}
                   {p.requires_meat_doneness && <Badge className="bg-rose-900/60 text-rose-200">Ponto</Badge>}
                   {p.allows_half_and_half && <Badge className="bg-amber-900/60 text-amber-200">½ a ½</Badge>}
+                  {p.sold_by_weight && <Badge className="bg-emerald-900/60 text-emerald-200">por kg</Badge>}
                   {!p.available && <Badge className="bg-slate-700">Em falta</Badge>}
                 </span>
               </span>
-              <span className="font-bold tabular-nums">{formatBRL(p.price)}</span>
+              <span className="font-bold tabular-nums">{formatBRL(priceOf(p))}{p.sold_by_weight ? '/kg' : ''}</span>
             </button>
-            {!needsSheet(p) && p.available && (
+            {!needsSheet(p) && !p.sold_by_weight && p.available && (
               <button aria-label="Opções" onClick={() => tapProduct(p, true)} className="grid w-12 place-items-center border-l border-slate-700 text-slate-400 active:bg-slate-700">
                 <SlidersHorizontal className="h-5 w-5" />
               </button>
@@ -165,6 +178,7 @@ function MenuPanel({ orderId }: { orderId: string }) {
       </div>
 
       <ProductSheet product={selected} onClose={() => setSelected(null)} onConfirm={add} />
+      <ScaleSheet orderId={orderId} open={scaleOpen} onClose={() => setScaleOpen(false)} />
       <DispatchTray orderId={orderId} />
     </div>
   );
@@ -183,14 +197,15 @@ function DispatchTray({ orderId }: { orderId: string }) {
 
   if (tray.length === 0) return null;
   const total = tray.reduce((a, t) => a + computeItemTotal(t.quantity, t.unit_price, t.modifiers_unit_price), 0);
-  const count = tray.reduce((a, t) => a + t.quantity, 0);
+  const count = tray.reduce((a, t) => a + (t.weight ? 1 : t.quantity), 0);
 
   const send = () => {
     const r = dispatch(orderId);
     if (!r.ok) return toast.error(r.error);
     if (sound) playDispatchChime();
     vibrate([40, 30, 40]);
-    printDispatchedItems(r.data.items);
+    // Prato pesado já foi servido no buffet: não vai para a produção.
+    printDispatchedItems(r.data.items.filter((i) => i.weight_gross_grams === null));
     toast.success(`✅ ${r.data.count} item(ns) enviados: ${r.data.sectors.map((s) => SECTOR_LABEL[s]).join(' · ')}`);
     setExpanded(false);
   };
@@ -214,9 +229,15 @@ function DispatchTray({ orderId }: { orderId: string }) {
                   {extras.length > 0 && <div className="truncate text-xs text-sky-300">{extras.join(' · ')}</div>}
                   <div className="text-xs text-slate-400">{SECTOR_LABEL[t.sector]} · {formatBRL(computeItemTotal(t.quantity, t.unit_price, t.modifiers_unit_price))}</div>
                 </div>
-                <button aria-label="Menos" onClick={() => updateQty(t.tray_id, t.quantity - 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700"><Minus className="h-5 w-5" /></button>
-                <span className="w-6 text-center font-bold">{t.quantity}</span>
-                <button aria-label="Mais" onClick={() => updateQty(t.tray_id, t.quantity + 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700"><Plus className="h-5 w-5" /></button>
+                {t.weight ? (
+                  <span className="rounded-lg bg-emerald-900/60 px-2 py-1 text-sm font-bold tabular-nums text-emerald-200">⚖️ {formatQty(t.quantity, 'KG')}{t.weight.source === 'MANUAL' ? ' · digitado' : ''}</span>
+                ) : (
+                  <>
+                    <button aria-label="Menos" onClick={() => updateQty(t.tray_id, t.quantity - 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700"><Minus className="h-5 w-5" /></button>
+                    <span className="w-6 text-center font-bold">{t.quantity}</span>
+                    <button aria-label="Mais" onClick={() => updateQty(t.tray_id, t.quantity + 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700"><Plus className="h-5 w-5" /></button>
+                  </>
+                )}
                 <button aria-label="Remover" onClick={() => remove(t.tray_id)} className="grid h-11 w-11 place-items-center rounded-lg text-rose-300"><Trash2 className="h-5 w-5" /></button>
               </li>
             );

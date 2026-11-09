@@ -63,7 +63,7 @@ function TicketBlock({ t, index }: { t: RenderedTicket; index: number }) {
         <div className="flex items-center gap-2 text-xs text-slate-400">
           <Icon className="h-4 w-4" /> {t.printer.name} · {t.printer.paperWidth === '80MM' ? '80mm' : '58mm'} ·{' '}
           {t.printer.connection === 'NETWORK_TCP' ? `${t.printer.ipAddress}:${t.printer.port ?? 9100}` : t.printer.connection === 'BLUETOOTH' ? t.printer.macAddress : 'interna'} · {t.byteLength} bytes ·{' '}
-          <span className={t.delivery.ok ? 'text-stone' : 'text-rose-300'}>{t.delivery.via === 'NATIVE' ? (t.delivery.ok ? 'enviado' : `falha: ${t.delivery.error}`) : 'simulado'}</span>
+          <span className={t.delivery.ok ? 'text-stone' : 'text-rose-300'}>{t.delivery.via === 'NATIVE' ? (t.delivery.skipped === 'ALREADY_PRINTED' ? 'já impresso' : t.delivery.ok ? 'enviado' : `falha: ${t.delivery.error}`) : 'simulado'}</span>
         </div>
       </header>
       {failed && (

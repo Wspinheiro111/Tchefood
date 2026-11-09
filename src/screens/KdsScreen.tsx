@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { BellRing, ChefHat, Flame, GlassWater, LayoutGrid, Smartphone } from 'lucide-react';
-import { useTcheStore } from '../store/useTcheStore';
+import { Ban, BellRing, ChefHat, Flame, GlassWater, LayoutGrid, MonitorSmartphone, ShoppingBag, Smartphone } from 'lucide-react';
+import { selectCan, useTcheStore } from '../store/useTcheStore';
 import type { ItemStatus, OrderItem, ProductionSector } from '../types';
 import { playDispatchChime } from '../lib/sound';
 import { useNow } from '../lib/useOnline';
-import { Badge, toast } from '../components/ui';
-import { QR_SELF_SERVICE_USER_ID } from '../data/seed';
+import { Badge, Btn, Sheet, toast } from '../components/ui';
+import { FULFILLMENT_LABEL, formatPickupNumber } from '../lib/kiosk';
 
 type Filter = 'ALL' | 'GRILL' | 'KITCHEN' | 'BAR';
 const FILTERS: Array<{ key: Filter; label: string; icon: typeof Flame }> = [
@@ -20,6 +20,11 @@ const NEXT_LABEL: Partial<Record<ItemStatus, string>> = {
   PREPARING: 'Marcar Pronto',
   READY: 'Entregue na Mesa',
 };
+/** No pedido com senha o cliente retira no balcão (o painel da TV chama a senha). */
+function nextLabel(status: ItemStatus, pickup: boolean): string | undefined {
+  if (pickup && status === 'READY') return 'Entregue no Balcão';
+  return NEXT_LABEL[status];
+}
 const NEXT_STYLE: Partial<Record<ItemStatus, string>> = {
   PENDING: 'bg-sky-600 text-white',
   PREPARING: 'bg-stone text-slate-950',
@@ -48,6 +53,8 @@ interface Ticket {
   oldest: string;
   fromQr: boolean;
   waiterName: string;
+  /** Pedido com senha (totem / caixa): mostra a senha no lugar da mesa. */
+  pickup: { number: string; fulfillment: string | null; name: string | null; fromKiosk: boolean } | null;
 }
 
 export function KdsScreen() {
@@ -60,9 +67,25 @@ export function KdsScreen() {
   const sound = useTcheStore((s) => s.soundEnabled);
   const now = useNow(1000);
   const [filter, setFilter] = useState<Filter>('ALL');
+  const canSoldOut = useTcheStore((s) => selectCan(s, 'MENU_AVAILABILITY'));
+  const [soldOutOpen, setSoldOutOpen] = useState(false);
+  const soldOutCount = products.filter((p) => p.active && !p.available).length;
+
+  // Venda de balcão (Ficha Rápida) é entregue pela ficha no balcão, fora do KDS.
+  const counterOrderIds = useMemo(() => {
+    const counterTables = new Set(tables.filter((t) => t.kind === 'COUNTER').map((t) => t.id));
+    return new Set(orders.filter((o) => counterTables.has(o.table_id)).map((o) => o.id));
+  }, [orders, tables]);
+
+  // Pedido com senha (totem / caixa) só entra na produção depois de pago.
+  const unpaidPickupIds = useMemo(() => {
+    const kioskTables = new Set(tables.filter((t) => t.kind === 'KIOSK').map((t) => t.id));
+    return new Set(orders.filter((o) => kioskTables.has(o.table_id) && o.status !== 'CLOSED').map((o) => o.id));
+  }, [orders, tables]);
+  const hiddenOrderIds = useMemo(() => new Set([...counterOrderIds, ...unpaidPickupIds]), [counterOrderIds, unpaidPickupIds]);
 
   // Alerta sonoro quando chega item novo na fila
-  const pendingCount = items.filter((i) => i.status === 'PENDING').length;
+  const pendingCount = items.filter((i) => i.status === 'PENDING' && !hiddenOrderIds.has(i.order_id)).length;
   const prev = useRef(pendingCount);
   useEffect(() => {
     if (pendingCount > prev.current) {
@@ -78,7 +101,7 @@ export function KdsScreen() {
     for (const i of active) {
       const order = orders.find((o) => o.id === i.order_id);
       // Conta paga não tira o item da produção: só o status do item decide.
-      if (!order || order.status === 'CANCELED') continue;
+      if (!order || order.status === 'CANCELED' || hiddenOrderIds.has(order.id)) continue;
       // Um ticket por comanda + lote de origem (QR Code separado do garçom)
       const fromQr = i.origin === 'QRCODE_TABLE';
       const key = `${i.order_id}:${fromQr ? 'qr' : i.waiter_id}`;
@@ -93,6 +116,15 @@ export function KdsScreen() {
           oldest: i.created_at,
           fromQr,
           waiterName: staff.find((u) => u.id === i.waiter_id)?.name ?? '?',
+          pickup:
+            table?.kind === 'KIOSK'
+              ? {
+                  number: formatPickupNumber(order.pickup_number),
+                  fulfillment: order.fulfillment_type ? FULFILLMENT_LABEL[order.fulfillment_type] : null,
+                  name: order.pickup_name,
+                  fromKiosk: i.origin === 'KIOSK',
+                }
+              : null,
         });
       }
       const t = map.get(key)!;
@@ -100,13 +132,13 @@ export function KdsScreen() {
       if (i.created_at < t.oldest) t.oldest = i.created_at;
     }
     return [...map.values()].sort((a, b) => a.oldest.localeCompare(b.oldest));
-  }, [items, orders, tables, staff, filter]);
+  }, [items, orders, tables, staff, filter, hiddenOrderIds]);
 
-  const bump = (ids: string[], fromStatus: ItemStatus) => {
+  const bump = (ids: string[], fromStatus: ItemStatus, pickup = false) => {
     const r = advanceItems(ids);
     if (!r.ok) return toast.error(r.error);
     if (fromStatus === 'PREPARING' && sound) playDispatchChime();
-    if (fromStatus === 'PREPARING') toast.success('✅ Pronto! Garçom avisado no mapa de mesas.');
+    if (fromStatus === 'PREPARING') toast.success(pickup ? '✅ Pronto! Quando o pedido todo ficar pronto, a senha é chamada no painel.' : '✅ Pronto! Garçom avisado no mapa de mesas.');
   };
 
   const counts = useMemo(() => {
@@ -114,14 +146,16 @@ export function KdsScreen() {
     for (const i of items) {
       if (i.status !== 'PENDING' && i.status !== 'PREPARING') continue;
       const o = orders.find((x) => x.id === i.order_id);
-      if (!o || o.status === 'CLOSED') continue;
+      if (!o || unpaidPickupIds.has(o.id)) continue;
+      // Pedido com senha está pago (CLOSED) enquanto é preparado: conta na fila.
+      if (o.status === 'CLOSED' && !tables.some((t) => t.id === o.table_id && t.kind === 'KIOSK')) continue;
       c.ALL++;
       if (matchFilter(i.sector, 'GRILL')) c.GRILL++;
       if (matchFilter(i.sector, 'KITCHEN')) c.KITCHEN++;
       if (matchFilter(i.sector, 'BAR')) c.BAR++;
     }
     return c;
-  }, [items, orders]);
+  }, [items, orders, tables, unpaidPickupIds]);
 
   return (
     <div className="px-3 pb-10 pt-3">
@@ -131,7 +165,13 @@ export function KdsScreen() {
             {f.label} <span className="rounded-full bg-black/30 px-2 text-sm">{counts[f.key]}</span>
           </button>
         ))}
+        {canSoldOut && (
+          <button onClick={() => setSoldOutOpen(true)} className="ml-auto flex min-h-touch-lg shrink-0 items-center gap-2 rounded-xl bg-surface px-5 text-lg font-bold text-rose-300">
+            <Ban className="h-5 w-5" /> Esgotados <span className="rounded-full bg-black/30 px-2 text-sm">{soldOutCount}</span>
+          </button>
+        )}
       </div>
+      {soldOutOpen && <SoldOutSheet filter={filter} onClose={() => setSoldOutOpen(false)} />}
 
       {tickets.length === 0 && (
         <div className="flex flex-col items-center py-20 text-slate-500">
@@ -151,10 +191,18 @@ export function KdsScreen() {
           return (
             <article key={t.key} className={`flex flex-col rounded-2xl border-4 p-3 ${sla.card}`}>
               <header className="mb-2 flex items-start justify-between gap-2">
-                <div>
-                  <div className="text-4xl font-black leading-none">{t.tableNumber}</div>
-                  <div className="text-sm text-slate-300">{t.tableLabel}</div>
-                </div>
+                {t.pickup ? (
+                  <div>
+                    <div className="text-xs font-bold uppercase text-ouro">Senha</div>
+                    <div className="text-4xl font-black leading-none tabular-nums">{t.pickup.number}</div>
+                    <div className="text-sm text-slate-300">{[t.pickup.fulfillment, t.pickup.name].filter(Boolean).join(' · ')}</div>
+                  </div>
+                ) : (
+                  <div>
+                    <div className="text-4xl font-black leading-none">{t.tableNumber}</div>
+                    <div className="text-sm text-slate-300">{t.tableLabel}</div>
+                  </div>
+                )}
                 <div className="text-right">
                   <div className={`rounded-lg px-2 py-1 font-mono text-2xl font-black tabular-nums ${sla.timer}`}>
                     {minutes.toString().padStart(2, '0')}:{(seconds % 60).toString().padStart(2, '0')}
@@ -163,10 +211,14 @@ export function KdsScreen() {
                 </div>
               </header>
               <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
-                {t.fromQr ? (
+                {t.pickup ? (
+                  <Badge className="bg-ouro text-slate-950">
+                    {t.pickup.fromKiosk ? <MonitorSmartphone className="h-3 w-3" /> : <ShoppingBag className="h-3 w-3" />} {t.pickup.fromKiosk ? 'Totem' : `Caixa: ${t.waiterName}`} · pago
+                  </Badge>
+                ) : t.fromQr ? (
                   <Badge className="bg-sky-500 text-white"><Smartphone className="h-3 w-3" /> 📱 Pedido via QR Code</Badge>
                 ) : (
-                  <span className="font-semibold">Garçom: {t.waiterName === staff.find((u) => u.id === QR_SELF_SERVICE_USER_ID)?.name ? '-' : t.waiterName}</span>
+                  <span className="font-semibold">Garçom: {t.fromQr ? '-' : t.waiterName}</span>
                 )}
                 <span className="text-slate-400">{new Date(t.oldest).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</span>
               </div>
@@ -190,8 +242,8 @@ export function KdsScreen() {
                         ))}
                       </div>
                       {NEXT_LABEL[i.status] && (
-                        <button onClick={() => bump([i.id], i.status)} className={`mt-2 min-h-touch w-full rounded-lg text-base font-bold ${NEXT_STYLE[i.status]}`}>
-                          {NEXT_LABEL[i.status]}
+                        <button onClick={() => bump([i.id], i.status, Boolean(t.pickup))} className={`mt-2 min-h-touch w-full rounded-lg text-base font-bold ${NEXT_STYLE[i.status]}`}>
+                          {nextLabel(i.status, Boolean(t.pickup))}
                         </button>
                       )}
                     </li>
@@ -199,8 +251,8 @@ export function KdsScreen() {
                 })}
               </ul>
               {t.items.length > 1 && NEXT_LABEL[lowest] && (
-                <button onClick={() => bump(lowestIds, lowest)} className={`min-h-touch-lg rounded-xl text-lg font-black ${NEXT_STYLE[lowest]}`}>
-                  {NEXT_LABEL[lowest]} · pedido completo ({lowestIds.length})
+                <button onClick={() => bump(lowestIds, lowest, Boolean(t.pickup))} className={`min-h-touch-lg rounded-xl text-lg font-black ${NEXT_STYLE[lowest]}`}>
+                  {nextLabel(lowest, Boolean(t.pickup))} · pedido completo ({lowestIds.length})
                 </button>
               )}
             </article>
@@ -208,5 +260,39 @@ export function KdsScreen() {
         })}
       </div>
     </div>
+  );
+}
+
+/** Etapa 0 — a cozinha marca o que acabou; some do pedido do garçom e do cardápio QR. */
+function SoldOutSheet({ filter, onClose }: { filter: Filter; onClose: () => void }) {
+  const products = useTcheStore((s) => s.products);
+  const setAvailable = useTcheStore((s) => s.setProductAvailable);
+  const [q, setQ] = useState('');
+  const term = q.trim().toLowerCase();
+  const list = products
+    .filter((p) => p.active && p.sector !== 'NONE' && matchFilter(p.sector, filter))
+    .filter((p) => !term || p.name.toLowerCase().includes(term) || p.code.toLowerCase().includes(term))
+    .sort((a, b) => Number(a.available) - Number(b.available) || a.name.localeCompare(b.name, 'pt-BR'));
+  return (
+    <Sheet open onClose={onClose} title="Marcar esgotado">
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar produto" className="mb-3 min-h-touch w-full rounded-xl border border-slate-600 bg-base px-3 text-[1rem] text-slate-100 outline-none focus:border-ouro" />
+      <div className="divide-y divide-slate-700 rounded-xl bg-base">
+        {list.map((p) => (
+          <div key={p.id} className="flex items-center gap-3 p-3">
+            <div className="flex-1 font-bold">{p.name}{!p.available && <Badge className="ml-2 bg-brasa text-white">esgotado</Badge>}</div>
+            <Btn
+              variant={p.available ? 'secondary' : 'success'}
+              onClick={() => {
+                const r = setAvailable(p.id, !p.available);
+                if (!r.ok) toast.error(r.error);
+              }}
+            >
+              {p.available ? 'Esgotar' : 'Voltou'}
+            </Btn>
+          </div>
+        ))}
+        {list.length === 0 && <p className="p-4 text-center text-sm text-slate-500">Nenhum produto neste setor.</p>}
+      </div>
+    </Sheet>
   );
 }

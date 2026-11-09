@@ -4,7 +4,7 @@
  * (PlugPag printText / Stone printer), por isso são texto puro.
  */
 import type { DiningTable, Order, OrderItem, Payment, Product, StaffUser, Tenant } from '../types';
-import { formatBRL } from './money';
+import { formatBRL, formatQty } from './money';
 import type { NfceDocument } from './nfce';
 import { CONSULTA_URL_RS, formatAccessKey } from './nfce';
 
@@ -88,7 +88,7 @@ export function conferenceLines(params: {
   ];
   for (const it of valid) {
     const p = params.products.find((x) => x.id === it.product_id);
-    lines.push(...wrap(`${it.quantity}x ${p?.code ?? ''} ${p?.name ?? 'Item'}`));
+    lines.push(...wrap(`${formatQty(it.quantity, p?.unit)} ${p?.code ?? ''} ${p?.name ?? 'Item'}`));
     if (it.meat_doneness) lines.push(`   Ponto: ${it.meat_doneness}`);
     lines.push(leftRight(`   ${it.is_paid ? '[PAGO]' : ''}`, money(it.total_item_price)));
   }

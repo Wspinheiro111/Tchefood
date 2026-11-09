@@ -6,7 +6,7 @@ React 18 + TypeScript estrito + Vite + Tailwind + Zustand (persistência Indexed
 ```bash
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 24 testes: motor financeiro, anti-fraude, rachadinha, NFC-e, QR, ESC/POS
+npm test           # motor financeiro, anti-fraude, rachadinha, NFC-e, QR, ESC/POS, maquininhas, Stone Connect, Etapa 0, Fase 5, delivery iFood, totem
 npm run build
 ```
 
@@ -15,9 +15,10 @@ npm run build
 |-----|--------|----------|
 | 1111 / 2222 / 3333 | Garçom | Mapa de mesas, QR Cliente |
 | 7777 | Cozinha | KDS |
-| 5555 | Caixa | Mesas, Retaguarda |
+| 5555 | Caixa | Mesas, Pedido no Caixa, Retaguarda |
 | 9999 | Gerente (autoriza cancelamentos, 10% e descontos) | Tudo |
 | 8888 | Proprietário | Tudo |
+| 4444 | Totem (aparelho do cliente) | Tela do totem; sair = 5 toques no logo + PIN de gerente |
 
 ## Fases entregues
 1. **Comanda do garçom** — login por PIN, mapa de mesas (Salão/Deck/Parrilla), abertura de mesa, lançamento por código rápido (101, 201…), Ponto da Carne obrigatório, adicionais, meio-a-meio (maior valor ou média), tags de 1 toque, bandeja de despacho com alerta sonoro, extrato de conferência.
@@ -27,15 +28,85 @@ npm run build
 4. **Retaguarda** — KPIs do turno, conciliação Stone × PagBank × Caixa por método, rateio exato dos 10% por garçom, central anti-fraude com prévia do alerta de WhatsApp, **NFC-e modelo 65** (payload Focus NFe, chave de 44 dígitos com DV, protocolo, QR Code SEFAZ-RS v2, tributos Lei 12.741) e DANFE 58mm.
 5. **Impressão ESC/POS universal** (58mm/32 col e 80mm/48 col) — cadastro de impressoras por praça, `UniversalEscPosBuilder`, roteamento automático no despacho, simulador lado a lado e ponte Android em `android/SmartPosJsBridge.java`.
 
-6. **Compras por XML (NF-e modelo 55)** — Retaguarda › Compras / Estoque. Lê o XML do fornecedor (regras do Tchê Vendas, tudo fail-closed: sem DTD, chave com DV, modelo 55, protocolo autorizado, nota destinada ao CNPJ da casa, itens fechando com o total), sugere o produto pelo vínculo do fornecedor, EAN ou nome, sugere o fator de embalagem (CX 2 com UN 24 = 12), cria o produto fora da venda quando não existe, dá entrada no estoque e recalcula o **custo médio ponderado** (produto − desconto + frete + seguro + outras + IPI + ICMS-ST). A mesma chave nunca entra duas vezes. Botão "XML de exemplo" para testar.
+6. **Regras de maquininha do Tchê Vendas** (mesmo autor) — aprovado só com prova completa (código `0000`, NSU, autorização, serial e valor batendo); resultado incerto vira **revisão manual** e trava nova cobrança em maquininha até o operador conferir o extrato; o sistema nunca inventa NSU/autorização; idempotência por `request_id`; comandos PlugPag serializados com `isServiceBusy()` (`src/lib/payments/terminalGuard.ts`, `android/PlugPagJsBridge.java`). Impressão de cozinha com ledger `STARTED/COMPLETE` (não reimprime sozinho se o resultado for incerto) e QR Code da NFC-e validado contra a chave de acesso.
+7. **Stone Connect 2.0 (servidor)** — `server/payments/stoneConnect.ts`, cliente do Pagar.me v5 portado do Tchê Vendas com testes. Guia completo e documentação oficial em `docs/integracoes/stone/`. Roda em servidor porque a Secret Key da loja nunca vai para o navegador.
+8. **Emissão real de NFC-e (Supabase Edge Function + Focus NFe)** — `supabase/functions/emit-nfce`, regras portadas do Tchê Vendas. Detalhes abaixo.
+
+9. **Etapa 0 — Fundação: cadastros na tela e nuvem** (Retaguarda → Cardápio, Salão, Equipe, Loja, Nuvem). Detalhes abaixo.
+
+10. **Fase 5 — Balcão, buffet, chopp e cashback**
+   - **⚡ Ficha Rápida (Balcão & Eventos):** vende sem abrir mesa (mesa técnica `COUNTER`, sem os 10%), cobra na SmartPOS Stone/PagBank ou em dinheiro e só então imprime **uma ficha destacável por unidade** (nome em fonte gigante, data/hora, QR Code com token antifraude de 16 caracteres e dígito verificador). A aba *Validar retirada* aceita cada ficha uma única vez (“FICHA JÁ USADA às 21:14”); o item só conta como entregue quando todas as fichas dele são retiradas. Venda não paga só é cancelada com PIN de gerente.
+   - **⚖️ Buffet a Quilo:** botão na comanda, leitura de balança Toledo/Filizola (protocolo ENQ/STX…ETX pela Web Serial, ou simulador), tara por recipiente, preço do quilo vindo do cadastro (nunca do aparelho). Peso digitado fica marcado como `MANUAL`.
+   - **🍺 Monitor de barris:** cada chopp vendido baixa o nível pelo volume do tamanho (300/500 ml/1 L); cancelado antes de servir volta, depois de servir vira desperdício. Leitura real do barril gera o **Índice de Aproveitamento** e alerta vermelho quando o volume real diverge do faturado. Troca de barril com PIN de gerente e histórico. Tela *Chopp* (bar/caixa/gerência) e aba na Retaguarda.
+   - **🎁 CRM de cashback:** após o pagamento aprovado, WhatsApp do cliente com opt-in (LGPD), 5% sobre o consumo sem os 10%, válido do dia seguinte por 30 dias, resgate só de terça a quinta em até 50% da conta. Prévia da mensagem automática com o link da NFC-e e botão *Enviar no WhatsApp* (wa.me). Aba *Clientes & Cashback* na Retaguarda.
+11. **Pedidos de delivery** — caixa de entrada única para apps de delivery com interface comum (`server/delivery/`). **iFood** (Merchant API) pronto e rodando contra um iFood simulado; tela **Delivery** para aceitar, preparar, marcar pronto, despachar e cancelar. 99Food, Keeta (Open Delivery), Delivery Much, Aiqfome, Anota AI e Rappi já estão no catálogo, aguardando credenciais/parceria. Guia em `docs/integracoes/delivery/`.
+12. **Painel de senhas na TV** — aba **Painel TV**: colunas "Preparando" e "Pronto" no estilo fast-food, com pedidos de delivery/retirada (número do app + primeiro nome) e pedidos feitos pelo QR da mesa. Quando um pedido fica pronto, o número pisca, toca o sinal e a TV fala o número (voz do navegador, dá para desligar). Botão de tela cheia. Não mostra telefone, endereço nem valores.
+13. **Totem de autoatendimento e pedido no caixa (pedido com senha)**
+   - **Totem (PIN 4444):** tela própria para o cliente, sem o menu da equipe. Toque para pedir → *Comer aqui* ou *Para levar* → cardápio por categoria com fotos de categoria, opções (ponto da carne, adicionais, meio a meio, observações) → revisão do pedido com teclado na tela para o nome → pagamento em **Crédito, Débito ou Pix na SmartPOS Stone/PagBank** ao lado do totem, ou **Pagar no caixa**. Sai a **senha do dia** (001, 002…, reinicia à meia-noite de Brasília) no comprovante. Inatividade de 90 s pergunta "Ainda está aí?" e volta ao início. Sair do totem: 5 toques no logo em 3 s + PIN de gerente (fica no `audit_logs`).
+   - **Pedido no Caixa (Caixa/Gerente/Dono):** a atendente monta o pedido no balcão, escolhe comer aqui/para levar, cobra em cartão, Pix ou dinheiro (com troco) e entrega a senha. Na mesma tela ficam as **senhas do totem aguardando pagamento** e o andamento das senhas de hoje (Preparando / Pronto / Entregue). Senha não paga só é cancelada com PIN de gerente.
+   - **Cozinha e TV:** o pedido só entra no **KDS** depois de pago, com a SENHA no lugar da mesa ("Para levar · João", selo Totem/Caixa) e botão *Entregue no Balcão*; o ticket das praças sai com `SENHA 042` em fonte gigante. O **Painel TV** mostra a senha em *Preparando* e passa para *Pronto* quando a cozinha termina, falando "Senha 42".
+   - **Regras de dinheiro:** mesa técnica `KIOSK` (fora do mapa), sem os 10% do garçom, preço sempre do cadastro, mesmas travas de maquininha da mesa (cobrança em andamento trava a conta, resultado incerto vira conferência manual e o totem manda o cliente ao caixa sem cobrar de novo, NSU nunca inventado). Fecha com NFC-e como qualquer conta.
+14. **Compras por XML (NF-e modelo 55)** — Retaguarda › Compras / Estoque. Lê o XML do fornecedor (regras do Tchê Vendas, tudo fail-closed: sem DTD, chave com DV, modelo 55, protocolo autorizado, nota destinada ao CNPJ da casa, itens fechando com o total), sugere o produto pelo vínculo do fornecedor, EAN ou nome, sugere o fator de embalagem (CX 2 com UN 24 = 12), cria o produto fora da venda quando não existe, dá entrada no estoque e recalcula o **custo médio ponderado** (produto − desconto + frete + seguro + outras + IPI + ICMS-ST). A mesma chave nunca entra duas vezes. Botão "XML de exemplo" para testar.
+
+## Etapa 0: cadastros na tela e sincronização
+**Cardápio** — categorias, produtos (código único, preço com 2 casas, NCM/CFOP/CSOSN validados), grupos de adicionais e opções, vínculo produto ↔ adicionais em ordem, **preço por dia/horário** (happy hour; janela que vira a meia-noite; duas regras do mesmo produto não podem se sobrepor) e **esgotado** em um toque, também no KDS para a cozinha.
+- O preço da bandeja é recalculado no store a partir do cardápio (regra de horário + meio a meio). O valor que a tela manda é ignorado.
+- Trocar preço grava `PRODUCT_PRICE_CHANGED` na auditoria e não muda item já lançado (o `order_items.unit_price` fica como foi vendido).
+- Produto e mesa nunca são apagados: são desativados e somem da venda e do mapa. Mesa com conta aberta não desativa (também no banco, por trigger).
+
+**Equipe** — PIN de 4 dígitos, único e não trivial. Trocar o PIN de outra pessoa, mudar perfil, desativar ou reativar pede PIN de gerente + motivo e grava `STAFF_*` na auditoria; o PIN nunca vai para o log. Gerente não mexe em gerente/proprietário; ninguém desativa a si mesmo; a loja nunca fica sem proprietário ativo.
+
+**Loja** — dados cadastrais (CNPJ com dígito verificador, UF, taxa de serviço 0–20% com 2 casas). **Permissões por perfil** (`role_permissions` guarda só as exceções ao padrão de `src/lib/permissions.ts`; o proprietário pode tudo e só ele muda permissões, com PIN e motivo). **Iniciar loja nova** tira o aparelho da demonstração: exige o PIN do proprietário, nenhuma conta aberta e a fila vazia se já houver nuvem. As maquininhas cadastradas no aparelho continuam, com id novo, e sobem para a nuvem antes de qualquer pagamento. Ainda não há tela para cadastrar maquininha: o número de série é único no banco, então os seriais de demonstração (STONE-01…) só servem para uma loja na nuvem.
+
+**Nuvem** — o aparelho entra com uma conta do Supabase Auth (e-mail e senha) e a fila `outbox` sobe sozinha a cada 5 s quando há internet (`src/lib/sync/`):
+- Envio em ordem, um evento por vez. O `audit_log` de cancelamento, remoção dos 10% ou desconto sobe **antes** da mudança que ele autoriza (as travas do banco exigem a autorização já gravada). Para um desconto dado sem internet ainda subir horas depois (mesmo em outra tentativa), a trava deixou de usar a janela de 5 minutos: a autorização fica presa à operação. Remover os 10% exige que o último registro de 10% da comanda seja `SERVICE_FEE_REMOVED` (depois de restaurar, nova remoção pede nova autorização); desconto exige um `DISCOUNT_APPLIED` com `discount_before`/`discount_after` iguais à mudança. `payments` e `audit_logs` são só INSERT (`ignore-duplicates`); o resto é upsert pelo id. DELETE só existe para vínculo produto ↔ adicional e opção de adicional.
+- Erro de rede, 5xx e 401 ficam para depois (401 renova o token). 4xx **para a fila** naquele evento e mostra o motivo na aba Nuvem; nada é descartado sozinho.
+- Token da Focus e CSC nunca sobem do aparelho; um trigger no banco também impede o app de trocá-los. `nfce_status` e `nfce_key` da comanda também não sobem: a NFC-e do aparelho é simulação e a situação real vem da `emit-nfce`.
+
+Configuração:
+```bash
+supabase db push    # aplica supabase/migrations/20261109070000_etapa0_cadastros.sql
+```
+1. No painel do Supabase: Authentication → Hooks → **Custom Access Token** → `public.tchefood_access_token_hook`. Ele copia `app_metadata.tenant_id` para a claim `tenant_id` que o RLS (`tchefood_tenant()`) lê.
+2. Crie a linha da loja em `tenants` e uma conta de usuário para o aparelho com `app_metadata = {"tenant_id": "<id da loja>"}` (pelo painel ou pela API admin; o app não cria lojas na nuvem).
+3. Build com `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY` (ou digite os dois na aba Nuvem).
+4. No aparelho: Retaguarda → Nuvem → entrar. Se a conta for de outra loja que a deste aparelho (ex.: ainda na demonstração), a própria tela oferece começar a loja da conta.
+
+Limites conhecidos desta etapa: a sincronização é **só de envio** (um aparelho novo ainda não baixa o cardápio da nuvem) e, fora das tabelas imutáveis, conflito entre dois aparelhos é "o último que gravou vale". **Combos** ficam para o próximo PR da Etapa 0.
+
+## NFC-e real: `supabase/functions/emit-nfce`
+```bash
+supabase db push                                   # aplica supabase/migrations (tabela nfce_documents)
+supabase secrets set FOCUS_AMBIENTE=homologacao    # "producao" (exato) liga produção
+supabase functions deploy emit-nfce
+```
+`POST /functions/v1/emit-nfce` com o JWT do app (claim `tenant_id`) e corpo `{ "order_id": "<uuid>" }`.
+- O corpo só traz o `order_id`. Itens, valores, pagamentos e o token Focus (`tenants.focus_nfe_token`) são lidos do banco; o cliente não altera o valor da nota nem vê o token. A comanda só é encontrada se o RLS do chamador permitir.
+- Um documento por comanda (`nfce_documents`, referência `tchefood<uuid>`). Reserva atômica antes do POST: duas abas não emitem duas vezes. Autorizada/cancelada → devolve o que está gravado; em processamento/contingência → só consulta (GET).
+- `authorized: true` somente com chave + protocolo da SEFAZ. Falha de rede/timeout fica `processing` (HTTP 202) e a próxima chamada consulta a mesma referência; nunca vira "contingência" ou "sucesso" inventados. Contingência offline da Focus aparece como `contingency` até ser efetivada.
+- Taxa de serviço em `valor_outras_despesas` e desconto em `valor_desconto`, rateados por item; qualquer divergência de centavo entre itens, total e pagamentos bloqueia a emissão (HTTP 422) sem chamar a Focus.
+- `tipo_integracao: 1` só com prova da maquininha (CNPJ da credenciadora Stone/PagBank coerente com o adquirente do pagamento + código de autorização); sem prova, `2`. Pix da maquininha sai `2`, como no Tchê Vendas.
+- Banco: transições inválidas (ex.: autorizada → rejeitada), DELETE e alteração de nota autorizada são barrados por trigger.
 
 ## Banco de dados
 `db/schema_purchases.sql` (rodar depois do `schema.sql`): `suppliers`, `purchase_invoices` (`UNIQUE (tenant_id, access_key)`), `purchase_invoice_items`, `stock_movements` (somente inserção), `supplier_product_links` e as colunas `cost_price`, `stock_quantity`, `barcode` em `products`.
 
 `db/schema.sql` contém a modelagem do blueprint sem alterações, mais: `product_modifier_groups`, `printers`, recálculo financeiro em PL/pgSQL idêntico a `src/lib/money.ts`, travas anti-fraude (DELETE bloqueado, cancelamento/10%/desconto só com audit_log de gerente, `audit_logs` imutável), fechamento automático e RLS multi-tenant.
 
+**Autorização de gerente no Supabase:** o cliente não grava a prova da autorização. Antes de cancelar item, tirar os 10% ou dar desconto, a sincronização chama a RPC `tchefood_authorize_manager(order_id, action_type, pin, performed_by, reason, ...)`, que confere o PIN no banco (bloqueia após 3 erros em 60s) e grava o `audit_log`. Os papéis `anon`/`authenticated` não leem `pin_code`, não alteram `staff_users` e não conseguem inserir `audit_logs` com gerente. O cadastro de equipe é feito com `service_role`, e o login por PIN no servidor ainda precisa de uma RPC própria.
+
+`db/schema_expansion.sql` (aplicar depois do `schema.sql`, idempotente) traz a Fase 5: venda por peso, barris (`keg_taps`, `keg_tap_products`, `keg_history`), fichas (`event_tickets` + `tchefood_redeem_ticket`), fidelidade (`loyalty_customers`, `cashback_ledger`, `tchefood_redeem_cashback`). O cabeçalho do arquivo lista as correções feitas sobre o rascunho original. Os cenários estão em `db/tests/fase5_cenarios.sql`.
+
+`db/schema_kiosk.sql` (aplicar depois do `schema_expansion.sql`, idempotente) traz o totem: papel `KIOSK`, mesa técnica `KIOSK`, colunas `orders.pickup_number`, `pickup_name`, `fulfillment_type`, contador `pickup_counters` (senha gerada pelo banco com trava de linha, sem repetir entre dois totens) e gatilho com as regras do pedido com senha. Cenários em `db/tests/kiosk_cenarios.sql`.
+
 ## O que ainda é simulado
-- Stone Connect / PlugPag: sem credenciais, as cobranças caem no simulador visual (`MockTerminalDriver`). Com `window.StoneBridge`/`window.PlugPagBridge` presentes, os drivers usam o hardware.
-- NFC-e: payload e DANFE gerados localmente em **homologação**; o envio à Focus NFe precisa de token, certificado e CSC reais.
+- Stone Connect / PlugPag: sem credenciais, as cobranças caem no simulador visual (`MockTerminalDriver`). Com `window.StoneBridge`/`window.PlugPagBridge` presentes, os drivers usam o hardware. O cliente Stone Connect 2.0 está pronto em `server/`, mas falta o servidor (rotas de cobrança e webhook) e a credencial de parceiro.
+- NFC-e: o app ainda gera payload e DANFE localmente em **homologação**; a emissão real está pronta em `supabase/functions/emit-nfce`, mas as telas ainda não chamam a função e ela precisa do token Focus, certificado A1 e CSC cadastrados na Focus.
+- Balança: a leitura pela Web Serial segue o protocolo Toledo/Filizola, mas não foi testada numa balança física; sem cabo, use o simulador ou o peso digitado.
+- Barril: a leitura real é digitada (balança de barril ou medidor de vazão); não há integração com medidor físico.
+- Fichas: o QR Code sai no simulador de bobina; na impressora real o comando de QR do ESC/POS ainda precisa ser ligado ao layout da ficha.
+- Cashback no WhatsApp: a mensagem abre pronta pelo link wa.me; o envio automático depende de um provedor da API oficial.
 - Alerta de WhatsApp: registrado (`whatsapp_alert_sent = true`) e pré-visualizado; o disparo real depende de um provedor.
-- Supabase: os eventos ficam na fila `outbox` (IndexedDB) prontos para sincronizar; o cliente Supabase ainda não está ligado.
+- Delivery: o iFood da tela Delivery é simulado no navegador. Falta o servidor que roda o polling com as credenciais reais e grava em `delivery_orders`, e os pedidos de delivery ainda não descem para o KDS nem geram NFC-e.
+- Totem: a senha é numerada no próprio aparelho enquanto o Supabase não está ligado; com dois totens offline ao mesmo tempo a senha pode repetir até sincronizar (no banco ela é gerada por `pickup_counters`). A maquininha do totem usa o mesmo simulador da SmartPOS; falta testar com Stone/PagBank físicos ao lado do totem e o modo quiosque do Android/Windows.
+- Supabase: a fila `outbox` sobe para o Supabase depois que o aparelho entra na aba Nuvem; sem conta conectada, os eventos ficam no IndexedDB. Ainda não há download (pull) da nuvem para um aparelho novo.

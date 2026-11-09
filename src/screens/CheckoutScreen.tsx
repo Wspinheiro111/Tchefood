@@ -6,8 +6,11 @@ import { computeEqualShare, computeItemsShare, formatBRL, round2, toCents } from
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest, type IPaymentTerminalDriver } from '../lib/payments/drivers';
 import { cardReceiptLines, conferenceLines } from '../lib/receipts';
 import { uuid } from '../lib/ids';
+import { clearReviewHold, getReviewHold, setReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
 import { Btn, Stepper, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
+import { CashbackCapture, CashbackRedeem } from '../components/CashbackPanel';
+import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
 
 type SplitMode = 'EQUAL' | 'FREE' | 'ITEMS';
 type Method = 'CREDIT' | 'DEBIT' | 'PIX' | 'CASH';
@@ -37,6 +40,9 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const [cashGiven, setCashGiven] = useState('');
   const [busy, setBusy] = useState(false);
   const [closedOrderId, setClosedOrderId] = useState<string | null>(null);
+  /** Cobrança com resultado incerto: bloqueia nova cobrança em maquininha até o operador conferir o extrato. */
+  const [reviewHold, setReviewHoldState] = useState<ReviewHold | null>(() => getReviewHold(orderId));
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   useEffect(() => {
     if (order && order.status === 'OPEN' && order.remaining_balance > 0) {
@@ -98,6 +104,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       return;
     }
 
+    if (reviewHold) return toast.error('Há uma cobrança sem confirmação. Confira o extrato da maquininha antes de cobrar de novo.');
     if (opMode === 'TEF_POS_WIRELESS' && (!terminal || !terminal.online)) return toast.error('Selecione uma maquininha online.');
     const driver = createDriver({ terminal: opMode === 'TEF_POS_WIRELESS' ? terminal : null, chassis: opMode === 'TEF_POS_WIRELESS' ? (terminal?.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE') : chassis, mode: opMode });
     const req: ChargeRequest = { request_id: uuid(), idempotency_key, amount, method, table_label: table.label, order_id: orderId, description };
@@ -107,6 +114,16 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     if (opMode === 'TEF_POS_WIRELESS') toast.info(`📡 Cobrança de ${formatBRL(amount)} enviada para ${terminal?.name} (${terminal?.serial_number}).`);
     try {
       const result = await driver.charge(req);
+      if (result.status === 'MANUAL_REVIEW') {
+        // Não registra pagamento nem recusa: o resultado é desconhecido e não pode ser repetido sozinho.
+        setReviewHoldState(setReviewHold({
+          order_id: orderId, amount, reason: result.reason, code: result.failure_code, method,
+          acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
+          idempotency_key, item_ids: itemIds,
+        }));
+        toast.alert(`⚠️ ${result.reason}`);
+        return;
+      }
       if (result.status === 'DECLINED') {
         s.registerPayment({
           orderId, amount, method, status: 'DECLINED', terminal_id: result.terminal_id, acquirer: result.acquirer, acquirer_cnpj: null,
@@ -121,7 +138,16 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         acquirer_cnpj: result.acquirer_cnpj, card_brand: result.card_brand, nsu: result.nsu, authorization_code: result.authorization_code,
         terminal_serial: result.terminal_serial, idempotency_key, item_ids: itemIds, charge_request_id: req.request_id,
       });
-      if (!r.ok) return toast.error(r.error);
+      if (!r.ok) {
+        // A maquininha aprovou mas o registro falhou: trava a conta (nunca cobra de novo) e o gerente registra pelo comprovante.
+        setReviewHoldState(setReviewHold({
+          order_id: orderId, amount, reason: `Aprovado na maquininha, mas não registrado: ${r.error}`, code: 'REGISTER_FAILED', method,
+          acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
+          idempotency_key, item_ids: itemIds,
+        }));
+        toast.alert(`⚠️ Aprovado na maquininha, mas não registrado: ${r.error}`);
+        return;
+      }
       afterApproved(r.data.payment, r.data.closed, result.masked_pan, driver);
     } finally {
       useTcheStore.getState().endTerminalCharge(req.request_id);
@@ -214,6 +240,8 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         )}
       </div>
 
+      <CashbackRedeem orderId={orderId} />
+
       {/* Forma de pagamento */}
       <div className="mb-3 grid grid-cols-4 gap-2">
         {(Object.keys(METHOD_META) as Method[]).map((m) => {
@@ -259,12 +287,38 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         </div>
       )}
 
+      {reviewHold && (
+        <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
+          <div className="mb-1 font-black text-ouro">Cobrança de {formatBRL(reviewHold.amount)} sem confirmação ({reviewHold.code})</div>
+          <p className="mb-3 text-slate-200">{reviewHold.reason} Se a maquininha mostra a transação aprovada, não cobre de novo: o gerente registra pelo comprovante. Se não houve cobrança, libere abaixo.</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Btn variant="success" size="lg" onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
+            <Btn variant="secondary" size="lg" onClick={() => { clearReviewHold(orderId); setReviewHoldState(null); }}>Conferi no extrato: não foi cobrado</Btn>
+          </div>
+          <ConfirmReviewedChargeSheet
+            open={confirmOpen}
+            onClose={() => setConfirmOpen(false)}
+            hold={reviewHold}
+            label={table.label}
+            onSuccess={(outcome) => {
+              // Mesmos ajustes de afterApproved, sem reimprimir o comprovante TEF (a maquininha já imprimiu).
+              setReviewHoldState(null);
+              if (mode === 'EQUAL') setPeopleLeft((n) => Math.max(1, n - 1));
+              setSelected([]);
+              setFreeRaw('');
+              setCashGiven('');
+              if (outcome.closed) setClosedOrderId(order.id);
+            }}
+          />
+        </div>
+      )}
+
       {trayPending && (
         <p className="mb-2 rounded-xl border border-rose-500 bg-rose-950/60 p-3 text-sm text-rose-100">Há itens na bandeja desta mesa que ainda não foram enviados. Volte e envie ou remova antes de cobrar.</p>
       )}
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_2fr]">
         <Btn variant="secondary" size="lg" onClick={printPreview}>Prévia de conferência</Btn>
-        <Btn variant="success" size="lg" disabled={!amountValid || busy || trayPending} onClick={charge}>
+        <Btn variant="success" size="lg" disabled={!amountValid || busy || trayPending || (reviewHold !== null && method !== 'CASH')} onClick={charge}>
           {busy ? 'Aguardando maquininha…' : `${method === 'CASH' ? 'Receber' : opMode === 'TEF_POS_WIRELESS' ? 'Enviar para maquininha' : 'Cobrar na SmartPOS'} ${formatBRL(amount)}`}
         </Btn>
       </div>
@@ -281,6 +335,7 @@ function ClosedView({ orderId, label, total, onDone }: { orderId: string; label:
       <p className="mb-1 text-slate-300">{label} · {formatBRL(total)} · saldo R$ 0,00</p>
       <p className="mb-6 text-sm text-slate-400">Mesa liberada no mapa e NFC-e modelo 65 gerada (tpIntegra = 1).</p>
       <div className="grid w-full gap-2">
+        <CashbackCapture orderId={orderId} />
         <Btn variant="gold" size="lg" onClick={() => setShowNfce(true)}>Ver NFC-e / Imprimir DANFE</Btn>
         <Btn size="lg" onClick={onDone}>Voltar ao mapa de mesas</Btn>
       </div>

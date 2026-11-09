@@ -28,7 +28,7 @@ CREATE TABLE tenants (
     state_registration VARCHAR(20),
     city VARCHAR(100) DEFAULT 'Santo Ângelo',
     state CHAR(2) DEFAULT 'RS',
-    default_service_fee_pct NUMERIC(5,2) NOT NULL DEFAULT 10.00,
+    default_service_fee_pct NUMERIC(5,2) NOT NULL DEFAULT 10.00 CHECK (default_service_fee_pct BETWEEN 0 AND 100),
     default_acquirer acquirer_type NOT NULL DEFAULT 'STONE',
     default_mode operation_mode NOT NULL DEFAULT 'TEF_POS_WIRELESS',
     focus_nfe_token TEXT,
@@ -127,7 +127,7 @@ CREATE TABLE orders (
     customer_cpf VARCHAR(14),
     subtotal_items NUMERIC(10,2) NOT NULL DEFAULT 0.00,
     charge_service_fee BOOLEAN NOT NULL DEFAULT TRUE,
-    service_fee_pct NUMERIC(5,2) NOT NULL DEFAULT 10.00,
+    service_fee_pct NUMERIC(5,2) NOT NULL DEFAULT 10.00 CHECK (service_fee_pct BETWEEN 0 AND 100),
     service_fee_amount NUMERIC(10,2) NOT NULL DEFAULT 0.00,
     discount_amount NUMERIC(10,2) NOT NULL DEFAULT 0.00,
     total_amount NUMERIC(10,2) NOT NULL DEFAULT 0.00,
@@ -145,8 +145,11 @@ CREATE TABLE order_items (
     product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
     waiter_id UUID NOT NULL REFERENCES staff_users(id),
     quantity NUMERIC(10,3) NOT NULL DEFAULT 1 CHECK (quantity > 0),
-    unit_price NUMERIC(10,2) NOT NULL,
+    unit_price NUMERIC(10,2) NOT NULL CHECK (unit_price >= 0),
+    -- Adicional pode ser negativo (ex.: "sem queijo"), mas o item nunca vale menos que zero:
+    -- item com preço negativo funcionaria como desconto sem PIN do gerente.
     modifiers_unit_price NUMERIC(10,2) NOT NULL DEFAULT 0.00,
+    CONSTRAINT order_items_effective_price_check CHECK (unit_price + modifiers_unit_price >= 0),
     total_item_price NUMERIC(10,2) NOT NULL,
     meat_doneness VARCHAR(40),
     notes TEXT,
@@ -231,6 +234,58 @@ CREATE TABLE printers (
     CHECK (connection <> 'BLUETOOTH' OR mac_address IS NOT NULL)
 );
 
+-- Pedidos de apps de delivery (iFood, 99Food, Keeta...). Espelho de server/delivery/deliveryInbox.ts.
+-- client_id/client_secret dos apps NÃO ficam aqui: vivem nos segredos do servidor.
+CREATE TYPE delivery_channel AS ENUM ('ifood', 'ninety_nine_food', 'keeta', 'delivery_much', 'aiqfome', 'anota_ai', 'rappi');
+CREATE TYPE delivery_order_status AS ENUM ('placed', 'confirmed', 'preparing', 'ready_for_pickup', 'dispatched', 'concluded', 'cancelled', 'unknown');
+
+-- Qual loja (merchantId no app) pertence a qual tenant.
+CREATE TABLE delivery_integrations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    channel delivery_channel NOT NULL,
+    merchant_external_id VARCHAR(64) NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (channel, merchant_external_id)
+);
+
+CREATE TABLE delivery_orders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    channel delivery_channel NOT NULL,
+    external_id VARCHAR(64) NOT NULL,
+    display_id VARCHAR(20) NOT NULL,
+    status delivery_order_status NOT NULL DEFAULT 'placed',
+    cancellation_pending BOOLEAN NOT NULL DEFAULT FALSE,
+    needs_review BOOLEAN NOT NULL DEFAULT FALSE,
+    review_reasons TEXT[] NOT NULL DEFAULT '{}',
+    -- Aviso de pedido novo (cozinha, KDS, alerta) já tentado; falso = reprocessar avisa de novo.
+    new_order_notified BOOLEAN NOT NULL DEFAULT FALSE,
+    last_cancellation_event_at TIMESTAMPTZ,
+    total_amount NUMERIC(10,2) NOT NULL CHECK (total_amount >= 0),
+    -- Pedido normalizado completo (DeliveryOrder): itens, pagamentos, endereço.
+    payload JSONB NOT NULL,
+    placed_at TIMESTAMPTZ NOT NULL,
+    last_event_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (channel, external_id)
+);
+
+-- Histórico de eventos recebidos. O UNIQUE é a deduplicação: o app entrega "pelo menos uma vez".
+CREATE TABLE delivery_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    channel delivery_channel NOT NULL,
+    external_event_id VARCHAR(64) NOT NULL,
+    external_order_id VARCHAR(64) NOT NULL,
+    raw_code VARCHAR(40) NOT NULL,
+    signal VARCHAR(30) NOT NULL,
+    event_created_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (channel, external_event_id)
+);
+
 ALTER TABLE dining_tables
     ADD CONSTRAINT dining_tables_current_order_fk FOREIGN KEY (current_order_id) REFERENCES orders(id) ON DELETE SET NULL;
 
@@ -238,6 +293,8 @@ CREATE INDEX idx_order_items_order ON order_items(order_id);
 CREATE INDEX idx_order_items_kds ON order_items(sector, status) WHERE status IN ('PENDING', 'PREPARING', 'READY');
 CREATE INDEX idx_payments_order ON payments(order_id);
 CREATE INDEX idx_audit_logs_tenant_created ON audit_logs(tenant_id, created_at DESC);
+CREATE INDEX idx_delivery_orders_open ON delivery_orders(tenant_id, placed_at DESC) WHERE status NOT IN ('concluded', 'cancelled');
+CREATE INDEX idx_delivery_events_order ON delivery_events(channel, external_order_id);
 CREATE INDEX idx_orders_tenant_status ON orders(tenant_id, status);
 
 -- -----------------------------------------------------------------------------
@@ -289,7 +346,8 @@ BEGIN
     RETURN NEW;
 END;
 $$;
-CREATE TRIGGER trg_order_items_total BEFORE INSERT OR UPDATE OF quantity, unit_price, modifiers_unit_price
+-- Dispara em QUALQUER update: total_item_price nunca aceita valor vindo do cliente.
+CREATE TRIGGER trg_order_items_total BEFORE INSERT OR UPDATE
     ON order_items FOR EACH ROW EXECUTE FUNCTION tchefood_item_total();
 
 CREATE OR REPLACE FUNCTION tchefood_after_item_change()
@@ -380,24 +438,33 @@ CREATE CONSTRAINT TRIGGER trg_order_items_cancel_audit AFTER UPDATE OF status ON
 -- 3) Remover os 10% ou dar desconto também exige audit_log autorizado por gerente.
 CREATE OR REPLACE FUNCTION tchefood_require_order_audit()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
-DECLARE v_action TEXT; v_ok BOOLEAN;
+DECLARE v_action TEXT; v_ok BOOLEAN; v_actions TEXT[] := ARRAY[]::TEXT[];
 BEGIN
+    -- Cada mudança protegida é conferida por conta própria: um UPDATE que tira os
+    -- 10% E aumenta o desconto precisa das duas autorizações.
     IF OLD.charge_service_fee AND NOT NEW.charge_service_fee THEN
-        v_action := 'SERVICE_FEE_REMOVED';
-    ELSIF NEW.discount_amount > OLD.discount_amount THEN
-        v_action := 'DISCOUNT_APPLIED';
-    ELSE
-        RETURN NULL;
+        v_actions := array_append(v_actions, 'SERVICE_FEE_REMOVED'::TEXT);
     END IF;
-    SELECT EXISTS (
-        SELECT 1 FROM audit_logs a JOIN staff_users m ON m.id = a.authorized_by_manager_id
-         WHERE a.order_id = NEW.id AND a.action_type = v_action
-           AND a.created_at >= NOW() - INTERVAL '5 minutes'
-           AND m.role IN ('MANAGER', 'OWNER') AND m.active
-    ) INTO v_ok;
-    IF NOT v_ok THEN
-        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % sem PIN de gerente registrado em audit_logs.', v_action;
+    IF NEW.discount_amount > OLD.discount_amount THEN
+        v_actions := array_append(v_actions, 'DISCOUNT_APPLIED'::TEXT);
     END IF;
+    FOREACH v_action IN ARRAY v_actions LOOP
+        -- A autorização vale só para a mudança exata que o gerente aprovou: no desconto,
+        -- discount_before/discount_after do audit_log precisam bater com OLD/NEW, então
+        -- uma aprovação pequena não serve para aumentar o desconto de novo.
+        SELECT EXISTS (
+            SELECT 1 FROM audit_logs a JOIN staff_users m ON m.id = a.authorized_by_manager_id
+             WHERE a.order_id = NEW.id AND a.action_type = v_action
+               AND a.created_at >= NOW() - INTERVAL '5 minutes'
+               AND m.role IN ('MANAGER', 'OWNER') AND m.active
+               AND (v_action <> 'DISCOUNT_APPLIED' OR (
+                    (a.metadata->>'discount_before')::numeric = OLD.discount_amount
+                AND (a.metadata->>'discount_after')::numeric = NEW.discount_amount))
+        ) INTO v_ok;
+        IF NOT v_ok THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % sem PIN de gerente registrado em audit_logs.', v_action;
+        END IF;
+    END LOOP;
     RETURN NULL;
 END;
 $$;
@@ -442,7 +509,8 @@ DO $$
 DECLARE t TEXT;
 BEGIN
     FOREACH t IN ARRAY ARRAY['staff_users','pos_terminals','categories','products','modifier_groups',
-                             'dining_tables','orders','payments','audit_logs','printers'] LOOP
+                             'dining_tables','orders','payments','audit_logs','printers',
+                             'delivery_integrations','delivery_orders','delivery_events'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('CREATE POLICY %I ON %I USING (tenant_id = tchefood_tenant()) WITH CHECK (tenant_id = tchefood_tenant())', t || '_tenant', t);
     END LOOP;
@@ -469,5 +537,343 @@ DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
         ALTER PUBLICATION supabase_realtime ADD TABLE order_items, dining_tables, orders;
+    END IF;
+END $$;
+
+-- -----------------------------------------------------------------------------
+-- AUTORIZAÇÃO DE GERENTE VALIDADA NO SERVIDOR
+-- O cliente nunca grava a "prova" da autorização: o audit_log com gerente só
+-- nasce dentro de tchefood_authorize_manager(), que confere o PIN no banco.
+-- Fluxo de sincronização: chame a RPC primeiro e depois faça o UPDATE do item
+-- ou da conta na mesma transação/janela de 5 minutos exigida pelos gatilhos.
+-- -----------------------------------------------------------------------------
+
+-- Papéis de cliente do Supabase (anon/authenticated) não podem inserir
+-- audit_log com authorized_by_manager_id: só a função SECURITY DEFINER pode.
+CREATE OR REPLACE FUNCTION tchefood_guard_audit_insert()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.authorized_by_manager_id IS NOT NULL AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: autorização de gerente só pode ser registrada por tchefood_authorize_manager().';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_audit_logs_guard BEFORE INSERT ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION tchefood_guard_audit_insert();
+
+-- Confere o PIN do gerente do próprio tenant, com bloqueio após 3 erros em 60s,
+-- e grava o audit_log autorizado. Retorna o id do audit_log, ou NULL se o PIN falhar
+-- (a falha também vira audit_log MANAGER_PIN_FAILED / MANAGER_PIN_LOCKOUT).
+CREATE OR REPLACE FUNCTION tchefood_authorize_manager(
+    p_order_id UUID,
+    p_action_type VARCHAR,
+    p_manager_pin VARCHAR,
+    p_performed_by UUID,
+    p_reason TEXT,
+    p_amount_impact NUMERIC DEFAULT 0,
+    p_metadata JSONB DEFAULT '{}'::jsonb
+) RETURNS UUID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_manager staff_users%ROWTYPE;
+    v_failures INT;
+    v_id UUID;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: sessão sem tenant.';
+    END IF;
+    IF p_action_type NOT IN ('ITEM_CANCELED', 'SERVICE_FEE_REMOVED', 'DISCOUNT_APPLIED') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: ação % não exige autorização.', p_action_type;
+    END IF;
+    IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: motivo obrigatório (mínimo 5 caracteres).';
+    END IF;
+    IF p_action_type = 'DISCOUNT_APPLIED' AND (
+        (p_metadata->>'discount_before') IS NULL OR (p_metadata->>'discount_after') IS NULL
+        OR (p_metadata->>'discount_after')::numeric <= (p_metadata->>'discount_before')::numeric) THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: desconto precisa de discount_before e discount_after (maior) no metadata.';
+    END IF;
+    IF p_action_type = 'ITEM_CANCELED' AND (p_metadata->>'item_id') IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: cancelamento precisa do item_id no metadata.';
+    END IF;
+    PERFORM 1 FROM orders o WHERE o.id = p_order_id AND o.tenant_id = v_tenant;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: conta não pertence ao tenant.';
+    END IF;
+    PERFORM 1 FROM staff_users u WHERE u.id = p_performed_by AND u.tenant_id = v_tenant AND u.active;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: operador inválido.';
+    END IF;
+
+    SELECT count(*) INTO v_failures FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.action_type = 'MANAGER_PIN_FAILED'
+       AND a.created_at >= NOW() - INTERVAL '60 seconds';
+    IF v_failures >= 3 THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES (v_tenant, p_order_id, p_performed_by, 'MANAGER_PIN_LOCKOUT', 'PIN de gerente bloqueado por excesso de tentativas', jsonb_build_object('attempted_action', p_action_type));
+        RETURN NULL;
+    END IF;
+
+    SELECT * INTO v_manager FROM staff_users m
+     WHERE m.tenant_id = v_tenant AND m.pin_code = p_manager_pin AND m.active AND m.role IN ('MANAGER', 'OWNER');
+    IF NOT FOUND THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES (v_tenant, p_order_id, p_performed_by, 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto', jsonb_build_object('attempted_action', p_action_type));
+        RETURN NULL;
+    END IF;
+
+    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+    VALUES (v_tenant, p_order_id, p_performed_by, v_manager.id, p_action_type, COALESCE(p_amount_impact, 0), trim(p_reason),
+            COALESCE(p_metadata, '{}'::jsonb) || jsonb_build_object('manager_name', v_manager.name, 'server_verified', true))
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END;
+$$;
+
+-- No Supabase: o cliente não lê PINs nem altera cargos. Cadastro de equipe é
+-- feito pela retaguarda com service_role; o app só vê os campos públicos.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE ALL ON staff_users FROM anon, authenticated;
+        GRANT SELECT (id, tenant_id, name, role, active, created_at) ON staff_users TO authenticated;
+        REVOKE ALL ON FUNCTION tchefood_authorize_manager(UUID, VARCHAR, VARCHAR, UUID, TEXT, NUMERIC, JSONB) FROM PUBLIC, anon;
+        GRANT EXECUTE ON FUNCTION tchefood_authorize_manager(UUID, VARCHAR, VARCHAR, UUID, TEXT, NUMERIC, JSONB) TO authenticated;
+    END IF;
+END $$;
+
+-- Item já gravado (despachado) não muda de preço, quantidade nem produto: a única
+-- forma de reduzir a conta por item é o cancelamento autorizado. Assim o cliente
+-- não zera o unit_price nem baixa a quantidade para escapar das travas.
+CREATE OR REPLACE FUNCTION tchefood_lock_item_financials()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.unit_price IS DISTINCT FROM OLD.unit_price
+       OR NEW.modifiers_unit_price IS DISTINCT FROM OLD.modifiers_unit_price
+       OR NEW.quantity IS DISTINCT FROM OLD.quantity
+       OR NEW.product_id IS DISTINCT FROM OLD.product_id
+       OR NEW.order_id IS DISTINCT FROM OLD.order_id THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: item % já enviado não pode ter preço, quantidade ou produto alterados. Cancele com PIN do gerente e lance de novo.', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_order_items_lock_financials BEFORE UPDATE ON order_items
+    FOR EACH ROW EXECUTE FUNCTION tchefood_lock_item_financials();
+
+-- O percentual dos 10% é fixado quando a conta abre (vem do tenant). Mudá-lo numa
+-- conta existente reduziria a taxa sem PIN do gerente; para dispensar a taxa o
+-- caminho é charge_service_fee = false, que exige SERVICE_FEE_REMOVED.
+CREATE OR REPLACE FUNCTION tchefood_lock_service_fee_pct()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.service_fee_pct IS DISTINCT FROM OLD.service_fee_pct THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: percentual da taxa de serviço da conta % não pode ser alterado depois de aberta.', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_orders_lock_service_fee_pct BEFORE UPDATE OF service_fee_pct ON orders
+    FOR EACH ROW EXECUTE FUNCTION tchefood_lock_service_fee_pct();
+
+-- Totais da conta (subtotal, 10%, total, pago, saldo) só mudam pelo recálculo do
+-- banco (tchefood_recalc_order), que roda dentro de outro gatilho. Um UPDATE direto
+-- do cliente (profundidade 1) não pode mexer neles, então não dá para zerar o saldo
+-- e disparar o fechamento automático sem pagamento. Conta nova sempre nasce zerada.
+CREATE OR REPLACE FUNCTION tchefood_lock_order_totals()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF pg_trigger_depth() > 1 THEN
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        NEW.subtotal_items := 0;
+        NEW.service_fee_amount := 0;
+        NEW.total_amount := 0;
+        NEW.paid_amount := 0;
+        NEW.remaining_balance := 0;
+        RETURN NEW;
+    END IF;
+    IF NEW.subtotal_items IS DISTINCT FROM OLD.subtotal_items
+       OR NEW.service_fee_amount IS DISTINCT FROM OLD.service_fee_amount
+       OR NEW.total_amount IS DISTINCT FROM OLD.total_amount
+       OR NEW.paid_amount IS DISTINCT FROM OLD.paid_amount
+       OR NEW.remaining_balance IS DISTINCT FROM OLD.remaining_balance THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: totais da conta % são calculados pelo banco e não podem ser gravados direto.', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_orders_lock_totals BEFORE INSERT OR UPDATE ON orders
+    FOR EACH ROW EXECUTE FUNCTION tchefood_lock_order_totals();
+
+-- -----------------------------------------------------------------------------
+-- SEÇÃO 4 — ETAPA 0 (cópia de supabase/migrations/20261109070000_etapa0_cadastros.sql)
+-- -----------------------------------------------------------------------------
+ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE dining_tables ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Código rápido único por loja (a tela já recusa duplicado; o banco garante).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_products_tenant_code ON products(tenant_id, lower(code));
+
+-- Mesa ocupada não pode ser desativada.
+CREATE OR REPLACE FUNCTION tchefood_table_deactivate_guard()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.active AND NOT NEW.active AND NEW.status <> 'FREE' THEN
+        RAISE EXCEPTION 'TCHEFOOD_CADASTRO: mesa % está em uso e não pode ser desativada.', NEW.label;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_dining_tables_deactivate ON dining_tables;
+CREATE TRIGGER trg_dining_tables_deactivate BEFORE UPDATE OF active ON dining_tables
+    FOR EACH ROW EXECUTE FUNCTION tchefood_table_deactivate_guard();
+
+-- Produto e mesa nunca são apagados (podem estar em contas e notas fiscais).
+CREATE OR REPLACE FUNCTION tchefood_block_catalog_delete()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'TCHEFOOD_CADASTRO: % não pode ser apagado; desative.', TG_TABLE_NAME;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_products_no_delete ON products;
+CREATE TRIGGER trg_products_no_delete BEFORE DELETE ON products
+    FOR EACH ROW EXECUTE FUNCTION tchefood_block_catalog_delete();
+DROP TRIGGER IF EXISTS trg_dining_tables_no_delete ON dining_tables;
+CREATE TRIGGER trg_dining_tables_no_delete BEFORE DELETE ON dining_tables
+    FOR EACH ROW EXECUTE FUNCTION tchefood_block_catalog_delete();
+DROP TRIGGER IF EXISTS trg_staff_users_no_delete ON staff_users;
+CREATE TRIGGER trg_staff_users_no_delete BEFORE DELETE ON staff_users
+    FOR EACH ROW EXECUTE FUNCTION tchefood_block_catalog_delete();
+
+CREATE TABLE IF NOT EXISTS price_schedules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    name VARCHAR(60) NOT NULL,
+    weekdays SMALLINT[] NOT NULL CHECK (cardinality(weekdays) BETWEEN 1 AND 7 AND weekdays <@ ARRAY[0,1,2,3,4,5,6]::SMALLINT[]),
+    start_time CHAR(5) NOT NULL CHECK (start_time ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$'),
+    end_time CHAR(5) NOT NULL CHECK (end_time ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$'),
+    price NUMERIC(10,2) NOT NULL CHECK (price > 0),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (start_time <> end_time)
+);
+CREATE INDEX IF NOT EXISTS idx_price_schedules_product ON price_schedules(product_id) WHERE active;
+
+DO $$ BEGIN
+    CREATE TYPE app_permission AS ENUM ('MENU_MANAGE', 'MENU_AVAILABILITY', 'TABLES_MANAGE', 'STAFF_MANAGE', 'STORE_SETTINGS', 'SYNC_MANAGE');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE TABLE IF NOT EXISTS role_permissions (
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    role user_role NOT NULL CHECK (role <> 'OWNER'),
+    permission app_permission NOT NULL,
+    allowed BOOLEAN NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, role, permission)
+);
+
+ALTER TABLE price_schedules ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS price_schedules_tenant ON price_schedules;
+CREATE POLICY price_schedules_tenant ON price_schedules
+    USING (tenant_id = tchefood_tenant()) WITH CHECK (tenant_id = tchefood_tenant());
+
+ALTER TABLE role_permissions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS role_permissions_tenant ON role_permissions;
+CREATE POLICY role_permissions_tenant ON role_permissions
+    USING (tenant_id = tchefood_tenant()) WITH CHECK (tenant_id = tchefood_tenant());
+
+-- Grava pelo aparelho (upsert) exige WITH CHECK nas tabelas que só tinham USING.
+DROP POLICY IF EXISTS modifier_options_tenant ON modifier_options;
+CREATE POLICY modifier_options_tenant ON modifier_options
+    USING (EXISTS (SELECT 1 FROM modifier_groups g WHERE g.id = group_id AND g.tenant_id = tchefood_tenant()))
+    WITH CHECK (EXISTS (SELECT 1 FROM modifier_groups g WHERE g.id = group_id AND g.tenant_id = tchefood_tenant()));
+DROP POLICY IF EXISTS product_modifier_groups_tenant ON product_modifier_groups;
+CREATE POLICY product_modifier_groups_tenant ON product_modifier_groups
+    USING (EXISTS (SELECT 1 FROM products p WHERE p.id = product_id AND p.tenant_id = tchefood_tenant()))
+    WITH CHECK (EXISTS (SELECT 1 FROM products p WHERE p.id = product_id AND p.tenant_id = tchefood_tenant()));
+
+-- O aparelho atualiza os dados cadastrais da loja, mas nunca o token Focus nem o CSC.
+CREATE OR REPLACE FUNCTION tchefood_tenant_secrets_guard()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('request.jwt.claims', true) IS NOT NULL
+       AND coalesce(current_setting('request.jwt.claims', true)::jsonb->>'role', '') = 'authenticated' THEN
+        NEW.focus_nfe_token := OLD.focus_nfe_token;
+        NEW.csc_id := OLD.csc_id;
+        NEW.csc_token := OLD.csc_token;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_tenants_secrets ON tenants;
+CREATE TRIGGER trg_tenants_secrets BEFORE UPDATE ON tenants
+    FOR EACH ROW EXECUTE FUNCTION tchefood_tenant_secrets_guard();
+
+-- Fila offline: a autorização do gerente (audit_log) pode subir horas depois de dada,
+-- e a atualização da comanda pode subir numa tentativa seguinte. Em vez da janela de
+-- 5 minutos (que recusaria esse reenvio para sempre), a autorização fica presa à
+-- própria operação:
+--  - remover os 10%: o último registro de 10% da comanda tem de ser SERVICE_FEE_REMOVED
+--    (depois de restaurar, uma nova remoção precisa de nova autorização);
+--  - desconto: o último DISCOUNT_APPLIED da comanda tem de ser exatamente desta
+--    mudança (discount_before = valor atual, discount_after = valor novo).
+CREATE OR REPLACE FUNCTION tchefood_require_order_audit()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_ok BOOLEAN := FALSE; v_action TEXT;
+BEGIN
+    IF OLD.charge_service_fee AND NOT NEW.charge_service_fee THEN
+        v_action := 'SERVICE_FEE_REMOVED';
+        SELECT (a.action_type = 'SERVICE_FEE_REMOVED' AND m.role IN ('MANAGER', 'OWNER') AND m.active)
+          INTO v_ok
+          FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id
+         WHERE a.order_id = NEW.id AND a.action_type IN ('SERVICE_FEE_REMOVED', 'SERVICE_FEE_RESTORED')
+         ORDER BY a.created_at DESC, a.id DESC
+         LIMIT 1;
+    ELSIF NEW.discount_amount > OLD.discount_amount THEN
+        v_action := 'DISCOUNT_APPLIED';
+        SELECT ((a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
+                AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
+                AND m.role IN ('MANAGER', 'OWNER') AND m.active)
+          INTO v_ok
+          FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id
+         WHERE a.order_id = NEW.id AND a.action_type = 'DISCOUNT_APPLIED'
+         ORDER BY a.created_at DESC, a.id DESC
+         LIMIT 1;
+    ELSE
+        RETURN NULL;
+    END IF;
+    IF NOT COALESCE(v_ok, FALSE) THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % sem PIN de gerente registrado em audit_logs.', v_action;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+-- Hook de access token do Supabase Auth: claim tenant_id = app_metadata.tenant_id.
+-- Ativar em Authentication > Hooks > Customize Access Token, função public.tchefood_access_token_hook.
+CREATE OR REPLACE FUNCTION public.tchefood_access_token_hook(event JSONB)
+RETURNS JSONB LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    claims JSONB := event->'claims';
+    tenant TEXT := event->'claims'->'app_metadata'->>'tenant_id';
+BEGIN
+    IF tenant IS NOT NULL AND tenant <> '' THEN
+        claims := jsonb_set(claims, '{tenant_id}', to_jsonb(tenant));
+    END IF;
+    RETURN jsonb_set(event, '{claims}', claims);
+END;
+$$;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_auth_admin') THEN
+        GRANT EXECUTE ON FUNCTION public.tchefood_access_token_hook(JSONB) TO supabase_auth_admin;
+        REVOKE EXECUTE ON FUNCTION public.tchefood_access_token_hook(JSONB) FROM authenticated, anon, public;
     END IF;
 END $$;

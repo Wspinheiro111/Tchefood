@@ -2,9 +2,9 @@ import { useMemo, useState } from 'react';
 import { Ban, BadgePercent, CheckCheck, CreditCard, HandPlatter, Lock, Printer, QrCode as QrIcon, Receipt, RotateCcw } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import type { ItemStatus, OrderItem } from '../types';
-import { formatBRL, round2 } from '../lib/money';
+import { formatBRL, formatQty, round2 } from '../lib/money';
 import { conferenceLines } from '../lib/receipts';
-import { useTerminalBus } from '../lib/payments/drivers';
+import { printDocument, useTerminalBus } from '../lib/payments/drivers';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { Badge, Btn, Sheet, Stepper, toast } from '../components/ui';
 import { SECTOR_LABEL } from './OrderScreen';
@@ -41,7 +41,12 @@ export function StatementPanel({ orderId, onCheckout }: { orderId: string; onChe
   const printConference = () => {
     const waiter = s.staff.find((u) => u.id === order.opened_by_user_id) ?? null;
     const lines = conferenceLines({ tenant: s.tenant, table, order, items: s.orderItems, products: s.products, waiter });
-    useTerminalBus.getState().enqueuePrint({ title: `Conferência ${table.label}`, lines, chassis: useTerminalBus.getState().chassis });
+    try {
+      const via = printDocument({ title: `Conferência ${table.label}`, lines, chassis: useTerminalBus.getState().chassis });
+      if (via === 'NATIVE') toast.success('Conferência enviada para a bobina.');
+    } catch (e) {
+      toast.error(`Conferência não impressa: ${e instanceof Error ? e.message : 'falha na impressora'}`);
+    }
   };
 
   return (
@@ -64,7 +69,7 @@ export function StatementPanel({ orderId, onCheckout }: { orderId: string; onChe
               <div className="flex items-start gap-2">
                 <div className="min-w-0 flex-1">
                   <div className={`font-semibold ${canceled ? 'line-through opacity-60' : ''}`}>
-                    {it.quantity}x {p?.name}
+                    {formatQty(it.quantity, p?.unit)} {p?.name}
                   </div>
                   <div className="mt-1 flex flex-wrap gap-1">
                     <Badge className={st.cls}>{st.label}</Badge>

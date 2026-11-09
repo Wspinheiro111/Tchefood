@@ -232,8 +232,9 @@ export function planPurchaseImport(
         description: null,
         price: 0,
         sector: 'NONE',
-        // Fica fora da venda até o dono definir preço e liberar.
+        // Fica fora da venda (desativado no Cardápio) até o dono definir preço e ativar.
         available: false,
+        active: false,
         requires_meat_doneness: false,
         allows_half_and_half: false,
         ncm: item.ncm ?? '21069090',
@@ -243,6 +244,8 @@ export function planPurchaseImport(
         cost_price: 0,
         stock_quantity: 0,
         barcode: item.barcode,
+        sold_by_weight: false,
+        tare_weight_grams: 0,
         created_at: ctx.now,
       };
       created.push(product);
