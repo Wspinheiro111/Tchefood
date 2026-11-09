@@ -150,7 +150,7 @@ describe('cardápio AR: envio do arquivo', () => {
     const calls: Array<{ url: string; headers: Record<string, string> }> = [];
     const url = await uploadModelFile(
       { url: 'https://proj.supabase.co/', anonKey: 'anon', accessToken: 'jwt' },
-      storagePath('tenant-1', 'model-1', 'glb'),
+      storagePath('tenant-1', 'model-1', 'glb', 1731186000000),
       new Blob(['glTF']),
       'glb',
       async (u, init) => {
@@ -158,9 +158,9 @@ describe('cardápio AR: envio do arquivo', () => {
         return { ok: true, status: 200, text: async () => '' };
       },
     );
-    expect(calls[0]!.url).toBe('https://proj.supabase.co/storage/v1/object/product-models/tenant-1/model-1.glb');
+    expect(calls[0]!.url).toBe('https://proj.supabase.co/storage/v1/object/product-models/tenant-1/model-1-1731186000000.glb');
     expect(calls[0]!.headers).toMatchObject({ Authorization: 'Bearer jwt', 'Content-Type': 'model/gltf-binary', 'x-upsert': 'true' });
-    expect(url).toBe(publicModelUrl('https://proj.supabase.co', 'tenant-1/model-1.glb'));
+    expect(url).toBe(publicModelUrl('https://proj.supabase.co', 'tenant-1/model-1-1731186000000.glb'));
     await expect(
       uploadModelFile({ url: 'https://p', anonKey: 'a', accessToken: 'j' }, 'x/y.glb', new Blob(['x']), 'glb', async () => ({ ok: false, status: 403, text: async () => 'new row violates row-level security policy' })),
     ).rejects.toThrow(/HTTP 403/);

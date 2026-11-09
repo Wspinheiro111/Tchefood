@@ -140,7 +140,8 @@ export function ModelViewer({ model, alt, variant, onEvent, onPick, onInfo, high
           el.currentTime = variant === 'admin' ? endOf(el) : 0;
         });
       }
-      // Mede uma vez por arquivo, ainda na pose de repouso (getDimensions ignora o atributo scale).
+      // Mede uma vez por arquivo, na pose de repouso. getDimensions já inclui o atributo scale, então a
+      // Retaguarda mede com scale_factor 1 (ver ArAdmin) e o valor sai do arquivo como veio.
       if (measured.current !== el.src) {
         measured.current = el.src;
         const d = el.getDimensions();

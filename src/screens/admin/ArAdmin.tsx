@@ -38,12 +38,12 @@ async function publishToCloud(model: ProductArModel, files: { glb?: Blob | null;
     if (glb.startsWith('idb:')) {
       const blob = files.glb ?? (await readModelFile(glb));
       if (!blob) return 'Arquivo .glb não está mais neste aparelho. Envie de novo.';
-      glb = await uploadModelFile(target, storagePath(model.tenant_id, model.id, 'glb'), blob, 'glb', fetchFn);
+      glb = await uploadModelFile(target, storagePath(model.tenant_id, model.id, 'glb', Date.now()), blob, 'glb', fetchFn);
     }
     if (usdz?.startsWith('idb:')) {
       const blob = files.usdz ?? (await readModelFile(usdz));
       if (!blob) return 'Arquivo .usdz não está mais neste aparelho. Envie de novo.';
-      usdz = await uploadModelFile(target, storagePath(model.tenant_id, model.id, 'usdz'), blob, 'usdz', fetchFn);
+      usdz = await uploadModelFile(target, storagePath(model.tenant_id, model.id, 'usdz', Date.now()), blob, 'usdz', fetchFn);
     }
     const r = useArStore.getState().setArModelUrls(model.product_id, { glb_url: glb, usdz_url: usdz });
     return r.ok ? null : r.error;
@@ -286,9 +286,9 @@ function ArModelEditor({ product, model, onClose }: { product: Product; model: P
         <div className="z-10 self-start lg:sticky lg:top-0">
           <div className="relative h-80 overflow-hidden rounded-2xl">
             {previewRef ? (
-              // Remonta ao trocar de arquivo ou de escala: o <model-viewer> 4.4 erra ao mudar
-              // o atributo scale de um modelo já carregado fora do AR.
-              <ModelViewer key={`${previewRef}|${factor}`} model={previewModel} alt={product.name} variant="admin" onInfo={onInfo} onPick={placing ? onPick : undefined} highlightId={placing} className="h-full" />
+              // Prévia sempre na escala 1: mede o arquivo como veio (getDimensions já inclui o
+              // scale) e as etiquetas ficam em coordenadas do modelo. Remonta ao trocar de arquivo.
+              <ModelViewer key={previewRef} model={{ ...previewModel, scale_factor: 1 }} alt={product.name} variant="admin" onInfo={onInfo} onPick={placing ? onPick : undefined} highlightId={placing} className="h-full" />
             ) : (
               <div className="grid h-full place-items-center bg-base p-6 text-center text-sm text-slate-500">Escolha o arquivo .glb do prato para ver aqui.</div>
             )}

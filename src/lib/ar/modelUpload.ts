@@ -13,8 +13,12 @@ export interface UploadTarget {
 
 export type BlobFetch = (url: string, init: { method: string; headers: Record<string, string>; body: Blob }) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
 
-export function storagePath(tenantId: string, modelId: string, ext: 'glb' | 'usdz'): string {
-  return `${tenantId}/${modelId}.${ext}`;
+/**
+ * Caminho no bucket. A revisão entra no nome: trocar o arquivo gera um link novo, para o
+ * celular do cliente não reaproveitar o 3D antigo do cache (do navegador ou do model-viewer).
+ */
+export function storagePath(tenantId: string, modelId: string, ext: 'glb' | 'usdz', revision: number): string {
+  return `${tenantId}/${modelId}-${revision}.${ext}`;
 }
 
 export function publicModelUrl(baseUrl: string, path: string): string {
