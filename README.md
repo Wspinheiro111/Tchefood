@@ -15,7 +15,7 @@ npm run build
 |-----|--------|----------|
 | 1111 / 2222 / 3333 | Garçom | Mapa de mesas, QR Cliente |
 | 7777 | Cozinha | KDS |
-| 5555 | Caixa | Mesas, Pedido no Caixa, Retaguarda |
+| 5555 | Caixa | Mesas, PDV / Caixa, Retaguarda |
 | 9999 | Gerente (autoriza cancelamentos, 10% e descontos) | Tudo |
 | 8888 | Proprietário | Tudo |
 | 4444 | Totem (aparelho do cliente) | Tela do totem; sair = 5 toques no logo + PIN de gerente |
@@ -43,7 +43,7 @@ npm run build
 12. **Painel de senhas na TV** — aba **Painel TV**: colunas "Preparando" e "Pronto" no estilo fast-food, com pedidos de delivery/retirada (número do app + primeiro nome) e pedidos feitos pelo QR da mesa. Quando um pedido fica pronto, o número pisca, toca o sinal e a TV fala o número (voz do navegador, dá para desligar). Botão de tela cheia. Não mostra telefone, endereço nem valores.
 13. **Totem de autoatendimento e pedido no caixa (pedido com senha)**
    - **Totem (PIN 4444):** tela própria para o cliente, sem o menu da equipe. Toque para pedir → *Comer aqui* ou *Para levar* → cardápio por categoria com fotos de categoria, opções (ponto da carne, adicionais, meio a meio, observações) → revisão do pedido com teclado na tela para o nome → pagamento em **Crédito, Débito ou Pix na SmartPOS Stone/PagBank** ao lado do totem, ou **Pagar no caixa**. Sai a **senha do dia** (001, 002…, reinicia à meia-noite de Brasília) no comprovante. Inatividade de 90 s pergunta "Ainda está aí?" e volta ao início. Sair do totem: 5 toques no logo em 3 s + PIN de gerente (fica no `audit_logs`).
-   - **Pedido no Caixa (Caixa/Gerente/Dono):** a atendente monta o pedido no balcão, escolhe comer aqui/para levar, cobra em cartão, Pix ou dinheiro (com troco) e entrega a senha. Na mesma tela ficam as **senhas do totem aguardando pagamento** e o andamento das senhas de hoje (Preparando / Pronto / Entregue). Senha não paga só é cancelada com PIN de gerente.
+   - **PDV / Caixa (Caixa/Gerente/Dono):** a atendente monta o pedido no balcão, escolhe comer aqui/para levar, cobra em cartão, Pix ou dinheiro (com troco) e entrega a senha. Na mesma tela ficam as **senhas do totem aguardando pagamento** e o andamento das senhas de hoje (Preparando / Pronto / Entregue). Senha não paga só é cancelada com PIN de gerente.
    - **Cozinha e TV:** o pedido só entra no **KDS** depois de pago, com a SENHA no lugar da mesa ("Para levar · João", selo Totem/Caixa) e botão *Entregue no Balcão*; o ticket das praças sai com `SENHA 042` em fonte gigante. O **Painel TV** mostra a senha em *Preparando* e passa para *Pronto* quando a cozinha termina, falando "Senha 42".
    - **Regras de dinheiro:** mesa técnica `KIOSK` (fora do mapa), sem os 10% do garçom, preço sempre do cadastro, mesmas travas de maquininha da mesa (cobrança em andamento trava a conta, resultado incerto vira conferência manual e o totem manda o cliente ao caixa sem cobrar de novo, NSU nunca inventado). Fecha com NFC-e como qualquer conta.
 14. **Compras por XML (NF-e modelo 55)** — Retaguarda › Compras / Estoque. Lê o XML do fornecedor (regras do Tchê Vendas, tudo fail-closed: sem DTD, chave com DV, modelo 55, protocolo autorizado, nota destinada ao CNPJ da casa, itens fechando com o total), sugere o produto pelo vínculo do fornecedor, EAN ou nome, sugere o fator de embalagem (CX 2 com UN 24 = 12), cria o produto fora da venda quando não existe, dá entrada no estoque e recalcula o **custo médio ponderado** (produto − desconto + frete + seguro + outras + IPI + ICMS-ST). A mesma chave nunca entra duas vezes. Botão "XML de exemplo" para testar.
