@@ -13,7 +13,7 @@ export default function Hero() {
     <section id="topo" className="relative overflow-hidden">
       <div
         aria-hidden
-        className="pointer-events-none absolute -top-40 left-1/2 h-[520px] w-[900px] -translate-x-1/2 animate-brasa rounded-full bg-[radial-gradient(closest-side,rgba(225,29,72,0.14),transparent)]"
+        className="pointer-events-none absolute -top-40 left-1/2 h-[520px] w-[900px] -translate-x-1/2 animate-brasa rounded-full bg-[radial-gradient(closest-side,rgba(210,35,42,0.14),transparent)]"
       />
       <div
         aria-hidden

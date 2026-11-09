@@ -7,7 +7,9 @@ export default {
         fundo: '#ffffff',
         surface: '#f8fafc',
         borda: '#e2e8f0',
-        brasa: '#e11d48',
+        brasa: '#D2232A', // vermelho oficial da marca
+        verde: '#0B7A3B', // verde oficial da marca
+        amarelo: '#FFCB05', // amarelo oficial da marca
         ouro: '#f59e0b',
       },
       fontFamily: {

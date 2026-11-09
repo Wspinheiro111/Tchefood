@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bike, ChefHat, Expand, Flame, Minimize, ShoppingBag, Volume2, VolumeX } from 'lucide-react';
+import { Bike, ChefHat, Expand, Minimize, ShoppingBag, Volume2, VolumeX } from 'lucide-react';
+import { BrandLogo } from '../components/Brand';
 import { useTcheStore } from '../store/useTcheStore';
 import { playDispatchChime } from '../lib/sound';
 import { useDeliveryOrders, useDeliveryPolling } from '../lib/deliveryDemo';
@@ -87,7 +88,7 @@ export function OrderBoardScreen() {
   return (
     <div ref={rootRef} className="flex min-h-[calc(100vh-56px)] flex-col bg-base text-white">
       <header className="flex items-center gap-3 border-b border-slate-800 px-6 py-4">
-        <div className="grid h-12 w-12 place-items-center rounded-xl bg-brasa"><Flame className="h-7 w-7" /></div>
+        <BrandLogo variant="dark" className="h-16 w-auto" />
         <div className="mr-auto">
           <div className="text-2xl font-black">{tenant.name}</div>
           <div className="text-sm text-slate-400">Acompanhe seu pedido</div>
