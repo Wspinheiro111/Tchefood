@@ -13,6 +13,7 @@ import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeS
 import { usePickupCart, usePickupMenu } from '../components/pickup/usePickupCart';
 import { Badge, Btn, toast } from '../components/ui';
 import { CategoryIcon } from './OrderScreen';
+import { useSalePrice } from '../lib/useSalePrice';
 
 type Method = 'CREDIT' | 'DEBIT' | 'PIX' | 'CASH';
 
@@ -43,6 +44,7 @@ export function PickupCounterScreen() {
 }
 
 function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void }) {
+  const priceOf = useSalePrice();
   const cart = usePickupCart();
   const { cats, sellable } = usePickupMenu();
   const [catId, setCatId] = useState('');
@@ -81,7 +83,7 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
             <button key={p.id} onClick={() => tap(p)} disabled={!p.available} className="flex min-h-[88px] flex-col justify-between rounded-2xl border border-slate-700 bg-surface p-3 text-left active:bg-slate-700 disabled:opacity-40">
               <span className="line-clamp-2 font-bold leading-tight">{p.name}</span>
               <span className="flex items-center justify-between">
-                <span className="text-lg font-black tabular-nums text-ouro">{formatBRL(p.price)}</span>
+                <span className="text-lg font-black tabular-nums text-ouro">{formatBRL(priceOf(p))}</span>
                 {cart.needsOptions(p) && <Badge className="bg-slate-700">opções</Badge>}
               </span>
             </button>

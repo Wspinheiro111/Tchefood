@@ -3,6 +3,7 @@ import { useTcheStore, type PickupLine } from '../../store/useTcheStore';
 import type { Product } from '../../types';
 import { computeItemTotal, formatBRL, halfAndHalfPrice, round2 } from '../../lib/money';
 import type { ProductDraft } from '../ProductSheet';
+import { useSalePrice } from '../../lib/useSalePrice';
 
 /** Linha do carrinho do pedido com senha. O preço aqui é só prévia: o store recalcula pelo cadastro. */
 export interface PickupCartLine extends PickupLine {
@@ -27,6 +28,8 @@ export function usePickupCart() {
   const products = useTcheStore((s) => s.products);
   const links = useTcheStore((s) => s.productModifierGroups);
   const pricing = useTcheStore((s) => s.halfAndHalfPricing);
+  // Mostra o preço com a regra de horário; o valor cobrado é recalculado no store.
+  const priceOf = useSalePrice();
   const [lines, setLines] = useState<PickupCartLine[]>([]);
 
   /** Produto que precisa de escolha (ponto, adicionais obrigatórios, meio a meio) abre a ficha de opções. */
@@ -36,7 +39,7 @@ export function usePickupCart() {
     const product = products.find((p) => p.id === d.product_id);
     if (!product) return;
     const halves = d.half_product_ids.map((id) => products.find((p) => p.id === id)).filter((p): p is Product => Boolean(p));
-    const base = halves.length ? halfAndHalfPrice([product.price, ...halves.map((h) => h.price)], pricing) : product.price;
+    const base = halves.length ? halfAndHalfPrice([priceOf(product), ...halves.map(priceOf)], pricing) : priceOf(product);
     const mods = round2(d.modifiers.reduce((a, m) => a + m.additional_price, 0));
     const details = [
       ...(halves.length ? [`1/2 ${product.name} + ${halves.map((h) => `1/2 ${h.name}`).join(' + ')}`] : []),
@@ -95,7 +98,7 @@ export function usePickupMenu() {
   const categories = useTcheStore((s) => s.categories);
   const products = useTcheStore((s) => s.products);
   return useMemo(() => {
-    const sellable = products.filter((p) => !p.sold_by_weight);
+    const sellable = products.filter((p) => p.active && !p.sold_by_weight);
     const cats = categories
       .filter((c) => c.active && sellable.some((p) => p.category_id === c.id))
       .sort((a, b) => a.sort_order - b.sort_order);

@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react';
 import { BellRing, Minus, Plus, Receipt, ShoppingBag, Trash2, UtensilsCrossed } from 'lucide-react';
-import { useTcheStore } from '../store/useTcheStore';
+import { useSalePrice } from '../lib/useSalePrice';
+import { QR_PRICE_CHANGED, useTcheStore } from '../store/useTcheStore';
 import type { Product } from '../types';
-import { computeItemTotal, formatBRL } from '../lib/money';
+import { computeItemTotal, formatBRL, fromCents, halfAndHalfPrice, toCents } from '../lib/money';
 import { ProductSheet, type ProductDraft } from '../components/ProductSheet';
 import { QrCode } from '../components/QrCode';
 import { Badge, toast } from '../components/ui';
@@ -17,9 +18,9 @@ interface CartLine extends ProductDraft {
 
 /** Simulador do celular do cliente lendo o QR Code da mesa (Cardápio Digital). */
 export function QrMenuScreen() {
-  const allTables = useTcheStore((s) => s.tables);
-  const tables = useMemo(() => allTables.filter((t) => t.kind === 'TABLE'), [allTables]);
-  const sorted = useMemo(() => [...tables].sort((a, b) => a.number - b.number), [tables]);
+  const tables = useTcheStore((s) => s.tables);
+  // Só mesas de verdade e ativas: a mesa técnica do balcão (COUNTER) não tem QR.
+  const sorted = useMemo(() => tables.filter((t) => t.active && t.kind === 'TABLE').sort((a, b) => a.number - b.number), [tables]);
   const [tableId, setTableId] = useState<string>(sorted.find((t) => t.number === 4)?.id ?? sorted[0]?.id ?? '');
   const table = tables.find((t) => t.id === tableId);
 
@@ -65,12 +66,14 @@ function CustomerPhone({ tableId }: { tableId: string }) {
   const table = s.tables.find((t) => t.id === tableId)!;
   const order = table.current_order_id ? s.orders.find((o) => o.id === table.current_order_id) : undefined;
   const [tab, setTab] = useState<'menu' | 'bill'>('menu');
-  const [cat, setCat] = useState(s.categories[0]?.id ?? '');
+  const priceOf = useSalePrice();
+  const liveCategories = s.categories.filter((c) => c.active).sort((a, b) => a.sort_order - b.sort_order);
+  const [cat, setCat] = useState(liveCategories[0]?.id ?? '');
   const [selected, setSelected] = useState<Product | null>(null);
   const [cart, setCart] = useState<CartLine[]>([]);
 
   // Buffet a quilo é pesado no balcão, não pedido pelo celular.
-  const products = s.products.filter((p) => p.category_id === cat && !p.sold_by_weight);
+  const products = s.products.filter((p) => p.active && p.category_id === cat && !p.sold_by_weight);
   const cartTotal = cart.reduce((a, c) => a + computeItemTotal(c.quantity, c.unit_price, c.modifiers_unit_price), 0);
   const myItems = order ? s.orderItems.filter((i) => i.order_id === order.id) : [];
 
@@ -80,9 +83,30 @@ function CustomerPhone({ tableId }: { tableId: string }) {
     toast.info('Adicionado ao seu pedido.');
   };
 
+  /** Recalcula o carrinho com o preço de agora (regra de horário e adicionais atuais). */
+  const repriced = (lines: CartLine[]): CartLine[] =>
+    lines.map((c) => {
+      const p = s.products.find((x) => x.id === c.product_id);
+      const modifiers = c.modifiers.map((m) => ({ ...m, additional_price: s.modifierOptions.find((o) => o.id === m.option_id)?.additional_price ?? m.additional_price }));
+      const mods = fromCents(modifiers.reduce((a, m) => a + toCents(m.additional_price), 0));
+      const halves = c.half_product_ids.map((id) => s.products.find((x) => x.id === id)).filter((x): x is Product => Boolean(x));
+      const unit = !p ? c.unit_price : halves.length ? halfAndHalfPrice([priceOf(p), ...halves.map(priceOf)], s.halfAndHalfPricing) : priceOf(p);
+      return { ...c, unit_price: unit, modifiers, modifiers_unit_price: mods };
+    });
+
   const send = () => {
+    const fresh = repriced(cart);
+    const changed = fresh.some((c, i) => toCents(c.unit_price) !== toCents(cart[i]!.unit_price) || toCents(c.modifiers_unit_price) !== toCents(cart[i]!.modifiers_unit_price));
+    if (changed) {
+      // Nunca enviar com valor diferente do que o cliente viu: atualiza e pede para conferir.
+      setCart(fresh);
+      return toast.alert('O preço de algum item mudou (horário de promoção). Confira o total e toque em Pedir de novo.');
+    }
     const r = s.qrPlaceOrder(tableId, cart.map(({ key: _k, ...d }) => d));
-    if (!r.ok) return toast.error(r.error);
+    if (!r.ok) {
+      if (r.error.startsWith(QR_PRICE_CHANGED)) setCart(fresh);
+      return toast.error(r.error);
+    }
     if (s.soundEnabled) playDispatchChime();
     printDispatchedItems(r.data.items);
     toast.success(`📱 Pedido enviado para a cozinha da ${table.label}!`);
@@ -113,7 +137,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
       {tab === 'menu' ? (
         <>
           <div className="flex gap-2 overflow-x-auto px-3 py-2">
-            {s.categories.filter((c) => s.products.some((p) => p.category_id === c.id && !p.sold_by_weight)).map((c) => (
+            {liveCategories.filter((c) => s.products.some((p) => p.active && p.category_id === c.id && !p.sold_by_weight)).map((c) => (
               <button key={c.id} onClick={() => setCat(c.id)} className={`flex shrink-0 flex-col items-center gap-1 rounded-xl px-3 py-2 text-[11px] font-bold ${cat === c.id ? 'bg-rose-600 text-white' : 'bg-white text-slate-700 shadow'}`}>
                 <CategoryIcon name={c.icon_name} className="h-6 w-6" />
                 {c.name}
@@ -133,7 +157,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
                     {p.description && <span className="line-clamp-2 block text-xs text-slate-500">{p.description}</span>}
                     {!p.available && <span className="text-xs font-bold text-rose-600">Esgotado</span>}
                   </span>
-                  <span className="font-black text-rose-700">{formatBRL(p.price)}</span>
+                  <span className="font-black text-rose-700">{formatBRL(priceOf(p))}</span>
                 </button>
               );
             })}

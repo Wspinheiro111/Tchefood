@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Check } from 'lucide-react';
+import { useSalePrice } from '../lib/useSalePrice';
 import { useTcheStore } from '../store/useTcheStore';
 import type { ModifierGroup, Product, SelectedModifier, TrayItem } from '../types';
 import { computeItemTotal, formatBRL, halfAndHalfPrice } from '../lib/money';
@@ -31,6 +32,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
   const groupsAll = useTcheStore((s) => s.modifierGroups);
   const optionsAll = useTcheStore((s) => s.modifierOptions);
   const pricingRule = useTcheStore((s) => s.halfAndHalfPricing);
+  const priceOf = useSalePrice();
 
   const [qty, setQty] = useState(1);
   const [doneness, setDoneness] = useState<string | null>(null);
@@ -60,10 +62,10 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
   if (!product) return null;
 
   const halfOptions = product.allows_half_and_half
-    ? products.filter((p) => p.allows_half_and_half && p.available && p.id !== product.id && p.category_id === product.category_id)
+    ? products.filter((p) => p.allows_half_and_half && p.active && p.available && p.id !== product.id && p.category_id === product.category_id)
     : [];
   const halfProduct = half ? products.find((p) => p.id === half) : undefined;
-  const unitPrice = halfProduct ? halfAndHalfPrice([product.price, halfProduct.price], pricingRule) : product.price;
+  const unitPrice = halfProduct ? halfAndHalfPrice([priceOf(product), priceOf(halfProduct)], pricingRule) : priceOf(product);
   const modsPrice = mods.reduce((a, m) => a + m.additional_price, 0);
   const total = computeItemTotal(qty, unitPrice, modsPrice);
 
@@ -156,7 +158,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
             <button onClick={() => setHalf(null)} className={`min-h-touch rounded-xl px-3 text-sm font-semibold ${!half ? 'bg-ouro text-slate-950' : 'bg-slate-700'}`}>Inteira</button>
             {halfOptions.map((p) => (
               <button key={p.id} onClick={() => setHalf(p.id)} className={`min-h-touch rounded-xl px-3 text-sm font-semibold ${half === p.id ? 'bg-ouro text-slate-950' : 'bg-slate-700'}`}>
-                ½ {p.name.replace('Pizza ', '')} · {formatBRL(p.price)}
+                ½ {p.name.replace('Pizza ', '')} · {formatBRL(priceOf(p))}
               </button>
             ))}
           </div>

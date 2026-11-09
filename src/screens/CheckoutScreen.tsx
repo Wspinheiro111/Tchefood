@@ -3,7 +3,7 @@ import { ArrowLeft, Banknote, CheckCircle2, CreditCard, Divide, ListChecks, QrCo
 import { useTcheStore } from '../store/useTcheStore';
 import type { OperationMode, Payment } from '../types';
 import { computeEqualShare, computeItemsShare, formatBRL, round2, toCents } from '../lib/money';
-import { createDriver, useTerminalBus, type Chassis, type ChargeRequest } from '../lib/payments/drivers';
+import { createDriver, useTerminalBus, type Chassis, type ChargeRequest, type IPaymentTerminalDriver } from '../lib/payments/drivers';
 import { cardReceiptLines, conferenceLines } from '../lib/receipts';
 import { uuid } from '../lib/ids';
 import { clearReviewHold, getReviewHold, setReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
@@ -65,6 +65,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const amount =
     mode === 'EQUAL' ? computeEqualShare(remaining, peopleLeft) : mode === 'FREE' ? freeValue : itemShare.share;
   const amountValid = amount > 0 && toCents(amount) <= toCents(remaining);
+  const trayPending = s.tray.some((t) => t.order_id === orderId);
   const cashGivenValue = round2(Number(cashGiven.replace(',', '.')) || 0);
   const change = method === 'CASH' && cashGivenValue > amount ? round2(cashGivenValue - amount) : 0;
 
@@ -72,13 +73,11 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const description =
     mode === 'EQUAL' ? `Cota ${order.customer_count - peopleLeft + 1} de ${order.customer_count}` : mode === 'FREE' ? 'Valor parcial livre' : `${selected.length} item(ns) consumido(s)`;
 
-  const afterApproved = (payment: Payment, closed: boolean, pan: string | null) => {
-    if (payment.method !== 'CASH') {
-      useTerminalBus.getState().enqueuePrint({
-        title: 'Comprovante TEF',
-        lines: cardReceiptLines({ tenant: s.tenant, payment, tableLabel: table.label, maskedPan: pan }),
-        chassis: payment.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE',
-      });
+  const afterApproved = (payment: Payment, closed: boolean, pan: string | null, driver: IPaymentTerminalDriver | null) => {
+    if (payment.method !== 'CASH' && driver) {
+      // Bobina da própria maquininha quando há ponte nativa; no navegador, o simulador visual.
+      const lines = cardReceiptLines({ tenant: s.tenant, payment, tableLabel: table.label, maskedPan: pan });
+      driver.print(lines).catch(() => toast.error('Comprovante não impresso. Reimprima pela maquininha.'));
     }
     toast.success(`✅ ${formatBRL(payment.amount)} aprovado${payment.authorization_code ? ` · cAut ${payment.authorization_code}` : ''}`);
     if (mode === 'EQUAL') setPeopleLeft((n) => Math.max(1, n - 1));
@@ -89,7 +88,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   };
 
   const charge = async () => {
-    if (!amountValid || busy) return;
+    if (!amountValid || busy || trayPending) return;
     const idempotency_key = uuid();
     const itemIds = mode === 'ITEMS' ? selected : [];
 
@@ -101,7 +100,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       });
       if (!r.ok) return toast.error(r.error);
       if (change > 0) toast.info(`Troco: ${formatBRL(change)}`);
-      afterApproved(r.data.payment, r.data.closed, null);
+      afterApproved(r.data.payment, r.data.closed, null, null);
       return;
     }
 
@@ -149,7 +148,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         toast.alert(`⚠️ Aprovado na maquininha, mas não registrado: ${r.error}`);
         return;
       }
-      afterApproved(r.data.payment, r.data.closed, result.masked_pan);
+      afterApproved(r.data.payment, r.data.closed, result.masked_pan, driver);
     } finally {
       useTcheStore.getState().endTerminalCharge(req.request_id);
       setBusy(false);
@@ -314,9 +313,12 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         </div>
       )}
 
+      {trayPending && (
+        <p className="mb-2 rounded-xl border border-rose-500 bg-rose-950/60 p-3 text-sm text-rose-100">Há itens na bandeja desta mesa que ainda não foram enviados. Volte e envie ou remova antes de cobrar.</p>
+      )}
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_2fr]">
         <Btn variant="secondary" size="lg" onClick={printPreview}>Prévia de conferência</Btn>
-        <Btn variant="success" size="lg" disabled={!amountValid || busy || (reviewHold !== null && method !== 'CASH')} onClick={charge}>
+        <Btn variant="success" size="lg" disabled={!amountValid || busy || trayPending || (reviewHold !== null && method !== 'CASH')} onClick={charge}>
           {busy ? 'Aguardando maquininha…' : `${method === 'CASH' ? 'Receber' : opMode === 'TEF_POS_WIRELESS' ? 'Enviar para maquininha' : 'Cobrar na SmartPOS'} ${formatBRL(amount)}`}
         </Btn>
       </div>

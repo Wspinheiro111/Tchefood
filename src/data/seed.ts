@@ -20,9 +20,11 @@ import type {
   OrderItem,
   Payment,
   PosTerminal,
+  PriceSchedule,
   Product,
   ProductModifierGroup,
   ProductionSector,
+  RolePermission,
   StaffUser,
   Tenant,
 } from '../types';
@@ -79,6 +81,15 @@ function staff(key: string, name: string, role: StaffUser['role'], pin: string):
   };
 }
 
+/**
+ * Usuário técnico do Cardápio QR: reconhecido pelo PIN (não numérico, impossível
+ * de digitar), não pelo id, porque cada loja na nuvem tem o seu.
+ */
+export const QR_SELF_SERVICE_PIN = 'QRSELF';
+export function isQrSelfService(u: Pick<StaffUser, 'pin_code'>): boolean {
+  return u.pin_code === QR_SELF_SERVICE_PIN;
+}
+
 export const SEED_STAFF: StaffUser[] = [
   staff('garcom-tiao', 'Tião', 'WAITER', '1111'),
   staff('garcom-duda', 'Duda', 'WAITER', '2222'),
@@ -88,7 +99,7 @@ export const SEED_STAFF: StaffUser[] = [
   staff('dono', 'Seu Arlindo (Dono)', 'OWNER', '8888'),
   staff('gerente', 'Gerente Rafa', 'MANAGER', '9999'),
   // Usuário técnico do Cardápio QR Code: PIN não numérico, impossível de digitar no PinPad.
-  staff('qrcode', 'Autoatendimento QR Code', 'WAITER', 'QRSELF'),
+  staff('qrcode', 'Autoatendimento QR Code', 'WAITER', QR_SELF_SERVICE_PIN),
   // Aparelho do totem de autoatendimento: entra direto na tela do cliente; sair exige PIN de gerente.
   staff('totem-01', 'Totem 01', 'KIOSK', '4444'),
 ];
@@ -240,6 +251,7 @@ export const SEED_PRODUCTS: Product[] = PRODUCT_SPECS.map((p) => ({
   price: p.price,
   sector: p.sector,
   available: p.available ?? true,
+  active: true,
   requires_meat_doneness: p.doneness ?? false,
   allows_half_and_half: p.half ?? false,
   ncm: p.ncm ?? '21069090',
@@ -363,6 +375,7 @@ function table(n: number, area: (typeof AREAS)[number], capacity: number): Dinin
     status: 'FREE',
     qr_code_token: `tchefood-galpao-${n.toString().padStart(3, '0')}-${(n * 7919).toString(36)}`,
     current_order_id: null,
+    active: true,
     updated_at: created,
     kind: 'TABLE',
   };
@@ -380,6 +393,7 @@ const COUNTER_TABLE: DiningTable = {
   status: 'FREE',
   qr_code_token: null,
   current_order_id: null,
+  active: true,
   updated_at: created,
   kind: 'COUNTER',
 };
@@ -396,6 +410,7 @@ export const KIOSK_TABLE: DiningTable = {
   status: 'FREE',
   qr_code_token: null,
   current_order_id: null,
+  active: true,
   updated_at: created,
   kind: 'KIOSK',
 };
@@ -650,5 +665,7 @@ export function createSeedData() {
     eventTickets: [] as EventTicket[],
     loyaltyCustomers: [] as LoyaltyCustomer[],
     cashbackLedger: [] as CashbackLedgerEntry[],
+    priceSchedules: [] as PriceSchedule[],
+    rolePermissions: [] as RolePermission[],
   };
 }
