@@ -667,6 +667,19 @@ describe('sincronização com o Supabase', () => {
     expect((await flushOutbox([freed], cfg, fetchFn)).sent).toEqual([freed.id]);
   });
 
+  it('mesa liberada segurada não é ultrapassada pela ocupação da mesma mesa por outra comanda', async () => {
+    const fetchFn: FetchLike = async (url) =>
+      url.includes('/payments') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
+    const payA = ev({ id: 'pa', table: 'payments', row_id: 'PA', payload: { id: 'PA', order_id: 'A' } });
+    const releaseA = ev({ id: 'ra', table: 'dining_tables', op: 'UPDATE', row_id: 'T1', payload: { id: 'T1', status: 'FREE', current_order_id: null }, depends_on_order_id: 'A' });
+    const occupyB = ev({ id: 'ob', table: 'dining_tables', op: 'UPDATE', row_id: 'T1', payload: { id: 'T1', status: 'OCCUPIED', current_order_id: 'B' } });
+    const other = ev({ id: 'x', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } });
+    const r = await flushOutbox([payA, releaseA, occupyB, other], cfg, fetchFn);
+    expect(r.rejected.map((x) => x.eventId)).toEqual(['pa']);
+    expect(r.sent).toEqual(['x']);
+    expect((await flushOutbox([releaseA, occupyB], cfg, fetchFn, 50, [payA])).sent).toEqual([]);
+  });
+
   it('eventos segurados não gastam o limite da rodada', async () => {
     const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
     const held = ev({ id: 'h', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } });

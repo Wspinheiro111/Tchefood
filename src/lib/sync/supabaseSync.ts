@@ -336,7 +336,7 @@ export function recordKeys(event: SyncEvent): string[] {
  * (eventos segurados não contam).
  * Um evento recusado (4xx) não para o envio: vai para `rejected` e o próximo segue.
  * Eventos posteriores do MESMO registro de um recusado (nesta rodada ou em `held`, os
- * recusados guardados) não sobem: ficam na fila até o recusado ser reenviado, para uma
+ * recusados guardados), ou de um registro que um evento segurado também toca, não sobem: ficam na fila até o recusado ser reenviado, para uma
  * versão antiga nunca sobrescrever uma mais nova na nuvem.
  * Não altera o estado: quem chama confirma os enviados (ackSyncedEvents) e tira os
  * recusados da fila (rejectSyncEvents), para não reenviá-los a cada rodada.
@@ -359,7 +359,15 @@ export async function flushOutbox(
   for (const event of serverOrder(events)) {
     // Eventos segurados não contam no limite: senão um bloco segurado no começo da fila
     // impediria para sempre que registros sem relação subissem.
-    if (recordKeys(event).some((k) => blocked.has(k))) continue;
+    const keys = recordKeys(event);
+    if (keys.some((k) => blocked.has(k))) {
+      // O segurado também segura o que vem depois dele em QUALQUER registro que ele
+      // toca: a liberação da mesa da comanda A, segurada pelo pagamento recusado de A,
+      // não pode ser ultrapassada pela ocupação da mesma mesa pela comanda B (senão,
+      // ao reenviar A, a liberação antiga sobrescreveria a mesa ocupada na nuvem).
+      for (const k of keys) blocked.add(k);
+      continue;
+    }
     if (attempts >= limit) break;
     attempts++;
     let req: SyncRequest;
