@@ -51,7 +51,7 @@ export interface PreviewLine {
   align: Align;
 }
 
-export type PreviewEvent = { kind: 'line'; line: PreviewLine } | { kind: 'beep' } | { kind: 'cut'; guillotine: boolean };
+export type PreviewEvent = { kind: 'line'; line: PreviewLine } | { kind: 'beep' } | { kind: 'cut'; guillotine: boolean } | { kind: 'qr'; data: string };
 
 const ESC = 0x1b;
 const GS = 0x1d;
@@ -187,6 +187,26 @@ export class UniversalEscPosBuilder {
   }
 
   /** Avança a margem da serrilha e aciona guilhotina (GS V 66 0) quando existir. */
+  /**
+   * GS ( k — QR Code nativo da impressora (modelo 2, correção M), centralizado.
+   * Suportado por Epson, Elgin, Bematech, Daruma, Tanca e bobinas internas Android.
+   */
+  qrCode(data: string, moduleSize = 5): this {
+    const bytes = Array.from(new TextEncoder().encode(data));
+    const len = bytes.length + 3;
+    const prevAlign = this.state.align;
+    this.align('CENTER');
+    this.buffer.push(GS, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00); // modelo 2
+    this.buffer.push(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, Math.min(16, Math.max(1, moduleSize))); // tamanho do módulo
+    this.buffer.push(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31); // correção M
+    this.buffer.push(GS, 0x28, 0x6b, len & 0xff, (len >> 8) & 0xff, 0x31, 0x50, 0x30, ...bytes); // armazena
+    this.buffer.push(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30); // imprime
+    this.buffer.push(LF);
+    this.preview.push({ kind: 'qr', data });
+    this.align(prevAlign);
+    return this;
+  }
+
   cut(enableGuillotine = true): this {
     this.buffer.push(LF, LF, LF, LF);
     if (enableGuillotine) this.buffer.push(GS, 0x56, 0x42, 0x00);

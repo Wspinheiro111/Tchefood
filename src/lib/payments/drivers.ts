@@ -20,6 +20,7 @@ import {
   terminalUserReference,
   type PlugPagRawResult,
 } from './terminalGuard';
+import { UniversalEscPosBuilder } from '../../services/printer/escposBuilder';
 
 export const ACQUIRER_CNPJ: Record<'STONE' | 'PAGBANK', string> = {
   STONE: '16501555000157',
@@ -158,6 +159,35 @@ export const useTerminalBus = create<TerminalBus>((set, get) => ({
   dismissPrint: (id) => set({ printQueue: get().printQueue.filter((j) => j.id !== id) }),
 }));
 
+/**
+ * Imprime um documento (DANFE, conferência) na bobina física do aparelho quando
+ * existe ponte nativa; no navegador, cai no simulador visual.
+ *  - SmartPosNative.printInternalEscPos: ESC/POS 58mm com QR Code nativo (GS ( k)
+ *  - PlugPagBridge.printText: texto puro; o QR vira a URL de consulta impressa
+ */
+export function printDocument(job: Omit<PrintJob, 'id'>): 'NATIVE' | 'SIMULATOR' {
+  const w = window as unknown as {
+    SmartPosNative?: { printInternalEscPos?: (b64: string) => string };
+    PlugPagBridge?: { printText?: (text: string) => void };
+  };
+  if (w.SmartPosNative?.printInternalEscPos) {
+    const b = new UniversalEscPosBuilder('58MM');
+    for (const l of job.lines) b.line(l);
+    if (job.qr) b.qrCode(job.qr);
+    for (const l of job.footer ?? []) b.line(l);
+    b.cut(false);
+    const r = JSON.parse(w.SmartPosNative.printInternalEscPos(b.toBase64())) as { success: boolean; error?: string };
+    if (!r.success) throw new Error(r.error ?? 'Falha na impressora interna');
+    return 'NATIVE';
+  }
+  if (w.PlugPagBridge?.printText) {
+    w.PlugPagBridge.printText([...job.lines, ...(job.qr ? ['', job.qr, ''] : []), ...(job.footer ?? [])].join('\n'));
+    return 'NATIVE';
+  }
+  useTerminalBus.getState().enqueuePrint(job);
+  return 'SIMULATOR';
+}
+
 // ---------------------------------------------------------------------------
 // Geradores de metadados (iguais aos formatos das adquirentes)
 // ---------------------------------------------------------------------------
@@ -229,6 +259,26 @@ interface StoneBridge {
   pay?: (json: string) => void;
 }
 
+type StoneNativeResult = TerminalResult & { request_id?: string };
+
+/**
+ * Cobranças nativas da Stone em andamento. A maquininha processa uma por vez,
+ * e cada resultado do callback window.onStoneResult é entregue à cobrança
+ * que o originou (pelo request_id), nunca à última que foi iniciada.
+ */
+const stoneInFlight = new Map<string, (r: TerminalResult) => void>();
+
+function installStoneCallback(): void {
+  const w = window as unknown as { onStoneResult?: (r: StoneNativeResult) => void };
+  w.onStoneResult = (r) => {
+    const id = r.request_id ?? (stoneInFlight.size === 1 ? stoneInFlight.keys().next().value : undefined);
+    const resolve = id ? stoneInFlight.get(id) : undefined;
+    if (!id || !resolve) return; // resultado sem cobrança correspondente: ignorado
+    stoneInFlight.delete(id);
+    resolve(r);
+  };
+}
+
 export class StonePosDriver implements IPaymentTerminalDriver {
   readonly acquirer: AcquirerType = 'STONE';
   private readonly fallback: MockTerminalDriver;
@@ -258,12 +308,21 @@ export class StonePosDriver implements IPaymentTerminalDriver {
     const bridge = (window as unknown as { StoneBridge?: StoneBridge }).StoneBridge;
     if (this.mode === 'SMARTPOS_EMBEDDED' && bridge?.pay) {
       // Integração nativa: o app Android devolve o resultado via callback window.onStoneResult.
-      return stoneQueue.run(() =>
-        new Promise<TerminalResult>((resolve) => {
-          (window as unknown as { onStoneResult?: (r: TerminalResult) => void }).onStoneResult = (r) => resolve(guardApproved(r, req));
-          bridge.pay?.(JSON.stringify({ deeplink: StonePosDriver.deepLink(req), ...req }));
-        }),
-      );
+      if (stoneInFlight.size > 0) {
+        return {
+          status: 'DECLINED',
+          acquirer: 'STONE',
+          reason: 'Maquininha ocupada com outra cobrança. Aguarde a resposta.',
+          terminal_serial: this.terminal?.serial_number ?? 'STONE-EMBEDDED',
+          terminal_id: this.terminal?.id ?? null,
+        };
+      }
+      installStoneCallback();
+      // Aprovação sem NSU/autorização/serial vira revisão manual (regra do Tchê Vendas).
+      return new Promise<TerminalResult>((resolve) => {
+        stoneInFlight.set(req.request_id, (r) => resolve(guardApproved(r, req)));
+        bridge.pay?.(JSON.stringify({ deeplink: StonePosDriver.deepLink(req), ...req }));
+      });
     }
     // TEF POS Sem Fio: em produção a cobrança vai para a fila do terminal
     // (serial STONE-01/02) via Stone Connect. Sem credenciais, o terminal
@@ -271,7 +330,17 @@ export class StonePosDriver implements IPaymentTerminalDriver {
     return this.fallback.charge(req);
   }
 
-  print(lines: string[]): Promise<void> {
+  async print(lines: string[]): Promise<void> {
+    // Stone embarcada: bobina interna pela ponte ESC/POS do app Android (SmartPosJsBridge).
+    const native = (window as unknown as { SmartPosNative?: { printInternalEscPos?: (b64: string) => string } }).SmartPosNative;
+    if (this.mode === 'SMARTPOS_EMBEDDED' && native?.printInternalEscPos) {
+      const b = new UniversalEscPosBuilder('58MM');
+      for (const l of lines) b.line(l);
+      b.cut(false);
+      const r = JSON.parse(native.printInternalEscPos(b.toBase64())) as { success: boolean; error?: string };
+      if (!r.success) throw new Error(r.error ?? 'Falha na impressora interna');
+      return;
+    }
     return this.fallback.print(lines);
   }
 
@@ -308,7 +377,9 @@ export class PagBankPlugPagDriver implements IPaymentTerminalDriver {
 
   async charge(req: ChargeRequest): Promise<TerminalResult> {
     const bridge = this.bridge();
-    if (!bridge?.doPayment) return this.fallback.charge(req);
+    // A ponte PlugPag cobra no próprio aparelho: só vale no modo SmartPOS embarcado.
+    // Em TEF POS Sem Fio a cobrança vai para a maquininha escolhida (simulada sem credenciais).
+    if (this.mode !== 'SMARTPOS_EMBEDDED' || !bridge?.doPayment) return this.fallback.charge(req);
     const doPayment = bridge.doPayment.bind(bridge);
     const serial = this.terminal?.serial_number ?? 'PAGBANK-EMBEDDED';
     const terminalId = this.terminal?.id ?? null;
@@ -396,7 +467,6 @@ export class PagBankPlugPagDriver implements IPaymentTerminalDriver {
 // Regras comuns (portadas do Tchê Vendas)
 // ---------------------------------------------------------------------------
 const plugPagQueue = new SerialQueue();
-const stoneQueue = new SerialQueue();
 const plugPagIdempotency = new IdempotencyRegistry<ChargeRequest, TerminalResult>(
   (r) => `${r.idempotency_key}|${Math.round(r.amount * 100)}|${r.method}|${r.order_id}`,
 );

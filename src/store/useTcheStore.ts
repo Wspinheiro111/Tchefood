@@ -34,19 +34,37 @@ import type {
   Order,
   OrderItem,
   Payment,
+  Permission,
   PosTerminal,
+  PriceSchedule,
   Product,
   ProductModifierGroup,
+  RolePermission,
   StaffUser,
   SyncEvent,
   Tenant,
   TrayItem,
   UUID,
 } from '../types';
-import { applyOrderTotals, computeItemTotal, halfAndHalfPrice, round2, round3, toCents } from '../lib/money';
+import { applyOrderTotals, computeItemTotal, formatBRL, halfAndHalfPrice, round2, round3, toCents } from '../lib/money';
+import {
+  effectivePrice,
+  validateCategory,
+  validateModifierGroup,
+  validateModifierOption,
+  validatePriceSchedule,
+  validateProduct,
+  validateStaff,
+  validateTable,
+  type PriceScheduleDraft,
+  type ProductDraft,
+  type StaffDraft,
+  type TableDraft,
+} from '../lib/catalog';
+import { can, PERMISSION_LABEL } from '../lib/permissions';
 import { nowISO, uuid } from '../lib/ids';
 import { idbStorage } from '../lib/idbStorage';
-import { createSeedData, KIOSK_TABLE, QR_SELF_SERVICE_USER_ID, SEED_STAFF } from '../data/seed';
+import { createSeedData, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
 import { getReviewHold } from '../lib/payments/reviewHolds';
 import { buildAccessKey } from '../lib/nfce';
@@ -82,6 +100,9 @@ export interface PendingCharge {
   user_id: UUID;
   started_at: number;
 }
+
+/** Início da mensagem do Cardápio QR quando o preço do carrinho ficou diferente do atual. */
+export const QR_PRICE_CHANGED = 'Preço atualizado:';
 
 const MANAGER_ROLES: ReadonlyArray<StaffUser['role']> = ['MANAGER', 'OWNER'];
 
@@ -185,6 +206,75 @@ interface DataSlice {
   eventTickets: EventTicket[];
   loyaltyCustomers: LoyaltyCustomer[];
   cashbackLedger: CashbackLedgerEntry[];
+  /** Etapa 0 — preço por dia/horário. */
+  priceSchedules: PriceSchedule[];
+  /** Etapa 0 — exceções ao padrão de permissões por perfil. */
+  rolePermissions: RolePermission[];
+}
+
+/** Sessão do aparelho na nuvem (Supabase Auth). Tokens ficam só neste aparelho. */
+export interface CloudSession {
+  url: string;
+  anon_key: string;
+  email: string;
+  access_token: string;
+  refresh_token: string;
+  /** Epoch em segundos (campo expires_at do Supabase Auth). */
+  expires_at: number;
+  tenant_id: UUID;
+}
+
+export interface SyncStatus {
+  last_success_at: string | null;
+  last_error: string | null;
+  last_error_at: string | null;
+  /** Evento que o servidor recusou (fica parado na fila até ser resolvido). */
+  blocked_event_id: UUID | null;
+}
+
+export interface CategoryDraft {
+  id?: UUID;
+  name: string;
+  sort_order: number;
+  icon_name: string | null;
+  active: boolean;
+}
+
+export interface ModifierGroupDraft {
+  id?: UUID;
+  name: string;
+  min_selection: number;
+  max_selection: number;
+  required: boolean;
+}
+
+export interface ModifierOptionDraft {
+  id?: UUID;
+  group_id: UUID;
+  name: string;
+  additional_price: number;
+}
+
+export interface TenantDraft {
+  name: string;
+  legal_name: string;
+  cnpj: string;
+  state_registration: string | null;
+  city: string;
+  state: string;
+  default_service_fee_pct: number;
+}
+
+export interface NewStoreInput {
+  tenant: TenantDraft;
+  owner_name: string;
+  owner_pin: string;
+  /**
+   * Conta da nuvem já validada (login feito) a que a loja nova fica ligada.
+   * Assim o aparelho de demonstração vira a loja real da conta: o id da loja
+   * passa a ser o tenant_id da conta.
+   */
+  cloud?: CloudSession;
 }
 
 interface DeviceSlice {
@@ -200,6 +290,8 @@ interface DeviceSlice {
   nfceSeq: number;
   /** Abre o simulador 80mm vs 58mm a cada despacho para produção. */
   showPrintSimulator: boolean;
+  cloud: CloudSession | null;
+  syncStatus: SyncStatus;
   /** Cobranças em andamento na maquininha (persistidas para sobreviver a recarga). */
   pendingCharges: PendingCharge[];
 }
@@ -231,6 +323,8 @@ interface Actions {
   registerPayment: (input: PaymentInput) => ActionResult<PaymentOutcome>;
   /** Reserva a conta enquanto a maquininha processa: bloqueia descontos, cancelamentos e outros pagamentos. */
   beginTerminalCharge: (orderId: UUID, requestId: string, amount: number) => ActionResult;
+  /** Encerra conta zerada sem nenhum pagamento (tudo cancelado ou 100% de desconto) e libera a mesa. */
+  closeZeroOrder: (orderId: UUID) => ActionResult<Order>;
   endTerminalCharge: (requestId: string) => void;
 
   // Fase 3 — KDS e QR Code
@@ -274,6 +368,26 @@ interface Actions {
   setSoundEnabled: (enabled: boolean) => void;
   setHalfAndHalfPricing: (rule: HalfAndHalfPricing) => void;
   resetDemo: () => void;
+
+  // Etapa 0 — cadastros
+  saveCategory: (draft: CategoryDraft) => ActionResult<Category>;
+  saveProduct: (draft: Omit<ProductDraft, 'id'> & { id?: UUID }) => ActionResult<Product>;
+  setProductAvailable: (productId: UUID, available: boolean) => ActionResult<Product>;
+  saveModifierGroup: (draft: ModifierGroupDraft) => ActionResult<ModifierGroup>;
+  saveModifierOption: (draft: ModifierOptionDraft) => ActionResult<ModifierOption>;
+  removeModifierOption: (optionId: UUID) => ActionResult;
+  setProductModifierGroups: (productId: UUID, groupIds: UUID[]) => ActionResult;
+  savePriceSchedule: (draft: Omit<PriceScheduleDraft, 'id'> & { id?: UUID }) => ActionResult<PriceSchedule>;
+  saveTable: (draft: Omit<TableDraft, 'id'> & { id?: UUID }) => ActionResult<DiningTable>;
+  saveStaff: (draft: Omit<StaffDraft, 'id'> & { id?: UUID }, auth?: ManagerAuthInput) => ActionResult<StaffUser>;
+  setRolePermission: (role: StaffUser['role'], permission: Permission, allowed: boolean, auth: ManagerAuthInput) => ActionResult<RolePermission>;
+  updateTenant: (draft: TenantDraft) => ActionResult<Tenant>;
+  startNewStore: (input: NewStoreInput, auth: ManagerAuthInput) => ActionResult<Tenant>;
+
+  // Etapa 0 — nuvem
+  setCloudSession: (session: CloudSession | null) => ActionResult;
+  ackSyncedEvents: (eventIds: UUID[]) => void;
+  setSyncError: (message: string | null, blockedEventId: UUID | null) => void;
 }
 
 export type TcheState = DataSlice & DeviceSlice & Actions;
@@ -282,12 +396,34 @@ export function migrateToKiosk(p: Partial<TcheState>): Partial<TcheState> {
   const orders = (p.orders ?? []).map((o) => ({ ...o, pickup_number: o.pickup_number ?? null, pickup_name: o.pickup_name ?? null, fulfillment_type: o.fulfillment_type ?? null }));
   const tables = p.tables ?? [];
   const staff = p.staff ?? [];
-  const kioskUsers = SEED_STAFF.filter((u) => u.role === 'KIOSK' && !staff.some((x) => x.id === u.id));
+  const tenantId = p.tenant?.id ?? SEED_TENANT.id;
+  // O usuário de demonstração do totem (PIN 4444) só entra na loja de demonstração;
+  // numa loja real o totem é cadastrado na Equipe.
+  const isDemo = tenantId === SEED_TENANT.id;
+  const kioskUsers = isDemo ? SEED_STAFF.filter((u) => u.role === 'KIOSK' && !staff.some((x) => x.id === u.id)) : [];
   return {
     ...p,
     orders,
-    tables: tables.some((t) => t.kind === 'KIOSK') ? tables : [...tables, { ...KIOSK_TABLE }],
+    tables: tables.some((t) => t.kind === 'KIOSK') ? tables : [...tables, kioskTable(tenantId, isDemo ? KIOSK_TABLE_ID : uuid())],
     staff: [...staff, ...kioskUsers],
+  };
+}
+
+/** Mesa técnica dos pedidos com senha (totem e pedido no caixa) de uma loja. */
+export function kioskTable(tenantId: UUID, id: UUID = uuid()): DiningTable {
+  return {
+    id,
+    tenant_id: tenantId,
+    number: 950,
+    label: 'Totem / Pedido no caixa',
+    area: 'Totem',
+    capacity: 1,
+    status: 'FREE',
+    qr_code_token: null,
+    current_order_id: null,
+    active: true,
+    updated_at: nowISO(),
+    kind: 'KIOSK',
   };
 }
 
@@ -307,7 +443,32 @@ function initialDevice(): DeviceSlice {
     hydrated: false,
     nfceSeq: 1000,
     showPrintSimulator: true,
+    cloud: null,
     pendingCharges: [],
+    syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
+  };
+}
+
+/** Linha de vínculo produto ↔ grupo não tem id próprio; a fila usa a chave composta. */
+function linkEvent(op: 'INSERT' | 'DELETE', link: ProductModifierGroup): SyncEvent {
+  return {
+    id: uuid(),
+    table: 'product_modifier_groups',
+    op,
+    row_id: `${link.product_id}:${link.group_id}`,
+    payload: { ...link } as unknown as Record<string, unknown>,
+    created_at: nowISO(),
+  };
+}
+
+function permissionEvent(row: RolePermission): SyncEvent {
+  return {
+    id: uuid(),
+    table: 'role_permissions',
+    op: 'UPDATE',
+    row_id: `${row.tenant_id}:${row.role}:${row.permission}`,
+    payload: { ...row } as unknown as Record<string, unknown>,
+    created_at: nowISO(),
   };
 }
 
@@ -342,10 +503,47 @@ function changedTaps(before: readonly KegTap[], after: readonly KegTap[]): KegTa
 
 /** Perfis que vendem no balcão e conferem fichas. */
 const COUNTER_ROLES: ReadonlyArray<StaffUser['role']> = ['WAITER', 'CASHIER', 'MANAGER', 'OWNER'];
-/** Perfis que operam o bar (sangria, leitura do barril). */
 /** Quem lança pedido com senha: o aparelho do totem e a equipe do caixa/balcão. */
 const PICKUP_ROLES: ReadonlyArray<StaffUser['role']> = ['KIOSK', ...COUNTER_ROLES];
+/** Perfis que operam o bar (sangria, leitura do barril). */
 const BAR_ROLES: ReadonlyArray<StaffUser['role']> = ['KITCHEN', 'CASHIER', 'MANAGER', 'OWNER'];
+
+function validateTenantDraft(d: TenantDraft): { ok: true } | { ok: false; error: string } {
+  if (d.name.trim().length < 2) return { ok: false, error: 'Informe o nome fantasia da loja.' };
+  if (d.legal_name.trim().length < 2) return { ok: false, error: 'Informe a razão social.' };
+  if (!/^\d{14}$/.test(d.cnpj.replace(/\D/g, ''))) return { ok: false, error: 'CNPJ deve ter 14 dígitos.' };
+  if (!isValidCnpj(d.cnpj.replace(/\D/g, ''))) return { ok: false, error: 'CNPJ inválido (dígito verificador).' };
+  if (d.city.trim().length < 2) return { ok: false, error: 'Informe a cidade.' };
+  if (!/^[A-Z]{2}$/.test(d.state.trim().toUpperCase())) return { ok: false, error: 'UF deve ter 2 letras.' };
+  const fee = d.default_service_fee_pct;
+  if (!Number.isFinite(fee) || fee < 0 || fee > 20) return { ok: false, error: 'Taxa de serviço entre 0% e 20%.' };
+  if (Math.abs(fee * 100 - Math.round(fee * 100)) > 1e-6) return { ok: false, error: 'Taxa de serviço com no máximo 2 casas decimais.' };
+  return { ok: true };
+}
+
+function cleanTenantDraft(d: TenantDraft): TenantDraft {
+  return {
+    name: d.name.trim(),
+    legal_name: d.legal_name.trim(),
+    cnpj: d.cnpj.replace(/\D/g, ''),
+    state_registration: d.state_registration?.replace(/\D/g, '') || null,
+    city: d.city.trim(),
+    state: d.state.trim().toUpperCase(),
+    default_service_fee_pct: round2(d.default_service_fee_pct),
+  };
+}
+
+/** Dígitos verificadores do CNPJ (módulo 11). */
+export function isValidCnpj(cnpj: string): boolean {
+  if (!/^\d{14}$/.test(cnpj) || /^(\d)\1{13}$/.test(cnpj)) return false;
+  const calc = (len: number) => {
+    const weights = len === 12 ? [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2] : [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+    const sum = weights.reduce((acc, w, i) => acc + w * Number(cnpj[i]), 0);
+    const r = sum % 11;
+    return r < 2 ? 0 : 11 - r;
+  };
+  return calc(12) === Number(cnpj[12]) && calc(13) === Number(cnpj[13]);
+}
 
 export const useTcheStore = create<TcheState>()(
   persist(
@@ -426,6 +624,48 @@ export const useTcheStore = create<TcheState>()(
         return { ok: true, data: order };
       };
 
+      /** Usuário logado com a permissão pedida (padrão + exceções da loja). */
+      const requirePermission = (permission: Permission): ActionResult<StaffUser> => {
+        const user = currentUser();
+        if (!user) return fail('Sessão expirada. Faça login novamente.');
+        if (!can(user.role, permission, get().rolePermissions)) {
+          return fail(`Seu perfil não tem acesso a: ${PERMISSION_LABEL[permission]}.`);
+        }
+        return { ok: true, data: user };
+      };
+
+      /** audit_log de cadastro: não é alerta de fraude, então não dispara WhatsApp. */
+      const catalogAudit = (
+        params: Pick<AuditLog, 'performed_by_user_id' | 'authorized_by_manager_id' | 'action_type' | 'reason' | 'metadata'>,
+      ): AuditLog => ({
+        id: uuid(),
+        tenant_id: get().tenant.id,
+        order_id: null,
+        amount_impact: 0,
+        whatsapp_alert_sent: false,
+        created_at: nowISO(),
+        ...params,
+      });
+
+      /** Preço de venda agora (cadastro + regra de horário). */
+      const salePrice = (product: Product): number => effectivePrice(product, get().priceSchedules, new Date());
+
+      /** Preço base do item: cadastro + regra de horário, e a regra do meio a meio quando houver sabores. */
+      const basePriceFor = (product: Product, halfIds: UUID[]): ActionResult<number> => {
+        const halves: Product[] = [];
+        for (const hid of halfIds) {
+          const h = get().products.find((p) => p.id === hid);
+          if (!h || !h.active) return fail('Sabor do meio-a-meio não encontrado.');
+          if (!h.available) return fail(`${h.name} está em falta.`);
+          if (!product.allows_half_and_half || !h.allows_half_and_half) return fail(`${h.name} não pode ser servido meio-a-meio.`);
+          halves.push(h);
+        }
+        return {
+          ok: true,
+          data: halves.length ? halfAndHalfPrice([salePrice(product), ...halves.map(salePrice)], get().halfAndHalfPricing) : salePrice(product),
+        };
+      };
+
       /** Cobrança em andamento na maquininha para a conta (ignora as abandonadas). */
       const activeCharge = (orderId: UUID): PendingCharge | null =>
         get().pendingCharges.find((c) => c.order_id === orderId && Date.now() - c.started_at < PENDING_CHARGE_TTL_MS) ?? null;
@@ -463,6 +703,15 @@ export const useTcheStore = create<TcheState>()(
         };
       };
 
+      /**
+       * Um ajuste que vai encerrar a conta não pode descartar itens ainda na bandeja:
+       * o operador precisa enviar ou remover antes.
+       */
+      const blocksSettleWithTray = (simulated: Order): string | null =>
+        toCents(simulated.paid_amount) > 0 && toCents(simulated.remaining_balance) === 0 && get().tray.some((t) => t.order_id === simulated.id)
+          ? 'Este ajuste quita a conta, mas há itens na bandeja não enviados. Envie ou remova antes.'
+          : null;
+
       /** Resultado de um ajuste financeiro: aplica totais e encerra se o saldo zerou. */
       const commitAdjustment = (
         s: TcheState,
@@ -481,36 +730,16 @@ export const useTcheStore = create<TcheState>()(
           nfceSeq: settled.nfceSeq,
           orders: s.orders.map((o) => (o.id === recalculated.id ? settled.order : o)),
           tables: settled.table ? s.tables.map((t) => (t.id === settled.table!.id ? settled.table! : t)) : s.tables,
-          tray: settled.closed ? s.tray.filter((t) => t.order_id !== recalculated.id) : s.tray,
           auditLogs: [log, ...s.auditLogs],
           outbox: [
             ...s.outbox,
+            // O audit_log sobe antes: o banco recusa o ajuste sem a autorização já gravada.
+            syncEvent('audit_logs', 'INSERT', log),
             ...allChanged.map((i) => syncEvent('order_items', 'UPDATE', i)),
             syncEvent('orders', 'UPDATE', settled.order),
-            syncEvent('audit_logs', 'INSERT', log),
             ...(settled.table ? [syncEvent('dining_tables', 'UPDATE', settled.table)] : []),
           ],
         };
-      };
-
-      /**
-       * Resolve o meio a meio a partir do cadastro (nunca confia no preço do aparelho):
-       * valida os sabores e aplica a regra de preço configurada.
-       */
-      const resolveHalfAndHalf = (product: Product, halfIds: readonly UUID[]): ActionResult<{ unitPrice: number; note: string | null }> => {
-        if (halfIds.length === 0) return { ok: true, data: { unitPrice: product.price, note: null } };
-        if (!product.allows_half_and_half) return fail(`${product.name} não aceita meio a meio.`);
-        const halves: Product[] = [];
-        for (const id of halfIds) {
-          const h = get().products.find((p) => p.id === id);
-          if (!h || !h.available || !h.allows_half_and_half || h.id === product.id || h.category_id !== product.category_id) {
-            return fail('Sabor do meio a meio inválido.');
-          }
-          halves.push(h);
-        }
-        const unitPrice = halfAndHalfPrice([product.price, ...halves.map((h) => h.price)], get().halfAndHalfPricing);
-        const note = `1/2 ${product.name} + ${halves.map((h) => `1/2 ${h.name}`).join(' + ')}`;
-        return { ok: true, data: { unitPrice, note } };
       };
 
       const tableLabel = (tableId: UUID): string => get().tables.find((t) => t.id === tableId)?.label ?? '?';
@@ -727,8 +956,12 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(draft.order_id);
           if (!res.ok) return res;
           const product = get().products.find((p) => p.id === draft.product_id);
-          if (!product) return fail('Produto não encontrado.');
+          if (!product || !product.active) return fail('Produto não encontrado.');
           if (!product.available) return fail(`${product.name} está em falta.`);
+          // Preço base sempre do cadastro (com regra de horário), nunca o que a tela mandou.
+          const base = basePriceFor(product, draft.half_product_ids);
+          if (!base.ok) return base;
+          const basePrice = base.data;
           if (product.requires_meat_doneness && !draft.meat_doneness) {
             return fail('Ponto da carne é obrigatório.');
           }
@@ -780,7 +1013,7 @@ export const useTcheStore = create<TcheState>()(
           const item: TrayItem = {
             ...draft,
             quantity: qty,
-            unit_price: round2(draft.unit_price),
+            unit_price: round2(basePrice),
             modifiers_unit_price: modsCents / 100,
             sector: product.sector,
             tray_id: uuid(),
@@ -921,6 +1154,8 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Cancelamento deixaria a conta abaixo do valor já pago. Estorne um pagamento primeiro.');
           }
+          const trayBlock = blocksSettleWithTray(simulated);
+          if (trayBlock) return fail(trayBlock);
 
           const authRes = authorizeManager(auth, { orderId: order.id, action: 'ITEM_CANCELED' });
           if (!authRes.ok) return authRes;
@@ -974,6 +1209,8 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Remover a taxa deixaria a conta abaixo do valor já pago.');
           }
+          const trayBlock = blocksSettleWithTray(simulated);
+          if (trayBlock) return fail(trayBlock);
           const authRes = authorizeManager(auth, { orderId, action: 'SERVICE_FEE_REMOVED' });
           if (!authRes.ok) return authRes;
           const user = currentUser()!;
@@ -1023,7 +1260,7 @@ export const useTcheStore = create<TcheState>()(
             return {
               orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
               auditLogs: [{ ...log, whatsapp_alert_sent: false }, ...s.auditLogs],
-              outbox: [...s.outbox, syncEvent('orders', 'UPDATE', recalculated), syncEvent('audit_logs', 'INSERT', log)],
+              outbox: [...s.outbox, syncEvent('audit_logs', 'INSERT', log), syncEvent('orders', 'UPDATE', recalculated)],
             };
           });
           return { ok: true, data: get().auditLogs[0]! };
@@ -1046,6 +1283,8 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Desconto deixaria a conta abaixo do valor já pago.');
           }
+          const trayBlock = blocksSettleWithTray(simulated);
+          if (trayBlock) return fail(trayBlock);
           const authRes = authorizeManager(auth, { orderId, action: 'DISCOUNT_APPLIED' });
           if (!authRes.ok) return authRes;
           const user = currentUser()!;
@@ -1097,6 +1336,9 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(input.orderId);
           if (!res.ok) return res;
           const order = res.data;
+          if (input.status === 'APPROVED' && get().tray.some((t) => t.order_id === order.id)) {
+            return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
+          }
           const lock = activeCharge(order.id);
           const fromLockedCharge = Boolean(lock && input.charge_request_id && lock.request_id === input.charge_request_id);
           if (lock && !fromLockedCharge) return fail(CHARGE_LOCK_ERROR);
@@ -1193,6 +1435,7 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(orderId);
           if (!res.ok) return res;
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (get().tray.some((t) => t.order_id === orderId)) return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
           const value = round2(amount);
           if (!(value > 0) || toCents(value) > toCents(res.data.remaining_balance)) return fail('Valor maior que o saldo restante da mesa.');
           set((s) => ({
@@ -1202,6 +1445,32 @@ export const useTcheStore = create<TcheState>()(
             ],
           }));
           return { ok: true, data: undefined };
+        },
+
+        closeZeroOrder: (orderId) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const res = findEditableOrder(orderId);
+          if (!res.ok) return res;
+          const order = res.data;
+          if (toCents(order.remaining_balance) !== 0 || toCents(order.paid_amount) !== 0) return fail('Só contas zeradas e sem pagamento podem ser encerradas assim.');
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (get().tray.some((t) => t.order_id === orderId)) return fail('Há itens na bandeja não enviados. Envie ou remova antes de encerrar.');
+          const ts = nowISO();
+          const hasItems = get().orderItems.some((i) => i.order_id === orderId && i.status !== 'CANCELED');
+          // Nada consumido: conta cancelada, sem NFC-e. Consumo com 100% de desconto
+          // (já autorizado por gerente): conta fechada, NFC-e fica pendente para o fiscal.
+          const closed: Order = hasItems
+            ? { ...order, status: 'CLOSED', closed_at: ts, nfce_status: 'PENDING' }
+            : { ...order, status: 'CANCELED', closed_at: ts, nfce_status: 'DISPENSADA' };
+          const table = get().tables.find((t) => t.id === order.table_id);
+          const freed: DiningTable | null = table && table.current_order_id === orderId ? { ...table, status: 'FREE', current_order_id: null, updated_at: ts } : null;
+          set((s) => ({
+            orders: s.orders.map((o) => (o.id === orderId ? closed : o)),
+            tables: freed ? s.tables.map((t) => (t.id === freed.id ? freed : t)) : s.tables,
+            outbox: [...s.outbox, syncEvent('orders', 'UPDATE', closed), ...(freed ? [syncEvent('dining_tables', 'UPDATE', freed)] : [])],
+          }));
+          return { ok: true, data: closed };
         },
 
         endTerminalCharge: (requestId) => set((s) => ({ pendingCharges: s.pendingCharges.filter((c) => c.request_id !== requestId) })),
@@ -1242,7 +1511,7 @@ export const useTcheStore = create<TcheState>()(
           if (!table) return fail('Mesa não encontrada.');
           if (table.status === 'DIRTY') return fail('Mesa em limpeza. Chame o garçom.');
           if (table.status === 'PAYING') return fail('Conta em fechamento. Chame o garçom para novos pedidos.');
-          const qrUser = s0.staff.find((u) => u.id === QR_SELF_SERVICE_USER_ID);
+          const qrUser = s0.staff.find((u) => isQrSelfService(u) && u.active);
           if (!qrUser) return fail('Autoatendimento indisponível.');
           const ts = nowISO();
           let order = table.current_order_id ? s0.orders.find((o) => o.id === table.current_order_id) : undefined;
@@ -1277,8 +1546,11 @@ export const useTcheStore = create<TcheState>()(
           const newItems: OrderItem[] = [];
           for (const d of drafts) {
             const product = products.find((p) => p.id === d.product_id);
-            if (!product || !product.available) return fail('Produto indisponível.');
+            if (!product || !product.active || !product.available) return fail('Produto indisponível.');
             if (product.sold_by_weight) return fail(`${product.name} é pesado no buffet. Chame o garçom.`);
+            const base = basePriceFor(product, d.half_product_ids);
+            if (!base.ok) return base;
+            const price = base.data;
             if (product.requires_meat_doneness && !d.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
             let modsCents = 0;
             for (const m of d.modifiers) {
@@ -1297,24 +1569,29 @@ export const useTcheStore = create<TcheState>()(
             }
             const qty = round3(d.quantity);
             if (!(qty > 0)) return fail('Quantidade inválida.');
-            const half = resolveHalfAndHalf(product, d.half_product_ids);
-            if (!half.ok) return half;
-            const unitPrice = half.data.unitPrice;
+            // Sabor do meio a meio precisa ser outro produto da mesma categoria.
+            if (d.half_product_ids.some((id) => { const h = products.find((p) => p.id === id); return !h || h.id === product.id || h.category_id !== product.category_id; })) {
+              return fail('Sabor do meio a meio inválido.');
+            }
+            // O cliente confirma o preço que viu. Se a regra de horário (ou o cadastro) mudou
+            // desde que ele montou o carrinho, o pedido não sai com outro valor sem ele ver.
+            if (toCents(d.unit_price) !== toCents(price) || toCents(d.modifiers_unit_price) !== modsCents) {
+              return fail(`${QR_PRICE_CHANGED} ${product.name} agora custa ${formatBRL(price)}${modsCents > 0 ? ` + ${formatBRL(fromCentsLocal(modsCents))} de adicionais` : ''}. Confira o pedido e envie de novo.`);
+            }
+            const halfNames = d.half_product_ids.map((id) => products.find((p) => p.id === id)?.name).filter((n): n is string => Boolean(n));
             const noteParts = [
-              ...(half.data.note ? [half.data.note] : []),
+              ...(halfNames.length ? [`1/2 ${product.name} + ${halfNames.map((n) => `1/2 ${n}`).join(' + ')}`] : []),
               ...d.modifiers.map((m) => `+ ${m.name}`),
-              ...d.quick_tags,
-              ...(d.free_notes.trim() ? [d.free_notes.trim()] : []),
-            ];
+              ...d.quick_tags, ...(d.free_notes.trim() ? [d.free_notes.trim()] : [])];
             newItems.push({
               id: uuid(),
               order_id: order.id,
               product_id: product.id,
               waiter_id: qrUser.id,
               quantity: qty,
-              unit_price: unitPrice,
+              unit_price: price,
               modifiers_unit_price: fromCentsLocal(modsCents),
-              total_item_price: computeItemTotal(qty, unitPrice, fromCentsLocal(modsCents)),
+              total_item_price: computeItemTotal(qty, price, fromCentsLocal(modsCents)),
               meat_doneness: d.meat_doneness,
               notes: noteParts.length ? noteParts.join(' · ') : null,
               sector: product.sector,
@@ -1646,7 +1923,7 @@ export const useTcheStore = create<TcheState>()(
           const items: OrderItem[] = [];
           for (const d of input.lines) {
             const product = s0.products.find((p) => p.id === d.product_id);
-            if (!product || !product.available) return fail('Produto indisponível.');
+            if (!product || !product.active || !product.available) return fail('Produto indisponível.');
             if (product.sold_by_weight) return fail(`${product.name} é pesado no buffet: peça no balcão.`);
             if (!Number.isInteger(d.quantity) || d.quantity < 1 || d.quantity > 99) return fail('Quantidade inválida (1 a 99).');
             if (product.requires_meat_doneness && !d.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
@@ -1666,13 +1943,19 @@ export const useTcheStore = create<TcheState>()(
               if (!groups.some((g) => g.id === opt.group_id)) return fail('Adicional não pertence ao produto.');
               modsCents += toCents(opt.additional_price);
             }
-            const half = resolveHalfAndHalf(product, d.half_product_ids);
-            if (!half.ok) return half;
-            // Preço sempre do cadastro, nunca do aparelho.
-            const unitPrice = half.data.unitPrice;
+            // Sabor do meio a meio precisa ser outro produto da mesma categoria.
+            const halves = d.half_product_ids.map((id) => s0.products.find((p) => p.id === id));
+            if (halves.some((h) => !h || h.id === product.id || h.category_id !== product.category_id)) {
+              return fail('Sabor do meio a meio inválido.');
+            }
+            // Preço sempre do cadastro (com regra de horário), nunca do aparelho.
+            const base = basePriceFor(product, d.half_product_ids);
+            if (!base.ok) return base;
+            const unitPrice = base.data;
             const mods = fromCentsLocal(modsCents);
+            const halfNote = halves.length ? `1/2 ${product.name} + ${halves.map((h) => `1/2 ${h!.name}`).join(' + ')}` : null;
             const noteParts = [
-              ...(half.data.note ? [half.data.note] : []),
+              ...(halfNote ? [halfNote] : []),
               ...d.modifiers.map((m) => `+ ${m.name}`),
               ...d.quick_tags,
               ...(d.free_notes.trim() ? [d.free_notes.trim().slice(0, 140)] : []),
@@ -2010,31 +2293,515 @@ export const useTcheStore = create<TcheState>()(
         setSoundEnabled: (enabled) => set({ soundEnabled: enabled }),
         setHalfAndHalfPricing: (rule) => set({ halfAndHalfPricing: rule }),
 
+        // ---------------------------------------------------------------------
+        // Etapa 0 — cadastros
+        // ---------------------------------------------------------------------
+        saveCategory: (draft) => {
+          const perm = requirePermission('MENU_MANAGE');
+          if (!perm.ok) return perm;
+          const state = get();
+          const existing = draft.id ? state.categories.find((c) => c.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Categoria não encontrada.');
+          const row: Category = {
+            id: existing?.id ?? uuid(),
+            tenant_id: state.tenant.id,
+            name: draft.name.trim(),
+            sort_order: Math.floor(draft.sort_order),
+            icon_name: draft.icon_name?.trim() || null,
+            active: draft.active,
+          };
+          const check = validateCategory(row, state.categories);
+          if (!check.ok) return check;
+          if (existing && existing.active && !row.active) {
+            const live = state.products.filter((p) => p.category_id === row.id && p.active);
+            if (live.length > 0) return fail(`Desative ou mova os ${live.length} produto(s) de ${existing.name} antes.`);
+          }
+          set((s) => ({
+            categories: existing ? s.categories.map((c) => (c.id === row.id ? row : c)) : [...s.categories, row],
+            outbox: [...s.outbox, syncEvent('categories', existing ? 'UPDATE' : 'INSERT', row)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        saveProduct: (draft) => {
+          const perm = requirePermission('MENU_MANAGE');
+          if (!perm.ok) return perm;
+          const user = perm.data;
+          const state = get();
+          const existing = draft.id ? state.products.find((p) => p.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Produto não encontrado.');
+          const row: Product = {
+            id: existing?.id ?? uuid(),
+            tenant_id: state.tenant.id,
+            category_id: draft.category_id,
+            code: draft.code.trim(),
+            name: draft.name.trim(),
+            description: draft.description?.trim() || null,
+            price: round2(draft.price),
+            sold_by_weight: draft.sold_by_weight ?? existing?.sold_by_weight ?? false,
+            tare_weight_grams: draft.tare_weight_grams ?? existing?.tare_weight_grams ?? 0,
+            cost_price: draft.cost_price ?? existing?.cost_price ?? 0,
+            sector: draft.sector,
+            available: draft.available,
+            active: draft.active,
+            requires_meat_doneness: draft.requires_meat_doneness,
+            allows_half_and_half: draft.allows_half_and_half,
+            ncm: draft.ncm.trim(),
+            cfop: draft.cfop.trim(),
+            csosn_cst: draft.csosn_cst.trim(),
+            unit: draft.unit.trim().toUpperCase(),
+            created_at: existing?.created_at ?? nowISO(),
+          };
+          const check = validateProduct(row, state.products, state.categories);
+          if (!check.ok) return check;
+          // Mudança de preço não mexe em item já lançado (OrderItem guarda unit_price) e fica auditada.
+          const priceChanged = existing && toCents(existing.price) !== toCents(row.price);
+          const log = priceChanged
+            ? catalogAudit({
+                performed_by_user_id: user.id,
+                authorized_by_manager_id: null,
+                action_type: 'PRODUCT_PRICE_CHANGED',
+                reason: `Preço de ${row.code} ${row.name} alterado no cadastro.`,
+                metadata: { product_id: row.id, product_code: row.code, price_before: existing.price, price_after: row.price, user_name: user.name },
+              })
+            : null;
+          set((s) => ({
+            products: existing ? s.products.map((p) => (p.id === row.id ? row : p)) : [...s.products, row],
+            auditLogs: log ? [log, ...s.auditLogs] : s.auditLogs,
+            outbox: [
+              ...s.outbox,
+              syncEvent('products', existing ? 'UPDATE' : 'INSERT', row),
+              ...(log ? [syncEvent('audit_logs', 'INSERT', log)] : []),
+            ],
+          }));
+          return { ok: true, data: row };
+        },
+
+        setProductAvailable: (productId, available) => {
+          const perm = requirePermission('MENU_AVAILABILITY');
+          if (!perm.ok) return perm;
+          const product = get().products.find((p) => p.id === productId);
+          if (!product || !product.active) return fail('Produto não encontrado.');
+          if (product.available === available) return { ok: true, data: product };
+          const row: Product = { ...product, available };
+          set((s) => ({
+            products: s.products.map((p) => (p.id === productId ? row : p)),
+            outbox: [...s.outbox, syncEvent('products', 'UPDATE', row)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        saveModifierGroup: (draft) => {
+          const perm = requirePermission('MENU_MANAGE');
+          if (!perm.ok) return perm;
+          const state = get();
+          const existing = draft.id ? state.modifierGroups.find((g) => g.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Grupo não encontrado.');
+          const row: ModifierGroup = {
+            id: existing?.id ?? uuid(),
+            tenant_id: state.tenant.id,
+            name: draft.name.trim(),
+            min_selection: draft.min_selection,
+            max_selection: draft.max_selection,
+            required: draft.required,
+          };
+          const check = validateModifierGroup(row);
+          if (!check.ok) return check;
+          const optionCount = state.modifierOptions.filter((o) => o.group_id === row.id).length;
+          if (existing && optionCount > 0 && Math.max(1, row.min_selection) > optionCount && row.required) {
+            return fail(`O grupo tem ${optionCount} opção(ões); o mínimo não pode ser maior.`);
+          }
+          set((s) => ({
+            modifierGroups: existing ? s.modifierGroups.map((g) => (g.id === row.id ? row : g)) : [...s.modifierGroups, row],
+            outbox: [...s.outbox, syncEvent('modifier_groups', existing ? 'UPDATE' : 'INSERT', row)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        saveModifierOption: (draft) => {
+          const perm = requirePermission('MENU_MANAGE');
+          if (!perm.ok) return perm;
+          const state = get();
+          const existing = draft.id ? state.modifierOptions.find((o) => o.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Adicional não encontrado.');
+          const row: ModifierOption = {
+            id: existing?.id ?? uuid(),
+            group_id: existing?.group_id ?? draft.group_id,
+            name: draft.name.trim(),
+            additional_price: round2(draft.additional_price),
+            volume_ml: existing?.volume_ml ?? null,
+          };
+          const check = validateModifierOption(row, state.modifierGroups, state.modifierOptions);
+          if (!check.ok) return check;
+          set((s) => ({
+            modifierOptions: existing ? s.modifierOptions.map((o) => (o.id === row.id ? row : o)) : [...s.modifierOptions, row],
+            outbox: [...s.outbox, syncEvent('modifier_options', existing ? 'UPDATE' : 'INSERT', row)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        removeModifierOption: (optionId) => {
+          const perm = requirePermission('MENU_MANAGE');
+          if (!perm.ok) return perm;
+          const state = get();
+          const option = state.modifierOptions.find((o) => o.id === optionId);
+          if (!option) return fail('Adicional não encontrado.');
+          const group = state.modifierGroups.find((g) => g.id === option.group_id);
+          const remaining = state.modifierOptions.filter((o) => o.group_id === option.group_id && o.id !== optionId).length;
+          if (group?.required && remaining < Math.max(1, group.min_selection)) {
+            return fail(`${group.name} é obrigatório e ficaria sem opções suficientes.`);
+          }
+          // Item já lançado guarda o nome do adicional no texto; apagar a opção não muda conta nenhuma.
+          set((s) => ({
+            modifierOptions: s.modifierOptions.filter((o) => o.id !== optionId),
+            outbox: [...s.outbox, { ...syncEvent('modifier_options', 'DELETE', option) }],
+          }));
+          return { ok: true, data: undefined };
+        },
+
+        setProductModifierGroups: (productId, groupIds) => {
+          const perm = requirePermission('MENU_MANAGE');
+          if (!perm.ok) return perm;
+          const state = get();
+          if (!state.products.some((p) => p.id === productId)) return fail('Produto não encontrado.');
+          const unique = Array.from(new Set(groupIds));
+          if (unique.some((gid) => !state.modifierGroups.some((g) => g.id === gid))) return fail('Grupo de adicionais não encontrado.');
+          const before = state.productModifierGroups.filter((l) => l.product_id === productId);
+          const after: ProductModifierGroup[] = unique.map((group_id, i) => ({ product_id: productId, group_id, sort_order: i + 1 }));
+          const removed = before.filter((b) => !after.some((a) => a.group_id === b.group_id));
+          const upserted = after.filter((a) => {
+            const b = before.find((x) => x.group_id === a.group_id);
+            return !b || b.sort_order !== a.sort_order;
+          });
+          set((s) => ({
+            productModifierGroups: [...s.productModifierGroups.filter((l) => l.product_id !== productId), ...after],
+            outbox: [...s.outbox, ...removed.map((l) => linkEvent('DELETE', l)), ...upserted.map((l) => linkEvent('INSERT', l))],
+          }));
+          return { ok: true, data: undefined };
+        },
+
+        savePriceSchedule: (draft) => {
+          const perm = requirePermission('MENU_MANAGE');
+          if (!perm.ok) return perm;
+          const state = get();
+          const existing = draft.id ? state.priceSchedules.find((x) => x.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Regra de preço não encontrada.');
+          const row: PriceSchedule = {
+            id: existing?.id ?? uuid(),
+            tenant_id: state.tenant.id,
+            product_id: existing?.product_id ?? draft.product_id,
+            name: draft.name.trim(),
+            weekdays: Array.from(new Set(draft.weekdays)).sort((a, b) => a - b),
+            start_time: draft.start_time,
+            end_time: draft.end_time,
+            price: round2(draft.price),
+            active: draft.active,
+            created_at: existing?.created_at ?? nowISO(),
+          };
+          const check = validatePriceSchedule(row, state.priceSchedules, state.products);
+          if (!check.ok) return check;
+          set((s) => ({
+            priceSchedules: existing ? s.priceSchedules.map((x) => (x.id === row.id ? row : x)) : [...s.priceSchedules, row],
+            outbox: [...s.outbox, syncEvent('price_schedules', existing ? 'UPDATE' : 'INSERT', row)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        saveTable: (draft) => {
+          const perm = requirePermission('TABLES_MANAGE');
+          if (!perm.ok) return perm;
+          const state = get();
+          const existing = draft.id ? state.tables.find((t) => t.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Mesa não encontrada.');
+          if (existing?.kind === 'COUNTER') return fail('O balcão da Ficha Rápida é técnico e não é editado.');
+          const candidate: TableDraft = {
+            id: existing?.id ?? uuid(),
+            number: draft.number,
+            label: draft.label.trim(),
+            area: draft.area.trim(),
+            capacity: draft.capacity,
+            active: draft.active,
+          };
+          const check = validateTable(candidate, state.tables);
+          if (!check.ok) return check;
+          const row: DiningTable = existing
+            ? { ...existing, ...candidate, updated_at: nowISO() }
+            : {
+                ...candidate,
+                tenant_id: state.tenant.id,
+                status: 'FREE',
+                qr_code_token: `tchefood-${uuid().replace(/-/g, '')}`,
+                current_order_id: null,
+                updated_at: nowISO(),
+                kind: 'TABLE',
+              };
+          set((s) => ({
+            tables: existing ? s.tables.map((t) => (t.id === row.id ? row : t)) : [...s.tables, row],
+            outbox: [...s.outbox, syncEvent('dining_tables', existing ? 'UPDATE' : 'INSERT', row)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        saveStaff: (draft, auth) => {
+          const perm = requirePermission('STAFF_MANAGE');
+          if (!perm.ok) return perm;
+          const actor = perm.data;
+          const state = get();
+          const existing = draft.id ? state.staff.find((u) => u.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Pessoa não encontrada.');
+          if (existing && isQrSelfService(existing)) return fail('O usuário do cardápio QR é técnico e não é editado.');
+          const candidate: StaffDraft = {
+            id: existing?.id ?? uuid(),
+            name: draft.name.trim(),
+            role: draft.role,
+            pin_code: draft.pin_code.trim(),
+            active: draft.active,
+          };
+          const check = validateStaff(candidate, state.staff, actor);
+          if (!check.ok) return check;
+
+          // Troca de PIN de outra pessoa, de perfil ou de acesso pede PIN de gerente e motivo.
+          const changes: AuditActionType[] = [];
+          if (existing) {
+            if (existing.pin_code !== candidate.pin_code) changes.push('STAFF_PIN_CHANGED');
+            if (existing.role !== candidate.role) changes.push('STAFF_ROLE_CHANGED');
+            if (existing.active && !candidate.active) changes.push('STAFF_DEACTIVATED');
+            if (!existing.active && candidate.active) changes.push('STAFF_REACTIVATED');
+          }
+          const ownPinOnly = existing?.id === actor.id && changes.length === 1 && changes[0] === 'STAFF_PIN_CHANGED';
+          let manager: StaffUser | null = null;
+          let reason = existing ? 'Cadastro atualizado.' : `Cadastro de ${candidate.name} como ${candidate.role}.`;
+          if (changes.length > 0 && !ownPinOnly) {
+            if (!auth) return fail('Informe o PIN de gerente e o motivo para esta alteração.');
+            const authRes = authorizeManager(auth, { orderId: null, action: changes[0]! });
+            if (!authRes.ok) return authRes;
+            manager = authRes.data;
+            reason = auth.reason.trim();
+          } else if (ownPinOnly) {
+            reason = 'Troca do próprio PIN.';
+          }
+
+          const row: StaffUser = existing
+            ? { ...existing, ...candidate }
+            : { ...candidate, tenant_id: state.tenant.id, created_at: nowISO() };
+          const actions: AuditActionType[] = existing ? changes : ['STAFF_CREATED'];
+          const logs = actions.map((action_type) =>
+            catalogAudit({
+              performed_by_user_id: actor.id,
+              authorized_by_manager_id: manager?.id ?? null,
+              action_type,
+              reason,
+              // O PIN nunca vai para o log, nem o antigo nem o novo.
+              metadata: {
+                staff_id: row.id,
+                staff_name: row.name,
+                role_before: existing?.role ?? null,
+                role_after: row.role,
+                active_after: row.active,
+                actor_name: actor.name,
+                manager_name: manager?.name ?? null,
+              },
+            }),
+          );
+          set((s) => ({
+            staff: existing ? s.staff.map((u) => (u.id === row.id ? row : u)) : [...s.staff, row],
+            auditLogs: [...logs, ...s.auditLogs],
+            outbox: [
+              ...s.outbox,
+              syncEvent('staff_users', existing ? 'UPDATE' : 'INSERT', row),
+              ...logs.map((l) => syncEvent('audit_logs', 'INSERT', l)),
+            ],
+          }));
+          return { ok: true, data: row };
+        },
+
+        setRolePermission: (role, permission, allowed, auth) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (user.role !== 'OWNER') return fail('Só o proprietário muda permissões.');
+          if (role === 'OWNER') return fail('O proprietário sempre tem todas as permissões.');
+          const authRes = authorizeManager(auth, { orderId: null, action: 'PERMISSION_CHANGED' });
+          if (!authRes.ok) return authRes;
+          const state = get();
+          const before = can(role, permission, state.rolePermissions);
+          const row: RolePermission = { tenant_id: state.tenant.id, role, permission, allowed, updated_at: nowISO() };
+          const log = catalogAudit({
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: authRes.data.id,
+            action_type: 'PERMISSION_CHANGED',
+            reason: auth.reason.trim(),
+            metadata: { role, permission, allowed_before: before, allowed_after: allowed },
+          });
+          set((s) => ({
+            rolePermissions: [...s.rolePermissions.filter((r) => !(r.role === role && r.permission === permission)), row],
+            auditLogs: [log, ...s.auditLogs],
+            outbox: [...s.outbox, permissionEvent(row), syncEvent('audit_logs', 'INSERT', log)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        updateTenant: (draft) => {
+          const perm = requirePermission('STORE_SETTINGS');
+          if (!perm.ok) return perm;
+          const check = validateTenantDraft(draft);
+          if (!check.ok) return check;
+          const row: Tenant = { ...get().tenant, ...cleanTenantDraft(draft) };
+          set((s) => ({ tenant: row, outbox: [...s.outbox, syncEvent('tenants', 'UPDATE', row)] }));
+          return { ok: true, data: row };
+        },
+
+        startNewStore: (input, auth) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (user.role !== 'OWNER') return fail('Só o proprietário inicia uma loja nova neste aparelho.');
+          const state = get();
+          if (state.orders.some((o) => o.status === 'OPEN' || o.status === 'PAYING')) {
+            return fail('Há contas abertas. Feche todas antes de iniciar uma loja nova.');
+          }
+          if (state.cloud && state.outbox.length > 0) {
+            return fail(`Ainda há ${state.outbox.length} evento(s) sem enviar para a nuvem. Sincronize antes.`);
+          }
+          const check = validateTenantDraft(input.tenant);
+          if (!check.ok) return check;
+          const authRes = authorizeManager(auth, { orderId: null, action: 'STORE_RESET' });
+          if (!authRes.ok) return authRes;
+          if (authRes.data.role !== 'OWNER') return fail('Use o PIN do proprietário para iniciar uma loja nova.');
+
+          const linkedCloud = input.cloud ?? state.cloud;
+          const tenantId = linkedCloud?.tenant_id ?? uuid();
+          const ts = nowISO();
+          const tenant: Tenant = {
+            ...cleanTenantDraft(input.tenant),
+            id: tenantId,
+            default_acquirer: state.tenant.default_acquirer,
+            default_mode: state.tenant.default_mode,
+            focus_nfe_token: null,
+            csc_id: null,
+            csc_token: null,
+            created_at: ts,
+          };
+          const owner: StaffUser = {
+            id: uuid(),
+            tenant_id: tenantId,
+            name: input.owner_name.trim(),
+            role: 'OWNER',
+            pin_code: input.owner_pin.trim(),
+            active: true,
+            created_at: ts,
+          };
+          const ownerCheck = validateStaff(owner, [], { ...owner });
+          if (!ownerCheck.ok) return ownerCheck;
+          const terminals: PosTerminal[] = state.terminals.map((t) => ({ ...t, id: uuid(), tenant_id: tenantId }));
+          // Cada loja tem o seu usuário técnico do Cardápio QR (id próprio, mesmo PIN não digitável).
+          const qrUser: StaffUser = {
+            id: uuid(),
+            tenant_id: tenantId,
+            name: 'Autoatendimento QR Code',
+            role: 'WAITER',
+            pin_code: QR_SELF_SERVICE_PIN,
+            active: true,
+            created_at: ts,
+          };
+          const log: AuditLog = {
+            id: uuid(),
+            tenant_id: tenantId,
+            order_id: null,
+            performed_by_user_id: owner.id,
+            authorized_by_manager_id: owner.id,
+            action_type: 'STORE_RESET',
+            amount_impact: 0,
+            reason: auth.reason.trim(),
+            whatsapp_alert_sent: false,
+            metadata: { previous_tenant_id: state.tenant.id, previous_tenant_name: state.tenant.name },
+            created_at: ts,
+          };
+          // Balcão da Ficha Rápida (Fase 5) da loja nova.
+          const counter = counterTable(tenantId);
+          const kiosk = kioskTable(tenantId);
+          set({
+            tenant,
+            staff: [owner, qrUser],
+            // As maquininhas deste aparelho continuam cadastradas (sem elas o modo TEF POS
+            // Sem Fio não cobraria cartão), com id novo e enviadas à nuvem antes de qualquer pagamento.
+            terminals,
+            categories: [],
+            products: [],
+            modifierGroups: [],
+            modifierOptions: [],
+            productModifierGroups: [],
+            tables: [counter, kiosk],
+            orders: [],
+            orderItems: [],
+            payments: [],
+            auditLogs: [log],
+            printers: [],
+            priceSchedules: [],
+            rolePermissions: [],
+            kegTaps: [],
+            kegTapProducts: [],
+            kegHistory: [],
+            eventTickets: [],
+            loyaltyCustomers: [],
+            cashbackLedger: [],
+            tray: [],
+            outbox: [
+              syncEvent('tenants', 'UPDATE', tenant),
+              syncEvent('staff_users', 'INSERT', owner),
+              syncEvent('staff_users', 'INSERT', qrUser),
+              ...terminals.map((t) => syncEvent('pos_terminals', 'INSERT', t)),
+              syncEvent('dining_tables', 'INSERT', counter),
+              syncEvent('dining_tables', 'INSERT', kiosk),
+              syncEvent('audit_logs', 'INSERT', log),
+            ],
+            currentUserId: owner.id,
+            cloud: linkedCloud ?? null,
+            managerPinFailures: 0,
+            managerPinLockedUntil: null,
+            nfceSeq: 1,
+            syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
+          });
+          return { ok: true, data: tenant };
+        },
+
+        // ---------------------------------------------------------------------
+        // Etapa 0 — nuvem
+        // ---------------------------------------------------------------------
+        setCloudSession: (session) => {
+          if (session && session.tenant_id !== get().tenant.id) {
+            return fail('Esta conta da nuvem é de outra loja. Use a conta desta loja ou inicie uma loja nova.');
+          }
+          set({ cloud: session });
+          return { ok: true, data: undefined };
+        },
+
+        ackSyncedEvents: (eventIds) => {
+          if (eventIds.length === 0) return;
+          const done = new Set(eventIds);
+          set((s) => ({
+            outbox: s.outbox.filter((e) => !done.has(e.id)),
+            syncStatus: { last_success_at: nowISO(), last_error: null, last_error_at: null, blocked_event_id: null },
+          }));
+        },
+
+        setSyncError: (message, blockedEventId) =>
+          set((s) => ({
+            syncStatus: {
+              ...s.syncStatus,
+              last_error: message,
+              last_error_at: message ? nowISO() : null,
+              blocked_event_id: blockedEventId,
+            },
+          })),
+
         resetDemo: () => set({ ...initialData(), ...initialDevice(), hydrated: true }),
       };
     },
     {
       name: 'tchefood-state-v1',
-      // v2 = Fase 5 (barril, fichas, balança, cashback). Os dados da demonstração
-      // são recriados a partir do seed porque produtos, mesas e itens ganharam
-      // colunas obrigatórias; impressoras e preferências do aparelho são mantidas.
-      version: 3,
-      migrate: (persisted, version) => {
-        const p = (persisted ?? {}) as Partial<TcheState>;
-        // v3 = totem / pedido com senha: comandas ganham os campos de senha (null) e o
-        // aparelho ganha a mesa técnica KIOSK e o usuário do totem, sem perder o movimento.
-        if (version === 2) return migrateToKiosk(p) as TcheState;
-        if (version >= 3) return p as TcheState;
-        return {
-          ...p,
-          ...createSeedData(),
-          printers: p.printers ?? createSeedData().printers,
-          tray: [],
-          outbox: [],
-          pendingCharges: [],
-          currentUserId: null,
-        } as TcheState;
-      },
+      // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback);
+      // v4 = totem / pedido com senha.
+      version: 4,
+      migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
         // Persistimos dados + estado do aparelho; funções e flag de hidratação ficam de fora.
@@ -2044,11 +2811,82 @@ export const useTcheStore = create<TcheState>()(
         return data as Partial<TcheState>;
       },
       onRehydrateStorage: () => () => {
-        useTcheStore.setState({ hydrated: true });
+        // Com o fallback síncrono (localStorage), este callback roda ainda dentro de
+        // create(), antes de useTcheStore existir; adiamos para depois da atribuição.
+        queueMicrotask(() => useTcheStore.setState({ hydrated: true }));
       },
     },
   ),
 );
+
+export function migratePersisted(persisted: unknown, version: number): unknown {
+  if (!persisted || typeof persisted !== 'object') return persisted;
+  const st = { ...(persisted as Record<string, unknown>) };
+  if (version < 2) {
+    if (Array.isArray(st.products)) st.products = (st.products as Product[]).map((p) => ({ ...p, active: p.active ?? true }));
+    if (Array.isArray(st.tables)) st.tables = (st.tables as DiningTable[]).map((t) => ({ ...t, active: t.active ?? true }));
+    st.priceSchedules = Array.isArray(st.priceSchedules) ? st.priceSchedules : [];
+    st.rolePermissions = Array.isArray(st.rolePermissions) ? st.rolePermissions : [];
+    st.cloud = st.cloud ?? null;
+    st.syncStatus = st.syncStatus ?? { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null };
+  }
+  if (version < 3) {
+    // Fase 5: colunas novas com valor neutro (nada da loja é apagado) e a mesa técnica do balcão.
+    if (Array.isArray(st.products)) {
+      st.products = (st.products as Product[]).map((p) => ({ ...p, sold_by_weight: p.sold_by_weight ?? false, tare_weight_grams: p.tare_weight_grams ?? 0, cost_price: p.cost_price ?? 0 }));
+    }
+    if (Array.isArray(st.modifierOptions)) {
+      st.modifierOptions = (st.modifierOptions as ModifierOption[]).map((o) => ({ ...o, volume_ml: o.volume_ml ?? null }));
+    }
+    if (Array.isArray(st.orderItems)) {
+      st.orderItems = (st.orderItems as OrderItem[]).map((i) => ({
+        ...i,
+        weight_gross_grams: i.weight_gross_grams ?? null,
+        weight_tare_grams: i.weight_tare_grams ?? null,
+        weight_source: i.weight_source ?? null,
+        keg_volume_ml: i.keg_volume_ml ?? null,
+      }));
+    }
+    if (Array.isArray(st.tables)) {
+      const tables = (st.tables as DiningTable[]).map((t) => ({ ...t, kind: t.kind ?? 'TABLE' }));
+      const tenantId = (st.tenant as Tenant | undefined)?.id ?? tables[0]?.tenant_id;
+      if (tenantId && !tables.some((t) => t.kind === 'COUNTER')) tables.push(counterTable(tenantId));
+      st.tables = tables;
+    }
+    for (const key of ['kegTaps', 'kegTapProducts', 'kegHistory', 'eventTickets', 'loyaltyCustomers', 'cashbackLedger'] as const) {
+      st[key] = Array.isArray(st[key]) ? st[key] : [];
+    }
+  }
+  if (version < 4) {
+    // Totem: comandas ganham os campos de senha (null) e a loja ganha a mesa técnica KIOSK.
+    return migrateToKiosk(st as Partial<TcheState>);
+  }
+  return st;
+}
+
+/** Mesa técnica da venda de balcão (Ficha Rápida) de uma loja. */
+export function counterTable(tenantId: UUID): DiningTable {
+  return {
+    id: uuid(),
+    tenant_id: tenantId,
+    number: 900,
+    label: 'Balcão / Eventos',
+    area: 'Balcão & Eventos',
+    capacity: 1,
+    status: 'FREE',
+    qr_code_token: null,
+    current_order_id: null,
+    active: true,
+    updated_at: nowISO(),
+    kind: 'COUNTER',
+  };
+}
+
+/** Permissão do usuário logado (padrão + exceções da loja). */
+export function selectCan(s: TcheState, permission: Permission): boolean {
+  const user = s.staff.find((u) => u.id === s.currentUserId && u.active);
+  return can(user?.role, permission, s.rolePermissions);
+}
 
 // ---------------------------------------------------------------------------
 // Seletores puros (reutilizados pelas telas)

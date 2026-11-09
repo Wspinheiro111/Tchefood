@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { BarChart3, Beer, Bike, ChefHat, CloudOff, Flame, LayoutGrid, LogOut, MonitorPlay, QrCode as QrIcon, RefreshCw, ShoppingBag, Smartphone, Ticket } from 'lucide-react';
-import { isManagerRole, selectCurrentUser, useTcheStore } from './store/useTcheStore';
+import { selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
 import { useTerminalBus } from './lib/payments/drivers';
 import { LoginScreen } from './screens/LoginScreen';
@@ -9,13 +9,14 @@ import { OrderScreen } from './screens/OrderScreen';
 import { CheckoutScreen } from './screens/CheckoutScreen';
 import { KdsScreen } from './screens/KdsScreen';
 import { QrMenuScreen } from './screens/QrMenuScreen';
-import { BackOffice } from './screens/BackOffice';
+import { BackOffice, useBackOfficeTabs } from './screens/BackOffice';
 import { FichaRapidaScreen } from './screens/FichaRapidaScreen';
 import { KegMonitorScreen } from './screens/KegMonitorScreen';
 import { DeliveryScreen } from './screens/DeliveryScreen';
 import { OrderBoardScreen } from './screens/OrderBoardScreen';
 import { KioskScreen } from './screens/KioskScreen';
 import { PickupCounterScreen } from './screens/PickupCounterScreen';
+import { useCloudSync } from './lib/sync/useCloudSync';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
 import { PrintSimulatorModal } from './components/PrintSimulator';
 import { ToastHost, toast } from './components/ui';
@@ -45,7 +46,8 @@ const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: U
   { key: 'qr', label: 'QR Cliente', icon: QrIcon, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
   { key: 'delivery', label: 'Delivery', icon: Bike, roles: ['MANAGER', 'OWNER', 'CASHIER'] },
   { key: 'board', label: 'Painel TV', icon: MonitorPlay, roles: ['MANAGER', 'OWNER', 'CASHIER', 'KITCHEN'] },
-  { key: 'backoffice', label: 'Retaguarda', icon: BarChart3, roles: ['MANAGER', 'OWNER', 'CASHIER'] },
+  // Retaguarda: aparece para quem tem ao menos uma aba liberada (perfil ou permissão).
+  { key: 'backoffice', label: 'Retaguarda', icon: BarChart3, roles: [] },
 ];
 
 export default function App() {
@@ -55,6 +57,9 @@ export default function App() {
   const outbox = useTcheStore((s) => s.outbox.length);
   const online = useOnline();
   const [view, setView] = useState<View>({ name: 'map' });
+  const backOfficeTabs = useBackOfficeTabs();
+  // Etapa 0: envia a fila para o Supabase quando há internet e o aparelho está conectado.
+  useCloudSync(online);
 
   // Perfil Cozinha entra direto no KDS.
   useEffect(() => {
@@ -90,7 +95,7 @@ export default function App() {
     );
   }
 
-  const nav = NAV.filter((n) => n.roles.includes(user.role));
+  const nav = NAV.filter((n) => (n.key === 'backoffice' ? backOfficeTabs.length > 0 : n.roles.includes(user.role)));
   const activeKey: NavKey = view.name === 'order' || view.name === 'checkout' ? 'map' : view.name;
 
   return (
@@ -132,7 +137,7 @@ export default function App() {
         {view.name === 'chopp' && <KegMonitorScreen />}
         {view.name === 'delivery' && <DeliveryScreen />}
         {view.name === 'board' && <OrderBoardScreen />}
-        {view.name === 'backoffice' && (isManagerRole(user.role) || user.role === 'CASHIER' ? <BackOffice /> : <p className="p-6">Acesso restrito.</p>)}
+        {view.name === 'backoffice' && <BackOffice />}
       </main>
 
       {nav.length > 1 && (

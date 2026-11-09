@@ -28,6 +28,7 @@ import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { usePickupCart, usePickupMenu } from '../components/pickup/usePickupCart';
 import { toast } from '../components/ui';
 import { CategoryIcon } from './OrderScreen';
+import { useSalePrice } from '../lib/useSalePrice';
 
 /**
  * Totem de autoatendimento (tela do cliente). O cliente monta o pedido, paga na maquininha
@@ -59,6 +60,7 @@ const PAY_OPTIONS: Array<{ key: PayMethod; label: string; hint: string; icon: ty
 ];
 
 export function KioskScreen() {
+  const priceOf = useSalePrice();
   const tenant = useTcheStore((s) => s.tenant);
   const cart = usePickupCart();
   const { cats, sellable } = usePickupMenu();
@@ -251,7 +253,7 @@ export function KioskScreen() {
                         <span className="text-lg font-black leading-tight">{p.name}</span>
                         {p.description && <span className="line-clamp-2 text-sm text-neutral-500">{p.description}</span>}
                         <span className="mt-auto flex items-center justify-between pt-2">
-                          <span className="text-2xl font-black tabular-nums text-brasa">{formatBRL(p.price)}</span>
+                          <span className="text-2xl font-black tabular-nums text-brasa">{formatBRL(priceOf(p))}</span>
                           {!p.available ? (
                             <span className="rounded-full bg-neutral-200 px-3 py-1 text-xs font-bold">Esgotado</span>
                           ) : (
@@ -408,8 +410,9 @@ export function KioskScreen() {
 }
 
 function Welcome({ name, onStart, onLogo }: { name: string; onStart: () => void; onLogo: () => void }) {
+  const priceOf = useSalePrice();
   const products = useTcheStore((s) => s.products);
-  const highlights = useMemo(() => products.filter((p) => p.available && !p.sold_by_weight).slice(0, 6), [products]);
+  const highlights = useMemo(() => products.filter((p) => p.active && p.available && !p.sold_by_weight).slice(0, 6), [products]);
   const [i, setI] = useState(0);
   useEffect(() => {
     const t = window.setInterval(() => setI((x) => x + 1), 3_500);
@@ -430,7 +433,7 @@ function Welcome({ name, onStart, onLogo }: { name: string; onStart: () => void;
           <div key={featured.id} className="mx-auto mt-10 max-w-md rounded-[2rem] bg-white/10 px-8 py-6 backdrop-blur">
             <div className="text-sm font-bold uppercase tracking-widest text-orange-200">Peça hoje</div>
             <div className="text-3xl font-black">{featured.name}</div>
-            <div className="text-4xl font-black tabular-nums text-ouro">{formatBRL(featured.price)}</div>
+            <div className="text-4xl font-black tabular-nums text-ouro">{formatBRL(priceOf(featured))}</div>
           </div>
         )}
       </div>
