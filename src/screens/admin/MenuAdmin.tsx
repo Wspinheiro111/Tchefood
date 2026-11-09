@@ -30,7 +30,7 @@ export function MenuAdmin() {
     <div className="space-y-3">
       <div className="flex flex-wrap gap-2">
         {subs.map((s) => (
-          <button key={s.key} onClick={() => setSub(s.key)} className={`min-h-touch rounded-full px-4 text-sm font-bold ${sub === s.key ? 'bg-slate-200 text-slate-950' : 'bg-surface text-slate-300'}`}>
+          <button key={s.key} onClick={() => setSub(s.key)} className={`min-h-touch rounded-full px-4 text-sm font-bold ${sub === s.key ? 'bg-slate-200 text-slate-950' : 'bg-surface text-slate-700'}`}>
             {s.label}
           </button>
         ))}
@@ -76,14 +76,14 @@ function ProductsPanel({ canManage }: { canManage: boolean }) {
       title={`Produtos (${products.filter((p) => p.active).length} ativos)`}
       action={canManage && <Btn variant="gold" disabled={categories.length === 0} onClick={() => setEditing('new')}><Plus className="h-4 w-4" /> Novo produto</Btn>}
     >
-      {canManage && categories.length === 0 && <p className="mb-3 text-sm text-ouro">Crie uma categoria antes do primeiro produto.</p>}
+      {canManage && categories.length === 0 && <p className="mb-3 text-sm text-brasa">Crie uma categoria antes do primeiro produto.</p>}
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <div className="relative min-w-[200px] flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
           <TextInput value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar por nome ou código" className="pl-9" />
         </div>
         {canManage && (
-          <button onClick={() => setShowInactive(!showInactive)} className={`min-h-touch rounded-xl px-3 text-sm font-bold ${showInactive ? 'bg-slate-200 text-slate-950' : 'bg-base text-slate-300'}`}>
+          <button onClick={() => setShowInactive(!showInactive)} className={`min-h-touch rounded-xl px-3 text-sm font-bold ${showInactive ? 'bg-slate-200 text-slate-950' : 'bg-base text-slate-700'}`}>
             {showInactive ? 'Mostrando desativados' : 'Mostrar desativados'}
           </button>
         )}
@@ -91,22 +91,22 @@ function ProductsPanel({ canManage }: { canManage: boolean }) {
       {groups.length === 0 && <p className="p-4 text-center text-sm text-slate-500">Nenhum produto encontrado.</p>}
       {groups.map((g) => (
         <div key={g.category.id} className="mb-4">
-          <div className="mb-1 text-xs font-bold uppercase tracking-wide text-slate-400">{g.category.name}{!g.category.active && ' · categoria desativada'}</div>
-          <div className="divide-y divide-slate-700 rounded-xl bg-base">
+          <div className="mb-1 text-xs font-bold uppercase tracking-wide text-slate-500">{g.category.name}{!g.category.active && ' · categoria desativada'}</div>
+          <div className="divide-y divide-slate-200 rounded-xl bg-base">
             {g.items.map((p) => {
               const rule = activeSchedule(p.id, schedules, now);
               return (
                 <div key={p.id} className={`flex flex-wrap items-center gap-3 p-3 ${p.active ? '' : 'opacity-50'}`}>
                   <div className="min-w-0 flex-1">
                     <div className="font-bold">
-                      <span className="mr-2 font-mono text-xs text-slate-400">{p.code}</span>
+                      <span className="mr-2 font-mono text-xs text-slate-500">{p.code}</span>
                       {p.name}
-                      {!p.active && <Badge className="ml-2 bg-slate-600 text-white">desativado</Badge>}
+                      {!p.active && <Badge className="ml-2 bg-neutral-500 text-white">desativado</Badge>}
                       {!p.available && p.active && <Badge className="ml-2 bg-brasa text-white">esgotado</Badge>}
                     </div>
-                    <div className="text-xs text-slate-400">
+                    <div className="text-xs text-slate-500">
                       {SECTOR_NAME[p.sector]} · {formatBRL(p.price)}
-                      {rule && <span className="ml-1 text-ouro"><Clock className="inline h-3 w-3" /> agora {formatBRL(rule.price)} ({rule.name})</span>}
+                      {rule && <span className="ml-1 text-brasa"><Clock className="inline h-3 w-3" /> agora {formatBRL(rule.price)} ({rule.name})</span>}
                     </div>
                   </div>
                   {p.active && canAvailability && (
@@ -229,7 +229,7 @@ function ProductEditor({ product, onClose }: { product: Product | null; onClose:
         <Field label="Unidade"><TextInput value={f.unit} maxLength={6} onChange={(e) => up('unit', e.target.value)} /></Field>
       </div>
       <Field label="Descrição (aparece no cardápio QR)">
-        <textarea value={f.description} maxLength={500} rows={2} onChange={(e) => up('description', e.target.value)} className="w-full rounded-xl border border-slate-600 bg-base p-3 text-[1rem] text-slate-100 outline-none focus:border-ouro" />
+        <textarea value={f.description} maxLength={500} rows={2} onChange={(e) => up('description', e.target.value)} className="w-full rounded-xl border border-slate-300 bg-base p-3 text-[1rem] text-slate-900 outline-none focus:border-ouro" />
       </Field>
       <div className="grid gap-x-3 sm:grid-cols-2">
         <Toggle label="Disponível (desligado = esgotado)" checked={f.available} onChange={(v) => up('available', v)} />
@@ -238,20 +238,20 @@ function ProductEditor({ product, onClose }: { product: Product | null; onClose:
         <Toggle label="Aceita meio a meio" checked={f.allows_half_and_half} onChange={(v) => up('allows_half_and_half', v)} />
       </div>
 
-      <h4 className="mb-2 mt-2 text-sm font-bold text-slate-300">Fiscal (NFC-e)</h4>
+      <h4 className="mb-2 mt-2 text-sm font-bold text-slate-700">Fiscal (NFC-e)</h4>
       <div className="grid grid-cols-3 gap-x-3">
         <Field label="NCM" hint="8 dígitos"><TextInput inputMode="numeric" value={f.ncm} maxLength={8} onChange={(e) => up('ncm', e.target.value.replace(/\D/g, ''))} /></Field>
         <Field label="CFOP" hint="4 dígitos"><TextInput inputMode="numeric" value={f.cfop} maxLength={4} onChange={(e) => up('cfop', e.target.value.replace(/\D/g, ''))} /></Field>
         <Field label="CSOSN/CST"><TextInput inputMode="numeric" value={f.csosn_cst} maxLength={4} onChange={(e) => up('csosn_cst', e.target.value.replace(/\D/g, ''))} /></Field>
       </div>
 
-      <h4 className="mb-2 mt-2 text-sm font-bold text-slate-300">Adicionais deste produto (na ordem em que aparecem)</h4>
+      <h4 className="mb-2 mt-2 text-sm font-bold text-slate-700">Adicionais deste produto (na ordem em que aparecem)</h4>
       {groups.length === 0 && <p className="text-sm text-slate-500">Nenhum grupo de adicionais cadastrado.</p>}
       <div className="flex flex-wrap gap-2">
         {groups.map((g) => {
           const pos = f.groupIds.indexOf(g.id);
           return (
-            <button key={g.id} onClick={() => toggleGroup(g.id)} className={`min-h-touch rounded-full px-3 text-sm font-semibold ${pos >= 0 ? 'bg-ouro text-slate-950' : 'bg-slate-700 text-slate-200'}`}>
+            <button key={g.id} onClick={() => toggleGroup(g.id)} className={`min-h-touch rounded-full px-3 text-sm font-semibold ${pos >= 0 ? 'bg-ouro text-slate-950' : 'bg-slate-200 text-slate-800'}`}>
               {pos >= 0 && `${pos + 1}. `}{g.name}{g.required && ' *'}
             </button>
           );
@@ -271,13 +271,13 @@ function CategoriesPanel() {
   const sorted = [...categories].sort((a, b) => a.sort_order - b.sort_order);
   return (
     <Panel title="Categorias" action={<Btn variant="gold" onClick={() => setEditing('new')}><Plus className="h-4 w-4" /> Nova categoria</Btn>}>
-      <div className="divide-y divide-slate-700 rounded-xl bg-base">
+      <div className="divide-y divide-slate-200 rounded-xl bg-base">
         {sorted.map((c) => (
           <div key={c.id} className={`flex items-center gap-3 p-3 ${c.active ? '' : 'opacity-50'}`}>
             <span className="w-8 text-center font-mono text-xs text-slate-500">{c.sort_order}</span>
             <div className="flex-1">
-              <div className="font-bold">{c.name}{!c.active && <Badge className="ml-2 bg-slate-600 text-white">desativada</Badge>}</div>
-              <div className="text-xs text-slate-400">{products.filter((p) => p.category_id === c.id && p.active).length} produto(s) ativo(s)</div>
+              <div className="font-bold">{c.name}{!c.active && <Badge className="ml-2 bg-neutral-500 text-white">desativada</Badge>}</div>
+              <div className="text-xs text-slate-500">{products.filter((p) => p.category_id === c.id && p.active).length} produto(s) ativo(s)</div>
             </div>
             <Btn variant="ghost" aria-label={`Editar ${c.name}`} onClick={() => setEditing(c)}><Pencil className="h-4 w-4" /></Btn>
           </div>
@@ -327,7 +327,7 @@ function ModifiersPanel() {
   const removeOption = useTcheStore((s) => s.removeModifierOption);
   return (
     <Panel title="Grupos de adicionais" action={<Btn variant="gold" onClick={() => setEditingGroup('new')}><Plus className="h-4 w-4" /> Novo grupo</Btn>}>
-      <p className="mb-3 text-xs text-slate-400">Ex.: "Acompanhamento" (escolha 1, obrigatório) ou "Extras" (até 3, opcional). Vincule o grupo ao produto na edição do produto.</p>
+      <p className="mb-3 text-xs text-slate-500">Ex.: "Acompanhamento" (escolha 1, obrigatório) ou "Extras" (até 3, opcional). Vincule o grupo ao produto na edição do produto.</p>
       <div className="space-y-3">
         {groups.map((g) => {
           const opts = options.filter((o) => o.group_id === g.id);
@@ -336,18 +336,18 @@ function ModifiersPanel() {
               <div className="mb-2 flex flex-wrap items-center gap-2">
                 <div className="flex-1">
                   <div className="font-bold">{g.name}</div>
-                  <div className="text-xs text-slate-400">
+                  <div className="text-xs text-slate-500">
                     {g.required ? 'Obrigatório' : 'Opcional'} · mín. {g.min_selection} · máx. {g.max_selection} · em {links.filter((l) => l.group_id === g.id).length} produto(s)
                   </div>
                 </div>
                 <Btn variant="ghost" aria-label={`Editar grupo ${g.name}`} onClick={() => setEditingGroup(g)}><Pencil className="h-4 w-4" /></Btn>
                 <Btn variant="secondary" onClick={() => setEditingOption({ group: g, option: null })}><Plus className="h-4 w-4" /> Opção</Btn>
               </div>
-              <div className="divide-y divide-slate-700">
+              <div className="divide-y divide-slate-200">
                 {opts.map((o) => (
                   <div key={o.id} className="flex items-center gap-2 py-2 text-sm">
                     <span className="flex-1">{o.name}</span>
-                    <span className="tabular-nums text-slate-300">{o.additional_price > 0 ? `+ ${formatBRL(o.additional_price)}` : 'sem custo'}</span>
+                    <span className="tabular-nums text-slate-700">{o.additional_price > 0 ? `+ ${formatBRL(o.additional_price)}` : 'sem custo'}</span>
                     <Btn variant="ghost" aria-label={`Editar ${o.name}`} onClick={() => setEditingOption({ group: g, option: o })}><Pencil className="h-4 w-4" /></Btn>
                     <Btn
                       variant="ghost"
@@ -437,16 +437,16 @@ function SchedulesPanel() {
   const sorted = [...schedules].sort((a, b) => (products.find((p) => p.id === a.product_id)?.name ?? '').localeCompare(products.find((p) => p.id === b.product_id)?.name ?? '', 'pt-BR'));
   return (
     <Panel title="Preço por dia e horário" action={<Btn variant="gold" onClick={() => setEditing('new')}><Plus className="h-4 w-4" /> Nova regra</Btn>}>
-      <p className="mb-3 text-xs text-slate-400">Happy hour, almoço executivo, rodízio de domingo. Fora da janela vale o preço do cadastro. Duas regras do mesmo produto não podem se sobrepor. O horário é o do relógio deste aparelho.</p>
-      <div className="divide-y divide-slate-700 rounded-xl bg-base">
+      <p className="mb-3 text-xs text-slate-500">Happy hour, almoço executivo, rodízio de domingo. Fora da janela vale o preço do cadastro. Duas regras do mesmo produto não podem se sobrepor. O horário é o do relógio deste aparelho.</p>
+      <div className="divide-y divide-slate-200 rounded-xl bg-base">
         {sorted.map((s) => {
           const p = products.find((x) => x.id === s.product_id);
           const live = activeSchedule(s.product_id, schedules, now)?.id === s.id;
           return (
             <div key={s.id} className={`flex flex-wrap items-center gap-3 p-3 ${s.active ? '' : 'opacity-50'}`}>
               <div className="min-w-0 flex-1">
-                <div className="font-bold">{s.name} · {p?.name ?? 'produto removido'}{live && <Badge className="ml-2 bg-stone text-slate-950">valendo agora</Badge>}{!s.active && <Badge className="ml-2 bg-slate-600 text-white">pausada</Badge>}</div>
-                <div className="text-xs text-slate-400">
+                <div className="font-bold">{s.name} · {p?.name ?? 'produto removido'}{live && <Badge className="ml-2 bg-stone text-white">valendo agora</Badge>}{!s.active && <Badge className="ml-2 bg-neutral-500 text-white">pausada</Badge>}</div>
+                <div className="text-xs text-slate-500">
                   {s.weekdays.map((d) => WEEKDAY_SHORT[d]).join(', ')} · {s.start_time}–{s.end_time}{s.end_time < s.start_time && ' (vira a meia-noite)'} · {formatBRL(s.price)} {p && <span>(normal {formatBRL(p.price)})</span>}
                 </div>
               </div>
@@ -490,10 +490,10 @@ function ScheduleEditor({ schedule, onClose }: { schedule: PriceSchedule | null;
       </Field>
       <Field label="Nome da regra"><TextInput value={name} maxLength={60} onChange={(e) => setName(e.target.value)} /></Field>
       <div className="mb-3">
-        <span className="mb-1 block text-sm font-semibold text-slate-300">Dias da semana</span>
+        <span className="mb-1 block text-sm font-semibold text-slate-700">Dias da semana</span>
         <div className="flex flex-wrap gap-2">
           {WEEKDAY_SHORT.map((label, d) => (
-            <button key={label} onClick={() => setDays(days.includes(d) ? days.filter((x) => x !== d) : [...days, d])} className={`min-h-touch min-w-[56px] rounded-xl px-2 text-sm font-bold ${days.includes(d) ? 'bg-ouro text-slate-950' : 'bg-slate-700 text-slate-200'}`}>
+            <button key={label} onClick={() => setDays(days.includes(d) ? days.filter((x) => x !== d) : [...days, d])} className={`min-h-touch min-w-[56px] rounded-xl px-2 text-sm font-bold ${days.includes(d) ? 'bg-ouro text-slate-950' : 'bg-slate-200 text-slate-800'}`}>
               {label}
             </button>
           ))}

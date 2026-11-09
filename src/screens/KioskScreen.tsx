@@ -1,3 +1,4 @@
+// @tema-claro: o totem já nasceu claro; o codemod do tema (scripts/light-theme-codemod.mjs) pula este arquivo.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
@@ -359,7 +360,7 @@ export function KioskScreen() {
 
         {step.name === 'review' && order && (
           <div className="mx-auto flex h-full max-w-2xl flex-col items-center justify-center gap-5 p-6 text-center">
-            <Hand className="h-20 w-20 text-ouro" />
+            <Hand className="h-20 w-20 text-amber-500" />
             <h1 className="text-4xl font-black">Procure o caixa, por favor</h1>
             <p className="text-xl text-neutral-600">Não conseguimos confirmar o pagamento. Não pague de novo: o caixa vai conferir na maquininha.</p>
             <div className="rounded-3xl bg-white px-10 py-6 shadow">
@@ -449,7 +450,7 @@ function DoneScreen({ order, paid, onFinish }: { order: Order; paid: boolean; on
   return (
     <div className="flex h-full flex-col items-center justify-center gap-6 p-6 text-center">
       <BrandLogo className="h-16 w-auto" />
-      <CheckCircle2 className={`h-20 w-20 ${paid ? 'text-emerald-600' : 'text-ouro'}`} />
+      <CheckCircle2 className={`h-20 w-20 ${paid ? 'text-emerald-600' : 'text-amber-500'}`} />
       <h1 className="text-4xl font-black">{paid ? 'Pedido confirmado!' : 'Pedido anotado!'}</h1>
       <div className="rounded-[2.5rem] border-4 border-neutral-900 bg-white px-14 py-8 shadow-xl">
         <div className="text-xl font-bold uppercase tracking-widest text-neutral-500">Sua senha</div>

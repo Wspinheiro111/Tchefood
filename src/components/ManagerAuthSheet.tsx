@@ -65,7 +65,7 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
       onClose={onClose}
       tone="danger"
       title={
-        <span className="flex items-center gap-2 text-rose-300">
+        <span className="flex items-center gap-2 text-rose-600">
           <ShieldAlert className="h-6 w-6" /> {title}
         </span>
       }
@@ -77,13 +77,13 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
     >
       <div className="mb-3 rounded-xl border border-brasa/50 bg-brasa/10 p-3 text-sm">{summary}</div>
 
-      <label className="mb-1 block text-sm font-semibold text-slate-300">Motivo obrigatório</label>
+      <label className="mb-1 block text-sm font-semibold text-slate-700">Motivo obrigatório</label>
       <div className="mb-2 flex flex-wrap gap-2">
         {quickReasons.map((r) => (
           <button
             key={r}
             onClick={() => setReason(r)}
-            className={`min-h-touch rounded-full px-3 text-sm font-medium ${reason === r ? 'bg-ouro text-slate-950' : 'bg-slate-700 text-slate-200'}`}
+            className={`min-h-touch rounded-full px-3 text-sm font-medium ${reason === r ? 'bg-ouro text-slate-950' : 'bg-slate-200 text-slate-800'}`}
           >
             {r}
           </button>
@@ -94,12 +94,12 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
         onChange={(e) => setReason(e.target.value)}
         rows={2}
         placeholder="Descreva o motivo…"
-        className="mb-4 w-full rounded-xl border border-slate-600 bg-base p-3 text-[1rem] text-slate-100 outline-none focus:border-ouro"
+        className="mb-4 w-full rounded-xl border border-slate-300 bg-base p-3 text-[1rem] text-slate-900 outline-none focus:border-ouro"
       />
 
-      <p className="mb-2 text-center text-sm font-semibold text-slate-300">PIN do Gerente</p>
+      <p className="mb-2 text-center text-sm font-semibold text-slate-700">PIN do Gerente</p>
       <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => reasonOk && submit(v)} error={Boolean(error)} compact />
-      {error && <p className="mt-3 rounded-lg bg-brasa/20 p-2 text-center text-sm font-semibold text-rose-200">{error}</p>}
+      {error && <p className="mt-3 rounded-lg bg-brasa/20 p-2 text-center text-sm font-semibold text-rose-700">{error}</p>}
     </Sheet>
   );
 }

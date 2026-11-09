@@ -8,11 +8,11 @@ import { useNow } from '../lib/useOnline';
 import { Btn, Sheet, Stepper, toast } from '../components/ui';
 
 const STATUS_STYLE: Record<TableStatus, { card: string; label: string; dot: string }> = {
-  FREE: { card: 'border-slate-700 bg-surface', label: 'Livre', dot: 'bg-stone' },
+  FREE: { card: 'border-slate-200 bg-surface', label: 'Livre', dot: 'bg-stone' },
   OCCUPIED: { card: 'border-brasa bg-brasa/15', label: 'Ocupada', dot: 'bg-brasa' },
   WAITING_BILL: { card: 'border-ouro bg-ouro/15 animate-pulse-ring', label: 'Pediu a conta', dot: 'bg-ouro' },
   PAYING: { card: 'border-pagbank bg-pagbank/15', label: 'Pagando', dot: 'bg-pagbank' },
-  DIRTY: { card: 'border-slate-600 bg-slate-800/60 border-dashed', label: 'Limpeza', dot: 'bg-slate-400' },
+  DIRTY: { card: 'border-slate-300 bg-slate-100/60 border-dashed', label: 'Limpeza', dot: 'bg-slate-400' },
 };
 
 
@@ -60,13 +60,13 @@ export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => vo
           <button
             key={f.key}
             onClick={() => setArea(f.key)}
-            className={`min-h-touch shrink-0 rounded-full px-5 text-base font-semibold ${area === f.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}
+            className={`min-h-touch shrink-0 rounded-full px-5 text-base font-semibold ${area === f.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}
           >
             {f.label}
           </button>
         ))}
       </div>
-      <div className="mb-3 flex flex-wrap gap-3 text-xs text-slate-400">
+      <div className="mb-3 flex flex-wrap gap-3 text-xs text-slate-500">
         {(Object.keys(STATUS_STYLE) as TableStatus[]).map((s) => (
           <span key={s} className="inline-flex items-center gap-1">
             <span className={`h-2.5 w-2.5 rounded-full ${STATUS_STYLE[s].dot}`} /> {STATUS_STYLE[s].label} ({counts[s]})
@@ -89,9 +89,9 @@ export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => vo
               <div className="flex items-start justify-between">
                 <div>
                   <div className="text-2xl font-black leading-none">{t.number}</div>
-                  <div className="text-xs text-slate-400">{t.area === 'Salão Principal' ? 'Salão' : t.area}</div>
+                  <div className="text-xs text-slate-500">{t.area === 'Salão Principal' ? 'Salão' : t.area}</div>
                 </div>
-                <span className="inline-flex items-center gap-1 rounded-md bg-black/30 px-1.5 py-0.5 text-[11px] font-bold">
+                <span className="inline-flex items-center gap-1 rounded-md bg-black/10 px-1.5 py-0.5 text-[11px] font-bold">
                   <span className={`h-2 w-2 rounded-full ${style.dot}`} />
                   {style.label}
                 </span>
@@ -99,7 +99,7 @@ export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => vo
               {order ? (
                 <div className="mt-2 space-y-0.5 text-sm">
                   <div className="text-lg font-bold tabular-nums">{formatBRL(order.paid_amount > 0 ? order.remaining_balance : order.total_amount)}</div>
-                  <div className="flex items-center gap-3 text-xs text-slate-300">
+                  <div className="flex items-center gap-3 text-xs text-slate-700">
                     <span className="inline-flex items-center gap-1"><Users className="h-3 w-3" />{order.customer_count}</span>
                     <span className="inline-flex items-center gap-1"><Clock className="h-3 w-3" />{elapsedLabel(order.opened_at, now)}</span>
                   </div>
@@ -107,7 +107,7 @@ export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => vo
               ) : (
                 <div className="mt-2 text-xs text-slate-500">
                   {t.status === 'DIRTY' ? (
-                    <span className="inline-flex items-center gap-1 text-slate-300"><Sparkles className="h-3 w-3" /> Toque para liberar</span>
+                    <span className="inline-flex items-center gap-1 text-slate-700"><Sparkles className="h-3 w-3" /> Toque para liberar</span>
                   ) : (
                     <span>{t.capacity} lugares</span>
                   )}
@@ -116,7 +116,7 @@ export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => vo
               {(hasQr || ready > 0) && (
                 <div className="absolute -right-1 -top-1 flex gap-1">
                   {hasQr && <span className="grid h-6 w-6 place-items-center rounded-full bg-sky-500 text-white" title="Pedido via QR Code"><QrIcon className="h-3.5 w-3.5" /></span>}
-                  {ready > 0 && <span className="grid h-6 min-w-6 place-items-center rounded-full bg-stone px-1.5 text-xs font-black text-slate-950" title="Itens prontos">{ready}</span>}
+                  {ready > 0 && <span className="grid h-6 min-w-6 place-items-center rounded-full bg-stone px-1.5 text-xs font-black text-white" title="Itens prontos">{ready}</span>}
                 </div>
               )}
             </button>
@@ -150,12 +150,12 @@ function OpenTableSheet({ table, onClose, onOpened }: { table: DiningTable | nul
       title={`Abrir ${table.label}`}
       footer={<Btn block size="lg" onClick={confirm}>Abrir mesa</Btn>}
     >
-      <p className="mb-2 text-sm text-slate-400">{table.area} · {table.capacity} lugares</p>
+      <p className="mb-2 text-sm text-slate-500">{table.area} · {table.capacity} lugares</p>
       <label className="mb-2 block font-semibold">Quantas pessoas?</label>
       <div className="mb-3 flex justify-center"><Stepper value={count} onChange={setCount} max={40} /></div>
       <div className="mb-4 flex flex-wrap justify-center gap-2">
         {[1, 2, 3, 4, 6, 8].map((n) => (
-          <button key={n} onClick={() => setCount(n)} className={`h-12 w-12 rounded-xl text-lg font-bold ${count === n ? 'bg-ouro text-slate-950' : 'bg-slate-700'}`}>{n}</button>
+          <button key={n} onClick={() => setCount(n)} className={`h-12 w-12 rounded-xl text-lg font-bold ${count === n ? 'bg-ouro text-slate-950' : 'bg-slate-200'}`}>{n}</button>
         ))}
       </div>
       <label className="mb-1 block font-semibold">CPF na nota (opcional)</label>
@@ -164,7 +164,7 @@ function OpenTableSheet({ table, onClose, onOpened }: { table: DiningTable | nul
         value={cpf}
         onChange={(e) => setCpf(e.target.value.replace(/[^\d.-]/g, '').slice(0, 14))}
         placeholder="000.000.000-00"
-        className="min-h-touch w-full rounded-xl border border-slate-600 bg-base px-3 text-lg outline-none focus:border-ouro"
+        className="min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 text-lg outline-none focus:border-ouro"
       />
     </Sheet>
   );

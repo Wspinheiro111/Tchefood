@@ -21,10 +21,10 @@ export function TablesAdmin() {
   const nextNumber = Math.max(0, ...tables.map((t) => t.number)) + 1;
   return (
     <Panel title={`Mesas (${tables.filter((t) => t.active).length} ativas)`} action={<Btn variant="gold" onClick={() => setEditing('new')}><Plus className="h-4 w-4" /> Nova mesa</Btn>}>
-      <p className="mb-3 text-xs text-slate-400">Mesa com conta aberta não pode ser desativada. Mesa nunca é apagada, para não quebrar o histórico de vendas.</p>
+      <p className="mb-3 text-xs text-slate-500">Mesa com conta aberta não pode ser desativada. Mesa nunca é apagada, para não quebrar o histórico de vendas.</p>
       {areas.map((area) => (
         <div key={area} className="mb-4">
-          <div className="mb-1 text-xs font-bold uppercase tracking-wide text-slate-400">{area}</div>
+          <div className="mb-1 text-xs font-bold uppercase tracking-wide text-slate-500">{area}</div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
             {tables
               .filter((t) => t.area === area)
@@ -32,8 +32,8 @@ export function TablesAdmin() {
               .map((t) => (
                 <button key={t.id} onClick={() => setEditing(t)} className={`rounded-xl bg-base p-3 text-left ${t.active ? '' : 'opacity-50'}`}>
                   <div className="flex items-center justify-between font-bold">{t.label}<Pencil className="h-3 w-3 text-slate-500" /></div>
-                  <div className="text-xs text-slate-400">nº {t.number} · {t.capacity} lugares</div>
-                  {!t.active && <Badge className="mt-1 bg-slate-600 text-white">desativada</Badge>}
+                  <div className="text-xs text-slate-500">nº {t.number} · {t.capacity} lugares</div>
+                  {!t.active && <Badge className="mt-1 bg-neutral-500 text-white">desativada</Badge>}
                   {t.status !== 'FREE' && <Badge className="mt-1 bg-ouro text-slate-950">em uso</Badge>}
                 </button>
               ))}
@@ -94,13 +94,13 @@ export function StaffAdmin() {
   const sorted = [...staff].sort((a, b) => Number(b.active) - Number(a.active) || order.indexOf(a.role) - order.indexOf(b.role) || a.name.localeCompare(b.name, 'pt-BR'));
   return (
     <Panel title={`Equipe (${staff.filter((u) => u.active).length} ativos)`} action={<Btn variant="gold" onClick={() => setEditing('new')}><Plus className="h-4 w-4" /> Nova pessoa</Btn>}>
-      <p className="mb-3 text-xs text-slate-400">Trocar o PIN de outra pessoa, mudar perfil ou desativar pede PIN de gerente e motivo, e vai para a auditoria. O PIN nunca aparece na tela nem no log.</p>
-      <div className="divide-y divide-slate-700 rounded-xl bg-base">
+      <p className="mb-3 text-xs text-slate-500">Trocar o PIN de outra pessoa, mudar perfil ou desativar pede PIN de gerente e motivo, e vai para a auditoria. O PIN nunca aparece na tela nem no log.</p>
+      <div className="divide-y divide-slate-200 rounded-xl bg-base">
         {sorted.map((u) => (
           <div key={u.id} className={`flex items-center gap-3 p-3 ${u.active ? '' : 'opacity-50'}`}>
             <div className="flex-1">
-              <div className="font-bold">{u.name}{u.id === me?.id && <span className="ml-2 text-xs text-ouro">(você)</span>}</div>
-              <div className="text-xs text-slate-400">{ROLE_LABEL[u.role]}{!u.active && ' · desativado'}</div>
+              <div className="font-bold">{u.name}{u.id === me?.id && <span className="ml-2 text-xs text-brasa">(você)</span>}</div>
+              <div className="text-xs text-slate-500">{ROLE_LABEL[u.role]}{!u.active && ' · desativado'}</div>
             </div>
             <Btn variant="ghost" aria-label={`Editar ${u.name}`} onClick={() => setEditing(u)}><Pencil className="h-4 w-4" /></Btn>
           </div>

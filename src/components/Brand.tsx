@@ -28,11 +28,11 @@ export function BrandLogo({ variant = 'light', className = 'h-12 w-auto' }: { va
 export function ReportHeader({ title, subtitle }: { title: string; subtitle?: string }) {
   const now = new Date().toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   return (
-    <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-700 bg-surface px-4 py-3">
-      <BrandLogo variant="dark" className="h-12 w-auto sm:h-14" />
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-surface px-4 py-3">
+      <BrandLogo className="h-12 w-auto sm:h-14" />
       <div className="text-right leading-tight">
         <div className="text-lg font-black">{title}</div>
-        {subtitle && <div className="text-sm text-slate-400">{subtitle}</div>}
+        {subtitle && <div className="text-sm text-slate-500">{subtitle}</div>}
         <div className="text-xs text-slate-500">{now}</div>
       </div>
     </div>

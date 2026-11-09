@@ -45,25 +45,25 @@ export function OrderScreen({ orderId, onBack, onCheckout }: { orderId: string; 
 
   return (
     <div className="mx-auto flex min-h-full max-w-5xl flex-col">
-      <div className="sticky top-[56px] z-20 border-b border-slate-800 bg-base/95 px-3 py-2 backdrop-blur">
+      <div className="sticky top-[56px] z-20 border-b border-slate-200 bg-base/95 px-3 py-2 backdrop-blur">
         <div className="flex items-center gap-2">
-          <button aria-label="Voltar" onClick={onBack} className="grid h-12 w-12 place-items-center rounded-xl bg-surface active:bg-slate-700">
+          <button aria-label="Voltar" onClick={onBack} className="grid h-12 w-12 place-items-center rounded-xl bg-surface active:bg-slate-200">
             <ArrowLeft className="h-6 w-6" />
           </button>
           <div className="min-w-0 flex-1">
             <div className="truncate text-xl font-black">{table.label}</div>
-            <div className="text-xs text-slate-400">
+            <div className="text-xs text-slate-500">
               {table.area} · {order.customer_count} pessoa(s) · {closed ? 'Encerrada' : table.status === 'WAITING_BILL' ? 'Pediu a conta' : table.status === 'PAYING' ? 'Em pagamento' : 'Aberta'}
             </div>
           </div>
           <div className="text-right">
-            <div className="text-xs text-slate-400">{order.paid_amount > 0 ? 'Saldo' : 'Total'}</div>
-            <div className="text-xl font-black tabular-nums text-ouro">{formatBRL(order.paid_amount > 0 ? order.remaining_balance : order.total_amount)}</div>
+            <div className="text-xs text-slate-500">{order.paid_amount > 0 ? 'Saldo' : 'Total'}</div>
+            <div className="text-xl font-black tabular-nums text-brasa">{formatBRL(order.paid_amount > 0 ? order.remaining_balance : order.total_amount)}</div>
           </div>
         </div>
         <div className="mt-2 grid grid-cols-2 gap-2">
-          <button onClick={() => setTab('menu')} disabled={closed} className={`min-h-touch rounded-xl font-bold disabled:opacity-40 ${tab === 'menu' ? 'bg-brasa text-white' : 'bg-surface text-slate-300'}`}>Lançar</button>
-          <button onClick={() => setTab('statement')} className={`min-h-touch rounded-xl font-bold ${tab === 'statement' || closed ? 'bg-brasa text-white' : 'bg-surface text-slate-300'}`}>Extrato da mesa</button>
+          <button onClick={() => setTab('menu')} disabled={closed} className={`min-h-touch rounded-xl font-bold disabled:opacity-40 ${tab === 'menu' ? 'bg-brasa text-white' : 'bg-surface text-slate-700'}`}>Lançar</button>
+          <button onClick={() => setTab('statement')} className={`min-h-touch rounded-xl font-bold ${tab === 'statement' || closed ? 'bg-brasa text-white' : 'bg-surface text-slate-700'}`}>Extrato da mesa</button>
         </div>
       </div>
 
@@ -129,7 +129,7 @@ function MenuPanel({ orderId }: { orderId: string }) {
           onKeyDown={(e) => e.key === 'Enter' && submitCode()}
           inputMode="search"
           placeholder="Código rápido (ex.: 101) ou nome…"
-          className="min-h-touch-lg w-full rounded-xl border border-slate-700 bg-surface pl-11 pr-3 text-lg outline-none focus:border-ouro"
+          className="min-h-touch-lg w-full rounded-xl border border-slate-200 bg-surface pl-11 pr-3 text-lg outline-none focus:border-ouro"
         />
       </div>
       {hasWeighable && (
@@ -143,7 +143,7 @@ function MenuPanel({ orderId }: { orderId: string }) {
             <button
               key={c.id}
               onClick={() => setCat(c.id)}
-              className={`flex min-h-touch shrink-0 items-center gap-2 rounded-full px-4 font-semibold ${cat === c.id ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}
+              className={`flex min-h-touch shrink-0 items-center gap-2 rounded-full px-4 font-semibold ${cat === c.id ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}
             >
               <CategoryIcon name={c.icon_name} className="h-4 w-4" /> {c.name}
             </button>
@@ -152,23 +152,23 @@ function MenuPanel({ orderId }: { orderId: string }) {
       )}
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
         {list.map((p) => (
-          <div key={p.id} className={`flex items-stretch overflow-hidden rounded-xl border border-slate-700 bg-surface ${!p.available ? 'opacity-40' : ''}`}>
-            <button onClick={() => tapProduct(p)} className="flex min-h-[64px] flex-1 items-center gap-3 px-3 text-left active:bg-slate-700">
-              <span className="rounded bg-base px-2 py-1 font-mono text-sm font-bold text-ouro">{p.code}</span>
+          <div key={p.id} className={`flex items-stretch overflow-hidden rounded-xl border border-slate-200 bg-surface ${!p.available ? 'opacity-40' : ''}`}>
+            <button onClick={() => tapProduct(p)} className="flex min-h-[64px] flex-1 items-center gap-3 px-3 text-left active:bg-slate-200">
+              <span className="rounded bg-base px-2 py-1 font-mono text-sm font-bold text-brasa">{p.code}</span>
               <span className="min-w-0 flex-1">
                 <span className="block truncate font-semibold">{p.name}</span>
-                <span className="flex flex-wrap gap-1 text-xs text-slate-400">
+                <span className="flex flex-wrap gap-1 text-xs text-slate-500">
                   {SECTOR_LABEL[p.sector]}
-                  {p.requires_meat_doneness && <Badge className="bg-rose-900/60 text-rose-200">Ponto</Badge>}
-                  {p.allows_half_and_half && <Badge className="bg-amber-900/60 text-amber-200">½ a ½</Badge>}
-                  {p.sold_by_weight && <Badge className="bg-emerald-900/60 text-emerald-200">por kg</Badge>}
-                  {!p.available && <Badge className="bg-slate-700">Em falta</Badge>}
+                  {p.requires_meat_doneness && <Badge className="bg-rose-50 text-rose-700">Ponto</Badge>}
+                  {p.allows_half_and_half && <Badge className="bg-amber-50 text-amber-700">½ a ½</Badge>}
+                  {p.sold_by_weight && <Badge className="bg-emerald-50 text-emerald-700">por kg</Badge>}
+                  {!p.available && <Badge className="bg-slate-200">Em falta</Badge>}
                 </span>
               </span>
               <span className="font-bold tabular-nums">{formatBRL(priceOf(p))}{p.sold_by_weight ? '/kg' : ''}</span>
             </button>
             {!needsSheet(p) && !p.sold_by_weight && p.available && (
-              <button aria-label="Opções" onClick={() => tapProduct(p, true)} className="grid w-12 place-items-center border-l border-slate-700 text-slate-400 active:bg-slate-700">
+              <button aria-label="Opções" onClick={() => tapProduct(p, true)} className="grid w-12 place-items-center border-l border-slate-200 text-slate-500 active:bg-slate-200">
                 <SlidersHorizontal className="h-5 w-5" />
               </button>
             )}
@@ -211,10 +211,10 @@ function DispatchTray({ orderId }: { orderId: string }) {
   };
 
   return (
-    <div className="fixed inset-x-0 bottom-0 z-30 mx-auto max-w-5xl border-t-2 border-ouro bg-surface shadow-2xl shadow-black">
+    <div className="fixed inset-x-0 bottom-0 z-30 mx-auto max-w-5xl border-t-2 border-ouro bg-surface shadow-2xl shadow-slate-300">
       <button onClick={() => setExpanded((e) => !e)} className="flex w-full items-center justify-between px-4 py-2 text-left">
         <span className="font-bold">Bandeja de despacho · {count} item(ns)</span>
-        <span className="flex items-center gap-2 font-bold text-ouro">{formatBRL(total)} {expanded ? <ChevronDown className="h-5 w-5" /> : <ChevronUp className="h-5 w-5" />}</span>
+        <span className="flex items-center gap-2 font-bold text-brasa">{formatBRL(total)} {expanded ? <ChevronDown className="h-5 w-5" /> : <ChevronUp className="h-5 w-5" />}</span>
       </button>
       {expanded && (
         <ul className="scroll-thin max-h-[45vh] space-y-2 overflow-y-auto px-3 pb-2">
@@ -226,19 +226,19 @@ function DispatchTray({ orderId }: { orderId: string }) {
               <li key={t.tray_id} className="flex items-center gap-2 rounded-xl bg-base p-2">
                 <div className="min-w-0 flex-1">
                   <div className="truncate font-semibold">{p?.name}</div>
-                  {extras.length > 0 && <div className="truncate text-xs text-sky-300">{extras.join(' · ')}</div>}
-                  <div className="text-xs text-slate-400">{SECTOR_LABEL[t.sector]} · {formatBRL(computeItemTotal(t.quantity, t.unit_price, t.modifiers_unit_price))}</div>
+                  {extras.length > 0 && <div className="truncate text-xs text-sky-600">{extras.join(' · ')}</div>}
+                  <div className="text-xs text-slate-500">{SECTOR_LABEL[t.sector]} · {formatBRL(computeItemTotal(t.quantity, t.unit_price, t.modifiers_unit_price))}</div>
                 </div>
                 {t.weight ? (
-                  <span className="rounded-lg bg-emerald-900/60 px-2 py-1 text-sm font-bold tabular-nums text-emerald-200">⚖️ {formatQty(t.quantity, 'KG')}{t.weight.source === 'MANUAL' ? ' · digitado' : ''}</span>
+                  <span className="rounded-lg bg-emerald-50 px-2 py-1 text-sm font-bold tabular-nums text-emerald-700">⚖️ {formatQty(t.quantity, 'KG')}{t.weight.source === 'MANUAL' ? ' · digitado' : ''}</span>
                 ) : (
                   <>
-                    <button aria-label="Menos" onClick={() => updateQty(t.tray_id, t.quantity - 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700"><Minus className="h-5 w-5" /></button>
+                    <button aria-label="Menos" onClick={() => updateQty(t.tray_id, t.quantity - 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-200"><Minus className="h-5 w-5" /></button>
                     <span className="w-6 text-center font-bold">{t.quantity}</span>
-                    <button aria-label="Mais" onClick={() => updateQty(t.tray_id, t.quantity + 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700"><Plus className="h-5 w-5" /></button>
+                    <button aria-label="Mais" onClick={() => updateQty(t.tray_id, t.quantity + 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-200"><Plus className="h-5 w-5" /></button>
                   </>
                 )}
-                <button aria-label="Remover" onClick={() => remove(t.tray_id)} className="grid h-11 w-11 place-items-center rounded-lg text-rose-300"><Trash2 className="h-5 w-5" /></button>
+                <button aria-label="Remover" onClick={() => remove(t.tray_id)} className="grid h-11 w-11 place-items-center rounded-lg text-rose-600"><Trash2 className="h-5 w-5" /></button>
               </li>
             );
           })}

@@ -27,7 +27,7 @@ function nextLabel(status: ItemStatus, pickup: boolean): string | undefined {
 }
 const NEXT_STYLE: Partial<Record<ItemStatus, string>> = {
   PENDING: 'bg-sky-600 text-white',
-  PREPARING: 'bg-stone text-slate-950',
+  PREPARING: 'bg-stone text-white',
   READY: 'bg-slate-200 text-slate-950',
 };
 
@@ -35,7 +35,7 @@ const NEXT_STYLE: Partial<Record<ItemStatus, string>> = {
 export function slaClass(minutes: number): { card: string; timer: string; label: string } {
   if (minutes >= 20) return { card: 'animate-sla-late border-brasa', timer: 'bg-brasa text-white', label: 'Atrasado' };
   if (minutes >= 10) return { card: 'border-ouro bg-ouro/10', timer: 'bg-ouro text-slate-950', label: 'Atenção' };
-  return { card: 'border-stone bg-stone/10', timer: 'bg-stone text-slate-950', label: 'No prazo' };
+  return { card: 'border-stone bg-stone/10', timer: 'bg-stone text-white', label: 'No prazo' };
 }
 
 function matchFilter(sector: ProductionSector, f: Filter): boolean {
@@ -161,13 +161,13 @@ export function KdsScreen() {
     <div className="px-3 pb-10 pt-3">
       <div className="scroll-thin -mx-3 mb-3 flex gap-2 overflow-x-auto px-3">
         {FILTERS.map((f) => (
-          <button key={f.key} onClick={() => setFilter(f.key)} className={`flex min-h-touch-lg shrink-0 items-center gap-2 rounded-xl px-5 text-lg font-bold ${filter === f.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}>
-            {f.label} <span className="rounded-full bg-black/30 px-2 text-sm">{counts[f.key]}</span>
+          <button key={f.key} onClick={() => setFilter(f.key)} className={`flex min-h-touch-lg shrink-0 items-center gap-2 rounded-xl px-5 text-lg font-bold ${filter === f.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}>
+            {f.label} <span className="rounded-full bg-black/10 px-2 text-sm">{counts[f.key]}</span>
           </button>
         ))}
         {canSoldOut && (
-          <button onClick={() => setSoldOutOpen(true)} className="ml-auto flex min-h-touch-lg shrink-0 items-center gap-2 rounded-xl bg-surface px-5 text-lg font-bold text-rose-300">
-            <Ban className="h-5 w-5" /> Esgotados <span className="rounded-full bg-black/30 px-2 text-sm">{soldOutCount}</span>
+          <button onClick={() => setSoldOutOpen(true)} className="ml-auto flex min-h-touch-lg shrink-0 items-center gap-2 rounded-xl bg-surface px-5 text-lg font-bold text-rose-600">
+            <Ban className="h-5 w-5" /> Esgotados <span className="rounded-full bg-black/10 px-2 text-sm">{soldOutCount}</span>
           </button>
         )}
       </div>
@@ -185,7 +185,7 @@ export function KdsScreen() {
           const ref = waiting.length ? waiting.reduce((a, b) => (a.created_at < b.created_at ? a : b)).created_at : t.oldest;
           const seconds = Math.max(0, Math.floor((now - new Date(ref).getTime()) / 1000));
           const minutes = Math.floor(seconds / 60);
-          const sla = waiting.length ? slaClass(minutes) : { card: 'border-slate-500 bg-slate-800', timer: 'bg-slate-500 text-white', label: 'Pronto' };
+          const sla = waiting.length ? slaClass(minutes) : { card: 'border-slate-300 bg-slate-100', timer: 'bg-neutral-500 text-white', label: 'Pronto' };
           const lowest: ItemStatus = t.items.some((i) => i.status === 'PENDING') ? 'PENDING' : t.items.some((i) => i.status === 'PREPARING') ? 'PREPARING' : 'READY';
           const lowestIds = t.items.filter((i) => i.status === lowest).map((i) => i.id);
           return (
@@ -193,14 +193,14 @@ export function KdsScreen() {
               <header className="mb-2 flex items-start justify-between gap-2">
                 {t.pickup ? (
                   <div>
-                    <div className="text-xs font-bold uppercase text-ouro">Senha</div>
+                    <div className="text-xs font-bold uppercase text-brasa">Senha</div>
                     <div className="text-4xl font-black leading-none tabular-nums">{t.pickup.number}</div>
-                    <div className="text-sm text-slate-300">{[t.pickup.fulfillment, t.pickup.name].filter(Boolean).join(' · ')}</div>
+                    <div className="text-sm text-slate-700">{[t.pickup.fulfillment, t.pickup.name].filter(Boolean).join(' · ')}</div>
                   </div>
                 ) : (
                   <div>
                     <div className="text-4xl font-black leading-none">{t.tableNumber}</div>
-                    <div className="text-sm text-slate-300">{t.tableLabel}</div>
+                    <div className="text-sm text-slate-700">{t.tableLabel}</div>
                   </div>
                 )}
                 <div className="text-right">
@@ -220,18 +220,18 @@ export function KdsScreen() {
                 ) : (
                   <span className="font-semibold">Garçom: {t.fromQr ? '-' : t.waiterName}</span>
                 )}
-                <span className="text-slate-400">{new Date(t.oldest).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</span>
+                <span className="text-slate-500">{new Date(t.oldest).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</span>
               </div>
               <ul className="mb-3 flex-1 space-y-2">
                 {t.items.map((i) => {
                   const p = products.find((x) => x.id === i.product_id);
                   return (
-                    <li key={i.id} className={`rounded-xl bg-black/40 p-2 ${i.status === 'READY' ? 'opacity-60' : ''}`}>
+                    <li key={i.id} className={`rounded-xl bg-white/80 p-2 shadow-sm ${i.status === 'READY' ? 'opacity-60' : ''}`}>
                       <div className="flex items-start justify-between gap-2">
                         <div className="text-xl font-black leading-tight">
-                          <span className="text-ouro">{i.quantity}x</span> {p?.name}
+                          <span className="text-brasa">{i.quantity}x</span> {p?.name}
                         </div>
-                        <Badge className={i.status === 'PENDING' ? 'bg-slate-600' : i.status === 'PREPARING' ? 'bg-ouro text-slate-950' : 'bg-stone text-slate-950'}>
+                        <Badge className={i.status === 'PENDING' ? 'bg-slate-300' : i.status === 'PREPARING' ? 'bg-ouro text-slate-950' : 'bg-stone text-white'}>
                           {i.status === 'PENDING' ? 'Fila' : i.status === 'PREPARING' ? 'Preparo' : 'Pronto'}
                         </Badge>
                       </div>
@@ -275,8 +275,8 @@ function SoldOutSheet({ filter, onClose }: { filter: Filter; onClose: () => void
     .sort((a, b) => Number(a.available) - Number(b.available) || a.name.localeCompare(b.name, 'pt-BR'));
   return (
     <Sheet open onClose={onClose} title="Marcar esgotado">
-      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar produto" className="mb-3 min-h-touch w-full rounded-xl border border-slate-600 bg-base px-3 text-[1rem] text-slate-100 outline-none focus:border-ouro" />
-      <div className="divide-y divide-slate-700 rounded-xl bg-base">
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar produto" className="mb-3 min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 text-[1rem] text-slate-900 outline-none focus:border-ouro" />
+      <div className="divide-y divide-slate-200 rounded-xl bg-base">
         {list.map((p) => (
           <div key={p.id} className="flex items-center gap-3 p-3">
             <div className="flex-1 font-bold">{p.name}{!p.available && <Badge className="ml-2 bg-brasa text-white">esgotado</Badge>}</div>
