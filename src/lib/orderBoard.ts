@@ -47,7 +47,13 @@ export function deliveryBoardEntries(records: readonly DeliveryOrderRecord[]): B
 
 // Pedidos feitos pelo cliente no QR da mesa: "Preparando" enquanto algum item ainda está na cozinha,
 // "Pronto" quando todos os itens pendentes ficaram prontos e ainda não foram levados à mesa.
-export function qrBoardEntries(items: readonly OrderItem[], tables: readonly DiningTable[]): BoardEntry[] {
+// A mesa vem do próprio pedido (order.table_id): quem paga pelo QR antes da comida ficar pronta libera a mesa
+// (current_order_id vira null), mas o pedido continua na produção e precisa seguir com o número da mesa.
+export function qrBoardEntries(
+  items: readonly OrderItem[],
+  tables: readonly DiningTable[],
+  orders: readonly Order[],
+): BoardEntry[] {
   const byOrder = new Map<string, OrderItem[]>();
   for (const item of items) {
     if (item.origin !== 'QRCODE_TABLE' || item.status === 'CANCELED' || item.status === 'DELIVERED' || item.sector === 'NONE') continue;
@@ -57,7 +63,10 @@ export function qrBoardEntries(items: readonly OrderItem[], tables: readonly Din
   }
   const entries: BoardEntry[] = [];
   for (const [orderId, list] of byOrder) {
-    const table = tables.find((candidate) => candidate.current_order_id === orderId);
+    const tableId = orders.find((order) => order.id === orderId)?.table_id;
+    const table = tableId
+      ? tables.find((candidate) => candidate.id === tableId)
+      : tables.find((candidate) => candidate.current_order_id === orderId);
     const allReady = list.every((item) => item.status === 'READY');
     const since = allReady
       ? list.reduce((latest, item) => ((item.prepared_at ?? '') > latest ? item.prepared_at ?? '' : latest), '')

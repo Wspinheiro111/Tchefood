@@ -45,7 +45,7 @@ export function OrderBoardScreen() {
   const firstRender = useRef(true);
 
   const { preparing, ready } = useMemo(
-    () => buildBoard([...deliveryBoardEntries(orders), ...qrBoardEntries(orderItems, tables), ...pickupBoardEntries(allOrders, orderItems, tables)]),
+    () => buildBoard([...deliveryBoardEntries(orders), ...qrBoardEntries(orderItems, tables, allOrders), ...pickupBoardEntries(allOrders, orderItems, tables)]),
     [orders, orderItems, tables, allOrders],
   );
 
