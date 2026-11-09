@@ -79,7 +79,8 @@ export function KdsScreen() {
     const map = new Map<string, Ticket>();
     for (const i of active) {
       const order = orders.find((o) => o.id === i.order_id);
-      if (!order || order.status === 'CLOSED' || order.status === 'CANCELED') continue;
+      // Conta paga não tira o item da produção: só o status do item decide.
+      if (!order || order.status === 'CANCELED') continue;
       // Um ticket por comanda + lote de origem (QR Code separado do garçom)
       const fromQr = i.origin === 'QRCODE_TABLE';
       const key = `${i.order_id}:${fromQr ? 'qr' : i.waiter_id}`;

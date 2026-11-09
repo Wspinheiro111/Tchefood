@@ -207,14 +207,27 @@ export function printTestPage(printer: PrinterConfig): RenderedTicket {
 // ---------------------------------------------------------------------------
 // Fila do simulador visual 80mm vs 58mm
 // ---------------------------------------------------------------------------
+/** Reenvia o mesmo ESC/POS para a impressora (ex.: impressora estava desligada). */
+export function resendTicket(ticket: RenderedTicket): RenderedTicket {
+  return { ...ticket, delivery: sendNative(ticket.printer, ticket.base64) };
+}
+
 interface PrintPreviewState {
   tickets: RenderedTicket[];
   show: (t: RenderedTicket[]) => void;
+  retry: (index: number) => RenderedTicket | null;
   clear: () => void;
 }
 
-export const usePrintPreview = create<PrintPreviewState>((set) => ({
+export const usePrintPreview = create<PrintPreviewState>((set, get) => ({
   tickets: [],
   show: (tickets) => set({ tickets }),
+  retry: (index) => {
+    const t = get().tickets[index];
+    if (!t) return null;
+    const again = resendTicket(t);
+    set((s) => ({ tickets: s.tickets.map((x, i) => (i === index ? again : x)) }));
+    return again;
+  },
   clear: () => set({ tickets: [] }),
 }));
