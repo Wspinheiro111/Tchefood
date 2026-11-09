@@ -9,6 +9,7 @@
  * Só roda com TCHEFOOD_PG=host:porta:usuario (ex.: /var/tmp/tfpg:5499:postgres).
  * Sem a variável, é pulado.
  */
+import { spawn } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -359,6 +360,23 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     // O aparelho não escolhe a ordem de gravação.
     const seq = await raw('POST', 'audit_logs', { tenant_id: TENANT, order_id: order.id, performed_by_user_id: st().currentUserId!, action_type: 'SERVICE_FEE_RESTORED', reason: 'x', server_seq: 1 });
     expect(seq.status).toBe(400);
+  });
+
+  it('alterações de equipe da mesma loja esperam uma pela outra (regra do último proprietário)', async () => {
+    vi.useRealTimers();
+    // Outra transação segurando a loja: tchefood_save_staff tem de esperar por ela.
+    const holder = spawn('psql', ['-h', target!.host, '-p', target!.port, '-U', target!.user, '-d', DB, '-X', '-q', '-v', 'ON_ERROR_STOP=1'], { stdio: ['pipe', 'ignore', 'ignore'] });
+    const done = new Promise((r) => holder.on('exit', r));
+    holder.stdin.end(`BEGIN; SELECT 1 FROM tenants WHERE id = '${TENANT}' FOR UPDATE; SELECT pg_sleep(1.5); COMMIT;`);
+    await new Promise((r) => setTimeout(r, 400));
+    const started = Date.now();
+    const res = await raw('POST', 'rpc/tchefood_save_staff', {
+      p_staff_id: crypto.randomUUID(), p_name: 'Espera', p_role: 'WAITER', p_pin: '3719', p_active: true,
+      p_actor_id: crypto.randomUUID(), p_actor_pin: '0000',
+    });
+    expect(res.body).toMatch(/operador inválido/);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(800);
+    await done;
   });
 
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {

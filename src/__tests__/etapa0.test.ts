@@ -291,6 +291,20 @@ describe('equipe no store', () => {
     expect(st().outbox[st().outbox.length - 1]!.staff_auth).toEqual({ actor_id: me.id, actor_pin: MANAGER, manager_pin: null, reason: null });
   });
 
+  it('salvar de novo substitui o evento de equipe antigo, sem PIN, que a nuvem recusou', () => {
+    login(MANAGER);
+    const me = staffByPin(MANAGER);
+    const legacy: SyncEvent = { id: 'legado', table: 'staff_users', op: 'UPDATE', row_id: me.id, payload: { ...me }, created_at: '2026-11-01T12:00:00.000Z' };
+    const queued: SyncEvent = { ...legacy, id: 'legado-na-fila' };
+    const other: SyncEvent = { ...legacy, id: 'outra-pessoa', row_id: 'outra', payload: { id: 'outra' } };
+    useTcheStore.setState({ outbox: [queued, other], syncRejected: [{ event: legacy, status: 400, message: 'Refaça', rejected_at: legacy.created_at }] });
+    expect(st().saveStaff({ id: me.id, name: me.name, role: me.role, pin_code: '4826', active: true }).ok).toBe(true);
+    expect(st().syncRejected).toEqual([]);
+    expect(st().outbox.map((e) => e.id).slice(0, 1)).toEqual(['outra-pessoa']);
+    expect(st().outbox).toHaveLength(2);
+    expect(st().outbox[1]!.staff_auth).toBeDefined();
+  });
+
   it('usuário técnico do QR não é editável', () => {
     login(OWNER);
     const qr = st().staff.find(isQrSelfService)!;

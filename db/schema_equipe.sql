@@ -18,7 +18,8 @@
 --  2. Trocar o PIN de outra pessoa, mudar perfil, desativar ou reativar pede PIN de
 --     gerente ou proprietário e motivo. Trocar só o próprio PIN não pede.
 --  3. Gerente não cadastra nem altera gerente/proprietário; ninguém desativa a si
---     mesmo nem muda o próprio perfil; a loja nunca fica sem proprietário ativo.
+--     mesmo nem muda o próprio perfil; a loja nunca fica sem proprietário ativo
+--     (as alterações de equipe de uma loja são feitas uma de cada vez).
 --  4. PIN novo ou trocado: 4 dígitos, sem sequência nem dígitos repetidos, único na loja.
 --     O PIN nunca vai para o audit_log. A unicidade só é conferida depois de todas
 --     as regras de perfil e do PIN de gerente, e uma colisão conta no bloqueio
@@ -149,6 +150,10 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_EQUIPE: cadastro incompleto.';
     END IF;
 
+    -- Uma alteração de equipe por vez na loja: sem isso, dois aparelhos rebaixando
+    -- cada um um proprietário diferente passariam juntos pela regra do último
+    -- proprietário ativo (cada um trava só a própria linha e vê o outro ativo).
+    PERFORM 1 FROM tenants WHERE id = v_tenant FOR UPDATE;
     SELECT * INTO v_existing FROM staff_users WHERE id = p_staff_id FOR UPDATE;
     v_is_new := NOT FOUND;
     IF NOT v_is_new AND v_existing.tenant_id <> v_tenant THEN

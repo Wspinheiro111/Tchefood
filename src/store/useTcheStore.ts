@@ -530,6 +530,24 @@ function syncEvent(table: SyncEvent['table'], op: SyncEvent['op'], row: { id: UU
   };
 }
 
+/**
+ * Evento de equipe/permissão gravado antes da versão com staff_auth: o servidor
+ * recusa (não há PIN para conferir) e o reenvio igual nunca passaria. Quando a
+ * mesma pessoa/permissão é salva de novo, o evento novo leva o estado completo
+ * do registro, então o antigo é descartado da fila e dos recusados. Sem isso o
+ * recusado antigo seguraria o novo para sempre (mesmo registro).
+ */
+function isLegacyStaffEvent(e: SyncEvent, replacement: SyncEvent): boolean {
+  return e.table === replacement.table && e.row_id === replacement.row_id && !e.staff_auth && !e.store_start;
+}
+
+function withSupersededLegacy(s: TcheState, event: SyncEvent): Pick<TcheState, 'outbox' | 'syncRejected'> {
+  return {
+    outbox: [...s.outbox.filter((e) => !isLegacyStaffEvent(e, event)), event],
+    syncRejected: (s.syncRejected ?? []).filter((r) => !isLegacyStaffEvent(r.event, event)),
+  };
+}
+
 /** Mesa mudada pelo pagamento ou fechamento de uma comanda: o envio dela depende daquela comanda. */
 function tableEventForOrder(table: DiningTable, orderId: UUID): SyncEvent {
   return { ...syncEvent('dining_tables', 'UPDATE', table), depends_on_order_id: orderId };
@@ -2772,7 +2790,7 @@ export const useTcheStore = create<TcheState>()(
           set((s) => ({
             staff: existing ? s.staff.map((u) => (u.id === row.id ? row : u)) : [...s.staff, row],
             auditLogs: [...logs, ...s.auditLogs],
-            outbox: [...s.outbox, staffEvent],
+            ...withSupersededLegacy(s, staffEvent),
           }));
           return { ok: true, data: row };
         },
@@ -2802,7 +2820,7 @@ export const useTcheStore = create<TcheState>()(
           set((s) => ({
             rolePermissions: [...s.rolePermissions.filter((r) => !(r.role === role && r.permission === permission)), row],
             auditLogs: [log, ...s.auditLogs],
-            outbox: [...s.outbox, event],
+            ...withSupersededLegacy(s, event),
           }));
           return { ok: true, data: row };
         },
