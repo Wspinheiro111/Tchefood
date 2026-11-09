@@ -347,7 +347,9 @@ export class PagBankPlugPagDriver implements IPaymentTerminalDriver {
 
   async charge(req: ChargeRequest): Promise<TerminalResult> {
     const bridge = this.bridge();
-    if (bridge?.doPayment) {
+    // A ponte PlugPag cobra no próprio aparelho: só vale no modo SmartPOS embarcado.
+    // Em TEF POS Sem Fio a cobrança vai para a maquininha escolhida (simulada sem credenciais).
+    if (this.mode === 'SMARTPOS_EMBEDDED' && bridge?.doPayment) {
       // PlugPagPaymentData: type 1=crédito 2=débito 5=pix; amount em centavos.
       const type = req.method === 'CREDIT' ? 1 : req.method === 'DEBIT' ? 2 : 5;
       const raw = bridge.doPayment(

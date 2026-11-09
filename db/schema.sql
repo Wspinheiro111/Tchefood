@@ -471,3 +471,99 @@ BEGIN
         ALTER PUBLICATION supabase_realtime ADD TABLE order_items, dining_tables, orders;
     END IF;
 END $$;
+
+-- -----------------------------------------------------------------------------
+-- AUTORIZAÇÃO DE GERENTE VALIDADA NO SERVIDOR
+-- O cliente nunca grava a "prova" da autorização: o audit_log com gerente só
+-- nasce dentro de tchefood_authorize_manager(), que confere o PIN no banco.
+-- Fluxo de sincronização: chame a RPC primeiro e depois faça o UPDATE do item
+-- ou da conta na mesma transação/janela de 5 minutos exigida pelos gatilhos.
+-- -----------------------------------------------------------------------------
+
+-- Papéis de cliente do Supabase (anon/authenticated) não podem inserir
+-- audit_log com authorized_by_manager_id: só a função SECURITY DEFINER pode.
+CREATE OR REPLACE FUNCTION tchefood_guard_audit_insert()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.authorized_by_manager_id IS NOT NULL AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: autorização de gerente só pode ser registrada por tchefood_authorize_manager().';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_audit_logs_guard BEFORE INSERT ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION tchefood_guard_audit_insert();
+
+-- Confere o PIN do gerente do próprio tenant, com bloqueio após 3 erros em 60s,
+-- e grava o audit_log autorizado. Retorna o id do audit_log, ou NULL se o PIN falhar
+-- (a falha também vira audit_log MANAGER_PIN_FAILED / MANAGER_PIN_LOCKOUT).
+CREATE OR REPLACE FUNCTION tchefood_authorize_manager(
+    p_order_id UUID,
+    p_action_type VARCHAR,
+    p_manager_pin VARCHAR,
+    p_performed_by UUID,
+    p_reason TEXT,
+    p_amount_impact NUMERIC DEFAULT 0,
+    p_metadata JSONB DEFAULT '{}'::jsonb
+) RETURNS UUID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_manager staff_users%ROWTYPE;
+    v_failures INT;
+    v_id UUID;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: sessão sem tenant.';
+    END IF;
+    IF p_action_type NOT IN ('ITEM_CANCELED', 'SERVICE_FEE_REMOVED', 'DISCOUNT_APPLIED') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: ação % não exige autorização.', p_action_type;
+    END IF;
+    IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: motivo obrigatório (mínimo 5 caracteres).';
+    END IF;
+    PERFORM 1 FROM orders o WHERE o.id = p_order_id AND o.tenant_id = v_tenant;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: conta não pertence ao tenant.';
+    END IF;
+    PERFORM 1 FROM staff_users u WHERE u.id = p_performed_by AND u.tenant_id = v_tenant AND u.active;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: operador inválido.';
+    END IF;
+
+    SELECT count(*) INTO v_failures FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.action_type = 'MANAGER_PIN_FAILED'
+       AND a.created_at >= NOW() - INTERVAL '60 seconds';
+    IF v_failures >= 3 THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES (v_tenant, p_order_id, p_performed_by, 'MANAGER_PIN_LOCKOUT', 'PIN de gerente bloqueado por excesso de tentativas', jsonb_build_object('attempted_action', p_action_type));
+        RETURN NULL;
+    END IF;
+
+    SELECT * INTO v_manager FROM staff_users m
+     WHERE m.tenant_id = v_tenant AND m.pin_code = p_manager_pin AND m.active AND m.role IN ('MANAGER', 'OWNER');
+    IF NOT FOUND THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES (v_tenant, p_order_id, p_performed_by, 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto', jsonb_build_object('attempted_action', p_action_type));
+        RETURN NULL;
+    END IF;
+
+    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+    VALUES (v_tenant, p_order_id, p_performed_by, v_manager.id, p_action_type, COALESCE(p_amount_impact, 0), trim(p_reason),
+            COALESCE(p_metadata, '{}'::jsonb) || jsonb_build_object('manager_name', v_manager.name, 'server_verified', true))
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END;
+$$;
+
+-- No Supabase: o cliente não lê PINs nem altera cargos. Cadastro de equipe é
+-- feito pela retaguarda com service_role; o app só vê os campos públicos.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE ALL ON staff_users FROM anon, authenticated;
+        GRANT SELECT (id, tenant_id, name, role, active, created_at) ON staff_users TO authenticated;
+        REVOKE ALL ON FUNCTION tchefood_authorize_manager(UUID, VARCHAR, VARCHAR, UUID, TEXT, NUMERIC, JSONB) FROM PUBLIC, anon;
+        GRANT EXECUTE ON FUNCTION tchefood_authorize_manager(UUID, VARCHAR, VARCHAR, UUID, TEXT, NUMERIC, JSONB) TO authenticated;
+    END IF;
+END $$;

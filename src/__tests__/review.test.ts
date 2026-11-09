@@ -106,3 +106,14 @@ describe('conta zerada sem pagamento', () => {
     }
   });
 });
+
+describe('PagBank em TEF POS Sem Fio', () => {
+  it('não usa a ponte PlugPag local quando o modo é sem fio', async () => {
+    const { PagBankPlugPagDriver } = await import('../lib/payments/drivers');
+    let called = false;
+    g.window = { PlugPagBridge: { doPayment: () => { called = true; return JSON.stringify({ result: 0 }); } } };
+    const d = new PagBankPlugPagDriver('TEF_POS_WIRELESS', null);
+    void d.charge({ request_id: 'r', idempotency_key: 'k', amount: 10, method: 'CREDIT', table_label: 'Mesa 1', order_id: 'o', description: 'x' });
+    expect(called).toBe(false);
+  });
+});

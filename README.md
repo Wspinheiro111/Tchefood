@@ -30,6 +30,8 @@ npm run build
 ## Banco de dados
 `db/schema.sql` contém a modelagem do blueprint sem alterações, mais: `product_modifier_groups`, `printers`, recálculo financeiro em PL/pgSQL idêntico a `src/lib/money.ts`, travas anti-fraude (DELETE bloqueado, cancelamento/10%/desconto só com audit_log de gerente, `audit_logs` imutável), fechamento automático e RLS multi-tenant.
 
+**Autorização de gerente no Supabase:** o cliente não grava a prova da autorização. Antes de cancelar item, tirar os 10% ou dar desconto, a sincronização chama a RPC `tchefood_authorize_manager(order_id, action_type, pin, performed_by, reason, ...)`, que confere o PIN no banco (bloqueia após 3 erros em 60s) e grava o `audit_log`. Os papéis `anon`/`authenticated` não leem `pin_code`, não alteram `staff_users` e não conseguem inserir `audit_logs` com gerente. O cadastro de equipe é feito com `service_role`, e o login por PIN no servidor ainda precisa de uma RPC própria.
+
 ## O que ainda é simulado
 - Stone Connect / PlugPag: sem credenciais, as cobranças caem no simulador visual (`MockTerminalDriver`). Com `window.StoneBridge`/`window.PlugPagBridge` presentes, os drivers usam o hardware.
 - NFC-e: payload e DANFE gerados localmente em **homologação**; o envio à Focus NFe precisa de token, certificado e CSC reais.
