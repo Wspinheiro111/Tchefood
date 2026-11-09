@@ -258,6 +258,14 @@ describe('emitNfce', () => {
     expect(r.body.authorized).toBe(true);
   });
 
+  it('lê o protocolo da resposta completa (protocolo_nota_fiscal.numero_protocolo)', async () => {
+    const repo = new MemoryRepo(source());
+    const { protocolo: _omit, ...complete } = AUTHORIZED;
+    const { focus } = fakeFocus([{ status: 201, body: { ...complete, protocolo_nota_fiscal: { numero_protocolo: '143260000000077', chave_nfe: KEY } } }]);
+    const r = await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ authorized: true, protocol: '143260000000077' });
+  });
+
   it('"autorizado" sem protocolo não é autorização', async () => {
     const repo = new MemoryRepo(source());
     const { focus } = fakeFocus([{ status: 201, body: { status: 'autorizado', chave_nfe: KEY } }]);

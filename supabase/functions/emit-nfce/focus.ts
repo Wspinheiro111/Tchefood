@@ -57,11 +57,17 @@ function str(value: unknown, max: number): string | null {
 export function sanitizeFocusResponse(value: unknown): FocusNfceResponse {
   const r = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
   const number = Number(r.numero);
+  // Com completa=1 a Focus devolve o protocolo em protocolo_nota_fiscal.numero_protocolo; o topo
+  // "protocolo" fica como alternativa (mesma regra do sanitizeNfeProviderResponse do Tchê Vendas).
+  const details = r.protocolo_nota_fiscal && typeof r.protocolo_nota_fiscal === 'object' && !Array.isArray(r.protocolo_nota_fiscal)
+    ? (r.protocolo_nota_fiscal as Record<string, unknown>)
+    : null;
+  const nested = str(details?.numero_protocolo, 80);
   return {
     status: str(r.status, 40),
     statusSefaz: str(r.status_sefaz, 12),
     message: str(r.mensagem_sefaz ?? r.mensagem ?? r.message, 1000),
-    protocol: str(r.protocolo, 80),
+    protocol: str(r.protocolo, 80) ?? (nested && /^\d{1,80}$/.test(nested) ? nested : null),
     accessKey: str(r.chave_nfe ?? r.chave_nfce, 60),
     number: Number.isInteger(number) && number > 0 ? number : null,
     series: str(r.serie, 3),
