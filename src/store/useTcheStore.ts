@@ -537,20 +537,24 @@ function syncEvent(table: SyncEvent['table'], op: SyncEvent['op'], row: { id: UU
 }
 
 /**
- * Evento de equipe/permissão gravado antes da versão com staff_auth: o servidor
- * recusa (não há PIN para conferir) e o reenvio igual nunca passaria. Quando a
- * mesma pessoa/permissão é salva de novo, o evento novo leva o estado completo
- * do registro, então o antigo é descartado da fila e dos recusados. Sem isso o
- * recusado antigo seguraria o novo para sempre (mesmo registro).
+ * Salvar de novo a mesma pessoa/permissão substitui o que a nuvem não pode aceitar
+ * daquele registro. O evento novo leva o estado completo da linha, então:
+ *  - qualquer evento RECUSADO do mesmo registro sai dos recusados (o servidor não
+ *    gravou nada dele; ex.: PIN repetido por dois aparelhos, corrigido agora na
+ *    tela Equipe). Sem isso, o recusado seguraria o novo para sempre;
+ *  - na fila, só o evento antigo sem staff_auth (gravado antes desta versão) sai,
+ *    porque o servidor sempre o recusaria. Os outros da fila sobem antes do novo,
+ *    cada um com a sua autorização e o seu audit_log.
+ * O proprietário da loja nova (store_start) nunca é substituído.
  */
-function isLegacyStaffEvent(e: SyncEvent, replacement: SyncEvent): boolean {
-  return e.table === replacement.table && e.row_id === replacement.row_id && !e.staff_auth && !e.store_start;
+function isSameRecord(e: SyncEvent, replacement: SyncEvent): boolean {
+  return e.table === replacement.table && e.row_id === replacement.row_id && !e.store_start;
 }
 
 function withSupersededLegacy(s: TcheState, event: SyncEvent): Pick<TcheState, 'outbox' | 'syncRejected'> {
   return {
-    outbox: [...s.outbox.filter((e) => !isLegacyStaffEvent(e, event)), event],
-    syncRejected: (s.syncRejected ?? []).filter((r) => !isLegacyStaffEvent(r.event, event)),
+    outbox: [...s.outbox.filter((e) => !(isSameRecord(e, event) && !e.staff_auth)), event],
+    syncRejected: (s.syncRejected ?? []).filter((r) => !isSameRecord(r.event, event)),
   };
 }
 

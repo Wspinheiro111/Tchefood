@@ -330,6 +330,27 @@ describe('equipe no store', () => {
     expect(st().outbox[1]!.staff_auth).toBeDefined();
   });
 
+  it('PIN repetido recusado pela nuvem: corrigir na tela Equipe substitui o recusado', () => {
+    login(OWNER);
+    const waiter = staffByPin(WAITER);
+    const auth = { actor_id: staffByPin(OWNER).id, actor_pin: OWNER, manager_pin: null, reason: null };
+    const refused: SyncEvent = { id: 'pin-repetido', table: 'staff_users', op: 'INSERT', row_id: waiter.id, payload: { ...waiter }, created_at: '2026-11-09T12:00:00.000Z', staff_auth: auth };
+    const owner: SyncEvent = { id: 'dono-loja-nova', table: 'staff_users', op: 'INSERT', row_id: 'dono', payload: { id: 'dono' }, created_at: refused.created_at, store_start: { qr_user_id: null, reason: 'Loja nova', metadata: {} } };
+    const pending: SyncEvent = { ...refused, id: 'na-fila-com-pin' };
+    useTcheStore.setState({
+      outbox: [pending],
+      syncRejected: [
+        { event: refused, status: 200, message: 'recusou o PIN novo', rejected_at: refused.created_at },
+        { event: owner, status: 400, message: 'x', rejected_at: refused.created_at },
+      ],
+    });
+    expect(st().saveStaff({ id: waiter.id, name: waiter.name, role: waiter.role, pin_code: '3719', active: true }, { managerPin: MANAGER, reason: 'PIN repetido em outro aparelho' }).ok).toBe(true);
+    expect(st().syncRejected.map((r) => r.event.id)).toEqual(['dono-loja-nova']);
+    // O da fila, já com prova de PIN, continua e sobe antes do novo.
+    expect(st().outbox.map((e) => e.id).slice(0, 1)).toEqual(['na-fila-com-pin']);
+    expect(st().outbox[1]!.payload.pin_code).toBe('3719');
+  });
+
   it('usuário técnico do QR não é editável', () => {
     login(OWNER);
     const qr = st().staff.find(isQrSelfService)!;
