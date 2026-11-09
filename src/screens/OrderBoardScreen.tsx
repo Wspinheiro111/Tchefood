@@ -32,6 +32,7 @@ export function OrderBoardScreen() {
   const orders = useDeliveryOrders((s) => s.orders);
   const orderItems = useTcheStore((s) => s.orderItems);
   const tables = useTcheStore((s) => s.tables);
+  const tableOrders = useTcheStore((s) => s.orders);
   const tenant = useTcheStore((s) => s.tenant);
   const [voice, setVoice] = useState(true);
   const [fullscreen, setFullscreen] = useState(false);
@@ -42,8 +43,8 @@ export function OrderBoardScreen() {
   const firstRender = useRef(true);
 
   const { preparing, ready } = useMemo(
-    () => buildBoard([...deliveryBoardEntries(orders), ...qrBoardEntries(orderItems, tables)]),
-    [orders, orderItems, tables],
+    () => buildBoard([...deliveryBoardEntries(orders), ...qrBoardEntries(orderItems, tables, tableOrders)]),
+    [orders, orderItems, tables, tableOrders],
   );
 
   useEffect(() => {
