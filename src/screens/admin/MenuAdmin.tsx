@@ -10,8 +10,9 @@ import { SECTORS, SECTOR_NAME, WEEKDAY_SHORT, activeSchedule } from '../../lib/c
 import { formatBRL } from '../../lib/money';
 import { Badge, Btn, Sheet, toast } from '../../components/ui';
 import { Field, FormError, Panel, Select, TextInput, Toggle, moneyToInput, parseIntInput, parseMoneyInput } from './fields';
+import { ArAdmin } from './ArAdmin';
 
-type Sub = 'products' | 'categories' | 'modifiers' | 'schedules';
+type Sub = 'products' | 'categories' | 'modifiers' | 'schedules' | 'ar';
 
 export function MenuAdmin() {
   const canManage = useTcheStore((s) => selectCan(s, 'MENU_MANAGE'));
@@ -23,6 +24,7 @@ export function MenuAdmin() {
           { key: 'categories', label: 'Categorias' },
           { key: 'modifiers', label: 'Adicionais' },
           { key: 'schedules', label: 'Preço por horário' },
+          { key: 'ar', label: '3D / Realidade aumentada' },
         ] as const)
       : []),
   ];
@@ -39,6 +41,7 @@ export function MenuAdmin() {
       {sub === 'categories' && canManage && <CategoriesPanel />}
       {sub === 'modifiers' && canManage && <ModifiersPanel />}
       {sub === 'schedules' && canManage && <SchedulesPanel />}
+      {sub === 'ar' && canManage && <ArAdmin />}
     </div>
   );
 }
