@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from 'react';
 import { Beer, CupSoda, Drumstick, Flame, IceCreamCone, Martini, Pizza, Scale, Utensils, UtensilsCrossed, type LucideIcon } from 'lucide-react';
 import { ArrowLeft, ChevronDown, ChevronUp, Minus, Plus, Search, Send, SlidersHorizontal, Trash2 } from 'lucide-react';
+import { useSalePrice } from '../lib/useSalePrice';
 import { useTcheStore } from '../store/useTcheStore';
 import type { Product, ProductionSector } from '../types';
 import { computeItemTotal, formatBRL, formatQty } from '../lib/money';
@@ -76,7 +77,8 @@ function MenuPanel({ orderId }: { orderId: string }) {
   const products = useTcheStore((s) => s.products);
   const links = useTcheStore((s) => s.productModifierGroups);
   const addToTray = useTcheStore((s) => s.addToTray);
-  const [cat, setCat] = useState<string>(categories[0]?.id ?? '');
+  const priceOf = useSalePrice();
+  const [cat, setCat] = useState<string>(categories.find((c) => c.active)?.id ?? '');
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Product | null>(null);
   const [scaleOpen, setScaleOpen] = useState(false);
@@ -85,9 +87,10 @@ function MenuPanel({ orderId }: { orderId: string }) {
 
   const list = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (q) return products.filter((p) => p.code.startsWith(q) || p.name.toLowerCase().includes(q));
-    return products.filter((p) => p.category_id === cat);
-  }, [products, cat, query]);
+    const live = products.filter((p) => p.active && categories.some((c) => c.id === p.category_id && c.active));
+    if (q) return live.filter((p) => p.code.toLowerCase().startsWith(q) || p.name.toLowerCase().includes(q));
+    return live.filter((p) => p.category_id === cat);
+  }, [products, categories, cat, query]);
 
   const needsSheet = (p: Product) => p.requires_meat_doneness || p.allows_half_and_half || links.some((l) => l.product_id === p.id);
 
@@ -103,11 +106,11 @@ function MenuPanel({ orderId }: { orderId: string }) {
     if (!p.available) return toast.error(`${p.name} em falta hoje.`);
     if (p.sold_by_weight) return setScaleOpen(true);
     if (forceSheet || needsSheet(p)) return setSelected(p);
-    add({ product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector });
+    add({ product_id: p.id, half_product_ids: [], quantity: 1, unit_price: priceOf(p), modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector });
   };
 
   const submitCode = () => {
-    const exact = products.find((p) => p.code === query.trim());
+    const exact = list.find((p) => p.code === query.trim());
     if (exact) {
       tapProduct(exact);
       setQuery('');
@@ -162,7 +165,7 @@ function MenuPanel({ orderId }: { orderId: string }) {
                   {!p.available && <Badge className="bg-slate-700">Em falta</Badge>}
                 </span>
               </span>
-              <span className="font-bold tabular-nums">{formatBRL(p.price)}{p.sold_by_weight ? '/kg' : ''}</span>
+              <span className="font-bold tabular-nums">{formatBRL(priceOf(p))}{p.sold_by_weight ? '/kg' : ''}</span>
             </button>
             {!needsSheet(p) && !p.sold_by_weight && p.available && (
               <button aria-label="Opções" onClick={() => tapProduct(p, true)} className="grid w-12 place-items-center border-l border-slate-700 text-slate-400 active:bg-slate-700">

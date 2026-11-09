@@ -14,10 +14,27 @@ export interface ShiftKpis {
   openOrders: number;
 }
 
-export function shiftKpis(orders: readonly Order[], payments: readonly Payment[]): ShiftKpis {
-  const approved = payments.filter((p) => p.status === 'APPROVED');
+/** Hora em que vira o dia operacional (o turno da noite que passa da meia-noite conta no dia anterior). */
+export const SHIFT_CUTOFF_HOUR = 5;
+
+/** Início do turno corrente: hoje às 05:00, ou ontem às 05:00 se ainda é madrugada. */
+export function shiftStart(now: Date = new Date(), cutoffHour = SHIFT_CUTOFF_HOUR): Date {
+  const start = new Date(now);
+  start.setHours(cutoffHour, 0, 0, 0);
+  if (now < start) start.setDate(start.getDate() - 1);
+  return start;
+}
+
+/**
+ * KPIs do turno: faturamento, contas fechadas, ticket médio e 10% contam só o
+ * que aconteceu desde `since`; o saldo em aberto no salão é sempre o atual.
+ */
+export function shiftKpis(orders: readonly Order[], payments: readonly Payment[], since: Date = shiftStart()): ShiftKpis {
+  const from = since.getTime();
+  const inShift = (iso: string | null) => iso !== null && new Date(iso).getTime() >= from;
+  const approved = payments.filter((p) => p.status === 'APPROVED' && inShift(p.created_at));
   const grossCents = approved.reduce((a, p) => a + toCents(p.amount), 0);
-  const closed = orders.filter((o) => o.status === 'CLOSED');
+  const closed = orders.filter((o) => o.status === 'CLOSED' && inShift(o.closed_at));
   const closedTotalCents = closed.reduce((a, o) => a + toCents(o.total_amount), 0);
   const feeCents = closed.reduce((a, o) => a + toCents(o.service_fee_amount), 0);
   const open = orders.filter((o) => o.status === 'OPEN' || o.status === 'PAYING');
@@ -26,7 +43,7 @@ export function shiftKpis(orders: readonly Order[], payments: readonly Payment[]
     closedOrders: closed.length,
     averageTicket: closed.length ? fromCents(Math.round(closedTotalCents / closed.length)) : 0,
     serviceFeeTotal: fromCents(feeCents),
-    tablesServed: orders.filter((o) => o.status !== 'CANCELED').length,
+    tablesServed: orders.filter((o) => o.status !== 'CANCELED' && (inShift(o.opened_at) || inShift(o.closed_at) || o.status === 'OPEN' || o.status === 'PAYING')).length,
     openBalance: fromCents(open.reduce((a, o) => a + toCents(o.remaining_balance), 0)),
     openOrders: open.length,
   };
@@ -124,6 +141,14 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   MANAGER_PIN_LOCKOUT: 'PIN bloqueado (3 erros)',
   KEG_CHANGED: 'Troca de barril de chopp',
   CASHBACK_REDEEMED: 'Cashback resgatado',
+  PRODUCT_PRICE_CHANGED: 'Preço alterado no cadastro',
+  STAFF_CREATED: 'Pessoa cadastrada na equipe',
+  STAFF_PIN_CHANGED: 'PIN trocado',
+  STAFF_ROLE_CHANGED: 'Perfil alterado',
+  STAFF_DEACTIVATED: 'Acesso desativado',
+  STAFF_REACTIVATED: 'Acesso reativado',
+  PERMISSION_CHANGED: 'Permissão alterada',
+  STORE_RESET: 'Loja nova iniciada no aparelho',
 };
 
 /** Texto do alerta enviado ao WhatsApp do proprietário. */
