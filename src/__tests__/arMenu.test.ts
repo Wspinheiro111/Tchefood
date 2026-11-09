@@ -202,4 +202,13 @@ describe('cardápio AR: loja nova no mesmo aparelho', () => {
     expect(selectActiveArModel(ar(), pizza)).toBeDefined();
     expect(selectActiveArModel(ar(), pizza, 'outra-loja')).toBeUndefined();
   });
+
+  it('loja real com um prato de código 401 não ganha a pizza de demonstração', () => {
+    const real = 'loja-real';
+    const prato = { ...product(AR_DEMO_PRODUCT_CODE), id: 'prato-real', tenant_id: real, name: 'Xis Salada' };
+    useTcheStore.setState((s) => ({ tenant: { ...s.tenant, id: real }, products: [...s.products, prato] }));
+    ar().ensureDemoModel();
+    expect(ar().arModels).toEqual([]);
+    expect(ar().demoSeededTenants).not.toContain(real);
+  });
 });

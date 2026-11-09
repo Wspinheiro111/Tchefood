@@ -13,10 +13,13 @@ import { AR_EVENTS_KEEP, normalizeComponents, validateArModel, type ArModelDraft
 import { PIZZA_DEMO_COMPONENTS, PIZZA_DEMO_DIAMETER_CM, PIZZA_DEMO_EXPLODE_ANIMATION, PIZZA_DEMO_GLB } from '../lib/ar/pizzaDemo';
 import { deleteModelFile } from '../lib/ar/modelFiles';
 import { selectCan, useTcheStore } from './useTcheStore';
+import { SEED_PRODUCTS, SEED_TENANT } from '../data/seed';
 import type { ActionResult, ArEngagementEvent, ArEngagementKind, ProductArModel, SyncEvent, UUID } from '../types';
 
 /** Produto do seed que ganha o modelo de demonstração (Pizza Calabresa). */
 export const AR_DEMO_PRODUCT_CODE = '401';
+/** Só o produto do catálogo de demonstração: numa loja real o código 401 pode ser qualquer prato. */
+const AR_DEMO_PRODUCT_ID = SEED_PRODUCTS.find((p) => p.code === AR_DEMO_PRODUCT_CODE)?.id;
 
 interface ArState {
   arModels: ProductArModel[];
@@ -59,8 +62,8 @@ export const useArStore = create<ArState>()(
       ensureDemoModel: () => {
         const main = useTcheStore.getState();
         const tenantId = main.tenant.id;
-        if (get().demoSeededTenants.includes(tenantId)) return;
-        const product = main.products.find((p) => p.code === AR_DEMO_PRODUCT_CODE && p.tenant_id === tenantId);
+        if (tenantId !== SEED_TENANT.id || get().demoSeededTenants.includes(tenantId)) return;
+        const product = main.products.find((p) => p.id === AR_DEMO_PRODUCT_ID && p.tenant_id === tenantId);
         if (!product) return;
         const now = nowISO();
         const demo: ProductArModel = {

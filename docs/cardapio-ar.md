@@ -39,7 +39,7 @@ Foto não vira 3D sozinha. Cada prato do cardápio precisa de um arquivo **.glb*
 4. **Adicionar item** → escreva o nome (ex.: "Mussarela") e toque no ponto do modelo onde a etiqueta fica. Até 12 itens.
 5. **Salvar 3D**. Com a loja ligada à nuvem, o arquivo sobe para o bucket `product-models` e já abre no celular dos clientes. Sem nuvem, fica marcado **só neste aparelho** até você tocar em **Enviar**.
 
-A demonstração já vem com uma **Pizza Calabresa de 35 cm** (código 401) gerada por `scripts/gerar-pizza-ar.mjs`, com formas simples e a animação dos itens. Serve para mostrar o fluxo; não é a foto do prato.
+A loja de demonstração já vem com uma **Pizza Calabresa de 35 cm** (código 401; numa loja real nada é cadastrado sozinho) gerada por `scripts/gerar-pizza-ar.mjs`, com formas simples e a animação dos itens. Serve para mostrar o fluxo; não é a foto do prato.
 
 ## Métricas de engajamento
 
