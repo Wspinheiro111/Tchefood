@@ -29,9 +29,11 @@ export function getDeliveryDemo() {
 interface DeliveryOrdersState {
   orders: DeliveryOrderRecord[];
   lastSync: string | null;
+  /** Último erro de cada app no ciclo mais recente (sem chave = funcionou). Vai para os avisos do Painel do dono. */
+  lastErrors: Partial<Record<DeliveryCycleReport['channel'], string>>;
 }
 
-export const useDeliveryOrders = create<DeliveryOrdersState>(() => ({ orders: [], lastSync: null }));
+export const useDeliveryOrders = create<DeliveryOrdersState>(() => ({ orders: [], lastSync: null, lastErrors: {} }));
 
 let inFlight: Promise<DeliveryCycleReport[]> | null = null;
 
@@ -41,7 +43,9 @@ export function syncDeliveryOrders(): Promise<DeliveryCycleReport[]> {
     inFlight = (async () => {
       const { inbox } = getDeliveryDemo();
       const reports = await inbox.runCycle();
-      useDeliveryOrders.setState({ orders: await inbox.listOrders(), lastSync: new Date().toLocaleTimeString('pt-BR') });
+      const lastErrors: DeliveryOrdersState['lastErrors'] = {};
+      for (const r of reports) if (r.error) lastErrors[r.channel] = r.error;
+      useDeliveryOrders.setState({ orders: await inbox.listOrders(), lastSync: new Date().toLocaleTimeString('pt-BR'), lastErrors });
       return reports;
     })().finally(() => {
       inFlight = null;

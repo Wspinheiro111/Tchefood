@@ -141,7 +141,7 @@ export default function App() {
         {view.name === 'chopp' && <KegMonitorScreen />}
         {view.name === 'delivery' && <DeliveryScreen />}
         {view.name === 'board' && <OrderBoardScreen />}
-        {view.name === 'backoffice' && <BackOffice />}
+        {view.name === 'backoffice' && <BackOffice onExit={(name) => setView({ name } as View)} />}
       </main>
 
       {nav.length > 1 && (
