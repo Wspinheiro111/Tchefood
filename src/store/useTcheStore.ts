@@ -2788,11 +2788,17 @@ export const useTcheStore = create<TcheState>()(
           );
           // No servidor, equipe só muda por tchefood_save_staff: confere o PIN de quem alterou
           // e o do gerente, grava a pessoa e os audit_logs juntos. Por isso os logs não sobem à parte.
+          // Troca do próprio PIN que a nuvem recusou (ex.: PIN já usado em outro aparelho):
+          // o PIN novo já está no aparelho, mas na nuvem continua o anterior. A correção
+          // prova quem é com o PIN que a nuvem ainda conhece, o do recusado mais antigo.
+          const cloudPin = (get().syncRejected ?? [])
+            .filter((r) => r.event.table === 'staff_users' && r.event.row_id === actor.id && r.event.staff_auth?.actor_id === actor.id)
+            .sort((x, y) => x.event.created_at.localeCompare(y.event.created_at))[0]?.event.staff_auth?.actor_pin;
           const staffEvent: SyncEvent = {
             ...syncEvent('staff_users', existing ? 'UPDATE' : 'INSERT', row),
             staff_auth: {
               actor_id: actor.id,
-              actor_pin: actor.pin_code,
+              actor_pin: cloudPin ?? actor.pin_code,
               manager_pin: manager ? auth!.managerPin : null,
               reason: manager ? reason : null,
             },

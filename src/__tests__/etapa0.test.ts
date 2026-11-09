@@ -351,6 +351,21 @@ describe('equipe no store', () => {
     expect(st().outbox[1]!.payload.pin_code).toBe('3719');
   });
 
+  it('próprio PIN recusado pela nuvem: a correção prova quem é com o PIN que a nuvem conhece', () => {
+    login(MANAGER);
+    const me = staffByPin(MANAGER);
+    expect(st().saveStaff({ id: me.id, name: me.name, role: me.role, pin_code: '4826', active: true }).ok).toBe(true);
+    const refused = st().outbox[st().outbox.length - 1]!;
+    expect(refused.staff_auth!.actor_pin).toBe(MANAGER);
+    st().rejectSyncEvents([{ eventId: refused.id, status: 200, message: 'recusou o PIN novo' }]);
+    // O aparelho já usa 4826; a nuvem ainda tem 9999.
+    expect(st().saveStaff({ id: me.id, name: me.name, role: me.role, pin_code: '3719', active: true }).ok).toBe(true);
+    const fixed = st().outbox[st().outbox.length - 1]!;
+    expect(fixed.payload.pin_code).toBe('3719');
+    expect(fixed.staff_auth!.actor_pin).toBe(MANAGER);
+    expect(st().syncRejected).toEqual([]);
+  });
+
   it('usuário técnico do QR não é editável', () => {
     login(OWNER);
     const qr = st().staff.find(isQrSelfService)!;
