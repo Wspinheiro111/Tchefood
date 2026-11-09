@@ -1,0 +1,64 @@
+# Publica a demonstração no GitHub Pages (grátis em repositório público).
+#   /       → landing page comercial (landing/)
+#   /app/   → app Tchê Food com dados de demonstração e maquininhas simuladas
+# Em pull request só roda o build (confere que o Actions está funcionando);
+# a publicação acontece só no push para a main ou manualmente.
+name: Demo no GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            landing/package-lock.json
+
+      - name: Build do app (demo)
+        run: |
+          npm ci
+          npx vite build --base=./ --outDir _site/app
+
+      - name: Build da landing
+        working-directory: landing
+        run: |
+          npm ci
+          npx vite build --outDir ../_site --emptyOutDir false
+
+      - name: Desliga o processamento Jekyll
+        run: touch _site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
