@@ -101,7 +101,7 @@ function baseHeaders(cfg: SyncConfig): Record<string, string> {
 function buildAuthorizeRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   if (!event.manager_pin) {
     // Fila gravada antes desta correção: sem o PIN, o servidor não tem como conferir.
-    throw new Error('Autorização de gerente sem PIN para o servidor conferir. Refaça a operação com o PIN do gerente.');
+    throw new Error('Autorização de gerente sem PIN para o servidor conferir. Em Nuvem, digite o PIN do gerente neste evento recusado e toque em Reenviar recusados.');
   }
   const p = event.payload;
   const metadata = { ...((p.metadata as Record<string, unknown> | null | undefined) ?? {}), client_audit_id: event.row_id };

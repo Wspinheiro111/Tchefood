@@ -191,6 +191,18 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     const local = st().orders.find((o) => o.id === order.id)!;
     expect(local.status).toBe('CLOSED');
     expect(sql(`SELECT status || ' ' || total_amount || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`)).toBe(`CLOSED ${local.total_amount.toFixed(2)} 0.00`);
+    // Reenvio da mesma autorização (resposta perdida na rede): devolve o mesmo registro.
+    const clientId = crypto.randomUUID();
+    const authorize = () =>
+      raw('POST', 'rpc/tchefood_authorize_manager', {
+        p_order_id: order.id, p_action_type: 'DISCOUNT_APPLIED', p_manager_pin: MANAGER_PIN, p_performed_by: st().currentUserId,
+        p_reason: 'Reenvio da fila', p_amount_impact: -1, p_metadata: { discount_before: 0, discount_after: 1, client_audit_id: clientId },
+      });
+    const first = await authorize();
+    const again = await authorize();
+    expect(first.status).toBe(200);
+    expect(again.body).toBe(first.body);
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE metadata->>'client_audit_id' = '${clientId}'`)).toBe('1');
   });
 
   it('cashback: ganha na conta fechada e resgata na próxima (vira desconto sem PIN de gerente)', async () => {

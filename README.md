@@ -70,7 +70,7 @@ Configuração:
 psql "$SUPABASE_DB_URL" -f db/schema.sql   # só numa base vazia (modelagem + travas)
 supabase db push                            # aplica supabase/migrations em ordem
 ```
-As migrations rodam de novo sem erro numa base que já recebeu os arquivos de `db/` à mão. Ordem: NFC-e (060000) → Etapa 0 (070000) → Fase 5 (080000, cópia de `db/schema_expansion.sql`) → totem (090000, `db/schema_kiosk.sql`) → compras por XML (100000, `db/schema_purchases.sql`) → equipe pelo servidor (110000, `db/schema_equipe.sql`). Cada migration copiada começa com `-- Cópia de db/...` e um teste confere que as duas estão iguais.
+As migrations rodam de novo sem erro numa base que já recebeu os arquivos de `db/` à mão. Ordem: NFC-e (060000) → Etapa 0 (070000) → Fase 5 (080000, cópia de `db/schema_expansion.sql`) → totem (090000, `db/schema_kiosk.sql`) → compras por XML (100000, `db/schema_purchases.sql`) → equipe pelo servidor (110000, `db/schema_equipe.sql`) → reenvio da autorização sem duplicar (120000, `db/schema_autorizacao.sql`). Cada migration copiada começa com `-- Cópia de db/...` e um teste confere que as duas estão iguais.
 1. No painel do Supabase: Authentication → Hooks → **Custom Access Token** → `public.tchefood_access_token_hook`. Ele copia `app_metadata.tenant_id` para a claim `tenant_id` que o RLS (`tchefood_tenant()`) lê.
 2. Crie a linha da loja em `tenants` e uma conta de usuário para o aparelho com `app_metadata = {"tenant_id": "<id da loja>"}` (pelo painel ou pela API admin; o app não cria lojas na nuvem).
 3. Build com `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY` (ou digite os dois na aba Nuvem).
@@ -103,7 +103,9 @@ supabase functions deploy emit-nfce
 
 `db/schema_kiosk.sql` (aplicar depois do `schema_expansion.sql`, idempotente) traz o totem: papel `KIOSK`, mesa técnica `KIOSK`, colunas `orders.pickup_number`, `pickup_name`, `fulfillment_type`, contador `pickup_counters` (senha gerada pelo banco com trava de linha, sem repetir entre dois totens) e gatilho com as regras do pedido com senha. Cenários em `db/tests/kiosk_cenarios.sql`.
 
-`db/schema_equipe.sql` (aplicar por último, idempotente): `tchefood_save_staff`, `tchefood_set_role_permission`, `tchefood_start_store`, conferência de PIN com bloqueio (`tchefood_check_pin`) e permissões padrão no banco (`tchefood_can`, igual a `src/lib/permissions.ts`). Tira do aparelho a gravação direta em `role_permissions`.
+`db/schema_equipe.sql` (idempotente): `tchefood_save_staff`, `tchefood_set_role_permission`, `tchefood_start_store`, conferência de PIN com bloqueio (`tchefood_check_pin`) e permissões padrão no banco (`tchefood_can`, igual a `src/lib/permissions.ts`). Tira do aparelho a gravação direta em `role_permissions`.
+
+`db/schema_autorizacao.sql` (aplicar por último, idempotente): `tchefood_authorize_manager` reconhece o reenvio da mesma autorização (o `client_audit_id` que a fila manda) e devolve o registro já gravado, em vez de duplicar o valor. Autorização gravada numa versão antiga do app, sem o PIN para o servidor conferir, aparece em Nuvem > recusados com o campo "PIN do gerente": o mesmo gerente digita o PIN e toca em Reenviar recusados.
 
 **Teste da fila contra o banco real:** `db/tests/cloudSync.pg.test.ts` sobe uma loja nova, equipe, permissões, comanda com cancelamento/desconto/10%, cashback, Ficha Rápida, pedido com senha e compra por XML num Postgres montado com `db/schema.sql` + `supabase/migrations`, pelo mesmo `flushOutbox` do app e um emulador do PostgREST com RLS. Também tenta as fraudes (gravar equipe ou permissão direto, PIN errado, gerente se promovendo, desconto e totais forjados) e confere que o banco recusa. Roda com um Postgres 15+ local:
 ```bash

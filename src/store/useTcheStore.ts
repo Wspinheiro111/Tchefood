@@ -434,6 +434,12 @@ interface Actions {
   rejectSyncEvents: (rejections: Array<{ eventId: UUID; status: number; message: string }>) => void;
   /** Devolve os recusados para o começo da fila, na ordem original, para nova tentativa. */
   retryRejectedSync: () => void;
+  /**
+   * Autorização de gerente recusada por ter sido gravada antes da versão que leva o
+   * PIN para o servidor: o mesmo gerente digita o PIN de novo e o evento fica pronto
+   * para Reenviar recusados (o servidor confere outra vez, com o bloqueio).
+   */
+  confirmRejectedAuthorization: (eventId: UUID, managerPin: string) => ActionResult;
 }
 
 export type TcheState = DataSlice & DeviceSlice & Actions;
@@ -2998,6 +3004,31 @@ export const useTcheStore = create<TcheState>()(
             back.sort((a, b) => a.created_at.localeCompare(b.created_at));
             return { outbox: [...back, ...s.outbox], syncRejected: [] };
           }),
+
+        confirmRejectedAuthorization: (eventId, managerPin) => {
+          const rejected = (get().syncRejected ?? []).find((r) => r.event.id === eventId);
+          if (!rejected) return fail('Evento recusado não encontrado.');
+          const ev = rejected.event;
+          const p = ev.payload;
+          if (ev.table !== 'audit_logs' || typeof p.authorized_by_manager_id !== 'string' || ev.manager_pin) {
+            return fail('Este evento não espera PIN de gerente.');
+          }
+          const auth = authorizeManager(
+            { managerPin, reason: String(p.reason ?? '') },
+            { orderId: (p.order_id as UUID | null) ?? null, action: p.action_type as AuditActionType },
+          );
+          if (!auth.ok) return auth;
+          if (auth.data.id !== p.authorized_by_manager_id) {
+            const who = get().staff.find((u) => u.id === p.authorized_by_manager_id)?.name ?? 'outro gerente';
+            return fail(`Esta autorização foi dada por ${who}. Digite o PIN dessa pessoa.`);
+          }
+          set((s) => ({
+            syncRejected: (s.syncRejected ?? []).map((r) =>
+              r.event.id === eventId ? { ...r, event: { ...r.event, manager_pin: managerPin } } : r,
+            ),
+          }));
+          return { ok: true, data: undefined };
+        },
 
         setSyncError: (message, blockedEventId) =>
           set((s) => ({

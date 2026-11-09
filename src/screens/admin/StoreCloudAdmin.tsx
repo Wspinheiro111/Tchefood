@@ -2,7 +2,7 @@
 import { useState } from 'react';
 import { Cloud, CloudOff, RefreshCw, Store } from 'lucide-react';
 import { selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
-import type { Permission, UserRole } from '../../types';
+import type { Permission, SyncEvent, UserRole } from '../../types';
 import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../lib/permissions';
 import { ROLE_LABEL } from '../../lib/catalog';
 import { signInDevice } from '../../lib/sync/supabaseSync';
@@ -283,6 +283,40 @@ function CloudLogin() {
   );
 }
 
+/** Autorização de gerente de uma fila antiga, sem o PIN para o servidor conferir. */
+function needsManagerPin(e: SyncEvent): boolean {
+  return e.table === 'audit_logs' && typeof e.payload.authorized_by_manager_id === 'string' && !e.manager_pin;
+}
+
+function RejectedAuthPin({ eventId }: { eventId: string }) {
+  const confirm = useTcheStore((s) => s.confirmRejectedAuthorization);
+  const [pin, setPin] = useState('');
+  return (
+    <span className="mt-1 flex items-center gap-2">
+      <input
+        type="password"
+        inputMode="numeric"
+        maxLength={4}
+        value={pin}
+        onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+        placeholder="PIN do gerente"
+        className="w-28 rounded-lg border border-slate-600 bg-slate-900 px-2 py-1 text-xs"
+      />
+      <Btn
+        disabled={pin.length !== 4}
+        onClick={() => {
+          const r = confirm(eventId, pin);
+          if (r.ok) toast.success('PIN conferido. Toque em Reenviar recusados.');
+          else toast.error(r.error);
+          setPin('');
+        }}
+      >
+        Confirmar PIN
+      </Btn>
+    </span>
+  );
+}
+
 function CloudStatus() {
   const cloud = useTcheStore((s) => s.cloud)!;
   const status = useTcheStore((s) => s.syncStatus);
@@ -332,6 +366,7 @@ function CloudStatus() {
             {rejected.map((r) => (
               <li key={r.event.id} className="text-slate-300">
                 <b>{r.event.table}</b> {r.event.op} (registro {r.event.row_id.slice(0, 8)}…) · HTTP {r.status}: {r.message}
+                {needsManagerPin(r.event) && <RejectedAuthPin eventId={r.event.id} />}
               </li>
             ))}
           </ul>

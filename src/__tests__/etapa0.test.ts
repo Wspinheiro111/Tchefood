@@ -291,6 +291,27 @@ describe('equipe no store', () => {
     expect(st().outbox[st().outbox.length - 1]!.staff_auth).toEqual({ actor_id: me.id, actor_pin: MANAGER, manager_pin: null, reason: null });
   });
 
+  it('autorização antiga sem PIN recusada: o mesmo gerente confirma o PIN e ela volta a poder subir', () => {
+    const cfg = { url: 'https://abc.supabase.co/', anonKey: 'anon', accessToken: 'jwt' };
+    login(WAITER);
+    const manager = staffByPin(MANAGER);
+    const owner = staffByPin(OWNER);
+    const payload = { id: 'L-velho', order_id: 'O1', performed_by_user_id: staffByPin(WAITER).id, authorized_by_manager_id: manager.id, action_type: 'DISCOUNT_APPLIED', reason: 'Cliente antigo', amount_impact: -5, metadata: {} };
+    const legacy: SyncEvent = { id: 'auth-velha', table: 'audit_logs', op: 'INSERT', row_id: 'L-velho', payload, created_at: '2026-11-01T12:00:00.000Z' };
+    useTcheStore.setState({ syncRejected: [{ event: legacy, status: 400, message: 'sem PIN', rejected_at: legacy.created_at }] });
+    expect(() => buildSyncRequest(legacy, cfg)).toThrow(/digite o PIN do gerente/);
+    // PIN errado conta no bloqueio local; PIN de outro gerente não serve.
+    expect(st().confirmRejectedAuthorization('auth-velha', '0000')).toMatchObject({ ok: false });
+    expect(st().confirmRejectedAuthorization('auth-velha', owner.pin_code)).toMatchObject({ ok: false, error: expect.stringContaining(manager.name) });
+    expect(st().syncRejected[0]!.event.manager_pin).toBeUndefined();
+    expect(st().confirmRejectedAuthorization('auth-velha', MANAGER).ok).toBe(true);
+    const fixed = st().syncRejected[0]!.event;
+    expect(fixed.manager_pin).toBe(MANAGER);
+    expect(JSON.parse(buildSyncRequest(fixed, cfg).body!).p_manager_pin).toBe(MANAGER);
+    st().retryRejectedSync();
+    expect(st().outbox[0]!.id).toBe('auth-velha');
+  });
+
   it('salvar de novo substitui o evento de equipe antigo, sem PIN, que a nuvem recusou', () => {
     login(MANAGER);
     const me = staffByPin(MANAGER);
