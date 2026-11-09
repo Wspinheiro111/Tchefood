@@ -15,7 +15,8 @@
 // ENUMS (CREATE TYPE ...)
 // ---------------------------------------------------------------------------
 
-export type UserRole = 'OWNER' | 'MANAGER' | 'CASHIER' | 'WAITER' | 'KITCHEN';
+/** KIOSK = aparelho do totem de autoatendimento (db/schema_kiosk.sql). */
+export type UserRole = 'OWNER' | 'MANAGER' | 'CASHIER' | 'WAITER' | 'KITCHEN' | 'KIOSK';
 export type TableStatus = 'FREE' | 'OCCUPIED' | 'WAITING_BILL' | 'PAYING' | 'DIRTY';
 export type OrderStatus = 'OPEN' | 'PAYING' | 'CLOSED' | 'CANCELED';
 export type ItemStatus = 'PENDING' | 'PREPARING' | 'READY' | 'DELIVERED' | 'CANCELED';
@@ -26,7 +27,7 @@ export type AcquirerType = 'STONE' | 'PAGBANK' | 'MOCK' | 'CASH_DESK';
 export type OperationMode = 'SMARTPOS_EMBEDDED' | 'TEF_POS_WIRELESS';
 
 /** Valores aceitos em order_items.origin (VARCHAR(20)). */
-export type OrderItemOrigin = 'WAITER' | 'SMARTPOS' | 'QRCODE_TABLE';
+export type OrderItemOrigin = 'WAITER' | 'SMARTPOS' | 'QRCODE_TABLE' | 'KIOSK';
 
 export type UUID = string;
 export type ISODateTime = string;
@@ -153,9 +154,17 @@ export interface DiningTable {
   /** Etapa 0: mesa desativada some do mapa; só mesa livre pode ser desativada. */
   active: boolean;
   updated_at: ISODateTime;
-  /** COUNTER = mesa técnica da venda de balcão/eventos (nunca ocupada, fora do mapa). */
+  /**
+   * COUNTER = mesa técnica da venda de balcão/eventos (nunca ocupada, fora do mapa).
+   * KIOSK = mesa técnica dos pedidos com senha (totem e pedido no caixa), que vão para o KDS.
+   */
   kind: DiningTableKind;
 }
+
+export type DiningTableKind = 'TABLE' | 'COUNTER' | 'KIOSK';
+
+/** Pedido com senha: comer no salão ou levar. */
+export type FulfillmentType = 'DINE_IN' | 'TAKEOUT';
 
 /**
  * Etapa 0 — preço por dia da semana e horário (happy hour, almoço executivo).
@@ -193,8 +202,6 @@ export interface RolePermission {
   updated_at: ISODateTime;
 }
 
-export type DiningTableKind = 'TABLE' | 'COUNTER';
-
 export interface Order {
   id: UUID;
   tenant_id: UUID;
@@ -215,6 +222,12 @@ export interface Order {
   nfce_key: string | null;
   opened_at: ISODateTime;
   closed_at: ISODateTime | null;
+  // Pedido com senha (db/schema_kiosk.sql). Null nas comandas de mesa e nas fichas de balcão.
+  /** Senha chamada no painel da TV (1 a 999, reinicia todo dia). */
+  pickup_number: number | null;
+  /** Primeiro nome para chamar o cliente (opcional). */
+  pickup_name: string | null;
+  fulfillment_type: FulfillmentType | null;
 }
 
 export interface OrderItem {
@@ -278,6 +291,7 @@ export type AuditActionType =
   | 'MANAGER_PIN_LOCKOUT'
   | 'KEG_CHANGED'
   | 'CASHBACK_REDEEMED'
+  | 'KIOSK_EXIT'
   // Etapa 0 — cadastros
   | 'PRODUCT_PRICE_CHANGED'
   | 'STAFF_CREATED'

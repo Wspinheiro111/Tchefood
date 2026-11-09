@@ -100,7 +100,10 @@ export const SEED_STAFF: StaffUser[] = [
   staff('gerente', 'Gerente Rafa', 'MANAGER', '9999'),
   // Usuário técnico do Cardápio QR Code: PIN não numérico, impossível de digitar no PinPad.
   staff('qrcode', 'Autoatendimento QR Code', 'WAITER', QR_SELF_SERVICE_PIN),
+  // Aparelho do totem de autoatendimento: entra direto na tela do cliente; sair exige PIN de gerente.
+  staff('totem-01', 'Totem 01', 'KIOSK', '4444'),
 ];
+export const KIOSK_DEVICE_USER_ID = seedId('staff:totem-01');
 export const QR_SELF_SERVICE_USER_ID = seedId('staff:qrcode');
 const WAITER_TIAO = seedId('staff:garcom-tiao');
 const WAITER_DUDA = seedId('staff:garcom-duda');
@@ -395,11 +398,29 @@ const COUNTER_TABLE: DiningTable = {
   kind: 'COUNTER',
 };
 
+/** Mesa técnica dos pedidos com senha (totem e pedido no caixa): nunca é ocupada, fora do mapa. */
+export const KIOSK_TABLE_ID = seedId('table:kiosk');
+export const KIOSK_TABLE: DiningTable = {
+  id: KIOSK_TABLE_ID,
+  tenant_id: T,
+  number: 950,
+  label: 'Totem / Pedido no caixa',
+  area: 'Totem',
+  capacity: 1,
+  status: 'FREE',
+  qr_code_token: null,
+  current_order_id: null,
+  active: true,
+  updated_at: created,
+  kind: 'KIOSK',
+};
+
 const BASE_TABLES: DiningTable[] = [
   ...[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => table(n, 'Salão Principal', n % 3 === 0 ? 6 : 4)),
   ...[21, 22, 23, 24, 25, 26].map((n) => table(n, 'Deck', n % 2 === 0 ? 8 : 4)),
   ...[31, 32, 33, 34].map((n) => table(n, 'Parrilla', 2)),
   COUNTER_TABLE,
+  KIOSK_TABLE,
 ];
 
 // ---------------------------------------------------------------------------
@@ -601,6 +622,9 @@ function buildSeedState() {
       nfce_key: null,
       opened_at: minutesAgoISO(spec.openedMinutesAgo),
       closed_at: null,
+      pickup_number: null,
+      pickup_name: null,
+      fulfillment_type: null,
     };
     orders.push(applyOrderTotals(base, items, payments));
     t.status = spec.tableStatus;

@@ -21,7 +21,7 @@ const okCheck: Check = { ok: true };
 const bad = (error: string): Check => ({ ok: false, error });
 
 export const SECTORS: ReadonlyArray<ProductionSector> = ['KITCHEN', 'GRILL', 'BAR', 'DESSERT', 'NONE'];
-export const ROLES: ReadonlyArray<UserRole> = ['OWNER', 'MANAGER', 'CASHIER', 'WAITER', 'KITCHEN'];
+export const ROLES: ReadonlyArray<UserRole> = ['OWNER', 'MANAGER', 'CASHIER', 'WAITER', 'KITCHEN', 'KIOSK'];
 
 export const ROLE_LABEL: Record<UserRole, string> = {
   OWNER: 'Proprietário',
@@ -29,6 +29,7 @@ export const ROLE_LABEL: Record<UserRole, string> = {
   CASHIER: 'Caixa',
   WAITER: 'Garçom',
   KITCHEN: 'Cozinha',
+  KIOSK: 'Totem (aparelho)',
 };
 
 export const SECTOR_NAME: Record<ProductionSector, string> = {

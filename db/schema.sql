@@ -234,6 +234,58 @@ CREATE TABLE printers (
     CHECK (connection <> 'BLUETOOTH' OR mac_address IS NOT NULL)
 );
 
+-- Pedidos de apps de delivery (iFood, 99Food, Keeta...). Espelho de server/delivery/deliveryInbox.ts.
+-- client_id/client_secret dos apps NÃO ficam aqui: vivem nos segredos do servidor.
+CREATE TYPE delivery_channel AS ENUM ('ifood', 'ninety_nine_food', 'keeta', 'delivery_much', 'aiqfome', 'anota_ai', 'rappi');
+CREATE TYPE delivery_order_status AS ENUM ('placed', 'confirmed', 'preparing', 'ready_for_pickup', 'dispatched', 'concluded', 'cancelled', 'unknown');
+
+-- Qual loja (merchantId no app) pertence a qual tenant.
+CREATE TABLE delivery_integrations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    channel delivery_channel NOT NULL,
+    merchant_external_id VARCHAR(64) NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (channel, merchant_external_id)
+);
+
+CREATE TABLE delivery_orders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    channel delivery_channel NOT NULL,
+    external_id VARCHAR(64) NOT NULL,
+    display_id VARCHAR(20) NOT NULL,
+    status delivery_order_status NOT NULL DEFAULT 'placed',
+    cancellation_pending BOOLEAN NOT NULL DEFAULT FALSE,
+    needs_review BOOLEAN NOT NULL DEFAULT FALSE,
+    review_reasons TEXT[] NOT NULL DEFAULT '{}',
+    -- Aviso de pedido novo (cozinha, KDS, alerta) já tentado; falso = reprocessar avisa de novo.
+    new_order_notified BOOLEAN NOT NULL DEFAULT FALSE,
+    last_cancellation_event_at TIMESTAMPTZ,
+    total_amount NUMERIC(10,2) NOT NULL CHECK (total_amount >= 0),
+    -- Pedido normalizado completo (DeliveryOrder): itens, pagamentos, endereço.
+    payload JSONB NOT NULL,
+    placed_at TIMESTAMPTZ NOT NULL,
+    last_event_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (channel, external_id)
+);
+
+-- Histórico de eventos recebidos. O UNIQUE é a deduplicação: o app entrega "pelo menos uma vez".
+CREATE TABLE delivery_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    channel delivery_channel NOT NULL,
+    external_event_id VARCHAR(64) NOT NULL,
+    external_order_id VARCHAR(64) NOT NULL,
+    raw_code VARCHAR(40) NOT NULL,
+    signal VARCHAR(30) NOT NULL,
+    event_created_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (channel, external_event_id)
+);
+
 ALTER TABLE dining_tables
     ADD CONSTRAINT dining_tables_current_order_fk FOREIGN KEY (current_order_id) REFERENCES orders(id) ON DELETE SET NULL;
 
@@ -241,6 +293,8 @@ CREATE INDEX idx_order_items_order ON order_items(order_id);
 CREATE INDEX idx_order_items_kds ON order_items(sector, status) WHERE status IN ('PENDING', 'PREPARING', 'READY');
 CREATE INDEX idx_payments_order ON payments(order_id);
 CREATE INDEX idx_audit_logs_tenant_created ON audit_logs(tenant_id, created_at DESC);
+CREATE INDEX idx_delivery_orders_open ON delivery_orders(tenant_id, placed_at DESC) WHERE status NOT IN ('concluded', 'cancelled');
+CREATE INDEX idx_delivery_events_order ON delivery_events(channel, external_order_id);
 CREATE INDEX idx_orders_tenant_status ON orders(tenant_id, status);
 
 -- -----------------------------------------------------------------------------
@@ -455,7 +509,8 @@ DO $$
 DECLARE t TEXT;
 BEGIN
     FOREACH t IN ARRAY ARRAY['staff_users','pos_terminals','categories','products','modifier_groups',
-                             'dining_tables','orders','payments','audit_logs','printers'] LOOP
+                             'dining_tables','orders','payments','audit_logs','printers',
+                             'delivery_integrations','delivery_orders','delivery_events'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('CREATE POLICY %I ON %I USING (tenant_id = tchefood_tenant()) WITH CHECK (tenant_id = tchefood_tenant())', t || '_tenant', t);
     END LOOP;

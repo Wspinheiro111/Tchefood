@@ -316,9 +316,9 @@ describe('loja nova', () => {
     // Id novo por loja: o mesmo id da demonstração colidiria entre lojas na nuvem.
     expect(st().terminals.some((t) => seedTerminalIds.includes(t.id))).toBe(false);
     const terms = st().terminals.length;
-    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', 'staff_users', ...Array(terms).fill('pos_terminals'), 'dining_tables', 'audit_logs']);
-    // A loja nova já nasce com o balcão da Ficha Rápida.
-    expect(st().tables.map((t) => t.kind)).toEqual(['COUNTER']);
+    expect(st().outbox.map((e) => e.table)).toEqual(['tenants', 'staff_users', 'staff_users', ...Array(terms).fill('pos_terminals'), 'dining_tables', 'dining_tables', 'audit_logs']);
+    // A loja nova já nasce com o balcão da Ficha Rápida e a mesa técnica do totem.
+    expect(st().tables.map((t) => t.kind)).toEqual(['COUNTER', 'KIOSK']);
     st().logout();
     expect(st().login('4826').ok).toBe(true);
   });
@@ -337,14 +337,14 @@ describe('migração do armazenamento local', () => {
     const v1 = { products: [{ id: 'p', price: 10 }], tables: [{ id: 't' }], orders: [{ id: 'o' }] };
     const v2 = migratePersisted(v1, 1) as Record<string, unknown>;
     expect(v2.products).toEqual([{ id: 'p', price: 10, active: true, sold_by_weight: false, tare_weight_grams: 0, cost_price: 0 }]);
-    expect(v2.tables).toEqual([{ id: 't', active: true, kind: 'TABLE' }]);
-    expect(v2.orders).toEqual([{ id: 'o' }]);
+    expect((v2.tables as Array<{ kind: string }>).filter((t) => t.kind === 'TABLE')).toEqual([{ id: 't', active: true, kind: 'TABLE' }]);
+    expect(v2.orders).toEqual([{ id: 'o', pickup_number: null, pickup_name: null, fulfillment_type: null }]);
     expect(v2.priceSchedules).toEqual([]);
     expect(v2.rolePermissions).toEqual([]);
     expect(v2.cloud).toBeNull();
   });
 
-  it('v2 (Etapa 0) ganha os campos da Fase 5 e o balcão sem apagar a loja', () => {
+  it('v2 (Etapa 0) ganha Fase 5, balcão e totem sem apagar a loja', () => {
     const v2 = {
       tenant: { id: 'loja' },
       products: [{ id: 'p', price: 10, active: true }],
@@ -357,9 +357,12 @@ describe('migração do armazenamento local', () => {
     const tables = v3.tables as Array<{ id: string; kind: string; tenant_id: string }>;
     expect(tables[0]).toMatchObject({ id: 't', kind: 'TABLE' });
     expect(tables.filter((t) => t.kind === 'COUNTER')).toHaveLength(1);
-    expect(tables[1]!.tenant_id).toBe('loja');
+    expect(tables.filter((t) => t.kind === 'KIOSK')).toHaveLength(1);
+    expect(tables.every((t) => t.tenant_id === 'loja')).toBe(true);
+    // Loja real não ganha o usuário de demonstração do totem.
+    expect(v3.staff).toEqual([]);
     expect(v3.orderItems).toEqual([{ id: 'i', weight_gross_grams: null, weight_tare_grams: null, weight_source: null, keg_volume_ml: null }]);
-    expect(v3.orders).toEqual([{ id: 'o' }]);
+    expect(v3.orders).toEqual([{ id: 'o', pickup_number: null, pickup_name: null, fulfillment_type: null }]);
     expect(v3.kegTaps).toEqual([]);
     expect(v3.cashbackLedger).toEqual([]);
   });

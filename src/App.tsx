@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { BarChart3, Beer, ChefHat, CloudOff, Flame, LayoutGrid, LogOut, QrCode as QrIcon, RefreshCw, Smartphone, Ticket } from 'lucide-react';
+import { BarChart3, Beer, Bike, ChefHat, CloudOff, Flame, LayoutGrid, LogOut, MonitorPlay, QrCode as QrIcon, RefreshCw, ShoppingBag, Smartphone, Ticket } from 'lucide-react';
 import { selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
 import { useTerminalBus } from './lib/payments/drivers';
@@ -12,6 +12,10 @@ import { QrMenuScreen } from './screens/QrMenuScreen';
 import { BackOffice, useBackOfficeTabs } from './screens/BackOffice';
 import { FichaRapidaScreen } from './screens/FichaRapidaScreen';
 import { KegMonitorScreen } from './screens/KegMonitorScreen';
+import { DeliveryScreen } from './screens/DeliveryScreen';
+import { OrderBoardScreen } from './screens/OrderBoardScreen';
+import { KioskScreen } from './screens/KioskScreen';
+import { PickupCounterScreen } from './screens/PickupCounterScreen';
 import { useCloudSync } from './lib/sync/useCloudSync';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
 import { PrintSimulatorModal } from './components/PrintSimulator';
@@ -24,18 +28,24 @@ type View =
   | { name: 'checkout'; orderId: string }
   | { name: 'kds' }
   | { name: 'qr' }
+  | { name: 'pickup' }
   | { name: 'ficha' }
   | { name: 'chopp' }
+  | { name: 'delivery' }
+  | { name: 'board' }
   | { name: 'backoffice' };
 
-type NavKey = 'map' | 'kds' | 'ficha' | 'chopp' | 'qr' | 'backoffice';
+type NavKey = 'map' | 'kds' | 'pickup' | 'ficha' | 'chopp' | 'qr' | 'delivery' | 'board' | 'backoffice';
 
 const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: UserRole[] }> = [
   { key: 'map', label: 'Mesas', icon: LayoutGrid, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
   { key: 'kds', label: 'KDS', icon: ChefHat, roles: ['KITCHEN', 'MANAGER', 'OWNER'] },
+  { key: 'pickup', label: 'Pedido no Caixa', icon: ShoppingBag, roles: ['CASHIER', 'MANAGER', 'OWNER'] },
   { key: 'ficha', label: 'Ficha Rápida', icon: Ticket, roles: ['WAITER', 'CASHIER', 'MANAGER', 'OWNER'] },
   { key: 'chopp', label: 'Chopp', icon: Beer, roles: ['KITCHEN', 'CASHIER', 'MANAGER', 'OWNER'] },
   { key: 'qr', label: 'QR Cliente', icon: QrIcon, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
+  { key: 'delivery', label: 'Delivery', icon: Bike, roles: ['MANAGER', 'OWNER', 'CASHIER'] },
+  { key: 'board', label: 'Painel TV', icon: MonitorPlay, roles: ['MANAGER', 'OWNER', 'CASHIER', 'KITCHEN'] },
   // Retaguarda: aparece para quem tem ao menos uma aba liberada (perfil ou permissão).
   { key: 'backoffice', label: 'Retaguarda', icon: BarChart3, roles: [] },
 ];
@@ -69,6 +79,17 @@ export default function App() {
     return (
       <>
         <LoginScreen />
+        <ToastHost />
+      </>
+    );
+  }
+
+  // Aparelho do totem: só a tela do cliente, sem menu da equipe (sair exige PIN de gerente).
+  if (user.role === 'KIOSK') {
+    return (
+      <>
+        <KioskScreen />
+        <SmartPosSimulator />
         <ToastHost />
       </>
     );
@@ -111,8 +132,11 @@ export default function App() {
         )}
         {view.name === 'kds' && <KdsScreen />}
         {view.name === 'qr' && <QrMenuScreen />}
+        {view.name === 'pickup' && <PickupCounterScreen />}
         {view.name === 'ficha' && <FichaRapidaScreen />}
         {view.name === 'chopp' && <KegMonitorScreen />}
+        {view.name === 'delivery' && <DeliveryScreen />}
+        {view.name === 'board' && <OrderBoardScreen />}
         {view.name === 'backoffice' && <BackOffice />}
       </main>
 

@@ -28,6 +28,7 @@ import type {
   SelectedModifier,
   WeightSource,
   HalfAndHalfPricing,
+  FulfillmentType,
   ModifierGroup,
   ModifierOption,
   Order,
@@ -63,7 +64,9 @@ import {
 import { can, PERMISSION_LABEL } from '../lib/permissions';
 import { nowISO, uuid } from '../lib/ids';
 import { idbStorage } from '../lib/idbStorage';
-import { createSeedData, isQrSelfService, QR_SELF_SERVICE_PIN } from '../data/seed';
+import { createSeedData, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
+import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
+import { getReviewHold } from '../lib/payments/reviewHolds';
 import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
@@ -140,6 +143,23 @@ export interface CounterLine {
   quantity: number;
   modifiers: SelectedModifier[];
   meat_doneness: string | null;
+}
+
+/** Linha do pedido com senha (totem ou caixa). Mesmo formato do lançamento da comanda. */
+export interface PickupLine {
+  product_id: UUID;
+  quantity: number;
+  modifiers: SelectedModifier[];
+  meat_doneness: string | null;
+  half_product_ids: UUID[];
+  quick_tags: string[];
+  free_notes: string;
+}
+
+export interface PickupOrderInput {
+  lines: PickupLine[];
+  fulfillment: FulfillmentType;
+  customerName: string | null;
 }
 
 export interface LoyaltyInput {
@@ -329,6 +349,13 @@ interface Actions {
   issueEventTickets: (orderId: UUID) => ActionResult<EventTicket[]>;
   redeemEventTicket: (rawToken: string) => ActionResult<EventTicket>;
 
+  // Totem de autoatendimento / pedido no caixa (pedido com senha que vai ao KDS depois de pago)
+  createPickupOrder: (input: PickupOrderInput) => ActionResult<Order>;
+  /** Desiste de um pedido com senha ainda não pago (PIN de gerente, itens auditados). */
+  voidPickupOrder: (orderId: UUID, auth: ManagerAuthInput) => ActionResult;
+  /** Fecha o modo totem neste aparelho (PIN de gerente; fica no audit_log). */
+  exitKioskMode: (auth: ManagerAuthInput) => ActionResult;
+
   // Fase 5 — Barris de chopp
   registerKegWaste: (tapId: UUID, ml: number, reason: string) => ActionResult<KegTap>;
   recordKegReading: (tapId: UUID, remainingMl: number) => ActionResult<KegTap>;
@@ -364,6 +391,41 @@ interface Actions {
 }
 
 export type TcheState = DataSlice & DeviceSlice & Actions;
+
+export function migrateToKiosk(p: Partial<TcheState>): Partial<TcheState> {
+  const orders = (p.orders ?? []).map((o) => ({ ...o, pickup_number: o.pickup_number ?? null, pickup_name: o.pickup_name ?? null, fulfillment_type: o.fulfillment_type ?? null }));
+  const tables = p.tables ?? [];
+  const staff = p.staff ?? [];
+  const tenantId = p.tenant?.id ?? SEED_TENANT.id;
+  // O usuário de demonstração do totem (PIN 4444) só entra na loja de demonstração;
+  // numa loja real o totem é cadastrado na Equipe.
+  const isDemo = tenantId === SEED_TENANT.id;
+  const kioskUsers = isDemo ? SEED_STAFF.filter((u) => u.role === 'KIOSK' && !staff.some((x) => x.id === u.id)) : [];
+  return {
+    ...p,
+    orders,
+    tables: tables.some((t) => t.kind === 'KIOSK') ? tables : [...tables, kioskTable(tenantId, isDemo ? KIOSK_TABLE_ID : uuid())],
+    staff: [...staff, ...kioskUsers],
+  };
+}
+
+/** Mesa técnica dos pedidos com senha (totem e pedido no caixa) de uma loja. */
+export function kioskTable(tenantId: UUID, id: UUID = uuid()): DiningTable {
+  return {
+    id,
+    tenant_id: tenantId,
+    number: 950,
+    label: 'Totem / Pedido no caixa',
+    area: 'Totem',
+    capacity: 1,
+    status: 'FREE',
+    qr_code_token: null,
+    current_order_id: null,
+    active: true,
+    updated_at: nowISO(),
+    kind: 'KIOSK',
+  };
+}
 
 function initialData(): DataSlice {
   return createSeedData();
@@ -441,8 +503,11 @@ function changedTaps(before: readonly KegTap[], after: readonly KegTap[]): KegTa
 
 /** Perfis que vendem no balcão e conferem fichas. */
 const COUNTER_ROLES: ReadonlyArray<StaffUser['role']> = ['WAITER', 'CASHIER', 'MANAGER', 'OWNER'];
+/** Quem lança pedido com senha: o aparelho do totem e a equipe do caixa/balcão. */
+const PICKUP_ROLES: ReadonlyArray<StaffUser['role']> = ['KIOSK', ...COUNTER_ROLES];
 /** Perfis que operam o bar (sangria, leitura do barril). */
 const BAR_ROLES: ReadonlyArray<StaffUser['role']> = ['KITCHEN', 'CASHIER', 'MANAGER', 'OWNER'];
+
 function validateTenantDraft(d: TenantDraft): { ok: true } | { ok: false; error: string } {
   if (d.name.trim().length < 2) return { ok: false, error: 'Informe o nome fantasia da loja.' };
   if (d.legal_name.trim().length < 2) return { ok: false, error: 'Informe a razão social.' };
@@ -690,6 +755,76 @@ export const useTcheStore = create<TcheState>()(
         ...params,
       });
 
+      /**
+       * Desiste de uma venda técnica ainda sem pagamento (ficha de balcão ou pedido com senha):
+       * PIN de gerente, itens CANCELED com um audit_log cada, conta CANCELED.
+       */
+      const voidTechnicalSale = (orderId: UUID, auth: ManagerAuthInput, kind: 'COUNTER' | 'KIOSK'): ActionResult => {
+        const res = findEditableOrder(orderId);
+        if (!res.ok) return res;
+        const order = res.data;
+        const table = get().tables.find((t) => t.id === order.table_id);
+        if (table?.kind !== kind) return fail(kind === 'COUNTER' ? 'Só vendas de balcão podem ser desfeitas aqui.' : 'Só pedidos com senha podem ser desfeitos aqui.');
+        if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+        if (toCents(order.paid_amount) > 0) return fail('Venda já tem pagamento aprovado. Estorne pela maquininha.');
+        const authRes = authorizeManager(auth, { orderId, action: 'ITEM_CANCELED' });
+        if (!authRes.ok) return authRes;
+        const user = currentUser()!;
+        const manager = authRes.data;
+        const ts = nowISO();
+        const reason = auth.reason.trim();
+        const targets = get().orderItems.filter((i) => i.order_id === orderId && i.status !== 'CANCELED');
+        // Um audit_log por item: o banco exige o vínculo item ↔ autorização do gerente.
+        const logs = targets.map((item) => {
+          const product = get().products.find((p) => p.id === item.product_id);
+          return buildAudit({
+            order_id: orderId,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: manager.id,
+            action_type: 'ITEM_CANCELED',
+            amount_impact: -item.total_item_price,
+            reason,
+            metadata: {
+              table: table.label,
+              item_id: item.id,
+              product_code: product?.code ?? null,
+              product_name: product?.name ?? null,
+              quantity: item.quantity,
+              item_total: item.total_item_price,
+              item_status_before: item.status,
+              ...(kind === 'COUNTER' ? { counter_sale_voided: true } : { kiosk_order_voided: true, pickup_number: order.pickup_number }),
+              waiter_name: user.name,
+              manager_name: manager.name,
+            },
+          });
+        });
+        set((s) => {
+          let kegTaps = s.kegTaps;
+          const canceled = new Map<UUID, OrderItem>();
+          for (const item of targets) {
+            kegTaps = applyKegCancel(kegTaps, s.kegTapProducts, item);
+            canceled.set(item.id, { ...item, status: 'CANCELED', canceled_at: ts, canceled_by_user_id: user.id, cancel_reason: reason });
+          }
+          const orderItems = s.orderItems.map((i) => canceled.get(i.id) ?? i);
+          const current = s.orders.find((o) => o.id === orderId)!;
+          const updated: Order = { ...applyOrderTotals(current, orderItems, s.payments), status: 'CANCELED', closed_at: ts, nfce_status: null };
+          return {
+            orderItems,
+            kegTaps,
+            orders: s.orders.map((o) => (o.id === orderId ? updated : o)),
+            auditLogs: [...logs.reverse(), ...s.auditLogs],
+            outbox: [
+              ...s.outbox,
+              ...[...canceled.values()].map((i) => syncEvent('order_items', 'UPDATE', i)),
+              syncEvent('orders', 'UPDATE', updated),
+              ...logs.map((l) => syncEvent('audit_logs', 'INSERT', l)),
+              ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
+            ],
+          };
+        });
+        return { ok: true, data: undefined };
+      };
+
       // -----------------------------------------------------------------------
       // Ações públicas
       // -----------------------------------------------------------------------
@@ -747,6 +882,9 @@ export const useTcheStore = create<TcheState>()(
             nfce_key: null,
             opened_at: ts,
             closed_at: null,
+            pickup_number: null,
+            pickup_name: null,
+            fulfillment_type: null,
           };
           const updatedTable: DiningTable = { ...table, status: 'OCCUPIED', current_order_id: order.id, updated_at: ts };
           set((s) => ({
@@ -1399,6 +1537,9 @@ export const useTcheStore = create<TcheState>()(
               nfce_key: null,
               opened_at: ts,
               closed_at: null,
+              pickup_number: null,
+              pickup_name: null,
+              fulfillment_type: null,
             };
           }
           const products = s0.products;
@@ -1580,6 +1721,9 @@ export const useTcheStore = create<TcheState>()(
             nfce_key: null,
             opened_at: ts,
             closed_at: null,
+            pickup_number: null,
+            pickup_name: null,
+            fulfillment_type: null,
           };
           const items: OrderItem[] = [];
           for (const line of lines) {
@@ -1652,71 +1796,7 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: recalculated };
         },
 
-        voidCounterSale: (orderId, auth) => {
-          const res = findEditableOrder(orderId);
-          if (!res.ok) return res;
-          const order = res.data;
-          const table = get().tables.find((t) => t.id === order.table_id);
-          if (table?.kind !== 'COUNTER') return fail('Só vendas de balcão podem ser desfeitas aqui.');
-          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
-          if (toCents(order.paid_amount) > 0) return fail('Venda já tem pagamento aprovado. Estorne pela maquininha.');
-          const authRes = authorizeManager(auth, { orderId, action: 'ITEM_CANCELED' });
-          if (!authRes.ok) return authRes;
-          const user = currentUser()!;
-          const manager = authRes.data;
-          const ts = nowISO();
-          const reason = auth.reason.trim();
-          const targets = get().orderItems.filter((i) => i.order_id === orderId && i.status !== 'CANCELED');
-          // Um audit_log por item: o banco exige o vínculo item ↔ autorização do gerente.
-          const logs = targets.map((item) => {
-            const product = get().products.find((p) => p.id === item.product_id);
-            return buildAudit({
-              order_id: orderId,
-              performed_by_user_id: user.id,
-              authorized_by_manager_id: manager.id,
-              action_type: 'ITEM_CANCELED',
-              amount_impact: -item.total_item_price,
-              reason,
-              metadata: {
-                table: table.label,
-                item_id: item.id,
-                product_code: product?.code ?? null,
-                product_name: product?.name ?? null,
-                quantity: item.quantity,
-                item_total: item.total_item_price,
-                item_status_before: item.status,
-                counter_sale_voided: true,
-                waiter_name: user.name,
-                manager_name: manager.name,
-              },
-            });
-          });
-          set((s) => {
-            let kegTaps = s.kegTaps;
-            const canceled = new Map<UUID, OrderItem>();
-            for (const item of targets) {
-              kegTaps = applyKegCancel(kegTaps, s.kegTapProducts, item);
-              canceled.set(item.id, { ...item, status: 'CANCELED', canceled_at: ts, canceled_by_user_id: user.id, cancel_reason: reason });
-            }
-            const orderItems = s.orderItems.map((i) => canceled.get(i.id) ?? i);
-            const current = s.orders.find((o) => o.id === orderId)!;
-            const updated: Order = { ...applyOrderTotals(current, orderItems, s.payments), status: 'CANCELED', closed_at: ts, nfce_status: null };
-            return {
-              orderItems,
-              kegTaps,
-              orders: s.orders.map((o) => (o.id === orderId ? updated : o)),
-              auditLogs: [...logs.reverse(), ...s.auditLogs],
-              outbox: [
-                ...s.outbox,
-                ...[...canceled.values()].map((i) => syncEvent('order_items', 'UPDATE', i)),
-                syncEvent('orders', 'UPDATE', updated),
-                ...logs.map((l) => syncEvent('audit_logs', 'INSERT', l)),
-                ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
-              ],
-            };
-          });
-          return { ok: true, data: undefined };
-        },
+        voidCounterSale: (orderId, auth) => voidTechnicalSale(orderId, auth, 'COUNTER'),
 
         issueEventTickets: (orderId) => {
           const s0 = get();
@@ -1799,6 +1879,166 @@ export const useTcheStore = create<TcheState>()(
             };
           });
           return { ok: true, data: redeemed };
+        },
+
+        // ---------------------------------------------------------------------
+        // Totem de autoatendimento / pedido no caixa
+        // ---------------------------------------------------------------------
+        createPickupOrder: (input) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          if (!PICKUP_ROLES.includes(user.role)) return fail('Seu perfil não lança pedido com senha.');
+          if (input.lines.length === 0) return fail('Escolha pelo menos um item.');
+          if (input.fulfillment !== 'DINE_IN' && input.fulfillment !== 'TAKEOUT') return fail('Escolha comer aqui ou para levar.');
+          const s0 = get();
+          const kiosk = s0.tables.find((t) => t.kind === 'KIOSK');
+          if (!kiosk) return fail('Totem não configurado.');
+          const ts = nowISO();
+          const order: Order = {
+            id: uuid(),
+            tenant_id: s0.tenant.id,
+            table_id: kiosk.id,
+            opened_by_user_id: user.id,
+            // Nasce aguardando pagamento: só vai para a cozinha depois de pago.
+            status: 'PAYING',
+            customer_count: 1,
+            customer_cpf: null,
+            subtotal_items: 0,
+            // Autoatendimento e retirada no balcão não cobram os 10% do garçom.
+            charge_service_fee: false,
+            service_fee_pct: s0.tenant.default_service_fee_pct,
+            service_fee_amount: 0,
+            discount_amount: 0,
+            total_amount: 0,
+            paid_amount: 0,
+            remaining_balance: 0,
+            nfce_status: 'PENDING',
+            nfce_key: null,
+            opened_at: ts,
+            closed_at: null,
+            pickup_number: nextPickupNumber(s0.orders.filter((o) => o.table_id === kiosk.id), new Date(ts)),
+            pickup_name: sanitizePickupName(input.customerName),
+            fulfillment_type: input.fulfillment,
+          };
+          const items: OrderItem[] = [];
+          for (const d of input.lines) {
+            const product = s0.products.find((p) => p.id === d.product_id);
+            if (!product || !product.active || !product.available) return fail('Produto indisponível.');
+            if (product.sold_by_weight) return fail(`${product.name} é pesado no buffet: peça no balcão.`);
+            if (!Number.isInteger(d.quantity) || d.quantity < 1 || d.quantity > 99) return fail('Quantidade inválida (1 a 99).');
+            if (product.requires_meat_doneness && !d.meat_doneness) return fail(`Escolha o ponto de ${product.name}.`);
+            const groups = s0.productModifierGroups
+              .filter((l) => l.product_id === product.id)
+              .map((l) => s0.modifierGroups.find((g) => g.id === l.group_id))
+              .filter((g): g is ModifierGroup => Boolean(g));
+            for (const g of groups) {
+              const chosen = d.modifiers.filter((m) => m.group_id === g.id).length;
+              const min = g.required ? Math.max(1, g.min_selection) : g.min_selection;
+              if (chosen < min || chosen > g.max_selection) return fail(`${product.name}: verifique ${g.name}.`);
+            }
+            let modsCents = 0;
+            for (const m of d.modifiers) {
+              const opt = s0.modifierOptions.find((o) => o.id === m.option_id && o.group_id === m.group_id);
+              if (!opt) return fail('Adicional inválido.');
+              if (!groups.some((g) => g.id === opt.group_id)) return fail('Adicional não pertence ao produto.');
+              modsCents += toCents(opt.additional_price);
+            }
+            // Sabor do meio a meio precisa ser outro produto da mesma categoria.
+            const halves = d.half_product_ids.map((id) => s0.products.find((p) => p.id === id));
+            if (halves.some((h) => !h || h.id === product.id || h.category_id !== product.category_id)) {
+              return fail('Sabor do meio a meio inválido.');
+            }
+            // Preço sempre do cadastro (com regra de horário), nunca do aparelho.
+            const base = basePriceFor(product, d.half_product_ids);
+            if (!base.ok) return base;
+            const unitPrice = base.data;
+            const mods = fromCentsLocal(modsCents);
+            const halfNote = halves.length ? `1/2 ${product.name} + ${halves.map((h) => `1/2 ${h!.name}`).join(' + ')}` : null;
+            const noteParts = [
+              ...(halfNote ? [halfNote] : []),
+              ...d.modifiers.map((m) => `+ ${m.name}`),
+              ...d.quick_tags,
+              ...(d.free_notes.trim() ? [d.free_notes.trim().slice(0, 140)] : []),
+            ];
+            items.push({
+              id: uuid(),
+              order_id: order.id,
+              product_id: product.id,
+              waiter_id: user.id,
+              quantity: d.quantity,
+              unit_price: unitPrice,
+              modifiers_unit_price: mods,
+              total_item_price: computeItemTotal(d.quantity, unitPrice, mods),
+              meat_doneness: d.meat_doneness,
+              notes: noteParts.length ? noteParts.join(' · ') : null,
+              sector: product.sector,
+              // PENDING, mas o KDS só mostra depois que a conta fecha (pago).
+              status: 'PENDING',
+              is_paid: false,
+              origin: user.role === 'KIOSK' ? 'KIOSK' : 'WAITER',
+              created_at: ts,
+              prepared_at: null,
+              canceled_at: null,
+              canceled_by_user_id: null,
+              cancel_reason: null,
+              weight_gross_grams: null,
+              weight_tare_grams: null,
+              weight_source: null,
+              keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
+            });
+          }
+          const recalculated = applyOrderTotals(order, items, []);
+          if (!(recalculated.total_amount > 0)) return fail('Pedido sem valor.');
+          set((s) => {
+            const kegTaps = applyKegSale(s.kegTaps, s.kegTapProducts, items);
+            return {
+              orders: [...s.orders, recalculated],
+              orderItems: [...s.orderItems, ...items],
+              kegTaps,
+              outbox: [
+                ...s.outbox,
+                syncEvent('orders', 'INSERT', recalculated),
+                ...items.map((i) => syncEvent('order_items', 'INSERT', i)),
+                ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
+              ],
+            };
+          });
+          return { ok: true, data: recalculated };
+        },
+
+        voidPickupOrder: (orderId, auth) => {
+          // Cobrança incerta pode ter sido aprovada: cancelar agora sumiria com um pedido pago.
+          if (getReviewHold(orderId)) {
+            return fail('Há uma cobrança sem confirmação nesta senha. Confira o extrato da maquininha antes de cancelar.');
+          }
+          return voidTechnicalSale(orderId, auth, 'KIOSK');
+        },
+
+        exitKioskMode: (auth) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          if (user.role !== 'KIOSK') return fail('Este aparelho não está em modo totem.');
+          if (get().pendingCharges.some((c) => c.user_id === user.id && Date.now() - c.started_at < PENDING_CHARGE_TTL_MS)) {
+            return fail('Há uma cobrança em andamento na maquininha. Aguarde a resposta antes de sair.');
+          }
+          const authRes = authorizeManager(auth, { orderId: null, action: 'KIOSK_EXIT' });
+          if (!authRes.ok) return authRes;
+          const log = buildAudit({
+            order_id: null,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: authRes.data.id,
+            action_type: 'KIOSK_EXIT',
+            amount_impact: 0,
+            reason: auth.reason.trim(),
+            metadata: { device_user: user.name, manager_name: authRes.data.name },
+          });
+          const exitLog: AuditLog = { ...log, whatsapp_alert_sent: false };
+          set((s) => ({
+            currentUserId: null,
+            auditLogs: [exitLog, ...s.auditLogs],
+            outbox: [...s.outbox, syncEvent('audit_logs', 'INSERT', exitLog)],
+          }));
+          return { ok: true, data: undefined };
         },
 
         // ---------------------------------------------------------------------
@@ -2477,6 +2717,7 @@ export const useTcheStore = create<TcheState>()(
           };
           // Balcão da Ficha Rápida (Fase 5) da loja nova.
           const counter = counterTable(tenantId);
+          const kiosk = kioskTable(tenantId);
           set({
             tenant,
             staff: [owner, qrUser],
@@ -2488,7 +2729,7 @@ export const useTcheStore = create<TcheState>()(
             modifierGroups: [],
             modifierOptions: [],
             productModifierGroups: [],
-            tables: [counter],
+            tables: [counter, kiosk],
             orders: [],
             orderItems: [],
             payments: [],
@@ -2509,6 +2750,7 @@ export const useTcheStore = create<TcheState>()(
               syncEvent('staff_users', 'INSERT', qrUser),
               ...terminals.map((t) => syncEvent('pos_terminals', 'INSERT', t)),
               syncEvent('dining_tables', 'INSERT', counter),
+              syncEvent('dining_tables', 'INSERT', kiosk),
               syncEvent('audit_logs', 'INSERT', log),
             ],
             currentUserId: owner.id,
@@ -2556,8 +2798,9 @@ export const useTcheStore = create<TcheState>()(
     },
     {
       name: 'tchefood-state-v1',
-      // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback).
-      version: 3,
+      // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback);
+      // v4 = totem / pedido com senha.
+      version: 4,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -2613,6 +2856,10 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
     for (const key of ['kegTaps', 'kegTapProducts', 'kegHistory', 'eventTickets', 'loyaltyCustomers', 'cashbackLedger'] as const) {
       st[key] = Array.isArray(st[key]) ? st[key] : [];
     }
+  }
+  if (version < 4) {
+    // Totem: comandas ganham os campos de senha (null) e a loja ganha a mesa técnica KIOSK.
+    return migrateToKiosk(st as Partial<TcheState>);
   }
   return st;
 }
