@@ -30,10 +30,9 @@ export const PLANOS: Plano[] = [
     publico: 'Lancherias, cafés, bistrôs e operações de balcão',
     precoMensal: 99,
     destaque: false,
-    limites: ['1 unidade', 'Até 2 maquininhas', 'Garçons ilimitados'],
+    limites: ['1 unidade', 'Garçons ilimitados', 'Sem TEF integrado'],
     recursos: [
       'Comanda no celular do garçom',
-      'Divisão de conta na maquininha',
       'NFC-e automática (SEFAZ-RS)',
       'Cardápio QR Code na mesa',
       'Impressão em bobina 58/80 mm',
@@ -49,6 +48,8 @@ export const PLANOS: Plano[] = [
     limites: ['1 unidade', 'Maquininhas ilimitadas', 'Garçons ilimitados'],
     recursos: [
       'Tudo do Bistrô & Lancheria',
+      'TEF integrado à maquininha Stone ou PagBank',
+      'Rachadinha na maquininha, na mesa',
       'Mapa de mesas e tela de cozinha (KDS)',
       'Cancelamento só com PIN de gerente',
       'Alerta de cancelamento no WhatsApp',

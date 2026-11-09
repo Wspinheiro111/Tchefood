@@ -10,7 +10,9 @@ export default function Planos() {
         <div className="mx-auto max-w-2xl text-center">
           <p className="eyebrow">Planos</p>
           <h2 className="mt-3 text-3xl font-bold sm:text-4xl">Planos transparentes. Garçons ilimitados em todos.</h2>
-          <p className="mt-4 text-slate-400">Sem cobrança por tela, por garçom ou por maquininha extra no salão.</p>
+          <p className="mt-4 text-slate-400">
+            Sem cobrança por tela ou por garçom. TEF integrado à maquininha a partir do plano Churrascaria &amp; Salão Pro.
+          </p>
         </div>
 
         <div className="mt-12 grid gap-6 lg:grid-cols-3">
