@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { BarChart3, Beer, ChefHat, CloudOff, Flame, LayoutGrid, LogOut, QrCode as QrIcon, RefreshCw, Smartphone, Ticket } from 'lucide-react';
+import { BarChart3, Beer, Bike, ChefHat, CloudOff, Flame, LayoutGrid, LogOut, MonitorPlay, QrCode as QrIcon, RefreshCw, Smartphone, Ticket } from 'lucide-react';
 import { isManagerRole, selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
 import { useTerminalBus } from './lib/payments/drivers';
@@ -12,6 +12,8 @@ import { QrMenuScreen } from './screens/QrMenuScreen';
 import { BackOffice } from './screens/BackOffice';
 import { FichaRapidaScreen } from './screens/FichaRapidaScreen';
 import { KegMonitorScreen } from './screens/KegMonitorScreen';
+import { DeliveryScreen } from './screens/DeliveryScreen';
+import { OrderBoardScreen } from './screens/OrderBoardScreen';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
 import { PrintSimulatorModal } from './components/PrintSimulator';
 import { ToastHost, toast } from './components/ui';
@@ -25,9 +27,11 @@ type View =
   | { name: 'qr' }
   | { name: 'ficha' }
   | { name: 'chopp' }
+  | { name: 'delivery' }
+  | { name: 'board' }
   | { name: 'backoffice' };
 
-type NavKey = 'map' | 'kds' | 'ficha' | 'chopp' | 'qr' | 'backoffice';
+type NavKey = 'map' | 'kds' | 'ficha' | 'chopp' | 'qr' | 'delivery' | 'board' | 'backoffice';
 
 const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: UserRole[] }> = [
   { key: 'map', label: 'Mesas', icon: LayoutGrid, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
@@ -35,6 +39,8 @@ const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: U
   { key: 'ficha', label: 'Ficha Rápida', icon: Ticket, roles: ['WAITER', 'CASHIER', 'MANAGER', 'OWNER'] },
   { key: 'chopp', label: 'Chopp', icon: Beer, roles: ['KITCHEN', 'CASHIER', 'MANAGER', 'OWNER'] },
   { key: 'qr', label: 'QR Cliente', icon: QrIcon, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
+  { key: 'delivery', label: 'Delivery', icon: Bike, roles: ['MANAGER', 'OWNER', 'CASHIER'] },
+  { key: 'board', label: 'Painel TV', icon: MonitorPlay, roles: ['MANAGER', 'OWNER', 'CASHIER', 'KITCHEN'] },
   { key: 'backoffice', label: 'Retaguarda', icon: BarChart3, roles: ['MANAGER', 'OWNER', 'CASHIER'] },
 ];
 
@@ -108,6 +114,8 @@ export default function App() {
         {view.name === 'qr' && <QrMenuScreen />}
         {view.name === 'ficha' && <FichaRapidaScreen />}
         {view.name === 'chopp' && <KegMonitorScreen />}
+        {view.name === 'delivery' && <DeliveryScreen />}
+        {view.name === 'board' && <OrderBoardScreen />}
         {view.name === 'backoffice' && (isManagerRole(user.role) || user.role === 'CASHIER' ? <BackOffice /> : <p className="p-6">Acesso restrito.</p>)}
       </main>
 
