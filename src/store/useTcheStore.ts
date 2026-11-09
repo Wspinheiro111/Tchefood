@@ -34,7 +34,7 @@ import type {
   TrayItem,
   UUID,
 } from '../types';
-import { applyOrderTotals, computeItemTotal, round2, round3, toCents } from '../lib/money';
+import { applyOrderTotals, computeItemTotal, halfAndHalfPrice, round2, round3, toCents } from '../lib/money';
 import { nowISO, uuid } from '../lib/ids';
 import { idbStorage } from '../lib/idbStorage';
 import { createSeedData, QR_SELF_SERVICE_USER_ID } from '../data/seed';
@@ -44,6 +44,17 @@ import type { PrinterConfig } from '../services/printer/escposBuilder';
 export const MANAGER_PIN_MAX_ATTEMPTS = 3;
 export const MANAGER_PIN_LOCK_MS = 60_000;
 export const MIN_REASON_LENGTH = 5;
+/** Cobrança na maquininha sem resposta após este tempo é considerada abandonada. */
+export const PENDING_CHARGE_TTL_MS = 5 * 60_000;
+
+/** Cobrança enviada à maquininha e ainda sem resposta: trava a conta até voltar. */
+export interface PendingCharge {
+  request_id: string;
+  order_id: UUID;
+  amount: number;
+  user_id: UUID;
+  started_at: number;
+}
 
 const MANAGER_ROLES: ReadonlyArray<StaffUser['role']> = ['MANAGER', 'OWNER'];
 
@@ -68,6 +79,8 @@ export interface PaymentInput {
   idempotency_key: string;
   /** Modo "por item consumido": itens que serão marcados is_paid = true. */
   item_ids: UUID[];
+  /** request_id da cobrança em andamento na maquininha que originou este pagamento. */
+  charge_request_id?: string | null;
 }
 
 export interface PaymentOutcome {
@@ -112,11 +125,13 @@ interface DeviceSlice {
   nfceSeq: number;
   /** Abre o simulador 80mm vs 58mm a cada despacho para produção. */
   showPrintSimulator: boolean;
+  /** Cobranças em andamento na maquininha (persistidas para sobreviver a recarga). */
+  pendingCharges: PendingCharge[];
 }
 
 interface Actions {
   login: (pin: string) => ActionResult<StaffUser>;
-  logout: () => void;
+  logout: () => ActionResult;
 
   openTable: (tableId: UUID, customerCount: number, customerCpf: string | null) => ActionResult<Order>;
   releaseTable: (tableId: UUID) => ActionResult;
@@ -139,6 +154,11 @@ interface Actions {
   // Fase 2 — fechamento / rachadinha
   startCheckout: (orderId: UUID) => ActionResult;
   registerPayment: (input: PaymentInput) => ActionResult<PaymentOutcome>;
+  /** Reserva a conta enquanto a maquininha processa: bloqueia descontos, cancelamentos e outros pagamentos. */
+  beginTerminalCharge: (orderId: UUID, requestId: string, amount: number) => ActionResult;
+  /** Encerra conta zerada sem nenhum pagamento (tudo cancelado ou 100% de desconto) e libera a mesa. */
+  closeZeroOrder: (orderId: UUID) => ActionResult<Order>;
+  endTerminalCharge: (requestId: string) => void;
 
   // Fase 3 — KDS e QR Code
   advanceItemStatus: (itemId: UUID) => ActionResult<OrderItem>;
@@ -174,6 +194,7 @@ function initialDevice(): DeviceSlice {
     hydrated: false,
     nfceSeq: 1000,
     showPrintSimulator: true,
+    pendingCharges: [],
   };
 }
 
@@ -275,6 +296,101 @@ export const useTcheStore = create<TcheState>()(
         return { ok: true, data: order };
       };
 
+      /** Cobrança em andamento na maquininha para a conta (ignora as abandonadas). */
+      const activeCharge = (orderId: UUID): PendingCharge | null =>
+        get().pendingCharges.find((c) => c.order_id === orderId && Date.now() - c.started_at < PENDING_CHARGE_TTL_MS) ?? null;
+
+      const CHARGE_LOCK_ERROR = 'Há uma cobrança em andamento na maquininha para esta mesa. Aguarde a resposta.';
+
+      /**
+       * Encerra a conta quando o saldo chega a zero com algo já pago: CLOSED,
+       * NFC-e autorizada, itens quitados e mesa livre. Usado tanto pelo
+       * pagamento quanto pelos ajustes autorizados que zeram o saldo.
+       */
+      const settleIfPaid = (
+        s: TcheState,
+        recalculated: Order,
+        orderItems: OrderItem[],
+        ts: string,
+      ): { order: Order; orderItems: OrderItem[]; nfceSeq: number; table: DiningTable | null; closed: boolean } => {
+        if (toCents(recalculated.paid_amount) <= 0 || toCents(recalculated.remaining_balance) !== 0) {
+          return { order: recalculated, orderItems, nfceSeq: s.nfceSeq, table: null, closed: false };
+        }
+        const nfceSeq = s.nfceSeq + 1;
+        const table = s.tables.find((t) => t.id === recalculated.table_id);
+        return {
+          order: {
+            ...recalculated,
+            status: 'CLOSED',
+            closed_at: ts,
+            nfce_status: 'AUTORIZADA',
+            nfce_key: buildAccessKey({ cnpj: s.tenant.cnpj, issuedAt: new Date(ts), number: nfceSeq }),
+          },
+          orderItems: orderItems.map((i) => (i.order_id === recalculated.id && i.status !== 'CANCELED' ? { ...i, is_paid: true } : i)),
+          nfceSeq,
+          table: table ? { ...table, status: 'FREE', current_order_id: null, updated_at: ts } : null,
+          closed: true,
+        };
+      };
+
+      /**
+       * Um ajuste que vai encerrar a conta não pode descartar itens ainda na bandeja:
+       * o operador precisa enviar ou remover antes.
+       */
+      const blocksSettleWithTray = (simulated: Order): string | null =>
+        toCents(simulated.paid_amount) > 0 && toCents(simulated.remaining_balance) === 0 && get().tray.some((t) => t.order_id === simulated.id)
+          ? 'Este ajuste quita a conta, mas há itens na bandeja não enviados. Envie ou remova antes.'
+          : null;
+
+      /** Resultado de um ajuste financeiro: aplica totais e encerra se o saldo zerou. */
+      const commitAdjustment = (
+        s: TcheState,
+        recalculated: Order,
+        orderItems: OrderItem[],
+        changedItems: OrderItem[],
+        log: AuditLog,
+      ): Partial<TcheState> => {
+        const ts = nowISO();
+        const settled = settleIfPaid(s, recalculated, orderItems, ts);
+        const allChanged = settled.closed
+          ? settled.orderItems.filter((i, idx) => i !== s.orderItems[idx])
+          : changedItems;
+        return {
+          orderItems: settled.orderItems,
+          nfceSeq: settled.nfceSeq,
+          orders: s.orders.map((o) => (o.id === recalculated.id ? settled.order : o)),
+          tables: settled.table ? s.tables.map((t) => (t.id === settled.table!.id ? settled.table! : t)) : s.tables,
+          auditLogs: [log, ...s.auditLogs],
+          outbox: [
+            ...s.outbox,
+            ...allChanged.map((i) => syncEvent('order_items', 'UPDATE', i)),
+            syncEvent('orders', 'UPDATE', settled.order),
+            syncEvent('audit_logs', 'INSERT', log),
+            ...(settled.table ? [syncEvent('dining_tables', 'UPDATE', settled.table)] : []),
+          ],
+        };
+      };
+
+      /**
+       * Resolve o meio a meio a partir do cadastro (nunca confia no preço do aparelho):
+       * valida os sabores e aplica a regra de preço configurada.
+       */
+      const resolveHalfAndHalf = (product: Product, halfIds: readonly UUID[]): ActionResult<{ unitPrice: number; note: string | null }> => {
+        if (halfIds.length === 0) return { ok: true, data: { unitPrice: product.price, note: null } };
+        if (!product.allows_half_and_half) return fail(`${product.name} não aceita meio a meio.`);
+        const halves: Product[] = [];
+        for (const id of halfIds) {
+          const h = get().products.find((p) => p.id === id);
+          if (!h || !h.available || !h.allows_half_and_half || h.id === product.id || h.category_id !== product.category_id) {
+            return fail('Sabor do meio a meio inválido.');
+          }
+          halves.push(h);
+        }
+        const unitPrice = halfAndHalfPrice([product.price, ...halves.map((h) => h.price)], get().halfAndHalfPricing);
+        const note = `1/2 ${product.name} + ${halves.map((h) => `1/2 ${h.name}`).join(' + ')}`;
+        return { ok: true, data: { unitPrice, note } };
+      };
+
       const tableLabel = (tableId: UUID): string => get().tables.find((t) => t.id === tableId)?.label ?? '?';
 
       const buildAudit = (
@@ -303,7 +419,14 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: user };
         },
 
-        logout: () => set({ currentUserId: null }),
+        logout: () => {
+          const uid = get().currentUserId;
+          if (get().pendingCharges.some((c) => c.user_id === uid && Date.now() - c.started_at < PENDING_CHARGE_TTL_MS)) {
+            return fail('Há uma cobrança em andamento na maquininha. Aguarde a resposta antes de sair.');
+          }
+          set({ currentUserId: null });
+          return { ok: true, data: undefined };
+        },
 
         openTable: (tableId, customerCount, customerCpf) => {
           const user = currentUser();
@@ -551,6 +674,7 @@ export const useTcheStore = create<TcheState>()(
           const orderRes = findEditableOrder(item.order_id);
           if (!orderRes.ok) return orderRes;
           const order = orderRes.data;
+          if (activeCharge(order.id)) return fail(CHARGE_LOCK_ERROR);
 
           // Simula o novo total antes de autorizar: não pode ficar abaixo do já pago.
           const ts = nowISO();
@@ -567,6 +691,8 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Cancelamento deixaria a conta abaixo do valor já pago. Estorne um pagamento primeiro.');
           }
+          const trayBlock = blocksSettleWithTray(simulated);
+          if (trayBlock) return fail(trayBlock);
 
           const authRes = authorizeManager(auth, { orderId: order.id, action: 'ITEM_CANCELED' });
           if (!authRes.ok) return authRes;
@@ -598,17 +724,7 @@ export const useTcheStore = create<TcheState>()(
             const orderItems = s.orderItems.map((i) => (i.id === itemId ? canceledItem : i));
             const current = s.orders.find((o) => o.id === order.id)!;
             const recalculated = applyOrderTotals(current, orderItems, s.payments);
-            return {
-              orderItems,
-              orders: s.orders.map((o) => (o.id === order.id ? recalculated : o)),
-              auditLogs: [log, ...s.auditLogs],
-              outbox: [
-                ...s.outbox,
-                syncEvent('order_items', 'UPDATE', canceledItem),
-                syncEvent('orders', 'UPDATE', recalculated),
-                syncEvent('audit_logs', 'INSERT', log),
-              ],
-            };
+            return commitAdjustment(s, recalculated, orderItems, [canceledItem], log);
           });
           return { ok: true, data: log };
         },
@@ -618,10 +734,13 @@ export const useTcheStore = create<TcheState>()(
           if (!res.ok) return res;
           const order = res.data;
           if (!order.charge_service_fee) return fail('A taxa de serviço já foi removida.');
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
           const simulated = applyOrderTotals({ ...order, charge_service_fee: false }, get().orderItems, get().payments);
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Remover a taxa deixaria a conta abaixo do valor já pago.');
           }
+          const trayBlock = blocksSettleWithTray(simulated);
+          if (trayBlock) return fail(trayBlock);
           const authRes = authorizeManager(auth, { orderId, action: 'SERVICE_FEE_REMOVED' });
           if (!authRes.ok) return authRes;
           const user = currentUser()!;
@@ -643,11 +762,7 @@ export const useTcheStore = create<TcheState>()(
           set((s) => {
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, charge_service_fee: false }, s.orderItems, s.payments);
-            return {
-              orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
-              auditLogs: [log, ...s.auditLogs],
-              outbox: [...s.outbox, syncEvent('orders', 'UPDATE', recalculated), syncEvent('audit_logs', 'INSERT', log)],
-            };
+            return commitAdjustment(s, recalculated, s.orderItems, [], log);
           });
           return { ok: true, data: log };
         },
@@ -687,12 +802,15 @@ export const useTcheStore = create<TcheState>()(
           const order = res.data;
           const discount = round2(amount);
           if (!(discount > 0)) return fail('Informe um desconto maior que zero.');
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
           const gross = round2(order.subtotal_items + order.service_fee_amount);
           if (toCents(discount) > toCents(gross)) return fail('Desconto maior que o valor da conta.');
           const simulated = applyOrderTotals({ ...order, discount_amount: discount }, get().orderItems, get().payments);
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Desconto deixaria a conta abaixo do valor já pago.');
           }
+          const trayBlock = blocksSettleWithTray(simulated);
+          if (trayBlock) return fail(trayBlock);
           const authRes = authorizeManager(auth, { orderId, action: 'DISCOUNT_APPLIED' });
           if (!authRes.ok) return authRes;
           const user = currentUser()!;
@@ -714,11 +832,7 @@ export const useTcheStore = create<TcheState>()(
           set((s) => {
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, discount_amount: discount }, s.orderItems, s.payments);
-            return {
-              orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
-              auditLogs: [log, ...s.auditLogs],
-              outbox: [...s.outbox, syncEvent('orders', 'UPDATE', recalculated), syncEvent('audit_logs', 'INSERT', log)],
-            };
+            return commitAdjustment(s, recalculated, s.orderItems, [], log);
           });
           return { ok: true, data: log };
         },
@@ -745,11 +859,19 @@ export const useTcheStore = create<TcheState>()(
         },
 
         registerPayment: (input) => {
-          const user = currentUser();
-          if (!user) return fail('Sessão expirada.');
           const res = findEditableOrder(input.orderId);
           if (!res.ok) return res;
           const order = res.data;
+          if (input.status === 'APPROVED' && get().tray.some((t) => t.order_id === order.id)) {
+            return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
+          }
+          const lock = activeCharge(order.id);
+          const fromLockedCharge = Boolean(lock && input.charge_request_id && lock.request_id === input.charge_request_id);
+          if (lock && !fromLockedCharge) return fail(CHARGE_LOCK_ERROR);
+          // A maquininha já cobrou: o pagamento pertence a quem iniciou a cobrança,
+          // mesmo que a sessão tenha mudado nesse meio-tempo.
+          const user = fromLockedCharge ? get().staff.find((u) => u.id === lock!.user_id) ?? null : currentUser();
+          if (!user) return fail('Sessão expirada.');
           const amount = round2(input.amount);
           if (!(amount > 0)) return fail('Valor do pagamento deve ser maior que zero.');
           if (get().payments.some((p) => p.idempotency_key === input.idempotency_key)) {
@@ -797,21 +919,18 @@ export const useTcheStore = create<TcheState>()(
             const current = s.orders.find((o) => o.id === order.id)!;
             let recalculated = applyOrderTotals(current, orderItems, payments);
             const table = s.tables.find((t) => t.id === current.table_id);
-            const closed = input.status === 'APPROVED' && toCents(recalculated.remaining_balance) === 0;
             let nfceSeq = s.nfceSeq;
             let updatedTable: DiningTable | null = null;
-            if (closed) {
-              nfceSeq += 1;
-              orderItems = orderItems.map((i) => (i.order_id === order.id && i.status !== 'CANCELED' ? { ...i, is_paid: true } : i));
-              recalculated = {
-                ...recalculated,
-                status: 'CLOSED',
-                closed_at: ts,
-                nfce_status: 'AUTORIZADA',
-                nfce_key: buildAccessKey({ cnpj: s.tenant.cnpj, issuedAt: new Date(ts), number: nfceSeq }),
-              };
-              if (table) updatedTable = { ...table, status: 'FREE', current_order_id: null, updated_at: ts };
-            } else if (input.status === 'APPROVED') {
+            let closed = false;
+            if (input.status === 'APPROVED') {
+              const settled = settleIfPaid(s, recalculated, orderItems, ts);
+              closed = settled.closed;
+              recalculated = settled.order;
+              orderItems = settled.orderItems;
+              nfceSeq = settled.nfceSeq;
+              updatedTable = settled.table;
+            }
+            if (input.status === 'APPROVED' && !closed) {
               recalculated = { ...recalculated, status: 'PAYING' };
               if (table && table.status !== 'PAYING') updatedTable = { ...table, status: 'PAYING', updated_at: ts };
             }
@@ -821,6 +940,7 @@ export const useTcheStore = create<TcheState>()(
               payments,
               orderItems,
               nfceSeq,
+              pendingCharges: fromLockedCharge ? s.pendingCharges.filter((c) => c.request_id !== input.charge_request_id) : s.pendingCharges,
               orders: s.orders.map((o) => (o.id === order.id ? recalculated : o)),
               tables: updatedTable ? s.tables.map((t) => (t.id === updatedTable!.id ? updatedTable! : t)) : s.tables,
               outbox: [
@@ -834,6 +954,52 @@ export const useTcheStore = create<TcheState>()(
           });
           return { ok: true, data: outcome! };
         },
+
+        beginTerminalCharge: (orderId, requestId, amount) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const res = findEditableOrder(orderId);
+          if (!res.ok) return res;
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (get().tray.some((t) => t.order_id === orderId)) return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
+          const value = round2(amount);
+          if (!(value > 0) || toCents(value) > toCents(res.data.remaining_balance)) return fail('Valor maior que o saldo restante da mesa.');
+          set((s) => ({
+            pendingCharges: [
+              ...s.pendingCharges.filter((c) => c.order_id !== orderId),
+              { request_id: requestId, order_id: orderId, amount: value, user_id: user.id, started_at: Date.now() },
+            ],
+          }));
+          return { ok: true, data: undefined };
+        },
+
+        closeZeroOrder: (orderId) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const res = findEditableOrder(orderId);
+          if (!res.ok) return res;
+          const order = res.data;
+          if (toCents(order.remaining_balance) !== 0 || toCents(order.paid_amount) !== 0) return fail('Só contas zeradas e sem pagamento podem ser encerradas assim.');
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (get().tray.some((t) => t.order_id === orderId)) return fail('Há itens na bandeja não enviados. Envie ou remova antes de encerrar.');
+          const ts = nowISO();
+          const hasItems = get().orderItems.some((i) => i.order_id === orderId && i.status !== 'CANCELED');
+          // Nada consumido: conta cancelada, sem NFC-e. Consumo com 100% de desconto
+          // (já autorizado por gerente): conta fechada, NFC-e fica pendente para o fiscal.
+          const closed: Order = hasItems
+            ? { ...order, status: 'CLOSED', closed_at: ts, nfce_status: 'PENDING' }
+            : { ...order, status: 'CANCELED', closed_at: ts, nfce_status: 'DISPENSADA' };
+          const table = get().tables.find((t) => t.id === order.table_id);
+          const freed: DiningTable | null = table && table.current_order_id === orderId ? { ...table, status: 'FREE', current_order_id: null, updated_at: ts } : null;
+          set((s) => ({
+            orders: s.orders.map((o) => (o.id === orderId ? closed : o)),
+            tables: freed ? s.tables.map((t) => (t.id === freed.id ? freed : t)) : s.tables,
+            outbox: [...s.outbox, syncEvent('orders', 'UPDATE', closed), ...(freed ? [syncEvent('dining_tables', 'UPDATE', freed)] : [])],
+          }));
+          return { ok: true, data: closed };
+        },
+
+        endTerminalCharge: (requestId) => set((s) => ({ pendingCharges: s.pendingCharges.filter((c) => c.request_id !== requestId) })),
 
         advanceItemStatus: (itemId) => {
           const res = get().advanceItems([itemId]);
@@ -922,16 +1088,24 @@ export const useTcheStore = create<TcheState>()(
             }
             const qty = round3(d.quantity);
             if (!(qty > 0)) return fail('Quantidade inválida.');
-            const noteParts = [...d.modifiers.map((m) => `+ ${m.name}`), ...d.quick_tags, ...(d.free_notes.trim() ? [d.free_notes.trim()] : [])];
+            const half = resolveHalfAndHalf(product, d.half_product_ids);
+            if (!half.ok) return half;
+            const unitPrice = half.data.unitPrice;
+            const noteParts = [
+              ...(half.data.note ? [half.data.note] : []),
+              ...d.modifiers.map((m) => `+ ${m.name}`),
+              ...d.quick_tags,
+              ...(d.free_notes.trim() ? [d.free_notes.trim()] : []),
+            ];
             newItems.push({
               id: uuid(),
               order_id: order.id,
               product_id: product.id,
               waiter_id: qrUser.id,
               quantity: qty,
-              unit_price: product.price,
+              unit_price: unitPrice,
               modifiers_unit_price: fromCentsLocal(modsCents),
-              total_item_price: computeItemTotal(qty, product.price, fromCentsLocal(modsCents)),
+              total_item_price: computeItemTotal(qty, unitPrice, fromCentsLocal(modsCents)),
               meat_doneness: d.meat_doneness,
               notes: noteParts.length ? noteParts.join(' · ') : null,
               sector: product.sector,
@@ -1016,7 +1190,9 @@ export const useTcheStore = create<TcheState>()(
         return data as Partial<TcheState>;
       },
       onRehydrateStorage: () => () => {
-        useTcheStore.setState({ hydrated: true });
+        // Com o fallback síncrono (localStorage), este callback roda ainda dentro de
+        // create(), antes de useTcheStore existir; adiamos para depois da atribuição.
+        queueMicrotask(() => useTcheStore.setState({ hydrated: true }));
       },
     },
   ),
