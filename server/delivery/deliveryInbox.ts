@@ -23,6 +23,9 @@ export type DeliveryOrderRecord = {
   // Precisa de olho humano: avisos do pedido, status desconhecido, ação recusada pelo app.
   needsReview: boolean;
   reviewReasons: string[];
+  // false até o aviso de pedido novo (cozinha, KDS, alerta) ter sido tentado. Fica gravado junto do pedido para
+  // que uma falha entre salvar o pedido e salvar o evento não pule o aviso no reprocessamento.
+  newOrderNotified: boolean;
   lastEventAt: string;
   updatedAt: string;
 };
@@ -205,7 +208,6 @@ export class DeliveryInbox {
     const repository = this.options.repository;
     let record = await repository.getOrder(event.channel, event.externalOrderId);
     if (record && (await repository.hasEvent(event.channel, event.externalEventId))) return "duplicate";
-    let isNew = false;
     if (!record) {
       // Primeiro evento deste pedido (normalmente "placed", mas pode ser qualquer um se o PDV ficou fora do ar):
       // busca o detalhe antes de gravar qualquer coisa, para que uma falha aqui deixe o evento sem ack.
@@ -215,11 +217,12 @@ export class DeliveryInbox {
         cancellationPending: false,
         needsReview: order.warnings.length > 0,
         reviewReasons: [...order.warnings],
+        newOrderNotified: false,
         lastEventAt: event.createdAt,
         updatedAt: this.now().toISOString(),
       };
-      isNew = true;
     }
+    const isNew = !record.newOrderNotified;
 
     // Pedido primeiro, histórico depois: se cair entre os dois, o evento é reprocessado, e aplicar o mesmo
     // evento duas vezes dá o mesmo resultado (status só anda para frente).
@@ -234,8 +237,9 @@ export class DeliveryInbox {
       await notify?.(record);
     } catch (error) {
       flag(record, `Aviso do pedido falhou (${describe(error)}): confira impressão e KDS.`);
-      await repository.saveOrder(record);
     }
+    if (isNew) record.newOrderNotified = true;
+    if (isNew || record.needsReview) await repository.saveOrder(record);
     return isNew ? "new_order" : "updated";
   }
 }

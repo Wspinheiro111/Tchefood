@@ -144,6 +144,21 @@ describe("caixa de entrada de delivery", () => {
     expect(record.reviewReasons[0]).toMatch(/impressora offline/);
   });
 
+  it("falha ao gravar o evento depois do pedido não pula o aviso de pedido novo", async () => {
+    const onNewOrder = vi.fn();
+    const { sandbox, repository, inbox } = setup({ onNewOrder });
+    const recordEvent = repository.recordEvent.bind(repository);
+    const spy = vi.spyOn(repository, "recordEvent").mockRejectedValueOnce(new Error("banco fora do ar"));
+    const id = sandbox.placeOrder({ items: ITEMS });
+    const [first] = await inbox.runCycle();
+    expect(first).toMatchObject({ acknowledged: 0, deferred: 1, newOrders: [] });
+    expect(onNewOrder).not.toHaveBeenCalled();
+    spy.mockImplementation(recordEvent);
+    const [second] = await inbox.runCycle();
+    expect(second).toMatchObject({ acknowledged: 1, newOrders: [id] });
+    expect(onNewOrder).toHaveBeenCalledOnce();
+  });
+
   it("app fora do ar não derruba o ciclo", async () => {
     const { sandbox, inbox } = setup();
     sandbox.failNext("events:polling", 500);
