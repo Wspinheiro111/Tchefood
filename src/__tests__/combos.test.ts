@@ -74,6 +74,15 @@ describe('combo na mesa', () => {
     expect(inserts.map((e) => e.row_id)).toEqual(items.map((i) => i.id));
   });
 
+  it('opção do combo com tamanho de chopp baixa esse volume, não o padrão da torneira', () => {
+    const orderId = openTable();
+    const drink = seedId('mo:combo-bebida:201');
+    useTcheStore.setState((s) => ({ modifierOptions: s.modifierOptions.map((o) => (o.id === drink ? { ...o, volume_ml: 1000 } : o)) }));
+    const [, , chopp] = launchCombo(orderId) as OrderItem[];
+    expect(chopp!.product_id).toBe(product('201').id);
+    expect(chopp!.keg_volume_ml).toBe(1000);
+  });
+
   it('duas unidades do combo: cada componente sai em dobro', () => {
     const orderId = openTable();
     const [parent, ...children] = launchCombo(orderId, 2) as [OrderItem, ...OrderItem[]];

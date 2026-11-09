@@ -80,7 +80,7 @@ export function expandComboItem(
   if (!comps.ok) return comps;
   const parent: OrderItem = { ...item, sector: 'NONE', status: 'DELIVERED', keg_volume_ml: null, combo_parent_item_id: null };
   const label = `Combo ${product.name}${item.notes ? ` · ${item.notes}` : ''}`;
-  const children = comps.data.map(({ product: comp, quantity }): OrderItem => ({
+  const children = comps.data.map(({ product: comp, quantity, option }): OrderItem => ({
     ...item,
     id: uuid(),
     product_id: comp.id,
@@ -91,7 +91,8 @@ export function expandComboItem(
     meat_doneness: comp.requires_meat_doneness ? item.meat_doneness : null,
     notes: label,
     sector: comp.sector,
-    keg_volume_ml: resolveKegVolume(comp.id, [], ctx.kegTapProducts, ctx.modifierOptions),
+    // A opção do combo pode trazer o tamanho do chopp (volume_ml); sem ele vale o padrão da torneira.
+    keg_volume_ml: resolveKegVolume(comp.id, [{ option_id: option.id }], ctx.kegTapProducts, ctx.modifierOptions),
     combo_parent_item_id: parent.id,
   }));
   return { ok: true, data: [parent, ...children] };
