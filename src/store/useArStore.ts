@@ -92,7 +92,7 @@ export const useArStore = create<ArState>()(
         const main = useTcheStore.getState();
         const error = validateArModel(draft, main.products);
         if (error) return fail(error);
-        const existing = get().arModels.find((m) => m.product_id === draft.product_id);
+        const existing = get().arModels.find((m) => m.product_id === draft.product_id && m.tenant_id === main.tenant.id);
         if (draft.id && existing && existing.id !== draft.id) return fail('Este produto já tem outro modelo 3D.');
         const now = nowISO();
         const row: ProductArModel = {
@@ -156,6 +156,6 @@ export const useArStore = create<ArState>()(
 );
 
 /** Modelo ativo do produto, para o cardápio do cliente. */
-export function selectActiveArModel(s: Pick<ArState, 'arModels'>, productId: UUID): ProductArModel | undefined {
-  return s.arModels.find((m) => m.product_id === productId && m.active);
+export function selectActiveArModel(s: Pick<ArState, 'arModels'>, productId: UUID, tenantId: UUID = useTcheStore.getState().tenant.id): ProductArModel | undefined {
+  return s.arModels.find((m) => m.product_id === productId && m.active && m.tenant_id === tenantId);
 }

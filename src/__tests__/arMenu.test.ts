@@ -194,3 +194,12 @@ describe('cardápio AR: fila da nuvem', () => {
     expect(req.headers.Prefer).toMatch(/ignore-duplicates/);
   });
 });
+
+describe('cardápio AR: loja nova no mesmo aparelho', () => {
+  it('modelo de outra loja não aparece no cardápio', () => {
+    ar().ensureDemoModel();
+    const pizza = product(AR_DEMO_PRODUCT_CODE).id;
+    expect(selectActiveArModel(ar(), pizza)).toBeDefined();
+    expect(selectActiveArModel(ar(), pizza, 'outra-loja')).toBeUndefined();
+  });
+});

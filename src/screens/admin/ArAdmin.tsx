@@ -54,8 +54,12 @@ async function publishToCloud(model: ProductArModel, files: { glb?: Blob | null;
 
 export function ArAdmin() {
   const products = useTcheStore((s) => s.products);
-  const models = useArStore((s) => s.arModels);
-  const events = useArStore((s) => s.arEvents);
+  const tenantId = useTcheStore((s) => s.tenant.id);
+  const allModels = useArStore((s) => s.arModels);
+  const allEvents = useArStore((s) => s.arEvents);
+  // O store do 3D é do aparelho: depois de "começar loja nova", os dados da loja anterior ficam de fora.
+  const models = useMemo(() => allModels.filter((m) => m.tenant_id === tenantId), [allModels, tenantId]);
+  const events = useMemo(() => allEvents.filter((e) => e.tenant_id === tenantId), [allEvents, tenantId]);
   const ensureDemoModel = useArStore((s) => s.ensureDemoModel);
   const [editing, setEditing] = useState<Product | null>(null);
   const [q, setQ] = useState('');
