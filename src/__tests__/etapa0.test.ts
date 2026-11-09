@@ -655,6 +655,13 @@ describe('sincronização com o Supabase', () => {
     const res = await flushOutbox([keg, tapUpd], cfg, fetchFn);
     expect(res.rejected.map((r) => r.eventId)).toEqual(['k']);
     expect(res.sent).toEqual([]);
+    // O chopp vendido depois espera a troca: no banco ele baixaria o barril velho.
+    const chopp = ev({ id: 'c', table: 'order_items', row_id: 'I1', payload: { id: 'I1', order_id: 'O1', keg_volume_ml: 300 }, keg_tap_id: 'T1' });
+    const otherTap = ev({ id: 'd', table: 'order_items', row_id: 'I2', payload: { id: 'I2', order_id: 'O2', keg_volume_ml: 300 }, keg_tap_id: 'T2' });
+    const later = await flushOutbox([chopp, otherTap], cfg, fetchFn, 50, [keg]);
+    expect(later.sent).toEqual(['d']);
+    // A torneira fica fora do que vai para o banco.
+    expect(JSON.parse(buildSyncRequest(chopp, cfg).body!)).not.toHaveProperty('keg_tap_id');
   });
 
   it('RPC que devolve null (PIN não confere no servidor) é recusa, segura a comanda e o resto segue', async () => {

@@ -371,6 +371,10 @@ export function recordKeys(event: SyncEvent): string[] {
   // Barril encerrado: a troca segura as mudanças seguintes da torneira (leitura,
   // desperdício, o barril novo), para nenhuma subir por cima de uma troca recusada.
   if (event.table === 'keg_history' && typeof event.payload.tap_id === 'string') keys.push(`keg_taps:${event.payload.tap_id}`);
+  // Item de chopp: o banco baixa o barril engatado na hora em que o item chega, então
+  // ele espera a troca de barril recusada da mesma torneira (senão o volume iria para o
+  // barril velho e o reenvio da troca gravaria números errados no histórico).
+  if (event.table === 'order_items' && typeof event.keg_tap_id === 'string') keys.push(`keg_taps:${event.keg_tap_id}`);
   // Mudança que depende de uma operação da comanda sem apontar para ela no registro:
   // a liberação da mesa no fechamento, o consumo do cashback no resgate.
   order(event.depends_on_order_id);

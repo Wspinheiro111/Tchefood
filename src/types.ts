@@ -622,6 +622,11 @@ export interface SyncEvent {
    * (manager_pin) e grava histórico, audit_log e barril novo juntos.
    */
   keg_change?: KegChangeSync;
+  /**
+   * Item de chopp: a torneira de onde sai. Segura o item atrás de uma troca de barril
+   * recusada da mesma torneira (recordKeys). Não vai para o banco.
+   */
+  keg_tap_id?: UUID;
   /** Só no proprietário da loja nova: sobe por tchefood_start_store, com o usuário do QR. */
   store_start?: StoreStartSync;
   /**

@@ -537,6 +537,17 @@ function syncEvent(table: SyncEvent['table'], op: SyncEvent['op'], row: { id: UU
 }
 
 /**
+ * Evento de item. O item de chopp leva a torneira (keg_tap_id): no banco ele baixa o
+ * barril engatado (tchefood_keg_on_item), então não pode subir antes de uma troca de
+ * barril recusada da mesma torneira, senão o volume cairia no barril velho.
+ */
+function itemEvent(op: SyncEvent['op'], item: OrderItem, links: readonly KegTapProduct[]): SyncEvent {
+  const ev = syncEvent('order_items', op, item);
+  const link = item.keg_volume_ml ? links.find((l) => l.product_id === item.product_id) : undefined;
+  return link ? { ...ev, keg_tap_id: link.tap_id } : ev;
+}
+
+/**
  * Salvar de novo a mesma pessoa/permissão substitui o que a nuvem não pode aceitar
  * daquele registro. O evento novo leva o estado completo da linha, então:
  *  - qualquer evento RECUSADO do mesmo registro sai dos recusados (o servidor não
@@ -826,7 +837,7 @@ export const useTcheStore = create<TcheState>()(
             ...s.outbox,
             // O audit_log sobe antes: o banco recusa o ajuste sem a autorização já gravada.
             managerAuthEvent(log, managerPin),
-            ...allChanged.map((i) => syncEvent('order_items', 'UPDATE', i)),
+            ...allChanged.map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
             syncEvent('orders', 'UPDATE', settled.order),
             ...(settled.table ? [tableEventForOrder(settled.table, recalculated.id)] : []),
           ],
@@ -909,7 +920,7 @@ export const useTcheStore = create<TcheState>()(
               // As autorizações sobem antes, pela RPC que confere o PIN: o banco só aceita
               // o cancelamento de cada item com o audit_log dele já gravado.
               ...logs.map((l) => managerAuthEvent(l, auth.managerPin)),
-              ...[...canceled.values()].map((i) => syncEvent('order_items', 'UPDATE', i)),
+              ...[...canceled.values()].map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
               syncEvent('orders', 'UPDATE', updated),
               ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
             ],
@@ -1198,7 +1209,7 @@ export const useTcheStore = create<TcheState>()(
               tray: s.tray.filter((t) => t.order_id !== orderId),
               outbox: [
                 ...s.outbox,
-                ...newItems.map((i) => syncEvent('order_items', 'INSERT', i)),
+                ...newItems.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
                 ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
                 syncEvent('orders', 'UPDATE', recalculated),
                 ...(updatedTable ? [syncEvent('dining_tables', 'UPDATE', updatedTable)] : []),
@@ -1217,7 +1228,7 @@ export const useTcheStore = create<TcheState>()(
           const updated: OrderItem = { ...item, status: 'DELIVERED' };
           set((s) => ({
             orderItems: s.orderItems.map((i) => (i.id === itemId ? updated : i)),
-            outbox: [...s.outbox, syncEvent('order_items', 'UPDATE', updated)],
+            outbox: [...s.outbox, itemEvent('UPDATE', updated, s.kegTapProducts)],
           }));
           return { ok: true, data: undefined };
         },
@@ -1513,7 +1524,7 @@ export const useTcheStore = create<TcheState>()(
               outbox: [
                 ...s.outbox,
                 syncEvent('payments', 'INSERT', payment),
-                ...changedItems.map((i) => syncEvent('order_items', 'UPDATE', i)),
+                ...changedItems.map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
                 syncEvent('orders', 'UPDATE', recalculated),
                 ...(updatedTable ? [tableEventForOrder(updatedTable, order.id)] : []),
               ],
@@ -1667,7 +1678,7 @@ export const useTcheStore = create<TcheState>()(
           const byId = new Map(updated.map((u) => [u.id, u]));
           set((s) => ({
             orderItems: s.orderItems.map((i) => byId.get(i.id) ?? i),
-            outbox: [...s.outbox, ...updated.map((u) => syncEvent('order_items', 'UPDATE', u))],
+            outbox: [...s.outbox, ...updated.map((u) => itemEvent('UPDATE', u, s.kegTapProducts))],
           }));
           return { ok: true, data: updated };
         },
@@ -1797,7 +1808,7 @@ export const useTcheStore = create<TcheState>()(
               outbox: [
                 ...s.outbox,
                 ...(newOrder ? [syncEvent('orders', 'INSERT', recalculated)] : [syncEvent('orders', 'UPDATE', recalculated)]),
-                ...newItems.map((i) => syncEvent('order_items', 'INSERT', i)),
+                ...newItems.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
                 syncEvent('dining_tables', 'UPDATE', updatedTable),
                 ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
               ],
@@ -1956,7 +1967,7 @@ export const useTcheStore = create<TcheState>()(
               outbox: [
                 ...s.outbox,
                 syncEvent('orders', 'INSERT', recalculated),
-                ...items.map((i) => syncEvent('order_items', 'INSERT', i)),
+                ...items.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
                 ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
               ],
             };
@@ -2042,7 +2053,7 @@ export const useTcheStore = create<TcheState>()(
               outbox: [
                 ...s.outbox,
                 syncEvent('event_tickets', 'UPDATE', redeemed),
-                ...(delivered ? [syncEvent('order_items', 'UPDATE', delivered)] : []),
+                ...(delivered ? [itemEvent('UPDATE', delivered, s.kegTapProducts)] : []),
               ],
             };
           });
@@ -2166,7 +2177,7 @@ export const useTcheStore = create<TcheState>()(
               outbox: [
                 ...s.outbox,
                 syncEvent('orders', 'INSERT', recalculated),
-                ...items.map((i) => syncEvent('order_items', 'INSERT', i)),
+                ...items.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
                 ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
               ],
             };

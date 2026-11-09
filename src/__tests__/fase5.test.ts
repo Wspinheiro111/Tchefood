@@ -63,6 +63,9 @@ describe('barril de chopp', () => {
     const [caneca] = launchChopp(orderId, 2, size('caneca'));
     expect(caneca!.keg_volume_ml).toBe(1000);
     expect(tap(1).billed_volume_ml).toBe(before + 2000);
+    // O item sobe marcado com a torneira (espera uma troca de barril recusada dela).
+    const insert = st().outbox.find((e) => e.table === 'order_items' && e.row_id === caneca!.id)!;
+    expect(insert.keg_tap_id).toBe(tap(1).id);
 
     // Cancelado antes de servir: volta para o barril.
     expect(st().cancelOrderItem(caneca!.id, MANAGER).ok).toBe(true);
