@@ -75,6 +75,8 @@ export function KioskScreen() {
   const logoTaps = useRef<number[]>([]);
 
   const activeCat = catId || cats[0]?.id || '';
+  // Pedido já criado e ainda não pago: os itens ficaram travados na primeira tentativa de pagamento.
+  const pendingOrder = order && order.status === 'PAYING' ? order : null;
   const list = sellable.filter((p) => p.category_id === activeCat);
 
   const clearCart = cart.clear;
@@ -128,7 +130,7 @@ export function KioskScreen() {
 
   /** Cria o pedido uma vez só (reaproveitado nas novas tentativas de pagamento). */
   const ensureOrder = (): Order | null => {
-    if (order && order.status === 'PAYING') return order;
+    if (pendingOrder) return pendingOrder;
     const r = useTcheStore.getState().createPickupOrder({ lines: cart.toInput(), fulfillment, customerName: name });
     if (!r.ok) {
       toast.error(r.error);
@@ -168,7 +170,7 @@ export function KioskScreen() {
     cart.addSimple(p);
   };
 
-  const showCartBar = step.name === 'menu' && cart.count > 0;
+  const showCartBar = step.name === 'menu' && cart.count > 0 && !pendingOrder;
 
   return (
     <div className="fixed inset-0 z-40 flex select-none flex-col bg-[#fff8ef] text-neutral-900">
@@ -308,7 +310,10 @@ export function KioskScreen() {
         {step.name === 'pay' && (
           <div className="mx-auto flex h-full max-w-3xl flex-col justify-center gap-5 p-5">
             <div className="flex items-center gap-3">
-              <button aria-label="Voltar ao pedido" onClick={() => setStep({ name: 'cart' })} className="grid h-14 w-14 place-items-center rounded-full bg-white shadow"><ArrowLeft className="h-7 w-7" /></button>
+              {/* Depois que o pedido foi criado (tentativa recusada) ele não muda mais: só a forma de pagamento. */}
+              {!pendingOrder && (
+                <button aria-label="Voltar ao pedido" onClick={() => setStep({ name: 'cart' })} className="grid h-14 w-14 place-items-center rounded-full bg-white shadow"><ArrowLeft className="h-7 w-7" /></button>
+              )}
               <div>
                 <h1 className="text-3xl font-black">Como você quer pagar?</h1>
                 <div className="text-xl text-neutral-500">Total <b className="tabular-nums text-neutral-900">{formatBRL(order?.status === 'PAYING' ? order.remaining_balance : cart.total)}</b></div>

@@ -4,6 +4,7 @@ import { brasiliaDate, formatPickupNumber, kioskStage, nextPickupNumber, pickupR
 import { buildBoard, pickupBoardEntries } from '../lib/orderBoard';
 import { chargePickupOrder } from '../lib/pickupCharge';
 import { KIOSK_TABLE_ID } from '../data/seed';
+import { clearReviewHold, setReviewHold } from '../lib/payments/reviewHolds';
 import type { Order } from '../types';
 
 const st = () => useTcheStore.getState();
@@ -138,6 +139,23 @@ describe('pedido com senha no totem', () => {
     expect(pay.waiter_id).toBe(st().staff.find((u) => u.pin_code === '5555')!.id);
     expect(st().orders.find((x) => x.id === o.id)!.status).toBe('CLOSED');
     expect((await chargePickupOrder({ orderId: o.id, method: 'CASH', chassis: 'STONE' })).status).toBe('ERROR');
+  });
+
+  it('cobrança incerta na maquininha trava também o dinheiro até conferir o extrato', async () => {
+    const o = kioskOrder();
+    setReviewHold({ order_id: o.id, amount: o.remaining_balance, reason: 'Sem NSU', code: 'NO_NSU' });
+    try {
+      st().logout();
+      expect(st().login('5555').ok).toBe(true);
+      const r = await chargePickupOrder({ orderId: o.id, method: 'CASH', chassis: 'STONE', cashGiven: 100 });
+      expect(r.status).toBe('MANUAL_REVIEW');
+      expect(st().payments.some((p) => p.order_id === o.id)).toBe(false);
+      expect(st().orders.find((x) => x.id === o.id)!.status).toBe('PAYING');
+      clearReviewHold(o.id);
+      expect((await chargePickupOrder({ orderId: o.id, method: 'CASH', chassis: 'STONE' })).status).toBe('APPROVED');
+    } finally {
+      clearReviewHold(o.id);
+    }
   });
 
   it('dinheiro a menos que o total é recusado', async () => {

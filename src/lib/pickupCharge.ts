@@ -36,6 +36,10 @@ export async function chargePickupOrder(params: {
   const idempotency_key = uuid();
   const label = `Senha ${formatPickupNumber(order.pickup_number)}`;
 
+  // Cobrança incerta na maquininha trava QUALQUER novo pagamento (inclusive dinheiro) até o operador
+  // conferir o extrato: se a maquininha tiver cobrado, receber de novo seria cobrança em dobro.
+  if (getReviewHold(order.id)) return { status: 'MANUAL_REVIEW', reason: 'Há uma cobrança sem confirmação. Confira o extrato da maquininha antes de receber de novo.' };
+
   if (params.method === 'CASH') {
     const given = round2(params.cashGiven ?? 0);
     if (given > 0 && toCents(given) < toCents(amount)) return { status: 'ERROR', reason: 'Valor recebido menor que o total.' };
@@ -45,7 +49,6 @@ export async function chargePickupOrder(params: {
     return { status: 'APPROVED', change: given > amount ? round2(given - amount) : 0 };
   }
 
-  if (getReviewHold(order.id)) return { status: 'MANUAL_REVIEW', reason: 'Há uma cobrança sem confirmação. Confira o extrato da maquininha antes de cobrar de novo.' };
   const driver = createDriver({ terminal: null, chassis: params.chassis, mode: 'SMARTPOS_EMBEDDED' });
   const req: ChargeRequest = {
     request_id: uuid(),

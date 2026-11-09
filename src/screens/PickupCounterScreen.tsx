@@ -287,10 +287,10 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
         </div>
       )}
 
-      {hold && method !== 'CASH' ? (
+      {hold ? (
         <div className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
           <p className="mb-2 font-bold text-ouro">⚠️ {hold.reason}</p>
-          <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de tentar de novo.</p>
+          <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de receber de novo, em qualquer forma de pagamento.</p>
           <Btn variant="secondary" block onClick={() => { clearReviewHold(orderId); setHold(null); }}>Conferi no extrato: não foi cobrado</Btn>
         </div>
       ) : (
