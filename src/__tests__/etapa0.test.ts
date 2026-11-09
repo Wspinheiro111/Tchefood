@@ -622,6 +622,41 @@ describe('sincronização com o Supabase', () => {
     expect(() => buildSyncRequest(ev({ table: 'audit_logs', payload: authLog() }), cfg)).toThrow(/PIN/);
   });
 
+  it('saída do totem e cobrança pelo comprovante sobem pela RPC; só cancelamento, desconto e 10% passam à frente da comanda', () => {
+    for (const action_type of ['KIOSK_EXIT', 'CHARGE_CONFIRMED_MANUALLY', 'KEG_CHANGED']) {
+      expect(buildSyncRequest(ev({ table: 'audit_logs', payload: authLog({ action_type }), manager_pin: '9999' }), cfg).url).toContain('/rpc/tchefood_authorize_manager');
+    }
+    const at = '2026-11-09T19:00:00.000Z';
+    const pay = ev({ id: 'p', table: 'payments', row_id: 'P1', payload: { id: 'P1', order_id: 'O1' }, created_at: at });
+    const close = ev({ id: 'c', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1', status: 'CLOSED' }, created_at: at });
+    const charge = ev({ id: 'a', table: 'audit_logs', row_id: 'A1', payload: authLog({ action_type: 'CHARGE_CONFIRMED_MANUALLY' }), manager_pin: '9999', created_at: at });
+    expect(serverOrder([pay, close, charge]).map((e) => e.id)).toEqual(['p', 'c', 'a']);
+    const discount = { ...charge, payload: authLog() };
+    expect(serverOrder([pay, close, discount]).map((e) => e.id)).toEqual(['p', 'a', 'c']);
+  });
+
+  it('troca de barril sobe inteira por tchefood_change_keg e segura a torneira se for recusada', async () => {
+    const history = { id: 'H1', tap_id: 'T1', kicked_by_user_id: 'U1', kicked_at: '2026-11-09T19:00:00.000Z', authorized_by_manager_id: 'M1' };
+    const keg = ev({
+      id: 'k', table: 'keg_history', row_id: 'H1', payload: history, manager_pin: '9999',
+      keg_change: { audit_id: 'A9', beer_name: 'IPA 30L', total_capacity_ml: 30000, keg_cost: 390, reason: 'Barril secou' },
+    });
+    const req = buildSyncRequest(keg, cfg);
+    expect(req.url).toBe('https://abc.supabase.co/rest/v1/rpc/tchefood_change_keg');
+    expect(JSON.parse(req.body!)).toEqual({
+      p_history_id: 'H1', p_audit_id: 'A9', p_tap_id: 'T1', p_beer_name: 'IPA 30L', p_capacity_ml: 30000, p_keg_cost: 390,
+      p_performed_by: 'U1', p_manager_pin: '9999', p_reason: 'Barril secou', p_kicked_at: '2026-11-09T19:00:00.000Z',
+    });
+    expect(() => buildSyncRequest({ ...keg, manager_pin: undefined }, cfg)).toThrow(/PIN do gerente/);
+    // A coluna gerada do barril nunca sobe (o banco recusa qualquer valor nela).
+    const tapUpd = ev({ id: 't', table: 'keg_taps', op: 'UPDATE', row_id: 'T1', payload: { id: 'T1', billed_volume_ml: 0, remaining_volume_ml: 30000 } });
+    expect(JSON.parse(buildSyncRequest(tapUpd, cfg).body!)).toEqual({ id: 'T1', billed_volume_ml: 0 });
+    const fetchFn: FetchLike = async (url) => (url.includes('/rpc/') ? { ok: true, status: 200, text: async () => 'null' } : { ok: true, status: 200, text: async () => '[{}]' });
+    const res = await flushOutbox([keg, tapUpd], cfg, fetchFn);
+    expect(res.rejected.map((r) => r.eventId)).toEqual(['k']);
+    expect(res.sent).toEqual([]);
+  });
+
   it('RPC que devolve null (PIN não confere no servidor) é recusa, segura a comanda e o resto segue', async () => {
     const auth = ev({ id: 'a', table: 'audit_logs', row_id: 'A1', payload: authLog(), manager_pin: '0000', created_at: '2026-11-09T19:00:00.000Z' });
     const upd = ev({ id: 'u', table: 'orders', op: 'UPDATE', row_id: 'O1', payload: { id: 'O1', discount_amount: 10 }, created_at: '2026-11-09T19:00:00.000Z' });

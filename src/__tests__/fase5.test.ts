@@ -100,6 +100,13 @@ describe('barril de chopp', () => {
     expect(tap(1).remaining_volume_ml).toBe(30000);
     expect(st().kegHistory[0]!.billed_volume_ml).toBe(2600);
     expect(st().auditLogs[0]!.action_type).toBe('KEG_CHANGED');
+    // Na fila: a troca inteira num evento (com o PIN para o servidor) e o barril novo.
+    const queued = st().outbox.slice(-2);
+    expect(queued.map((e) => `${e.table}/${e.op}`)).toEqual(['keg_history/INSERT', 'keg_taps/UPDATE']);
+    expect(queued[0]).toMatchObject({
+      manager_pin: '9999',
+      keg_change: { audit_id: st().auditLogs[0]!.id, beer_name: 'Pilsen 30L', total_capacity_ml: 30000, keg_cost: 320, reason: 'Barril secou' },
+    });
   });
 });
 

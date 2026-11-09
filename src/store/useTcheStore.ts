@@ -1636,7 +1636,9 @@ export const useTcheStore = create<TcheState>()(
               manager_name: manager.name,
             },
           });
-          set((s) => ({ auditLogs: [log, ...s.auditLogs], outbox: [...s.outbox, syncEvent('audit_logs', 'INSERT', log)] }));
+          // Sobe por tchefood_authorize_manager, depois do pagamento: o servidor confere o
+          // PIN e que o pagamento com este NSU já está na conta.
+          set((s) => ({ auditLogs: [log, ...s.auditLogs], outbox: [...s.outbox, managerAuthEvent(log, auth.managerPin)] }));
           clearReviewHold(order.id);
           return pay;
         },
@@ -2202,7 +2204,7 @@ export const useTcheStore = create<TcheState>()(
           set((s) => ({
             currentUserId: null,
             auditLogs: [exitLog, ...s.auditLogs],
-            outbox: [...s.outbox, syncEvent('audit_logs', 'INSERT', exitLog)],
+            outbox: [...s.outbox, managerAuthEvent(exitLog, auth.managerPin)],
           }));
           return { ok: true, data: undefined };
         },
@@ -2306,10 +2308,16 @@ export const useTcheStore = create<TcheState>()(
             kegTaps: s.kegTaps.map((t) => (t.id === tapId ? updated : t)),
             kegHistory: [history, ...s.kegHistory],
             auditLogs: [{ ...log, whatsapp_alert_sent: false }, ...s.auditLogs],
+            // A troca sobe inteira por tchefood_change_keg (histórico + audit_log + barril
+            // novo), com o PIN para o servidor conferir. O UPDATE da torneira vem depois
+            // e fica segurado se a troca for recusada (recordKeys).
             outbox: [
               ...s.outbox,
-              syncEvent('keg_history', 'INSERT', history),
-              syncEvent('audit_logs', 'INSERT', log),
+              {
+                ...syncEvent('keg_history', 'INSERT', history),
+                manager_pin: auth.managerPin,
+                keg_change: { audit_id: log.id, beer_name: beer, total_capacity_ml: capacity, keg_cost: cost, reason: auth.reason.trim() },
+              },
               syncEvent('keg_taps', 'UPDATE', updated),
             ],
           }));
@@ -3022,7 +3030,8 @@ export const useTcheStore = create<TcheState>()(
           if (!rejected) return fail('Evento recusado não encontrado.');
           const ev = rejected.event;
           const p = ev.payload;
-          if (ev.table !== 'audit_logs' || typeof p.authorized_by_manager_id !== 'string') {
+          const kegChange = ev.table === 'keg_history' && ev.keg_change != null;
+          if (!kegChange && (ev.table !== 'audit_logs' || typeof p.authorized_by_manager_id !== 'string')) {
             return fail('Este evento não espera PIN de gerente.');
           }
           if (!/^[0-9]{4}$/.test(managerPin)) return fail('O PIN tem 4 dígitos.');

@@ -11,9 +11,12 @@
  *  - Os demais são upsert pelo id (merge-duplicates).
  *  - Segredos da loja (token Focus, CSC) e a situação fiscal da comanda
  *    (nfce_status, nfce_key) nunca saem do aparelho por aqui: o servidor é a fonte deles.
- *  - A autorização de gerente (cancelamento, desconto, remoção dos 10%) NÃO é
- *    gravada direto em audit_logs: o banco só aceita esse registro vindo de
- *    tchefood_authorize_manager(), que confere o PIN de novo. A fila chama essa RPC.
+ *  - A autorização de gerente (cancelamento, desconto, remoção dos 10%, cobrança
+ *    incerta pelo comprovante, saída do totem) NÃO é gravada direto em audit_logs:
+ *    o banco só aceita esse registro vindo de tchefood_authorize_manager(), que
+ *    confere o PIN de novo. A fila chama essa RPC.
+ *  - A troca de barril sobe inteira por tchefood_change_keg() (histórico, audit_log e
+ *    barril novo), que também confere o PIN do gerente.
  *  - Equipe (staff_users), permissões (role_permissions) e a loja nova também não são
  *    gravadas direto: o banco não deixa o aparelho escrever nelas. Sobem pelas funções
  *    tchefood_save_staff, tchefood_set_role_permission e tchefood_start_store, que
@@ -51,15 +54,31 @@ const CONFLICT_KEY: Partial<Record<SyncEvent['table'], string>> = {
 const INSERT_ONLY: ReadonlyArray<SyncEvent['table']> = ['payments', 'audit_logs'];
 
 /** Ações que o banco só aceita pela RPC que confere o PIN (ver tchefood_authorize_manager). */
-export const RPC_AUTHORIZED_ACTIONS: ReadonlyArray<string> = ['ITEM_CANCELED', 'SERVICE_FEE_REMOVED', 'DISCOUNT_APPLIED'];
+export const RPC_AUTHORIZED_ACTIONS: ReadonlyArray<string> = [
+  'ITEM_CANCELED',
+  'SERVICE_FEE_REMOVED',
+  'DISCOUNT_APPLIED',
+  'CHARGE_CONFIRMED_MANUALLY',
+  'KIOSK_EXIT',
+  // Só a fila gravada antes de a troca de barril subir por tchefood_change_keg.
+  'KEG_CHANGED',
+];
+/** Autorizações que destravam uma atualização da comanda no banco (ver serverOrder). */
+const ORDER_UNLOCKING_ACTIONS: ReadonlyArray<string> = ['ITEM_CANCELED', 'SERVICE_FEE_REMOVED', 'DISCOUNT_APPLIED'];
 const AUTHORIZE_RPC = 'tchefood_authorize_manager';
+const CHANGE_KEG_RPC = 'tchefood_change_keg';
 const SAVE_STAFF_RPC = 'tchefood_save_staff';
 const SET_PERMISSION_RPC = 'tchefood_set_role_permission';
 const START_STORE_RPC = 'tchefood_start_store';
 
 /** Eventos que sobem por função do servidor que confere PIN e responde null quando ele não confere. */
 export function isPinCheckedRpc(event: SyncEvent): boolean {
-  return isManagerAuthorization(event) || event.table === 'staff_users' || event.table === 'role_permissions';
+  return isManagerAuthorization(event) || isKegChange(event) || event.table === 'staff_users' || event.table === 'role_permissions';
+}
+
+/** Barril encerrado de uma troca de barril que sobe por tchefood_change_keg. */
+export function isKegChange(event: SyncEvent): boolean {
+  return event.table === 'keg_history' && event.op === 'INSERT' && event.keg_change != null;
 }
 
 /** audit_log de autorização de gerente que precisa subir pela RPC. */
@@ -81,6 +100,9 @@ const NEVER_UPLOAD: Partial<Record<SyncEvent['table'], ReadonlyArray<string>>> =
   orders: ['nfce_status', 'nfce_key', 'subtotal_items', 'service_fee_amount', 'total_amount', 'paid_amount', 'remaining_balance'],
   // Ordem de gravação dada pelo banco (GENERATED ALWAYS): o banco recusaria o valor.
   audit_logs: ['server_seq'],
+  // Coluna gerada no banco (capacidade − faturado − desperdício): o banco recusa
+  // qualquer valor nela, e toda mudança de barril (leitura, desperdício, troca) caía.
+  keg_taps: ['remaining_volume_ml'],
 };
 
 export function sanitizePayload(event: SyncEvent): Record<string, unknown> {
@@ -119,6 +141,26 @@ function buildAuthorizeRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
       p_metadata: metadata,
     }),
   };
+}
+
+function buildKegChangeRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
+  const k = event.keg_change!;
+  if (!event.manager_pin) {
+    throw new Error('Troca de barril sem PIN para o servidor conferir. Em Nuvem, digite o PIN do gerente neste evento recusado e toque em Reenviar recusados.');
+  }
+  const p = event.payload;
+  return rpcRequest(cfg, CHANGE_KEG_RPC, {
+    p_history_id: event.row_id,
+    p_audit_id: k.audit_id,
+    p_tap_id: p.tap_id,
+    p_beer_name: k.beer_name,
+    p_capacity_ml: k.total_capacity_ml,
+    p_keg_cost: k.keg_cost,
+    p_performed_by: p.kicked_by_user_id,
+    p_manager_pin: event.manager_pin,
+    p_reason: k.reason,
+    p_kicked_at: p.kicked_at ?? null,
+  });
 }
 
 function rpcRequest(cfg: SyncConfig, fn: string, args: Record<string, unknown>): SyncRequest {
@@ -179,6 +221,7 @@ function buildPermissionRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest 
 
 export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   if (isManagerAuthorization(event)) return buildAuthorizeRequest(event, cfg);
+  if (isKegChange(event)) return buildKegChangeRequest(event, cfg);
   if (event.table === 'staff_users') return buildStaffRequest(event, cfg);
   if (event.table === 'role_permissions') return buildPermissionRequest(event, cfg);
   const root = `${cfg.url.replace(/\/+$/, '')}/rest/v1/${event.table}`;
@@ -281,7 +324,8 @@ export function serverOrder(events: SyncEvent[]): SyncEvent[] {
     // Só a autorização de gerente destrava uma atualização; outro audit_log (ex.: a
     // volta dos 10%) sobe exatamente onde está, porque a ordem de gravação no banco
     // (server_seq) decide qual registro de 10% é o último.
-    const orderId = isManagerAuthorization(ev) ? (ev.payload.order_id as string | null | undefined) : null;
+    const unlocks = isManagerAuthorization(ev) && ORDER_UNLOCKING_ACTIONS.includes(String(ev.payload.action_type));
+    const orderId = unlocks ? (ev.payload.order_id as string | null | undefined) : null;
     if (!orderId) continue;
     // Só atravessa as atualizações da MESMA ação (gravadas no mesmo instante, no máximo
     // item + comanda). Uma operação anterior, com a sua própria autorização, nunca é ultrapassada.
@@ -324,6 +368,9 @@ export function recordKeys(event: SyncEvent): string[] {
   if (ORDER_CHILDREN.includes(event.table)) order(event.payload.order_id);
   // Mesa: a situação dela segue a comanda em current_order_id (ocupada/aguardando conta).
   if (event.table === 'dining_tables') order(event.payload.current_order_id);
+  // Barril encerrado: a troca segura as mudanças seguintes da torneira (leitura,
+  // desperdício, o barril novo), para nenhuma subir por cima de uma troca recusada.
+  if (event.table === 'keg_history' && typeof event.payload.tap_id === 'string') keys.push(`keg_taps:${event.payload.tap_id}`);
   // Mudança que depende de uma operação da comanda sem apontar para ela no registro:
   // a liberação da mesa no fechamento, o consumo do cashback no resgate.
   order(event.depends_on_order_id);
@@ -392,7 +439,7 @@ export async function flushOutbox(
     if (res.ok) {
       // A RPC responde null quando o PIN não confere no servidor (ou está bloqueado):
       // nada foi autorizado, e a atualização da comanda que vem depois seria recusada.
-      if (isManagerAuthorization(event) && !isUuidResponse(text)) {
+      if ((isManagerAuthorization(event) || isKegChange(event)) && !isUuidResponse(text)) {
         reject(event, res.status, 'O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).');
         continue;
       }

@@ -283,8 +283,9 @@ function CloudLogin() {
   );
 }
 
-/** Autorização de gerente recusada: fila antiga sem PIN, ou PIN que mudou antes de subir. */
+/** Autorização de gerente (ou troca de barril) recusada: fila antiga sem PIN, ou PIN que mudou antes de subir. */
 function needsManagerPin(e: SyncEvent): boolean {
+  if (e.table === 'keg_history') return e.keg_change != null;
   return e.table === 'audit_logs' && typeof e.payload.authorized_by_manager_id === 'string';
 }
 
