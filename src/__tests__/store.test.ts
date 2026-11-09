@@ -174,3 +174,77 @@ describe('fase 3 — KDS e QR Code', () => {
     expect(table(4).status).toBe('WAITING_BILL');
   });
 });
+
+describe('revisão — ajustes que zeram o saldo, cobrança em andamento e meio a meio no QR', () => {
+  const cash = (orderId: string, amount: number, key: string) =>
+    st().registerPayment({ orderId, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: key, item_ids: [] });
+  const auth = { managerPin: '9999', reason: 'Cliente reclamou do atendimento' };
+
+  it('remover os 10% depois de pagar o valor dos itens fecha a conta e libera a mesa', () => {
+    const id = openFreshTable(1);
+    launch(id, '311'); // 1 item, subtotal fixo
+    st().dispatchTray(id);
+    const o0 = st().orders.find((x) => x.id === id)!;
+    expect(cash(id, o0.subtotal_items, 'k1').ok).toBe(true);
+    const r = st().removeServiceFee(id, auth);
+    expect(r.ok).toBe(true);
+    const o = st().orders.find((x) => x.id === id)!;
+    expect(o.remaining_balance).toBe(0);
+    expect(o.status).toBe('CLOSED');
+    expect(o.nfce_key).toHaveLength(44);
+    expect(table(1).status).toBe('FREE');
+    expect(st().orderItems.filter((i) => i.order_id === id).every((i) => i.is_paid)).toBe(true);
+  });
+
+  it('desconto e cancelamento que zeram o saldo também fecham a conta', () => {
+    const id = openFreshTable(3);
+    launch(id, '311');
+    launch(id, '311');
+    st().dispatchTray(id);
+    const o0 = st().orders.find((x) => x.id === id)!;
+    expect(cash(id, round2(o0.total_amount - 5), 'k2').ok).toBe(true);
+    expect(st().applyDiscount(id, 5, auth).ok).toBe(true);
+    expect(st().orders.find((x) => x.id === id)!.status).toBe('CLOSED');
+    expect(table(3).status).toBe('FREE');
+  });
+
+  it('ajuste sem nada pago não fecha a conta', () => {
+    const id = openFreshTable(6);
+    launch(id, '311');
+    st().dispatchTray(id);
+    expect(st().removeServiceFee(id, auth).ok).toBe(true);
+    expect(st().orders.find((x) => x.id === id)!.status).not.toBe('CLOSED');
+  });
+
+  it('cobrança em andamento na maquininha trava desconto, outros pagamentos e logout, e grava o aprovado', () => {
+    const id = openFreshTable(8);
+    launch(id, '311');
+    st().dispatchTray(id);
+    const o0 = st().orders.find((x) => x.id === id)!;
+    expect(st().beginTerminalCharge(id, 'req-1', o0.remaining_balance).ok).toBe(true);
+    expect(st().applyDiscount(id, 1, auth).ok).toBe(false);
+    expect(st().removeServiceFee(id, auth).ok).toBe(false);
+    expect(cash(id, 1, 'k3').ok).toBe(false);
+    expect(st().logout().ok).toBe(false);
+    const r = st().registerPayment({
+      orderId: id, amount: o0.remaining_balance, method: 'CREDIT', status: 'APPROVED', terminal_id: null, acquirer: 'STONE', acquirer_cnpj: '16501555000157',
+      card_brand: 'VISA', nsu: '123456', authorization_code: 'A1B2C3', terminal_serial: 'SN', idempotency_key: 'k4', item_ids: [], charge_request_id: 'req-1',
+    });
+    expect(r.ok && r.data.closed).toBe(true);
+    expect(st().pendingCharges).toHaveLength(0);
+    expect(st().logout().ok).toBe(true);
+  });
+
+  it('QR Code grava preço e sabores do meio a meio pela regra configurada', () => {
+    const calabresa = product('401');
+    const portuguesa = product('402');
+    st().setHalfAndHalfPricing('HIGHEST');
+    const r = st().qrPlaceOrder(table(4).id, [{ product_id: calabresa.id, half_product_ids: [portuguesa.id], quantity: 1, unit_price: calabresa.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: calabresa.sector }]);
+    expect(r.ok).toBe(true);
+    const item = r.ok ? r.data.items[0]! : null;
+    expect(item?.unit_price).toBe(74.9);
+    expect(item?.notes).toContain('1/2 Pizza Portuguesa');
+    const bad = st().qrPlaceOrder(table(4).id, [{ product_id: calabresa.id, half_product_ids: [product('311').id], quantity: 1, unit_price: 1, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: calabresa.sector }]);
+    expect(bad.ok).toBe(false);
+  });
+});
