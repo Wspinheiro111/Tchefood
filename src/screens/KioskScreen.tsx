@@ -16,7 +16,7 @@ import {
   TriangleAlert,
   UtensilsCrossed,
 } from 'lucide-react';
-import { BrandMark } from '../components/Brand';
+import { BrandLogo, BrandMark } from '../components/Brand';
 import { useTcheStore } from '../store/useTcheStore';
 import type { FulfillmentType, Order, Product } from '../types';
 import { computeItemTotal, formatBRL } from '../lib/money';
@@ -423,8 +423,8 @@ function Welcome({ name, onStart, onLogo }: { name: string; onStart: () => void;
     <div className="relative flex h-full flex-col items-center justify-between overflow-hidden bg-gradient-to-b from-brasa to-[#7f1d1d] p-8 text-white" onClick={onStart}>
       <div className="pointer-events-none absolute -right-24 -top-24 h-96 w-96 rounded-full bg-ouro/30 blur-3xl" />
       <div className="pointer-events-none absolute -bottom-32 -left-24 h-96 w-96 rounded-full bg-orange-400/30 blur-3xl" />
-      <button aria-label="Logo" onClick={(e) => { e.stopPropagation(); onLogo(); }} className="relative mt-6 grid h-28 w-28 place-items-center rounded-[2rem] bg-white p-3 shadow-xl">
-        <BrandMark className="h-full w-full" />
+      <button aria-label="Logo" onClick={(e) => { e.stopPropagation(); onLogo(); }} className="relative mt-6 rounded-[2rem] bg-white px-8 py-4 shadow-xl">
+        <BrandLogo className="h-24 w-auto sm:h-28" />
       </button>
       <div className="relative text-center">
         <div className="text-2xl font-bold uppercase tracking-[0.3em] text-orange-200">Bem-vindo ao</div>
@@ -448,6 +448,7 @@ function Welcome({ name, onStart, onLogo }: { name: string; onStart: () => void;
 function DoneScreen({ order, paid, onFinish }: { order: Order; paid: boolean; onFinish: () => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-6 p-6 text-center">
+      <BrandLogo className="h-16 w-auto" />
       <CheckCircle2 className={`h-20 w-20 ${paid ? 'text-emerald-600' : 'text-ouro'}`} />
       <h1 className="text-4xl font-black">{paid ? 'Pedido confirmado!' : 'Pedido anotado!'}</h1>
       <div className="rounded-[2.5rem] border-4 border-neutral-900 bg-white px-14 py-8 shadow-xl">

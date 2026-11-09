@@ -9,6 +9,7 @@ import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { Badge, Btn, Sheet, Stepper, toast } from '../components/ui';
 import { SECTOR_LABEL } from './OrderScreen';
 import { NfceViewer } from './NfceViewer';
+import { BrandLogo } from '../components/Brand';
 
 export const ITEM_STATUS_STYLE: Record<ItemStatus, { label: string; cls: string }> = {
   PENDING: { label: 'Na fila', cls: 'bg-slate-600 text-white' },
@@ -51,6 +52,13 @@ export function StatementPanel({ orderId, onCheckout }: { orderId: string; onChe
 
   return (
     <div className="flex-1 px-3 pb-10 pt-3">
+      <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-slate-700 bg-surface px-3 py-2">
+        <BrandLogo variant="dark" className="h-10 w-auto" />
+        <div className="text-right text-sm leading-tight">
+          <div className="font-black">Extrato da conta</div>
+          <div className="text-slate-400">{table.label}</div>
+        </div>
+      </div>
       {closed && (
         <div className="mb-3 rounded-xl border border-stone bg-stone/10 p-3">
           <div className="font-bold text-stone">Conta encerrada · NFC-e {order.nfce_status}</div>

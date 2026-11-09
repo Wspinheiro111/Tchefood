@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { BellRing, Minus, Plus, Receipt, ShoppingBag, Trash2, UtensilsCrossed } from 'lucide-react';
+import { BellRing, Minus, Plus, Receipt, ShoppingBag, Trash2 } from 'lucide-react';
 import { useSalePrice } from '../lib/useSalePrice';
 import { QR_PRICE_CHANGED, useTcheStore } from '../store/useTcheStore';
 import type { Product } from '../types';
@@ -11,6 +11,7 @@ import { CategoryIcon } from './OrderScreen';
 import { ITEM_STATUS_STYLE } from './StatementPanel';
 import { playDispatchChime } from '../lib/sound';
 import { printDispatchedItems } from '../components/PrintSimulator';
+import { BrandLogo } from '../components/Brand';
 
 interface CartLine extends ProductDraft {
   key: string;
@@ -126,7 +127,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
         <div className="text-xs opacity-90">{s.tenant.name}</div>
         <div className="flex items-center justify-between">
           <div className="text-2xl font-black">{table.label}</div>
-          <UtensilsCrossed className="h-6 w-6" />
+          <span className="rounded-xl bg-white px-2 py-1 shadow"><BrandLogo className="h-8 w-auto" /></span>
         </div>
         <div className="mt-2 grid grid-cols-2 gap-1 rounded-xl bg-black/20 p-1 text-sm font-bold">
           <button onClick={() => setTab('menu')} className={`min-h-touch rounded-lg ${tab === 'menu' ? 'bg-white text-rose-700' : ''}`}>Cardápio</button>

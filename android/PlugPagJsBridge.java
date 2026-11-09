@@ -2,6 +2,7 @@ package food.tche.smartpos;
 
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -164,7 +165,9 @@ public final class PlugPagJsBridge {
         paint.setTextSize(PAPER_WIDTH_PX / 32f / 0.6f);
         Paint.FontMetrics fm = paint.getFontMetrics();
         int lineHeight = (int) Math.ceil(fm.descent - fm.ascent);
-        int height = Math.max(lineHeight, lines.length * lineHeight) + lineHeight;
+        Bitmap logo = loadBrandLogo();
+        int logoHeight = logo == null ? 0 : logo.getHeight() + lineHeight;
+        int height = Math.max(lineHeight, lines.length * lineHeight) + lineHeight + logoHeight;
         Bitmap bitmap = Bitmap.createBitmap(PAPER_WIDTH_PX, height, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
         canvas.drawColor(Color.WHITE);
@@ -173,6 +176,12 @@ public final class PlugPagJsBridge {
             canvas.drawText(line, 0, y, paint);
             y += lineHeight;
         }
+        if (logo != null) {
+            // Logo oficial do Tchê Food centralizada ao final do cupom.
+            float top = y - (-fm.ascent) + lineHeight;
+            canvas.drawBitmap(logo, Math.max(0, (PAPER_WIDTH_PX - logo.getWidth()) / 2f), top, null);
+            logo.recycle();
+        }
         File file = File.createTempFile("tchefood-print-", ".png", appContext.getCacheDir());
         try (FileOutputStream out = new FileOutputStream(file)) {
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, out);
@@ -180,6 +189,24 @@ public final class PlugPagJsBridge {
             bitmap.recycle();
         }
         return file;
+    }
+
+    /**
+     * Logo em 1 bit (assets/tchefood-logo-print.png, 360 px de largura). Se o asset faltar
+     * ou não abrir, imprime só o texto: a logo nunca impede o comprovante.
+     */
+    private Bitmap loadBrandLogo() {
+        try (java.io.InputStream in = appContext.getAssets().open("tchefood-logo-print.png")) {
+            Bitmap raw = BitmapFactory.decodeStream(in);
+            if (raw == null) return null;
+            if (raw.getWidth() <= PAPER_WIDTH_PX) return raw;
+            int h = Math.round(raw.getHeight() * (PAPER_WIDTH_PX / (float) raw.getWidth()));
+            Bitmap scaled = Bitmap.createScaledBitmap(raw, PAPER_WIDTH_PX, h, false);
+            raw.recycle();
+            return scaled;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private static JSONObject toJson(PlugPagTransactionResult r) {
