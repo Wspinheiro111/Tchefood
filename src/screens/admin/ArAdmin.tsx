@@ -189,6 +189,8 @@ function ArModelEditor({ product, model, onClose }: { product: Product; model: P
     const v = linkInput.trim();
     if (!/^https:\/\/\S+\.glb(\?\S*)?$/i.test(v)) return setError('O link precisa ser https e terminar em .glb.');
     setError(null);
+    // Mesmo link já na prévia: o 3D não recarrega nem mede de novo, então a medida fica.
+    if (!glbFile && v === glbUrl) return;
     setInfo(null);
     setGlbFile(null);
     setGlbPreview(null);
