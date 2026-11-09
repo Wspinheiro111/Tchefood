@@ -530,6 +530,11 @@ function syncEvent(table: SyncEvent['table'], op: SyncEvent['op'], row: { id: UU
   };
 }
 
+/** Mesa mudada pelo pagamento ou fechamento de uma comanda: o envio dela depende daquela comanda. */
+function tableEventForOrder(table: DiningTable, orderId: UUID): SyncEvent {
+  return { ...syncEvent('dining_tables', 'UPDATE', table), depends_on_order_id: orderId };
+}
+
 /**
  * audit_log de autorização de gerente para a fila: leva o PIN digitado para o servidor
  * conferir de novo (tchefood_authorize_manager). O PIN não entra no audit_log.
@@ -795,7 +800,7 @@ export const useTcheStore = create<TcheState>()(
             managerAuthEvent(log, managerPin),
             ...allChanged.map((i) => syncEvent('order_items', 'UPDATE', i)),
             syncEvent('orders', 'UPDATE', settled.order),
-            ...(settled.table ? [syncEvent('dining_tables', 'UPDATE', settled.table)] : []),
+            ...(settled.table ? [tableEventForOrder(settled.table, recalculated.id)] : []),
           ],
         };
       };
@@ -1482,7 +1487,7 @@ export const useTcheStore = create<TcheState>()(
                 syncEvent('payments', 'INSERT', payment),
                 ...changedItems.map((i) => syncEvent('order_items', 'UPDATE', i)),
                 syncEvent('orders', 'UPDATE', recalculated),
-                ...(updatedTable ? [syncEvent('dining_tables', 'UPDATE', updatedTable)] : []),
+                ...(updatedTable ? [tableEventForOrder(updatedTable, order.id)] : []),
               ],
             };
           });
@@ -1528,7 +1533,7 @@ export const useTcheStore = create<TcheState>()(
           set((s) => ({
             orders: s.orders.map((o) => (o.id === orderId ? closed : o)),
             tables: freed ? s.tables.map((t) => (t.id === freed.id ? freed : t)) : s.tables,
-            outbox: [...s.outbox, syncEvent('orders', 'UPDATE', closed), ...(freed ? [syncEvent('dining_tables', 'UPDATE', freed)] : [])],
+            outbox: [...s.outbox, syncEvent('orders', 'UPDATE', closed), ...(freed ? [tableEventForOrder(freed, orderId)] : [])],
           }));
           return { ok: true, data: closed };
         },

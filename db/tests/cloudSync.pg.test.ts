@@ -282,6 +282,13 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     expect(Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'`))).toBe(failsBefore + 2);
     // Gerente não promove ninguém a proprietário, nem com o próprio PIN de gerente.
     expect((await save({ p_role: 'OWNER', p_pin: CASHIER_PIN })).body).toMatch(/só o proprietário/);
+    // Perfil é conferido antes da unicidade do PIN: com PIN já usado ou livre, a
+    // resposta é a mesma (o gerente não descobre quais PINs existem).
+    const newOwner = { p_staff_id: crypto.randomUUID(), p_name: 'Sócio', p_role: 'OWNER' };
+    const taken = (await save({ ...newOwner, p_pin: OWNER_PIN })).body;
+    const free = (await save({ ...newOwner, p_pin: '3719' })).body;
+    expect(taken).toMatch(/só o proprietário/);
+    expect(free).toBe(taken);
     // Garçom (sem STAFF_MANAGE) não cadastra, mesmo com PIN de gerente.
     const waiter = ok(st().saveStaff({ name: 'Garçom Caio', role: 'WAITER', pin_code: '6815', active: true }));
     await expectSynced('garçom');
@@ -290,6 +297,11 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     expect(
       (await save({ p_staff_id: owner.id, p_name: owner.name, p_role: 'OWNER', p_pin: owner.pin_code, p_active: false, p_actor_id: owner.id, p_actor_pin: owner.pin_code, p_manager_pin: MANAGER_PIN })).body,
     ).toMatch(/próprio acesso|proprietário ativo/);
+    // PIN novo que já é de outra pessoa (todos os outros PINs certos): responde null
+    // como PIN errado, sem mensagem própria, e conta no bloqueio (é a 3ª falha).
+    expect(await save({ p_pin: OWNER_PIN })).toEqual({ status: 200, body: 'null' });
+    expect(sql(`SELECT reason FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED' ORDER BY created_at DESC LIMIT 1`)).toBe('PIN novo recusado pelo servidor');
+    expect(Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'`))).toBe(failsBefore + 3);
     // Permissão: só o proprietário, e com PIN de gerente/proprietário.
     const perm = (over: Record<string, unknown>) =>
       rpc('tchefood_set_role_permission', { p_role: 'WAITER', p_permission: 'STAFF_MANAGE', p_allowed: true, p_actor_id: owner.id, p_actor_pin: owner.pin_code, p_manager_pin: MANAGER_PIN, p_reason: 'Teste de trava', ...over });

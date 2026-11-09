@@ -612,6 +612,12 @@ export interface SyncEvent {
   staff_auth?: StaffSyncAuth;
   /** Só no proprietário da loja nova: sobe por tchefood_start_store, com o usuário do QR. */
   store_start?: StoreStartSync;
+  /**
+   * Só na mesa mudada pelo pagamento ou fechamento da conta (inclusive liberada, já
+   * sem current_order_id): a comanda de que essa mudança depende. Se o pagamento ou a autorização daquela
+   * comanda for recusado, a mesa fica segurada junto e não aparece livre na nuvem.
+   */
+  depends_on_order_id?: UUID;
 }
 
 export interface StaffSyncAuth {

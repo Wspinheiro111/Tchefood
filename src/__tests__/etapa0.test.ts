@@ -599,6 +599,39 @@ describe('sincronização com o Supabase', () => {
     expect((await flushOutbox([pay, item, otherPay], cfg, fetchFn, 50, [held])).sent).toEqual(['q']);
   });
 
+  it('pagamento recusado segura a mesa: ela não aparece livre na nuvem', async () => {
+    login(CASHIER);
+    const opened = st().openTable(table(1).id, 1, null);
+    if (!opened.ok) throw new Error(opened.error);
+    const orderId = opened.data.id;
+    const p = product('311');
+    const added = st().addToTray({ order_id: orderId, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector });
+    if (!added.ok) throw new Error(added.error);
+    const sentTray = st().dispatchTray(orderId);
+    if (!sentTray.ok) throw new Error(sentTray.error);
+    const total = st().orders.find((o) => o.id === orderId)!.remaining_balance;
+    const paid = st().registerPayment({ orderId, amount: total, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'mesa-livre', item_ids: [] });
+    if (!paid.ok) throw new Error(paid.error);
+    expect(paid.data.closed).toBe(true);
+    const freed = st().outbox.filter((e) => e.table === 'dining_tables' && e.row_id === table(1).id).pop()!;
+    expect(freed.payload.current_order_id).toBeNull();
+    expect(freed.depends_on_order_id).toBe(orderId);
+    expect(buildSyncRequest(freed, cfg).body).not.toContain('depends_on_order_id');
+
+    const payEvent = st().outbox.find((e) => e.table === 'payments' && e.payload.order_id === orderId)!;
+    const fetchFn: FetchLike = async (url) =>
+      url.includes('/payments') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
+    const tail = st().outbox.slice(st().outbox.indexOf(payEvent));
+    const r = await flushOutbox(tail, cfg, fetchFn);
+    expect(r.rejected.map((x) => x.eventId)).toEqual([payEvent.id]);
+    expect(r.sent).not.toContain(freed.id);
+    // Rodada seguinte, com o pagamento nos recusados: a mesa continua esperando.
+    const next = await flushOutbox([freed], cfg, fetchFn, 50, [payEvent]);
+    expect(next.sent).toEqual([]);
+    // Sem nada recusado, a mesa sobe.
+    expect((await flushOutbox([freed], cfg, fetchFn)).sent).toEqual([freed.id]);
+  });
+
   it('eventos segurados não gastam o limite da rodada', async () => {
     const fetchFn: FetchLike = async () => ({ ok: true, status: 204, text: async () => '' });
     const held = ev({ id: 'h', table: 'products', op: 'UPDATE', row_id: 'P', payload: { id: 'P' } });

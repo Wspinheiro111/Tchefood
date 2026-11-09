@@ -21,7 +21,9 @@
 --  3. Gerente não cadastra nem altera gerente/proprietário; ninguém desativa a si
 --     mesmo nem muda o próprio perfil; a loja nunca fica sem proprietário ativo.
 --  4. PIN novo ou trocado: 4 dígitos, sem sequência nem dígitos repetidos, único na loja.
---     O PIN nunca vai para o audit_log.
+--     O PIN nunca vai para o audit_log. A unicidade só é conferida depois de todas
+--     as regras de perfil e do PIN de gerente, e uma colisão conta no bloqueio
+--     como tentativa errada (sem mensagem própria), para não virar oráculo de PIN.
 --  5. Permissão por perfil: só o proprietário muda, com PIN de gerente/proprietário
 --     e motivo. O aparelho não grava mais role_permissions direto.
 --  6. Loja nova: só numa loja da nuvem ainda sem equipe. Cria o proprietário, o
@@ -180,17 +182,13 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_EQUIPE: sem permissão para cadastrar equipe.';
     END IF;
 
-    -- 2) Validações do cadastro (validateStaff).
+    -- 2) Validações do cadastro (validateStaff) e de quem pode mexer em quem.
+    --    Tudo isto vem antes de olhar se o PIN novo já existe na equipe: quem não
+    --    pode cadastrar aquele perfil nunca chega a perguntar ao banco por PINs.
     IF NOT v_is_new AND v_existing.pin_code = tchefood_qr_self_service_pin() THEN
         RAISE EXCEPTION 'TCHEFOOD_EQUIPE: o usuário do cardápio QR é técnico e não é editado.';
     END IF;
     IF length(v_name) < 2 OR length(v_name) > 100 THEN RAISE EXCEPTION 'TCHEFOOD_EQUIPE: nome entre 2 e 100 letras.'; END IF;
-    IF (v_is_new OR v_existing.pin_code <> p_pin) AND NOT tchefood_valid_new_pin(p_pin) THEN
-        RAISE EXCEPTION 'TCHEFOOD_EQUIPE: PIN deve ter 4 dígitos, sem sequência nem dígitos repetidos.';
-    END IF;
-    IF EXISTS (SELECT 1 FROM staff_users u WHERE u.tenant_id = v_tenant AND u.pin_code = p_pin AND u.id <> p_staff_id) THEN
-        RAISE EXCEPTION 'TCHEFOOD_EQUIPE: este PIN já é usado por outra pessoa da equipe.';
-    END IF;
     v_self := NOT v_is_new AND v_existing.id = v_actor.id;
     IF v_actor.role <> 'OWNER' AND NOT v_self THEN
         IF p_role IN ('OWNER', 'MANAGER') THEN
@@ -208,6 +206,9 @@ BEGIN
        AND NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.tenant_id = v_tenant AND u.role = 'OWNER' AND u.active AND u.id <> v_existing.id) THEN
         RAISE EXCEPTION 'TCHEFOOD_EQUIPE: a loja precisa de ao menos um proprietário ativo.';
     END IF;
+    IF (v_is_new OR v_existing.pin_code <> p_pin) AND NOT tchefood_valid_new_pin(p_pin) THEN
+        RAISE EXCEPTION 'TCHEFOOD_EQUIPE: PIN deve ter 4 dígitos, sem sequência nem dígitos repetidos.';
+    END IF;
 
     -- 3) PIN de gerente para o que não é só o próprio PIN.
     v_own_pin_only := v_self AND v_changes = ARRAY['STAFF_PIN_CHANGED'];
@@ -224,6 +225,18 @@ BEGIN
         v_reason := format('Cadastro de %s como %s.', v_name, p_role);
     ELSE
         v_reason := 'Cadastro atualizado.';
+    END IF;
+
+    -- 4) PIN novo repetido. Saber que um PIN "já existe" ajuda a adivinhar o PIN
+    --    de outra pessoa, então a colisão conta no bloqueio como uma tentativa
+    --    errada (MANAGER_PIN_FAILED, que fica gravado: NULL em vez de erro) e não
+    --    tem mensagem própria. O app já recusa PIN repetido antes de enfileirar;
+    --    aqui só chega por corrida entre aparelhos ou requisição forjada.
+    IF EXISTS (SELECT 1 FROM staff_users u WHERE u.tenant_id = v_tenant AND u.pin_code = p_pin AND u.id <> p_staff_id) THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES (v_tenant, NULL, v_actor.id, 'MANAGER_PIN_FAILED', 'PIN novo recusado pelo servidor',
+                jsonb_build_object('attempted_action', v_action, 'pin_of', 'new_pin'));
+        RETURN NULL;
     END IF;
 
     IF v_is_new THEN
