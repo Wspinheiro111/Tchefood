@@ -4,13 +4,13 @@ export default {
   theme: {
     extend: {
       colors: {
-        base: '#0f172a',
-        surface: '#1e293b',
+        base: '#ffffff', // fundo branco do sistema (tema claro)
+        surface: '#f8fafc', // cartões e barras sobre o fundo branco
         brasa: '#D2232A', // vermelho oficial da marca
         verde: '#0B7A3B', // verde oficial da marca
         amarelo: '#FFCB05', // amarelo oficial da marca
-        ouro: '#f59e0b',
-        stone: '#10b981',
+        ouro: '#FFCB05', // destaque = amarelo da marca (fundo; texto de destaque usa brasa)
+        stone: '#0B7A3B', // sucesso = verde da marca
         pagbank: '#eab308',
       },
       minHeight: { touch: '48px', 'touch-lg': '56px' },

@@ -43,25 +43,25 @@ export function PrinterSettings() {
   return (
     <div>
       <div className="mb-3 flex items-center justify-between gap-2">
-        <p className="text-sm text-slate-400">Cada praça imprime no formato da sua bobina: 80mm = 48 colunas com guilhotina, 58mm = 32 colunas com serrilha.</p>
+        <p className="text-sm text-slate-500">Cada praça imprime no formato da sua bobina: 80mm = 48 colunas com guilhotina, 58mm = 32 colunas com serrilha.</p>
         <Btn onClick={() => setEditing(blank())}><Plus className="h-5 w-5" /> Nova impressora</Btn>
       </div>
       <div className="grid gap-3 md:grid-cols-2">
         {printers.map((p) => {
           const Icon = CONN_ICON[p.connection];
           return (
-            <div key={p.id} className={`rounded-2xl border bg-surface p-4 ${p.active ? 'border-slate-700' : 'border-dashed border-slate-700 opacity-60'}`}>
+            <div key={p.id} className={`rounded-2xl border bg-surface p-4 ${p.active ? 'border-slate-200' : 'border-dashed border-slate-200 opacity-60'}`}>
               <div className="mb-2 flex items-start justify-between gap-2">
                 <div>
-                  <div className="flex items-center gap-2 font-bold"><Printer className="h-5 w-5 text-ouro" /> {p.name}</div>
-                  <div className="text-xs text-slate-400">{BRAND_PRESETS[p.brand].label} {p.model}</div>
+                  <div className="flex items-center gap-2 font-bold"><Printer className="h-5 w-5 text-brasa" /> {p.name}</div>
+                  <div className="text-xs text-slate-500">{BRAND_PRESETS[p.brand].label} {p.model}</div>
                 </div>
-                <Badge className={p.paperWidth === '80MM' ? 'bg-ouro text-slate-950' : 'bg-slate-600'}>{p.paperWidth === '80MM' ? '80mm · 48 col' : '58mm · 32 col'}</Badge>
+                <Badge className={p.paperWidth === '80MM' ? 'bg-ouro text-slate-950' : 'bg-slate-300'}>{p.paperWidth === '80MM' ? '80mm · 48 col' : '58mm · 32 col'}</Badge>
               </div>
               <div className="mb-3 space-y-1 text-sm">
                 <div>{SECTOR_LABEL[p.sector]}</div>
-                <div className="flex items-center gap-1 text-slate-300"><Icon className="h-4 w-4" /> {p.connection === 'NETWORK_TCP' ? `${p.ipAddress}:${p.port ?? 9100}` : p.connection === 'BLUETOOTH' ? p.macAddress : 'Bobina interna'}</div>
-                <div className="text-xs text-slate-400">{p.beepOnPrint ? 'Sirene ligada' : 'Sem sirene'} · {p.cutPaper ? 'Guilhotina automática' : 'Serrilha manual'}</div>
+                <div className="flex items-center gap-1 text-slate-700"><Icon className="h-4 w-4" /> {p.connection === 'NETWORK_TCP' ? `${p.ipAddress}:${p.port ?? 9100}` : p.connection === 'BLUETOOTH' ? p.macAddress : 'Bobina interna'}</div>
+                <div className="text-xs text-slate-500">{p.beepOnPrint ? 'Sirene ligada' : 'Sem sirene'} · {p.cutPaper ? 'Guilhotina automática' : 'Serrilha manual'}</div>
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <Btn variant="success" onClick={() => test(p)}>Testar</Btn>
@@ -94,7 +94,7 @@ function PrinterForm({ value, onClose }: { value: PrinterConfig; onClose: () => 
     onClose();
   };
 
-  const field = 'min-h-touch w-full rounded-xl border border-slate-600 bg-base px-3 outline-none focus:border-ouro';
+  const field = 'min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro';
   return (
     <Sheet open onClose={onClose} title={value.name ? `Editar ${value.name}` : 'Nova impressora'} footer={<Btn block size="lg" onClick={save}>Salvar impressora</Btn>}>
       <div className="space-y-3">

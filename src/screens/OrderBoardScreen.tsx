@@ -86,14 +86,14 @@ export function OrderBoardScreen() {
 
 
   return (
-    <div ref={rootRef} className="flex min-h-[calc(100vh-56px)] flex-col bg-base text-white">
-      <header className="flex items-center gap-3 border-b border-slate-800 px-6 py-4">
-        <BrandLogo variant="dark" className="h-16 w-auto" />
+    <div ref={rootRef} className="flex min-h-[calc(100vh-56px)] flex-col bg-base text-slate-900">
+      <header className="flex items-center gap-3 border-b border-slate-200 px-6 py-4">
+        <BrandLogo className="h-16 w-auto" />
         <div className="mr-auto">
           <div className="text-2xl font-black">{tenant.name}</div>
-          <div className="text-sm text-slate-400">Acompanhe seu pedido</div>
+          <div className="text-sm text-slate-500">Acompanhe seu pedido</div>
         </div>
-        <div className="text-3xl font-black tabular-nums text-slate-300">
+        <div className="text-3xl font-black tabular-nums text-slate-700">
           {new Date(now).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
         </div>
         <button aria-label={voice ? 'Desligar voz' : 'Ligar voz'} onClick={() => setVoice((v) => !v)} className="grid h-12 w-12 place-items-center rounded-xl bg-surface">
@@ -105,15 +105,15 @@ export function OrderBoardScreen() {
       </header>
 
       <div className="grid flex-1 grid-cols-1 md:grid-cols-2">
-        <section className="border-b border-slate-800 p-6 md:border-b-0 md:border-r">
-          <h2 className="mb-5 flex items-center gap-3 text-3xl font-black uppercase tracking-wide text-ouro">
+        <section className="border-b border-slate-200 p-6 md:border-b-0 md:border-r">
+          <h2 className="mb-5 flex items-center gap-3 text-3xl font-black uppercase tracking-wide text-brasa">
             <ChefHat className="h-9 w-9" /> Preparando
           </h2>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
             {preparing.map((entry) => (
-              <div key={entry.key} className="rounded-2xl border border-slate-700 bg-surface px-4 py-3 text-center">
-                <div className="text-5xl font-black tabular-nums text-slate-200">{entry.number}</div>
-                <div className="truncate text-lg text-slate-400">{entry.subtitle}</div>
+              <div key={entry.key} className="rounded-2xl border border-slate-200 bg-surface px-4 py-3 text-center">
+                <div className="text-5xl font-black tabular-nums text-slate-800">{entry.number}</div>
+                <div className="truncate text-lg text-slate-500">{entry.subtitle}</div>
               </div>
             ))}
           </div>
@@ -121,7 +121,7 @@ export function OrderBoardScreen() {
         </section>
 
         <section className="bg-stone/5 p-6">
-          <h2 className="mb-5 flex items-center gap-3 text-3xl font-black uppercase tracking-wide text-stone">
+          <h2 className="mb-5 flex items-center gap-3 text-3xl font-black uppercase tracking-wide text-verde">
             <ShoppingBag className="h-9 w-9" /> Pronto
           </h2>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
@@ -131,12 +131,12 @@ export function OrderBoardScreen() {
               return (
                 <div
                   key={entry.key}
-                  className={`rounded-2xl border-2 px-4 py-3 text-center ${fresh ? 'animate-pulse-ring border-stone bg-stone text-slate-950' : 'border-stone/60 bg-stone/15'}`}
+                  className={`rounded-2xl border-2 px-4 py-3 text-center ${fresh ? 'animate-pulse-ring border-stone bg-stone text-white' : 'border-stone/60 bg-stone/15'}`}
                 >
                   <div className="text-6xl font-black tabular-nums">{entry.number}</div>
-                  <div className={`truncate text-lg ${fresh ? 'text-slate-900' : 'text-slate-300'}`}>{entry.subtitle}</div>
+                  <div className={`truncate text-lg ${fresh ? 'text-slate-900' : 'text-slate-700'}`}>{entry.subtitle}</div>
                   {entry.courierLabel && (
-                    <div className={`mt-1 flex items-center justify-center gap-1 text-sm font-bold ${fresh ? 'text-slate-900' : 'text-stone'}`}>
+                    <div className={`mt-1 flex items-center justify-center gap-1 text-sm font-bold ${fresh ? 'text-slate-900' : 'text-verde'}`}>
                       <Bike className="h-4 w-4" /> {entry.courierLabel}
                     </div>
                   )}

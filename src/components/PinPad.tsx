@@ -41,7 +41,7 @@ export function PinPad({ value, onChange, onComplete, length = 4, disabled, erro
           <span
             key={i}
             className={`h-5 w-5 rounded-full border-2 ${
-              error ? 'border-brasa bg-brasa' : i < value.length ? 'border-ouro bg-ouro' : 'border-slate-500'
+              error ? 'border-brasa bg-brasa' : i < value.length ? 'border-ouro bg-ouro' : 'border-slate-300'
             }`}
           />
         ))}
@@ -52,16 +52,16 @@ export function PinPad({ value, onChange, onComplete, length = 4, disabled, erro
             key={d}
             disabled={disabled}
             onClick={() => press(d)}
-            className={`${keySize} rounded-2xl bg-slate-800 font-bold active:bg-slate-600 disabled:opacity-40`}
+            className={`${keySize} rounded-2xl bg-slate-100 font-bold active:bg-slate-300 disabled:opacity-40`}
           >
             {d}
           </button>
         ))}
         <span />
-        <button disabled={disabled} onClick={() => press('0')} className={`${keySize} rounded-2xl bg-slate-800 font-bold active:bg-slate-600 disabled:opacity-40`}>
+        <button disabled={disabled} onClick={() => press('0')} className={`${keySize} rounded-2xl bg-slate-100 font-bold active:bg-slate-300 disabled:opacity-40`}>
           0
         </button>
-        <button aria-label="Apagar" disabled={disabled} onClick={back} className={`${keySize} grid place-items-center rounded-2xl bg-slate-900 active:bg-slate-700`}>
+        <button aria-label="Apagar" disabled={disabled} onClick={back} className={`${keySize} grid place-items-center rounded-2xl bg-slate-50 active:bg-slate-200`}>
           <Delete className="h-7 w-7" />
         </button>
       </div>

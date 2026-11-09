@@ -114,7 +114,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
       onClose={onClose}
       title={
         <span>
-          <span className="mr-2 rounded bg-slate-700 px-1.5 py-0.5 font-mono text-sm text-ouro">{product.code}</span>
+          <span className="mr-2 rounded bg-slate-200 px-1.5 py-0.5 font-mono text-sm text-brasa">{product.code}</span>
           {product.name}
         </span>
       }
@@ -127,7 +127,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
         </div>
       }
     >
-      {product.description && <p className="mb-3 text-sm text-slate-400">{product.description}</p>}
+      {product.description && <p className="mb-3 text-sm text-slate-500">{product.description}</p>}
 
       {product.requires_meat_doneness && (
         <section className="mb-4">
@@ -140,7 +140,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
                 key={d}
                 onClick={() => setDoneness(d)}
                 className={`flex min-h-touch-lg items-center justify-center gap-2 rounded-xl border-2 text-base font-bold ${
-                  doneness === d ? 'border-ouro bg-ouro/20 text-white' : 'border-slate-600 bg-base text-slate-300'
+                  doneness === d ? 'border-ouro bg-ouro/20 text-slate-900' : 'border-slate-300 bg-base text-slate-700'
                 }`}
               >
                 <span className={`h-4 w-4 rounded-full ${DONENESS_COLOR[d]}`} />
@@ -153,11 +153,11 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
 
       {halfOptions.length > 0 && (
         <section className="mb-4">
-          <h3 className="mb-1 font-bold">Meio-a-meio <span className="text-xs font-normal text-slate-400">(cobra pelo {pricingRule === 'HIGHEST' ? 'maior valor' : 'valor médio'})</span></h3>
+          <h3 className="mb-1 font-bold">Meio-a-meio <span className="text-xs font-normal text-slate-500">(cobra pelo {pricingRule === 'HIGHEST' ? 'maior valor' : 'valor médio'})</span></h3>
           <div className="flex flex-wrap gap-2">
-            <button onClick={() => setHalf(null)} className={`min-h-touch rounded-xl px-3 text-sm font-semibold ${!half ? 'bg-ouro text-slate-950' : 'bg-slate-700'}`}>Inteira</button>
+            <button onClick={() => setHalf(null)} className={`min-h-touch rounded-xl px-3 text-sm font-semibold ${!half ? 'bg-ouro text-slate-950' : 'bg-slate-200'}`}>Inteira</button>
             {halfOptions.map((p) => (
-              <button key={p.id} onClick={() => setHalf(p.id)} className={`min-h-touch rounded-xl px-3 text-sm font-semibold ${half === p.id ? 'bg-ouro text-slate-950' : 'bg-slate-700'}`}>
+              <button key={p.id} onClick={() => setHalf(p.id)} className={`min-h-touch rounded-xl px-3 text-sm font-semibold ${half === p.id ? 'bg-ouro text-slate-950' : 'bg-slate-200'}`}>
                 ½ {p.name.replace('Pizza ', '')} · {formatBRL(priceOf(p))}
               </button>
             ))}
@@ -175,7 +175,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
               {g.required ? (
                 <span className="rounded bg-brasa px-1.5 text-[10px] font-black uppercase">Obrigatório</span>
               ) : (
-                <span className="text-xs font-normal text-slate-400">até {g.max_selection}</span>
+                <span className="text-xs font-normal text-slate-500">até {g.max_selection}</span>
               )}
             </h3>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -185,13 +185,13 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
                   <button
                     key={o.id}
                     onClick={() => toggleOption(g, o.id)}
-                    className={`flex min-h-touch items-center justify-between rounded-xl border-2 px-3 text-left ${on ? 'border-stone bg-stone/15' : 'border-slate-600 bg-base'}`}
+                    className={`flex min-h-touch items-center justify-between rounded-xl border-2 px-3 text-left ${on ? 'border-stone bg-stone/15' : 'border-slate-300 bg-base'}`}
                   >
                     <span className="flex items-center gap-2 font-semibold">
-                      <span className={`grid h-6 w-6 place-items-center rounded-md border-2 ${on ? 'border-stone bg-stone text-slate-950' : 'border-slate-500'}`}>{on && <Check className="h-4 w-4" />}</span>
+                      <span className={`grid h-6 w-6 place-items-center rounded-md border-2 ${on ? 'border-stone bg-stone text-white' : 'border-slate-300'}`}>{on && <Check className="h-4 w-4" />}</span>
                       {o.name}
                     </span>
-                    <span className="text-sm text-slate-300">{o.additional_price > 0 ? `+ ${formatBRL(o.additional_price)}` : 'grátis'}</span>
+                    <span className="text-sm text-slate-700">{o.additional_price > 0 ? `+ ${formatBRL(o.additional_price)}` : 'grátis'}</span>
                   </button>
                 );
               })}
@@ -209,7 +209,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
               <button
                 key={t}
                 onClick={() => setTags((cur) => (on ? cur.filter((x) => x !== t) : [...cur, t]))}
-                className={`min-h-touch rounded-full px-4 text-sm font-semibold ${on ? 'bg-sky-500 text-white' : 'bg-slate-700 text-slate-200'}`}
+                className={`min-h-touch rounded-full px-4 text-sm font-semibold ${on ? 'bg-sky-500 text-white' : 'bg-slate-200 text-slate-800'}`}
               >
                 {t}
               </button>
@@ -220,7 +220,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
           placeholder="Outra observação…"
-          className="mt-2 min-h-touch w-full rounded-xl border border-slate-600 bg-base px-3 outline-none focus:border-ouro"
+          className="mt-2 min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro"
         />
       </section>
     </Sheet>

@@ -20,7 +20,7 @@ export function EscPosPaper({ width, events }: { width: PaperWidth; events: Prev
           if (e.kind === 'qr') return <div key={idx} className="my-2 flex justify-center"><QrCode value={e.data} size={120} /></div>;
           if (e.kind === 'cut')
             return (
-              <div key={idx} className="mt-3 flex items-center gap-1 border-t-2 border-dashed border-slate-500 pt-1 text-[10px] text-slate-600">
+              <div key={idx} className="mt-3 flex items-center gap-1 border-t-2 border-dashed border-slate-300 pt-1 text-[10px] text-slate-600">
                 <Scissors className="h-3 w-3" /> {e.guillotine ? 'GS V 66 0 · guilhotina' : 'serrilha manual'}
               </div>
             );
@@ -59,34 +59,34 @@ function TicketBlock({ t, index }: { t: RenderedTicket; index: number }) {
     if (r) (r.delivery.ok ? toast.success : toast.error)(r.delivery.ok ? `${t.printer.name}: impresso.` : `${t.printer.name}: ${r.delivery.error ?? 'falha ao imprimir'}`);
   };
   return (
-    <section className="rounded-2xl bg-slate-900 p-3">
+    <section className="rounded-2xl bg-slate-50 p-3">
       <header className="mb-2 flex flex-wrap items-center justify-between gap-2 text-sm">
         <div className="font-bold">{t.title}</div>
-        <div className="flex items-center gap-2 text-xs text-slate-400">
+        <div className="flex items-center gap-2 text-xs text-slate-500">
           <Icon className="h-4 w-4" /> {t.printer.name} · {t.printer.paperWidth === '80MM' ? '80mm' : '58mm'} ·{' '}
           {t.printer.connection === 'NETWORK_TCP' ? `${t.printer.ipAddress}:${t.printer.port ?? 9100}` : t.printer.connection === 'BLUETOOTH' ? t.printer.macAddress : 'interna'} · {t.byteLength} bytes ·{' '}
-          <span className={t.delivery.ok ? 'text-stone' : 'text-rose-300'}>{t.delivery.via === 'NATIVE' ? (t.delivery.skipped === 'ALREADY_PRINTED' ? 'já impresso' : t.delivery.ok ? 'enviado' : `falha: ${t.delivery.error}`) : 'simulado'}</span>
+          <span className={t.delivery.ok ? 'text-verde' : 'text-rose-600'}>{t.delivery.via === 'NATIVE' ? (t.delivery.skipped === 'ALREADY_PRINTED' ? 'já impresso' : t.delivery.ok ? 'enviado' : `falha: ${t.delivery.error}`) : 'simulado'}</span>
         </div>
       </header>
       {failed && (
-        <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500 bg-rose-950/60 p-3 text-sm text-rose-100">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500 bg-rose-50 p-3 text-sm text-rose-700">
           <span>Não imprimiu em {t.printer.name}: {t.delivery.error ?? 'impressora sem resposta'}. Verifique papel, energia e conexão.</span>
           <button onClick={retry} className="flex min-h-touch items-center gap-2 rounded-xl bg-rose-600 px-4 font-bold text-white"><RotateCcw className="h-4 w-4" /> Reenviar</button>
         </div>
       )}
       <div className="scroll-thin flex gap-4 overflow-x-auto pb-2">
         <div className="shrink-0">
-          <div className={`mb-1 text-center text-xs font-bold ${t.printer.paperWidth === '80MM' ? 'text-ouro' : 'text-slate-400'}`}>Bobina larga 80mm · 48 colunas{t.printer.paperWidth === '80MM' ? ' (esta impressora)' : ''}</div>
+          <div className={`mb-1 text-center text-xs font-bold ${t.printer.paperWidth === '80MM' ? 'text-brasa' : 'text-slate-500'}`}>Bobina larga 80mm · 48 colunas{t.printer.paperWidth === '80MM' ? ' (esta impressora)' : ''}</div>
           <EscPosPaper width="80MM" events={t.preview['80MM']} />
         </div>
         <div className="shrink-0">
-          <div className={`mb-1 text-center text-xs font-bold ${t.printer.paperWidth === '58MM' ? 'text-ouro' : 'text-slate-400'}`}>Bobina estreita 58mm · 32 colunas{t.printer.paperWidth === '58MM' ? ' (esta impressora)' : ''}</div>
+          <div className={`mb-1 text-center text-xs font-bold ${t.printer.paperWidth === '58MM' ? 'text-brasa' : 'text-slate-500'}`}>Bobina estreita 58mm · 32 colunas{t.printer.paperWidth === '58MM' ? ' (esta impressora)' : ''}</div>
           <EscPosPaper width="58MM" events={t.preview['58MM']} />
         </div>
       </div>
-      <details className="mt-1 text-xs text-slate-400">
+      <details className="mt-1 text-xs text-slate-500">
         <summary className="cursor-pointer">Base64 ESC/POS enviado à ponte nativa</summary>
-        <code className="block max-h-24 overflow-auto break-all text-[10px] text-emerald-300">{t.base64}</code>
+        <code className="block max-h-24 overflow-auto break-all text-[10px] text-emerald-600">{t.base64}</code>
       </details>
     </section>
   );
@@ -99,9 +99,9 @@ export function PrintSimulatorModal() {
   return (
     <div className="fixed inset-0 z-[70] flex items-end justify-center bg-black/80 sm:items-center" onClick={clear}>
       <div onClick={(e) => e.stopPropagation()} className="flex max-h-[94vh] w-full max-w-5xl flex-col rounded-t-2xl bg-surface sm:rounded-2xl">
-        <div className="flex items-center justify-between border-b border-slate-700 px-4 py-3">
+        <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
           <h2 className="text-lg font-bold">Impressão térmica ESC/POS · {tickets.length} ticket(s)</h2>
-          <button aria-label="Fechar" onClick={clear} className="grid h-11 w-11 place-items-center rounded-full active:bg-slate-700"><X className="h-6 w-6" /></button>
+          <button aria-label="Fechar" onClick={clear} className="grid h-11 w-11 place-items-center rounded-full active:bg-slate-200"><X className="h-6 w-6" /></button>
         </div>
         <div className="scroll-thin space-y-3 overflow-y-auto p-3">
           {tickets.map((t, i) => <TicketBlock key={i} t={t} index={i} />)}

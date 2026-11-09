@@ -27,8 +27,8 @@ const METHODS: Array<{ key: Method; label: string; icon: typeof CreditCard }> = 
 const STAGE_BADGE: Record<KioskStage, { label: string; className: string }> = {
   AWAITING_PAYMENT: { label: 'Aguardando pagamento', className: 'bg-ouro text-slate-950' },
   PREPARING: { label: 'Preparando', className: 'bg-sky-600 text-white' },
-  READY: { label: 'Pronto', className: 'bg-stone text-slate-950' },
-  DELIVERED: { label: 'Entregue', className: 'bg-slate-600 text-white' },
+  READY: { label: 'Pronto', className: 'bg-stone text-white' },
+  DELIVERED: { label: 'Entregue', className: 'bg-neutral-500 text-white' },
   CANCELED: { label: 'Cancelado', className: 'bg-rose-800 text-white' },
 };
 
@@ -73,18 +73,18 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
       <div className="min-w-0">
         <div className="scroll-thin -mx-3 mb-3 flex gap-2 overflow-x-auto px-3 pb-1">
           {cats.map((c) => (
-            <button key={c.id} onClick={() => setCatId(c.id)} className={`flex min-h-touch shrink-0 items-center gap-2 rounded-full px-4 font-semibold ${activeCat === c.id ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}>
+            <button key={c.id} onClick={() => setCatId(c.id)} className={`flex min-h-touch shrink-0 items-center gap-2 rounded-full px-4 font-semibold ${activeCat === c.id ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}>
               <CategoryIcon name={c.icon_name} className="h-4 w-4" /> {c.name}
             </button>
           ))}
         </div>
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
           {list.map((p) => (
-            <button key={p.id} onClick={() => tap(p)} disabled={!p.available} className="flex min-h-[88px] flex-col justify-between rounded-2xl border border-slate-700 bg-surface p-3 text-left active:bg-slate-700 disabled:opacity-40">
+            <button key={p.id} onClick={() => tap(p)} disabled={!p.available} className="flex min-h-[88px] flex-col justify-between rounded-2xl border border-slate-200 bg-surface p-3 text-left active:bg-slate-200 disabled:opacity-40">
               <span className="line-clamp-2 font-bold leading-tight">{p.name}</span>
               <span className="flex items-center justify-between">
-                <span className="text-lg font-black tabular-nums text-ouro">{formatBRL(priceOf(p))}</span>
-                {cart.needsOptions(p) && <Badge className="bg-slate-700">opções</Badge>}
+                <span className="text-lg font-black tabular-nums text-brasa">{formatBRL(priceOf(p))}</span>
+                {cart.needsOptions(p) && <Badge className="bg-slate-200">opções</Badge>}
               </span>
             </button>
           ))}
@@ -95,12 +95,12 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
       <aside className="h-fit rounded-2xl border-2 border-ouro/60 bg-surface p-3 lg:sticky lg:top-[72px]">
         <div className="mb-2 grid grid-cols-2 gap-2">
           {(['TAKEOUT', 'DINE_IN'] as FulfillmentType[]).map((f) => (
-            <button key={f} onClick={() => setFulfillment(f)} className={`flex min-h-touch items-center justify-center gap-2 rounded-xl text-sm font-black ${fulfillment === f ? 'bg-brasa text-white' : 'bg-base text-slate-300'}`}>
+            <button key={f} onClick={() => setFulfillment(f)} className={`flex min-h-touch items-center justify-center gap-2 rounded-xl text-sm font-black ${fulfillment === f ? 'bg-brasa text-white' : 'bg-base text-slate-700'}`}>
               {f === 'TAKEOUT' ? <ShoppingBag className="h-4 w-4" /> : <UtensilsCrossed className="h-4 w-4" />} {FULFILLMENT_LABEL[f]}
             </button>
           ))}
         </div>
-        <input value={name} onChange={(e) => setName(e.target.value)} maxLength={20} placeholder="Nome do cliente (para chamar)" className="mb-3 min-h-touch w-full rounded-xl border border-slate-600 bg-base px-3 outline-none focus:border-ouro" />
+        <input value={name} onChange={(e) => setName(e.target.value)} maxLength={20} placeholder="Nome do cliente (para chamar)" className="mb-3 min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
         {cart.lines.length === 0 ? (
           <p className="py-6 text-center text-sm text-slate-500">Toque nos produtos para montar o pedido.</p>
         ) : (
@@ -109,17 +109,17 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
               <li key={l.key} className="flex items-center gap-2 rounded-xl bg-base p-2">
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-semibold">{l.label}</div>
-                  {l.details.length > 0 && <div className="truncate text-xs text-slate-400">{l.details.join(' · ')}</div>}
-                  <div className="text-xs text-slate-400">{formatBRL(computeItemTotal(l.quantity, l.unitTotal, 0))}</div>
+                  {l.details.length > 0 && <div className="truncate text-xs text-slate-500">{l.details.join(' · ')}</div>}
+                  <div className="text-xs text-slate-500">{formatBRL(computeItemTotal(l.quantity, l.unitTotal, 0))}</div>
                 </div>
-                <button aria-label="Menos" onClick={() => cart.setQty(l.key, l.quantity - 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700">{l.quantity === 1 ? <Trash2 className="h-4 w-4" /> : <Minus className="h-5 w-5" />}</button>
+                <button aria-label="Menos" onClick={() => cart.setQty(l.key, l.quantity - 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-200">{l.quantity === 1 ? <Trash2 className="h-4 w-4" /> : <Minus className="h-5 w-5" />}</button>
                 <span className="w-6 text-center font-bold">{l.quantity}</span>
-                <button aria-label="Mais" onClick={() => cart.setQty(l.key, l.quantity + 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-700"><Plus className="h-5 w-5" /></button>
+                <button aria-label="Mais" onClick={() => cart.setQty(l.key, l.quantity + 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-200"><Plus className="h-5 w-5" /></button>
               </li>
             ))}
           </ul>
         )}
-        <div className="mb-3 flex items-end justify-between"><span className="text-slate-400">Total</span><span className="text-3xl font-black tabular-nums text-ouro">{formatBRL(cart.total)}</span></div>
+        <div className="mb-3 flex items-end justify-between"><span className="text-slate-500">Total</span><span className="text-3xl font-black tabular-nums text-brasa">{formatBRL(cart.total)}</span></div>
         <Btn block size="lg" variant="success" disabled={cart.count === 0} onClick={goPay}>Cobrar e gerar senha</Btn>
         <p className="mt-2 text-center text-[11px] text-slate-500">Sem os 10% do garçom. O pedido vai para a cozinha assim que o pagamento for aprovado.</p>
       </aside>
@@ -151,13 +151,13 @@ function PickupQueue({ onCharge }: { onCharge: (orderId: string) => void }) {
     <div className="mt-4 space-y-3">
       {waiting.length > 0 && (
         <div className="rounded-2xl border border-ouro/50 bg-ouro/10 p-3">
-          <div className="mb-2 text-sm font-black text-ouro">Senhas aguardando pagamento</div>
+          <div className="mb-2 text-sm font-black text-brasa">Senhas aguardando pagamento</div>
           {waiting.map((o) => (
             <button key={o.id} onClick={() => onCharge(o.id)} className="mb-1 flex min-h-touch w-full items-center gap-3 rounded-xl bg-base px-3 text-left text-sm">
               <span className="text-2xl font-black tabular-nums">{formatPickupNumber(o.pickup_number)}</span>
-              <span className="flex-1 text-slate-300">
+              <span className="flex-1 text-slate-700">
                 {o.pickup_name ?? 'Sem nome'} · {o.fulfillment_type ? FULFILLMENT_LABEL[o.fulfillment_type] : ''}
-                {getReviewHold(o.id) && <span className="ml-2 font-bold text-ouro">· conferir maquininha</span>}
+                {getReviewHold(o.id) && <span className="ml-2 font-bold text-brasa">· conferir maquininha</span>}
               </span>
               <OriginTag order={o} />
               <b className="tabular-nums">{formatBRL(o.remaining_balance)}</b>
@@ -166,14 +166,14 @@ function PickupQueue({ onCharge }: { onCharge: (orderId: string) => void }) {
         </div>
       )}
       {others.length > 0 && (
-        <div className="rounded-2xl border border-slate-700 bg-surface p-3">
+        <div className="rounded-2xl border border-slate-200 bg-surface p-3">
           <div className="mb-2 text-sm font-black">Senhas de hoje</div>
           {others.map((o) => {
             const stage = kioskStage(o, items);
             return (
               <div key={o.id} className="mb-1 flex items-center gap-3 rounded-xl bg-base px-3 py-2 text-sm">
                 <span className="text-xl font-black tabular-nums">{formatPickupNumber(o.pickup_number)}</span>
-                <span className="flex-1 truncate text-slate-300">{o.pickup_name ?? 'Sem nome'} · {formatBRL(o.total_amount)}</span>
+                <span className="flex-1 truncate text-slate-700">{o.pickup_name ?? 'Sem nome'} · {formatBRL(o.total_amount)}</span>
                 <OriginTag order={o} />
                 <Badge className={STAGE_BADGE[stage].className}>{STAGE_BADGE[stage].label}</Badge>
               </div>
@@ -189,9 +189,9 @@ function OriginTag({ order }: { order: Order }) {
   const staff = useTcheStore((s) => s.staff);
   const fromKiosk = staff.find((u) => u.id === order.opened_by_user_id)?.role === 'KIOSK';
   return fromKiosk ? (
-    <span className="inline-flex items-center gap-1 text-xs text-slate-400"><MonitorSmartphone className="h-3 w-3" /> Totem</span>
+    <span className="inline-flex items-center gap-1 text-xs text-slate-500"><MonitorSmartphone className="h-3 w-3" /> Totem</span>
   ) : (
-    <span className="inline-flex items-center gap-1 text-xs text-slate-400"><ShoppingBag className="h-3 w-3" /> Caixa</span>
+    <span className="inline-flex items-center gap-1 text-xs text-slate-500"><ShoppingBag className="h-3 w-3" /> Caixa</span>
   );
 }
 
@@ -233,11 +233,11 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
   if (order.status === 'CLOSED') {
     return (
       <div className="mx-auto max-w-xl space-y-3 px-3 pt-6 text-center">
-        <CheckCircle2 className="mx-auto h-16 w-16 text-stone" />
-        <div className="text-sm font-bold uppercase text-slate-400">Senha</div>
+        <CheckCircle2 className="mx-auto h-16 w-16 text-verde" />
+        <div className="text-sm font-bold uppercase text-slate-500">Senha</div>
         <div className="text-7xl font-black tabular-nums">{number}</div>
         <div className="text-xl font-black">Pago · {formatBRL(order.total_amount)}</div>
-        <p className="text-slate-400">Pedido na cozinha (KDS). Entregue o comprovante com a senha ao cliente.</p>
+        <p className="text-slate-500">Pedido na cozinha (KDS). Entregue o comprovante com a senha ao cliente.</p>
         <div className="grid grid-cols-2 gap-2">
           <Btn variant="secondary" size="lg" onClick={() => { printPickupReceipt(orderId, chassis); printPickupKitchen(orderId); }}><Printer className="h-5 w-5" /> Reimprimir</Btn>
           <Btn size="lg" variant="success" onClick={onDone}>Novo pedido</Btn>
@@ -249,7 +249,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
   if (order.status === 'CANCELED') {
     return (
       <div className="mx-auto max-w-xl space-y-3 px-3 pt-6 text-center">
-        <XCircle className="mx-auto h-16 w-16 text-rose-400" />
+        <XCircle className="mx-auto h-16 w-16 text-rose-600" />
         <div className="text-xl font-black">Senha {number} cancelada</div>
         <Btn size="lg" onClick={onDone}>Voltar</Btn>
       </div>
@@ -258,13 +258,13 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
 
   return (
     <div className="mx-auto max-w-xl px-3 pb-10 pt-3">
-      <div className="mb-3 rounded-2xl border border-slate-700 bg-surface p-3">
+      <div className="mb-3 rounded-2xl border border-slate-200 bg-surface p-3">
         <div className="mb-2 flex items-baseline justify-between">
           <div>
-            <div className="text-xs font-bold uppercase text-slate-400">Senha</div>
+            <div className="text-xs font-bold uppercase text-slate-500">Senha</div>
             <div className="text-5xl font-black tabular-nums">{number}</div>
           </div>
-          <div className="text-right text-sm text-slate-300">
+          <div className="text-right text-sm text-slate-700">
             {order.fulfillment_type ? FULFILLMENT_LABEL[order.fulfillment_type] : ''}
             {order.pickup_name && <div className="font-bold">{order.pickup_name}</div>}
           </div>
@@ -277,26 +277,26 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
             </li>
           ))}
         </ul>
-        <div className="mt-2 flex justify-between border-t border-slate-700 pt-2 text-xl font-black"><span>Total</span><span className="tabular-nums text-ouro">{formatBRL(order.remaining_balance)}</span></div>
+        <div className="mt-2 flex justify-between border-t border-slate-200 pt-2 text-xl font-black"><span>Total</span><span className="tabular-nums text-brasa">{formatBRL(order.remaining_balance)}</span></div>
       </div>
 
       <div className="mb-3 grid grid-cols-4 gap-2">
         {METHODS.map((m) => (
-          <button key={m.key} onClick={() => setMethod(m.key)} className={`flex min-h-touch-lg flex-col items-center justify-center gap-1 rounded-xl text-sm font-bold ${method === m.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}><m.icon className="h-5 w-5" /> {m.label}</button>
+          <button key={m.key} onClick={() => setMethod(m.key)} className={`flex min-h-touch-lg flex-col items-center justify-center gap-1 rounded-xl text-sm font-bold ${method === m.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}><m.icon className="h-5 w-5" /> {m.label}</button>
         ))}
       </div>
       {method === 'CASH' ? (
-        <input inputMode="decimal" value={cashGiven} onChange={(e) => setCashGiven(e.target.value.replace(/[^\d.,]/g, ''))} placeholder="Valor recebido (para troco)" className="mb-3 min-h-touch-lg w-full rounded-xl border border-slate-600 bg-base px-3 text-lg outline-none focus:border-ouro" />
+        <input inputMode="decimal" value={cashGiven} onChange={(e) => setCashGiven(e.target.value.replace(/[^\d.,]/g, ''))} placeholder="Valor recebido (para troco)" className="mb-3 min-h-touch-lg w-full rounded-xl border border-slate-300 bg-base px-3 text-lg outline-none focus:border-ouro" />
       ) : (
         <div className="mb-3 grid grid-cols-2 gap-2">
-          <button onClick={() => setChassis('STONE')} className={`min-h-touch-lg rounded-xl font-bold ${chassis === 'STONE' ? 'bg-stone text-slate-950' : 'bg-base'}`}>SmartPOS Stone</button>
+          <button onClick={() => setChassis('STONE')} className={`min-h-touch-lg rounded-xl font-bold ${chassis === 'STONE' ? 'bg-stone text-white' : 'bg-base'}`}>SmartPOS Stone</button>
           <button onClick={() => setChassis('PAGBANK')} className={`min-h-touch-lg rounded-xl font-bold ${chassis === 'PAGBANK' ? 'bg-pagbank text-slate-950' : 'bg-base'}`}>SmartPOS PagBank</button>
         </div>
       )}
 
       {hold ? (
         <div className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
-          <p className="mb-2 font-bold text-ouro">⚠️ {hold.reason}</p>
+          <p className="mb-2 font-bold text-brasa">⚠️ {hold.reason}</p>
           <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de receber de novo, em qualquer forma de pagamento. Se a maquininha mostra a transação aprovada, não cobre de novo: guarde o comprovante e chame o gerente.</p>
           <div className="grid gap-2">
             <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>

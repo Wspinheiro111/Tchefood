@@ -71,7 +71,7 @@ export default function App() {
   if (!hydrated) {
     return (
       <div className="grid h-full place-items-center">
-        <RefreshCw className="h-8 w-8 animate-spin text-ouro" />
+        <RefreshCw className="h-8 w-8 animate-spin text-brasa" />
       </div>
     );
   }
@@ -101,24 +101,26 @@ export default function App() {
 
   return (
     <div className="min-h-full pb-[72px] sm:pb-0">
-      <header className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b border-slate-800 bg-base/95 px-3 backdrop-blur">
+      <header className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b border-slate-200 bg-base/95 px-3 shadow-sm backdrop-blur">
+        {/* Faixa com as três cores da marca no topo de todas as telas da equipe */}
+        <div aria-hidden className="absolute inset-x-0 top-0 flex h-1"><span className="flex-1 bg-brasa" /><span className="flex-1 bg-amarelo" /><span className="flex-1 bg-verde" /></div>
         <BrandMark className="h-9 w-9 2xl:hidden" />
-        <BrandLogo variant="dark" className="hidden h-11 w-auto 2xl:block" />
+        <BrandLogo className="hidden h-11 w-auto 2xl:block" />
         <div className="mr-auto leading-tight">
           <div className="font-black 2xl:hidden">Tchê<span className="text-brasa">Food</span></div>
-          <div className="text-[11px] text-slate-400">{user.name} · {user.role === 'WAITER' ? 'Garçom' : user.role === 'MANAGER' ? 'Gerente' : user.role === 'OWNER' ? 'Proprietário' : user.role === 'KITCHEN' ? 'Cozinha' : 'Caixa'}</div>
+          <div className="text-[11px] text-slate-500">{user.name} · {user.role === 'WAITER' ? 'Garçom' : user.role === 'MANAGER' ? 'Gerente' : user.role === 'OWNER' ? 'Proprietário' : user.role === 'KITCHEN' ? 'Cozinha' : 'Caixa'}</div>
         </div>
         <nav className="hidden gap-1 sm:flex">
           {nav.map((n) => (
-            <button key={n.key} onClick={() => setView({ name: n.key } as View)} className={`flex min-h-touch items-center gap-2 rounded-xl px-3 text-sm font-bold ${activeKey === n.key ? 'bg-surface text-ouro' : 'text-slate-300'}`}>
+            <button key={n.key} onClick={() => setView({ name: n.key } as View)} className={`flex min-h-touch items-center gap-2 rounded-xl px-3 text-sm font-bold ${activeKey === n.key ? 'bg-brasa text-white shadow' : 'text-slate-700 hover:bg-slate-100'}`}>
               <n.icon className="h-4 w-4" /> {n.label}
             </button>
           ))}
         </nav>
-        <button aria-label="Abrir maquininha" onClick={() => useTerminalBus.getState().openSimulator()} className="grid h-11 w-11 place-items-center rounded-xl bg-surface text-stone" title="Maquininha / bobina">
+        <button aria-label="Abrir maquininha" onClick={() => useTerminalBus.getState().openSimulator()} className="grid h-11 w-11 place-items-center rounded-xl bg-surface text-verde" title="Maquininha / bobina">
           <Smartphone className="h-5 w-5" />
         </button>
-        <span title={online ? `${outbox} evento(s) na fila de sincronização` : 'Offline: operando pela fila local'} className={`hidden items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold md:inline-flex ${online ? 'bg-stone/15 text-stone' : 'bg-ouro/20 text-ouro'}`}>
+        <span title={online ? `${outbox} evento(s) na fila de sincronização` : 'Offline: operando pela fila local'} className={`hidden items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold md:inline-flex ${online ? 'bg-stone/15 text-verde' : 'bg-ouro/20 text-brasa'}`}>
           {online ? '●' : <CloudOff className="h-3 w-3" />} {online ? 'Online' : 'Offline'} · fila {outbox}
         </span>
         <button aria-label="Sair" onClick={() => { const r = logout(); if (!r.ok) toast.error(r.error); }}className="grid h-11 w-11 place-items-center rounded-xl bg-surface"><LogOut className="h-5 w-5" /></button>
@@ -143,9 +145,9 @@ export default function App() {
       </main>
 
       {nav.length > 1 && (
-        <nav className="fixed inset-x-0 bottom-0 z-20 grid border-t border-slate-800 bg-base sm:hidden" style={{ gridTemplateColumns: `repeat(${nav.length}, 1fr)` }}>
+        <nav className="fixed inset-x-0 bottom-0 z-20 grid border-t border-slate-200 bg-base sm:hidden" style={{ gridTemplateColumns: `repeat(${nav.length}, 1fr)` }}>
           {nav.map((n) => (
-            <button key={n.key} onClick={() => setView({ name: n.key } as View)} className={`flex min-h-[64px] flex-col items-center justify-center gap-1 text-xs font-bold ${activeKey === n.key ? 'text-ouro' : 'text-slate-400'}`}>
+            <button key={n.key} onClick={() => setView({ name: n.key } as View)} className={`flex min-h-[64px] flex-col items-center justify-center gap-1 text-xs font-bold ${activeKey === n.key ? 'text-brasa' : 'text-slate-500'}`}>
               <n.icon className="h-6 w-6" /> {n.label}
             </button>
           ))}
