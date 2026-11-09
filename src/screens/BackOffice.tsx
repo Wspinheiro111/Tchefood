@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { AlertTriangle, BarChart3, FileText, MessageCircle, Printer, Receipt, Settings, ShieldAlert, Users } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import { formatBRL } from '../lib/money';
-import { AUDIT_LABEL, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
+import { AUDIT_LABEL, reconciliation, shiftKpis, shiftStart, waiterSplit, whatsappAlertText } from '../lib/reports';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
@@ -64,7 +64,7 @@ function Dashboard() {
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi label="Faturamento bruto do turno" value={formatBRL(k.grossRevenue)} hint="Σ pagamentos aprovados" tone="text-stone" />
+        <Kpi label="Faturamento bruto do turno" value={formatBRL(k.grossRevenue)} hint={`Σ aprovados desde ${shiftStart().toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}`} tone="text-stone" />
         <Kpi label="Ticket médio por mesa" value={formatBRL(k.averageTicket)} hint={`${k.closedOrders} conta(s) fechada(s)`} />
         <Kpi label="Taxa de serviço (10%)" value={formatBRL(k.serviceFeeTotal)} hint="Contas fechadas" tone="text-ouro" />
         <Kpi label="Mesas atendidas" value={String(k.tablesServed)} hint={`${occupied} ocupada(s) agora`} />

@@ -4,7 +4,7 @@ import { useTcheStore } from '../store/useTcheStore';
 import type { ItemStatus, OrderItem } from '../types';
 import { formatBRL, round2 } from '../lib/money';
 import { conferenceLines } from '../lib/receipts';
-import { useTerminalBus } from '../lib/payments/drivers';
+import { printDocument, useTerminalBus } from '../lib/payments/drivers';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { Badge, Btn, Sheet, Stepper, toast } from '../components/ui';
 import { SECTOR_LABEL } from './OrderScreen';
@@ -41,7 +41,12 @@ export function StatementPanel({ orderId, onCheckout }: { orderId: string; onChe
   const printConference = () => {
     const waiter = s.staff.find((u) => u.id === order.opened_by_user_id) ?? null;
     const lines = conferenceLines({ tenant: s.tenant, table, order, items: s.orderItems, products: s.products, waiter });
-    useTerminalBus.getState().enqueuePrint({ title: `Conferência ${table.label}`, lines, chassis: useTerminalBus.getState().chassis });
+    try {
+      const via = printDocument({ title: `Conferência ${table.label}`, lines, chassis: useTerminalBus.getState().chassis });
+      if (via === 'NATIVE') toast.success('Conferência enviada para a bobina.');
+    } catch (e) {
+      toast.error(`Conferência não impressa: ${e instanceof Error ? e.message : 'falha na impressora'}`);
+    }
   };
 
   return (
@@ -176,7 +181,11 @@ export function StatementPanel({ orderId, onCheckout }: { orderId: string; onChe
               <Receipt className="h-5 w-5" /> Pedir a conta
             </Btn>
           )}
-          <Btn variant="success" size="lg" disabled={order.remaining_balance <= 0} onClick={onCheckout}><CreditCard className="h-5 w-5" /> Fechar / Cobrar</Btn>
+          {order.remaining_balance <= 0 && order.paid_amount <= 0 ? (
+            <Btn variant="success" size="lg" onClick={() => { const r = s.closeZeroOrder(orderId); if (!r.ok) toast.error(r.error); else toast.success(`Conta zerada encerrada. ${table.label} liberada.`); }}><CheckCheck className="h-5 w-5" /> Encerrar conta zerada</Btn>
+          ) : (
+            <Btn variant="success" size="lg" disabled={order.remaining_balance <= 0} onClick={onCheckout}><CreditCard className="h-5 w-5" /> Fechar / Cobrar</Btn>
+          )}
         </div>
       )}
 
