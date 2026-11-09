@@ -293,8 +293,12 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
             hold={reviewHold}
             label={table.label}
             onSuccess={(outcome) => {
+              // Mesmos ajustes de afterApproved, sem reimprimir o comprovante TEF (a maquininha já imprimiu).
               setReviewHoldState(null);
+              if (mode === 'EQUAL') setPeopleLeft((n) => Math.max(1, n - 1));
               setSelected([]);
+              setFreeRaw('');
+              setCashGiven('');
               if (outcome.closed) setClosedOrderId(order.id);
             }}
           />
