@@ -28,7 +28,12 @@ import type {
   PosTerminal,
   Product,
   ProductModifierGroup,
+  PurchaseInvoice,
+  PurchaseInvoiceItem,
   StaffUser,
+  StockMovement,
+  Supplier,
+  SupplierProductLink,
   SyncEvent,
   Tenant,
   TrayItem,
@@ -40,6 +45,8 @@ import { idbStorage } from '../lib/idbStorage';
 import { createSeedData, QR_SELF_SERVICE_USER_ID } from '../data/seed';
 import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
+import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
+import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
 
 export const MANAGER_PIN_MAX_ATTEMPTS = 3;
 export const MANAGER_PIN_LOCK_MS = 60_000;
@@ -110,6 +117,11 @@ interface DataSlice {
   payments: Payment[];
   auditLogs: AuditLog[];
   printers: PrinterConfig[];
+  suppliers: Supplier[];
+  purchaseInvoices: PurchaseInvoice[];
+  purchaseInvoiceItems: PurchaseInvoiceItem[];
+  stockMovements: StockMovement[];
+  supplierProductLinks: SupplierProductLink[];
 }
 
 interface DeviceSlice {
@@ -174,6 +186,10 @@ interface Actions {
   setSoundEnabled: (enabled: boolean) => void;
   setHalfAndHalfPricing: (rule: HalfAndHalfPricing) => void;
   resetDemo: () => void;
+
+  // Compras / estoque
+  /** Importa a NF-e de compra (XML) com as decisões da conferência. Só gerente/proprietário. */
+  importPurchaseInvoice: (xml: string, decisions: PurchaseItemDecision[]) => ActionResult<PurchaseImportPlan>;
 }
 
 export type TcheState = DataSlice & DeviceSlice & Actions;
@@ -1162,11 +1178,73 @@ export const useTcheStore = create<TcheState>()(
         setHalfAndHalfPricing: (rule) => set({ halfAndHalfPricing: rule }),
 
         resetDemo: () => set({ ...initialData(), ...initialDevice(), hydrated: true }),
+
+        importPurchaseInvoice: (xml, decisions) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!MANAGER_ROLES.includes(user.role)) return fail('Só gerente ou proprietário pode dar entrada em nota de compra.');
+          let plan: PurchaseImportPlan;
+          try {
+            // O XML é lido de novo aqui: o que entra no estoque é o que está na nota, não o que estava na tela.
+            const nfe = parsePurchaseNfeXml(xml);
+            const s = get();
+            plan = planPurchaseImport(
+              {
+                tenant: s.tenant,
+                categories: s.categories,
+                products: s.products,
+                suppliers: s.suppliers,
+                purchaseInvoices: s.purchaseInvoices,
+                supplierProductLinks: s.supplierProductLinks,
+                stockMovements: s.stockMovements,
+              },
+              nfe,
+              decisions,
+              { userId: user.id, now: nowISO(), newId: uuid, nextProductCode: nextPurchaseProductCode },
+            );
+          } catch (e) {
+            return fail(e instanceof NfeImportError || e instanceof Error ? e.message : 'Falha ao ler o XML.');
+          }
+          const p = plan;
+          let duplicated = false;
+          set((s) => {
+            // Mesma checagem dentro do set(): duas confirmações seguidas não gravam a nota duas vezes.
+            if (s.purchaseInvoices.some((i) => i.tenant_id === p.invoice.tenant_id && i.access_key === p.invoice.access_key)) {
+              duplicated = true;
+              return {};
+            }
+            const updatedById = new Map(p.updatedProducts.map((u) => [u.id, u]));
+            const linkIds = new Set(p.links.map((l) => l.id));
+            const existingLinkIds = new Set(s.supplierProductLinks.map((l) => l.id));
+            return {
+              suppliers: p.supplierIsNew ? [...s.suppliers, p.supplier] : s.suppliers,
+              products: [...s.products.map((prod) => updatedById.get(prod.id) ?? prod), ...p.createdProducts],
+              purchaseInvoices: [p.invoice, ...s.purchaseInvoices],
+              purchaseInvoiceItems: [...s.purchaseInvoiceItems, ...p.items],
+              stockMovements: [...s.stockMovements, ...p.movements],
+              supplierProductLinks: [...s.supplierProductLinks.filter((l) => !linkIds.has(l.id)), ...p.links],
+              outbox: [
+                ...s.outbox,
+                ...(p.supplierIsNew ? [syncEvent('suppliers', 'INSERT', p.supplier)] : []),
+                ...p.createdProducts.map((prod) => syncEvent('products', 'INSERT', prod)),
+                ...p.updatedProducts.map((prod) => syncEvent('products', 'UPDATE', prod)),
+                syncEvent('purchase_invoices', 'INSERT', p.invoice),
+                ...p.items.map((i) => syncEvent('purchase_invoice_items', 'INSERT', i)),
+                ...p.movements.map((m) => syncEvent('stock_movements', 'INSERT', m)),
+                ...p.links.map((l) => syncEvent('supplier_product_links', existingLinkIds.has(l.id) ? 'UPDATE' : 'INSERT', l)),
+              ],
+            };
+          });
+          if (duplicated) return fail('Esta NF-e já foi importada.');
+          return { ok: true, data: p };
+        },
       };
     },
     {
       name: 'tchefood-state-v1',
-      version: 1,
+      version: 2,
+      // v2: produtos ganham cost_price / stock_quantity / barcode; tabelas de compras e estoque.
+      migrate: (persisted, version) => migratePersistedState(persisted, version) as unknown as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
         // Persistimos dados + estado do aparelho; funções e flag de hidratação ficam de fora.
@@ -1181,6 +1259,24 @@ export const useTcheStore = create<TcheState>()(
     },
   ),
 );
+
+/** Migração do estado salvo no aparelho (IndexedDB) entre versões. */
+export function migratePersistedState(persisted: unknown, version: number): Record<string, unknown> {
+  const state = { ...((persisted ?? {}) as Record<string, unknown>) };
+  if (version < 2) {
+    const products = Array.isArray(state.products) ? (state.products as Array<Record<string, unknown>>) : [];
+    state.products = products.map((p) => ({
+      ...p,
+      cost_price: typeof p.cost_price === 'number' ? p.cost_price : 0,
+      stock_quantity: typeof p.stock_quantity === 'number' ? p.stock_quantity : 0,
+      barcode: typeof p.barcode === 'string' ? p.barcode : null,
+    }));
+    for (const key of ['suppliers', 'purchaseInvoices', 'purchaseInvoiceItems', 'stockMovements', 'supplierProductLinks']) {
+      if (!Array.isArray(state[key])) state[key] = [];
+    }
+  }
+  return state;
+}
 
 // ---------------------------------------------------------------------------
 // Seletores puros (reutilizados pelas telas)

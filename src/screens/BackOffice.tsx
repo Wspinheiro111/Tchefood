@@ -1,13 +1,14 @@
 import { useMemo, useState } from 'react';
-import { AlertTriangle, BarChart3, FileText, MessageCircle, Printer, Receipt, Settings, ShieldAlert, Users } from 'lucide-react';
+import { AlertTriangle, BarChart3, FileText, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Users } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import { formatBRL } from '../lib/money';
 import { AUDIT_LABEL, reconciliation, shiftKpis, shiftStart, waiterSplit, whatsappAlertText } from '../lib/reports';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
+import { PurchaseImport } from './PurchaseImport';
 
-type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'nfce' | 'printers' | 'config';
+type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'nfce' | 'purchases' | 'printers' | 'config';
 
 const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3 }> = [
   { key: 'dash', label: 'Dashboard', icon: BarChart3 },
@@ -15,6 +16,7 @@ const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3 }> = [
   { key: 'waiters', label: 'Rateio 10%', icon: Users },
   { key: 'audit', label: 'Anti-Fraude', icon: ShieldAlert },
   { key: 'nfce', label: 'NFC-e', icon: FileText },
+  { key: 'purchases', label: 'Compras / Estoque', icon: PackageOpen },
   { key: 'printers', label: 'Impressoras', icon: Printer },
   { key: 'config', label: 'Ajustes', icon: Settings },
 ];
@@ -37,6 +39,7 @@ export function BackOffice() {
       {tab === 'waiters' && <WaiterSplit />}
       {tab === 'audit' && <AuditCenter />}
       {tab === 'nfce' && <NfceList />}
+      {tab === 'purchases' && <PurchaseImport />}
       {tab === 'printers' && <PrinterSettings />}
       {tab === 'config' && <Config />}
     </div>

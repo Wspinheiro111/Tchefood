@@ -163,6 +163,7 @@ interface ProductSpec {
   ncm?: string;
   unit?: string;
   available?: boolean;
+  barcode?: string;
 }
 
 const PRODUCT_SPECS: ProductSpec[] = [
@@ -199,7 +200,7 @@ const PRODUCT_SPECS: ProductSpec[] = [
   { code: '212', name: 'Gin Tônica', cat: 'drinks', price: 32.9, sector: 'BAR', ncm: '22089000' },
   { code: '213', name: 'Quentão de Vinho', cat: 'drinks', price: 18.9, sector: 'BAR', ncm: '22042100' },
   // Sem álcool (BAR)
-  { code: '221', name: 'Refrigerante Lata', cat: 'sem-alcool', price: 7.9, sector: 'BAR', ncm: '22021000' },
+  { code: '221', name: 'Refrigerante Lata', cat: 'sem-alcool', price: 7.9, sector: 'BAR', ncm: '22021000', barcode: '7890000000017' },
   { code: '222', name: 'Água Mineral 500ml', cat: 'sem-alcool', price: 5.9, sector: 'BAR', ncm: '22011000' },
   { code: '223', name: 'Suco Natural', cat: 'sem-alcool', price: 12.9, sector: 'BAR', ncm: '20098990' },
   // Sobremesas (DESSERT)
@@ -224,6 +225,9 @@ export const SEED_PRODUCTS: Product[] = PRODUCT_SPECS.map((p) => ({
   cfop: '5102',
   csosn_cst: '102',
   unit: p.unit ?? 'UN',
+  cost_price: 0,
+  stock_quantity: 0,
+  barcode: p.barcode ?? null,
   created_at: created,
 }));
 
@@ -552,5 +556,10 @@ export function createSeedData() {
     payments: dyn.payments,
     auditLogs: [],
     printers: SEED_PRINTERS.map((p) => ({ ...p })),
+    suppliers: [],
+    purchaseInvoices: [],
+    purchaseInvoiceItems: [],
+    stockMovements: [],
+    supplierProductLinks: [],
   };
 }

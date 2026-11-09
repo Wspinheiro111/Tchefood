@@ -27,7 +27,11 @@ npm run build
 4. **Retaguarda** — KPIs do turno, conciliação Stone × PagBank × Caixa por método, rateio exato dos 10% por garçom, central anti-fraude com prévia do alerta de WhatsApp, **NFC-e modelo 65** (payload Focus NFe, chave de 44 dígitos com DV, protocolo, QR Code SEFAZ-RS v2, tributos Lei 12.741) e DANFE 58mm.
 5. **Impressão ESC/POS universal** (58mm/32 col e 80mm/48 col) — cadastro de impressoras por praça, `UniversalEscPosBuilder`, roteamento automático no despacho, simulador lado a lado e ponte Android em `android/SmartPosJsBridge.java`.
 
+6. **Compras por XML (NF-e modelo 55)** — Retaguarda › Compras / Estoque. Lê o XML do fornecedor (regras do Tchê Vendas, tudo fail-closed: sem DTD, chave com DV, modelo 55, protocolo autorizado, nota destinada ao CNPJ da casa, itens fechando com o total), sugere o produto pelo vínculo do fornecedor, EAN ou nome, sugere o fator de embalagem (CX 2 com UN 24 = 12), cria o produto fora da venda quando não existe, dá entrada no estoque e recalcula o **custo médio ponderado** (produto − desconto + frete + seguro + outras + IPI + ICMS-ST). A mesma chave nunca entra duas vezes. Botão "XML de exemplo" para testar.
+
 ## Banco de dados
+`db/schema_purchases.sql` (rodar depois do `schema.sql`): `suppliers`, `purchase_invoices` (`UNIQUE (tenant_id, access_key)`), `purchase_invoice_items`, `stock_movements` (somente inserção), `supplier_product_links` e as colunas `cost_price`, `stock_quantity`, `barcode` em `products`.
+
 `db/schema.sql` contém a modelagem do blueprint sem alterações, mais: `product_modifier_groups`, `printers`, recálculo financeiro em PL/pgSQL idêntico a `src/lib/money.ts`, travas anti-fraude (DELETE bloqueado, cancelamento/10%/desconto só com audit_log de gerente, `audit_logs` imutável), fechamento automático e RLS multi-tenant.
 
 ## O que ainda é simulado
