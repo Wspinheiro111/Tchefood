@@ -139,7 +139,16 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         acquirer_cnpj: result.acquirer_cnpj, card_brand: result.card_brand, nsu: result.nsu, authorization_code: result.authorization_code,
         terminal_serial: result.terminal_serial, idempotency_key, item_ids: itemIds, charge_request_id: req.request_id,
       });
-      if (!r.ok) return toast.error(r.error);
+      if (!r.ok) {
+        // A maquininha aprovou mas o registro falhou: trava a conta (nunca cobra de novo) e o gerente registra pelo comprovante.
+        setReviewHoldState(setReviewHold({
+          order_id: orderId, amount, reason: `Aprovado na maquininha, mas não registrado: ${r.error}`, code: 'REGISTER_FAILED', method,
+          acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
+          idempotency_key, item_ids: itemIds,
+        }));
+        toast.alert(`⚠️ Aprovado na maquininha, mas não registrado: ${r.error}`);
+        return;
+      }
       afterApproved(r.data.payment, r.data.closed, result.masked_pan);
     } finally {
       useTcheStore.getState().endTerminalCharge(req.request_id);
