@@ -1,19 +1,24 @@
 import { useMemo, useState } from 'react';
-import { AlertTriangle, BarChart3, FileText, MessageCircle, Printer, Receipt, Settings, ShieldAlert, Users } from 'lucide-react';
+import { AlertTriangle, BarChart3, Beer, Gift, FileText, MessageCircle, Printer, Receipt, Settings, ShieldAlert, Users } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import { formatBRL } from '../lib/money';
+import { kegStatus } from '../lib/kegs';
 import { AUDIT_LABEL, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
+import { CrmPanel } from './CrmPanel';
+import { KegMonitorScreen } from './KegMonitorScreen';
 
-type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'nfce' | 'printers' | 'config';
+type Tab = 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 'nfce' | 'printers' | 'config';
 
 const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3 }> = [
   { key: 'dash', label: 'Dashboard', icon: BarChart3 },
   { key: 'recon', label: 'Conciliação', icon: Receipt },
   { key: 'waiters', label: 'Rateio 10%', icon: Users },
   { key: 'audit', label: 'Anti-Fraude', icon: ShieldAlert },
+  { key: 'chopp', label: 'Barris de chopp', icon: Beer },
+  { key: 'crm', label: 'Clientes & Cashback', icon: Gift },
   { key: 'nfce', label: 'NFC-e', icon: FileText },
   { key: 'printers', label: 'Impressoras', icon: Printer },
   { key: 'config', label: 'Ajustes', icon: Settings },
@@ -22,6 +27,8 @@ const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3 }> = [
 export function BackOffice() {
   const [tab, setTab] = useState<Tab>('dash');
   const alerts = useTcheStore((s) => s.auditLogs.filter((l) => l.whatsapp_alert_sent).length);
+  const kegTaps = useTcheStore((s) => s.kegTaps);
+  const kegAlerts = useMemo(() => kegTaps.filter((t) => t.active && kegStatus(t).alert === 'CRITICAL').length, [kegTaps]);
   return (
     <div className="mx-auto max-w-6xl px-3 pb-10 pt-3">
       <div className="scroll-thin -mx-3 mb-4 flex gap-2 overflow-x-auto px-3">
@@ -29,6 +36,7 @@ export function BackOffice() {
           <button key={t.key} onClick={() => setTab(t.key)} className={`flex min-h-touch shrink-0 items-center gap-2 rounded-xl px-4 font-bold ${tab === t.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}>
             <t.icon className="h-4 w-4" /> {t.label}
             {t.key === 'audit' && alerts > 0 && <span className="rounded-full bg-brasa px-2 text-xs text-white">{alerts}</span>}
+            {t.key === 'chopp' && kegAlerts > 0 && <span className="rounded-full bg-rose-600 px-2 text-xs text-white">{kegAlerts}</span>}
           </button>
         ))}
       </div>
@@ -36,6 +44,8 @@ export function BackOffice() {
       {tab === 'recon' && <Reconciliation />}
       {tab === 'waiters' && <WaiterSplit />}
       {tab === 'audit' && <AuditCenter />}
+      {tab === 'chopp' && <KegMonitorScreen compact />}
+      {tab === 'crm' && <CrmPanel />}
       {tab === 'nfce' && <NfceList />}
       {tab === 'printers' && <PrinterSettings />}
       {tab === 'config' && <Config />}

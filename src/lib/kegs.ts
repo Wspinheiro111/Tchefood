@@ -126,7 +126,7 @@ export function kegStatus(tap: KegTap): KegStatus {
     lossValue = Math.round(((Math.max(unexplainedLossMl, 0) * tap.keg_cost) / cap) * 100) / 100;
     if (unexplainedLossPct > KEG_LOSS_CRITICAL_PCT) {
       alert = 'CRITICAL';
-      message = `${(unexplainedLossMl / 1000).toFixed(1)} L saíram do barril sem faturar nem registrar desperdício.`;
+      message = `${formatLiters(unexplainedLossMl)} saíram do barril sem faturar nem registrar desperdício.`;
     } else if (unexplainedLossPct > KEG_LOSS_WARN_PCT) {
       alert = 'WARN';
       message = `Perda acima de ${KEG_LOSS_WARN_PCT}%: confira sangria e espuma.`;

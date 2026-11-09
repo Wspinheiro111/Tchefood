@@ -17,7 +17,8 @@ interface CartLine extends ProductDraft {
 
 /** Simulador do celular do cliente lendo o QR Code da mesa (Cardápio Digital). */
 export function QrMenuScreen() {
-  const tables = useTcheStore((s) => s.tables);
+  const allTables = useTcheStore((s) => s.tables);
+  const tables = useMemo(() => allTables.filter((t) => t.kind === 'TABLE'), [allTables]);
   const sorted = useMemo(() => [...tables].sort((a, b) => a.number - b.number), [tables]);
   const [tableId, setTableId] = useState<string>(sorted.find((t) => t.number === 4)?.id ?? sorted[0]?.id ?? '');
   const table = tables.find((t) => t.id === tableId);
@@ -68,7 +69,8 @@ function CustomerPhone({ tableId }: { tableId: string }) {
   const [selected, setSelected] = useState<Product | null>(null);
   const [cart, setCart] = useState<CartLine[]>([]);
 
-  const products = s.products.filter((p) => p.category_id === cat);
+  // Buffet a quilo é pesado no balcão, não pedido pelo celular.
+  const products = s.products.filter((p) => p.category_id === cat && !p.sold_by_weight);
   const cartTotal = cart.reduce((a, c) => a + computeItemTotal(c.quantity, c.unit_price, c.modifiers_unit_price), 0);
   const myItems = order ? s.orderItems.filter((i) => i.order_id === order.id) : [];
 
@@ -111,7 +113,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
       {tab === 'menu' ? (
         <>
           <div className="flex gap-2 overflow-x-auto px-3 py-2">
-            {s.categories.map((c) => (
+            {s.categories.filter((c) => s.products.some((p) => p.category_id === c.id && !p.sold_by_weight)).map((c) => (
               <button key={c.id} onClick={() => setCat(c.id)} className={`flex shrink-0 flex-col items-center gap-1 rounded-xl px-3 py-2 text-[11px] font-bold ${cat === c.id ? 'bg-rose-600 text-white' : 'bg-white text-slate-700 shadow'}`}>
                 <CategoryIcon name={c.icon_name} className="h-6 w-6" />
                 {c.name}
