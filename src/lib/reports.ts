@@ -124,6 +124,7 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   MANAGER_PIN_LOCKOUT: 'PIN bloqueado (3 erros)',
   KEG_CHANGED: 'Troca de barril de chopp',
   CASHBACK_REDEEMED: 'Cashback resgatado',
+  KIOSK_EXIT: 'Totem fechado',
 };
 
 /** Texto do alerta enviado ao WhatsApp do proprietário. */

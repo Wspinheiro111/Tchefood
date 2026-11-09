@@ -1,6 +1,7 @@
 import type { DeliveryOrderRecord } from '../../server/delivery/deliveryInbox';
 import { DELIVERY_CHANNEL_CATALOG } from '../../server/delivery/marketplace';
-import type { DiningTable, OrderItem } from '../types';
+import type { DiningTable, Order, OrderItem } from '../types';
+import { FULFILLMENT_LABEL, formatPickupNumber, kioskStage, kioskTableIds, producedItems } from './kiosk';
 
 // Regras do painel de senhas (TV estilo fast-food). Só número e primeiro nome: nada de telefone, endereço ou valor.
 
@@ -66,6 +67,34 @@ export function qrBoardEntries(items: readonly OrderItem[], tables: readonly Din
       stage: allReady ? 'ready' : 'preparing',
       number: table ? `Mesa ${table.number}` : 'Mesa',
       subtitle: 'Pedido pelo QR',
+      courierLabel: null,
+      since,
+    });
+  }
+  return entries;
+}
+
+// Pedidos com senha (totem e pedido no caixa): só entram depois de pagos. "Preparando" enquanto algum item
+// está na cozinha, "Pronto" quando tudo ficou pronto, e saem quando a cozinha marca entregue no balcão.
+export function pickupBoardEntries(orders: readonly Order[], items: readonly OrderItem[], tables: readonly DiningTable[]): BoardEntry[] {
+  const kioskTables = kioskTableIds(tables);
+  const entries: BoardEntry[] = [];
+  for (const order of orders) {
+    if (!kioskTables.has(order.table_id) || order.pickup_number === null) continue;
+    const stage = kioskStage(order, items);
+    if (stage !== 'PREPARING' && stage !== 'READY') continue;
+    const produced = producedItems(items, order.id);
+    // Pedido só de bebida de geladeira é entregue na hora pelo caixa: não aparece no painel.
+    if (produced.length === 0) continue;
+    const since =
+      stage === 'READY'
+        ? produced.reduce((latest, item) => ((item.prepared_at ?? '') > latest ? item.prepared_at ?? '' : latest), '')
+        : order.closed_at ?? order.opened_at;
+    entries.push({
+      key: `pickup:${order.id}`,
+      stage: stage === 'READY' ? 'ready' : 'preparing',
+      number: formatPickupNumber(order.pickup_number),
+      subtitle: order.pickup_name ? firstName(order.pickup_name) : order.fulfillment_type ? FULFILLMENT_LABEL[order.fulfillment_type] : 'Retirada',
       courierLabel: null,
       since,
     });

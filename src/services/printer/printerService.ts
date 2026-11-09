@@ -42,13 +42,15 @@ export interface KitchenTicketData {
   fromQr: boolean;
   createdAt: string;
   items: Array<{ quantity: number; name: string; code: string; doneness: string | null; notes: string | null }>;
+  /** Título gigante no lugar de "MESA n" (ex.: "SENHA 042" no pedido do totem). */
+  headline?: string;
 }
 
 /** Ticket de produção: mesa gigante, quantidade/ponto em dupla altura. */
 export function buildKitchenTicket(width: PaperWidth, data: KitchenTicketData, opts: { beep: boolean; cut: boolean }): UniversalEscPosBuilder {
   const b = new UniversalEscPosBuilder(width);
   if (opts.beep) b.beep();
-  b.align('CENTER').size('LARGE').bold(true).line(`MESA ${data.tableNumber}`);
+  b.align('CENTER').size('LARGE').bold(true).line(data.headline ?? `MESA ${data.tableNumber}`);
   b.size('DOUBLE_HEIGHT').line(data.sectorLabel.toUpperCase());
   b.size('NORMAL').bold(false).align('LEFT').divider('=');
   b.leftRight(data.fromQr ? 'PEDIDO VIA QR CODE' : `Garcom: ${data.waiterName}`, new Date(data.createdAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }));
@@ -171,6 +173,7 @@ export function routeDispatch(params: {
   staff: readonly StaffUser[];
   tableLabel: string;
   tableNumber: number;
+  headline?: string;
 }): RenderedTicket[] {
   const bySector = new Map<ProductionSector, OrderItem[]>();
   for (const i of params.items) bySector.set(i.sector, [...(bySector.get(i.sector) ?? []), i]);
@@ -186,6 +189,7 @@ export function routeDispatch(params: {
       waiterName: params.staff.find((s) => s.id === first.waiter_id)?.name ?? '-',
       fromQr: first.origin === 'QRCODE_TABLE',
       createdAt: first.created_at,
+      ...(params.headline ? { headline: params.headline } : {}),
       items: items.map((i) => {
         const p = params.products.find((x) => x.id === i.product_id);
         return { quantity: i.quantity, name: p?.name ?? 'Item', code: p?.code ?? '', doneness: i.meat_doneness, notes: i.notes };

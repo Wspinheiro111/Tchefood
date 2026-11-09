@@ -3,13 +3,15 @@ import { Bike, ChefHat, Expand, Flame, Minimize, ShoppingBag, Volume2, VolumeX }
 import { useTcheStore } from '../store/useTcheStore';
 import { playDispatchChime } from '../lib/sound';
 import { useDeliveryOrders, useDeliveryPolling } from '../lib/deliveryDemo';
-import { buildBoard, deliveryBoardEntries, qrBoardEntries, type BoardEntry } from '../lib/orderBoard';
+import { buildBoard, deliveryBoardEntries, pickupBoardEntries, qrBoardEntries, type BoardEntry } from '../lib/orderBoard';
 
 // Painel de senhas para TV (estilo fast-food): "Preparando" e "Pronto". Só mostra número do pedido e primeiro
 // nome do cliente; nada de telefone, endereço ou valores, porque fica virado para o salão.
 const HIGHLIGHT_MS = 30_000;
 
 function spokenNumber(entry: BoardEntry): string {
+  // Senha do totem / caixa: "Senha 42" (sem os zeros à esquerda do painel).
+  if (entry.key.startsWith('pickup:')) return `Senha ${Number(entry.number)}`;
   return /^\d+$/.test(entry.number) ? `Pedido ${entry.number.split('').join(' ')}` : entry.number;
 }
 
@@ -31,6 +33,7 @@ export function OrderBoardScreen() {
   useDeliveryPolling(useCallback(() => undefined, []));
   const orders = useDeliveryOrders((s) => s.orders);
   const orderItems = useTcheStore((s) => s.orderItems);
+  const allOrders = useTcheStore((s) => s.orders);
   const tables = useTcheStore((s) => s.tables);
   const tenant = useTcheStore((s) => s.tenant);
   const [voice, setVoice] = useState(true);
@@ -42,8 +45,8 @@ export function OrderBoardScreen() {
   const firstRender = useRef(true);
 
   const { preparing, ready } = useMemo(
-    () => buildBoard([...deliveryBoardEntries(orders), ...qrBoardEntries(orderItems, tables)]),
-    [orders, orderItems, tables],
+    () => buildBoard([...deliveryBoardEntries(orders), ...qrBoardEntries(orderItems, tables), ...pickupBoardEntries(allOrders, orderItems, tables)]),
+    [orders, orderItems, tables, allOrders],
   );
 
   useEffect(() => {
