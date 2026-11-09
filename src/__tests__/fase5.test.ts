@@ -278,6 +278,9 @@ describe('cashback no WhatsApp', () => {
     expect(order.total_amount).toBe(10.41);
     expect(st().auditLogs[0]!.action_type).toBe('CASHBACK_REDEEMED');
     expect(st().loyaltyCustomers[0]!.cashback_balance).toBe(0);
+    // Extrato e cliente do resgate sobem presos à comanda do resgate.
+    const tagged = st().outbox.filter((e) => (e.table === 'cashback_ledger' || e.table === 'loyalty_customers') && e.depends_on_order_id === second);
+    expect(tagged.map((e) => `${e.table} ${e.op}`).sort()).toEqual(['cashback_ledger INSERT', 'cashback_ledger UPDATE', 'loyalty_customers UPDATE']);
     expect(st().redeemCashback(second, '55999991234').ok).toBe(false);
     expect(st().applyDiscount(second, 2, MANAGER).ok).toBe(false);
   });
