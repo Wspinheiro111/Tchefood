@@ -155,19 +155,38 @@ describe("caixa de entrada de delivery", () => {
     expect(record.reviewReasons[0]).toMatch(/impressora offline/);
   });
 
-  it("falha ao gravar o evento depois do pedido não pula o aviso de pedido novo", async () => {
+  it("falha ao gravar o evento depois do aviso não perde o pedido nem avisa duas vezes", async () => {
     const onNewOrder = vi.fn();
     const { sandbox, repository, inbox } = setup({ onNewOrder });
     const recordEvent = repository.recordEvent.bind(repository);
     const spy = vi.spyOn(repository, "recordEvent").mockRejectedValueOnce(new Error("banco fora do ar"));
-    const id = sandbox.placeOrder({ items: ITEMS });
+    sandbox.placeOrder({ items: ITEMS });
     const [first] = await inbox.runCycle();
-    expect(first).toMatchObject({ acknowledged: 0, deferred: 1, newOrders: [] });
-    expect(onNewOrder).not.toHaveBeenCalled();
+    expect(first).toMatchObject({ acknowledged: 0, deferred: 1 });
+    expect(onNewOrder).toHaveBeenCalledOnce();
     spy.mockImplementation(recordEvent);
     const [second] = await inbox.runCycle();
-    expect(second).toMatchObject({ acknowledged: 1, newOrders: [id] });
+    expect(second).toMatchObject({ acknowledged: 1, deferred: 0 });
     expect(onNewOrder).toHaveBeenCalledOnce();
+    expect(await inbox.listOrders()).toHaveLength(1);
+  });
+
+  it("falha ao gravar o pedido depois do aviso repete o aviso em vez de pulá-lo", async () => {
+    const onNewOrder = vi.fn();
+    const { sandbox, repository, inbox } = setup({ onNewOrder });
+    const saveOrder = repository.saveOrder.bind(repository);
+    let calls = 0;
+    vi.spyOn(repository, "saveOrder").mockImplementation(async (record) => {
+      calls += 1;
+      if (calls === 2) throw new Error("banco fora do ar");
+      return saveOrder(record);
+    });
+    sandbox.placeOrder({ items: ITEMS });
+    const [first] = await inbox.runCycle();
+    expect(first.acknowledged).toBe(0);
+    const [second] = await inbox.runCycle();
+    expect(second.acknowledged).toBe(1);
+    expect(onNewOrder).toHaveBeenCalledTimes(2);
   });
 
   it("resposta de ação que chega depois do polling não volta o status do pedido", async () => {
@@ -223,6 +242,50 @@ describe("caixa de entrada de delivery", () => {
     const [record] = await custom.listOrders();
     expect(record.cancellationPending).toBe(false);
     expect(allowedDeliveryActions(record.order, record.cancellationPending)).toContain("confirm");
+  });
+
+  it("recusa de cancelamento recebida durante a chamada não é desfeita", async () => {
+    const repository = new InMemoryDeliveryRepository();
+    const queue: DeliveryEvent[] = [];
+    const event = (id: string, signal: DeliveryEvent["signal"], createdAt: string): DeliveryEvent => ({
+      channel: "ifood", externalEventId: id, externalOrderId: "o1", merchantExternalId: "m", rawCode: id, signal, createdAt,
+    });
+    let inbox: DeliveryInbox;
+    const adapter = {
+      channel: "ifood" as const,
+      pollEvents: async () => queue.splice(0),
+      acknowledge: async () => undefined,
+      getOrder: async () => baseOrder(),
+      performAction: async () => undefined,
+      listCancellationReasons: async () => [],
+      requestCancellation: async () => {
+        queue.push(event("e2", "cancellation_requested", "2026-11-09T10:01:00Z"), event("e3", "cancellation_denied", "2026-11-09T10:02:00Z"));
+        await inbox.runCycle();
+      },
+    };
+    inbox = new DeliveryInbox({ adapters: [adapter], repository });
+    queue.push(event("e1", "placed", "2026-11-09T10:00:00Z"));
+    await inbox.runCycle();
+    const result = await inbox.requestCancellation("ifood", "o1", { code: "501", description: "Problemas de sistema" });
+    expect(result.cancellationPending).toBe(false);
+  });
+
+  it("falha ao gravar o resultado do aviso reprocessa o evento em vez de esconder a pendência", async () => {
+    const { sandbox, repository, inbox } = setup({ onNewOrder: () => Promise.reject(new Error("impressora offline")) });
+    const saveOrder = repository.saveOrder.bind(repository);
+    let calls = 0;
+    vi.spyOn(repository, "saveOrder").mockImplementation(async (record) => {
+      calls += 1;
+      if (calls === 2) throw new Error("banco fora do ar");
+      return saveOrder(record);
+    });
+    sandbox.placeOrder({ items: ITEMS });
+    const [first] = await inbox.runCycle();
+    expect(first.acknowledged).toBe(0);
+    await inbox.runCycle();
+    const [record] = await inbox.listOrders();
+    expect(record.needsReview).toBe(true);
+    expect(record.reviewReasons.join(" ")).toMatch(/impressora offline/);
   });
 
   it("app fora do ar não derruba o ciclo", async () => {

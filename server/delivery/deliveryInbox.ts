@@ -182,12 +182,15 @@ export class DeliveryInbox {
     if (["concluded", "cancelled"].includes(record.order.status)) {
       throw new DeliveryMarketplaceError(channel, "conflict", "Pedido já finalizado não pode ser cancelado.");
     }
+    const cancellationSeenBefore = record.lastCancellationEventAt;
     await adapter.requestCancellation(externalOrderId, reason, details);
     // Relê o pedido depois da resposta: o polling pode ter gravado eventos (até o próprio cancelamento) enquanto
     // a chamada estava em andamento, e a foto lida antes não pode sobrescrever isso.
     return this.withOrderLock(channel, externalOrderId, async () => {
       const latest = await this.requireOrder(channel, externalOrderId);
-      if (latest.order.status !== "cancelled" && latest.order.status !== "concluded") {
+      // Se o polling aplicou algum evento de cancelamento (recusa ou confirmação) durante a chamada, ele manda.
+      const cancellationAdvanced = latest.lastCancellationEventAt !== cancellationSeenBefore;
+      if (!cancellationAdvanced && latest.order.status !== "cancelled" && latest.order.status !== "concluded") {
         latest.cancellationPending = true;
         latest.updatedAt = this.now().toISOString();
         await this.options.repository.saveOrder(latest);
@@ -258,12 +261,12 @@ export class DeliveryInbox {
     }
     const isNew = !record.newOrderNotified;
 
-    // Pedido primeiro, histórico depois: se cair entre os dois, o evento é reprocessado, e aplicar o mesmo
-    // evento duas vezes dá o mesmo resultado (status só anda para frente).
+    // Ordem: pedido gravado, aviso, resultado do aviso gravado e, por último, o evento no histórico. Se qualquer
+    // passo falhar, o evento fica sem ack e é reprocessado inteiro; aplicar o mesmo evento de novo dá o mesmo
+    // status (só anda para frente). O aviso pode repetir nesse caso, mas nunca se perde.
     applySignal(record, event);
     record.updatedAt = this.now().toISOString();
     await repository.saveOrder(record);
-    await repository.recordEvent(event);
 
     // Falha no aviso (impressora, KDS) não desfaz o pedido gravado: vira pendência para o lojista.
     const notify = isNew ? this.options.onNewOrder : this.options.onOrderUpdated;
@@ -274,6 +277,7 @@ export class DeliveryInbox {
     }
     if (isNew) record.newOrderNotified = true;
     if (isNew || record.needsReview) await repository.saveOrder(record);
+    await repository.recordEvent(event);
     return isNew ? "new_order" : "updated";
   }
 }
