@@ -28,7 +28,7 @@ export const PLANOS: Plano[] = [
     id: 'bistro',
     nome: 'Bistrô & Lancheria',
     publico: 'Lancherias, cafés, bistrôs e operações de balcão',
-    precoMensal: null, // TODO(Will): definir preço
+    precoMensal: 99,
     destaque: false,
     limites: ['1 unidade', 'Até 2 maquininhas', 'Garçons ilimitados'],
     recursos: [
@@ -44,7 +44,7 @@ export const PLANOS: Plano[] = [
     id: 'salao-pro',
     nome: 'Churrascaria & Salão Pro',
     publico: 'Restaurantes com salão, churrascarias e pizzarias',
-    precoMensal: null, // TODO(Will): definir preço
+    precoMensal: 199,
     destaque: true,
     limites: ['1 unidade', 'Maquininhas ilimitadas', 'Garçons ilimitados'],
     recursos: [
@@ -60,7 +60,7 @@ export const PLANOS: Plano[] = [
     id: 'rede-eventos',
     nome: 'Rede & Eventos',
     publico: 'Redes, cervejarias, bailes, festas e food trucks',
-    precoMensal: null, // TODO(Will): definir preço
+    precoMensal: 299,
     destaque: false,
     limites: ['Várias unidades', 'Maquininhas ilimitadas', 'Garçons ilimitados'],
     recursos: [
