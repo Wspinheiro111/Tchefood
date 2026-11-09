@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { scroll-behavior: smooth; }
+  body {
+    @apply bg-fundo text-slate-200 font-sans antialiased;
+  }
+  h1, h2, h3 { @apply font-display text-white; }
+  ::selection { background: rgba(225, 29, 72, 0.35); }
+}
+
+@layer components {
+  .container-lp { @apply mx-auto w-full max-w-6xl px-4 sm:px-6; }
+  .btn-primario {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-brasa px-5 py-3 font-semibold text-white
+      shadow-[0_8px_30px_-8px_rgba(225,29,72,0.6)] transition hover:bg-rose-500 focus:outline-none
+      focus-visible:ring-2 focus-visible:ring-ouro focus-visible:ring-offset-2 focus-visible:ring-offset-fundo;
+  }
+  .btn-secundario {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border border-borda bg-surface/60 px-5 py-3
+      font-semibold text-slate-100 transition hover:border-slate-500 focus:outline-none
+      focus-visible:ring-2 focus-visible:ring-ouro;
+  }
+  .card { @apply rounded-2xl border border-borda bg-surface/70; }
+  .eyebrow { @apply text-xs font-semibold uppercase tracking-[0.18em] text-ouro; }
+
+  .slider {
+    @apply h-2 w-full cursor-pointer appearance-none rounded-full bg-slate-700;
+    accent-color: #e11d48;
+  }
+  .slider::-webkit-slider-thumb {
+    @apply h-5 w-5 appearance-none rounded-full border-2 border-white bg-brasa shadow;
+  }
+  .slider::-moz-range-thumb {
+    @apply h-5 w-5 rounded-full border-2 border-white bg-brasa;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
