@@ -1,4 +1,5 @@
-import { BellRing, Bluetooth, Network, Scissors, Smartphone, X } from 'lucide-react';
+import { BellRing, Bluetooth, Network, RotateCcw, Scissors, Smartphone, X } from 'lucide-react';
+import { toast } from './ui';
 import { COLUMNS, type PaperWidth, type PreviewEvent } from '../services/printer/escposBuilder';
 import { routeDispatch, usePrintPreview, type RenderedTicket } from '../services/printer/printerService';
 import { useTcheStore } from '../store/useTcheStore';
@@ -46,8 +47,13 @@ export function EscPosPaper({ width, events }: { width: PaperWidth; events: Prev
 
 const CONN_ICON = { NETWORK_TCP: Network, BLUETOOTH: Bluetooth, SMARTPOS_INTERNAL: Smartphone } as const;
 
-function TicketBlock({ t }: { t: RenderedTicket }) {
+function TicketBlock({ t, index }: { t: RenderedTicket; index: number }) {
   const Icon = CONN_ICON[t.printer.connection];
+  const failed = t.delivery.via === 'NATIVE' && !t.delivery.ok;
+  const retry = () => {
+    const r = usePrintPreview.getState().retry(index);
+    if (r) (r.delivery.ok ? toast.success : toast.error)(r.delivery.ok ? `${t.printer.name}: impresso.` : `${t.printer.name}: ${r.delivery.error ?? 'falha ao imprimir'}`);
+  };
   return (
     <section className="rounded-2xl bg-slate-900 p-3">
       <header className="mb-2 flex flex-wrap items-center justify-between gap-2 text-sm">
@@ -58,6 +64,12 @@ function TicketBlock({ t }: { t: RenderedTicket }) {
           <span className={t.delivery.ok ? 'text-stone' : 'text-rose-300'}>{t.delivery.via === 'NATIVE' ? (t.delivery.skipped === 'ALREADY_PRINTED' ? 'já impresso' : t.delivery.ok ? 'enviado' : `falha: ${t.delivery.error}`) : 'simulado'}</span>
         </div>
       </header>
+      {failed && (
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500 bg-rose-950/60 p-3 text-sm text-rose-100">
+          <span>Não imprimiu em {t.printer.name}: {t.delivery.error ?? 'impressora sem resposta'}. Verifique papel, energia e conexão.</span>
+          <button onClick={retry} className="flex min-h-touch items-center gap-2 rounded-xl bg-rose-600 px-4 font-bold text-white"><RotateCcw className="h-4 w-4" /> Reenviar</button>
+        </div>
+      )}
       <div className="scroll-thin flex gap-4 overflow-x-auto pb-2">
         <div className="shrink-0">
           <div className={`mb-1 text-center text-xs font-bold ${t.printer.paperWidth === '80MM' ? 'text-ouro' : 'text-slate-400'}`}>Bobina larga 80mm · 48 colunas{t.printer.paperWidth === '80MM' ? ' (esta impressora)' : ''}</div>
@@ -88,7 +100,7 @@ export function PrintSimulatorModal() {
           <button aria-label="Fechar" onClick={clear} className="grid h-11 w-11 place-items-center rounded-full active:bg-slate-700"><X className="h-6 w-6" /></button>
         </div>
         <div className="scroll-thin space-y-3 overflow-y-auto p-3">
-          {tickets.map((t, i) => <TicketBlock key={i} t={t} />)}
+          {tickets.map((t, i) => <TicketBlock key={i} t={t} index={i} />)}
         </div>
       </div>
     </div>
@@ -102,5 +114,12 @@ export function printDispatchedItems(items: readonly OrderItem[]) {
   const table = s.tables.find((t) => t.id === order?.table_id);
   if (!order || !table) return;
   const tickets = routeDispatch({ items, printers: s.printers, products: s.products, staff: s.staff, tableLabel: table.label, tableNumber: table.number });
+  const failed = tickets.filter((t) => t.delivery.via === 'NATIVE' && !t.delivery.ok);
+  if (failed.length > 0) {
+    // Falha de impressão sempre aparece, com o simulador ligado ou não.
+    toast.error(`Ticket não impresso: ${failed.map((t) => t.printer.name).join(', ')}. Toque em Reenviar.`);
+    usePrintPreview.getState().show(s.showPrintSimulator ? tickets : failed);
+    return;
+  }
   if (s.showPrintSimulator && tickets.some((t) => t.delivery.via === 'SIMULATOR')) usePrintPreview.getState().show(tickets);
 }

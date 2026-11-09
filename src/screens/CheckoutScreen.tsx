@@ -106,6 +106,8 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     if (opMode === 'TEF_POS_WIRELESS' && (!terminal || !terminal.online)) return toast.error('Selecione uma maquininha online.');
     const driver = createDriver({ terminal: opMode === 'TEF_POS_WIRELESS' ? terminal : null, chassis: opMode === 'TEF_POS_WIRELESS' ? (terminal?.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE') : chassis, mode: opMode });
     const req: ChargeRequest = { request_id: uuid(), idempotency_key, amount, method, table_label: table.label, order_id: orderId, description };
+    const lock = s.beginTerminalCharge(orderId, req.request_id, amount);
+    if (!lock.ok) return toast.error(lock.error);
     setBusy(true);
     if (opMode === 'TEF_POS_WIRELESS') toast.info(`📡 Cobrança de ${formatBRL(amount)} enviada para ${terminal?.name} (${terminal?.serial_number}).`);
     try {
@@ -120,6 +122,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         s.registerPayment({
           orderId, amount, method, status: 'DECLINED', terminal_id: result.terminal_id, acquirer: result.acquirer, acquirer_cnpj: null,
           card_brand: null, nsu: null, authorization_code: null, terminal_serial: result.terminal_serial, idempotency_key, item_ids: [],
+          charge_request_id: req.request_id,
         });
         toast.error(`❌ Transação recusada: ${result.reason}`);
         return;
@@ -127,11 +130,12 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       const r = s.registerPayment({
         orderId, amount, method, status: 'APPROVED', terminal_id: result.terminal_id, acquirer: result.acquirer,
         acquirer_cnpj: result.acquirer_cnpj, card_brand: result.card_brand, nsu: result.nsu, authorization_code: result.authorization_code,
-        terminal_serial: result.terminal_serial, idempotency_key, item_ids: itemIds,
+        terminal_serial: result.terminal_serial, idempotency_key, item_ids: itemIds, charge_request_id: req.request_id,
       });
       if (!r.ok) return toast.error(r.error);
       afterApproved(r.data.payment, r.data.closed, result.masked_pan);
     } finally {
+      useTcheStore.getState().endTerminalCharge(req.request_id);
       setBusy(false);
     }
   };

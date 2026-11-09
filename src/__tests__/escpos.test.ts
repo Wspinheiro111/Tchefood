@@ -37,3 +37,29 @@ describe('ESC/POS universal', () => {
     expect(t.toBase64().length).toBeGreaterThan(100);
   });
 });
+
+describe('falha da impressora nativa', () => {
+  it('reenviar usa o mesmo ESC/POS e atualiza o status', async () => {
+    const { printTestPage, usePrintPreview } = await import('../services/printer/printerService');
+    let up = false;
+    const sent: string[] = [];
+    (globalThis as unknown as { window: unknown }).window = {
+      SmartPosNative: {
+        printNetworkEscPos: (_ip: string, _port: number, b64: string) => {
+          sent.push(b64);
+          return JSON.stringify(up ? { success: true } : { success: false, error: 'Connection refused' });
+        },
+      },
+    };
+    const printer = { id: 'p1', name: 'Parrilla', brand: 'ELGIN' as const, model: 'i9', sector: 'GRILL' as const, paperWidth: '80MM' as const, connection: 'NETWORK_TCP' as const, ipAddress: '192.168.1.50', port: 9100, beepOnPrint: true, cutPaper: true, active: true };
+    const t = printTestPage(printer);
+    expect(t.delivery).toMatchObject({ ok: false, via: 'NATIVE', error: 'Connection refused' });
+    usePrintPreview.getState().show([t]);
+    up = true;
+    const again = usePrintPreview.getState().retry(0);
+    expect(again?.delivery.ok).toBe(true);
+    expect(sent[1]).toBe(sent[0]);
+    expect(usePrintPreview.getState().tickets[0]!.delivery.ok).toBe(true);
+    delete (globalThis as unknown as { window?: unknown }).window;
+  });
+});

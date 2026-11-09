@@ -12,7 +12,7 @@ import { QrMenuScreen } from './screens/QrMenuScreen';
 import { BackOffice } from './screens/BackOffice';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
 import { PrintSimulatorModal } from './components/PrintSimulator';
-import { ToastHost } from './components/ui';
+import { ToastHost, toast } from './components/ui';
 import type { UserRole } from './types';
 
 type View =
@@ -87,7 +87,7 @@ export default function App() {
         <span title={online ? `${outbox} evento(s) na fila de sincronização` : 'Offline: operando pela fila local'} className={`hidden items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold md:inline-flex ${online ? 'bg-stone/15 text-stone' : 'bg-ouro/20 text-ouro'}`}>
           {online ? '●' : <CloudOff className="h-3 w-3" />} {online ? 'Online' : 'Offline'} · fila {outbox}
         </span>
-        <button aria-label="Sair" onClick={logout} className="grid h-11 w-11 place-items-center rounded-xl bg-surface"><LogOut className="h-5 w-5" /></button>
+        <button aria-label="Sair" onClick={() => { const r = logout(); if (!r.ok) toast.error(r.error); }}className="grid h-11 w-11 place-items-center rounded-xl bg-surface"><LogOut className="h-5 w-5" /></button>
       </header>
 
       <main>
