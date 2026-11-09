@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Copy, FileJson, Printer, Receipt } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
-import { buildNfce, formatAccessKey } from '../lib/nfce';
+import { buildNfce, formatAccessKey, isValidNfceQrCodeContent } from '../lib/nfce';
 import { danfeLines } from '../lib/receipts';
 import { printDocument } from '../lib/payments/drivers';
 import { Btn, Sheet, toast } from '../components/ui';
@@ -29,7 +29,9 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
 
   const danfe = danfeLines({ tenant: s.tenant, doc });
   const json = JSON.stringify(doc.payload, null, 2);
+  const qrValid = isValidNfceQrCodeContent(doc.qr_url, doc.access_key);
   const printDanfe = () => {
+    if (!qrValid) return toast.error('QR Code da NFC-e não confere com a chave de acesso. DANFE não impresso.');
     const first = s.payments.find((p) => p.order_id === orderId && p.status === 'APPROVED' && p.acquirer === 'PAGBANK');
     try {
       const via = printDocument({ title: `DANFE NFC-e ${doc.payload.numero}`, lines: danfe.top, qr: doc.qr_url, footer: danfe.bottom, chassis: first ? 'PAGBANK' : 'STONE' });
@@ -63,7 +65,7 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
       <div className="mb-3 rounded-xl bg-base p-3 text-xs">
         <div><b>Chave de acesso:</b> <span className="font-mono">{formatAccessKey(doc.access_key)}</span></div>
         <div><b>Protocolo SEFAZ-RS:</b> {doc.protocol} · <b>Status:</b> {order.nfce_status} (homologação)</div>
-        <div className="break-all"><b>QR consulta:</b> {doc.qr_url}</div>
+        <div className="break-all"><b>QR consulta:</b> {doc.qr_url}{!qrValid && <b className="text-rose-300"> (inválido para esta nota)</b>}</div>
       </div>
       <div className="mb-3 grid grid-cols-2 gap-2">
         <button onClick={() => setTab('danfe')} className={`min-h-touch rounded-xl font-bold ${tab === 'danfe' ? 'bg-brasa' : 'bg-base'}`}>DANFE 58mm</button>

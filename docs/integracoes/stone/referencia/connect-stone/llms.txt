@@ -1,0 +1,62 @@
+# Stone Connect 2.0 Documentation
+
+> Documentation for Stone Connect 2.0
+
+## Guides: Documentation
+- [O que é o Connect Stone?](https://connect-stone.stone.com.br/docs/o-que-é-a-api-connect-20.md): Vamos mostrar como é a realidade do cliente que usa um sistema/ERP sem integração com as transações, e como conseguimos somar forças para melhorar a produtividade do nosso cliente!
+- [Conceitos](https://connect-stone.stone.com.br/docs/conceitos.md)
+- [Operações](https://connect-stone.stone.com.br/docs/operações.md)
+- [Dispositivos Suportados](https://connect-stone.stone.com.br/docs/dispositivos-suportados.md)
+- [Documentação Técnica](https://connect-stone.stone.com.br/docs/documentação-técnica.md)
+- [Processo de integração](https://connect-stone.stone.com.br/docs/processo-de-integração.md)
+
+## Guides: QUERO SER PARCEIRO
+- [Evolua ao nosso lado](https://connect-stone.stone.com.br/docs/evolua-ao-nosso-lado.md)
+
+## API Reference: Connect 2.0
+- [Visão Geral](https://connect-stone.stone.com.br/reference/visão-geral.md)
+- [Fluxos Transacionais](https://connect-stone.stone.com.br/reference/fluxos-transacionais-copy.md)
+- [Ambiente](https://connect-stone.stone.com.br/reference/autenticação-copy.md)
+- [Autenticação](https://connect-stone.stone.com.br/reference/autenticação-copy-1.md)
+- [Criar pedido para maquininha](https://connect-stone.stone.com.br/reference/criar-pedido.md)
+  - [Exemplo de pedidos: Direto e Listado](https://connect-stone.stone.com.br/reference/pedido-direto.md): Segue abaixo exemplos de como preencher os dois tipos de pedidos:
+- [Recebendo um Pagamento](https://connect-stone.stone.com.br/reference/recebendo-um-pagamento.md)
+- [Fechamento de um pedido](https://connect-stone.stone.com.br/reference/fechamento-de-um-pedido.md)
+- [Impressão de nota fiscal](https://connect-stone.stone.com.br/reference/impressão-de-nota-fiscal.md)
+- [Obter pedido](https://connect-stone.stone.com.br/reference/obter-pedido.md)
+- [Cancelamento de pedido](https://connect-stone.stone.com.br/reference/cancelamento-de-pedido.md)
+- [Webhook](https://connect-stone.stone.com.br/reference/webhook.md)
+  - [Retorno Webhook](https://connect-stone.stone.com.br/reference/retorno-webhook.md): Exemplos de postback dos Webhooks do Connect Stone
+
+## API Reference: CONNECT SPLIT
+- [Visão Geral](https://connect-stone.stone.com.br/reference/visão-geral-1.md)
+- [Fluxos Transacionais](https://connect-stone.stone.com.br/reference/fluxo-transacional.md)
+- [Dispositivos Suportados](https://connect-stone.stone.com.br/reference/dispositivos-suportados-1.md)
+- [Autenticação](https://connect-stone.stone.com.br/reference/autenticação-1.md)
+- [Cadastro de Recebedores](https://connect-stone.stone.com.br/reference/cadastro-de-recebedores.md)
+- [Criar pedido para maquininha](https://connect-stone.stone.com.br/reference/criar-pedido-para-maquininha-copy.md): Para criar um pedido a ser pago no POS integrado você deve utilizar o endpoint de [Criar um pedido](https://docs.pagar.me/reference#criar-pedido-2).  Todos os pedidos criados em aberto…
+  - [Exemplo de pedidos](https://connect-stone.stone.com.br/reference/exemplo-de-pedidos.md)
+- [Recebendo um pagamento](https://connect-stone.stone.com.br/reference/recebendo-um-pagamento-1.md)
+- [[DESCONTINUADO] Captura de Cobrança](https://connect-stone.stone.com.br/reference/captura-de-cobrança.md)
+- [Fechamento de Pedido](https://connect-stone.stone.com.br/reference/fechamento-de-pedido.md)
+- [Impressão de Nota Fiscal](https://connect-stone.stone.com.br/reference/impressão-de-nota-fiscal-1.md)
+- [Obter Pedido](https://connect-stone.stone.com.br/reference/impressão-de-nota-fiscal-2.md)
+- [Cancelamento de Cobrança](https://connect-stone.stone.com.br/reference/cancelamento-de-pedido-1.md)
+- [Split na criação do pedido](https://connect-stone.stone.com.br/reference/split-no-pedido.md): Contém detalhes para adicionar o objeto de split na criação de um pedido.
+- [Conciliação Transacional](https://connect-stone.stone.com.br/reference/conciliação-transacional.md): Para consultar as transações que são realizadas, temos duas opções:
+- [Webhook](https://connect-stone.stone.com.br/reference/webhook-1.md)
+  - [Retorno Webhook](https://connect-stone.stone.com.br/reference/retorno-webhook-1.md): Exemplos de postback dos Webhooks do Connect Stone
+
+## API Reference: APÊNDICE
+- [Itens](https://connect-stone.stone.com.br/reference/itens.md): Contem as informações detalhadas dos campos do objeto ITENS.
+- [Customer](https://connect-stone.stone.com.br/reference/customer.md): Contem as informações detalhadas dos campos do objeto CUSTOMER.
+- [POI payment settings](https://connect-stone.stone.com.br/reference/poi-payment-settings.md): Contem as informações detalhadas dos campos do objeto POI PAYMENT SETTINGS.
+
+## API Reference: QUERO SER PARCEIRO
+- [Evolua ao nosso lado](https://connect-stone.stone.com.br/reference/evolua-ao-nosso-lado-1.md)
+
+## API Reference: Connect Split
+- [Getting Started With Your API](https://connect-stone.stone.com.br/reference/getting-started-with-your-api.md): This page will help you get started with Connect Split.
+
+## Pages
+- [Dúvidas Frequentes](https://connect-stone.stone.com.br/page/faq.md)

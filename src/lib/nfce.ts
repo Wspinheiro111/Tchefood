@@ -112,6 +112,41 @@ export function buildConsultaQrUrl(key: string, tenant: Pick<Tenant, 'csc_id' | 
 
 export const CONSULTA_URL_RS = 'www.sefaz.rs.gov.br/nfce/consulta';
 
+/**
+ * Portado do Tchê Vendas (server/danfceQrCode.ts): só aceita como QR Code do
+ * DANFE uma URL http(s) de SEFAZ (.gov.br) cujo parâmetro p começa pela chave
+ * de acesso DESTA NFC-e. Um endereço de consulta (sem p), de outra nota ou de
+ * outro domínio nunca vira QR Code impresso.
+ */
+export function isValidNfceQrCodeContent(content: string | null | undefined, accessKey: string | null | undefined): content is string {
+  if (!content || content.length > 1000 || /[\s<>"']/.test(content)) return false;
+  // Chave pode ter letras nas posições do CNPJ alfanumérico do emitente (NT 2025.001).
+  const key = (accessKey ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '').replace(/^NFE/, '');
+  if (!/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return false;
+  let url: URL;
+  try {
+    url = new URL(content);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
+  if (url.username || url.password || !/(^|\.)gov\.br$/i.test(url.hostname)) return false;
+  const p = url.searchParams.get('p');
+  return Boolean(p) && p!.split('|')[0] === key;
+}
+
+/** Extrai o QR Code assinado do XML autorizado (infNFeSupl/qrCode), quando a Focus devolver o XML. */
+export function extractNfceQrCodeFromXml(xml: string): string | null {
+  const supl = /<(?:\w+:)?infNFeSupl\b[^>]*>([\s\S]*?)<\/(?:\w+:)?infNFeSupl>/.exec(xml);
+  if (!supl) return null;
+  const qr = /<(?:\w+:)?qrCode\b[^>]*>([\s\S]*?)<\/(?:\w+:)?qrCode>/.exec(supl[1] ?? '');
+  if (!qr) return null;
+  const raw = (qr[1] ?? '').trim();
+  const cdata = /^<!\[CDATA\[([\s\S]*?)\]\]>$/.exec(raw);
+  const value = (cdata ? cdata[1] ?? '' : raw.replace(/&amp;/g, '&')).trim();
+  return value || null;
+}
+
 export interface FocusNfceItem {
   numero_item: number;
   codigo_produto: string;

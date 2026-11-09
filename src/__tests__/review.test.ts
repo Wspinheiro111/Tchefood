@@ -36,7 +36,7 @@ describe('Stone nativa', () => {
     expect(sent).toHaveLength(1);
     const cb = g.window.onStoneResult as (r: unknown) => void;
     cb({ request_id: 'outra', status: 'APPROVED' }); // resultado sem cobrança correspondente é ignorado
-    cb({ request_id: 'r1', status: 'APPROVED', acquirer: 'STONE', nsu: '123456' });
+    cb({ request_id: 'r1', status: 'APPROVED', acquirer: 'STONE', nsu: '123456', authorization_code: 'A1B2C3', terminal_serial: 'STONE-EMBEDDED' });
     await expect(p1).resolves.toMatchObject({ status: 'APPROVED', nsu: '123456' });
   });
 });
