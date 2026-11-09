@@ -79,6 +79,8 @@ const NEVER_UPLOAD: Partial<Record<SyncEvent['table'], ReadonlyArray<string>>> =
   // Totais da conta são do banco (tchefood_recalc_order a cada item e pagamento) e um
   // gatilho recusa gravação direta deles; mandar o valor do aparelho só arrisca a recusa.
   orders: ['nfce_status', 'nfce_key', 'subtotal_items', 'service_fee_amount', 'total_amount', 'paid_amount', 'remaining_balance'],
+  // Ordem de gravação dada pelo banco (GENERATED ALWAYS): o banco recusaria o valor.
+  audit_logs: ['server_seq'],
 };
 
 export function sanitizePayload(event: SyncEvent): Record<string, unknown> {
@@ -264,8 +266,8 @@ export interface FlushResult {
 }
 
 /**
- * Ordem de envio para o servidor. Igual à da fila, exceto que um audit_log de pedido
- * sobe antes das atualizações daquele pedido que vieram logo antes dele: as travas do
+ * Ordem de envio para o servidor. Igual à da fila, exceto que uma autorização de
+ * gerente (audit_log de pedido com gerente) sobe antes das atualizações daquele pedido que vieram logo antes dele: as travas do
  * banco (cancelamento, remoção dos 10%, desconto) exigem a autorização já gravada.
  * Cobre filas antigas, gravadas antes de o store enfileirar o audit_log primeiro.
  */
@@ -276,7 +278,10 @@ export function serverOrder(events: SyncEvent[]): SyncEvent[] {
   const out = [...events];
   for (let i = 0; i < out.length; i++) {
     const ev = out[i]!;
-    const orderId = ev.table === 'audit_logs' ? (ev.payload.order_id as string | null | undefined) : null;
+    // Só a autorização de gerente destrava uma atualização; outro audit_log (ex.: a
+    // volta dos 10%) sobe exatamente onde está, porque a ordem de gravação no banco
+    // (server_seq) decide qual registro de 10% é o último.
+    const orderId = isManagerAuthorization(ev) ? (ev.payload.order_id as string | null | undefined) : null;
     if (!orderId) continue;
     // Só atravessa as atualizações da MESMA ação (gravadas no mesmo instante, no máximo
     // item + comanda). Uma operação anterior, com a sua própria autorização, nunca é ultrapassada.

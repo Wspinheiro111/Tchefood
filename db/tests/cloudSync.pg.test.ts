@@ -174,9 +174,17 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     await expectSynced('abre e lança');
     ok(st().cancelOrderItem(items[0]!.id, MANAGER));
     ok(st().applyDiscount(order.id, 5, MANAGER));
+    // Tira e volta os 10% com o relógio do aparelho atrasado: a remoção sobe pela
+    // função (hora do servidor) e a volta com a hora do aparelho. A volta continua
+    // valendo como a última, e a remoção não pode ser reaproveitada depois.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date(Date.now() - 3_600_000) });
     ok(st().removeServiceFee(order.id, MANAGER));
     ok(st().restoreServiceFee(order.id));
+    vi.useRealTimers();
     await expectSynced('cancelamento, desconto e 10%');
+    expect(sql(`SELECT charge_service_fee FROM orders WHERE id = '${order.id}'`)).toBe('t');
+    const reuse = await raw('PATCH', `orders?id=eq.${order.id}`, { charge_service_fee: false }, 'return=representation');
+    expect(reuse.body).toMatch(/SERVICE_FEE_REMOVED sem PIN/);
     payCash(order.id);
     await expectSynced('pagamento');
     const local = st().orders.find((o) => o.id === order.id)!;
@@ -348,6 +356,9 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     expect(fee.body).toMatch(/SERVICE_FEE_REMOVED sem PIN/);
     const totals = await raw('PATCH', `orders?id=eq.${order.id}`, { remaining_balance: 0 }, 'return=representation');
     expect(totals.body).toMatch(/calculados pelo banco/);
+    // O aparelho não escolhe a ordem de gravação.
+    const seq = await raw('POST', 'audit_logs', { tenant_id: TENANT, order_id: order.id, performed_by_user_id: st().currentUserId!, action_type: 'SERVICE_FEE_RESTORED', reason: 'x', server_seq: 1 });
+    expect(seq.status).toBe(400);
   });
 
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {

@@ -550,13 +550,22 @@ $$;
 -- exatamente o cashback resgatado (registrado no extrato e em audit_logs).
 -- Mesma regra da Etapa 0 (db/schema.sql, seção 4): a autorização fica presa à
 -- operação, sem janela de 5 minutos, porque a fila offline pode subir horas depois.
---  - remover os 10%: o último registro de 10% da comanda tem de ser SERVICE_FEE_REMOVED
---    autorizado por gerente ativo;
+--  - remover os 10%: o último registro de 10% da comanda (pela ordem de gravação no
+--    servidor, server_seq) tem de ser SERVICE_FEE_REMOVED autorizado por gerente ativo;
 --  - desconto: o último DISCOUNT_APPLIED da comanda tem de ser exatamente desta
 --    mudança (discount_before = valor atual, discount_after = valor novo), ou o
 --    aumento tem de ser o cashback desta conta: REDEEM no extrato com o valor do
 --    aumento e audit_log CASHBACK_REDEEMED com o mesmo discount_before/discount_after.
 --  - um UPDATE que tira os 10% e aumenta o desconto precisa das duas autorizações.
+-- Ordem real de gravação dos audit_logs no servidor. created_at é a hora do
+-- aparelho (a fila offline sobe horas depois, e o aparelho escolhe esse valor),
+-- enquanto as autorizações gravadas por função ficam com a hora do servidor:
+-- comparar as duas deixaria um SERVICE_FEE_RESTORED antigo perder para a remoção
+-- que veio antes dele. server_seq é dado pelo banco e não aceita valor do cliente
+-- (GENERATED ALWAYS), e a fila sobe na ordem em que as ações aconteceram.
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS server_seq BIGINT GENERATED ALWAYS AS IDENTITY;
+CREATE INDEX IF NOT EXISTS idx_audit_logs_order_seq ON audit_logs(order_id, server_seq DESC);
+
 CREATE OR REPLACE FUNCTION tchefood_require_order_audit()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE v_ok BOOLEAN;
@@ -567,7 +576,7 @@ BEGIN
           INTO v_ok
           FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id
          WHERE a.order_id = NEW.id AND a.action_type IN ('SERVICE_FEE_REMOVED', 'SERVICE_FEE_RESTORED')
-         ORDER BY a.created_at DESC, a.id DESC
+         ORDER BY a.server_seq DESC
          LIMIT 1;
         IF NOT COALESCE(v_ok, FALSE) THEN
             RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: SERVICE_FEE_REMOVED sem PIN de gerente registrado em audit_logs.';
@@ -581,7 +590,7 @@ BEGIN
           INTO v_ok
           FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id
          WHERE a.order_id = NEW.id AND a.action_type = 'DISCOUNT_APPLIED'
-         ORDER BY a.created_at DESC, a.id DESC
+         ORDER BY a.server_seq DESC
          LIMIT 1;
         IF NOT COALESCE(v_ok, FALSE) THEN
             SELECT EXISTS (

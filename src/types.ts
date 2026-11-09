@@ -421,6 +421,11 @@ export interface AuditLog {
   whatsapp_alert_sent: boolean;
   metadata: Record<string, unknown> | null;
   created_at: ISODateTime;
+  /**
+   * Ordem de gravação no servidor (db/schema_expansion.sql). Dada pelo banco, nunca
+   * pelo aparelho: o registro local não tem, e a fila não envia.
+   */
+  server_seq?: number;
 }
 
 // ---------------------------------------------------------------------------
