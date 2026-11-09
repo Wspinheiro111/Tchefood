@@ -224,6 +224,7 @@ describe('modo totem', () => {
     expect(st().exitKioskMode(MANAGER).ok).toBe(true);
     expect(st().currentUserId).toBeNull();
     expect(st().auditLogs[0]!.action_type).toBe('KIOSK_EXIT');
+    expect(st().outbox.at(-1)).toMatchObject({ table: 'audit_logs', row_id: st().auditLogs[0]!.id, manager_pin: MANAGER.managerPin });
   });
 
   it('só o aparelho do totem usa a saída do totem', () => {
