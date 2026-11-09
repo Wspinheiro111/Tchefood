@@ -435,9 +435,9 @@ interface Actions {
   /** Devolve os recusados para o começo da fila, na ordem original, para nova tentativa. */
   retryRejectedSync: () => void;
   /**
-   * Autorização de gerente recusada por ter sido gravada antes da versão que leva o
-   * PIN para o servidor: o mesmo gerente digita o PIN de novo e o evento fica pronto
-   * para Reenviar recusados (o servidor confere outra vez, com o bloqueio).
+   * Autorização de gerente recusada (fila antiga sem PIN, ou PIN trocado em outro
+   * aparelho antes de subir): o mesmo gerente digita o PIN atual e o evento fica
+   * pronto para Reenviar recusados (o servidor confere outra vez, com o bloqueio).
    */
   confirmRejectedAuthorization: (eventId: UUID, managerPin: string) => ActionResult;
 }
@@ -3010,17 +3010,18 @@ export const useTcheStore = create<TcheState>()(
           if (!rejected) return fail('Evento recusado não encontrado.');
           const ev = rejected.event;
           const p = ev.payload;
-          if (ev.table !== 'audit_logs' || typeof p.authorized_by_manager_id !== 'string' || ev.manager_pin) {
+          if (ev.table !== 'audit_logs' || typeof p.authorized_by_manager_id !== 'string') {
             return fail('Este evento não espera PIN de gerente.');
           }
-          const auth = authorizeManager(
-            { managerPin, reason: String(p.reason ?? '') },
-            { orderId: (p.order_id as UUID | null) ?? null, action: p.action_type as AuditActionType },
-          );
-          if (!auth.ok) return auth;
-          if (auth.data.id !== p.authorized_by_manager_id) {
+          if (!/^[0-9]{4}$/.test(managerPin)) return fail('O PIN tem 4 dígitos.');
+          // Vale para a fila antiga (sem PIN) e para PIN trocado em outro aparelho
+          // antes de a fila subir. O PIN atual pode ainda não estar neste aparelho
+          // (a nuvem não desce a equipe), então quem confere é o servidor, com o
+          // bloqueio de 3 erros. Aqui só se recusa o PIN de OUTRO gerente conhecido.
+          const local = get().staff.find((u) => u.active && MANAGER_ROLES.includes(u.role) && u.pin_code === managerPin);
+          if (local && local.id !== p.authorized_by_manager_id) {
             const who = get().staff.find((u) => u.id === p.authorized_by_manager_id)?.name ?? 'outro gerente';
-            return fail(`Esta autorização foi dada por ${who}. Digite o PIN dessa pessoa.`);
+            return fail(`Esta autorização foi dada por ${who}. Digite o PIN atual dessa pessoa.`);
           }
           set((s) => ({
             syncRejected: (s.syncRejected ?? []).map((r) =>

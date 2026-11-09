@@ -291,7 +291,7 @@ describe('equipe no store', () => {
     expect(st().outbox[st().outbox.length - 1]!.staff_auth).toEqual({ actor_id: me.id, actor_pin: MANAGER, manager_pin: null, reason: null });
   });
 
-  it('autorização antiga sem PIN recusada: o mesmo gerente confirma o PIN e ela volta a poder subir', () => {
+  it('autorização recusada (sem PIN ou PIN antigo): o mesmo gerente digita o PIN atual e ela volta a poder subir', () => {
     const cfg = { url: 'https://abc.supabase.co/', anonKey: 'anon', accessToken: 'jwt' };
     login(WAITER);
     const manager = staffByPin(MANAGER);
@@ -300,10 +300,14 @@ describe('equipe no store', () => {
     const legacy: SyncEvent = { id: 'auth-velha', table: 'audit_logs', op: 'INSERT', row_id: 'L-velho', payload, created_at: '2026-11-01T12:00:00.000Z' };
     useTcheStore.setState({ syncRejected: [{ event: legacy, status: 400, message: 'sem PIN', rejected_at: legacy.created_at }] });
     expect(() => buildSyncRequest(legacy, cfg)).toThrow(/digite o PIN do gerente/);
-    // PIN errado conta no bloqueio local; PIN de outro gerente não serve.
-    expect(st().confirmRejectedAuthorization('auth-velha', '0000')).toMatchObject({ ok: false });
+    // PIN de outro gerente conhecido não serve; formato errado também não.
     expect(st().confirmRejectedAuthorization('auth-velha', owner.pin_code)).toMatchObject({ ok: false, error: expect.stringContaining(manager.name) });
+    expect(st().confirmRejectedAuthorization('auth-velha', '12')).toMatchObject({ ok: false });
     expect(st().syncRejected[0]!.event.manager_pin).toBeUndefined();
+    expect(st().confirmRejectedAuthorization('auth-velha', MANAGER).ok).toBe(true);
+    // PIN trocado em outro aparelho (ainda não conhecido aqui): fica para o servidor conferir.
+    expect(st().confirmRejectedAuthorization('auth-velha', '3719').ok).toBe(true);
+    expect(st().syncRejected[0]!.event.manager_pin).toBe('3719');
     expect(st().confirmRejectedAuthorization('auth-velha', MANAGER).ok).toBe(true);
     const fixed = st().syncRejected[0]!.event;
     expect(fixed.manager_pin).toBe(MANAGER);

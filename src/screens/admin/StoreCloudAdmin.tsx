@@ -283,9 +283,9 @@ function CloudLogin() {
   );
 }
 
-/** Autorização de gerente de uma fila antiga, sem o PIN para o servidor conferir. */
+/** Autorização de gerente recusada: fila antiga sem PIN, ou PIN que mudou antes de subir. */
 function needsManagerPin(e: SyncEvent): boolean {
-  return e.table === 'audit_logs' && typeof e.payload.authorized_by_manager_id === 'string' && !e.manager_pin;
+  return e.table === 'audit_logs' && typeof e.payload.authorized_by_manager_id === 'string';
 }
 
 function RejectedAuthPin({ eventId }: { eventId: string }) {
@@ -299,7 +299,7 @@ function RejectedAuthPin({ eventId }: { eventId: string }) {
         maxLength={4}
         value={pin}
         onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
-        placeholder="PIN do gerente"
+        placeholder="PIN atual do gerente"
         className="w-28 rounded-lg border border-slate-600 bg-slate-900 px-2 py-1 text-xs"
       />
       <Btn
