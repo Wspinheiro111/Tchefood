@@ -619,3 +619,34 @@ END;
 $$;
 CREATE TRIGGER trg_orders_lock_service_fee_pct BEFORE UPDATE OF service_fee_pct ON orders
     FOR EACH ROW EXECUTE FUNCTION tchefood_lock_service_fee_pct();
+
+-- Totais da conta (subtotal, 10%, total, pago, saldo) só mudam pelo recálculo do
+-- banco (tchefood_recalc_order), que roda dentro de outro gatilho. Um UPDATE direto
+-- do cliente (profundidade 1) não pode mexer neles, então não dá para zerar o saldo
+-- e disparar o fechamento automático sem pagamento. Conta nova sempre nasce zerada.
+CREATE OR REPLACE FUNCTION tchefood_lock_order_totals()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF pg_trigger_depth() > 1 THEN
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        NEW.subtotal_items := 0;
+        NEW.service_fee_amount := 0;
+        NEW.total_amount := 0;
+        NEW.paid_amount := 0;
+        NEW.remaining_balance := 0;
+        RETURN NEW;
+    END IF;
+    IF NEW.subtotal_items IS DISTINCT FROM OLD.subtotal_items
+       OR NEW.service_fee_amount IS DISTINCT FROM OLD.service_fee_amount
+       OR NEW.total_amount IS DISTINCT FROM OLD.total_amount
+       OR NEW.paid_amount IS DISTINCT FROM OLD.paid_amount
+       OR NEW.remaining_balance IS DISTINCT FROM OLD.remaining_balance THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: totais da conta % são calculados pelo banco e não podem ser gravados direto.', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_orders_lock_totals BEFORE INSERT OR UPDATE ON orders
+    FOR EACH ROW EXECUTE FUNCTION tchefood_lock_order_totals();
