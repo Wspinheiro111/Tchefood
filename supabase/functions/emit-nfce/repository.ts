@@ -100,10 +100,5 @@ export function supabaseNfceRepository(db: SupabaseLike): NfceRepository {
       );
     },
 
-    async setOrderNfce(tenantId: string, orderId: string, status: string, accessKey: string | null): Promise<void> {
-      const patch: Record<string, string> = { nfce_status: status };
-      if (accessKey) patch.nfce_key = accessKey;
-      check(await db.from('orders').update(patch).eq('id', orderId).eq('tenant_id', tenantId), 'atualizar a comanda');
-    },
   };
 }

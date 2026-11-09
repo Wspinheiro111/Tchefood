@@ -163,7 +163,6 @@ describe('Focus: status e erros', () => {
 
 class MemoryRepo implements NfceRepository {
   doc: NfceDocumentRow | null = null;
-  orderStatus: string | null = null;
   constructor(public src: NfceSource) {}
   async loadSource(tenantId: string, orderId: string) {
     return tenantId === TENANT && orderId === ORDER ? this.src : null;
@@ -185,9 +184,6 @@ class MemoryRepo implements NfceRepository {
     if (!this.doc || this.doc.id !== id || this.doc.status !== expected || this.doc.transmissions !== expectedTransmissions) return null;
     this.doc = { ...this.doc, ...fields };
     return { ...this.doc };
-  }
-  async setOrderNfce(_t: string, _o: string, status: string) {
-    this.orderStatus = status;
   }
 }
 
@@ -213,7 +209,6 @@ describe('emitNfce', () => {
     const first = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
     expect(first.httpStatus).toBe(200);
     expect(first.body).toMatchObject({ authorized: true, access_key: KEY, protocol: '143260000000001', qrcode_url: QR });
-    expect(repo.orderStatus).toBe('AUTORIZADA');
     const second = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
     expect(second.body.authorized).toBe(true);
     expect(calls).toHaveLength(1);
@@ -236,7 +231,7 @@ describe('emitNfce', () => {
     const { focus } = fakeFocus([{ status: 201, body: { ...AUTHORIZED, contingencia_offline: true, contingencia_offline_efetivada: false } }]);
     const r = await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
     expect(r.body).toMatchObject({ status: 'contingency', authorized: false, contingency: true, protocol: null });
-    expect(repo.orderStatus).toBe('CONTINGENCIA');
+    expect(repo.doc?.status).toBe('contingency');
   });
 
   it('rejeição da SEFAZ permite reenviar a mesma referência', async () => {
@@ -296,18 +291,6 @@ describe('emitNfce', () => {
     expect(r.httpStatus).toBe(409);
   });
 
-  it('falha ao atualizar a comanda não impede a transmissão', async () => {
-    const repo = new MemoryRepo(source());
-    repo.setOrderNfce = async () => {
-      throw new Error('db down');
-    };
-    const { calls, focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
-    const r = await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
-    expect(calls.map((c) => c.method)).toEqual(['POST']);
-    expect(r.body.authorized).toBe(true);
-    expect(repo.doc?.status).toBe('authorized');
-  });
-
   it('GET atrasado da tentativa anterior não grava rejeição sobre o reenvio em curso', async () => {
     const repo = new MemoryRepo(source());
     const { focus } = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', mensagem_sefaz: 'NCM' } }]);
@@ -336,7 +319,7 @@ describe('emitNfce', () => {
     await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
     const r = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
     expect(r.body.status).toBe('cancelled');
-    expect(repo.orderStatus).toBe('CANCELADA');
+    expect(repo.doc?.status).toBe('cancelled');
   });
 
   it('comanda de outro tenant: 404', async () => {

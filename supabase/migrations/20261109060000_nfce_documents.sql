@@ -64,6 +64,31 @@ DROP TRIGGER IF EXISTS trg_nfce_guard ON nfce_documents;
 CREATE TRIGGER trg_nfce_guard BEFORE UPDATE OR DELETE ON nfce_documents
     FOR EACH ROW EXECUTE FUNCTION tchefood_nfce_guard();
 
+-- Espelho na comanda (orders.nfce_status / nfce_key, lidos pelas telas atuais) feito na MESMA
+-- transação da gravação do documento: um retorno atrasado nunca deixa a comanda diferente
+-- do documento (a gravação do documento já é condicionada a status + tentativa).
+CREATE OR REPLACE FUNCTION tchefood_nfce_mirror_order()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE orders
+       SET nfce_status = CASE NEW.status
+               WHEN 'processing'  THEN 'PROCESSANDO'
+               WHEN 'authorized'  THEN 'AUTORIZADA'
+               WHEN 'rejected'    THEN 'REJEITADA'
+               WHEN 'contingency' THEN 'CONTINGENCIA'
+               WHEN 'cancelled'   THEN 'CANCELADA'
+           END,
+           nfce_key = CASE WHEN NEW.status IN ('authorized', 'contingency', 'cancelled') AND NEW.access_key IS NOT NULL
+                           THEN NEW.access_key ELSE nfce_key END
+     WHERE id = NEW.order_id AND tenant_id = NEW.tenant_id;
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_nfce_mirror_order ON nfce_documents;
+CREATE TRIGGER trg_nfce_mirror_order AFTER INSERT OR UPDATE OF status, access_key ON nfce_documents
+    FOR EACH ROW EXECUTE FUNCTION tchefood_nfce_mirror_order();
+
 -- O app só lê (RLS por tenant); só a Edge Function (service role) escreve.
 ALTER TABLE nfce_documents ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS nfce_documents_tenant_read ON nfce_documents;

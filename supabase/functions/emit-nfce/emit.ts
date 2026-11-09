@@ -80,8 +80,6 @@ export interface NfceRepository {
    * Sem a tentativa, um GET atrasado da tentativa anterior gravaria "rejected" sobre um reenvio em curso.
    */
   saveProviderResult(id: string, expectedStatus: NfceDocumentStatus, expectedTransmissions: number, fields: ProviderFields): Promise<NfceDocumentRow | null>;
-  /** Espelha o estado na comanda (orders.nfce_status / nfce_key) para as telas atuais. */
-  setOrderNfce(tenantId: string, orderId: string, status: string, accessKey: string | null): Promise<void>;
 }
 
 export interface EmitDeps {
@@ -113,13 +111,8 @@ export interface EmitResponse {
   };
 }
 
-const ORDER_STATUS: Record<NfceDocumentStatus, string> = {
-  processing: 'PROCESSANDO',
-  authorized: 'AUTORIZADA',
-  rejected: 'REJEITADA',
-  contingency: 'CONTINGENCIA',
-  cancelled: 'CANCELADA',
-};
+// orders.nfce_status / nfce_key são espelhados pelo trigger tchefood_nfce_mirror_order na mesma
+// transação da gravação de nfce_documents: nunca ficam diferentes do documento.
 
 const HTTP_BY_STATUS: Record<NfceDocumentStatus, number> = {
   authorized: 200,
@@ -188,19 +181,6 @@ function providerFields(doc: NfceDocumentRow, next: NfceDocumentStatus, response
   };
 }
 
-/**
- * Espelho em orders.nfce_status é auxiliar: a fonte da verdade é nfce_documents. Uma falha
- * aqui não pode impedir o POST depois da reserva (o documento ficaria em processing com a
- * referência nunca enviada) nem transformar uma autorização gravada em erro 500.
- */
-async function mirrorOnOrder(deps: EmitDeps, tenantId: string, orderId: string, status: string, accessKey: string | null): Promise<void> {
-  try {
-    await deps.repo.setOrderNfce(tenantId, orderId, status, accessKey);
-  } catch (error) {
-    console.error('[emit-nfce] falha ao espelhar status na comanda', error instanceof Error ? error.message : error);
-  }
-}
-
 async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceResponse): Promise<EmitResponse> {
   const next = normalizeProviderStatus(response.status, doc.status, response);
   if (!canTransition(doc.status, next)) {
@@ -217,7 +197,6 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
     const current = await deps.repo.getDocument(doc.tenant_id, doc.order_id);
     return current ? respond(current, 'O estado da NFC-e mudou durante a operação; este é o estado atual.') : failure(409, 'conflict', deps.environment, 'Documento NFC-e não encontrado após a operação.');
   }
-  await mirrorOnOrder(deps, saved.tenant_id, saved.order_id, ORDER_STATUS[saved.status], saved.status === 'authorized' || saved.status === 'contingency' ? saved.access_key : null);
   return respond(saved);
 }
 
@@ -296,6 +275,5 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
     }
     doc = inserted;
   }
-  await mirrorOnOrder(deps, doc.tenant_id, doc.order_id, ORDER_STATUS.processing, null);
   return transmit(deps, doc, token, payload);
 }
