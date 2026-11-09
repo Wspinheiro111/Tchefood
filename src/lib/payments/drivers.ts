@@ -175,6 +175,7 @@ export function printDocument(job: Omit<PrintJob, 'id'>): 'NATIVE' | 'SIMULATOR'
     for (const l of job.lines) b.line(l);
     if (job.qr) b.qrCode(job.qr);
     for (const l of job.footer ?? []) b.line(l);
+    b.logo();
     b.cut(false);
     const r = JSON.parse(w.SmartPosNative.printInternalEscPos(b.toBase64())) as { success: boolean; error?: string };
     if (!r.success) throw new Error(r.error ?? 'Falha na impressora interna');
@@ -336,6 +337,7 @@ export class StonePosDriver implements IPaymentTerminalDriver {
     if (this.mode === 'SMARTPOS_EMBEDDED' && native?.printInternalEscPos) {
       const b = new UniversalEscPosBuilder('58MM');
       for (const l of lines) b.line(l);
+      b.logo();
       b.cut(false);
       const r = JSON.parse(native.printInternalEscPos(b.toBase64())) as { success: boolean; error?: string };
       if (!r.success) throw new Error(r.error ?? 'Falha na impressora interna');

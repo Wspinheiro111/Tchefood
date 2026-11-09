@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { AlertTriangle, BarChart3, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
 import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
+import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
 import { AUDIT_LABEL, reconciliation, shiftKpis, shiftStart, waiterSplit, whatsappAlertText } from '../lib/reports';
@@ -69,9 +70,11 @@ export function BackOffice() {
   const alerts = useTcheStore((s) => s.auditLogs.filter((l) => l.whatsapp_alert_sent).length);
   const kegTaps = useTcheStore((s) => s.kegTaps);
   const kegAlerts = useMemo(() => kegTaps.filter((t) => t.active && kegStatus(t).alert === 'CRITICAL').length, [kegTaps]);
+  const tenant = useTcheStore((s) => s.tenant);
   if (!tab) return <p className="p-6">Acesso restrito.</p>;
   return (
     <div className="mx-auto max-w-6xl px-3 pb-10 pt-3">
+      <ReportHeader title={tabs.find((t) => t.key === tab)?.label ?? 'Retaguarda'} subtitle={`${tenant.name} · ${tenant.city}/${tenant.state}`} />
       <div className="scroll-thin -mx-3 mb-4 flex gap-2 overflow-x-auto px-3">
         {tabs.map((t) => (
           <button key={t.key} onClick={() => setTab(t.key)} className={`flex min-h-touch shrink-0 items-center gap-2 rounded-xl px-4 font-bold ${tab === t.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-300'}`}>

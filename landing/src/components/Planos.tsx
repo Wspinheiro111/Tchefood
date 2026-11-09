@@ -21,7 +21,7 @@ export default function Planos() {
               key={p.id}
               className={`relative flex flex-col rounded-2xl border p-6 ${
                 p.destaque
-                  ? 'border-brasa/70 bg-gradient-to-b from-brasa/15 to-surface/80 shadow-[0_20px_60px_-25px_rgba(225,29,72,0.6)]'
+                  ? 'border-brasa/70 bg-gradient-to-b from-brasa/15 to-surface/80 shadow-[0_20px_60px_-25px_rgba(210,35,42,0.6)]'
                   : 'border-borda bg-surface/70'
               }`}
             >

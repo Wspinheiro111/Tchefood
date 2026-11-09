@@ -2,7 +2,7 @@
 import { useState } from 'react';
 import { Cloud, CloudOff, RefreshCw, Store } from 'lucide-react';
 import { selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
-import type { Permission, UserRole } from '../../types';
+import type { Permission, SyncEvent, UserRole } from '../../types';
 import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../lib/permissions';
 import { ROLE_LABEL } from '../../lib/catalog';
 import { signInDevice } from '../../lib/sync/supabaseSync';
@@ -283,6 +283,40 @@ function CloudLogin() {
   );
 }
 
+/** Autorização de gerente recusada: fila antiga sem PIN, ou PIN que mudou antes de subir. */
+function needsManagerPin(e: SyncEvent): boolean {
+  return e.table === 'audit_logs' && typeof e.payload.authorized_by_manager_id === 'string';
+}
+
+function RejectedAuthPin({ eventId }: { eventId: string }) {
+  const confirm = useTcheStore((s) => s.confirmRejectedAuthorization);
+  const [pin, setPin] = useState('');
+  return (
+    <span className="mt-1 flex items-center gap-2">
+      <input
+        type="password"
+        inputMode="numeric"
+        maxLength={4}
+        value={pin}
+        onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+        placeholder="PIN atual do gerente"
+        className="w-28 rounded-lg border border-slate-600 bg-slate-900 px-2 py-1 text-xs"
+      />
+      <Btn
+        disabled={pin.length !== 4}
+        onClick={() => {
+          const r = confirm(eventId, pin);
+          if (r.ok) toast.success('PIN conferido. Toque em Reenviar recusados.');
+          else toast.error(r.error);
+          setPin('');
+        }}
+      >
+        Confirmar PIN
+      </Btn>
+    </span>
+  );
+}
+
 function CloudStatus() {
   const cloud = useTcheStore((s) => s.cloud)!;
   const status = useTcheStore((s) => s.syncStatus);
@@ -290,7 +324,8 @@ function CloudStatus() {
   const setCloud = useTcheStore((s) => s.setCloudSession);
   const online = useOnline();
   const [busy, setBusy] = useState(false);
-  const blocked = status.blocked_event_id ? outbox.find((e) => e.id === status.blocked_event_id) : undefined;
+  const rejected = useTcheStore((s) => s.syncRejected) ?? [];
+  const retryRejected = useTcheStore((s) => s.retryRejectedSync);
   const byTable = outbox.reduce<Record<string, number>>((acc, e) => ({ ...acc, [e.table]: (acc[e.table] ?? 0) + 1 }), {});
   const now = async () => {
     setBusy(true);
@@ -319,11 +354,25 @@ function CloudStatus() {
         <div className="mb-3 rounded-xl border border-brasa/60 bg-brasa/10 p-3 text-sm">
           <div className="font-bold text-rose-200">{status.last_error}</div>
           {status.last_error_at && <div className="text-xs text-slate-400">{new Date(status.last_error_at).toLocaleString('pt-BR')}</div>}
-          {blocked && (
-            <div className="mt-2 text-xs text-slate-300">
-              A fila está parada no evento {blocked.op} em <b>{blocked.table}</b> (registro {blocked.row_id.slice(0, 8)}…). Nada foi descartado. Corrija no servidor (permissão, tabela ou trava) e toque em Sincronizar agora.
-            </div>
-          )}
+        </div>
+      )}
+      {rejected.length > 0 && (
+        <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm">
+          <div className="mb-2 font-bold text-ouro">{rejected.length} evento(s) recusado(s) pela nuvem</div>
+          <p className="mb-2 text-xs text-slate-300">
+            Eles saíram da fila para não travar o resto do envio; as mudanças seguintes dos mesmos registros esperam na fila até o reenvio. Nada foi descartado. Corrija a causa no servidor (permissão, PIN do gerente ou trava) e toque em Reenviar recusados.
+          </p>
+          <ul className="mb-2 max-h-48 space-y-1 overflow-y-auto text-xs">
+            {rejected.map((r) => (
+              <li key={r.event.id} className="text-slate-300">
+                <b>{r.event.table}</b> {r.event.op} (registro {r.event.row_id.slice(0, 8)}…) · HTTP {r.status}: {r.message}
+                {needsManagerPin(r.event) && <RejectedAuthPin eventId={r.event.id} />}
+              </li>
+            ))}
+          </ul>
+          <Btn disabled={!online} onClick={() => { retryRejected(); void syncOnce(); }}>
+            <RefreshCw className="h-4 w-4" /> Reenviar recusados
+          </Btn>
         </div>
       )}
       <Btn

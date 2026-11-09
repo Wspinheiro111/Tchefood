@@ -36,7 +36,7 @@ function Slider({ rotulo, valor, min, max, passo, formatar, onChange }: SliderPr
         value={valor}
         onChange={(e) => onChange(Number(e.target.value))}
         className="slider mt-3"
-        style={{ background: `linear-gradient(90deg,#e11d48 ${pct}%,#e2e8f0 ${pct}%)` }}
+        style={{ background: `linear-gradient(90deg,#D2232A ${pct}%,#e2e8f0 ${pct}%)` }}
       />
       <div className="mt-1 flex justify-between text-[11px] text-slate-500">
         <span>{formatar(min)}</span>

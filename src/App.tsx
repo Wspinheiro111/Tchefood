@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { BarChart3, Beer, Bike, ChefHat, CloudOff, Flame, LayoutGrid, LogOut, MonitorPlay, QrCode as QrIcon, RefreshCw, ShoppingBag, Smartphone, Ticket } from 'lucide-react';
+import { BarChart3, Beer, Bike, ChefHat, CloudOff, LayoutGrid, LogOut, MonitorPlay, QrCode as QrIcon, RefreshCw, ShoppingBag, Smartphone, Ticket } from 'lucide-react';
+import { BrandLogo, BrandMark } from './components/Brand';
 import { selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
 import { useTerminalBus } from './lib/payments/drivers';
@@ -101,9 +102,10 @@ export default function App() {
   return (
     <div className="min-h-full pb-[72px] sm:pb-0">
       <header className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b border-slate-800 bg-base/95 px-3 backdrop-blur">
-        <div className="grid h-9 w-9 place-items-center rounded-lg bg-brasa"><Flame className="h-5 w-5 text-white" /></div>
+        <BrandMark className="h-9 w-9 2xl:hidden" />
+        <BrandLogo variant="dark" className="hidden h-11 w-auto 2xl:block" />
         <div className="mr-auto leading-tight">
-          <div className="font-black">Tchê <span className="text-ouro">Food</span></div>
+          <div className="font-black 2xl:hidden">Tchê<span className="text-brasa">Food</span></div>
           <div className="text-[11px] text-slate-400">{user.name} · {user.role === 'WAITER' ? 'Garçom' : user.role === 'MANAGER' ? 'Gerente' : user.role === 'OWNER' ? 'Proprietário' : user.role === 'KITCHEN' ? 'Cozinha' : 'Caixa'}</div>
         </div>
         <nav className="hidden gap-1 sm:flex">

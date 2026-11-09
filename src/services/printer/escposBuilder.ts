@@ -7,6 +7,8 @@
  * (tamanho, negrito, alinhamento) usado pelo simulador visual lado a lado.
  */
 
+import { BRAND_LOGO_RASTER } from './brandLogoRaster';
+
 export type PaperWidth = '80MM' | '58MM';
 export type PrinterConnection = 'NETWORK_TCP' | 'BLUETOOTH' | 'SMARTPOS_INTERNAL';
 export type PrinterSector = 'KITCHEN' | 'BAR' | 'GRILL' | 'DESSERT' | 'CASHIER';
@@ -51,7 +53,12 @@ export interface PreviewLine {
   align: Align;
 }
 
-export type PreviewEvent = { kind: 'line'; line: PreviewLine } | { kind: 'beep' } | { kind: 'cut'; guillotine: boolean } | { kind: 'qr'; data: string };
+export type PreviewEvent =
+  | { kind: 'line'; line: PreviewLine }
+  | { kind: 'beep' }
+  | { kind: 'cut'; guillotine: boolean }
+  | { kind: 'qr'; data: string }
+  | { kind: 'logo' };
 
 const ESC = 0x1b;
 const GS = 0x1d;
@@ -203,6 +210,23 @@ export class UniversalEscPosBuilder {
     this.buffer.push(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30); // imprime
     this.buffer.push(LF);
     this.preview.push({ kind: 'qr', data });
+    this.align(prevAlign);
+    return this;
+  }
+
+  /**
+   * GS v 0 — logo oficial do Tchê Food em imagem raster (1 bit), centralizada.
+   * Comando suportado por Epson, Elgin, Bematech, Daruma, Tanca, Sunmi e bobinas internas Android.
+   */
+  logo(): this {
+    const { widthBytes, heightDots, base64 } = BRAND_LOGO_RASTER;
+    const bin = atob(base64);
+    const prevAlign = this.state.align;
+    this.align('CENTER');
+    this.buffer.push(GS, 0x76, 0x30, 0x00, widthBytes & 0xff, (widthBytes >> 8) & 0xff, heightDots & 0xff, (heightDots >> 8) & 0xff);
+    for (let i = 0; i < bin.length; i++) this.buffer.push(bin.charCodeAt(i));
+    this.buffer.push(LF);
+    this.preview.push({ kind: 'logo' });
     this.align(prevAlign);
     return this;
   }

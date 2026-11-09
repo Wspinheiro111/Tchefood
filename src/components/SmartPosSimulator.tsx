@@ -14,6 +14,7 @@ import { buildPixBrCode } from '../lib/pix';
 import { formatBRL } from '../lib/money';
 import { useTcheStore } from '../store/useTcheStore';
 import { QrCode } from './QrCode';
+import printLogoUrl from '../assets/brand/logo-print.png';
 import { playDeniedBuzz, playDispatchChime, playTap } from '../lib/sound';
 
 const CHASSIS_STYLE: Record<Chassis, { body: string; accent: string; brand: string; text: string; key: string }> = {
@@ -36,6 +37,10 @@ export function ThermalPaper({ job, onTear, qr, footer }: { job: Pick<PrintJob, 
           </div>
         )}
         {footer && <pre className="whitespace-pre text-left text-[9.5px] leading-[12px]">{footer.join('\n')}</pre>}
+        {/* Logo oficial impressa ao final de todo cupom (GS v 0 na bobina ESC/POS, PNG no PlugPag). */}
+        <div className="mt-2 flex justify-center">
+          <img src={printLogoUrl} alt="Tchê Food" className="w-[180px]" style={{ imageRendering: 'pixelated' }} />
+        </div>
         <div className="mt-2 border-t border-dashed border-slate-400" />
       </div>
       {onTear && (

@@ -69,6 +69,7 @@ export function buildKitchenTicket(width: PaperWidth, data: KitchenTicketData, o
     b.line(`   cod ${it.code}`);
     b.divider();
   }
+  b.logo();
   b.align('CENTER').line('Tche Food - Comanda Mobile').align('LEFT');
   b.cut(opts.cut);
   return b;
@@ -78,6 +79,7 @@ export function buildKitchenTicket(width: PaperWidth, data: KitchenTicketData, o
 export function buildTestPage(width: PaperWidth, printer: PrinterConfig): UniversalEscPosBuilder {
   const b = new UniversalEscPosBuilder(width);
   if (printer.beepOnPrint) b.beep();
+  b.logo();
   b.align('CENTER').size('LARGE').bold(true).line('TESTE OK');
   b.size('NORMAL').bold(false).line(printer.name).line(`${printer.brand} ${printer.model}`);
   b.align('LEFT').divider('=');

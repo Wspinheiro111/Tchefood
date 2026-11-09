@@ -1,6 +1,7 @@
 import { BellRing, Bluetooth, Network, RotateCcw, Scissors, Smartphone, X } from 'lucide-react';
 import { toast } from './ui';
 import { QrCode } from './QrCode';
+import printLogoUrl from '../assets/brand/logo-print.png';
 import { COLUMNS, type PaperWidth, type PreviewEvent } from '../services/printer/escposBuilder';
 import { routeDispatch, usePrintPreview, type RenderedTicket } from '../services/printer/printerService';
 import { useTcheStore } from '../store/useTcheStore';
@@ -15,6 +16,7 @@ export function EscPosPaper({ width, events }: { width: PaperWidth; events: Prev
       <div className="px-2 py-3 leading-[14px] text-slate-900">
         {events.map((e, idx) => {
           if (e.kind === 'beep') return <div key={idx} className="mb-1 flex items-center gap-1 text-[10px] font-bold text-rose-700"><BellRing className="h-3 w-3" /> ESC B · sirene</div>;
+          if (e.kind === 'logo') return <div key={idx} className="my-2 flex justify-center"><img src={printLogoUrl} alt="Tchê Food" className="h-auto" style={{ width: width === '80MM' ? '62%' : '93%', imageRendering: 'pixelated' }} /></div>;
           if (e.kind === 'qr') return <div key={idx} className="my-2 flex justify-center"><QrCode value={e.data} size={120} /></div>;
           if (e.kind === 'cut')
             return (
