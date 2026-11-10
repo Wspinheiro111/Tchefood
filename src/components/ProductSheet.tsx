@@ -17,6 +17,8 @@ interface Props {
   confirmLabel?: string;
   /** Cliente via QR não vê tags de cozinha internas como "Prioridade". */
   audience?: 'waiter' | 'customer';
+  /** Quantidade inicial (PDV: "3*101" num produto com opções já abre com 3). */
+  initialQty?: number;
 }
 
 const DONENESS_COLOR: Record<string, string> = {
@@ -27,7 +29,7 @@ const DONENESS_COLOR: Record<string, string> = {
 };
 
 /** Modal de lançamento: Ponto da Carne, adicionais, meio-a-meio e tags de 1 toque. */
-export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adicionar à bandeja', audience = 'waiter' }: Props) {
+export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adicionar à bandeja', audience = 'waiter', initialQty = 1 }: Props) {
   const products = useTcheStore((s) => s.products);
   const links = useTcheStore((s) => s.productModifierGroups);
   const groupsAll = useTcheStore((s) => s.modifierGroups);
@@ -52,7 +54,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
   }, [product, links, groupsAll]);
 
   useEffect(() => {
-    setQty(1);
+    setQty(initialQty);
     setDoneness(null);
     // Combo: item fixo (grupo obrigatório com uma opção só) já vem marcado.
     setMods(product?.is_combo ? fixedComboChoices(groups, optionsAll) : []);
