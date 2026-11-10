@@ -1,7 +1,8 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Banknote, CheckCircle2, CreditCard, Minus, Plus, Printer, QrCode as QrIcon, ScanLine, Ticket, Trash2, XCircle } from 'lucide-react';
 import { COUNTER_EVENT_LABEL, useTcheStore, type CounterLine } from '../store/useTcheStore';
 import type { EventTicket, Order, PaymentMethod, Product, SelectedModifier } from '../types';
+import { effectivePrice } from '../lib/catalog';
 import { computeItemTotal, formatBRL, round2, toCents } from '../lib/money';
 import { uuid } from '../lib/ids';
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest } from '../lib/payments/drivers';
@@ -18,7 +19,8 @@ import { CategoryIcon } from './OrderScreen';
 interface CartLine extends CounterLine {
   key: string;
   label: string;
-  unitTotal: number;
+  /** Só os adicionais: o preço do produto é recalculado a cada tela (vira com o happy hour). */
+  modsUnit: number;
 }
 
 const METHODS: Array<{ key: PaymentMethod; label: string; icon: typeof CreditCard }> = [
@@ -60,6 +62,18 @@ function SellPanel() {
   const categories = useTcheStore((s) => s.categories);
   const products = useTcheStore((s) => s.products);
   const links = useTcheStore((s) => s.productModifierGroups);
+  const schedules = useTcheStore((s) => s.priceSchedules);
+  // O relógio do happy hour: refaz o preço do carrinho quando a janela vira, sem tocar na tela.
+  const [, setClock] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setClock((n) => n + 1), 15_000);
+    return () => clearInterval(t);
+  }, []);
+  const priceNow = (p: Product) => effectivePrice(p, schedules, new Date());
+  const lineUnit = (l: CartLine) => {
+    const p = products.find((x) => x.id === l.product_id);
+    return round2((p ? priceNow(p) : 0) + l.modsUnit);
+  };
   const [cat, setCat] = useState<string>('');
   const [cart, setCart] = useState<CartLine[]>([]);
   const [selected, setSelected] = useState<Product | null>(null);
@@ -82,7 +96,7 @@ function SellPanel() {
     setCart((c) => {
       const found = c.find((l) => l.key === key);
       if (found) return c.map((l) => (l.key === key ? { ...l, quantity: Math.min(l.quantity + quantity, 99) } : l));
-      return [...c, { key, label, product_id: p.id, quantity, modifiers, meat_doneness: doneness, unitTotal: round2(p.price + modsUnit) }];
+      return [...c, { key, label, product_id: p.id, quantity, modifiers, meat_doneness: doneness, modsUnit }];
     });
   };
 
@@ -102,7 +116,7 @@ function SellPanel() {
 
   const setQty = (key: string, q: number) => setCart((c) => (q <= 0 ? c.filter((l) => l.key !== key) : c.map((l) => (l.key === key ? { ...l, quantity: Math.min(q, 99) } : l))));
 
-  const total = round2(cart.reduce((a, l) => a + computeItemTotal(l.quantity, l.unitTotal, 0), 0));
+  const total = round2(cart.reduce((a, l) => a + computeItemTotal(l.quantity, lineUnit(l), 0), 0));
   const units = cart.reduce((a, l) => a + l.quantity, 0);
 
   const goPay = () => {
@@ -129,7 +143,7 @@ function SellPanel() {
             <button key={p.id} onClick={() => tap(p)} disabled={!p.available} className="flex min-h-[88px] flex-col justify-between rounded-2xl border border-slate-200 bg-surface p-3 text-left active:bg-slate-200 disabled:opacity-40">
               <span className="line-clamp-2 font-bold leading-tight">{p.name}</span>
               <span className="flex items-center justify-between">
-                <span className="text-lg font-black tabular-nums text-brasa">{formatBRL(p.price)}</span>
+                <span className="text-lg font-black tabular-nums text-brasa">{formatBRL(priceNow(p))}</span>
                 {needsSheet(p) && <Badge className="bg-slate-200">opções</Badge>}
               </span>
             </button>
@@ -149,7 +163,7 @@ function SellPanel() {
               <li key={l.key} className="flex items-center gap-2 rounded-xl bg-base p-2">
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-semibold">{l.label}</div>
-                  <div className="text-xs text-slate-500">{formatBRL(computeItemTotal(l.quantity, l.unitTotal, 0))}</div>
+                  <div className="text-xs text-slate-500">{formatBRL(computeItemTotal(l.quantity, lineUnit(l), 0))}</div>
                 </div>
                 <button aria-label="Menos" onClick={() => setQty(l.key, l.quantity - 1)} className="grid h-11 w-11 place-items-center rounded-lg bg-slate-200">{l.quantity === 1 ? <Trash2 className="h-4 w-4" /> : <Minus className="h-5 w-5" />}</button>
                 <span className="w-6 text-center font-bold">{l.quantity}</span>
