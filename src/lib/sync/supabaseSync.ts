@@ -77,6 +77,7 @@ const SAVE_STAFF_RPC = 'tchefood_save_staff';
 const SET_PERMISSION_RPC = 'tchefood_set_role_permission';
 const START_STORE_RPC = 'tchefood_start_store';
 const REGISTER_PAYMENT_RPC = 'tchefood_register_payment';
+const CASHBACK_REDEEM_RPC = 'tchefood_register_cashback_redeem';
 
 /** Eventos que sobem por função do servidor que confere PIN e responde null quando ele não confere. */
 export function isPinCheckedRpc(event: SyncEvent): boolean {
@@ -86,6 +87,11 @@ export function isPinCheckedRpc(event: SyncEvent): boolean {
 /** Barril encerrado de uma troca de barril que sobe por tchefood_change_keg. */
 export function isKegChange(event: SyncEvent): boolean {
   return event.table === 'keg_history' && event.op === 'INSERT' && event.keg_change != null;
+}
+
+/** Resgate de cashback: sobe por tchefood_register_cashback_redeem (o banco recusa o REDEEM direto). */
+export function isCashbackRedeem(event: SyncEvent): boolean {
+  return event.table === 'cashback_ledger' && event.op === 'INSERT' && event.payload.entry_type === 'REDEEM';
 }
 
 /** audit_log de autorização de gerente que precisa subir pela RPC. */
@@ -239,8 +245,28 @@ function buildPaymentRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   return rpcRequest(cfg, REGISTER_PAYMENT_RPC, { p_payment: sanitizePayload(event) });
 }
 
+/**
+ * Resgate de cashback sobe por tchefood_register_cashback_redeem (db/schema_cashback_servidor.sql):
+ * o banco confere dia, crédito liberado, teto e saldo, baixa os créditos e grava o
+ * resgate, o audit_log e o desconto da comanda juntos.
+ */
+function buildCashbackRedeemRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
+  const p = event.payload;
+  if (!event.cashback_redeem) throw new Error('Resgate de cashback sem o registro do resgate. Refaça o resgate na conta.');
+  return rpcRequest(cfg, CASHBACK_REDEEM_RPC, {
+    p_redeem_id: event.row_id,
+    p_audit_id: event.cashback_redeem.audit_id,
+    p_order_id: p.order_id,
+    p_customer_id: p.customer_id,
+    p_amount: p.amount,
+    p_user_id: p.created_by_user_id,
+    p_created_at: p.created_at ?? null,
+  });
+}
+
 export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   if (isManagerAuthorization(event)) return buildAuthorizeRequest(event, cfg);
+  if (isCashbackRedeem(event)) return buildCashbackRedeemRequest(event, cfg);
   if (event.table === 'payments') return buildPaymentRequest(event, cfg);
   if (isKegChange(event)) return buildKegChangeRequest(event, cfg);
   if (event.table === 'staff_users') return buildStaffRequest(event, cfg);

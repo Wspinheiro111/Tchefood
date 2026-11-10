@@ -797,6 +797,12 @@ export interface SyncEvent {
    */
   keg_change?: KegChangeSync;
   /**
+   * Só no resgate de cashback (cashback_ledger REDEEM): o id do audit_log do resgate.
+   * Sobe por tchefood_register_cashback_redeem(), que confere dia, saldo e teto,
+   * baixa os créditos e grava resgate, audit_log e desconto da comanda juntos.
+   */
+  cashback_redeem?: { audit_id: UUID };
+  /**
    * Item de chopp: a torneira de onde sai. Segura o item atrás de uma troca de barril
    * recusada da mesma torneira (recordKeys). Não vai para o banco.
    */

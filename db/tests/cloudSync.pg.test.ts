@@ -90,6 +90,11 @@ function payCash(orderId: string) {
 
 const MANAGER = { managerPin: MANAGER_PIN, reason: 'Teste com o banco real' };
 
+/** Fixa a data do servidor para a regra do cashback (terça a quinta); null volta para NOW(). */
+function setCashbackClock(at: string | null) {
+  sql(`CREATE OR REPLACE FUNCTION tchefood_cashback_now() RETURNS TIMESTAMPTZ LANGUAGE sql STABLE AS $$ SELECT ${at ? `'${at}'::timestamptz` : 'NOW()'} $$;`);
+}
+
 afterEach(() => vi.useRealTimers());
 
 /** Requisição direta ao "PostgREST", como faria quem tem só o token do aparelho. */
@@ -226,16 +231,88 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     await expectSynced('cashback ganho');
 
     vi.setSystemTime(new Date('2026-11-12T13:00:00-03:00'));
+    setCashbackClock('2026-11-12T13:05:00-03:00');
     login(CASHIER_PIN);
     const second = ok(st().openTable(mesa.id, 1, null));
     launch(second.id, 1);
     const redeemed = ok(st().redeemCashback(second.id, '55999887766'));
     expect(redeemed.amount).toBeGreaterThan(0);
     await expectSynced('cashback resgatado');
+    // Gravado pela função do servidor: resgate, baixa do crédito e audit_log conferido.
+    expect(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${second.id}' AND entry_type = 'REDEEM'`)).toBe(redeemed.amount.toFixed(2));
+    expect(sql(`SELECT remaining_amount FROM cashback_ledger WHERE order_id = '${first.id}' AND entry_type = 'EARN'`)).toBe(
+      (Math.round((Number(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${first.id}' AND entry_type = 'EARN'`)) - redeemed.amount) * 100) / 100).toFixed(2),
+    );
+    expect(sql(`SELECT metadata->>'server_verified' FROM audit_logs WHERE order_id = '${second.id}' AND action_type = 'CASHBACK_REDEEMED'`)).toBe('true');
     payCash(second.id);
     await expectSynced('conta com cashback paga');
     expect(sql(`SELECT discount_amount FROM orders WHERE id = '${second.id}'`)).toBe(redeemed.amount.toFixed(2));
     expect(sql(`SELECT status FROM orders WHERE id = '${second.id}'`)).toBe('CLOSED');
+  });
+
+  it('travas do cashback: o token do aparelho não resgata direto, e a função confere dia, valor, conta e repetição', async () => {
+    const mesa = st().tables.find((t) => t.number === 1)!;
+    const p = st().products.find((x) => x.id === productId)!;
+    const customer = sql(`SELECT id FROM loyalty_customers WHERE tenant_id = '${TENANT}' LIMIT 1`);
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    // Crédito novo liberado (gravado pelo servidor, como se viesse de uma conta fechada).
+    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         SELECT '${TENANT}', '${customer}', o.id, 'EARN', 20, 20, '2026-11-01', '2026-12-31'
+           FROM orders o WHERE o.tenant_id = '${TENANT}' AND o.status = 'CLOSED'
+            AND NOT EXISTS (SELECT 1 FROM cashback_ledger c WHERE c.order_id = o.id AND c.entry_type = 'EARN') LIMIT 1;`);
+    const earn = sql(`SELECT id FROM cashback_ledger WHERE customer_id = '${customer}' AND entry_type = 'EARN' AND remaining_amount = 20`);
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(mesa.id, 1, null));
+    ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 2, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order.id));
+    await expectSynced('conta aberta');
+    const total = Number(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`));
+    const expected = Math.min(20, Math.round(total * 50) / 100);
+    const redeem = (args: Record<string, unknown>) => raw('POST', 'rpc/tchefood_register_cashback_redeem', {
+      p_redeem_id: 'aaaaaaaa-0000-4000-8000-000000000001', p_audit_id: 'aaaaaaaa-0000-4000-8000-000000000002', p_order_id: order.id,
+      p_customer_id: customer, p_amount: expected, p_user_id: cashier, p_created_at: '2026-11-12T19:59:00-03:00', ...args,
+    });
+
+    // Direto na tabela: resgate, baixa do saldo e expiração são recusados.
+    const direct = await raw('POST', 'cashback_ledger', { tenant_id: TENANT, customer_id: customer, order_id: order.id, entry_type: 'REDEEM', amount: 5 });
+    expect(direct.status).toBe(400);
+    expect(direct.body).toContain('só pela função do servidor');
+    expect((await raw('PATCH', `cashback_ledger?id=eq.${earn}`, { remaining_amount: 0 })).body).toContain('só baixa pela função do servidor');
+    expect((await raw('POST', 'cashback_ledger', { tenant_id: TENANT, customer_id: customer, entry_type: 'EXPIRE', amount: 20 })).status).toBe(400);
+    expect(sql(`SELECT remaining_amount FROM cashback_ledger WHERE id = '${earn}'`)).toBe('20.00');
+    // A função antiga (sem conferir quem chama) não é do aparelho.
+    expect(sql(`SELECT has_function_privilege('authenticated', 'tchefood_redeem_cashback(uuid,uuid,uuid)', 'EXECUTE')`)).toBe('f');
+
+    // Valor diferente do que o banco calcula: recusado.
+    expect((await redeem({ p_amount: expected + 1 })).body).toContain(`o servidor calcula R$ ${expected.toFixed(2)}`);
+    // Resgate de mais de 24 horas atrás: recusado.
+    expect((await redeem({ p_created_at: '2026-11-11T12:00:00-03:00' })).body).toContain('mais de 24 horas');
+    // Segunda-feira (pelo relógio do servidor): recusado.
+    setCashbackClock('2026-11-16T20:00:00-03:00');
+    expect((await redeem({ p_created_at: null })).body).toContain('terça a quinta');
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    // Quem resgata tem de ser da equipe ativa da loja.
+    expect((await redeem({ p_user_id: 'bbbbbbbb-0000-4000-8000-000000000009' })).body).toContain('equipe ativa');
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}'`)).toBe('0');
+
+    // Certo: grava o resgate, baixa o crédito, grava o audit_log e o desconto.
+    const okRes = await redeem({});
+    expect(okRes.status).toBe(200);
+    expect(Number(okRes.body)).toBe(expected);
+    expect(sql(`SELECT remaining_amount FROM cashback_ledger WHERE id = '${earn}'`)).toBe((20 - expected).toFixed(2));
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order.id}'`)).toBe(expected.toFixed(2));
+    // Reenvio da fila: devolve o gravado sem consumir de novo.
+    expect(Number((await redeem({})).body)).toBe(expected);
+    expect(sql(`SELECT remaining_amount FROM cashback_ledger WHERE id = '${earn}'`)).toBe((20 - expected).toFixed(2));
+    // Segundo resgate na mesma conta, com outro id: recusado.
+    expect((await redeem({ p_redeem_id: 'aaaaaaaa-0000-4000-8000-000000000003', p_audit_id: 'aaaaaaaa-0000-4000-8000-000000000004' })).body).toContain('já usou cashback');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order.id}'`)).toBe(expected.toFixed(2));
+    // Fecha a conta para não atrapalhar os próximos testes.
+    useTcheStore.setState({ orders: st().orders.filter((o) => o.id !== order.id), tables: st().tables.map((t) => (t.id === mesa.id ? { ...t, status: 'FREE' as const, current_order_id: null } : t)) });
+    sql(`SET session_replication_role = replica; UPDATE orders SET status = 'CANCELED' WHERE id = '${order.id}'; UPDATE dining_tables SET status = 'FREE', current_order_id = NULL WHERE id = '${mesa.id}';`);
+    setCashbackClock(null);
   });
 
   it('balcão (Ficha Rápida) com fichas e retirada', async () => {

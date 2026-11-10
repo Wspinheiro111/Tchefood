@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { useTcheStore } from '../store/useTcheStore';
+import { migrateCashbackRedeemQueue, migratePersisted, useTcheStore } from '../store/useTcheStore';
 import { kegStatus } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken, TICKET_ALPHABET } from '../lib/eventTickets';
 import { cashbackEarnAmount, isCashbackDay, normalizeWhatsapp } from '../lib/loyalty';
 import { computeNetWeight, encodeScaleFrame, parseScaleFrame, parseScalePayload, readStable, SimulatedScale } from '../lib/scale';
 import { seedId } from '../data/seed';
-import type { SelectedModifier } from '../types';
+import type { AuditLog, SelectedModifier, SyncEvent } from '../types';
 
 const st = () => useTcheStore.getState();
 const product = (code: string) => st().products.find((p) => p.code === code)!;
@@ -288,11 +288,44 @@ describe('cashback no WhatsApp', () => {
     expect(order.total_amount).toBe(10.41);
     expect(st().auditLogs[0]!.action_type).toBe('CASHBACK_REDEEMED');
     expect(st().loyaltyCustomers[0]!.cashback_balance).toBe(0);
-    // Extrato e cliente do resgate sobem presos à comanda do resgate.
+    // Extrato e cliente do resgate sobem presos à comanda do resgate. O resgate sobe numa
+    // chamada só (tchefood_register_cashback_redeem): sem a baixa dos créditos por UPDATE
+    // e sem o audit_log solto, e antes da atualização da comanda.
     const tagged = st().outbox.filter((e) => (e.table === 'cashback_ledger' || e.table === 'loyalty_customers') && e.depends_on_order_id === second);
-    expect(tagged.map((e) => `${e.table} ${e.op}`).sort()).toEqual(['cashback_ledger INSERT', 'cashback_ledger UPDATE', 'loyalty_customers UPDATE']);
+    expect(tagged.map((e) => `${e.table} ${e.op}`).sort()).toEqual(['cashback_ledger INSERT', 'loyalty_customers UPDATE']);
+    const redeemEvent = st().outbox.find((e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.entry_type === 'REDEEM')!;
+    expect(redeemEvent.cashback_redeem).toEqual({ audit_id: st().auditLogs[0]!.id });
+    expect(st().outbox.some((e) => e.table === 'audit_logs' && e.payload.action_type === 'CASHBACK_REDEEMED')).toBe(false);
+    const outbox = st().outbox;
+    expect(outbox.findIndex((e) => e.id === redeemEvent.id)).toBeLessThan(
+      outbox.findIndex((e) => e.table === 'orders' && e.row_id === second && e.op === 'UPDATE' && e.payload.discount_amount === 3.78),
+    );
     expect(st().redeemCashback(second, '55999991234').ok).toBe(false);
     expect(st().applyDiscount(second, 2, MANAGER).ok).toBe(false);
+  });
+
+  it('fila de versão anterior: o resgate em três partes vira a chamada única da função do servidor', () => {
+    const ev = (id: string, table: SyncEvent['table'], op: SyncEvent['op'], payload: Record<string, unknown>, extra: Partial<SyncEvent> = {}): SyncEvent => ({
+      id, table, op, row_id: String(payload.id ?? id), payload, created_at: '2026-11-12T16:00:00.000Z', ...extra,
+    });
+    const audit = ev('e1', 'audit_logs', 'INSERT', { id: 'A1', order_id: 'O1', action_type: 'CASHBACK_REDEEMED' });
+    const earn = ev('e2', 'cashback_ledger', 'UPDATE', { id: 'L1', entry_type: 'EARN', remaining_amount: 0 }, { depends_on_order_id: 'O1' });
+    const redeem = ev('e3', 'cashback_ledger', 'INSERT', { id: 'R1', order_id: 'O1', entry_type: 'REDEEM', amount: 3.78 }, { depends_on_order_id: 'O1' });
+    const order = ev('e4', 'orders', 'UPDATE', { id: 'O1', discount_amount: 3.78 });
+    const other = ev('e5', 'audit_logs', 'INSERT', { id: 'A2', order_id: 'O2', action_type: 'CASHBACK_REDEEMED' });
+    const out = migrateCashbackRedeemQueue([audit, earn, redeem, order, other], []);
+    expect(out.map((e) => e.id)).toEqual(['e3', 'e4', 'e5']);
+    expect(out[0]!.cashback_redeem).toEqual({ audit_id: 'A1' });
+    // audit_log que já subiu: o id vem do histórico do aparelho e a função usa o gravado.
+    const logs = [{ id: 'A9', order_id: 'O1', action_type: 'CASHBACK_REDEEMED' } as AuditLog];
+    expect(migrateCashbackRedeemQueue([earn, redeem, order], logs).map((e) => [e.id, e.cashback_redeem?.audit_id])).toEqual([['e3', 'A9'], ['e4', undefined]]);
+    // Na hidratação, vale também para os recusados.
+    const migrated = migratePersisted({ outbox: [earn, order], syncRejected: [{ event: redeem, status: 400, message: 'x', rejected_at: 't' }], auditLogs: logs }, 11) as {
+      outbox: SyncEvent[];
+      syncRejected: Array<{ event: SyncEvent }>;
+    };
+    expect(migrated.outbox.map((e) => e.id)).toEqual(['e4']);
+    expect(migrated.syncRejected.map((r) => r.event.cashback_redeem)).toEqual([{ audit_id: 'A9' }]);
   });
 
   it('valida WhatsApp brasileiro', () => {

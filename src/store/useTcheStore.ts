@@ -2778,11 +2778,12 @@ export const useTcheStore = create<TcheState>()(
           set((s) => {
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, discount_amount: round2(current.discount_amount + amount) }, s.orderItems, s.payments);
-            const changedLedger = ledger.filter((e, i) => e !== s.cashbackLedger[i] && e.entry_type === 'EARN');
             const patch = commitAdjustment(s, recalculated, s.orderItems, [], log, null);
-            // Ordem no servidor: audit_log e extrato (REDEEM) antes do desconto da comanda,
-            // porque a trava do desconto confere os dois.
-            const [auditEvent, ...orderEvents] = patch.outbox!.slice(s.outbox.length);
+            // O resgate sobe por tchefood_register_cashback_redeem, que confere a regra no
+            // banco, baixa os créditos e grava o audit_log e o desconto da comanda. Por isso
+            // o audit_log e a baixa dos créditos não sobem sozinhos, e o resgate vai antes da
+            // atualização da comanda (que então já encontra o desconto gravado).
+            const [, ...orderEvents] = patch.outbox!.slice(s.outbox.length);
             return {
               ...patch,
               auditLogs: patch.auditLogs,
@@ -2790,11 +2791,7 @@ export const useTcheStore = create<TcheState>()(
               loyaltyCustomers: s.loyaltyCustomers.map((c) => (c.id === customer.id ? updatedCustomer : c)),
               outbox: [
                 ...s.outbox,
-                auditEvent!,
-                // O consumo dos créditos só sobe junto com a comanda do resgate: se a
-                // autorização ou o desconto dela for recusado, o extrato fica esperando.
-                ...changedLedger.map((e) => ({ ...syncEvent('cashback_ledger', 'UPDATE', e), depends_on_order_id: orderId })),
-                { ...syncEvent('cashback_ledger', 'INSERT', entry), depends_on_order_id: orderId },
+                { ...syncEvent('cashback_ledger', 'INSERT', entry), depends_on_order_id: orderId, cashback_redeem: { audit_id: log.id } },
                 ...orderEvents,
                 { ...syncEvent('loyalty_customers', 'UPDATE', updatedCustomer), depends_on_order_id: orderId },
               ],
@@ -4017,8 +4014,8 @@ export const useTcheStore = create<TcheState>()(
       // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras);
       // v6 = combos; v7 = nuvem → aparelho (pullStatus);
       // v8 = caixa (abertura, sangria, suprimento, fechamento); v9 = preço conferido pelo servidor;
-      // v10 = entrega própria; v11 = avaliações dos clientes.
-      version: 11,
+      // v10 = entrega própria; v11 = avaliações dos clientes; v12 = resgate de cashback pela função do servidor.
+      version: 12,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -4149,7 +4146,44 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
   if (version < 11) {
     if (!Array.isArray(out.reviews)) out.reviews = [];
   }
+  if (version < 12) {
+    const auditLogs = Array.isArray(out.auditLogs) ? (out.auditLogs as AuditLog[]) : [];
+    const outbox = Array.isArray(out.outbox) ? (out.outbox as SyncEvent[]) : [];
+    const rejected = Array.isArray(out.syncRejected) ? (out.syncRejected as RejectedSyncEvent[]) : [];
+    const queued = migrateCashbackRedeemQueue([...rejected.map((r) => r.event), ...outbox], auditLogs);
+    const rejectedIds = new Set(rejected.map((r) => r.event.id));
+    out.syncRejected = rejected.flatMap((r) => {
+      const ev = queued.find((e) => e.id === r.event.id);
+      return ev ? [{ ...r, event: ev }] : [];
+    });
+    out.outbox = queued.filter((e) => !rejectedIds.has(e.id));
+  }
   return out;
+}
+
+/**
+ * Fila gravada antes da v12: o resgate de cashback subia em três partes (audit_log
+ * CASHBACK_REDEEMED, baixa dos créditos por UPDATE e o REDEEM). Agora sobe numa chamada
+ * (tchefood_register_cashback_redeem), que faz as três no banco. O REDEEM ganha o id do
+ * audit_log do resgate; o audit_log e as baixas ainda na fila saem dela (o banco recusaria
+ * a baixa direta). Se o audit_log já tinha subido, a função usa o que está gravado.
+ */
+export function migrateCashbackRedeemQueue(events: SyncEvent[], auditLogs: AuditLog[]): SyncEvent[] {
+  const redeems = events.filter((e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.entry_type === 'REDEEM' && !e.cashback_redeem);
+  if (!redeems.length) return events;
+  const orderIds = new Set(redeems.map((e) => String(e.payload.order_id)));
+  const auditFor = (orderId: string) =>
+    events.find((e) => e.table === 'audit_logs' && e.op === 'INSERT' && e.payload.action_type === 'CASHBACK_REDEEMED' && e.payload.order_id === orderId)?.row_id ??
+    auditLogs.find((l) => l.action_type === 'CASHBACK_REDEEMED' && l.order_id === orderId)?.id;
+  return events.flatMap((e) => {
+    if (e.table === 'cashback_ledger' && e.op === 'UPDATE' && e.depends_on_order_id && orderIds.has(e.depends_on_order_id)) return [];
+    if (e.table === 'audit_logs' && e.op === 'INSERT' && e.payload.action_type === 'CASHBACK_REDEEMED' && orderIds.has(String(e.payload.order_id))) return [];
+    if (redeems.includes(e)) {
+      const audit = auditFor(String(e.payload.order_id));
+      return [audit ? { ...e, cashback_redeem: { audit_id: audit } } : e];
+    }
+    return [e];
+  });
 }
 
 /** Mesa técnica da venda de balcão (Ficha Rápida) de uma loja. */
