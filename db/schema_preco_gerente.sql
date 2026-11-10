@@ -11,6 +11,9 @@
 --      o item que o servidor não consegue conferir (sabor/adicional
 --      desconhecido) e só aceita com um PRICE_OVERRIDE do mesmo item e mesmo preço.
 --      O PRICE_MISMATCH continua sendo gravado, agora com o gerente que autorizou.
+--   3. tchefood_expected_item_price (cópia da versão de schema_entrega.sql): a Ficha
+--      Rápida segue a regra de horário, como o app (PR #27). Sem isso a venda certa
+--      de happy hour no balcão seria recusada.
 --      Item de fila antiga (sem priced_at) é conferido pelo cadastro da hora em que
 --      entrou (a mesma janela de 12 h do priced_at): com o preço certo entra, como antes.
 -- No aparelho, o item recusado aparece em Nuvem › recusados com o campo de PIN do
@@ -144,6 +147,65 @@ BEGIN
             COALESCE(p_metadata, '{}'::jsonb) || jsonb_build_object('manager_name', v_manager.name, 'server_verified', true))
     RETURNING id INTO v_id;
     RETURN v_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION tchefood_expected_item_price(p_item order_items)
+RETURNS TABLE (base NUMERIC, modifiers NUMERIC)
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_product products%ROWTYPE;
+    v_rule VARCHAR;
+    v_at TIMESTAMPTZ;
+    v_prices NUMERIC[];
+    v_half UUID;
+    v_mods NUMERIC;
+    v_count INT;
+BEGIN
+    SELECT * INTO v_product FROM products WHERE id = p_item.product_id;
+    IF NOT FOUND THEN RETURN; END IF;
+    -- Taxa de entrega própria: o preço é a taxa do bairro gravada na entrega da conta
+    -- (a entrega sobe antes dos itens). Sem entrega, o banco não tem como conferir.
+    IF v_product.code = 'TAXA-ENTREGA' THEN
+        SELECT d.delivery_fee, 0::NUMERIC INTO base, modifiers FROM own_deliveries d
+         WHERE d.order_id = p_item.order_id AND d.tenant_id = v_product.tenant_id;
+        IF FOUND AND COALESCE(array_length(p_item.modifier_option_ids, 1), 0) = 0 AND COALESCE(array_length(p_item.half_product_ids, 1), 0) = 0 THEN
+            RETURN NEXT;
+        END IF;
+        RETURN;
+    END IF;
+    SELECT t.half_and_half_pricing INTO v_rule FROM tenants t WHERE t.id = v_product.tenant_id;
+    -- Instante do preço: quando o item foi para a bandeja, dentro de 12 h antes do envio
+    -- e nunca no futuro (relógio do aparelho adiantado não vale).
+    v_at := LEAST(GREATEST(COALESCE(p_item.priced_at, p_item.created_at, NOW()), COALESCE(p_item.created_at, NOW()) - INTERVAL '12 hours'), NOW());
+
+    -- Ficha Rápida (origem SMARTPOS) segue a regra de horário como a comanda: o app cobra
+    -- o happy hour no balcão desde o PR #27 (createCounterSale usa effectivePrice). Antes
+    -- o banco usava o preço base e, com a recusa abaixo, travaria a venda certa.
+    v_prices := ARRAY[tchefood_sale_price(v_product.id, v_at)];
+    FOREACH v_half IN ARRAY COALESCE(p_item.half_product_ids, '{}') LOOP
+        IF NOT EXISTS (SELECT 1 FROM products h WHERE h.id = v_half AND h.tenant_id = v_product.tenant_id AND h.allows_half_and_half)
+           OR NOT v_product.allows_half_and_half THEN
+            RETURN;
+        END IF;
+        v_prices := v_prices || tchefood_sale_price(v_half, v_at);
+    END LOOP;
+    IF array_length(v_prices, 1) > 1 THEN
+        base := CASE WHEN v_rule = 'AVERAGE'
+                     THEN round((SELECT sum(round(x * 100)) FROM unnest(v_prices) x) / array_length(v_prices, 1)) / 100
+                     ELSE (SELECT max(round(x, 2)) FROM unnest(v_prices) x) END;
+    ELSE
+        base := v_prices[1];
+    END IF;
+
+    -- Adicionais: só opções de grupos ligados ao produto.
+    SELECT count(*), COALESCE(sum(o.additional_price), 0) INTO v_count, v_mods
+      FROM unnest(COALESCE(p_item.modifier_option_ids, '{}')) AS sel(id)
+      JOIN modifier_options o ON o.id = sel.id
+      JOIN product_modifier_groups l ON l.group_id = o.group_id AND l.product_id = v_product.id;
+    IF v_count <> COALESCE(array_length(p_item.modifier_option_ids, 1), 0) THEN RETURN; END IF;
+    modifiers := round(v_mods, 2);
+    RETURN NEXT;
 END;
 $$;
 

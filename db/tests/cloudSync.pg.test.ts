@@ -688,6 +688,12 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT unit_price FROM order_items WHERE id = '${staleItem.id}'`)).toBe('55.15');
     expect(sql(`SELECT reason FROM audit_logs WHERE action_type = 'PRICE_OVERRIDE' AND metadata->>'item_id' = '${staleItem.id}' AND authorized_by_manager_id IS NOT NULL`)).toBe('Preço antigo da casa');
     sql(`UPDATE products SET price = 55.15 WHERE id = '${marguerita.id}'`);
+    // Ficha Rápida no happy hour (regra de horário o dia todo no carreteiro): o app cobra
+    // R$ 39,90 e o banco confere pela mesma regra, sem pedir PIN.
+    const counter = ok(st().createCounterSale([{ product_id: productId, quantity: 1, modifiers: [], meat_doneness: null }]));
+    expect(st().orderItems.find((i) => i.order_id === counter.id)!.unit_price).toBe(39.9);
+    await expectSynced('Ficha Rápida no happy hour');
+    expect(sql(`SELECT unit_price FROM order_items WHERE order_id = '${counter.id}'`)).toBe('39.90');
   });
 
   it('dinheiro no servidor: pagamento só pela função, com saldo, NSU e caixa conferidos; conta só fecha zerada', async () => {
