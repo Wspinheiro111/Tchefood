@@ -106,6 +106,10 @@ BEGIN
             IF v_pay.nsu IS NULL OR length(trim(v_pay.nsu)) = 0 THEN
                 RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: % aprovado sem o NSU do comprovante.', v_pay.method;
             END IF;
+            -- Dois aparelhos com o mesmo comprovante em contas diferentes: o travamento da conta
+            -- (acima) não os serializa, então o comprovante também trava a transação.
+            PERFORM pg_advisory_xact_lock(hashtextextended(
+                v_tenant::text || '|' || v_pay.acquirer || '|' || COALESCE(v_pay.terminal_serial, '') || '|' || v_pay.nsu, 0));
             IF EXISTS (
                 SELECT 1 FROM payments p
                  WHERE p.tenant_id = v_tenant AND p.status = 'APPROVED' AND p.acquirer = v_pay.acquirer
@@ -132,10 +136,28 @@ $$;
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION tchefood_order_close_guard()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    v_subtotal NUMERIC(10,2);
+    v_fee      NUMERIC(10,2);
+    v_discount NUMERIC(10,2);
+    v_paid     NUMERIC(10,2);
+    v_remaining NUMERIC(10,2);
 BEGIN
-    IF NEW.status IN ('CLOSED', 'CANCELED') AND OLD.status IN ('OPEN', 'PAYING') AND NEW.remaining_balance <> 0 THEN
-        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: a conta % ainda deve R$ % no servidor e não pode ser %.',
-            OLD.id, NEW.remaining_balance, CASE NEW.status WHEN 'CLOSED' THEN 'fechada' ELSE 'cancelada' END;
+    IF NEW.status IN ('CLOSED', 'CANCELED') AND OLD.status IN ('OPEN', 'PAYING') THEN
+        -- O mesmo UPDATE que encerra a conta pode trazer a taxa de serviço ou o desconto novos
+        -- (quitar com a gorjeta dispensada, por exemplo). Os totais gravados só são refeitos DEPOIS
+        -- (trg_orders_flags), então o saldo é calculado aqui com os valores que estão chegando,
+        -- pela mesma regra de tchefood_recalc_order.
+        SELECT COALESCE(SUM(total_item_price), 0) INTO v_subtotal
+          FROM order_items WHERE order_id = OLD.id AND status <> 'CANCELED';
+        v_fee := CASE WHEN NEW.charge_service_fee THEN round(v_subtotal * NEW.service_fee_pct / 100, 2) ELSE 0 END;
+        v_discount := LEAST(GREATEST(NEW.discount_amount, 0), v_subtotal + v_fee);
+        SELECT COALESCE(SUM(amount), 0) INTO v_paid FROM payments WHERE order_id = OLD.id AND status = 'APPROVED';
+        v_remaining := GREATEST(v_subtotal + v_fee - v_discount - v_paid, 0);
+        IF v_remaining <> 0 THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: a conta % ainda deve R$ % no servidor e não pode ser %.',
+                OLD.id, v_remaining, CASE NEW.status WHEN 'CLOSED' THEN 'fechada' ELSE 'cancelada' END;
+        END IF;
     END IF;
     IF OLD.status IN ('CLOSED', 'CANCELED') AND NEW.status IN ('OPEN', 'PAYING') THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: a conta % já foi encerrada e não reabre.', OLD.id;

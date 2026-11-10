@@ -665,8 +665,20 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await rpc(pay({ status: 'DECLINED', nsu: null, amount: 99999 }))).status).toBe(200);
     const left = server();
     expect(Number(left)).toBeGreaterThan(0);
-    // O resto em dinheiro no caixa fecha a conta (fechamento automático do banco).
-    expect((await rpc(pay({ method: 'CASH', acquirer: 'CASH_DESK', nsu: null, card_brand: null, terminal_serial: null, amount: Number(left) }))).status).toBe(200);
+    const cash = (amount: number) => pay({ method: 'CASH', acquirer: 'CASH_DESK', nsu: null, card_brand: null, terminal_serial: null, amount });
+    // Paga tudo menos a taxa de serviço em dinheiro; dispensar a taxa e encerrar no MESMO update fecha a conta
+    // (o saldo é refeito com a taxa nova, não pelo valor gravado antes).
+    const fee = Number(sql(`SELECT service_fee_amount FROM orders WHERE id = '${order.id}'`));
+    expect(fee).toBeGreaterThan(0);
+    expect((await rpc(cash(Math.round((Number(left) - fee) * 100) / 100))).status).toBe(200);
+    expect((await raw('PATCH', `orders?id=eq.${order.id}`, { status: 'CLOSED' })).body).toMatch(/ainda deve/);
+    const auth = await raw('POST', 'rpc/tchefood_authorize_manager', {
+      p_order_id: order.id, p_action_type: 'SERVICE_FEE_REMOVED', p_manager_pin: MANAGER_PIN, p_performed_by: st().currentUserId,
+      p_reason: 'Teste da taxa dispensada', p_amount_impact: -fee, p_metadata: { client_audit_id: crypto.randomUUID() },
+    });
+    expect(auth.status).toBe(200);
+    const waive = await raw('PATCH', `orders?id=eq.${order.id}`, { charge_service_fee: false, status: 'CLOSED' });
+    expect(waive.status).toBeLessThan(300);
     expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 0.00');
     // Conta fechada não recebe mais pagamento nem reabre.
     expect((await rpc(pay({ method: 'CASH', acquirer: 'CASH_DESK', nsu: null, amount: 1 }))).body).toMatch(/fechada/);
