@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Clock, QrCode as QrIcon, Sparkles, Users } from 'lucide-react';
+import { Clock, CreditCard, LayoutGrid, QrCode as QrIcon, Sparkles, Users } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import type { DiningTable, TableStatus } from '../types';
 import { formatBRL } from '../lib/money';
@@ -16,6 +16,17 @@ const STATUS_STYLE: Record<TableStatus, { card: string; label: string; dot: stri
 };
 
 
+type MapMode = 'TABLES' | 'CARDS';
+const MAP_MODE_KEY = 'tchefood:mapa-modo';
+/** Lembra se o aparelho estava em Mesas ou Cartões (o garçom do bar volta da conta direto para os cartões). */
+function readMapMode(): MapMode {
+  try {
+    return localStorage.getItem(MAP_MODE_KEY) === 'CARDS' ? 'CARDS' : 'TABLES';
+  } catch {
+    return 'TABLES';
+  }
+}
+
 export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => void }) {
   // A mesa técnica do balcão (Ficha Rápida) não aparece no mapa.
   const allTables = useTcheStore((s) => s.tables);
@@ -26,6 +37,16 @@ export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => vo
   const now = useNow(30_000);
   const [area, setArea] = useState<string>('ALL');
   const [opening, setOpening] = useState<DiningTable | null>(null);
+  const hasCards = useMemo(() => allTables.some((t) => t.kind === 'CARD' && t.active), [allTables]);
+  const [mode, setModeState] = useState<MapMode>(readMapMode);
+  const setMode = (m: MapMode) => {
+    setModeState(m);
+    try {
+      localStorage.setItem(MAP_MODE_KEY, m);
+    } catch {
+      /* sem armazenamento: só não lembra a aba */
+    }
+  };
 
   // Áreas vêm do cadastro de mesas (Retaguarda > Salão), na ordem em que aparecem.
   const filters = useMemo(() => {
@@ -53,8 +74,29 @@ export function TableMap({ onOpenOrder }: { onOpenOrder: (orderId: string) => vo
     if (t.current_order_id) onOpenOrder(t.current_order_id);
   };
 
+  const modeToggle = hasCards ? (
+    <div className="mb-3 grid grid-cols-2 gap-2" role="tablist">
+      <button role="tab" aria-selected={mode === 'TABLES'} onClick={() => setMode('TABLES')} className={`inline-flex min-h-touch items-center justify-center gap-2 rounded-xl font-bold ${mode === 'TABLES' ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}>
+        <LayoutGrid className="h-5 w-5" /> Mesas
+      </button>
+      <button role="tab" aria-selected={mode === 'CARDS'} onClick={() => setMode('CARDS')} className={`inline-flex min-h-touch items-center justify-center gap-2 rounded-xl font-bold ${mode === 'CARDS' ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}>
+        <CreditCard className="h-5 w-5" /> Cartões
+      </button>
+    </div>
+  ) : null;
+
+  if (hasCards && mode === 'CARDS') {
+    return (
+      <div className="mx-auto max-w-5xl px-3 pb-24 pt-3">
+        {modeToggle}
+        <CardPanel onOpenOrder={onOpenOrder} />
+      </div>
+    );
+  }
+
   return (
     <div className="mx-auto max-w-5xl px-3 pb-24 pt-3">
+      {modeToggle}
       <div className="scroll-thin -mx-3 mb-3 flex gap-2 overflow-x-auto px-3">
         {filters.map((f) => (
           <button
@@ -167,5 +209,94 @@ function OpenTableSheet({ table, onClose, onOpened }: { table: DiningTable | nul
         className="min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 text-lg outline-none focus:border-ouro"
       />
     </Sheet>
+  );
+}
+
+/**
+ * Comanda por cartão numerado: o garçom digita (ou bipa) o número do cartão.
+ * Cartão livre abre a conta na hora (1 pessoa); cartão em uso abre a conta que já está nele.
+ */
+function CardPanel({ onOpenOrder }: { onOpenOrder: (orderId: string) => void }) {
+  const tables = useTcheStore((s) => s.tables);
+  const orders = useTcheStore((s) => s.orders);
+  const openCard = useTcheStore((s) => s.openCard);
+  const now = useNow(30_000);
+  const [number, setNumber] = useState('');
+  const inUse = useMemo(
+    () => tables.filter((t) => t.kind === 'CARD' && t.current_order_id && t.status !== 'FREE').sort((a, b) => a.number - b.number),
+    [tables],
+  );
+  const freeCount = useMemo(() => tables.filter((t) => t.kind === 'CARD' && t.active && t.status === 'FREE').length, [tables]);
+
+  const go = () => {
+    const n = Number(number);
+    if (!number || !Number.isInteger(n)) return toast.error('Digite o número do cartão.');
+    const card = tables.find((t) => t.kind === 'CARD' && t.number === n);
+    const wasFree = card?.status === 'FREE';
+    const r = openCard(n);
+    if (!r.ok) return toast.error(r.error);
+    if (wasFree) toast.success(`Cartão ${n} aberto.`);
+    setNumber('');
+    onOpenOrder(r.data.id);
+  };
+
+  return (
+    <div>
+      <form
+        className="mb-4 rounded-2xl border border-slate-200 bg-surface p-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          go();
+        }}
+      >
+        <label htmlFor="card-number" className="mb-1 block font-semibold">Número do cartão</label>
+        <div className="flex gap-2">
+          <input
+            id="card-number"
+            autoFocus
+            inputMode="numeric"
+            value={number}
+            onChange={(e) => setNumber(e.target.value.replace(/\D/g, '').slice(0, 4))}
+            placeholder="Ex.: 27"
+            className="min-h-touch-lg w-full rounded-xl border border-slate-300 bg-base px-3 text-2xl font-black tabular-nums outline-none focus:border-ouro"
+          />
+          <Btn size="lg" type="submit">Abrir</Btn>
+        </div>
+        <p className="mt-2 text-xs text-slate-500">Cartão livre abre a conta na hora. Cartão em uso abre a conta dele. {freeCount} cartões livres.</p>
+      </form>
+
+      <h2 className="mb-2 text-sm font-bold uppercase tracking-wide text-slate-500">Cartões em uso ({inUse.length})</h2>
+      {inUse.length === 0 ? (
+        <p className="rounded-xl bg-surface p-4 text-center text-slate-500">Nenhum cartão em uso agora.</p>
+      ) : (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+          {inUse.map((t) => {
+            const order = orders.find((o) => o.id === t.current_order_id);
+            const style = STATUS_STYLE[t.status];
+            return (
+              <button
+                key={t.id}
+                onClick={() => t.current_order_id && onOpenOrder(t.current_order_id)}
+                className={`flex min-h-[96px] flex-col justify-between rounded-2xl border-2 p-3 text-left active:scale-[0.98] ${style.card}`}
+              >
+                <div className="flex items-start justify-between">
+                  <div className="inline-flex items-center gap-1 text-2xl font-black leading-none"><CreditCard className="h-5 w-5" />{t.number}</div>
+                  <span className="inline-flex items-center gap-1 rounded-md bg-black/10 px-1.5 py-0.5 text-[11px] font-bold">
+                    <span className={`h-2 w-2 rounded-full ${style.dot}`} />
+                    {style.label}
+                  </span>
+                </div>
+                {order && (
+                  <div className="mt-2 flex items-center justify-between text-sm">
+                    <span className="text-lg font-bold tabular-nums">{formatBRL(order.paid_amount > 0 ? order.remaining_balance : order.total_amount)}</span>
+                    <span className="inline-flex items-center gap-1 text-xs text-slate-700"><Clock className="h-3 w-3" />{elapsedLabel(order.opened_at, now)}</span>
+                  </div>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }

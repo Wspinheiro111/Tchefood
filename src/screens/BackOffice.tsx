@@ -16,7 +16,7 @@ import { MenuAdmin } from './admin/MenuAdmin';
 import { FeesReceivables } from './FeesReceivables';
 import { OwnDeliveryAdmin } from './admin/OwnDeliveryAdmin';
 import { OwnerDashboard, type DashboardNavTarget } from './OwnerDashboard';
-import { StaffAdmin, TablesAdmin } from './admin/TablesStaffAdmin';
+import { CardsAdmin, StaffAdmin, TablesAdmin } from './admin/TablesStaffAdmin';
 import { CloudAdmin, StoreAdmin } from './admin/StoreCloudAdmin';
 import type { Permission } from '../types';
 
@@ -109,7 +109,12 @@ export function BackOffice({ onExit }: { onExit?: (view: BackOfficeExit) => void
       {tab === 'nfce' && <NfceList />}
       {tab === 'purchases' && <PurchaseImport />}
       {tab === 'menu' && <MenuAdmin />}
-      {tab === 'tables' && <TablesAdmin />}
+      {tab === 'tables' && (
+        <>
+          <TablesAdmin />
+          <CardsAdmin />
+        </>
+      )}
       {tab === 'staff' && <StaffAdmin />}
       {tab === 'store' && <StoreAdmin />}
       {tab === 'cloud' && <CloudAdmin />}

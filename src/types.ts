@@ -181,11 +181,12 @@ export interface DiningTable {
   /**
    * COUNTER = mesa técnica da venda de balcão/eventos (nunca ocupada, fora do mapa).
    * KIOSK = mesa técnica dos pedidos com senha (totem e pedido no caixa), que vão para o KDS.
+   * CARD = cartão de comanda numerado (o cliente anda com o cartão; a conta é como a da mesa).
    */
   kind: DiningTableKind;
 }
 
-export type DiningTableKind = 'TABLE' | 'COUNTER' | 'KIOSK';
+export type DiningTableKind = 'TABLE' | 'COUNTER' | 'KIOSK' | 'CARD';
 
 /** Pedido com senha: comer no salão ou levar. */
 /** DELIVERY = entrega própria (motoboy da casa), db/schema_entrega.sql. */

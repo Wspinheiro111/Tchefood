@@ -21,7 +21,8 @@
 ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'KIOSK';
 
 ALTER TABLE dining_tables DROP CONSTRAINT IF EXISTS dining_tables_kind_check;
-ALTER TABLE dining_tables ADD CONSTRAINT dining_tables_kind_check CHECK (kind IN ('TABLE', 'COUNTER', 'KIOSK'));
+-- CARD vem da comanda por cartão (db/schema_cartao.sql); fica aqui também para este arquivo rodar de novo numa base que já tem cartões.
+ALTER TABLE dining_tables ADD CONSTRAINT dining_tables_kind_check CHECK (kind IN ('TABLE', 'COUNTER', 'KIOSK', 'CARD'));
 
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_number INT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_name VARCHAR(20);

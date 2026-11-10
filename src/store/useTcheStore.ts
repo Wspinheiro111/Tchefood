@@ -68,6 +68,7 @@ import {
   validateProduct,
   validateStaff,
   validateTable,
+  validateCardRange,
   type PriceScheduleDraft,
   type ProductDraft,
   type StaffDraft,
@@ -466,6 +467,12 @@ interface Actions {
   setProductModifierGroups: (productId: UUID, groupIds: UUID[]) => ActionResult;
   savePriceSchedule: (draft: Omit<PriceScheduleDraft, 'id'> & { id?: UUID }) => ActionResult<PriceSchedule>;
   saveTable: (draft: Omit<TableDraft, 'id'> & { id?: UUID }) => ActionResult<DiningTable>;
+  /** Cria os cartões de comanda numerados de `from` a `to` (pula os que já existem). */
+  createCards: (from: number, to: number) => ActionResult<DiningTable[]>;
+  /** Ativa ou desativa um cartão (perdido ou quebrado); só cartão livre é desativado. */
+  setCardActive: (cardId: UUID, active: boolean) => ActionResult<DiningTable>;
+  /** Abre a conta do cartão pelo número (1 pessoa); se já estiver em uso, devolve a conta aberta. */
+  openCard: (number: number) => ActionResult<Order>;
   saveStaff: (draft: Omit<StaffDraft, 'id'> & { id?: UUID }, auth?: ManagerAuthInput) => ActionResult<StaffUser>;
   setRolePermission: (role: StaffUser['role'], permission: Permission, allowed: boolean, auth: ManagerAuthInput) => ActionResult<RolePermission>;
   updateTenant: (draft: TenantDraft) => ActionResult<Tenant>;
@@ -3049,6 +3056,59 @@ export const useTcheStore = create<TcheState>()(
             outbox: [...s.outbox, syncEvent('dining_tables', existing ? 'UPDATE' : 'INSERT', row)],
           }));
           return { ok: true, data: row };
+        },
+
+        createCards: (from, to) => {
+          const perm = requirePermission('TABLES_MANAGE');
+          if (!perm.ok) return perm;
+          const check = validateCardRange(from, to);
+          if (!check.ok) return check;
+          const state = get();
+          const taken = new Set(state.tables.filter((t) => t.kind === 'CARD').map((t) => t.number));
+          const ts = nowISO();
+          const rows: DiningTable[] = [];
+          for (let n = from; n <= to; n++) {
+            if (taken.has(n)) continue;
+            rows.push({
+              id: uuid(),
+              tenant_id: state.tenant.id,
+              number: n,
+              label: `Cartão ${n}`,
+              area: 'Cartões',
+              capacity: 1,
+              status: 'FREE',
+              qr_code_token: null,
+              current_order_id: null,
+              active: true,
+              updated_at: ts,
+              kind: 'CARD',
+            });
+          }
+          if (rows.length === 0) return fail('Esses cartões já estão cadastrados.');
+          set((s) => ({ tables: [...s.tables, ...rows], outbox: [...s.outbox, ...rows.map((r) => syncEvent('dining_tables', 'INSERT', r))] }));
+          return { ok: true, data: rows };
+        },
+
+        setCardActive: (cardId, active) => {
+          const perm = requirePermission('TABLES_MANAGE');
+          if (!perm.ok) return perm;
+          const card = get().tables.find((t) => t.id === cardId && t.kind === 'CARD');
+          if (!card) return fail('Cartão não encontrado.');
+          if (!active && card.status !== 'FREE') return fail(`${card.label} está com conta aberta. Feche a conta antes de desativar.`);
+          const updated: DiningTable = { ...card, active, updated_at: nowISO() };
+          set((s) => ({ tables: s.tables.map((t) => (t.id === card.id ? updated : t)), outbox: [...s.outbox, syncEvent('dining_tables', 'UPDATE', updated)] }));
+          return { ok: true, data: updated };
+        },
+
+        openCard: (number) => {
+          const card = get().tables.find((t) => t.kind === 'CARD' && t.number === number);
+          if (!card) return fail(`Cartão ${number} não cadastrado.`);
+          if (!card.active) return fail(`${card.label} está desativado (perdido ou quebrado).`);
+          if (card.current_order_id) {
+            const open = get().orders.find((o) => o.id === card.current_order_id);
+            if (open) return { ok: true, data: open };
+          }
+          return get().openTable(card.id, 1, null);
         },
 
         saveStaff: (draft, auth) => {

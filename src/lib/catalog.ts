@@ -132,7 +132,8 @@ export type TableDraft = Pick<DiningTable, 'id' | 'number' | 'label' | 'area' | 
 
 export function validateTable(t: TableDraft, tables: DiningTable[]): Check {
   if (!Number.isInteger(t.number) || t.number < 1 || t.number > 9999) return bad('Número da mesa: inteiro de 1 a 9999.');
-  if (tables.some((o) => o.id !== t.id && o.number === t.number)) return bad(`Já existe a mesa número ${t.number}.`);
+  // Cartão de comanda tem numeração própria (o cartão 12 não impede a mesa 12).
+  if (tables.some((o) => o.id !== t.id && o.kind !== 'CARD' && o.number === t.number)) return bad(`Já existe a mesa número ${t.number}.`);
   const label = t.label.trim();
   if (label.length < 1 || label.length > 50) return bad('Nome da mesa: de 1 a 50 letras.');
   const area = t.area.trim();
@@ -140,6 +141,16 @@ export function validateTable(t: TableDraft, tables: DiningTable[]): Check {
   if (!Number.isInteger(t.capacity) || t.capacity < 1 || t.capacity > 99) return bad('Lugares: de 1 a 99.');
   const current = tables.find((o) => o.id === t.id);
   if (current && !t.active && current.status !== 'FREE') return bad(`${current.label} está em uso. Só mesa livre pode ser desativada.`);
+  return okCheck;
+}
+
+/** Cartões de comanda criados de uma vez (faixa de números). */
+export const MAX_CARDS_PER_BATCH = 300;
+
+export function validateCardRange(from: number, to: number): Check {
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to > 9999) return bad('Números dos cartões: inteiros de 1 a 9999.');
+  if (to < from) return bad('O último número precisa ser maior ou igual ao primeiro.');
+  if (to - from + 1 > MAX_CARDS_PER_BATCH) return bad(`No máximo ${MAX_CARDS_PER_BATCH} cartões por vez.`);
   return okCheck;
 }
 
