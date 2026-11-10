@@ -3695,28 +3695,34 @@ export const useTcheStore = create<TcheState>()(
           const orderId = rejected.event.row_id;
           const order = get().orders.find((o) => o.id === orderId);
           if (!order) return fail('Conta não encontrada neste aparelho.');
-          const deltaCents = toCents(cloud) - toCents(Number(rejected.event.payload.discount_amount ?? order.discount_amount));
-          const recalculated = applyOrderTotals(
-            { ...order, discount_amount: Math.max(toCents(order.discount_amount) + deltaCents, 0) / 100 }, get().orderItems, get().payments);
-          if (toCents(recalculated.total_amount) < toCents(order.paid_amount)) {
-            return fail('Com o desconto da nuvem a conta fica abaixo do já pago neste aparelho. Chame o gerente para conferir os pagamentos.');
-          }
           // A conta recusada leva o desconto da nuvem. As mudanças seguintes dela (que
-          // esperavam a recusa) levam a mesma diferença sobre o desconto que cada uma tinha,
-          // limitada ao bruto daquele momento (um cancelamento depois pode ter limitado o
-          // desconto local; o banco limita o dele do mesmo jeito ao receber o cancelamento).
-          const rebase = (e: SyncEvent): SyncEvent => {
+          // esperavam a recusa) são refeitas em ordem, como o banco as aplica: cada uma leva
+          // a diferença que sobrou da anterior, limitada ao bruto daquele momento. Um
+          // cancelamento que limitou o desconto reduz a diferença levada às seguintes (o
+          // banco limita o dele do mesmo jeito ao receber o cancelamento).
+          let carryCents = toCents(cloud) - toCents(Number(rejected.event.payload.discount_amount ?? order.discount_amount));
+          const outbox = get().outbox.map((e): SyncEvent => {
             if (e.table !== 'orders' || e.row_id !== orderId || typeof e.payload.discount_amount !== 'number') return e;
             const p = e.payload as Partial<Order>;
-            let cents = Math.max(toCents(p.discount_amount!) + deltaCents, 0);
+            const own = toCents(p.discount_amount!);
+            let cents = Math.max(own + carryCents, 0);
             if (typeof p.subtotal_items === 'number' && typeof p.service_fee_amount === 'number') {
               cents = Math.min(cents, toCents(p.subtotal_items) + toCents(p.service_fee_amount));
             }
+            carryCents = cents - own;
             return { ...e, payload: { ...e.payload, discount_amount: cents / 100 } };
-          };
+          });
+          const localCents = Math.min(
+            Math.max(toCents(order.discount_amount) + carryCents, 0),
+            toCents(order.subtotal_items) + toCents(order.service_fee_amount),
+          );
+          const recalculated = applyOrderTotals({ ...order, discount_amount: localCents / 100 }, get().orderItems, get().payments);
+          if (toCents(recalculated.total_amount) < toCents(order.paid_amount)) {
+            return fail('Com o desconto da nuvem a conta fica abaixo do já pago neste aparelho. Chame o gerente para conferir os pagamentos.');
+          }
           set((s) => ({
             orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
-            outbox: [{ ...rejected.event, payload: { ...rejected.event.payload, discount_amount: cloud } }, ...s.outbox.map(rebase)],
+            outbox: [{ ...rejected.event, payload: { ...rejected.event.payload, discount_amount: cloud } }, ...outbox],
             syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
           }));
           return { ok: true, data: cloud };

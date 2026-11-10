@@ -835,8 +835,13 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     const prato = st().orderItems.find((i) => i.order_id === order!.id && i.product_id === productId)!;
     ok(st().cancelOrderItem(prato.id, MANAGER));
     expect(st().orders.find((o) => o.id === order!.id)!.discount_amount).toBe(3.3);
+    // Achado do Codex em cd47453: consumo novo depois do cancelamento (o desconto fica 3,30).
+    // A diferença que o cancelamento já absorveu não volta na versão seguinte da conta.
+    ok(st().addToTray({ order_id: order!.id, product_id: agua.id, half_product_ids: [], quantity: 2, unit_price: 3, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: agua.sector }));
+    ok(st().dispatchTray(order!.id));
+    expect(st().orders.find((o) => o.id === order!.id)!.discount_amount).toBe(3.3);
     expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
-    await expectSynced('conta com o desconto da nuvem e o cancelamento');
+    await expectSynced('conta com o desconto da nuvem, o cancelamento e o consumo novo');
     const local = st().orders.find((o) => o.id === order!.id)!;
     expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order!.id}'`)).toBe(`${local.discount_amount.toFixed(2)} ${local.total_amount.toFixed(2)}`);
     expect(local.discount_amount).toBe(3.3);
