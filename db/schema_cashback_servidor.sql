@@ -13,8 +13,12 @@
 --    (terça a quinta em Brasília, crédito liberado, teto de 50% do total, saldo da
 --    conta), com trava da conta e do cliente, idempotente pelo id do resgate. O valor é
 --    calculado pelo banco e precisa bater com o do aparelho, senão é recusado.
---  - Fila offline: o resgate vale pela hora do aparelho, limitada às últimas 24 horas
---    e nunca no futuro; resgate mais antigo que isso é recusado.
+--  - Dia permitido, saldo e hora do resgate pelo relógio do servidor; a hora do aparelho
+--    só fica registrada. Resgate feito sem internet que sobe fora de terça a quinta é
+--    recusado e fica em Nuvem › recusados.
+--  - Tudo filtrado pela loja da sessão, e o lançamento só aponta para cliente e conta da
+--    própria loja (chaves compostas).
+--  - Fila da versão anterior com o crédito já baixado: só com prova na nuvem (abaixo).
 -- =============================================================================
 
 -- O aparelho grava o crédito (EARN, conferido abaixo); resgate e expiração não.
@@ -63,12 +67,20 @@ $$;
 -- fixar a data (a regra de terça a quinta depende do dia).
 CREATE OR REPLACE FUNCTION tchefood_cashback_now() RETURNS TIMESTAMPTZ LANGUAGE sql STABLE AS $$ SELECT NOW() $$;
 
--- p_legacy_predebited: só a fila convertida de um aparelho da versão anterior manda TRUE.
--- Naquela versão o aparelho baixava o saldo dos créditos (UPDATE) ANTES de subir o
--- resgate; se a internet caiu no meio, parte do crédito já saiu da nuvem sem o REDEEM.
--- O servidor não confia na palavra do aparelho: mede essa baixa sem resgate do próprio
--- cliente (soma de amount - remaining dos EARN menos a soma dos REDEEM) e só ela entra
--- no cálculo, sem ser consumida de novo. Sem baixa pendente, o resgate segue a regra normal.
+-- Resgate da fila de um aparelho da versão anterior (p_legacy_predebited). Naquela versão
+-- a fila subia, nesta ordem: o audit_log CASHBACK_REDEEMED, a baixa dos créditos (UPDATE)
+-- e o REDEEM. Se a internet caiu no meio, parte do crédito já saiu da nuvem sem o REDEEM.
+-- A marca do aparelho sozinha não libera nada. O servidor só conta a baixa como já feita
+-- quando há prova na nuvem:
+--   - o audit_log daquele resgate (p_audit_id) gravado pela versão anterior, da mesma loja,
+--     conta, cliente e valor, e ainda sem REDEEM;
+--   - a baixa sem resgate do cliente (soma de amount - remaining dos EARN menos a soma dos
+--     REDEEM, só desta loja) pertence sem dúvida a esse resgate: ele é o único pendente do
+--     cliente, ou a baixa é exatamente a soma dos pendentes.
+-- Ambíguo (vários pendentes e uma baixa parcial): recusa; fica em Nuvem › recusados para
+-- o gerente conciliar. Sem prova: segue a regra normal, sem nada já baixado.
+-- O aparelho não grava mais CASHBACK_REDEEMED direto (tchefood_guard_audit_insert), então
+-- a prova só pode ser da versão anterior.
 CREATE OR REPLACE FUNCTION tchefood_register_cashback_redeem(
     p_redeem_id UUID, p_audit_id UUID, p_order_id UUID, p_customer_id UUID,
     p_amount NUMERIC, p_user_id UUID, p_created_at TIMESTAMPTZ, p_legacy_predebited BOOLEAN DEFAULT FALSE)
@@ -80,10 +92,12 @@ DECLARE
     v_order orders%ROWTYPE;
     v_customer loyalty_customers%ROWTYPE;
     v_audit audit_logs%ROWTYPE;
-    v_now TIMESTAMPTZ := tchefood_cashback_now();
-    v_at TIMESTAMPTZ;
+    -- Dia, saldo e hora do resgate: o relógio do servidor. A hora do aparelho
+    -- (p_created_at) pode ser forjada e só fica registrada no audit_log.
+    v_at TIMESTAMPTZ := tchefood_cashback_now();
     v_available NUMERIC(10,2); v_cap NUMERIC(10,2); v_amount NUMERIC(10,2); v_left NUMERIC(10,2); v_take NUMERIC(10,2);
     v_predebited NUMERIC(10,2) := 0; v_from_predebit NUMERIC(10,2) := 0;
+    v_orphan NUMERIC(10,2); v_pending_count INT; v_pending_sum NUMERIC(10,2); v_legacy BOOLEAN := FALSE;
     r RECORD;
 BEGIN
     IF v_tenant IS NULL THEN
@@ -120,36 +134,64 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: cliente inválido.';
     END IF;
-    IF EXISTS (SELECT 1 FROM cashback_ledger WHERE order_id = p_order_id AND entry_type = 'REDEEM') THEN
+    IF EXISTS (SELECT 1 FROM cashback_ledger WHERE tenant_id = v_tenant AND order_id = p_order_id AND entry_type = 'REDEEM') THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: esta conta já usou cashback.';
-    END IF;
-
-    -- Baixa da versão anterior ainda sem resgate (ver o comentário da função).
-    IF COALESCE(p_legacy_predebited, FALSE) THEN
-        SELECT GREATEST(
-                 COALESCE((SELECT SUM(amount - remaining_amount) FROM cashback_ledger WHERE customer_id = p_customer_id AND entry_type = 'EARN'), 0)
-               - COALESCE((SELECT SUM(amount) FROM cashback_ledger WHERE customer_id = p_customer_id AND entry_type = 'REDEEM'), 0), 0)
-          INTO v_predebited;
-    END IF;
-
-    -- Hora do resgate: a do aparelho (fila offline), nunca no futuro e no máximo 24 h atrás.
-    -- A fila da versão anterior com crédito já baixado pode ser mais velha (o aparelho
-    -- ficou sem atualizar): recusar deixaria o cliente sem o crédito que já saiu.
-    v_at := LEAST(COALESCE(p_created_at, v_now), v_now);
-    IF v_at < v_now - INTERVAL '24 hours' AND v_predebited <= 0 THEN
-        RAISE EXCEPTION 'TCHEFOOD_CASHBACK: resgate feito há mais de 24 horas não sobe; refaça na conta.';
     END IF;
     IF NOT tchefood_is_cashback_day(v_at) THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: cashback só pode ser usado de terça a quinta.';
     END IF;
 
-    v_available := tchefood_cashback_available(p_customer_id, v_at) + v_predebited;
+    -- Versão anterior: baixa já feita, só com prova (ver o comentário da função).
+    IF COALESCE(p_legacy_predebited, FALSE) AND EXISTS (
+        SELECT 1 FROM audit_logs a
+         WHERE a.id = p_audit_id AND a.tenant_id = v_tenant AND a.order_id = p_order_id
+           AND a.action_type = 'CASHBACK_REDEEMED' AND a.authorized_by_manager_id IS NULL
+           AND COALESCE(a.metadata->>'server_verified', '') <> 'true'
+           AND a.metadata->>'customer_id' = p_customer_id::text
+           AND jsonb_typeof(a.metadata->'amount') = 'number' AND (a.metadata->>'amount')::numeric = p_amount) THEN
+        v_legacy := TRUE;
+        SELECT GREATEST(
+                 COALESCE((SELECT SUM(amount - remaining_amount) FROM cashback_ledger
+                            WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type = 'EARN'), 0)
+               - COALESCE((SELECT SUM(amount) FROM cashback_ledger
+                            WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type = 'REDEEM'), 0), 0)
+          INTO v_orphan;
+        SELECT count(*), COALESCE(SUM(CASE WHEN jsonb_typeof(a.metadata->'amount') = 'number' THEN (a.metadata->>'amount')::numeric END), 0)
+          INTO v_pending_count, v_pending_sum
+          FROM audit_logs a
+         WHERE a.tenant_id = v_tenant AND a.action_type = 'CASHBACK_REDEEMED' AND a.authorized_by_manager_id IS NULL
+           AND COALESCE(a.metadata->>'server_verified', '') <> 'true'
+           AND a.metadata->>'customer_id' = p_customer_id::text
+           AND NOT EXISTS (SELECT 1 FROM cashback_ledger c WHERE c.tenant_id = v_tenant AND c.order_id = a.order_id AND c.entry_type = 'REDEEM');
+        IF v_orphan <= 0 THEN
+            v_predebited := 0;
+        ELSIF v_pending_count = 1 THEN
+            v_predebited := LEAST(v_orphan, p_amount);
+        ELSIF v_orphan = v_pending_sum THEN
+            v_predebited := p_amount;
+        ELSE
+            RAISE EXCEPTION 'TCHEFOOD_CASHBACK: resgate da versão anterior ambíguo (R$ % de crédito baixado para % resgates sem registro). O gerente precisa conciliar.', v_orphan, v_pending_count;
+        END IF;
+    END IF;
+
+    -- Saldo liberado agora, só desta loja.
+    SELECT COALESCE(SUM(remaining_amount), 0) INTO v_available FROM cashback_ledger
+     WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type = 'EARN'
+       AND valid_from <= v_at AND expires_at > v_at;
+    v_available := v_available + v_predebited;
     v_cap := round(v_order.total_amount * tchefood_cashback_max_usage_pct() / 100, 2);
     v_amount := LEAST(v_available, v_cap, v_order.remaining_balance);
     IF v_amount <= 0 THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: sem saldo disponível.';
     END IF;
-    IF p_amount IS DISTINCT FROM v_amount THEN
+    IF v_legacy THEN
+        -- O aparelho antigo calculou o valor com o saldo daquela hora: vale o dele, desde
+        -- que não passe do que o servidor permite agora.
+        IF p_amount IS NULL OR p_amount <= 0 OR p_amount > v_amount THEN
+            RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o servidor permite no máximo R$ % de cashback para esta conta, o aparelho mandou R$ %.', v_amount, p_amount;
+        END IF;
+        v_amount := p_amount;
+    ELSIF p_amount IS DISTINCT FROM v_amount THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o servidor calcula R$ % de cashback para esta conta, o aparelho mandou R$ %.', v_amount, p_amount;
     END IF;
 
@@ -157,7 +199,7 @@ BEGIN
     v_from_predebit := LEAST(v_predebited, v_amount);
     v_left := v_amount - v_from_predebit;
     FOR r IN SELECT id, remaining_amount FROM cashback_ledger
-              WHERE customer_id = p_customer_id AND entry_type = 'EARN' AND remaining_amount > 0
+              WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type = 'EARN' AND remaining_amount > 0
                 AND valid_from <= v_at AND expires_at > v_at
               ORDER BY expires_at, created_at FOR UPDATE LOOP
         EXIT WHEN v_left <= 0;
@@ -184,13 +226,50 @@ BEGIN
                 'Cashback de fidelidade resgatado', FALSE,
                 jsonb_build_object('customer_id', p_customer_id, 'phone', v_customer.phone_whatsapp, 'amount', v_amount,
                                    'discount_before', v_order.discount_amount, 'discount_after', v_order.discount_amount + v_amount,
-                                   'server_verified', TRUE, 'legacy_predebited', v_from_predebit),
+                                   'server_verified', TRUE, 'legacy_predebited', v_from_predebit, 'device_created_at', p_created_at),
                 v_at);
     END IF;
     UPDATE orders SET discount_amount = discount_amount + v_amount WHERE id = p_order_id;
     RETURN v_amount;
 END;
 $$;
+
+-- O audit_log do resgate só nasce na função acima: o aparelho não grava CASHBACK_REDEEMED
+-- direto (seria uma prova forjada de resgate da versão anterior). Mantém a trava de
+-- schema.sql (autorização de gerente só por tchefood_authorize_manager).
+CREATE OR REPLACE FUNCTION tchefood_guard_audit_insert()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.authorized_by_manager_id IS NOT NULL AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: autorização de gerente só pode ser registrada por tchefood_authorize_manager().';
+    END IF;
+    IF NEW.action_type = 'CASHBACK_REDEEMED' AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o registro do resgate só é gravado por tchefood_register_cashback_redeem.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+-- Crédito, resgate e expiração presos à loja: cliente e conta do lançamento são da mesma
+-- loja do lançamento. NOT VALID: vale para todo lançamento novo ou alterado; o que já
+-- existe não é reprovado (as consultas acima filtram pela loja de qualquer forma).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'loyalty_customers_tenant_id_id_key') THEN
+        ALTER TABLE loyalty_customers ADD CONSTRAINT loyalty_customers_tenant_id_id_key UNIQUE (tenant_id, id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_tenant_id_id_key') THEN
+        ALTER TABLE orders ADD CONSTRAINT orders_tenant_id_id_key UNIQUE (tenant_id, id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cashback_ledger_customer_same_tenant') THEN
+        ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_customer_same_tenant
+            FOREIGN KEY (tenant_id, customer_id) REFERENCES loyalty_customers (tenant_id, id) NOT VALID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cashback_ledger_order_same_tenant') THEN
+        ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_order_same_tenant
+            FOREIGN KEY (tenant_id, order_id) REFERENCES orders (tenant_id, id) NOT VALID;
+    END IF;
+END $$;
 
 DO $$
 BEGIN

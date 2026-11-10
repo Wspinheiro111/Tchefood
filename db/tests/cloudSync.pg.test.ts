@@ -287,8 +287,22 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
 
     // Valor diferente do que o banco calcula: recusado.
     expect((await redeem({ p_amount: expected + 1 })).body).toContain(`o servidor calcula R$ ${expected.toFixed(2)}`);
-    // Resgate de mais de 24 horas atrás: recusado.
-    expect((await redeem({ p_created_at: '2026-11-11T12:00:00-03:00' })).body).toContain('mais de 24 horas');
+    // P0-02 do GPT: o dia é o do servidor. Sexta 00h10 no servidor e o aparelho dizendo
+    // quinta 23h59: recusado, com ou sem a marca da versão anterior.
+    setCashbackClock('2026-11-13T00:10:00-03:00');
+    for (const legacy of [false, true]) {
+      const r = await redeem({ p_created_at: '2026-11-12T23:59:00-03:00', p_legacy_predebited: legacy });
+      expect(r.status, r.body).toBe(400);
+      expect(r.body).toContain('terça a quinta');
+    }
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    // O aparelho não grava o registro do resgate direto (seria prova forjada da versão anterior).
+    const fakeAudit = await raw('POST', 'audit_logs', {
+      id: crypto.randomUUID(), tenant_id: TENANT, order_id: order.id, performed_by_user_id: cashier, action_type: 'CASHBACK_REDEEMED',
+      amount_impact: -expected, reason: 'Cashback de fidelidade resgatado', metadata: { customer_id: customer, amount: expected, discount_before: 0, discount_after: expected },
+    });
+    expect(fakeAudit.status).toBe(400);
+    expect(fakeAudit.body).toContain('só é gravado por tchefood_register_cashback_redeem');
     // Segunda-feira (pelo relógio do servidor): recusado.
     setCashbackClock('2026-11-16T20:00:00-03:00');
     expect((await redeem({ p_created_at: null })).body).toContain('terça a quinta');
@@ -315,45 +329,140 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     setCashbackClock(null);
   });
 
-  it('fila da versão anterior com a baixa do crédito já na nuvem: o servidor mede a baixa e não consome de novo', async () => {
-    const mesa = st().tables.find((t) => t.number === 1)!;
+  /** Abre contas novas (mesas 11 em diante) com dois itens, para os testes de cashback. */
+  async function cashbackOrders(n: number, first: number) {
+    login(OWNER_PIN);
+    for (let i = 0; i < n; i++) ok(st().saveTable({ number: first + i, label: `Mesa ${first + i}`, area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('mesas do cashback');
+    login(CASHIER_PIN);
     const p = st().products.find((x) => x.id === productId)!;
-    const customer = sql(`SELECT id FROM loyalty_customers WHERE tenant_id = '${TENANT}' LIMIT 1`);
+    const orders = Array.from({ length: n }, (_, i) => {
+      const mesa = st().tables.find((t) => t.number === first + i)!;
+      const order = ok(st().openTable(mesa.id, 1, null));
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 2, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      return order;
+    });
+    await expectSynced('contas do cashback');
+    return orders.map((o) => ({ id: o.id, cap: Math.round(Number(sql(`SELECT total_amount FROM orders WHERE id = '${o.id}'`)) * 50) / 100 }));
+  }
+  function closeCashbackOrders(ids: string[]) {
+    useTcheStore.setState({
+      orders: st().orders.filter((o) => !ids.includes(o.id)),
+      tables: st().tables.map((t) => (t.current_order_id && ids.includes(t.current_order_id) ? { ...t, status: 'FREE' as const, current_order_id: null } : t)),
+    });
+    const list = ids.map((x) => `'${x}'`).join(',');
+    sql(`SET session_replication_role = replica; UPDATE orders SET status = 'CANCELED' WHERE id IN (${list}); UPDATE dining_tables SET status = 'FREE', current_order_id = NULL WHERE current_order_id IN (${list});`);
+  }
+  /** Cliente novo da loja com créditos liberados (como se viessem de contas fechadas). */
+  function cashbackCustomer(phone: string, credits: { amount: number; remaining?: number; expires: string }[], tenant = TENANT) {
+    const id = crypto.randomUUID();
+    sql(`INSERT INTO loyalty_customers (id, tenant_id, phone_whatsapp, name) VALUES ('${id}', '${tenant}', '${phone}', 'Cliente ${phone}');`);
+    const earns = credits.map((c) => {
+      const earn = crypto.randomUUID();
+      sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (id, tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+           VALUES ('${earn}', '${tenant}', '${id}', 'EARN', ${c.amount}, ${c.remaining ?? c.amount}, '2026-11-01', '${c.expires}');`);
+      return earn;
+    });
+    return { id, earns };
+  }
+  /** O que a versão anterior deixava na nuvem quando a internet caía no meio do resgate: o registro do resgate (sem REDEEM). */
+  function legacyAudit(orderId: string, customerId: string, amount: number) {
+    const id = crypto.randomUUID();
     const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    sql(`INSERT INTO audit_logs (id, tenant_id, order_id, performed_by_user_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${id}', '${TENANT}', '${orderId}', '${cashier}', 'CASHBACK_REDEEMED', ${-amount}, 'Cashback de fidelidade resgatado',
+                 '{"customer_id": "${customerId}", "amount": ${amount}, "discount_before": 0, "discount_after": ${amount}}');`);
+    return id;
+  }
+  const remainingOf = (earn: string) => Number(sql(`SELECT remaining_amount FROM cashback_ledger WHERE id = '${earn}'`));
+  const debit = (earn: string, v: number) => sql(`SET session_replication_role = replica; UPDATE cashback_ledger SET remaining_amount = remaining_amount - ${v} WHERE id = '${earn}';`);
+  const cashbackRpc = (orderId: string, customerId: string, amount: number, args: Record<string, unknown> = {}) => raw('POST', 'rpc/tchefood_register_cashback_redeem', {
+    p_redeem_id: crypto.randomUUID(), p_audit_id: crypto.randomUUID(), p_order_id: orderId, p_customer_id: customerId, p_amount: amount,
+    p_user_id: sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`), p_created_at: '2026-11-12T19:00:00-03:00', ...args,
+  });
+
+  it('cashback entre lojas: crédito de outra loja não conta nem baixa, e lançamento cruzado novo é recusado', async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
     setCashbackClock('2026-11-12T20:00:00-03:00');
-    login(CASHIER_PIN);
-    const order = ok(st().openTable(mesa.id, 1, null));
-    ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 2, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
-    ok(st().dispatchTray(order.id));
-    await expectSynced('conta aberta');
-    const remaining = () => Number(sql(`SELECT COALESCE(SUM(remaining_amount), 0) FROM cashback_ledger WHERE customer_id = '${customer}' AND entry_type = 'EARN' AND expires_at > '2026-11-12T20:00:00-03:00' AND valid_from <= '2026-11-12T20:00:00-03:00'`));
-    // Crédito novo liberado (gravado pelo servidor, como se viesse de uma conta fechada).
-    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
-         VALUES ('${TENANT}', '${customer}', 'EARN', 20, 20, '2026-11-01', '2026-12-31');`);
-    const before = remaining();
-    expect(before).toBeGreaterThan(2);
-    const total = Number(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`));
-    const expected = Math.min(before, Math.round(total * 50) / 100);
-    const redeem = (args: Record<string, unknown>) => raw('POST', 'rpc/tchefood_register_cashback_redeem', {
-      p_redeem_id: 'cccccccc-0000-4000-8000-000000000001', p_audit_id: 'cccccccc-0000-4000-8000-000000000002', p_order_id: order.id,
-      p_customer_id: customer, p_amount: expected, p_user_id: cashier, p_created_at: '2026-11-10T20:00:00-03:00', p_legacy_predebited: true, ...args,
-    });
-    // Sem baixa pendente na nuvem, a marca da fila antiga não muda nada: o resgate de 2 dias atrás é recusado.
-    expect((await redeem({})).body).toContain('mais de 24 horas');
-    // A versão anterior baixou R$ 2,00 de um crédito e caiu antes de subir o resgate.
-    const earn = sql(`SELECT id FROM cashback_ledger WHERE customer_id = '${customer}' AND entry_type = 'EARN' AND remaining_amount >= 2 ORDER BY expires_at LIMIT 1`);
-    sql(`SET session_replication_role = replica; UPDATE cashback_ledger SET remaining_amount = remaining_amount - 2 WHERE id = '${earn}';`);
-    expect(remaining()).toBe(Math.round((before - 2) * 100) / 100);
-    // A fila convertida sobe: o valor é o mesmo que o aparelho calculou com o crédito inteiro,
-    // e só a diferença sai dos créditos (os R$ 2,00 já tinham saído).
-    const res = await redeem({});
+    const [order, other] = await cashbackOrders(2, 11);
+    const amount = Math.min(5, order!.cap);
+    const customer = cashbackCustomer('5553988110001', [{ amount, expires: '2026-12-31' }]);
+    // Outra loja com um crédito de R$ 30 que aponta (de propósito) para o cliente desta loja.
+    const TENANT_B = '33333333-3333-4333-8333-333333333333';
+    const cross = crypto.randomUUID();
+    sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT_B}', 'Outra loja', 'Outra loja Ltda', '33444555000181');
+         SET session_replication_role = replica;
+         INSERT INTO cashback_ledger (id, tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         VALUES ('${cross}', '${TENANT_B}', '${customer.id}', 'EARN', 30, 30, '2026-11-01', '2026-12-31');`);
+    // O servidor só conta o crédito desta loja: pedir mais que ele é recusado, e o da outra loja não baixa.
+    const greedy = await cashbackRpc(order!.id, customer.id, Math.min(amount + 30, order!.cap));
+    if (order!.cap > amount) expect(greedy.body).toContain(`o servidor calcula R$ ${amount.toFixed(2)}`);
+    expect(remainingOf(cross)).toBe(30);
+    const res = await cashbackRpc(order!.id, customer.id, amount);
     expect(res.status, res.body).toBe(200);
-    expect(Number(res.body)).toBe(expected);
-    expect(remaining()).toBe(Math.round((before - expected) * 100) / 100);
-    expect(sql(`SELECT metadata->>'legacy_predebited' FROM audit_logs WHERE id = 'cccccccc-0000-4000-8000-000000000002'`)).toBe('2.00');
-    useTcheStore.setState({ orders: st().orders.filter((o) => o.id !== order.id), tables: st().tables.map((t) => (t.id === mesa.id ? { ...t, status: 'FREE' as const, current_order_id: null } : t)) });
-    sql(`SET session_replication_role = replica; UPDATE orders SET status = 'CANCELED' WHERE id = '${order.id}'; UPDATE dining_tables SET status = 'FREE', current_order_id = NULL WHERE id = '${mesa.id}';`);
+    expect(remainingOf(customer.earns[0]!)).toBe(0);
+    expect(remainingOf(cross)).toBe(30);
+    // Lançamento novo com cliente ou conta de outra loja: recusado pelas chaves compostas.
+    expect(() => sql(`INSERT INTO cashback_ledger (tenant_id, customer_id, entry_type, amount)
+                      VALUES ('${TENANT_B}', '${customer.id}', 'REDEEM', 1);`)).toThrow(/cashback_ledger_customer_same_tenant/);
+    const customerB = crypto.randomUUID();
+    sql(`INSERT INTO loyalty_customers (id, tenant_id, phone_whatsapp, name) VALUES ('${customerB}', '${TENANT_B}', '5553988110009', 'Cliente B');`);
+    expect(() => sql(`INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount)
+                      VALUES ('${TENANT_B}', '${customerB}', '${other!.id}', 'REDEEM', 1);`)).toThrow(/cashback_ledger_order_same_tenant/);
+    closeCashbackOrders([order!.id, other!.id]);
+    setCashbackClock(null);
+  });
+
+  it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [a, b, a1, a2] = await cashbackOrders(4, 21);
+    for (const o of [a, b, a1, a2]) expect(o!.cap).toBeGreaterThanOrEqual(5);
+
+    // P0-03 do GPT: a conta A da versão anterior baixou R$ 5 (todo o crédito) e caiu antes do REDEEM.
+    const c = cashbackCustomer('5553988110002', [{ amount: 5, expires: '2026-12-31' }]);
+    const auditA = legacyAudit(a!.id, c.id, 5);
+    debit(c.earns[0]!, 5);
+    // Outra conta (B) com a marca da versão anterior e sem prova: a baixa de A não vale para ela.
+    const stolen = await cashbackRpc(b!.id, c.id, 5, { p_legacy_predebited: true });
+    expect(stolen.status).toBe(400);
+    expect(stolen.body).toContain('sem saldo');
+    // Mesmo com o registro de A como prova, mas na conta B: não confere.
+    expect((await cashbackRpc(b!.id, c.id, 5, { p_legacy_predebited: true, p_audit_id: auditA })).status).toBe(400);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${b!.id}'`)).toBe('0');
+    // A sem a marca: segue a regra normal e não tem saldo.
+    expect((await cashbackRpc(a!.id, c.id, 5, { p_audit_id: auditA })).body).toContain('sem saldo');
+    // Crédito novo do cliente: a recuperação de A não pode consumi-lo.
+    const earn2 = crypto.randomUUID();
+    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (id, tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         VALUES ('${earn2}', '${TENANT}', '${c.id}', 'EARN', 5, 5, '2026-11-01', '2027-01-31');`);
+    // A com a marca e a prova: o resgate entra com a baixa que já tinha saído.
+    const recovered = await cashbackRpc(a!.id, c.id, 5, { p_legacy_predebited: true, p_audit_id: auditA });
+    expect(recovered.status, recovered.body).toBe(200);
+    expect(Number(recovered.body)).toBe(5);
+    expect(remainingOf(earn2)).toBe(5);
+    expect(remainingOf(c.earns[0]!)).toBe(0);
+
+    // Duas contas da versão anterior com baixa parcial (créditos com validades diferentes):
+    // R$ 5 baixados para resgates de R$ 4 e R$ 3. Não dá para saber de quem é: recusa as duas.
+    const d = cashbackCustomer('5553988110004', [{ amount: 10, expires: '2026-11-20' }, { amount: 10, expires: '2026-12-31' }]);
+    const audit1 = legacyAudit(a1!.id, d.id, 4);
+    const audit2 = legacyAudit(a2!.id, d.id, 3);
+    debit(d.earns[0]!, 5);
+    for (const [o, audit, v] of [[a1!, audit1, 4], [a2!, audit2, 3]] as const) {
+      const r = await cashbackRpc(o.id, d.id, v, { p_legacy_predebited: true, p_audit_id: audit });
+      expect(r.status).toBe(400);
+      expect(r.body).toContain('ambíguo');
+    }
+    expect(remainingOf(d.earns[0]!) + remainingOf(d.earns[1]!)).toBe(15);
+    // O resto das baixas sobe (R$ 7, a soma dos dois): sem ambiguidade, cada um entra com o seu valor e nada é consumido de novo.
+    debit(d.earns[0]!, 2);
+    expect((await cashbackRpc(a1!.id, d.id, 4, { p_legacy_predebited: true, p_audit_id: audit1 })).status).toBe(200);
+    expect((await cashbackRpc(a2!.id, d.id, 3, { p_legacy_predebited: true, p_audit_id: audit2 })).status).toBe(200);
+    expect(remainingOf(d.earns[0]!) + remainingOf(d.earns[1]!)).toBe(13);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE entry_type = 'REDEEM' AND order_id IN ('${a!.id}', '${a1!.id}', '${a2!.id}')`)).toBe('3');
+    closeCashbackOrders([a!.id, b!.id, a1!.id, a2!.id]);
     setCashbackClock(null);
   });
 

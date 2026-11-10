@@ -4167,8 +4167,9 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
  * (tchefood_register_cashback_redeem), que faz as três no banco. O REDEEM ganha o id do
  * audit_log do resgate; o audit_log e as baixas ainda na fila saem dela (o banco recusaria
  * a baixa direta). Se o audit_log já tinha subido, a função usa o que está gravado; se
- * parte das baixas já tinha subido, a função mede o crédito já baixado sem resgate e não
- * o consome de novo (legacy_predebited).
+ * parte das baixas já tinha subido, a função só conta esse crédito como já baixado com a
+ * prova na nuvem (o audit_log deste resgate, desta conta, cliente e valor) e sem dúvida de
+ * a qual resgate ele pertence; senão recusa e o gerente concilia (legacy_predebited).
  */
 export function migrateCashbackRedeemQueue(events: SyncEvent[], auditLogs: AuditLog[]): SyncEvent[] {
   const redeems = events.filter((e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.entry_type === 'REDEEM' && !e.cashback_redeem);
