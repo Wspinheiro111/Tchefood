@@ -61,6 +61,7 @@ import type {
   RejectedSyncEvent,
 } from '../types';
 import { applyOrderTotals, computeItemTotal, formatBRL, halfAndHalfPrice, round2, round3, toCents } from '../lib/money';
+import { cloudDiscountOf } from '../lib/sync/cloudDiscount';
 import {
   effectivePrice,
   validateCategory,
@@ -101,6 +102,7 @@ import {
   balanceCashback,
   CASHBACK_DAYS_LABEL,
   CASHBACK_PCT,
+  CASHBACK_VALIDITY_DAYS,
   cashbackBase,
   cashbackEarnAmount,
   cashbackUsable,
@@ -504,6 +506,11 @@ interface Actions {
    * pronto para Reenviar recusados (o servidor confere outra vez, com o bloqueio).
    */
   confirmRejectedAuthorization: (eventId: UUID, managerPin: string) => ActionResult;
+  /**
+   * Conta recusada pela nuvem porque o desconto dela lá é outro (outro aparelho ou o
+   * cashback mudou a conta): adota o desconto da nuvem neste aparelho e reenvia a conta.
+   */
+  adoptCloudDiscount: (eventId: UUID) => ActionResult<number>;
 
   // Caixa
   /** Abre o caixa com o fundo de troco. Um caixa aberto por loja. */
@@ -868,6 +875,11 @@ export const useTcheStore = create<TcheState>()(
         get().pendingCharges.find((c) => c.order_id === orderId && Date.now() - c.started_at < PENDING_CHARGE_TTL_MS) ?? null;
 
       const CHARGE_LOCK_ERROR = 'Há uma cobrança em andamento na maquininha para esta mesa. Aguarde a resposta.';
+
+      /** A nuvem recusou a conta por ter outro desconto lá (outro aparelho ou o cashback). */
+      const cloudDiscountConflict = (orderId: UUID): boolean =>
+        (get().syncRejected ?? []).some((r) => r.event.table === 'orders' && r.event.row_id === orderId && cloudDiscountOf(r.message) !== null);
+      const CLOUD_DISCOUNT_CONFLICT = 'A nuvem tem outro desconto para esta conta (outro aparelho ou o cashback mudou). Em Retaguarda › Nuvem, use o desconto da nuvem antes de cobrar.';
 
       /**
        * Encerra a conta quando o saldo chega a zero com algo já pago: CLOSED,
@@ -1429,6 +1441,17 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Cancelamento deixaria a conta abaixo do valor já pago. Estorne um pagamento primeiro.');
           }
+          // Conta com cashback: se o cancelamento deixa o desconto abaixo do cashback usado,
+          // a diferença volta para o cliente (REFUND). Quem grava na nuvem é o banco, no
+          // cancelamento do item (tchefood_orders_cashback_refund), pela mesma conta; aqui
+          // fica o espelho local, que não sobe.
+          const redeem = get().cashbackLedger.find((e) => e.order_id === order.id && e.entry_type === 'REDEEM');
+          const netRedeemed = redeem
+            ? toCents(redeem.amount) - get().cashbackLedger
+              .filter((e) => e.order_id === order.id && e.entry_type === 'REFUND')
+              .reduce((sum, e) => sum + toCents(e.amount), 0)
+            : 0;
+          const refundCents = netRedeemed - toCents(simulated.discount_amount);
           const trayBlock = blocksSettleWithTray(simulated);
           if (trayBlock) return fail(trayBlock);
 
@@ -1484,6 +1507,46 @@ export const useTcheStore = create<TcheState>()(
             });
           });
 
+          const refund: CashbackLedgerEntry | null = redeem && refundCents > 0
+            ? {
+              id: uuid(),
+              tenant_id: order.tenant_id,
+              customer_id: redeem.customer_id,
+              order_id: order.id,
+              entry_type: 'REFUND',
+              amount: fromCentsLocal(refundCents),
+              remaining_amount: fromCentsLocal(refundCents),
+              base_amount: null,
+              pct: null,
+              valid_from: ts,
+              expires_at: new Date(new Date(ts).getTime() + CASHBACK_VALIDITY_DAYS * 86_400_000).toISOString(),
+              created_by_user_id: user.id,
+              created_at: ts,
+            }
+            : null;
+          const refundLog: AuditLog | null = refund
+            ? {
+              ...buildAudit({
+                order_id: order.id,
+                performed_by_user_id: user.id,
+                authorized_by_manager_id: null,
+                action_type: 'CASHBACK_REFUNDED',
+                amount_impact: refund.amount,
+                reason: 'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)',
+                metadata: {
+                  table: tableLabel(order.table_id),
+                  customer_id: refund.customer_id,
+                  amount: refund.amount,
+                  redeem_id: redeem!.id,
+                  discount_before: order.discount_amount,
+                  discount_after: simulated.discount_amount,
+                  item_cancel_audit_id: log.id,
+                },
+              }),
+              whatsapp_alert_sent: false,
+            }
+            : null;
+
           set((s) => {
             const orderItems = s.orderItems.map((i) => canceledById.get(i.id) ?? i);
             const current = s.orders.find((o) => o.id === order.id)!;
@@ -1494,8 +1557,16 @@ export const useTcheStore = create<TcheState>()(
               if (before) kegTaps = applyKegCancel(kegTaps, s.kegTapProducts, before);
             }
             const patch = commitAdjustment(s, recalculated, orderItems, [...canceledById.values()], [log, ...partLogs], auth.managerPin);
+            // Estorno: só local (o banco grava o dele ao receber o cancelamento).
+            const cashbackLedger = refund ? [...s.cashbackLedger, refund] : s.cashbackLedger;
+            const loyaltyCustomers = refund
+              ? s.loyaltyCustomers.map((c) => (c.id === refund.customer_id ? { ...c, cashback_balance: balanceCashback(cashbackLedger, c.id, new Date(ts)) } : c))
+              : s.loyaltyCustomers;
             return {
               ...patch,
+              ...(refundLog ? { auditLogs: [refundLog, ...patch.auditLogs!] } : {}),
+              cashbackLedger,
+              loyaltyCustomers,
               kegTaps,
               outbox: [...patch.outbox!, ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k))],
             };
@@ -1619,6 +1690,7 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(orderId);
           if (!res.ok) return res;
           const order = res.data;
+          if (cloudDiscountConflict(orderId)) return fail(CLOUD_DISCOUNT_CONFLICT);
           if (get().tray.some((t) => t.order_id === orderId)) {
             return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
           }
@@ -1640,6 +1712,7 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(input.orderId);
           if (!res.ok) return res;
           const order = res.data;
+          if (input.status === 'APPROVED' && !input.charge_request_id && cloudDiscountConflict(order.id)) return fail(CLOUD_DISCOUNT_CONFLICT);
           if (input.status === 'APPROVED' && get().tray.some((t) => t.order_id === order.id)) {
             return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
           }
@@ -3566,6 +3639,32 @@ export const useTcheStore = create<TcheState>()(
             ),
           }));
           return { ok: true, data: undefined };
+        },
+
+        adoptCloudDiscount: (eventId) => {
+          const rejected = (get().syncRejected ?? []).find((r) => r.event.id === eventId);
+          if (!rejected || rejected.event.table !== 'orders') return fail('Conta recusada não encontrada.');
+          const cloud = cloudDiscountOf(rejected.message);
+          if (cloud === null) return fail('Esta recusa não é de desconto diferente na nuvem.');
+          const orderId = rejected.event.row_id;
+          const order = get().orders.find((o) => o.id === orderId);
+          if (!order) return fail('Conta não encontrada neste aparelho.');
+          const recalculated = applyOrderTotals({ ...order, discount_amount: cloud }, get().orderItems, get().payments);
+          if (toCents(recalculated.total_amount) < toCents(order.paid_amount)) {
+            return fail('Com o desconto da nuvem a conta fica abaixo do já pago neste aparelho. Chame o gerente para conferir os pagamentos.');
+          }
+          const fix = (e: SyncEvent): SyncEvent =>
+            e.table === 'orders' && e.row_id === orderId && 'discount_amount' in e.payload
+              ? { ...e, payload: { ...e.payload, discount_amount: cloud } }
+              : e;
+          set((s) => ({
+            orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
+            // A conta volta à frente da fila com o desconto da nuvem; as mudanças seguintes
+            // dela (que esperavam a recusa) também levam o valor certo.
+            outbox: [fix(rejected.event), ...s.outbox.map(fix)],
+            syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
+          }));
+          return { ok: true, data: cloud };
         },
 
         openCashSession: (openingFloat) => {

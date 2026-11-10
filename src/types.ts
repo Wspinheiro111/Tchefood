@@ -427,6 +427,7 @@ export type AuditActionType =
   | 'MANAGER_PIN_LOCKOUT'
   | 'KEG_CHANGED'
   | 'CASHBACK_REDEEMED'
+  | 'CASHBACK_REFUNDED'
   | 'KIOSK_EXIT'
   | 'CHARGE_CONFIRMED_MANUALLY'
   // Etapa 0 — cadastros
@@ -542,7 +543,8 @@ export interface LoyaltyCustomer {
   created_at: ISODateTime;
 }
 
-export type CashbackEntryType = 'EARN' | 'REDEEM' | 'EXPIRE';
+/** REFUND: cashback devolvido ao cliente quando um cancelamento deixa o desconto abaixo do resgate (crédito como o EARN). */
+export type CashbackEntryType = 'EARN' | 'REDEEM' | 'EXPIRE' | 'REFUND';
 
 export interface CashbackLedgerEntry {
   id: UUID;

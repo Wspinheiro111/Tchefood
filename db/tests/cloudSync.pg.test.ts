@@ -430,9 +430,13 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
          UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
     const gross = sql(`SELECT subtotal_items + service_fee_amount FROM orders WHERE id = '${order!.id}'`);
     // A fila deste aparelho sobe a atualização da conta com o desconto antigo, e depois a
-    // conta indo para pagamento (também com o valor antigo): o desconto continua R$ 7.
-    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5 })).status).toBeLessThan(300);
-    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5, status: 'PAYING' })).status).toBeLessThan(300);
+    // conta indo para pagamento (também com o valor antigo): as duas são recusadas como
+    // conflito (rodada 5: o aparelho fica sabendo antes de cobrar) e o desconto continua R$ 7.
+    const stale = await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5 });
+    expect(stale.status).toBe(400);
+    expect(stale.body).toContain('TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ 7.00 e este aparelho mandou R$ 5.00');
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5, status: 'PAYING' })).status).toBe(400);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 7, status: 'PAYING' })).status).toBeLessThan(300);
     expect(sql(`SELECT discount_amount || ' ' || status FROM orders WHERE id = '${order!.id}'`)).toBe('7.00 PAYING');
     expect(sql(`SELECT total_amount = ${gross} - 7 FROM orders WHERE id = '${order!.id}'`)).toBe('t');
     expect(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${order!.id}' AND entry_type = 'REDEEM'`)).toBe('5.00');
@@ -461,17 +465,30 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     ok(st().applyDiscount(order!.id, 5, MANAGER));
     await expectSynced('troca para R$ 5');
     expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('5.00');
-    // Atualização antiga da fila (sem autorização dessa troca): o desconto fica.
-    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 3 })).status).toBeLessThan(300);
+    // Atualização antiga da fila (sem autorização dessa troca): recusada, o desconto fica.
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 3 })).status).toBe(400);
     expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('5.00');
     // Reenvio da troca já feita (R$ 10 → R$ 5) depois de outra autorização (R$ 5 → R$ 8): não vale.
     const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
     sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
          VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -3, 'Outro aparelho', '{"discount_before": 5, "discount_after": 8}');
          UPDATE orders SET discount_amount = 8 WHERE id = '${order!.id}';`);
-    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5 })).status).toBeLessThan(300);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5 })).status).toBe(400);
     expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('8.00');
     sql(`UPDATE orders SET discount_amount = 5 WHERE id = '${order!.id}';`);
+    // P2-01 da rodada 4: duas trocas na mesma transação têm o mesmo created_at; a última é a
+    // da sequência do servidor (R$ 5 → R$ 4), não a de UUID maior (R$ 5 → R$ 3).
+    sql(`BEGIN;
+         INSERT INTO audit_logs (id, tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('ffffffff-ffff-4fff-bfff-ffffffffffff', '${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', 2, 'Primeira troca', '{"discount_before": 5, "discount_after": 3}');
+         INSERT INTO audit_logs (id, tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('00000000-0000-4000-8000-000000000001', '${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', 1, 'Segunda troca', '{"discount_before": 5, "discount_after": 4}');
+         COMMIT;`);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 3 })).status).toBe(400);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 4 })).status).toBeLessThan(300);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -1, 'Volta', '{"discount_before": 4, "discount_after": 5}');
+         UPDATE orders SET discount_amount = 5 WHERE id = '${order!.id}';`);
     // O pagamento do valor que o aparelho calcula (com R$ 5 de desconto) entra e fecha a conta.
     payCash(order!.id);
     await expectSynced('pagamento com o desconto trocado');
@@ -484,7 +501,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await cashbackRpc(withCashback!.id, c.id, 5)).status).toBe(200);
     sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
          VALUES ('${TENANT}', '${withCashback!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', 2, 'Troca', '{"discount_before": 5, "discount_after": 3}');`);
-    expect((await raw('PATCH', `orders?id=eq.${withCashback!.id}`, { discount_amount: 3 })).status).toBeLessThan(300);
+    expect((await raw('PATCH', `orders?id=eq.${withCashback!.id}`, { discount_amount: 3 })).status).toBe(400);
     expect(sql(`SELECT discount_amount FROM orders WHERE id = '${withCashback!.id}'`)).toBe('5.00');
     closeCashbackOrders([withCashback!.id]);
     setCashbackClock(null);
@@ -513,6 +530,122 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     payCash(order!.id);
     await expectSynced('pagamento depois do cancelamento');
     expect(sql(`SELECT status FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED');
+  });
+
+  it('conta com cashback: cancelamento que deixa o desconto abaixo do cashback usado devolve a diferença ao cliente', async () => {
+    // P0-01 da rodada 4 (decisão do Will: "devolva"): R$ 50 de cashback numa conta de R$ 100;
+    // o cancelamento leva o bruto a R$ 30, o recálculo limita o desconto a R$ 30 e os R$ 20
+    // que sobram voltam ao cliente (REFUND + CASHBACK_REFUNDED), uma vez só, mesmo com o
+    // reenvio da fila depois de a internet cair antes da confirmação.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(OWNER_PIN);
+    const product = (code: string, name: string, price: number) => ok(st().saveProduct({
+      category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    const picanha = product('451', 'Picanha', 70);
+    const salada = product('452', 'Salada', 30);
+    ok(st().saveTable({ number: 45, label: 'Mesa 45', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('produtos e mesa');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 45)!.id, 1, null));
+    for (const p of [picanha, salada]) {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    }
+    ok(st().dispatchTray(order.id));
+    ok(st().removeServiceFee(order.id, MANAGER));
+    await expectSynced('conta de R$ 100');
+    // Cliente com R$ 60 liberados, na nuvem e no aparelho.
+    const phone = '5553988110008';
+    const c = cashbackCustomer(phone, [{ amount: 60, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 60, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 60, remaining_amount: 60 }],
+    });
+    expect(ok(st().redeemCashback(order.id, phone)).amount).toBe(50);
+    await expectSynced('resgate de R$ 50');
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe('50.00 50.00');
+
+    const item = st().orderItems.find((i) => i.order_id === order.id && i.product_id === picanha.id)!;
+    ok(st().cancelOrderItem(item.id, MANAGER));
+    const pending = [...st().outbox];
+    await expectSynced('cancelamento da picanha');
+    // Internet caiu antes da confirmação: a fila sobe de novo os mesmos eventos.
+    const cloud = st().cloud!;
+    const resend = await flushOutbox(pending, { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000);
+    expect(resend.rejected).toEqual([]);
+
+    const local = st().orders.find((o) => o.id === order.id)!;
+    expect([local.discount_amount, local.total_amount]).toEqual([30, 0]);
+    expect(sql(`SELECT discount_amount || ' ' || total_amount || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`)).toBe('30.00 0.00 0.00');
+    // Um estorno só, de R$ 20, crédito novo liberado; o EARN original não muda (R$ 10 de 60).
+    expect(sql(`SELECT count(*) || ' ' || sum(amount) || ' ' || sum(remaining_amount) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND'`)).toBe('1 20.00 20.00');
+    expect(sql(`SELECT amount || ' ' || remaining_amount FROM cashback_ledger WHERE id = '${c.earns[0]}'`)).toBe('60.00 10.00');
+    expect(sql(`SELECT count(*) || ' ' || sum(amount_impact) || ' ' || bool_and((metadata->>'server_verified')::boolean) FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'CASHBACK_REFUNDED'`)).toBe('1 20.00 true');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('30.00');
+    // O aparelho chega ao mesmo extrato sem baixar nada da nuvem.
+    const localRefunds = st().cashbackLedger.filter((e) => e.order_id === order.id && e.entry_type === 'REFUND');
+    expect(localRefunds.map((e) => e.amount)).toEqual([20]);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(30);
+
+    // O aparelho não grava estorno nem o registro dele.
+    const user = st().currentUserId;
+    expect((await raw('POST', 'cashback_ledger', {
+      id: crypto.randomUUID(), tenant_id: TENANT, customer_id: c.id, order_id: order.id, entry_type: 'REFUND', amount: 5, remaining_amount: 5,
+      valid_from: '2026-11-12T20:00:00-03:00', expires_at: '2026-12-12T20:00:00-03:00', created_by_user_id: user,
+    })).status).toBe(400);
+    expect((await raw('POST', 'audit_logs', {
+      id: crypto.randomUUID(), tenant_id: TENANT, order_id: order.id, performed_by_user_id: user, action_type: 'CASHBACK_REFUNDED',
+      amount_impact: 5, reason: 'forjado', whatsapp_alert_sent: false, metadata: {},
+    })).status).toBe(400);
+
+    // O crédito devolvido vale como o ganho: entra no próximo resgate (pelo FIFO do servidor).
+    const [next] = await cashbackOrders(1, 46);
+    const cap = next!.cap;
+    expect((await cashbackRpc(next!.id, c.id, Math.min(30, cap))).status).toBe(200);
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe((30 - Math.min(30, cap)).toFixed(2));
+    closeCashbackOrders([next!.id, ...(local.status === 'CLOSED' ? [] : [order.id])]);
+    setCashbackClock(null);
+  });
+
+  it('dois aparelhos: desconto antigo da fila vira conflito, o aparelho não cobra e adota o desconto da nuvem', async () => {
+    // P1-01 da rodada 4: antes o banco ignorava a atualização antiga em silêncio e o aparelho
+    // cobrava com o desconto velho (pagamento recusado depois).
+    const [order] = await cashbackOrders(1, 47);
+    login(CASHIER_PIN);
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    await expectSynced('desconto de R$ 5');
+    // Outro aparelho: desconto autorizado R$ 5 → R$ 7.
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    // Este aparelho vai para o pagamento com o desconto antigo: a conta sobe e é recusada.
+    ok(st().startCheckout(order!.id));
+    const rejected = await sync();
+    expect(rejected).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 7.00');
+    // Antes de cobrar o aparelho sabe do conflito e não registra o pagamento.
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    const blocked = st().registerPayment({
+      orderId: order!.id, amount: local.remaining_balance, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
+      acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: `k-${Math.random()}`, item_ids: [],
+    });
+    expect(blocked.ok).toBe(false);
+    expect(st().startCheckout(order!.id).ok).toBe(false);
+    // O gerente adota o desconto da nuvem: a conta converge e o pagamento do valor certo fecha.
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
+    await expectSynced('conta com o desconto da nuvem');
+    expect(st().orders.find((o) => o.id === order!.id)!.remaining_balance.toFixed(2)).toBe(sql(`SELECT remaining_balance FROM orders WHERE id = '${order!.id}'`));
+    payCash(order!.id);
+    await expectSynced('pagamento depois do conflito');
+    expect(sql(`SELECT status || ' ' || discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 7.00');
   });
 
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {

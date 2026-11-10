@@ -76,10 +76,15 @@ export function cashbackValidity(earnedAt: Date): { valid_from: string; expires_
   return { valid_from: from.toISOString(), expires_at: until.toISOString() };
 }
 
+/** Lançamento que é crédito do cliente: o ganho (EARN) e a devolução de um resgate (REFUND). */
+export function isCashbackCredit(e: CashbackLedgerEntry): boolean {
+  return e.entry_type === 'EARN' || e.entry_type === 'REFUND';
+}
+
 function isUsableEarn(e: CashbackLedgerEntry, customerId: UUID, at: Date): boolean {
   return (
     e.customer_id === customerId &&
-    e.entry_type === 'EARN' &&
+    isCashbackCredit(e) &&
     e.remaining_amount > 0 &&
     e.valid_from !== null &&
     e.expires_at !== null &&
@@ -97,7 +102,7 @@ export function availableCashback(ledger: readonly CashbackLedgerEntry[], custom
 export function balanceCashback(ledger: readonly CashbackLedgerEntry[], customerId: UUID, at: Date): number {
   return fromCents(
     ledger
-      .filter((e) => e.customer_id === customerId && e.entry_type === 'EARN' && e.expires_at !== null && new Date(e.expires_at) > at)
+      .filter((e) => e.customer_id === customerId && isCashbackCredit(e) && e.expires_at !== null && new Date(e.expires_at) > at)
       .reduce((a, e) => a + toCents(e.remaining_amount), 0),
   );
 }

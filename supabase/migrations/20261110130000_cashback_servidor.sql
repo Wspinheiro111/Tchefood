@@ -20,6 +20,8 @@
 --  - Tudo filtrado pela loja da sessão, e o lançamento só aponta para cliente e conta da
 --    própria loja (chaves compostas).
 --  - Fila da versão anterior com o crédito já baixado: só com prova na nuvem (abaixo).
+--  - Cancelamento de item que deixa o desconto abaixo do cashback usado devolve a
+--    diferença ao cliente (REFUND + audit_log CASHBACK_REFUNDED, só pelo banco).
 -- =============================================================================
 
 -- O aparelho grava o crédito (EARN, conferido abaixo); resgate e expiração não.
@@ -154,7 +156,7 @@ BEGIN
         v_legacy := TRUE;
         SELECT GREATEST(
                  COALESCE((SELECT SUM(amount - remaining_amount) FROM cashback_ledger
-                            WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type = 'EARN'), 0)
+                            WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type IN ('EARN', 'REFUND')), 0)
                - COALESCE((SELECT SUM(amount) FROM cashback_ledger
                             WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type = 'REDEEM'), 0), 0)
           INTO v_orphan;
@@ -178,7 +180,7 @@ BEGIN
 
     -- Saldo liberado agora, só desta loja.
     SELECT COALESCE(SUM(remaining_amount), 0) INTO v_available FROM cashback_ledger
-     WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type = 'EARN'
+     WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type IN ('EARN', 'REFUND')
        AND valid_from <= v_at AND expires_at > v_at;
     v_available := v_available + v_predebited;
     v_cap := round(v_order.total_amount * tchefood_cashback_max_usage_pct() / 100, 2);
@@ -201,7 +203,7 @@ BEGIN
     v_from_predebit := LEAST(v_predebited, v_amount);
     v_left := v_amount - v_from_predebit;
     FOR r IN SELECT id, remaining_amount FROM cashback_ledger
-              WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type = 'EARN' AND remaining_amount > 0
+              WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type IN ('EARN', 'REFUND') AND remaining_amount > 0
                 AND valid_from <= v_at AND expires_at > v_at
               ORDER BY expires_at, created_at FOR UPDATE LOOP
         EXIT WHEN v_left <= 0;
@@ -249,6 +251,9 @@ BEGIN
     END IF;
     IF NEW.action_type = 'CASHBACK_REDEEMED' AND current_user IN ('anon', 'authenticated') THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o registro do resgate só é gravado por tchefood_register_cashback_redeem.';
+    END IF;
+    IF NEW.action_type = 'CASHBACK_REFUNDED' AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o estorno do cashback só é gravado pelo banco, no cancelamento do item.';
     END IF;
     RETURN NEW;
 END;
@@ -391,33 +396,46 @@ BEGIN
 END $$;
 
 -- Desconto da conta: só cresce por autorização (DISCOUNT_APPLIED) ou pela função do
--- cashback. O aparelho só o reduz quando o gerente troca o desconto manual por um menor:
--- a última DISCOUNT_APPLIED da conta, de gerente ativo, com discount_before/discount_after
--- iguais ao valor do banco e ao novo. Qualquer outra redução é uma atualização antiga da
--- fila (feita antes de outro desconto chegar à nuvem) e apagaria o desconto já gravado:
--- o banco mantém o valor dele. Conta com resgate de cashback não reduz (o app também não
--- deixa combinar desconto manual com cashback).
+-- cashback. O aparelho só o reduz quando o gerente troca o desconto manual por um menor.
+-- Qualquer outra redução vinda do aparelho é uma atualização antiga da fila (feita antes de
+-- outro desconto chegar à nuvem) e apagaria o desconto já gravado: o banco recusa.
 CREATE OR REPLACE FUNCTION tchefood_orders_keep_discount()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
-DECLARE v_ok BOOLEAN;
+DECLARE
+    v_ok BOOLEAN;
+    v_redeemed NUMERIC(10,2);
 BEGIN
+    IF NEW.discount_amount >= OLD.discount_amount THEN
+        RETURN NEW;
+    END IF;
     -- Profundidade > 1: o recálculo do banco (tchefood_recalc_order, dentro de outro gatilho)
-    -- limita o desconto ao bruto da conta quando um item é cancelado; não é a fila do aparelho.
-    IF current_user IN ('anon', 'authenticated') AND pg_trigger_depth() = 1
-       AND NEW.discount_amount < OLD.discount_amount THEN
-        SELECT (a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
-           AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
-           AND m.role IN ('MANAGER', 'OWNER') AND m.active
-          INTO v_ok
-          FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id AND m.tenant_id = a.tenant_id
-         WHERE a.order_id = NEW.id AND a.tenant_id = NEW.tenant_id AND a.action_type = 'DISCOUNT_APPLIED'
-         ORDER BY a.created_at DESC, a.id DESC
-         LIMIT 1;
-        IF NOT COALESCE(v_ok, false) OR EXISTS (
-            SELECT 1 FROM cashback_ledger l
-             WHERE l.order_id = NEW.id AND l.tenant_id = NEW.tenant_id AND l.entry_type = 'REDEEM') THEN
-            NEW.discount_amount := OLD.discount_amount;
-        END IF;
+    -- limita o desconto ao bruto da conta quando um item é cancelado. Em conta com cashback,
+    -- o que o desconto perder abaixo do cashback consumido volta para o cliente
+    -- (tchefood_orders_cashback_refund, depois da atualização).
+    IF pg_trigger_depth() > 1 THEN
+        RETURN NEW;
+    END IF;
+    IF current_user NOT IN ('anon', 'authenticated') THEN
+        RETURN NEW;
+    END IF;
+    SELECT COALESCE(SUM(l.amount), 0) INTO v_redeemed FROM cashback_ledger l
+     WHERE l.order_id = NEW.id AND l.tenant_id = NEW.tenant_id AND l.entry_type = 'REDEEM';
+    -- Atualização direta do aparelho: só reduz com a última DISCOUNT_APPLIED da conta (pela
+    -- sequência do servidor), de gerente ativo, conferindo com o valor do banco e o novo, e
+    -- nunca em conta com cashback. Qualquer outra redução é um conflito: o aparelho tem um
+    -- desconto antigo. Recusa (em vez de ignorar) para o aparelho saber antes de cobrar; a
+    -- fila segura o resto da conta e o gerente adota o desconto da nuvem em Nuvem › recusados.
+    SELECT (a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
+       AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
+       AND m.role IN ('MANAGER', 'OWNER') AND m.active
+      INTO v_ok
+      FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id AND m.tenant_id = a.tenant_id
+     WHERE a.order_id = NEW.id AND a.tenant_id = NEW.tenant_id AND a.action_type = 'DISCOUNT_APPLIED'
+     ORDER BY a.server_seq DESC
+     LIMIT 1;
+    IF NOT COALESCE(v_ok, false) OR v_redeemed > 0 THEN
+        RAISE EXCEPTION 'TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ % e este aparelho mandou R$ % (outro aparelho ou o cashback mudou a conta). Use o desconto da nuvem antes de cobrar.',
+            to_char(OLD.discount_amount, 'FM999999990.00'), to_char(NEW.discount_amount, 'FM999999990.00');
     END IF;
     RETURN NEW;
 END;
@@ -426,6 +444,88 @@ DROP TRIGGER IF EXISTS trg_orders_00_keep_discount ON orders;
 CREATE TRIGGER trg_orders_00_keep_discount BEFORE UPDATE OF discount_amount ON orders
     FOR EACH ROW EXECUTE FUNCTION tchefood_orders_keep_discount();
 
+-- Estorno do cashback (decisão do Will, 10/11/2026: "devolva"). Quando o cancelamento de
+-- item deixa o desconto da conta abaixo do cashback que ela consumiu, a diferença volta
+-- para o cliente como um lançamento REFUND: crédito novo, com saldo próprio, liberado na
+-- hora e válido por tchefood_cashback_validity_days(). O EARN original não é tocado (o
+-- extrato continua somente inserção). Cada estorno grava um audit_log CASHBACK_REFUNDED.
+-- Idempotente: o valor é sempre (resgatado − já estornado) − desconto atual, calculado do
+-- extrato com a conta travada; o reenvio do mesmo cancelamento não muda o desconto e não
+-- estorna de novo. Gatilho (não função chamável): o aparelho não consegue pedir estorno
+-- com um valor seu.
+CREATE OR REPLACE FUNCTION tchefood_orders_cashback_refund()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_redeem cashback_ledger%ROWTYPE;
+    v_refunded NUMERIC(10,2);
+    v_amount NUMERIC(10,2);
+    v_user UUID;
+    v_cancel UUID;
+    v_now TIMESTAMPTZ := NOW();
+BEGIN
+    SELECT * INTO v_redeem FROM cashback_ledger
+     WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'REDEEM';
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT COALESCE(SUM(amount), 0) INTO v_refunded FROM cashback_ledger
+     WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'REFUND';
+    v_amount := v_redeem.amount - v_refunded - NEW.discount_amount;
+    IF v_amount <= 0 THEN RETURN NULL; END IF;
+    -- Quem cancelou: o último ITEM_CANCELED da conta (pela sequência do servidor).
+    SELECT a.id, a.performed_by_user_id INTO v_cancel, v_user FROM audit_logs a
+     WHERE a.tenant_id = NEW.tenant_id AND a.order_id = NEW.id AND a.action_type = 'ITEM_CANCELED'
+     ORDER BY a.server_seq DESC LIMIT 1;
+    v_user := COALESCE(v_user, v_redeem.created_by_user_id);
+    INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount,
+                                 valid_from, expires_at, created_by_user_id, created_at)
+    VALUES (NEW.tenant_id, v_redeem.customer_id, NEW.id, 'REFUND', v_amount, v_amount,
+            v_now, v_now + make_interval(days => tchefood_cashback_validity_days()), v_user, v_now);
+    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact,
+                            reason, whatsapp_alert_sent, metadata, created_at)
+    VALUES (NEW.tenant_id, NEW.id, v_user, NULL, 'CASHBACK_REFUNDED', v_amount,
+            'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)', FALSE,
+            jsonb_build_object('customer_id', v_redeem.customer_id, 'amount', v_amount, 'redeem_id', v_redeem.id,
+                               'redeemed', v_redeem.amount, 'refunded_before', v_refunded,
+                               'discount_before', OLD.discount_amount, 'discount_after', NEW.discount_amount,
+                               'item_cancel_audit_id', v_cancel, 'server_verified', TRUE),
+            v_now);
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_orders_cashback_refund ON orders;
+CREATE TRIGGER trg_orders_cashback_refund AFTER UPDATE OF discount_amount ON orders
+    FOR EACH ROW WHEN (NEW.discount_amount < OLD.discount_amount)
+    EXECUTE FUNCTION tchefood_orders_cashback_refund();
+
+-- Extrato aceita o REFUND: crédito com validade e saldo próprio (como o EARN), vários por
+-- conta (um por cancelamento). Um crédito e um resgate por conta continuam valendo. As
+-- restrições originais (schema_expansion.sql) têm nome gerado pelo banco: são achadas
+-- pela definição e trocadas pelas de nome fixo, uma vez só.
+DO $$
+DECLARE r RECORD;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cashback_ledger_entry_type_refund') THEN
+        FOR r IN SELECT conname FROM pg_constraint
+                  WHERE conrelid = 'cashback_ledger'::regclass AND contype = 'c'
+                    AND pg_get_constraintdef(oid) LIKE '%entry_type%' LOOP
+            EXECUTE format('ALTER TABLE cashback_ledger DROP CONSTRAINT %I', r.conname);
+        END LOOP;
+        FOR r IN SELECT c.conname FROM pg_constraint c
+                  WHERE c.conrelid = 'cashback_ledger'::regclass AND c.contype = 'u'
+                    AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM pg_attribute a
+                          WHERE a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)) = ARRAY['entry_type', 'order_id'] LOOP
+            EXECUTE format('ALTER TABLE cashback_ledger DROP CONSTRAINT %I', r.conname);
+        END LOOP;
+        ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_entry_type_refund
+            CHECK (entry_type IN ('EARN', 'REDEEM', 'EXPIRE', 'REFUND'));
+        ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_credit_validity
+            CHECK (entry_type NOT IN ('EARN', 'REFUND') OR (valid_from IS NOT NULL AND expires_at > valid_from AND remaining_amount <= amount));
+        ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_debit_no_balance
+            CHECK (entry_type IN ('EARN', 'REFUND') OR remaining_amount = 0);
+    END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS cashback_ledger_one_earn_redeem_per_order
+    ON cashback_ledger (order_id, entry_type) WHERE entry_type IN ('EARN', 'REDEEM', 'EXPIRE');
+
 -- Saldo exibido do cliente (cache do extrato): o banco calcula, o valor do aparelho não
 -- vale. Sem isso, a atualização do cliente que sobe depois do resgate gravaria o saldo
 -- antigo do aparelho por cima de um crédito novo de outro aparelho.
@@ -433,7 +533,7 @@ CREATE OR REPLACE FUNCTION tchefood_refresh_cashback_balance(p_customer_id UUID)
 RETURNS VOID LANGUAGE sql AS $$
     UPDATE loyalty_customers c SET cashback_balance =
         (SELECT COALESCE(SUM(l.remaining_amount), 0) FROM cashback_ledger l
-          WHERE l.tenant_id = c.tenant_id AND l.customer_id = c.id AND l.entry_type = 'EARN' AND l.expires_at > NOW())
+          WHERE l.tenant_id = c.tenant_id AND l.customer_id = c.id AND l.entry_type IN ('EARN', 'REFUND') AND l.expires_at > NOW())
      WHERE c.id = p_customer_id
 $$;
 CREATE OR REPLACE FUNCTION tchefood_loyalty_balance_from_ledger()
@@ -441,7 +541,7 @@ RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 BEGIN
     NEW.cashback_balance := (SELECT COALESCE(SUM(l.remaining_amount), 0) FROM cashback_ledger l
                               WHERE l.tenant_id = NEW.tenant_id AND l.customer_id = NEW.id
-                                AND l.entry_type = 'EARN' AND l.expires_at > NOW());
+                                AND l.entry_type IN ('EARN', 'REFUND') AND l.expires_at > NOW());
     RETURN NEW;
 END;
 $$;
@@ -479,6 +579,7 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_redeem_cashback(UUID, UUID, UUID) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_cashback_now() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_loyalty_balance_from_ledger() FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_orders_cashback_refund() FROM PUBLIC, anon, authenticated;
         REVOKE DELETE ON cashback_ledger FROM anon, authenticated;
     END IF;
 END $$;

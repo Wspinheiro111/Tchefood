@@ -10,12 +10,13 @@ import {
   CASHBACK_PCT,
   CASHBACK_VALIDITY_DAYS,
   formatWhatsapp,
+  isCashbackCredit,
   isCashbackDay,
 } from '../lib/loyalty';
 import { Badge } from '../components/ui';
 import { WinbackPanel } from './WinbackPanel';
 
-const ENTRY_LABEL = { EARN: 'Crédito', REDEEM: 'Resgate', EXPIRE: 'Vencido' } as const;
+const ENTRY_LABEL = { EARN: 'Crédito', REDEEM: 'Resgate', EXPIRE: 'Vencido', REFUND: 'Devolvido' } as const;
 
 /** Retaguarda · CRM: clientes do programa, saldo de cashback e extrato. */
 export function CrmPanel() {
@@ -40,7 +41,8 @@ export function CrmPanel() {
   }, [customers, ledger, q]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const earned = ledger.filter((e) => e.entry_type === 'EARN').reduce((a, e) => a + e.amount, 0);
-  const redeemed = ledger.filter((e) => e.entry_type === 'REDEEM').reduce((a, e) => a + e.amount, 0);
+  // Resgatado líquido: o que voltou ao cliente num cancelamento (REFUND) não foi usado.
+  const redeemed = ledger.reduce((a, e) => a + (e.entry_type === 'REDEEM' ? e.amount : e.entry_type === 'REFUND' ? -e.amount : 0), 0);
   const outstanding = rows.reduce((a, r) => a + r.balance, 0);
 
   return (
@@ -82,8 +84,8 @@ export function CrmPanel() {
                     <tr key={e.id} className="border-t border-slate-200">
                       <td className="py-1">{new Date(e.created_at).toLocaleDateString('pt-BR')}</td>
                       <td>{ENTRY_LABEL[e.entry_type]}</td>
-                      <td className={`text-right tabular-nums ${e.entry_type === 'EARN' ? 'text-verde' : 'text-rose-600'}`}>{e.entry_type === 'EARN' ? '+' : '−'}{formatBRL(e.amount)}</td>
-                      <td className="text-right tabular-nums">{e.entry_type === 'EARN' ? formatBRL(e.remaining_amount) : ''}</td>
+                      <td className={`text-right tabular-nums ${isCashbackCredit(e) ? 'text-verde' : 'text-rose-600'}`}>{isCashbackCredit(e) ? '+' : '−'}{formatBRL(e.amount)}</td>
+                      <td className="text-right tabular-nums">{isCashbackCredit(e) ? formatBRL(e.remaining_amount) : ''}</td>
                       <td className="text-right">{e.expires_at ? new Date(e.expires_at).toLocaleDateString('pt-BR') : ''}</td>
                     </tr>
                   ))}

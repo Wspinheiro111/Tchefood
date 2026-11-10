@@ -6,6 +6,7 @@ import type { Permission, SyncEvent, UserRole } from '../../types';
 import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../lib/permissions';
 import { ROLE_LABEL } from '../../lib/catalog';
 import { signInDevice, type SyncConfig } from '../../lib/sync/supabaseSync';
+import { cloudDiscountOf } from '../../lib/sync/cloudDiscount';
 import { fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, type CloudStaff } from '../../lib/sync/cloudPull';
 import { defaultCloudConfig, syncOnce } from '../../lib/sync/useCloudSync';
 import { useOnline } from '../../lib/useOnline';
@@ -441,6 +442,29 @@ function needsManagerPin(e: SyncEvent): boolean {
   return e.table === 'audit_logs' && typeof e.payload.authorized_by_manager_id === 'string';
 }
 
+/** Conta recusada por ter outro desconto na nuvem: adota o da nuvem e reenvia. */
+function AdoptCloudDiscount({ eventId, value }: { eventId: string; value: number }) {
+  const adopt = useTcheStore((s) => s.adoptCloudDiscount);
+  const online = useOnline();
+  return (
+    <div className="mt-1">
+      <Btn
+        disabled={!online}
+        onClick={() => {
+          const r = adopt(eventId);
+          if (!r.ok) toast.error(r.error);
+          else {
+            toast.success(`Desconto da nuvem (R$ ${value.toFixed(2).replace('.', ',')}) aplicado nesta conta.`);
+            void syncOnce();
+          }
+        }}
+      >
+        Usar o desconto da nuvem (R$ {value.toFixed(2).replace('.', ',')})
+      </Btn>
+    </div>
+  );
+}
+
 function RejectedAuthPin({ eventId }: { eventId: string }) {
   const confirm = useTcheStore((s) => s.confirmRejectedAuthorization);
   const [pin, setPin] = useState('');
@@ -527,6 +551,9 @@ function CloudStatus() {
               <li key={r.event.id} className="text-slate-700">
                 <b>{r.event.table}</b> {r.event.op} (registro {r.event.row_id.slice(0, 8)}…) · HTTP {r.status}: {r.message}
                 {needsManagerPin(r.event) && <RejectedAuthPin eventId={r.event.id} />}
+                {r.event.table === 'orders' && cloudDiscountOf(r.message) !== null && (
+                  <AdoptCloudDiscount eventId={r.event.id} value={cloudDiscountOf(r.message)!} />
+                )}
               </li>
             ))}
           </ul>

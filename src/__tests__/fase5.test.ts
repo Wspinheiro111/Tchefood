@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { migrateCashbackRedeemQueue, migratePersisted, useTcheStore } from '../store/useTcheStore';
 import { kegStatus } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken, TICKET_ALPHABET } from '../lib/eventTickets';
-import { cashbackEarnAmount, isCashbackDay, normalizeWhatsapp } from '../lib/loyalty';
+import { availableCashback, cashbackEarnAmount, isCashbackDay, normalizeWhatsapp } from '../lib/loyalty';
 import { computeNetWeight, encodeScaleFrame, parseScaleFrame, parseScalePayload, readStable, SimulatedScale } from '../lib/scale';
 import { seedId } from '../data/seed';
 import type { AuditLog, SelectedModifier, SyncEvent } from '../types';
@@ -302,6 +302,25 @@ describe('cashback no WhatsApp', () => {
     );
     expect(st().redeemCashback(second, '55999991234').ok).toBe(false);
     expect(st().applyDiscount(second, 2, MANAGER).ok).toBe(false);
+    // Cancelamento que deixa o desconto abaixo do cashback usado: a diferença volta para o
+    // cliente (REFUND, liberado na hora). Só local: o banco grava o dele ao receber o cancelamento.
+    const items = st().orderItems.filter((i) => i.order_id === second && i.status !== 'CANCELED');
+    const before = st().outbox.length;
+    for (const item of items) {
+      const cancel = st().cancelOrderItem(item.id, MANAGER);
+      if (!cancel.ok) throw new Error(cancel.error);
+    }
+    const after = st().orders.find((o) => o.id === second)!;
+    expect(after.discount_amount).toBe(0);
+    const refunds = st().cashbackLedger.filter((e) => e.order_id === second && e.entry_type === 'REFUND');
+    expect(refunds.map((e) => [e.amount, e.remaining_amount])).toEqual([[3.78, 3.78]]);
+    const customer = st().loyaltyCustomers.find((c) => c.id === refunds[0]!.customer_id)!;
+    expect(customer.cashback_balance).toBe(3.78);
+    expect(availableCashback(st().cashbackLedger, customer.id, new Date())).toBe(3.78);
+    expect(st().auditLogs.filter((l) => l.order_id === second && l.action_type === 'CASHBACK_REFUNDED').map((l) => l.amount_impact)).toEqual([3.78]);
+    const sent = st().outbox.slice(before);
+    expect(sent.some((e) => e.table === 'cashback_ledger' || e.table === 'loyalty_customers')).toBe(false);
+    expect(sent.some((e) => e.table === 'audit_logs' && e.payload.action_type === 'CASHBACK_REFUNDED')).toBe(false);
   });
 
   it('fila de versão anterior: o resgate em três partes vira a chamada única da função do servidor', () => {
