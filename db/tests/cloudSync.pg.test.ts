@@ -490,6 +490,31 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     setCashbackClock(null);
   });
 
+  it('item cancelado deixa o bruto abaixo do desconto: o recálculo do banco limita o desconto como o app', async () => {
+    // Achado do Codex em 0ed2531: a trava do desconto não pode barrar o recálculo do banco.
+    const [order] = await cashbackOrders(1, 43);
+    login(CASHIER_PIN);
+    const gross = st().orders.find((o) => o.id === order!.id)!.subtotal_items;
+    ok(st().applyDiscount(order!.id, gross, MANAGER));
+    await expectSynced('desconto do valor todo');
+    const item = st().orderItems.find((i) => i.order_id === order!.id && i.status !== 'CANCELED')!;
+    ok(st().cancelOrderItem(item.id, MANAGER));
+    await expectSynced('cancelamento do item');
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    expect(local.discount_amount).toBe(0);
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order!.id}'`)).toBe('0.00 0.00');
+    // Consumo novo depois: o saldo do banco é o mesmo do aparelho.
+    const p = st().products.find((x) => x.id === productId)!;
+    ok(st().addToTray({ order_id: order!.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order!.id));
+    await expectSynced('consumo novo');
+    const after = st().orders.find((o) => o.id === order!.id)!;
+    expect(sql(`SELECT discount_amount || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe(`${after.discount_amount.toFixed(2)} ${after.remaining_balance.toFixed(2)}`);
+    payCash(order!.id);
+    await expectSynced('pagamento depois do cancelamento');
+    expect(sql(`SELECT status FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED');
+  });
+
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
     setCashbackClock('2026-11-12T20:00:00-03:00');

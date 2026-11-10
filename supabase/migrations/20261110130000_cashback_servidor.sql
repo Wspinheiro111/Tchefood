@@ -401,7 +401,10 @@ CREATE OR REPLACE FUNCTION tchefood_orders_keep_discount()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE v_ok BOOLEAN;
 BEGIN
-    IF current_user IN ('anon', 'authenticated') AND NEW.discount_amount < OLD.discount_amount THEN
+    -- Profundidade > 1: o recálculo do banco (tchefood_recalc_order, dentro de outro gatilho)
+    -- limita o desconto ao bruto da conta quando um item é cancelado; não é a fila do aparelho.
+    IF current_user IN ('anon', 'authenticated') AND pg_trigger_depth() = 1
+       AND NEW.discount_amount < OLD.discount_amount THEN
         SELECT (a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
            AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
            AND m.role IN ('MANAGER', 'OWNER') AND m.active
