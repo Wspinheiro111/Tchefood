@@ -1,0 +1,57 @@
+name: APK Android
+
+on:
+  pull_request:
+    paths:
+      - "android/**"
+      - "src/**"
+      - "public/**"
+      - "index.html"
+      - "package*.json"
+      - "vite.config.ts"
+      - ".github/workflows/android-apk.yml"
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "src/**"
+      - "public/**"
+      - ".github/workflows/android-apk.yml"
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Build web (dist/)
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build APKs (pagbank e tablet, debug)
+        run: gradle -p android assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tchefood-apk
+          path: android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error

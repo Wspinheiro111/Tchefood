@@ -117,6 +117,13 @@ export interface Product {
   sold_by_weight: boolean;
   /** Tara padrão do prato/recipiente, em gramas. */
   tare_weight_grams: number;
+  // Combos (db/schema_combos.sql)
+  /**
+   * Combo: price é o preço do combo, e cada opção escolhida nos grupos do combo que
+   * aponta para um produto (ModifierOption.component_product_id) vira um item de
+   * produção à parte (preço zero, setor do componente), ligado ao item do combo.
+   */
+  is_combo: boolean;
 }
 
 export interface ModifierGroup {
@@ -135,6 +142,13 @@ export interface ModifierOption {
   additional_price: number;
   /** Volume servido por esta opção de tamanho (ex.: chopp 300/500/1000 ml). */
   volume_ml: number | null;
+  /**
+   * Combo: produto que esta opção coloca no pedido (ex.: "Refrigerante lata" no grupo
+   * "Bebida do combo"). Só vale em produto combo; additional_price é o acréscimo da troca.
+   */
+  component_product_id: UUID | null;
+  /** Quantas unidades do componente cada combo leva (inteiro, 1 a 20). */
+  component_quantity: number;
 }
 
 /**
@@ -265,6 +279,11 @@ export interface OrderItem {
   weight_source: WeightSource | null;
   /** Volume que cada unidade tira do barril (ml); null se não sai de torneira. */
   keg_volume_ml: number | null;
+  /**
+   * Combos: item de produção de um combo (preço zero) aponta para o item do combo,
+   * que leva o preço e vai para a NFC-e. null em item comum e no próprio combo.
+   */
+  combo_parent_item_id: UUID | null;
 }
 
 export type WeightSource = 'SCALE' | 'MANUAL';
@@ -596,7 +615,10 @@ export interface SyncEvent {
     | 'modifier_options'
     | 'product_modifier_groups'
     | 'price_schedules'
-    | 'role_permissions';
+    | 'role_permissions'
+    // Cardápio em realidade aumentada (db/schema_ar.sql)
+    | 'product_ar_models'
+    | 'ar_engagement_events';
   /** DELETE só para linhas sem valor financeiro (vínculos e opções de adicional). */
   op: 'INSERT' | 'UPDATE' | 'DELETE';
   row_id: UUID;
@@ -674,3 +696,57 @@ export interface RejectedSyncEvent {
 export type ActionResult<T = undefined> =
   | { ok: true; data: T }
   | { ok: false; error: string };
+
+// ---------------------------------------------------------------------------
+// Cardápio em realidade aumentada (db/schema_ar.sql)
+// ---------------------------------------------------------------------------
+
+/** Um item do prato com etiqueta no 3D (ex.: "Mussarela"), na posição da vista "itens do prato". */
+export interface ArComponent {
+  id: UUID;
+  label: string;
+  detail: string | null;
+  /** Posição da etiqueta no modelo, em metros: "x y z" (formato do model-viewer). */
+  position: string;
+  /** Direção da superfície onde a etiqueta foi presa: "x y z". */
+  normal: string;
+}
+
+/** Modelo 3D de um produto do cardápio. Um por produto (product_ar_models.product_id é único). */
+export interface ProductArModel {
+  id: UUID;
+  tenant_id: UUID;
+  product_id: UUID;
+  /**
+   * Arquivo GLB/glTF binário (Android, computador e base do iPhone).
+   * https://… na nuvem (bucket product-models), ar/… para o modelo de demonstração
+   * ou idb:… para o arquivo enviado e ainda guardado só neste aparelho.
+   */
+  glb_url: string;
+  /** USDZ opcional para o Quick Look do iPhone. Sem ele o iPhone gera o USDZ a partir do GLB. */
+  usdz_url: string | null;
+  /** Fator aplicado ao modelo para ficar no tamanho real (1 = o arquivo já está em metros). */
+  scale_factor: number;
+  /** Medidas reais do prato, em centímetros, já com o fator aplicado. NUMERIC(6,1). */
+  real_width_cm: number;
+  real_depth_cm: number;
+  real_height_cm: number;
+  /** Animação do arquivo que separa as camadas (vista "itens do prato"); null = só etiquetas. */
+  explode_animation: string | null;
+  components: ArComponent[];
+  active: boolean;
+  created_at: ISODateTime;
+  updated_at: ISODateTime;
+}
+
+/** O que o cliente fez com o 3D. ADD_AFTER_VIEW = pediu o produto depois de ver o 3D. */
+export type ArEngagementKind = 'VIEW_3D' | 'AR_START' | 'EXPLODE' | 'ADD_AFTER_VIEW';
+
+export interface ArEngagementEvent {
+  id: UUID;
+  tenant_id: UUID;
+  product_id: UUID;
+  table_id: UUID | null;
+  kind: ArEngagementKind;
+  created_at: ISODateTime;
+}

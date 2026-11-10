@@ -14,6 +14,7 @@ import type {
   StaffUser,
   UserRole,
 } from '../types';
+import { COMBO_COMPONENT_MAX_QTY } from './combos';
 import { round2, toCents } from './money';
 
 export type Check = { ok: true } | { ok: false; error: string };
@@ -63,7 +64,7 @@ export function validateCategory(c: Pick<Category, 'id' | 'name' | 'sort_order'>
 // PRODUTOS
 // ---------------------------------------------------------------------------
 /** Campos da Fase 5 (balança, CMV) e de estoque são opcionais no cadastro: sem eles, o produto mantém o que já tinha. */
-type Fase5ProductFields = 'sold_by_weight' | 'tare_weight_grams' | 'cost_price' | 'stock_quantity' | 'barcode';
+type Fase5ProductFields = 'sold_by_weight' | 'tare_weight_grams' | 'cost_price' | 'stock_quantity' | 'barcode' | 'is_combo';
 export type ProductDraft = Omit<Product, 'tenant_id' | 'created_at' | Fase5ProductFields> & Partial<Pick<Product, Fase5ProductFields>>;
 
 export function validateProduct(p: ProductDraft, products: Product[], categories: Category[]): Check {
@@ -84,6 +85,10 @@ export function validateProduct(p: ProductDraft, products: Product[], categories
   if (!/^\d{2,4}$/.test(p.csosn_cst)) return bad('CSOSN/CST deve ter de 2 a 4 dígitos.');
   const unit = p.unit.trim();
   if (unit.length < 1 || unit.length > 6) return bad('Unidade: de 1 a 6 letras (ex.: UN, KG).');
+  if (p.is_combo) {
+    if (p.sold_by_weight) return bad('Combo não é vendido por peso.');
+    if (p.allows_half_and_half) return bad('Combo não tem meio-a-meio.');
+  }
   return okCheck;
 }
 
@@ -100,8 +105,17 @@ export function validateModifierGroup(g: Omit<ModifierGroup, 'tenant_id'>): Chec
   return okCheck;
 }
 
-export function validateModifierOption(o: ModifierOption, groups: ModifierGroup[], options: ModifierOption[]): Check {
+export function validateModifierOption(o: ModifierOption, groups: ModifierGroup[], options: ModifierOption[], products: Product[] = []): Check {
   if (!groups.some((g) => g.id === o.group_id)) return bad('Grupo do adicional não encontrado.');
+  if (o.component_product_id) {
+    const comp = products.find((p) => p.id === o.component_product_id);
+    if (!comp || !comp.active) return bad('Produto do combo não encontrado.');
+    if (comp.is_combo) return bad('Um combo não entra dentro de outro combo.');
+    if (comp.sold_by_weight) return bad(`${comp.name} é vendido por peso e não entra em combo.`);
+    if (!Number.isInteger(o.component_quantity) || o.component_quantity < 1 || o.component_quantity > COMBO_COMPONENT_MAX_QTY) {
+      return bad(`Quantidade no combo: inteiro de 1 a ${COMBO_COMPONENT_MAX_QTY}.`);
+    }
+  }
   const name = o.name.trim();
   if (name.length < 1 || name.length > 80) return bad('Nome do adicional: entre 1 e 80 letras.');
   if (!validMoney(o.additional_price) || o.additional_price < 0) return bad('Valor do adicional deve ser ≥ 0, com até 2 casas.');

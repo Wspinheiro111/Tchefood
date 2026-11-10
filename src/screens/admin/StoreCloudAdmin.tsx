@@ -1,16 +1,17 @@
 /** Etapa 0 — Loja (dados, permissões, loja nova) e Nuvem (login do aparelho e envio da fila). */
-import { useState } from 'react';
-import { Cloud, CloudOff, RefreshCw, Store } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Cloud, CloudDownload, CloudOff, RefreshCw, Store, Users } from 'lucide-react';
 import { selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
 import type { Permission, SyncEvent, UserRole } from '../../types';
 import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../lib/permissions';
 import { ROLE_LABEL } from '../../lib/catalog';
-import { signInDevice } from '../../lib/sync/supabaseSync';
+import { signInDevice, type SyncConfig } from '../../lib/sync/supabaseSync';
+import { fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, type CloudStaff } from '../../lib/sync/cloudPull';
 import { defaultCloudConfig, syncOnce } from '../../lib/sync/useCloudSync';
 import { useOnline } from '../../lib/useOnline';
 import { Btn, Sheet, toast } from '../../components/ui';
 import { ManagerAuthSheet } from '../../components/ManagerAuthSheet';
-import { Field, FormError, Panel, TextInput, parseMoneyInput } from './fields';
+import { Field, FormError, Panel, Select, TextInput, parseMoneyInput } from './fields';
 
 // ---------------------------------------------------------------------------
 // LOJA
@@ -273,10 +274,161 @@ function CloudLogin() {
           {busy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Cloud className="h-4 w-4" />} {online ? 'Entrar' : 'Sem internet'}
         </Btn>
       </Panel>
-      {otherStore && (
-        <div className="space-y-3 rounded-2xl border border-ouro p-3">
-          <p className="text-sm text-brasa">Esta conta é de outra loja (id {otherStore.tenant_id.slice(0, 8)}…). Os dados deste aparelho são de {useTcheStore.getState().tenant.name}. Para usar esta conta, comece a loja dela neste aparelho.</p>
-          {isOwner ? <NewStorePanel cloud={otherStore} onDone={() => setOtherStore(null)} /> : <p className="text-sm text-slate-500">Peça ao proprietário para fazer isso.</p>}
+      {otherStore && <OtherStoreChoice session={otherStore} isOwner={isOwner} onDone={() => setOtherStore(null)} />}
+    </div>
+  );
+}
+
+function cloudConfig(session: CloudSession): SyncConfig {
+  return { url: session.url, anonKey: session.anon_key, accessToken: session.access_token };
+}
+
+const browserFetch = (u: string, init: { method: string; headers: Record<string, string>; body?: string }) => fetch(u, init);
+
+/**
+ * Conta de outra loja: se a loja da nuvem já tem equipe, este aparelho baixa a loja
+ * (aparelho novo); se ainda não tem, começa a loja dela do zero.
+ */
+function OtherStoreChoice({ session, isOwner, onDone }: { session: CloudSession; isOwner: boolean; onDone: () => void }) {
+  const [team, setTeam] = useState<CloudStaff[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    fetchCloudStaff(cloudConfig(session), browserFetch)
+      .then((t) => live && setTeam(t))
+      .catch((e: Error) => live && setError(e.message));
+    return () => {
+      live = false;
+    };
+  }, [session]);
+  return (
+    <div className="space-y-3 rounded-2xl border border-ouro p-3">
+      <p className="text-sm text-brasa">Esta conta é de outra loja (id {session.tenant_id.slice(0, 8)}…). Os dados deste aparelho são de {useTcheStore.getState().tenant.name}.</p>
+      <FormError error={error} />
+      {!isOwner ? (
+        <p className="text-sm text-slate-500">Peça ao proprietário deste aparelho para fazer isso.</p>
+      ) : team === null ? (
+        !error && <p className="flex items-center gap-2 text-sm text-slate-500"><RefreshCw className="h-4 w-4 animate-spin" /> Lendo a loja na nuvem…</p>
+      ) : team.length > 0 ? (
+        <JoinStorePanel session={session} team={team} onDone={onDone} />
+      ) : (
+        <NewStorePanel cloud={session} onDone={onDone} />
+      )}
+    </div>
+  );
+}
+
+/** Aparelho novo de uma loja que já está na nuvem: baixa os cadastros e a equipe. */
+function JoinStorePanel({ session, team, onDone }: { session: CloudSession; team: CloudStaff[]; onDone: () => void }) {
+  const join = useTcheStore((s) => s.joinCloudStore);
+  const managers = team.filter((u) => u.active && (u.role === 'MANAGER' || u.role === 'OWNER'));
+  const [who, setWho] = useState(managers[0]?.id ?? '');
+  const [pin, setPin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const cfg = cloudConfig(session);
+      const pins = await fetchStaffPins(cfg, who, pin, browserFetch);
+      if (!pins.ok) return setError(pins.error);
+      const snapshot = await fetchCloudSnapshot(cfg, session.tenant_id, browserFetch);
+      const r = join({ session, snapshot, staff: pins.staff, userId: who });
+      if (!r.ok) return setError(r.error);
+      toast.success(`Loja ${r.data.name} baixada. Cada pessoa entra com o PIN dela.`);
+      onDone();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setPin('');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Panel title={<span className="flex items-center gap-2"><CloudDownload className="h-4 w-4" /> Baixar a loja desta conta</span>}>
+      <p className="mb-3 text-sm text-slate-500">
+        A loja já tem equipe na nuvem. Este aparelho troca os dados dele (cardápio, mesas, equipe e histórico de demonstração) pelos cadastros da loja: cardápio, combos, mesas, equipe, maquininhas, permissões e fornecedores. Contas e pagamentos de outros aparelhos não vêm. Confirme com o PIN de um gerente ou do proprietário da loja.
+      </p>
+      <FormError error={error} />
+      {managers.length === 0 ? (
+        <p className="text-sm text-slate-500">A loja não tem gerente nem proprietário ativo na nuvem.</p>
+      ) : (
+        <>
+          <div className="grid gap-x-3 sm:grid-cols-2">
+            <Field label="Quem confirma">
+              <Select value={who} onChange={setWho} options={managers.map((u) => ({ value: u.id, label: `${u.name} (${ROLE_LABEL[u.role]})` }))} />
+            </Field>
+            <Field label="PIN">
+              <TextInput type="password" inputMode="numeric" autoComplete="off" maxLength={4} value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))} />
+            </Field>
+          </div>
+          <Btn block variant="danger" disabled={busy || pin.length !== 4 || !who} onClick={() => void run()}>
+            {busy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <CloudDownload className="h-4 w-4" />} Apagar este aparelho e baixar a loja
+          </Btn>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+/** Pessoa nova ou PIN trocado em outro aparelho: o gerente traz a equipe com os PINs. */
+function RefreshStaffPanel() {
+  const cloud = useTcheStore((s) => s.cloud)!;
+  const unknown = useTcheStore((s) => s.pullStatus?.cloud_staff_unknown ?? 0);
+  const staff = useTcheStore((s) => s.staff);
+  const managers = staff.filter((u) => u.active && (u.role === 'MANAGER' || u.role === 'OWNER'));
+  const applyStaff = useTcheStore((s) => s.applyCloudStaff);
+  const online = useOnline();
+  const [open, setOpen] = useState(false);
+  const [who, setWho] = useState('');
+  const [pin, setPin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const chosen = who || managers[0]?.id || '';
+
+  const run = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const r = await fetchStaffPins(cloudConfig(useTcheStore.getState().cloud ?? cloud), chosen, pin, browserFetch);
+      if (!r.ok) return setError(r.error);
+      const applied = applyStaff(r.staff);
+      if (!applied.ok) return setError(applied.error);
+      toast.success(applied.data.added > 0 ? `Equipe atualizada: ${applied.data.added} pessoa(s) nova(s).` : 'Equipe atualizada.');
+      setOpen(false);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setPin('');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mb-3 rounded-xl border border-slate-200 p-3 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className={unknown > 0 ? 'font-bold text-brasa' : 'text-slate-700'}>
+          {unknown > 0 ? `${unknown} pessoa(s) nova(s) na equipe da nuvem ainda sem PIN neste aparelho.` : 'PIN trocado ou pessoa nova em outro aparelho? Atualize a equipe.'}
+        </span>
+        <Btn disabled={!online} onClick={() => setOpen((v) => !v)}><Users className="h-4 w-4" /> Atualizar equipe</Btn>
+      </div>
+      {open && (
+        <div className="mt-3">
+          <FormError error={error} />
+          <div className="grid gap-x-3 sm:grid-cols-2">
+            <Field label="Gerente ou proprietário">
+              <Select value={chosen} onChange={setWho} options={managers.map((u) => ({ value: u.id, label: u.name }))} />
+            </Field>
+            <Field label="PIN">
+              <TextInput type="password" inputMode="numeric" autoComplete="off" maxLength={4} value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))} />
+            </Field>
+          </div>
+          <Btn block disabled={busy || pin.length !== 4 || !chosen} onClick={() => void run()}>
+            {busy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Users className="h-4 w-4" />} Baixar equipe com os PINs
+          </Btn>
         </div>
       )}
     </div>
@@ -321,6 +473,7 @@ function RejectedAuthPin({ eventId }: { eventId: string }) {
 function CloudStatus() {
   const cloud = useTcheStore((s) => s.cloud)!;
   const status = useTcheStore((s) => s.syncStatus);
+  const pull = useTcheStore((s) => s.pullStatus);
   const outbox = useTcheStore((s) => s.outbox);
   const setCloud = useTcheStore((s) => s.setCloudSession);
   const online = useOnline();
@@ -331,9 +484,10 @@ function CloudStatus() {
   const now = async () => {
     setBusy(true);
     try {
-      await syncOnce();
+      await syncOnce(undefined, { forcePull: true });
       const st = useTcheStore.getState();
       if (st.syncStatus.last_error) toast.error(st.syncStatus.last_error);
+      else if (st.pullStatus?.last_error) toast.error(st.pullStatus.last_error);
       else toast.success(st.outbox.length === 0 ? 'Tudo enviado para a nuvem.' : `${st.outbox.length} evento(s) ainda na fila.`);
     } finally {
       setBusy(false);
@@ -349,6 +503,7 @@ function CloudStatus() {
         <dt className="text-slate-500">Projeto</dt><dd className="break-all">{cloud.url}</dd>
         <dt className="text-slate-500">Fila</dt><dd>{outbox.length} evento(s){outbox.length > 0 && ` · ${Object.entries(byTable).map(([t, n]) => `${t} ${n}`).join(', ')}`}</dd>
         <dt className="text-slate-500">Último envio</dt><dd>{status.last_success_at ? new Date(status.last_success_at).toLocaleString('pt-BR') : 'ainda não'}</dd>
+        <dt className="text-slate-500">Cadastros da nuvem</dt><dd>{pull?.last_pull_at ? `lidos ${new Date(pull.last_pull_at).toLocaleString('pt-BR')}` : 'ainda não lidos'} <span className="text-xs text-slate-500">(a cada minuto, com a fila vazia)</span></dd>
         {!online && (<><dt className="text-slate-500">Conexão</dt><dd className="text-brasa">Sem internet: a fila espera e sobe sozinha quando voltar.</dd></>)}
       </dl>
       {status.last_error && (
@@ -357,6 +512,10 @@ function CloudStatus() {
           {status.last_error_at && <div className="text-xs text-slate-500">{new Date(status.last_error_at).toLocaleString('pt-BR')}</div>}
         </div>
       )}
+      {pull?.last_error && (
+        <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm text-brasa">Leitura da nuvem: {pull.last_error}</div>
+      )}
+      <RefreshStaffPanel />
       {rejected.length > 0 && (
         <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm">
           <div className="mb-2 font-bold text-brasa">{rejected.length} evento(s) recusado(s) pela nuvem</div>
