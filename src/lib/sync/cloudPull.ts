@@ -16,6 +16,8 @@
  */
 import type {
   Category,
+  Courier,
+  DeliveryZone,
   DiningTable,
   ModifierGroup,
   ModifierOption,
@@ -54,6 +56,9 @@ export interface CloudSnapshot {
   supplierProductLinks: SupplierProductLink[];
   /** Notas de compra já importadas: sem elas um aparelho novo importaria a mesma NF-e de novo e somaria o estoque duas vezes. */
   purchaseInvoices: PurchaseInvoice[];
+  /** Entrega própria: bairros com taxa e entregadores. */
+  deliveryZones: DeliveryZone[];
+  couriers: Courier[];
 }
 
 const TENANT_COLUMNS = ['id', 'name', 'legal_name', 'cnpj', 'state_registration', 'city', 'state', 'default_service_fee_pct', 'default_acquirer', 'default_mode', 'created_at'] as const;
@@ -92,6 +97,8 @@ const TABLES = {
       'items_count', 'imported_by_user_id', 'imported_at',
     ],
   },
+  deliveryZones: { table: 'delivery_zones', order: 'id', columns: ['id', 'tenant_id', 'name', 'fee', 'eta_minutes', 'active'] },
+  couriers: { table: 'couriers', order: 'id', columns: ['id', 'tenant_id', 'name', 'phone', 'fee_per_delivery', 'active'] },
 } as const;
 
 /** Linhas por página (o Supabase limita a 1000 por padrão). */
@@ -151,6 +158,8 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
   const suppliers = await read('suppliers');
   const supplierProductLinks = await read('supplierProductLinks');
   const purchaseInvoices = await read('purchaseInvoices');
+  const deliveryZones = await read('deliveryZones');
+  const couriers = await read('couriers');
   return {
     tenant,
     staff,
@@ -166,6 +175,8 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
     suppliers: suppliers as Supplier[],
     supplierProductLinks: supplierProductLinks as SupplierProductLink[],
     purchaseInvoices: purchaseInvoices as PurchaseInvoice[],
+    deliveryZones: (deliveryZones as DeliveryZone[]).map((z) => ({ ...z, fee: Number(z.fee) })),
+    couriers: (couriers as Courier[]).map((c) => ({ ...c, fee_per_delivery: Number(c.fee_per_delivery) })),
   };
 }
 
@@ -253,6 +264,8 @@ export const MERGE = {
   suppliers: { table: 'suppliers', key: (r: Supplier) => r.id, dropMissing: false },
   supplierProductLinks: { table: 'supplier_product_links', key: (r: SupplierProductLink) => r.id, dropMissing: false },
   purchaseInvoices: { table: 'purchase_invoices', key: (r: PurchaseInvoice) => r.id, dropMissing: false },
+  deliveryZones: { table: 'delivery_zones', key: (r: DeliveryZone) => r.id, dropMissing: false },
+  couriers: { table: 'couriers', key: (r: Courier) => r.id, dropMissing: false },
 } satisfies { [K in keyof typeof TABLES]: MergeSpec<CloudSnapshot[K][number]> };
 
 /**

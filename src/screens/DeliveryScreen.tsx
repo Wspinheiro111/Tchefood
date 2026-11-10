@@ -15,6 +15,7 @@ import {
   type DeliveryOrderStatus,
 } from '../../server/delivery/marketplace';
 import type { Product } from '../types';
+import { OwnDeliveryBoard } from './OwnDeliveryBoard';
 
 const STATUS_LABEL: Record<DeliveryOrderStatus, string> = {
   placed: 'Novo: aceitar',
@@ -73,7 +74,28 @@ function randomDemoOrder(products: Product[]): IfoodSandboxOrderInput {
   };
 }
 
+type DeliveryTab = 'ifood' | 'own';
+
+/** Delivery: pedidos do iFood e a entrega própria (motoboy da casa). */
 export function DeliveryScreen() {
+  const [tab, setTab] = useState<DeliveryTab>('own');
+  return (
+    <div>
+      <div className="mx-auto flex max-w-5xl gap-2 px-3 pt-3" role="tablist">
+        {([['own', 'Entrega própria'], ['ifood', 'iFood']] as const).map(([key, label]) => (
+          <button key={key} role="tab" aria-selected={tab === key} onClick={() => setTab(key)} className={`min-h-touch rounded-xl px-4 text-sm font-black ${tab === key ? 'bg-brasa text-white' : 'bg-base text-slate-700'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+      {/* O iFood continua montado (escondido) para não parar de buscar pedidos novos. */}
+      <div hidden={tab !== 'ifood'}><IfoodDeliveryPanel /></div>
+      {tab === 'own' && <OwnDeliveryBoard />}
+    </div>
+  );
+}
+
+function IfoodDeliveryPanel() {
   const products = useTcheStore((s) => s.products);
   const sound = useTcheStore((s) => s.soundEnabled);
   const orders = useDeliveryOrders((s) => s.orders);

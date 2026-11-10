@@ -728,6 +728,50 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT count(*) FROM cash_movements WHERE session_id = '${session.id}'`)).toBe('2');
   });
 
+  it('entrega própria: taxa na conta, rota, entregue e acerto com o dinheiro no caixa e o ganho em sangria', async () => {
+    login(OWNER_PIN);
+    const zone = ok(st().saveDeliveryZone({ name: 'Centro', fee: 6, eta_minutes: 30, active: true }));
+    const courier = ok(st().saveCourier({ name: 'Juca', phone: '53999990000', fee_per_delivery: 5, active: true }));
+    login(CASHIER_PIN);
+    ok(st().openCashSession(50));
+    const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
+    const delivery = { customerName: 'Maria', phone: '53 98888-7777', address: 'Rua XV de Novembro, 10', reference: '', zoneId: zone.id, changeFor: null };
+    const onDelivery = ok(st().createPickupOrder({ lines: [line], fulfillment: 'DELIVERY', customerName: 'Maria', delivery: { ...delivery, payOnDelivery: true } }));
+    const paidNow = ok(st().createPickupOrder({ lines: [line], fulfillment: 'DELIVERY', customerName: 'Maria', delivery: { ...delivery, payOnDelivery: false } }));
+    payCash(paidNow.id);
+    await expectSynced('pedidos de entrega');
+    expect(sql(`SELECT count(*) FROM order_items i JOIN products p ON p.id = i.product_id WHERE p.code = 'TAXA-ENTREGA' AND i.order_id IN ('${onDelivery.id}', '${paidNow.id}')`)).toBe('2');
+    const [d1, d2] = [onDelivery.id, paidNow.id].map((id) => st().ownDeliveries.find((d) => d.order_id === id)!);
+    for (const d of [d1!, d2!]) ok(st().setOwnDeliveryStatus(d.id, 'READY'));
+    ok(st().dispatchOwnDeliveries([d1!.id, d2!.id], courier.id));
+    for (const d of [d1!, d2!]) ok(st().setOwnDeliveryStatus(d.id, 'DELIVERED'));
+    await expectSynced('rota e entregue');
+    // Voltar de etapa direto pelo token do aparelho: recusado.
+    const back = await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, { status: 'PREPARING' });
+    expect(back.status).toBeGreaterThanOrEqual(400);
+    // Entrega para um pedido que não é de entrega: recusada.
+    const takeout = ok(st().createPickupOrder({ lines: [line], fulfillment: 'TAKEOUT', customerName: 'Ana' }));
+    await expectSynced('senha para levar');
+    const forged = await raw('POST', 'own_deliveries', { ...d1!, id: crypto.randomUUID(), order_id: takeout.id, status: 'PREPARING', courier_id: null, courier_fee: null, out_at: null, delivered_at: null });
+    expect(forged.status).toBeGreaterThanOrEqual(400);
+
+    const settlement = ok(st().settleCourier(courier.id, { payFromDrawer: true, auth: MANAGER }));
+    await expectSynced('acerto com o entregador');
+    expect(sql(`SELECT status FROM orders WHERE id = '${onDelivery.id}'`)).toBe('CLOSED');
+    expect(sql(`SELECT count(*) FROM own_deliveries WHERE settlement_id = '${settlement.id}'`)).toBe('2');
+    expect(sql(`SELECT m.type || ' ' || m.amount || ' ' || (m.authorized_by_manager_id IS NOT NULL) FROM courier_settlements s JOIN cash_movements m ON m.id = s.cash_movement_id WHERE s.id = '${settlement.id}'`)).toBe('WITHDRAWAL 10.00 true');
+    expect(sql(`SELECT cash_collected FROM courier_settlements WHERE id = '${settlement.id}'`)).toBe(onDelivery.total_amount.toFixed(2));
+    // Entrega acertada não muda; acerto não se altera; reenvios iguais passam.
+    const settled = st().ownDeliveries.find((d) => d.id === d1!.id)!;
+    expect((await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, { ...settled, courier_fee: 0 })).status).toBeGreaterThanOrEqual(400);
+    expect((await raw('PATCH', `courier_settlements?id=eq.${settlement.id}`, { cash_collected: 0 })).status).toBeGreaterThanOrEqual(400);
+    expect((await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, settled)).status).toBeLessThan(300);
+    expect((await raw('POST', 'courier_settlements?on_conflict=id', settlement, 'resolution=ignore-duplicates,return=minimal')).status).toBeLessThan(300);
+    // Acerto apontando para uma sangria de outro valor: recusado.
+    const wrong = await raw('POST', 'courier_settlements', { ...settlement, id: crypto.randomUUID(), courier_fees: 99 });
+    expect(wrong.status).toBeGreaterThanOrEqual(400);
+  });
+
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
     const dir = join(ROOT, 'supabase', 'migrations');
     for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) psqlFile(target!, join(dir, f), DB);

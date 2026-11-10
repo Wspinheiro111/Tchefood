@@ -77,11 +77,14 @@ export function KdsScreen() {
     return new Set(orders.filter((o) => counterTables.has(o.table_id)).map((o) => o.id));
   }, [orders, tables]);
 
+  const ownDeliveries = useTcheStore((st) => st.ownDeliveries);
   // Pedido com senha (totem / caixa) só entra na produção depois de pago.
   const unpaidPickupIds = useMemo(() => {
     const kioskTables = new Set(tables.filter((t) => t.kind === 'KIOSK').map((t) => t.id));
-    return new Set(orders.filter((o) => kioskTables.has(o.table_id) && o.status !== 'CLOSED').map((o) => o.id));
-  }, [orders, tables]);
+    // Entrega paga na entrega vai para a cozinha logo: o dinheiro chega no acerto do entregador.
+    const payOnDelivery = new Set(ownDeliveries.filter((d) => d.pay_on_delivery && d.status !== 'CANCELED').map((d) => d.order_id));
+    return new Set(orders.filter((o) => kioskTables.has(o.table_id) && o.status !== 'CLOSED' && !payOnDelivery.has(o.id)).map((o) => o.id));
+  }, [orders, tables, ownDeliveries]);
   const hiddenOrderIds = useMemo(() => new Set([...counterOrderIds, ...unpaidPickupIds]), [counterOrderIds, unpaidPickupIds]);
 
   // Alerta sonoro quando chega item novo na fila
