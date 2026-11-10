@@ -689,7 +689,9 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 0.00');
     // Conta fechada não recebe mais pagamento nem reabre.
     expect((await rpc(pay({ method: 'CASH', acquirer: 'CASH_DESK', nsu: null, amount: 1 }))).body).toMatch(/fechada/);
-    expect((await raw('PATCH', `orders?id=eq.${order.id}`, { status: 'OPEN' })).body).toMatch(/não reabre/);
+    // Tentar reabrir (ou reenviar um evento antigo da fila) é ignorado: a conta continua fechada e nada trava.
+    expect((await raw('PATCH', `orders?id=eq.${order.id}`, { status: 'OPEN' })).status).toBeLessThan(300);
+    expect(sql(`SELECT status FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED');
     // O aparelho ficou com a conta aberta (os pagamentos acima foram direto no servidor): fecha aqui sem subir.
     useTcheStore.setState((s) => ({
       orders: s.orders.map((o) => (o.id === order.id ? { ...o, status: 'CLOSED' as const } : o)),

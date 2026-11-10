@@ -174,7 +174,11 @@ BEGIN
         END IF;
     END IF;
     IF OLD.status IN ('CLOSED', 'CANCELED') AND NEW.status IN ('OPEN', 'PAYING') THEN
-        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: a conta % já foi encerrada e não reabre.', OLD.id;
+        -- Não reabre. Em vez de recusar com erro, o UPDATE é ignorado: o reenvio de um evento antigo da
+        -- fila (o aparelho caiu antes de confirmar o lote) volta a ser inofensivo e não trava os eventos
+        -- seguintes da conta; quem tenta reabrir de propósito continua sem conseguir.
+        RAISE NOTICE 'TCHEFOOD_ANTIFRAUDE: a conta % já foi encerrada e não reabre (atualização ignorada).', OLD.id;
+        RETURN NULL;
     END IF;
     RETURN NEW;
 END;
