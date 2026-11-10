@@ -44,7 +44,7 @@ const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: U
   { key: 'map', label: 'Mesas', icon: LayoutGrid, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
   { key: 'kds', label: 'KDS', icon: ChefHat, roles: ['KITCHEN', 'MANAGER', 'OWNER'] },
   { key: 'caixa', label: 'Caixa', icon: Wallet, roles: ['CASHIER', 'MANAGER', 'OWNER'] },
-  { key: 'pickup', label: 'Pedido no Caixa', icon: ShoppingBag, roles: ['CASHIER', 'MANAGER', 'OWNER'] },
+  { key: 'pickup', label: 'PDV / Caixa', icon: ShoppingBag, roles: ['CASHIER', 'MANAGER', 'OWNER'] },
   { key: 'ficha', label: 'Ficha Rápida', icon: Ticket, roles: ['WAITER', 'CASHIER', 'MANAGER', 'OWNER'] },
   { key: 'chopp', label: 'Chopp', icon: Beer, roles: ['KITCHEN', 'CASHIER', 'MANAGER', 'OWNER'] },
   { key: 'qr', label: 'QR Cliente', icon: QrIcon, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
