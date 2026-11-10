@@ -12,7 +12,8 @@
 --     - pagamento aprovado não passa do saldo que o BANCO calculou;
 --     - dinheiro é no caixa (CASH_DESK); cartão e PIX aprovados têm o NSU do
 --       comprovante (o NSU nunca é inventado) e o mesmo NSU da mesma credenciadora
---       e maquininha não paga duas contas em 24 h;
+--       e maquininha não paga duas contas em 24 h (contados pelo relógio do servidor
+--       e também pela hora do comprovante);
 --     - reenvio do mesmo pagamento (mesmo id) devolve o que já está gravado.
 -- 2. Conta só vira CLOSED ou CANCELED com saldo zero no banco (o fechamento normal
 --    é o automático, quando os pagamentos zeram o saldo).
@@ -33,6 +34,9 @@ ALTER TABLE tenants DROP CONSTRAINT IF EXISTS tenants_half_and_half_pricing_chec
 ALTER TABLE tenants ADD CONSTRAINT tenants_half_and_half_pricing_check CHECK (half_and_half_pricing IN ('HIGHEST', 'AVERAGE'));
 
 -- O que o banco precisa para refazer a conta do preço do item.
+-- Quando o servidor registrou o pagamento (o aparelho não escolhe): é a base da trava de comprovante repetido.
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 ALTER TABLE order_items ADD COLUMN IF NOT EXISTS priced_at TIMESTAMPTZ;
 ALTER TABLE order_items ADD COLUMN IF NOT EXISTS half_product_ids UUID[] NOT NULL DEFAULT '{}';
 ALTER TABLE order_items ADD COLUMN IF NOT EXISTS modifier_option_ids UUID[] NOT NULL DEFAULT '{}';
@@ -75,6 +79,16 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: conta não encontrada nesta loja.';
     END IF;
+    -- Dois envios do mesmo pagamento ao mesmo tempo: o segundo espera a conta e, ao entrar, o primeiro
+    -- já gravou. Confere de novo para devolver o gravado em vez de recusar um reenvio legítimo.
+    SELECT * INTO v_existing FROM payments WHERE id = v_pay.id;
+    IF FOUND THEN
+        IF v_existing.tenant_id <> v_tenant OR v_existing.order_id <> v_pay.order_id
+           OR v_existing.amount <> v_pay.amount OR v_existing.status <> v_pay.status THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: já existe outro pagamento com este id.';
+        END IF;
+        RETURN v_existing.id;
+    END IF;
     IF v_order.status NOT IN ('OPEN', 'PAYING') THEN
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a conta já está %.', CASE v_order.status WHEN 'CLOSED' THEN 'fechada' ELSE 'cancelada' END;
     END IF;
@@ -114,8 +128,9 @@ BEGIN
                 SELECT 1 FROM payments p
                  WHERE p.tenant_id = v_tenant AND p.status = 'APPROVED' AND p.acquirer = v_pay.acquirer
                    AND p.nsu = v_pay.nsu AND COALESCE(p.terminal_serial, '') = COALESCE(v_pay.terminal_serial, '')
-                   AND p.created_at > COALESCE(v_pay.created_at, NOW()) - INTERVAL '24 hours'
-                   AND p.created_at < COALESCE(v_pay.created_at, NOW()) + INTERVAL '24 hours'
+                   AND (p.registered_at > NOW() - INTERVAL '24 hours'
+                        OR (p.created_at > COALESCE(v_pay.created_at, NOW()) - INTERVAL '24 hours'
+                            AND p.created_at < COALESCE(v_pay.created_at, NOW()) + INTERVAL '24 hours'))
             ) THEN
                 RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o NSU % já pagou outra conta (mesma credenciadora e maquininha).', v_pay.nsu;
             END IF;

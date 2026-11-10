@@ -661,6 +661,13 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await rpc(first)).status).toBe(200);
     expect(sql(`SELECT count(*) FROM payments WHERE id = '${first.id}'`)).toBe('1');
     expect((await rpc(pay({}))).body).toMatch(/já pagou outra conta/);
+    // Hora do comprovante forjada (3 dias atrás) não escapa da trava: vale também a hora em que o servidor registrou.
+    expect((await rpc(pay({ created_at: new Date(Date.now() - 3 * 86400_000).toISOString() }))).body).toMatch(/já pagou outra conta/);
+    // Dois envios simultâneos do mesmo pagamento: os dois voltam 200 e só um registro entra.
+    const twin = pay({ nsu: '556677', amount: 1 });
+    const both = await Promise.all([rpc(twin), rpc(twin)]);
+    expect(both.map((r) => r.status)).toEqual([200, 200]);
+    expect(sql(`SELECT count(*) FROM payments WHERE id = '${twin.id}'`)).toBe('1');
     // Recusado na maquininha: não mexe no saldo e não precisa de NSU.
     expect((await rpc(pay({ status: 'DECLINED', nsu: null, amount: 99999 }))).status).toBe(200);
     const left = server();
