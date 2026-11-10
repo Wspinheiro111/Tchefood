@@ -14,3 +14,4 @@ Uma linha por rodada. Processo em `docs/auditoria-gpt.md`.
 | #28 | c487f94 | 1 | aguardando | | |
 | #29 | bafe9d6 | 1 | aguardando | | |
 | #30 | 875b9ac | 1 | aguardando | | |
+| #31 | b888e6e | 1 | aguardando | | |

@@ -23,9 +23,11 @@ Will cola no GPT e traz a resposta de volta.
 6. **Re-auditoria.** Se o veredito foi REPROVADO, o Claude gera um novo texto
    para o SHA corrigido (`--rodada 2`, `3`…), citando o que mudou desde a
    rodada anterior. Repete até APROVADO.
-7. **Merge.** O merge não espera a auditoria: segue a regra do Will de
-   10/11/2026 (PR pronto é mergeado sem perguntar). Achado confirmado depois do
-   merge vira PR de seguimento; P0 e P1 têm prioridade sobre trabalho novo.
+7. **Merge.** Decisão do Will (10/11/2026): o PR **só é mergeado depois do
+   `VEREDITO: APROVADO`** do GPT no SHA da cabeça do PR. REPROVADO ou commit
+   novo depois da aprovação exige nova rodada. P3 de um PR aprovado vira PR de
+   seguimento. PRs mergeados antes desta regra (#21 a #31) são auditados
+   depois, e os achados confirmados viram PRs de seguimento.
 8. **Registro.** Cada rodada entra em `docs/auditoria-gpt/registro.md`
    (PR, SHA, rodada, veredito, achados e o que foi feito).
 
