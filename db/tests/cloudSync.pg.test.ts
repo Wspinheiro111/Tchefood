@@ -934,6 +934,28 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(st().tables.find((t) => t.id === cards[1]!.id)!.status).toBe('FREE');
   });
 
+  it('segredos da loja: o token do aparelho não lê o token da Focus nem o CSC, mas lê e altera o cadastro', async () => {
+    sql(`UPDATE tenants SET focus_nfe_token = 'focus-secreto', csc_id = '000001', csc_token = 'csc-secreto' WHERE id = '${TENANT}';`);
+    for (const col of ['focus_nfe_token', 'csc_id', 'csc_token', '*']) {
+      const r = await raw('GET', `tenants?select=${col}&id=eq.${TENANT}`, undefined);
+      expect(r.status, col).toBe(403);
+      expect(r.body).not.toContain('secreto');
+    }
+    // A leitura que o app faz (cloudPull) continua funcionando.
+    const snap = await fetchCloudSnapshot({ url: 'http://cloud.test', anonKey: 'anon', accessToken: 'jwt' }, TENANT,
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-2' }));
+    expect(snap.tenant.cnpj).toBe('11222333000181');
+    expect(JSON.stringify(snap.tenant)).not.toContain('secreto');
+    // O aparelho atualiza o cadastro, e tentar gravar o segredo é recusado.
+    expect((await raw('PATCH', `tenants?id=eq.${TENANT}`, { city: 'Pelotas' })).status).toBeLessThan(300);
+    expect((await raw('PATCH', `tenants?id=eq.${TENANT}`, { focus_nfe_token: 'troca' })).status).toBe(403);
+    expect(sql(`SELECT focus_nfe_token || ' ' || csc_token FROM tenants WHERE id = '${TENANT}'`)).toBe('focus-secreto csc-secreto');
+    // anon não lê a tabela.
+    expect(sql(`SELECT has_table_privilege('anon', 'tenants', 'SELECT')`)).toBe('f');
+    // A Edge Function emit-nfce lê com a service role.
+    expect(sql(`SET ROLE service_role; SELECT focus_nfe_token FROM tenants WHERE id = '${TENANT}';`)).toContain('focus-secreto');
+  });
+
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
     const dir = join(ROOT, 'supabase', 'migrations');
     for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) psqlFile(target!, join(dir, f), DB);
