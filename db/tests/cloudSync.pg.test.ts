@@ -848,6 +848,58 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     closeCashbackOrders([order!.id]);
   });
 
+  it('desconto da nuvem menor adotado com cancelamento na fila: o limite ao bruto não leva a diferença do aparelho', async () => {
+    // Achado do Codex em 38c5497: aparelho com R$ 7 de cashback, nuvem com R$ 5 (outro
+    // aparelho reduziu e o banco estornou). O cancelamento atrás da recusa limita o desconto
+    // do aparelho ao bruto de R$ 5,50; o banco fica com 5 (abaixo do bruto). Levar a diferença
+    // (−2) para a versão seguinte dava 3,50, e o banco recusava a redução.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(OWNER_PIN);
+    const product = (code: string, name: string, price: number) => ok(st().saveProduct({
+      category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    const big = product('456', 'Vazio', 100);
+    const small = product('457', 'Farofa', 5);
+    ok(st().saveTable({ number: 55, label: 'Mesa 55', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('produtos e mesa');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 55)!.id, 1, null));
+    for (const p of [big, small]) {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    }
+    ok(st().dispatchTray(order.id));
+    await expectSynced('conta de R$ 105 + 10%');
+    const phone = '5553988119055';
+    const c = cashbackCustomer(phone, [{ amount: 7, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 7, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 7, remaining_amount: 7 }],
+    });
+    expect(ok(st().redeemCashback(order.id, phone)).amount).toBe(7);
+    await expectSynced('resgate de R$ 7');
+    // Outro aparelho: a conta fica com R$ 5 na nuvem (o banco devolve R$ 2 ao cliente).
+    sql(`UPDATE orders SET discount_amount = 5 WHERE id = '${order.id}';`);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order.id}'`)).toBe('5.00');
+    ok(st().startCheckout(order.id));
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order.id)!;
+    expect(conflict.message).toContain('TCHEFOOD_DESCONTO');
+    // Na fila, atrás da recusa: o cancelamento do vazio (fica a farofa, R$ 5,50 com os 10%).
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === order.id && i.product_id === big.id)!.id, MANAGER));
+    expect(st().orders.find((o) => o.id === order.id)!.discount_amount).toBe(5.5);
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(5);
+    await expectSynced('conta com o desconto menor da nuvem e o cancelamento');
+    const local = st().orders.find((o) => o.id === order.id)!;
+    expect(local.discount_amount).toBe(5);
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe(`${local.discount_amount.toFixed(2)} ${local.total_amount.toFixed(2)}`);
+    closeCashbackOrders([order.id]);
+  });
+
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
     setCashbackClock('2026-11-12T20:00:00-03:00');

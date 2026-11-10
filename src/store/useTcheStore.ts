@@ -3696,26 +3696,32 @@ export const useTcheStore = create<TcheState>()(
           const order = get().orders.find((o) => o.id === orderId);
           if (!order) return fail('Conta não encontrada neste aparelho.');
           // A conta recusada leva o desconto da nuvem. As mudanças seguintes dela (que
-          // esperavam a recusa) são refeitas em ordem, como o banco as aplica: cada uma leva
-          // a diferença que sobrou da anterior, limitada ao bruto daquele momento. Um
-          // cancelamento que limitou o desconto reduz a diferença levada às seguintes (o
-          // banco limita o dele do mesmo jeito ao receber o cancelamento).
-          let carryCents = toCents(cloud) - toCents(Number(rejected.event.payload.discount_amount ?? order.discount_amount));
+          // esperavam a recusa) são refeitas em ordem, como o banco as aplica, a partir do
+          // desconto já refeito da anterior: quando o aparelho limitou o desconto ao bruto
+          // (cancelamento, tirar os 10%), o banco limita o dele ao mesmo bruto, sem levar a
+          // diferença do aparelho (com nuvem 5 e aparelho 7, cancelar até bruto 6 fica 5 no
+          // banco, não 4); outra mudança leva a mesma diferença, limitada ao bruto.
+          let prevOwn = toCents(Number(rejected.event.payload.discount_amount ?? order.discount_amount));
+          let prevNew = toCents(cloud);
+          const rebase = (own: number, gross: number | null): number => {
+            const clamped = gross !== null && own < prevOwn && own === gross;
+            let cents = clamped ? Math.min(prevNew, gross) : Math.max(prevNew + own - prevOwn, 0);
+            if (gross !== null) cents = Math.min(cents, gross);
+            prevOwn = own;
+            prevNew = cents;
+            return cents;
+          };
           const outbox = get().outbox.map((e): SyncEvent => {
             if (e.table !== 'orders' || e.row_id !== orderId || typeof e.payload.discount_amount !== 'number') return e;
             const p = e.payload as Partial<Order>;
-            const own = toCents(p.discount_amount!);
-            let cents = Math.max(own + carryCents, 0);
-            if (typeof p.subtotal_items === 'number' && typeof p.service_fee_amount === 'number') {
-              cents = Math.min(cents, toCents(p.subtotal_items) + toCents(p.service_fee_amount));
-            }
-            carryCents = cents - own;
+            const gross =
+              typeof p.subtotal_items === 'number' && typeof p.service_fee_amount === 'number'
+                ? toCents(p.subtotal_items) + toCents(p.service_fee_amount)
+                : null;
+            const cents = rebase(toCents(p.discount_amount!), gross);
             return { ...e, payload: { ...e.payload, discount_amount: cents / 100 } };
           });
-          const localCents = Math.min(
-            Math.max(toCents(order.discount_amount) + carryCents, 0),
-            toCents(order.subtotal_items) + toCents(order.service_fee_amount),
-          );
+          const localCents = rebase(toCents(order.discount_amount), toCents(order.subtotal_items) + toCents(order.service_fee_amount));
           const recalculated = applyOrderTotals({ ...order, discount_amount: localCents / 100 }, get().orderItems, get().payments);
           if (toCents(recalculated.total_amount) < toCents(order.paid_amount)) {
             return fail('Com o desconto da nuvem a conta fica abaixo do já pago neste aparelho. Chame o gerente para conferir os pagamentos.');
