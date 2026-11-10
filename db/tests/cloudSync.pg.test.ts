@@ -451,6 +451,45 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     setCashbackClock(null);
   });
 
+  it('gerente troca o desconto manual por um menor: o banco aceita; redução sem autorização não', async () => {
+    // Achado do Codex em e5ce9cb: a trava do desconto (P0-01 da rodada 3) não pode barrar a
+    // troca de R$ 10 por R$ 5 autorizada pelo gerente; senão o pagamento do valor certo é recusado.
+    const [order, withCashback] = await cashbackOrders(2, 41);
+    login(CASHIER_PIN);
+    ok(st().applyDiscount(order!.id, 10, MANAGER));
+    await expectSynced('desconto de R$ 10');
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    await expectSynced('troca para R$ 5');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('5.00');
+    // Atualização antiga da fila (sem autorização dessa troca): o desconto fica.
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 3 })).status).toBeLessThan(300);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('5.00');
+    // Reenvio da troca já feita (R$ 10 → R$ 5) depois de outra autorização (R$ 5 → R$ 8): não vale.
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -3, 'Outro aparelho', '{"discount_before": 5, "discount_after": 8}');
+         UPDATE orders SET discount_amount = 8 WHERE id = '${order!.id}';`);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5 })).status).toBeLessThan(300);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('8.00');
+    sql(`UPDATE orders SET discount_amount = 5 WHERE id = '${order!.id}';`);
+    // O pagamento do valor que o aparelho calcula (com R$ 5 de desconto) entra e fecha a conta.
+    payCash(order!.id);
+    await expectSynced('pagamento com o desconto trocado');
+    expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 0.00');
+
+    // Conta com resgate de cashback: nem com autorização o aparelho reduz o desconto.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const c = cashbackCustomer('5553988110007', [{ amount: 5, expires: '2026-12-31' }]);
+    expect((await cashbackRpc(withCashback!.id, c.id, 5)).status).toBe(200);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${withCashback!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', 2, 'Troca', '{"discount_before": 5, "discount_after": 3}');`);
+    expect((await raw('PATCH', `orders?id=eq.${withCashback!.id}`, { discount_amount: 3 })).status).toBeLessThan(300);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${withCashback!.id}'`)).toBe('5.00');
+    closeCashbackOrders([withCashback!.id]);
+    setCashbackClock(null);
+  });
+
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
     setCashbackClock('2026-11-12T20:00:00-03:00');
