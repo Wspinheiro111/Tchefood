@@ -40,6 +40,8 @@ export function supabaseNfceRepository(db: SupabaseLike): NfceRepository {
           .from('order_items')
           .select('id, order_id, product_id, quantity, unit_price, modifiers_unit_price, total_item_price, meat_doneness, status, created_at')
           .eq('order_id', orderId)
+          // Componente de combo (preço zero) não é linha da nota: o combo é o item vendido.
+          .is('combo_parent_item_id', null)
           .order('created_at', { ascending: true })
           .order('id', { ascending: true }),
         db

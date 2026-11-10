@@ -140,8 +140,8 @@ describe('caixa — store', () => {
     expect(lines.join('\n')).toContain('ESPERADO NA GAVETA');
   });
 
-  it('migração v5 → v6 cria as listas do caixa', () => {
-    const out = migratePersisted({ orders: [] }, 5) as Record<string, unknown>;
+  it('migração v7 → v8 cria as listas do caixa', () => {
+    const out = migratePersisted({ orders: [] }, 7) as Record<string, unknown>;
     expect(out.cashSessions).toEqual([]);
     expect(out.cashMovements).toEqual([]);
   });

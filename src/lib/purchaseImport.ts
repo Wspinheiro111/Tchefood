@@ -246,6 +246,7 @@ export function planPurchaseImport(
         barcode: item.barcode,
         sold_by_weight: false,
         tare_weight_grams: 0,
+        is_combo: false,
         created_at: ctx.now,
       };
       created.push(product);

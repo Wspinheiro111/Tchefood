@@ -27,7 +27,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const s = useTcheStore();
   const order = s.orders.find((o) => o.id === orderId);
   const table = s.tables.find((t) => t.id === order?.table_id);
-  const items = useMemo(() => s.orderItems.filter((i) => i.order_id === orderId && i.status !== 'CANCELED'), [s.orderItems, orderId]);
+  const items = useMemo(() => s.orderItems.filter((i) => i.order_id === orderId && i.status !== 'CANCELED' && i.combo_parent_item_id == null), [s.orderItems, orderId]);
 
   const [mode, setMode] = useState<SplitMode>('EQUAL');
   const [peopleLeft, setPeopleLeft] = useState(order?.customer_count ?? 1);
