@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from 'react';
 import { Banknote, CheckCircle2, CreditCard, Minus, Plus, Printer, QrCode as QrIcon, ScanLine, Ticket, Trash2, XCircle } from 'lucide-react';
 import { COUNTER_EVENT_LABEL, useTcheStore, type CounterLine } from '../store/useTcheStore';
 import type { EventTicket, Order, PaymentMethod, Product, SelectedModifier } from '../types';
+import { effectivePrice } from '../lib/catalog';
 import { computeItemTotal, formatBRL, round2, toCents } from '../lib/money';
 import { uuid } from '../lib/ids';
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest } from '../lib/payments/drivers';
@@ -60,6 +61,8 @@ function SellPanel() {
   const categories = useTcheStore((s) => s.categories);
   const products = useTcheStore((s) => s.products);
   const links = useTcheStore((s) => s.productModifierGroups);
+  const schedules = useTcheStore((s) => s.priceSchedules);
+  const priceNow = (p: Product) => effectivePrice(p, schedules, new Date());
   const [cat, setCat] = useState<string>('');
   const [cart, setCart] = useState<CartLine[]>([]);
   const [selected, setSelected] = useState<Product | null>(null);
@@ -82,7 +85,7 @@ function SellPanel() {
     setCart((c) => {
       const found = c.find((l) => l.key === key);
       if (found) return c.map((l) => (l.key === key ? { ...l, quantity: Math.min(l.quantity + quantity, 99) } : l));
-      return [...c, { key, label, product_id: p.id, quantity, modifiers, meat_doneness: doneness, unitTotal: round2(p.price + modsUnit) }];
+      return [...c, { key, label, product_id: p.id, quantity, modifiers, meat_doneness: doneness, unitTotal: round2(priceNow(p) + modsUnit) }];
     });
   };
 
@@ -129,7 +132,7 @@ function SellPanel() {
             <button key={p.id} onClick={() => tap(p)} disabled={!p.available} className="flex min-h-[88px] flex-col justify-between rounded-2xl border border-slate-200 bg-surface p-3 text-left active:bg-slate-200 disabled:opacity-40">
               <span className="line-clamp-2 font-bold leading-tight">{p.name}</span>
               <span className="flex items-center justify-between">
-                <span className="text-lg font-black tabular-nums text-brasa">{formatBRL(p.price)}</span>
+                <span className="text-lg font-black tabular-nums text-brasa">{formatBRL(priceNow(p))}</span>
                 {needsSheet(p) && <Badge className="bg-slate-200">opções</Badge>}
               </span>
             </button>

@@ -876,6 +876,22 @@ describe('sincronização com o Supabase', () => {
     expect(st().qrPlaceOrder(table(4).id, [{ ...line, unit_price: p.price }]).ok).toBe(true);
   });
 
+  it('Ficha Rápida vende pelo preço de happy hour, como a comanda', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-09T19:00:00-03:00'));
+    login(OWNER);
+    const p = product('105');
+    expect(st().savePriceSchedule({ product_id: p.id, name: 'Happy hour', weekdays: [1], start_time: '18:00', end_time: '20:00', price: 20, active: true }).ok).toBe(true);
+    st().logout();
+    login(CASHIER);
+    const sale = st().createCounterSale([{ product_id: p.id, quantity: 2, modifiers: [], meat_doneness: p.requires_meat_doneness ? 'Ao Ponto' : null }]);
+    expect(sale.ok).toBe(true);
+    expect(st().orderItems.filter((i) => i.order_id === (sale as { data: { id: string } }).data.id).map((i) => i.unit_price)).toEqual([20]);
+    vi.setSystemTime(new Date('2026-11-09T20:01:00-03:00'));
+    const after = st().createCounterSale([{ product_id: p.id, quantity: 1, modifiers: [], meat_doneness: p.requires_meat_doneness ? 'Ao Ponto' : null }]);
+    expect(st().orderItems.filter((i) => i.order_id === (after as { data: { id: string } }).data.id).map((i) => i.unit_price)).toEqual([p.price]);
+  });
+
   it('lê tenant_id do JWT e exige a loja na conta', async () => {
     const b64 = (o: object) => btoa(JSON.stringify(o)).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
     const jwt = (claims: object) => `${b64({ alg: 'HS256' })}.${b64(claims)}.sig`;
