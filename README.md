@@ -57,6 +57,11 @@ npm run build
 
 16. **Caixa** (menu Caixa, perfis Caixa, Gerente e Proprietário): abre com o fundo de troco, lança suprimento (entrada) e sangria (saída, com PIN de gerente e motivo, nunca mais do que há na gaveta) e fecha **às cegas**: o operador digita o que contou sem ver o esperado; se não bater, só o gerente vê a diferença e fecha com PIN + motivo (falta vai para o alerta do proprietário). Sai o cupom de fechamento na bobina. Dinheiro recebido com o caixa fechado aparece na tela do Caixa e no Painel do dono. No banco (`db/schema_caixa.sql`) o esperado e a diferença são calculados pelo servidor, movimento é só inserção e caixa fechado não muda mais. Um caixa aberto por loja.
 
+17. **Taxas e recebíveis** (Retaguarda): o proprietário cadastra as taxas do contrato da maquininha (Stone/PagBank × crédito, débito, Pix, voucher × bandeira, com percentual, tarifa fixa e prazo D+n em dias úteis ou corridos) e a comissão de cada app de delivery. Com isso:
+   - **Quanto sobrou?** no Painel do dono: vendido − custo dos produtos (contas fechadas, pelo custo do cadastro) − taxas da maquininha − comissão dos apps, antes das despesas fixas. O que falta cadastrar aparece no próprio card.
+   - **Agenda de recebíveis**: o que cai na conta em cada dia dos próximos 35 dias, já sem a taxa, por maquininha. Pagamento sem taxa cadastrada fica fora da agenda e é avisado (nada é inventado). Feriados não entram no prazo.
+   - As taxas ficam no aparelho da gerência (como a meta do dia), não na nuvem.
+
 ## Etapa 0: cadastros na tela e sincronização
 **Cardápio** — categorias, produtos (código único, preço com 2 casas, NCM/CFOP/CSOSN validados), grupos de adicionais e opções, vínculo produto ↔ adicionais em ordem, **preço por dia/horário** (happy hour; janela que vira a meia-noite; duas regras do mesmo produto não podem se sobrepor) e **esgotado** em um toque, também no KDS para a cozinha.
 - O preço da bandeja é recalculado no store a partir do cardápio (regra de horário + meio a meio). O valor que a tela manda é ignorado.

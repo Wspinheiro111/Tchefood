@@ -11,7 +11,7 @@ import { CHANNEL_DEPENDENCE_PCT } from './ownerDashboard';
 export type AlertTone = 'critical' | 'warning' | 'info';
 
 /** Para onde o botão do aviso leva (aba da Retaguarda ou tela do menu). */
-export type AlertTarget = 'delivery' | 'pickup' | 'map' | 'caixa' | 'chopp' | 'cloud' | 'menu' | 'audit';
+export type AlertTarget = 'delivery' | 'pickup' | 'map' | 'caixa' | 'chopp' | 'cloud' | 'menu' | 'audit' | 'fees';
 
 export interface OwnerAlert {
   id: string;

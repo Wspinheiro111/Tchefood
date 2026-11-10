@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { AlertTriangle, BarChart3, Gauge, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
+import { AlertTriangle, BarChart3, CreditCard, Gauge, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
 import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
@@ -13,12 +13,13 @@ import { CrmPanel } from './CrmPanel';
 import { PurchaseImport } from './PurchaseImport';
 import { KegMonitorScreen } from './KegMonitorScreen';
 import { MenuAdmin } from './admin/MenuAdmin';
+import { FeesReceivables } from './FeesReceivables';
 import { OwnerDashboard, type DashboardNavTarget } from './OwnerDashboard';
 import { StaffAdmin, TablesAdmin } from './admin/TablesStaffAdmin';
 import { CloudAdmin, StoreAdmin } from './admin/StoreCloudAdmin';
 import type { Permission } from '../types';
 
-type Tab = 'owner' | 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 'nfce' | 'purchases' | 'menu' | 'tables' | 'staff' | 'store' | 'cloud' | 'printers' | 'config';
+type Tab = 'owner' | 'fees' | 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 'nfce' | 'purchases' | 'menu' | 'tables' | 'staff' | 'store' | 'cloud' | 'printers' | 'config';
 
 /**
  * Abas da retaguarda. As de relatório seguem o perfil (gerente, proprietário, caixa);
@@ -26,6 +27,7 @@ type Tab = 'owner' | 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 
  */
 const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3; needs: 'reports' | Permission | Permission[] }> = [
   { key: 'owner', label: 'Painel do dono', icon: Gauge, needs: 'reports' },
+  { key: 'fees', label: 'Taxas e recebíveis', icon: CreditCard, needs: 'reports' },
   { key: 'dash', label: 'Turno', icon: BarChart3, needs: 'reports' },
   { key: 'recon', label: 'Conciliação', icon: Receipt, needs: 'reports' },
   { key: 'waiters', label: 'Rateio 10%', icon: Users, needs: 'reports' },
@@ -94,6 +96,7 @@ export function BackOffice({ onExit }: { onExit?: (view: BackOfficeExit) => void
         ))}
       </div>
       {tab === 'owner' && <OwnerDashboard onNavigate={navigate} />}
+      {tab === 'fees' && <FeesReceivables />}
       {tab === 'dash' && <Dashboard />}
       {tab === 'recon' && <Reconciliation />}
       {tab === 'waiters' && <WaiterSplit />}
