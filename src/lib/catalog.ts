@@ -246,9 +246,17 @@ export function validatePriceSchedule(s: PriceScheduleDraft, all: PriceSchedule[
   return okCheck;
 }
 
-/** Minuto da semana no horário local do aparelho da loja. */
+/** Fuso da loja: o mesmo que o banco usa para conferir o preço (db/schema_dinheiro_servidor.sql). */
+export const STORE_TIME_ZONE = 'America/Sao_Paulo';
+const STORE_CLOCK = new Intl.DateTimeFormat('en-US', {
+  timeZone: STORE_TIME_ZONE, weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+});
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/** Minuto da semana no horário da loja (America/Sao_Paulo), não no relógio do aparelho. */
 export function minuteOfWeek(at: Date): number {
-  return at.getDay() * MINUTES_PER_DAY + at.getHours() * 60 + at.getMinutes();
+  const parts = Object.fromEntries(STORE_CLOCK.formatToParts(at).map((x) => [x.type, x.value]));
+  return WEEKDAYS.indexOf(parts.weekday ?? '') * MINUTES_PER_DAY + Number(parts.hour ?? 0) * 60 + Number(parts.minute ?? 0);
 }
 
 /** Regra de horário que vale agora para o produto (no máximo uma: sobreposição é recusada no cadastro). */

@@ -76,9 +76,9 @@ describe('preço por horário', () => {
   it('preço efetivo dentro e fora da janela', () => {
     const p = product('101');
     const rules = [schedule()];
-    const monday19 = new Date(2026, 10, 9, 19, 0); // 09/11/2026 é segunda
-    const monday20 = new Date(2026, 10, 9, 20, 0);
-    const saturday19 = new Date(2026, 10, 14, 19, 0);
+    const monday19 = new Date('2026-11-09T19:00:00-03:00'); // 09/11/2026 é segunda
+    const monday20 = new Date('2026-11-09T20:00:00-03:00');
+    const saturday19 = new Date('2026-11-14T19:00:00-03:00');
     expect(effectivePrice(p, rules, monday19)).toBe(9.9);
     expect(effectivePrice(p, rules, monday20)).toBe(p.price);
     expect(effectivePrice(p, rules, saturday19)).toBe(p.price);
@@ -87,7 +87,7 @@ describe('preço por horário', () => {
 
   it('a bandeja usa o preço do cardápio no horário, não o que a tela mandou', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 10, 9, 19, 0));
+    vi.setSystemTime(new Date('2026-11-09T19:00:00-03:00'));
     login(OWNER);
     const p = product('101');
     const r = st().savePriceSchedule({ product_id: p.id, name: 'Happy hour', weekdays: [1], start_time: '18:00', end_time: '20:00', price: 50, active: true });
@@ -862,14 +862,14 @@ describe('sincronização com o Supabase', () => {
 
   it('Cardápio QR não envia com preço diferente do que o cliente viu', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 10, 9, 19, 0));
+    vi.setSystemTime(new Date('2026-11-09T19:00:00-03:00'));
     login(OWNER);
     const p = product('105');
     expect(st().savePriceSchedule({ product_id: p.id, name: 'Happy hour', weekdays: [1], start_time: '18:00', end_time: '20:00', price: 20, active: true }).ok).toBe(true);
     st().logout();
     const line = { product_id: p.id, half_product_ids: [], quantity: 1, unit_price: 20, modifiers: [], modifiers_unit_price: 0, meat_doneness: p.requires_meat_doneness ? 'Ao Ponto' : null, quick_tags: [], free_notes: '', sector: p.sector };
     // O happy hour acabou entre montar o carrinho e enviar.
-    vi.setSystemTime(new Date(2026, 10, 9, 20, 1));
+    vi.setSystemTime(new Date('2026-11-09T20:01:00-03:00'));
     const r = st().qrPlaceOrder(table(4).id, [line]);
     expect(r).toMatchObject({ ok: false });
     if (!r.ok) expect(r.error).toContain(QR_PRICE_CHANGED);
