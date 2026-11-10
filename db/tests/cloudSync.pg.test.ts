@@ -700,6 +700,10 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     });
     expect(blocked.ok).toBe(false);
     expect(st().startCheckout(order!.id).ok).toBe(false);
+    // Achado do Codex em 9b525b6: nem a maquininha começa uma cobrança nova com o valor antigo.
+    const terminal = st().beginTerminalCharge(order!.id, `req-${Math.random()}`, local.remaining_balance);
+    expect(terminal.ok).toBe(false);
+    if (!terminal.ok) expect(terminal.error).toContain('use o desconto da nuvem');
     // O gerente adota o desconto da nuvem: a conta converge e o pagamento do valor certo fecha.
     expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
     await expectSynced('conta com o desconto da nuvem');

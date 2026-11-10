@@ -1812,6 +1812,9 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(orderId);
           if (!res.ok) return res;
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          // Desconto diferente na nuvem: nenhuma cobrança nova na maquininha com o valor
+          // antigo. A resposta de uma cobrança já em andamento continua sendo registrada.
+          if (cloudDiscountConflict(orderId)) return fail(CLOUD_DISCOUNT_CONFLICT);
           if (get().tray.some((t) => t.order_id === orderId)) return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
           const value = round2(amount);
           if (!(value > 0) || toCents(value) > toCents(res.data.remaining_balance)) return fail('Valor maior que o saldo restante da mesa.');
