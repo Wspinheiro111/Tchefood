@@ -91,7 +91,7 @@ import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
 import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
 import { comboChildrenOf, comboComponents, comboNeedsDoneness, expandComboItem } from '../lib/combos';
-import { adaptTable, MERGE, mergeRows, mergeStaffWithoutPins, mergeStaffWithPins, pendingRowKeys, type CloudSnapshot } from '../lib/sync/cloudPull';
+import { adaptTable, MERGE, mergeCashback, mergeRows, mergeStaffWithoutPins, mergeStaffWithPins, pendingRowKeys, type CloudSnapshot } from '../lib/sync/cloudPull';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
 import { computeNetWeight } from '../lib/scale';
@@ -877,6 +877,84 @@ export const useTcheStore = create<TcheState>()(
 
       const CHARGE_LOCK_ERROR = 'Há uma cobrança em andamento na maquininha para esta mesa. Aguarde a resposta.';
 
+      /**
+       * Espelho local do estorno de cashback (tchefood_orders_cashback_refund): quando um
+       * ajuste deixa o desconto da conta abaixo do cashback usado, a diferença volta ao
+       * cliente, cada parte com a validade do crédito de onde saiu (decisão do Will,
+       * 10/11/2026: o cashback vale 30 dias de quando foi gerado, com ou sem cancelamento).
+       * Não sobe: o banco grava o dele ao receber o ajuste, e a leitura da nuvem acerta.
+       */
+      const cashbackRefundMirror = (
+        order: Order, discountAfter: number, userId: UUID, ts: string, meta: Record<string, unknown>,
+      ): { refunds: CashbackLedgerEntry[]; refundLogs: AuditLog[] } => {
+        const ledger = get().cashbackLedger;
+        const redeem = ledger.find((e) => e.order_id === order.id && e.entry_type === 'REDEEM');
+        if (!redeem) return { refunds: [], refundLogs: [] };
+        const netRedeemed = toCents(redeem.amount) - ledger
+          .filter((e) => e.order_id === order.id && e.entry_type === 'REFUND')
+          .reduce((sum, e) => sum + toCents(e.amount), 0);
+        const refundCents = netRedeemed - toCents(discountAfter);
+        if (refundCents <= 0) return { refunds: [], refundLogs: [] };
+        const refunds: CashbackLedgerEntry[] = planCashbackRefund(ledger, redeem, fromCentsLocal(refundCents)).map((part) => ({
+          id: uuid(),
+          tenant_id: order.tenant_id,
+          customer_id: redeem.customer_id,
+          order_id: order.id,
+          entry_type: 'REFUND',
+          amount: part.amount,
+          remaining_amount: part.amount,
+          base_amount: null,
+          pct: null,
+          valid_from: part.valid_from,
+          expires_at: part.expires_at,
+          created_by_user_id: userId,
+          created_at: ts,
+          refund_of_id: part.refund_of_id,
+        }));
+        const refundLogs: AuditLog[] = refunds.map((refund) => ({
+          ...buildAudit({
+            order_id: order.id,
+            performed_by_user_id: userId,
+            authorized_by_manager_id: null,
+            action_type: 'CASHBACK_REFUNDED',
+            amount_impact: refund.amount,
+            reason: 'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)',
+            metadata: {
+              table: tableLabel(order.table_id),
+              customer_id: refund.customer_id,
+              amount: refund.amount,
+              redeem_id: redeem.id,
+              refund_id: refund.id,
+              refund_of_id: refund.refund_of_id ?? null,
+              expires_at: refund.expires_at,
+              already_expired: new Date(refund.expires_at!) <= new Date(ts),
+              discount_before: order.discount_amount,
+              discount_after: discountAfter,
+              ...meta,
+            },
+          }),
+          whatsapp_alert_sent: false,
+        }));
+        return { refunds, refundLogs };
+      };
+
+      /** Estado com o espelho do estorno aplicado (extrato, saldo do cliente e audit_logs). */
+      const withCashbackRefund = (
+        s: { cashbackLedger: CashbackLedgerEntry[]; loyaltyCustomers: LoyaltyCustomer[] },
+        auditLogs: AuditLog[],
+        mirror: { refunds: CashbackLedgerEntry[]; refundLogs: AuditLog[] },
+        ts: string,
+      ) => {
+        if (!mirror.refunds.length) return {};
+        const cashbackLedger = [...s.cashbackLedger, ...mirror.refunds];
+        const customerId = mirror.refunds[0]!.customer_id;
+        return {
+          cashbackLedger,
+          loyaltyCustomers: s.loyaltyCustomers.map((c) => (c.id === customerId ? { ...c, cashback_balance: balanceCashback(cashbackLedger, c.id, new Date(ts)) } : c)),
+          auditLogs: [...[...mirror.refundLogs].reverse(), ...auditLogs],
+        };
+      };
+
       /** A nuvem recusou a conta por ter outro desconto lá (outro aparelho ou o cashback). */
       const cloudDiscountConflict = (orderId: UUID): boolean =>
         (get().syncRejected ?? []).some((r) => r.event.table === 'orders' && r.event.row_id === orderId && cloudDiscountOf(r.message) !== null);
@@ -1446,13 +1524,6 @@ export const useTcheStore = create<TcheState>()(
           // a diferença volta para o cliente (REFUND). Quem grava na nuvem é o banco, no
           // cancelamento do item (tchefood_orders_cashback_refund), pela mesma conta; aqui
           // fica o espelho local, que não sobe.
-          const redeem = get().cashbackLedger.find((e) => e.order_id === order.id && e.entry_type === 'REDEEM');
-          const netRedeemed = redeem
-            ? toCents(redeem.amount) - get().cashbackLedger
-              .filter((e) => e.order_id === order.id && e.entry_type === 'REFUND')
-              .reduce((sum, e) => sum + toCents(e.amount), 0)
-            : 0;
-          const refundCents = netRedeemed - toCents(simulated.discount_amount);
           const trayBlock = blocksSettleWithTray(simulated);
           if (trayBlock) return fail(trayBlock);
 
@@ -1508,50 +1579,7 @@ export const useTcheStore = create<TcheState>()(
             });
           });
 
-          // Cada parte volta com a validade do crédito de onde saiu (decisão do Will,
-          // 10/11/2026: o cashback vale 30 dias de quando foi gerado, com ou sem cancelamento).
-          const refunds: CashbackLedgerEntry[] = redeem && refundCents > 0
-            ? planCashbackRefund(get().cashbackLedger, redeem, fromCentsLocal(refundCents)).map((part) => ({
-              id: uuid(),
-              tenant_id: order.tenant_id,
-              customer_id: redeem.customer_id,
-              order_id: order.id,
-              entry_type: 'REFUND',
-              amount: part.amount,
-              remaining_amount: part.amount,
-              base_amount: null,
-              pct: null,
-              valid_from: part.valid_from,
-              expires_at: part.expires_at,
-              created_by_user_id: user.id,
-              created_at: ts,
-              refund_of_id: part.refund_of_id,
-            }))
-            : [];
-          const refundLogs: AuditLog[] = refunds.map((refund) => ({
-            ...buildAudit({
-              order_id: order.id,
-              performed_by_user_id: user.id,
-              authorized_by_manager_id: null,
-              action_type: 'CASHBACK_REFUNDED',
-              amount_impact: refund.amount,
-              reason: 'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)',
-              metadata: {
-                table: tableLabel(order.table_id),
-                customer_id: refund.customer_id,
-                amount: refund.amount,
-                redeem_id: redeem!.id,
-                refund_id: refund.id,
-                refund_of_id: refund.refund_of_id ?? null,
-                expires_at: refund.expires_at,
-                already_expired: new Date(refund.expires_at!) <= new Date(ts),
-                discount_before: order.discount_amount,
-                discount_after: simulated.discount_amount,
-                item_cancel_audit_id: log.id,
-              },
-            }),
-            whatsapp_alert_sent: false,
-          }));
+          const { refunds, refundLogs } = cashbackRefundMirror(order, simulated.discount_amount, user.id, ts, { item_cancel_audit_id: log.id });
 
           set((s) => {
             const orderItems = s.orderItems.map((i) => canceledById.get(i.id) ?? i);
@@ -1564,16 +1592,9 @@ export const useTcheStore = create<TcheState>()(
             }
             const patch = commitAdjustment(s, recalculated, orderItems, [...canceledById.values()], [log, ...partLogs], auth.managerPin);
             // Estorno: só local (o banco grava o dele ao receber o cancelamento).
-            const cashbackLedger = refunds.length ? [...s.cashbackLedger, ...refunds] : s.cashbackLedger;
-            const refundCustomer = refunds[0]?.customer_id;
-            const loyaltyCustomers = refundCustomer
-              ? s.loyaltyCustomers.map((c) => (c.id === refundCustomer ? { ...c, cashback_balance: balanceCashback(cashbackLedger, c.id, new Date(ts)) } : c))
-              : s.loyaltyCustomers;
             return {
               ...patch,
-              ...(refundLogs.length ? { auditLogs: [...refundLogs.reverse(), ...patch.auditLogs!] } : {}),
-              cashbackLedger,
-              loyaltyCustomers,
+              ...withCashbackRefund(s, patch.auditLogs!, { refunds, refundLogs }, ts),
               kegTaps,
               outbox: [...patch.outbox!, ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k))],
             };
@@ -1611,10 +1632,15 @@ export const useTcheStore = create<TcheState>()(
               manager_name: authRes.data.name,
             },
           });
+          // Sem os 10%, o desconto pode ficar limitado ao novo bruto e abaixo do cashback
+          // usado: o banco devolve a diferença; aqui fica o mesmo espelho do cancelamento.
+          const ts = nowISO();
+          const mirror = cashbackRefundMirror(order, simulated.discount_amount, user.id, ts, { service_fee_audit_id: log.id });
           set((s) => {
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, charge_service_fee: false }, s.orderItems, s.payments);
-            return commitAdjustment(s, recalculated, s.orderItems, [], log, auth.managerPin);
+            const patch = commitAdjustment(s, recalculated, s.orderItems, [], log, auth.managerPin);
+            return { ...patch, ...withCashbackRefund(s, patch.auditLogs!, mirror, ts) };
           });
           return { ok: true, data: log };
         },
@@ -1655,6 +1681,9 @@ export const useTcheStore = create<TcheState>()(
           const discount = round2(amount);
           if (!(discount > 0)) return fail('Informe um desconto maior que zero.');
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          // Com o conflito pendente, a autorização nova descreveria a troca a partir do
+          // desconto velho deste aparelho e não bateria com a nuvem depois de adotar o dela.
+          if (cloudDiscountConflict(orderId)) return fail(CLOUD_DISCOUNT_CONFLICT);
           // O desconto manual substitui o valor; com cashback já abatido ele apagaria o resgate.
           if (get().cashbackLedger.some((e) => e.order_id === orderId && e.entry_type === 'REDEEM')) {
             return fail('Esta conta já usou cashback. Desconto manual não pode ser combinado.');
@@ -2803,6 +2832,7 @@ export const useTcheStore = create<TcheState>()(
           if (!res.ok) return res;
           const order = res.data;
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (cloudDiscountConflict(orderId)) return fail(CLOUD_DISCOUNT_CONFLICT);
           const now = new Date();
           if (!isCashbackDay(now)) return fail(`Cashback só pode ser usado de ${CASHBACK_DAYS_LABEL}.`);
           if (get().cashbackLedger.some((e) => e.order_id === orderId && e.entry_type === 'REDEEM')) return fail('Esta conta já usou cashback.');
@@ -3526,8 +3556,8 @@ export const useTcheStore = create<TcheState>()(
             kegTapProducts: [],
             kegHistory: [],
             eventTickets: [],
-            loyaltyCustomers: [],
-            cashbackLedger: [],
+            loyaltyCustomers: [...(snapshot.loyaltyCustomers ?? [])],
+            cashbackLedger: [...(snapshot.cashbackLedger ?? [])],
             tray: [],
             pendingCharges: [],
             outbox: extraTables.map((t) => syncEvent('dining_tables', 'INSERT', t)),
@@ -3569,6 +3599,10 @@ export const useTcheStore = create<TcheState>()(
             purchaseInvoices: mergeRows(state.purchaseInvoices, snapshot.purchaseInvoices, pending, MERGE.purchaseInvoices),
             deliveryZones: mergeRows(state.deliveryZones, snapshot.deliveryZones, pending, MERGE.deliveryZones),
             couriers: mergeRows(state.couriers, snapshot.couriers, pending, MERGE.couriers),
+            ...(snapshot.loyaltyCustomers && snapshot.cashbackLedger
+              ? mergeCashback(state, { loyaltyCustomers: snapshot.loyaltyCustomers, cashbackLedger: snapshot.cashbackLedger },
+                [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)])
+              : {}),
             // Desativado em outro aparelho: sai da sessão aqui também.
             currentUserId: currentStillActive ? state.currentUserId : null,
             pullStatus: { last_pull_at: nowISO(), last_error: null, cloud_staff_unknown: team.unknown },

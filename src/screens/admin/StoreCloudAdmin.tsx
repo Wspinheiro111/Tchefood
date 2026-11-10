@@ -351,7 +351,7 @@ function JoinStorePanel({ session, team, onDone }: { session: CloudSession; team
   return (
     <Panel title={<span className="flex items-center gap-2"><CloudDownload className="h-4 w-4" /> Baixar a loja desta conta</span>}>
       <p className="mb-3 text-sm text-slate-500">
-        A loja já tem equipe na nuvem. Este aparelho troca os dados dele (cardápio, mesas, equipe e histórico de demonstração) pelos cadastros da loja: cardápio, combos, mesas, equipe, maquininhas, permissões e fornecedores. Contas e pagamentos de outros aparelhos não vêm. Confirme com o PIN de um gerente ou do proprietário da loja.
+        A loja já tem equipe na nuvem. Este aparelho troca os dados dele (cardápio, mesas, equipe e histórico de demonstração) pelos cadastros da loja: cardápio, combos, mesas, equipe, maquininhas, permissões e fornecedores. Clientes e saldo do cashback vêm; contas e pagamentos de outros aparelhos não. Confirme com o PIN de um gerente ou do proprietário da loja.
       </p>
       <FormError error={error} />
       {managers.length === 0 ? (

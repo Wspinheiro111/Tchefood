@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { planCashbackRefund } from '../lib/loyalty';
+import { mergeCashback } from '../lib/sync/cloudPull';
 import type { CashbackLedgerEntry } from '../types';
 
 // Decisão do Will (10/11/2026): o cashback vale 30 dias de quando foi gerado, com ou sem
@@ -37,5 +38,36 @@ describe('estorno do cashback', () => {
     expect(planCashbackRefund([old, fresh, legacy], legacy, 10)).toEqual([
       { refund_of_id: null, amount: 10, valid_from: fresh.valid_from, expires_at: fresh.expires_at },
     ]);
+  });
+});
+
+describe('cashback vindo da nuvem', () => {
+  const earn = entry({ id: 'e1', customer_id: 'c1', amount: 10, remaining_amount: 10, valid_from: '2026-11-01T03:00:00.000Z', expires_at: '2026-12-01T03:00:00.000Z' });
+  const customer = { id: 'c1', tenant_id: 't', name: null, phone_whatsapp: '5555999990000', cpf: null, whatsapp_opt_in: false, opt_in_at: null, cashback_balance: 10, total_spent: 0, visits_count: 0, last_visit_at: null, created_at: '2026-11-01T00:00:00.000Z' };
+
+  it('a nuvem substitui o extrato e o estorno local (espelho) sai', () => {
+    const mirror = entry({ id: 'm', customer_id: 'c1', order_id: 'o', entry_type: 'REFUND', amount: 3, remaining_amount: 3 });
+    const cloudRefund = { ...mirror, id: 'r-cloud' };
+    const out = mergeCashback(
+      { loyaltyCustomers: [customer], cashbackLedger: [{ ...earn, remaining_amount: 0 }, mirror] },
+      { loyaltyCustomers: [{ ...customer, cashback_balance: 13 }], cashbackLedger: [earn, cloudRefund] },
+      [],
+    );
+    expect(out.cashbackLedger.map((e) => [e.id, e.remaining_amount])).toEqual([['e1', 10], ['r-cloud', 3]]);
+    expect(out.loyaltyCustomers[0]!.cashback_balance).toBe(13);
+  });
+
+  it('cliente com resgate ou conta com cashback ainda não aceitos fica como está aqui', () => {
+    const redeem = entry({ id: 'r', customer_id: 'c1', order_id: 'o', entry_type: 'REDEEM', amount: 10 });
+    const local = { loyaltyCustomers: [{ ...customer, cashback_balance: 0 }], cashbackLedger: [{ ...earn, remaining_amount: 0 }, redeem] };
+    const cloud = { loyaltyCustomers: [customer], cashbackLedger: [earn] };
+    for (const pending of [
+      [{ table: 'cashback_ledger' as const, row_id: 'r', payload: { customer_id: 'c1' } }],
+      [{ table: 'orders' as const, row_id: 'o', payload: {} }],
+    ]) {
+      const out = mergeCashback(local, cloud, pending);
+      expect(out.cashbackLedger.map((e) => [e.id, e.remaining_amount])).toEqual([['e1', 0], ['r', 0]]);
+      expect(out.loyaltyCustomers[0]!.cashback_balance).toBe(0);
+    }
   });
 });
