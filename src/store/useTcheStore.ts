@@ -20,6 +20,10 @@ import type {
   CashbackLedgerEntry,
   CashMovement,
   CashSession,
+  Courier,
+  CourierSettlement,
+  DeliveryZone,
+  OwnDelivery,
   Category,
   DiningTable,
   EventTicket,
@@ -70,7 +74,7 @@ import {
   type TableDraft,
 } from '../lib/catalog';
 import { can, PERMISSION_LABEL } from '../lib/permissions';
-import { nowISO, uuid } from '../lib/ids';
+import { nowISO, stableUuid, uuid } from '../lib/ids';
 import { idbStorage } from '../lib/idbStorage';
 import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
@@ -87,6 +91,7 @@ import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '.
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
 import { computeNetWeight } from '../lib/scale';
 import { cashSummary, closingDifference, validCashAmount } from '../lib/cashRegister';
+import { normalizePhone, validateCourier, validateDeliveryInput, validateZone, type DeliveryAddressInput } from '../lib/ownDelivery';
 import {
   availableCashback,
   balanceCashback,
@@ -192,7 +197,12 @@ export interface PickupOrderInput {
   lines: PickupLine[];
   fulfillment: FulfillmentType;
   customerName: string | null;
+  /** Obrigatório na entrega própria (fulfillment DELIVERY). */
+  delivery?: DeliveryAddressInput;
 }
+
+/** Código do produto técnico da taxa de entrega (fora do cardápio). */
+export const DELIVERY_FEE_CODE = 'TAXA-ENTREGA';
 
 export interface LoyaltyInput {
   phone: string;
@@ -250,6 +260,11 @@ interface DataSlice {
   /** Caixa (db/schema_caixa.sql): turnos de caixa e movimentos de suprimento/sangria. */
   cashSessions: CashSession[];
   cashMovements: CashMovement[];
+  /** Entrega própria (db/schema_entrega.sql). */
+  deliveryZones: DeliveryZone[];
+  couriers: Courier[];
+  ownDeliveries: OwnDelivery[];
+  courierSettlements: CourierSettlement[];
 }
 
 /** Sessão do aparelho na nuvem (Supabase Auth). Tokens ficam só neste aparelho. */
@@ -490,6 +505,21 @@ interface Actions {
    * só fecha com PIN de gerente + motivo (auth); sem auth devolve o erro com a diferença.
    */
   closeCashSession: (countedCash: number, notes: string | null, auth: ManagerAuthInput | null) => ActionResult<CashSession>;
+
+  // Entrega própria
+  saveDeliveryZone: (draft: Pick<DeliveryZone, 'name' | 'fee' | 'eta_minutes' | 'active'> & { id?: UUID }) => ActionResult<DeliveryZone>;
+  saveCourier: (draft: Pick<Courier, 'name' | 'phone' | 'fee_per_delivery' | 'active'> & { id?: UUID }) => ActionResult<Courier>;
+  /** Pronto (saiu da cozinha) ou entregue. */
+  setOwnDeliveryStatus: (deliveryId: UUID, status: 'READY' | 'DELIVERED') => ActionResult<OwnDelivery>;
+  /** Entregador sai com as entregas escolhidas (rota). */
+  dispatchOwnDeliveries: (deliveryIds: UUID[], courierId: UUID) => ActionResult<OwnDelivery[]>;
+  /** Cancela a entrega de um pedido ainda não pago (PIN de gerente; desfaz a senha). */
+  cancelOwnDelivery: (deliveryId: UUID, auth: ManagerAuthInput) => ActionResult;
+  /**
+   * Acerto do entregador: as senhas pagas na entrega recebem o pagamento em dinheiro
+   * e, com payFromDrawer, o que ele ganhou sai do caixa como sangria (PIN de gerente).
+   */
+  settleCourier: (courierId: UUID, opts: { payFromDrawer: boolean; auth: ManagerAuthInput | null }) => ActionResult<CourierSettlement>;
 }
 
 export type TcheState = DataSlice & DeviceSlice & Actions;
@@ -918,6 +948,56 @@ export const useTcheStore = create<TcheState>()(
        * Desiste de uma venda técnica ainda sem pagamento (ficha de balcão ou pedido com senha):
        * PIN de gerente, itens CANCELED com um audit_log cada, conta CANCELED.
        */
+      /**
+       * Produto técnico "Taxa de entrega" (e a categoria inativa dele), criado na primeira
+       * entrega com taxa. Fica fora do cardápio (inativo) e da cozinha (setor NONE).
+       */
+      /** A senha de entrega foi desfeita: a entrega em andamento sai do quadro junto. */
+      const cancelDeliveryOf = (orderId: UUID): void => {
+        const d = get().ownDeliveries.find((x) => x.order_id === orderId);
+        if (!d || d.status === 'DELIVERED' || d.status === 'CANCELED') return;
+        const updated: OwnDelivery = { ...d, status: 'CANCELED' };
+        set((s) => ({
+          ownDeliveries: s.ownDeliveries.map((x) => (x.id === d.id ? updated : x)),
+          outbox: [...s.outbox, syncEvent('own_deliveries', 'UPDATE', updated)],
+        }));
+      };
+
+      const ensureDeliveryFeeProduct = (s0: TcheState): { category: Category | null; product: Product | null } => {
+        if (s0.products.some((p) => p.code === DELIVERY_FEE_CODE)) return { category: null, product: null };
+        const existingCat = s0.categories.find((c) => c.name === 'Taxas (fora do cardápio)');
+        const category: Category | null = existingCat
+          ? null
+          : { id: stableUuid(`taxas:${s0.tenant.id}`), tenant_id: s0.tenant.id, name: 'Taxas (fora do cardápio)', sort_order: 999, icon_name: null, active: false };
+        // Id fixo por loja: dois aparelhos que criem ao mesmo tempo mandam o mesmo registro.
+        const product: Product = {
+          id: stableUuid(`taxa-entrega:${s0.tenant.id}`),
+          tenant_id: s0.tenant.id,
+          category_id: existingCat?.id ?? category!.id,
+          code: DELIVERY_FEE_CODE,
+          name: 'Taxa de entrega',
+          description: 'Taxa do bairro na entrega própria (valor vem do cadastro do bairro).',
+          price: 0,
+          sold_by_weight: false,
+          is_combo: false,
+          tare_weight_grams: 0,
+          cost_price: 0,
+          stock_quantity: 0,
+          barcode: null,
+          sector: 'NONE',
+          available: true,
+          active: false,
+          requires_meat_doneness: false,
+          allows_half_and_half: false,
+          ncm: '00000000',
+          cfop: '5102',
+          csosn_cst: '102',
+          unit: 'UN',
+          created_at: nowISO(),
+        };
+        return { category, product };
+      };
+
       const voidTechnicalSale = (orderId: UUID, auth: ManagerAuthInput, kind: 'COUNTER' | 'KIOSK'): ActionResult => {
         const res = findEditableOrder(orderId);
         if (!res.ok) return res;
@@ -2198,7 +2278,8 @@ export const useTcheStore = create<TcheState>()(
           if (!user) return fail('Sessão expirada.');
           if (!PICKUP_ROLES.includes(user.role)) return fail('Seu perfil não lança pedido com senha.');
           if (input.lines.length === 0) return fail('Escolha pelo menos um item.');
-          if (input.fulfillment !== 'DINE_IN' && input.fulfillment !== 'TAKEOUT') return fail('Escolha comer aqui ou para levar.');
+          if (input.fulfillment !== 'DINE_IN' && input.fulfillment !== 'TAKEOUT' && input.fulfillment !== 'DELIVERY') return fail('Escolha comer aqui, para levar ou entrega.');
+          if (input.fulfillment === 'DELIVERY' && (!input.delivery || !COUNTER_ROLES.includes(user.role))) return fail('Entrega própria é lançada no caixa, com o endereço.');
           const s0 = get();
           const kiosk = s0.tables.find((t) => t.kind === 'KIOSK');
           if (!kiosk) return fail('Totem não configurado.');
@@ -2307,6 +2388,73 @@ export const useTcheStore = create<TcheState>()(
             if (!expanded.ok) return expanded;
             items.push(...expanded.data);
           }
+          // Entrega própria: a taxa do bairro entra como item da conta (produto técnico,
+          // fora do cardápio e da cozinha) e a entrega nasce em preparo.
+          let delivery: OwnDelivery | null = null;
+          let feeCatalog: { category: Category | null; product: Product | null } = { category: null, product: null };
+          if (input.fulfillment === 'DELIVERY') {
+            const d = input.delivery!;
+            const zone = s0.deliveryZones.find((z) => z.id === d.zoneId && z.active);
+            const itemsTotal = applyOrderTotals(order, items, []).total_amount;
+            const err = validateDeliveryInput(d, s0.deliveryZones, round2(itemsTotal + (zone?.fee ?? 0)));
+            if (err || !zone) return fail(err ?? 'Escolha o bairro da entrega.');
+            if (zone.fee > 0) {
+              feeCatalog = ensureDeliveryFeeProduct(s0);
+              const feeProduct = feeCatalog.product ?? s0.products.find((p) => p.code === DELIVERY_FEE_CODE)!;
+              items.push({
+                id: uuid(),
+                order_id: order.id,
+                product_id: feeProduct.id,
+                waiter_id: user.id,
+                quantity: 1,
+                unit_price: zone.fee,
+                modifiers_unit_price: 0,
+                total_item_price: zone.fee,
+                meat_doneness: null,
+                notes: `Entrega: ${zone.name}`,
+                sector: 'NONE',
+                // Taxa não vai para a cozinha.
+                status: 'DELIVERED',
+                is_paid: false,
+                origin: 'WAITER',
+                created_at: ts,
+                prepared_at: ts,
+                canceled_at: null,
+                canceled_by_user_id: null,
+                cancel_reason: null,
+                weight_gross_grams: null,
+                weight_tare_grams: null,
+                weight_source: null,
+                keg_volume_ml: null,
+                combo_parent_item_id: null,
+                priced_at: ts,
+                half_product_ids: [],
+                modifier_option_ids: [],
+              });
+            }
+            delivery = {
+              id: uuid(),
+              tenant_id: s0.tenant.id,
+              order_id: order.id,
+              customer_name: d.customerName.trim().slice(0, 60),
+              customer_phone: normalizePhone(d.phone)!,
+              address: d.address.trim().slice(0, 160),
+              reference: d.reference.trim().slice(0, 120) || null,
+              zone_id: zone.id,
+              zone_name: zone.name,
+              delivery_fee: zone.fee,
+              pay_on_delivery: d.payOnDelivery,
+              change_for: d.payOnDelivery && d.changeFor !== null ? round2(d.changeFor) : null,
+              status: 'PREPARING',
+              courier_id: null,
+              courier_fee: null,
+              out_at: null,
+              delivered_at: null,
+              settlement_id: null,
+              created_at: ts,
+            };
+            if (!order.pickup_name) order.pickup_name = sanitizePickupName(delivery.customer_name);
+          }
           const recalculated = applyOrderTotals(order, items, []);
           if (!(recalculated.total_amount > 0)) return fail('Pedido sem valor.');
           set((s) => {
@@ -2314,10 +2462,17 @@ export const useTcheStore = create<TcheState>()(
             return {
               orders: [...s.orders, recalculated],
               orderItems: [...s.orderItems, ...items],
+              categories: feeCatalog.category ? [...s.categories, feeCatalog.category] : s.categories,
+              products: feeCatalog.product ? [...s.products, feeCatalog.product] : s.products,
+              ownDeliveries: delivery ? [delivery, ...s.ownDeliveries] : s.ownDeliveries,
               kegTaps,
               outbox: [
                 ...s.outbox,
+                ...(feeCatalog.category ? [syncEvent('categories', 'INSERT', feeCatalog.category)] : []),
+                ...(feeCatalog.product ? [syncEvent('products', 'INSERT', feeCatalog.product)] : []),
                 syncEvent('orders', 'INSERT', recalculated),
+                // A entrega sobe antes dos itens: o banco confere o preço da taxa pela entrega (schema_entrega.sql).
+                ...(delivery ? [syncEvent('own_deliveries', 'INSERT', delivery)] : []),
                 ...items.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
                 ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
               ],
@@ -2331,7 +2486,9 @@ export const useTcheStore = create<TcheState>()(
           if (getReviewHold(orderId)) {
             return fail('Há uma cobrança sem confirmação nesta senha. Confira o extrato da maquininha antes de cancelar.');
           }
-          return voidTechnicalSale(orderId, auth, 'KIOSK');
+          const voided = voidTechnicalSale(orderId, auth, 'KIOSK');
+          if (voided.ok) cancelDeliveryOf(orderId);
+          return voided;
         },
 
         exitKioskMode: (auth) => {
@@ -3120,6 +3277,10 @@ export const useTcheStore = create<TcheState>()(
             cashbackLedger: [],
             cashSessions: [],
             cashMovements: [],
+            deliveryZones: [],
+            couriers: [],
+            ownDeliveries: [],
+            courierSettlements: [],
             tray: [],
             outbox: [
               syncEvent('tenants', 'UPDATE', tenant),
@@ -3198,6 +3359,10 @@ export const useTcheStore = create<TcheState>()(
             suppliers: [...snapshot.suppliers],
             supplierProductLinks: [...snapshot.supplierProductLinks],
             purchaseInvoices: [...snapshot.purchaseInvoices],
+            deliveryZones: [...snapshot.deliveryZones],
+            couriers: [...snapshot.couriers],
+            ownDeliveries: [],
+            courierSettlements: [],
             tables: [...tables, ...extraTables],
             orders: [],
             orderItems: [],
@@ -3251,6 +3416,8 @@ export const useTcheStore = create<TcheState>()(
             suppliers: mergeRows(state.suppliers, snapshot.suppliers, pending, MERGE.suppliers),
             supplierProductLinks: mergeRows(state.supplierProductLinks, snapshot.supplierProductLinks, pending, MERGE.supplierProductLinks),
             purchaseInvoices: mergeRows(state.purchaseInvoices, snapshot.purchaseInvoices, pending, MERGE.purchaseInvoices),
+            deliveryZones: mergeRows(state.deliveryZones, snapshot.deliveryZones, pending, MERGE.deliveryZones),
+            couriers: mergeRows(state.couriers, snapshot.couriers, pending, MERGE.couriers),
             // Desativado em outro aparelho: sai da sessão aqui também.
             currentUserId: currentStillActive ? state.currentUserId : null,
             pullStatus: { last_pull_at: nowISO(), last_error: null, cloud_staff_unknown: team.unknown },
@@ -3499,6 +3666,188 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: closed };
         },
 
+        saveDeliveryZone: (draft) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!isManagerRole(user.role)) return fail('Só gerente ou proprietário cadastra bairros.');
+          const err = validateZone(draft);
+          if (err) return fail(err);
+          const existing = draft.id ? get().deliveryZones.find((z) => z.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Bairro não encontrado.');
+          const name = draft.name.trim();
+          if (get().deliveryZones.some((z) => z.id !== draft.id && z.name.toLowerCase() === name.toLowerCase())) return fail('Já existe um bairro com esse nome.');
+          const row: DeliveryZone = { id: existing?.id ?? uuid(), tenant_id: get().tenant.id, name, fee: round2(draft.fee), eta_minutes: draft.eta_minutes, active: draft.active };
+          set((s) => ({
+            deliveryZones: existing ? s.deliveryZones.map((z) => (z.id === row.id ? row : z)) : [...s.deliveryZones, row],
+            outbox: [...s.outbox, syncEvent('delivery_zones', existing ? 'UPDATE' : 'INSERT', row)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        saveCourier: (draft) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!isManagerRole(user.role)) return fail('Só gerente ou proprietário cadastra entregadores.');
+          const err = validateCourier(draft);
+          if (err) return fail(err);
+          const existing = draft.id ? get().couriers.find((c) => c.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Entregador não encontrado.');
+          const row: Courier = {
+            id: existing?.id ?? uuid(),
+            tenant_id: get().tenant.id,
+            name: draft.name.trim(),
+            phone: draft.phone ? normalizePhone(draft.phone) : null,
+            fee_per_delivery: round2(draft.fee_per_delivery),
+            active: draft.active,
+          };
+          set((s) => ({
+            couriers: existing ? s.couriers.map((c) => (c.id === row.id ? row : c)) : [...s.couriers, row],
+            outbox: [...s.outbox, syncEvent('couriers', existing ? 'UPDATE' : 'INSERT', row)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        setOwnDeliveryStatus: (deliveryId, status) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!COUNTER_ROLES.includes(user.role)) return fail('Seu perfil não mexe nas entregas.');
+          const d = get().ownDeliveries.find((x) => x.id === deliveryId);
+          if (!d) return fail('Entrega não encontrada.');
+          const order = get().orders.find((o) => o.id === d.order_id);
+          if (status === 'READY') {
+            if (d.status !== 'PREPARING') return fail('Só entrega em preparo fica pronta.');
+            // Paga antes (no caixa) só sai da cozinha depois de paga; paga na entrega já está na cozinha.
+            if (!d.pay_on_delivery && order?.status !== 'CLOSED') return fail('Pedido ainda não foi pago no caixa.');
+          } else if (d.status !== 'OUT') return fail('Só entrega que saiu pode ser marcada como entregue.');
+          const updated: OwnDelivery = { ...d, status, delivered_at: status === 'DELIVERED' ? nowISO() : d.delivered_at };
+          set((s) => ({
+            ownDeliveries: s.ownDeliveries.map((x) => (x.id === d.id ? updated : x)),
+            outbox: [...s.outbox, syncEvent('own_deliveries', 'UPDATE', updated)],
+          }));
+          return { ok: true, data: updated };
+        },
+
+        dispatchOwnDeliveries: (deliveryIds, courierId) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!COUNTER_ROLES.includes(user.role)) return fail('Seu perfil não mexe nas entregas.');
+          const courier = get().couriers.find((c) => c.id === courierId && c.active);
+          if (!courier) return fail('Escolha o entregador.');
+          const ids = [...new Set(deliveryIds)];
+          if (ids.length === 0) return fail('Escolha as entregas da rota.');
+          const list = ids.map((id) => get().ownDeliveries.find((d) => d.id === id));
+          if (list.some((d) => !d || d.status !== 'READY')) return fail('Só entregas prontas saem para entrega.');
+          const ts = nowISO();
+          const updated = list.map((d) => ({ ...d!, status: 'OUT' as const, courier_id: courier.id, courier_fee: courier.fee_per_delivery, out_at: ts }));
+          const byId = new Map(updated.map((d) => [d.id, d]));
+          set((s) => ({
+            ownDeliveries: s.ownDeliveries.map((d) => byId.get(d.id) ?? d),
+            outbox: [...s.outbox, ...updated.map((d) => syncEvent('own_deliveries', 'UPDATE', d))],
+          }));
+          return { ok: true, data: updated };
+        },
+
+        cancelOwnDelivery: (deliveryId, auth) => {
+          const d = get().ownDeliveries.find((x) => x.id === deliveryId);
+          if (!d) return fail('Entrega não encontrada.');
+          if (d.status === 'DELIVERED' || d.status === 'CANCELED') return fail('Entrega já encerrada.');
+          const order = get().orders.find((o) => o.id === d.order_id);
+          if (order && order.status !== 'CLOSED' && order.status !== 'CANCELED') {
+            // Conta em aberto: desfaz a senha (PIN de gerente, itens auditados) e a entrega sai junto.
+            const voided = get().voidPickupOrder(d.order_id, auth);
+            if (!voided.ok) return voided;
+          } else {
+            // Conta já paga (ou já desfeita no caixa): só a entrega sai do quadro, com PIN de gerente.
+            // O estorno do dinheiro, se houver, é feito à parte no caixa.
+            const authRes = authorizeManager(auth, { orderId: d.order_id, action: 'ITEM_CANCELED' });
+            if (!authRes.ok) return authRes;
+          }
+          cancelDeliveryOf(d.order_id);
+          return { ok: true, data: undefined };
+        },
+
+        settleCourier: (courierId, opts) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário acerta com o entregador.');
+          const courier = get().couriers.find((c) => c.id === courierId);
+          if (!courier) return fail('Entregador não encontrado.');
+          const own = get().ownDeliveries.filter((d) => d.courier_id === courierId && d.status === 'DELIVERED' && d.settlement_id === null);
+          if (own.length === 0) return fail('Nenhuma entrega para acertar.');
+          const feesCents = own.reduce((a, d) => a + toCents(d.courier_fee ?? 0), 0);
+          if (opts.payFromDrawer && feesCents > 0) {
+            const open = get().cashSessions.find((c) => c.status === 'OPEN');
+            if (!open) return fail('Abra o caixa para pagar o entregador com o dinheiro da gaveta.');
+            if (!opts.auth) return fail('Pagar o entregador pelo caixa é sangria: precisa do PIN do gerente.');
+          }
+          // O PIN da sangria é conferido antes de receber qualquer conta: PIN errado não deixa acerto pela metade.
+          const withdrawalAuth = opts.payFromDrawer && feesCents > 0
+            ? {
+                managerPin: opts.auth!.managerPin,
+                reason: opts.auth!.reason.trim().length >= MIN_REASON_LENGTH ? opts.auth!.reason : `Acerto do entregador ${courier.name}`,
+              }
+            : null;
+          if (withdrawalAuth) {
+            const pre = authorizeManager(withdrawalAuth, { orderId: null, action: 'CASH_WITHDRAWAL' });
+            if (!pre.ok) return pre;
+          }
+          // 1) O dinheiro que o entregador trouxe vira o pagamento de cada senha paga na entrega.
+          // Senha já recebida numa tentativa anterior deste acerto (que parou no meio) não paga de novo,
+          // mas o dinheiro dela conta no acerto (pela chave entrega-<id> do pagamento).
+          for (const d of own) {
+            if (!d.pay_on_delivery) continue;
+            const order = get().orders.find((o) => o.id === d.order_id);
+            if (!order || order.status !== 'PAYING' || !(order.remaining_balance > 0)) continue;
+            const amount = order.remaining_balance;
+            const r = get().registerPayment({
+              orderId: order.id,
+              amount,
+              method: 'CASH',
+              status: 'APPROVED',
+              terminal_id: null,
+              acquirer: 'CASH_DESK',
+              acquirer_cnpj: null,
+              card_brand: null,
+              nsu: null,
+              authorization_code: null,
+              terminal_serial: null,
+              idempotency_key: `entrega-${d.id}`,
+              item_ids: [],
+            });
+            if (!r.ok) return fail(`Senha ${order.pickup_number ?? ''}: ${r.error} Acerto parado; as anteriores já foram recebidas.`);
+          }
+          const keys = new Set(own.filter((d) => d.pay_on_delivery).map((d) => `entrega-${d.id}`));
+          const cashCents = get().payments
+            .filter((p) => p.status === 'APPROVED' && p.idempotency_key !== null && keys.has(p.idempotency_key))
+            .reduce((a, p) => a + toCents(p.amount), 0);
+          // 2) O ganho do entregador sai da gaveta (sangria com PIN de gerente).
+          let movementId: UUID | null = null;
+          if (opts.payFromDrawer && feesCents > 0) {
+            const wd = get().addCashWithdrawal(fromCentsLocal(feesCents), withdrawalAuth!);
+            if (!wd.ok) return fail(`${wd.error} As senhas já foram recebidas; pague o entregador e acerte de novo sem a gaveta.`);
+            movementId = wd.data.id;
+          }
+          const settlement: CourierSettlement = {
+            id: uuid(),
+            tenant_id: get().tenant.id,
+            courier_id: courierId,
+            deliveries: own.length,
+            cash_collected: fromCentsLocal(cashCents),
+            courier_fees: fromCentsLocal(feesCents),
+            cash_movement_id: movementId,
+            settled_by_user_id: user.id,
+            created_at: nowISO(),
+          };
+          const ids = new Set(own.map((d) => d.id));
+          const settledRows = own.map((d) => ({ ...d, settlement_id: settlement.id }));
+          set((s) => ({
+            courierSettlements: [settlement, ...s.courierSettlements],
+            ownDeliveries: s.ownDeliveries.map((d) => (ids.has(d.id) ? { ...d, settlement_id: settlement.id } : d)),
+            outbox: [...s.outbox, syncEvent('courier_settlements', 'INSERT', settlement), ...settledRows.map((d) => syncEvent('own_deliveries', 'UPDATE', d))],
+          }));
+          return { ok: true, data: settlement };
+        },
+
         setSyncError: (message, blockedEventId) =>
           set((s) => ({
             syncStatus: {
@@ -3577,8 +3926,9 @@ export const useTcheStore = create<TcheState>()(
       // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback);
       // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras);
       // v6 = combos; v7 = nuvem → aparelho (pullStatus);
-      // v8 = caixa (abertura, sangria, suprimento, fechamento); v9 = preço conferido pelo servidor.
-      version: 9,
+      // v8 = caixa (abertura, sangria, suprimento, fechamento); v9 = preço conferido pelo servidor;
+      // v10 = entrega própria.
+      version: 10,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -3698,6 +4048,12 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
         half_product_ids: Array.isArray(i.half_product_ids) ? i.half_product_ids : [],
         modifier_option_ids: Array.isArray(i.modifier_option_ids) ? i.modifier_option_ids : [],
       }));
+    }
+  }
+  if (version < 10) {
+    // Entrega própria: a loja cadastra bairros e entregadores depois da atualização.
+    for (const key of ['deliveryZones', 'couriers', 'ownDeliveries', 'courierSettlements']) {
+      if (!Array.isArray(out[key])) out[key] = [];
     }
   }
   return out;

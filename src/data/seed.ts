@@ -9,6 +9,10 @@ import type {
   CashbackLedgerEntry,
   CashMovement,
   CashSession,
+  Courier,
+  CourierSettlement,
+  DeliveryZone,
+  OwnDelivery,
   Category,
   DiningTable,
   EventTicket,
@@ -680,6 +684,11 @@ function buildSeedState() {
   return { tables, orders, items, payments, kegTaps };
 }
 
+/** Entrega própria da demonstração: bairros de Santo Ângelo e um motoboy. */
+const zone = (key: string, name: string, fee: number, eta: number): DeliveryZone => ({ id: seedId(`zona:${key}`), tenant_id: T, name, fee, eta_minutes: eta, active: true });
+export const SEED_DELIVERY_ZONES: DeliveryZone[] = [zone('centro', 'Centro', 5, 30), zone('pippi', 'Pippi', 7, 40), zone('sao-carlos', 'São Carlos', 8, 45)];
+export const SEED_COURIERS: Courier[] = [{ id: seedId('entregador:juca'), tenant_id: T, name: 'Juca (moto)', phone: '55999990000', fee_per_delivery: 6, active: true }];
+
 export function createSeedData() {
   const dyn = buildSeedState();
   return {
@@ -712,5 +721,9 @@ export function createSeedData() {
     rolePermissions: [] as RolePermission[],
     cashSessions: [] as CashSession[],
     cashMovements: [] as CashMovement[],
+    deliveryZones: SEED_DELIVERY_ZONES,
+    couriers: SEED_COURIERS,
+    ownDeliveries: [] as OwnDelivery[],
+    courierSettlements: [] as CourierSettlement[],
   };
 }

@@ -128,7 +128,7 @@ export function ownerAlerts(a: AlertInput): OwnerAlert[] {
   }
 
   const unpaidPickup = a.orders.filter(
-    (o) => o.pickup_number !== null && o.status === 'PAYING' && o.paid_amount === 0 && minutesSince(o.opened_at, a.now) >= PICKUP_UNPAID_ALERT_MIN,
+    (o) => o.pickup_number !== null && o.fulfillment_type !== 'DELIVERY' && o.status === 'PAYING' && o.paid_amount === 0 && minutesSince(o.opened_at, a.now) >= PICKUP_UNPAID_ALERT_MIN,
   );
   if (unpaidPickup.length) {
     out.push({

@@ -24,6 +24,8 @@ function snapshotOfDemo(tenantId = st().tenant.id): CloudSnapshot {
     suppliers: s.suppliers,
     supplierProductLinks: s.supplierProductLinks,
     purchaseInvoices: s.purchaseInvoices,
+    deliveryZones: s.deliveryZones,
+    couriers: s.couriers,
   };
 }
 

@@ -188,7 +188,8 @@ export interface DiningTable {
 export type DiningTableKind = 'TABLE' | 'COUNTER' | 'KIOSK';
 
 /** Pedido com senha: comer no salão ou levar. */
-export type FulfillmentType = 'DINE_IN' | 'TAKEOUT';
+/** DELIVERY = entrega própria (motoboy da casa), db/schema_entrega.sql. */
+export type FulfillmentType = 'DINE_IN' | 'TAKEOUT' | 'DELIVERY';
 
 /**
  * Etapa 0 — preço por dia da semana e horário (happy hour, almoço executivo).
@@ -559,6 +560,76 @@ export interface CashbackLedgerEntry {
 }
 
 // ---------------------------------------------------------------------------
+// ENTREGA PRÓPRIA (db/schema_entrega.sql)
+// ---------------------------------------------------------------------------
+
+/** Bairro atendido e a taxa de entrega dele. */
+export interface DeliveryZone {
+  id: UUID;
+  tenant_id: UUID;
+  name: string;
+  fee: number;
+  /** Tempo estimado de entrega em minutos (mostrado ao cliente). */
+  eta_minutes: number;
+  active: boolean;
+}
+
+/** Entregador da casa e quanto ganha por entrega. */
+export interface Courier {
+  id: UUID;
+  tenant_id: UUID;
+  name: string;
+  phone: string | null;
+  fee_per_delivery: number;
+  active: boolean;
+}
+
+export type OwnDeliveryStatus = 'PREPARING' | 'READY' | 'OUT' | 'DELIVERED' | 'CANCELED';
+
+/** Entrega própria de um pedido com senha (fulfillment_type DELIVERY). */
+export interface OwnDelivery {
+  id: UUID;
+  tenant_id: UUID;
+  order_id: UUID;
+  customer_name: string;
+  customer_phone: string;
+  address: string;
+  reference: string | null;
+  zone_id: UUID;
+  /** Retrato do bairro e da taxa no pedido (o cadastro pode mudar depois). */
+  zone_name: string;
+  delivery_fee: number;
+  /** Paga em dinheiro na entrega (o entregador recebe e acerta na volta). */
+  pay_on_delivery: boolean;
+  /** Troco para (dinheiro na entrega). */
+  change_for: number | null;
+  status: OwnDeliveryStatus;
+  courier_id: UUID | null;
+  /** Retrato do valor da entrega do entregador na saída. */
+  courier_fee: number | null;
+  out_at: ISODateTime | null;
+  delivered_at: ISODateTime | null;
+  settlement_id: UUID | null;
+  created_at: ISODateTime;
+}
+
+/** Acerto com o entregador: dinheiro que ele trouxe e o que ele ganhou. */
+export interface CourierSettlement {
+  id: UUID;
+  tenant_id: UUID;
+  courier_id: UUID;
+  deliveries: number;
+  /** Dinheiro das entregas pagas na entrega (vira pagamento das senhas). */
+  cash_collected: number;
+  /** Soma do que o entregador ganhou nas entregas acertadas. */
+  courier_fees: number;
+  /** Sangria do caixa que pagou o entregador (null = pago por fora). */
+  cash_movement_id: UUID | null;
+  settled_by_user_id: UUID;
+  created_at: ISODateTime;
+}
+
+// ---------------------------------------------------------------------------
 // CAIXA (db/schema_caixa.sql)
 // ---------------------------------------------------------------------------
 
@@ -677,7 +748,12 @@ export interface SyncEvent {
     | 'ar_engagement_events'
     // Caixa (db/schema_caixa.sql)
     | 'cash_sessions'
-    | 'cash_movements';
+    | 'cash_movements'
+    // Entrega própria (db/schema_entrega.sql)
+    | 'delivery_zones'
+    | 'couriers'
+    | 'own_deliveries'
+    | 'courier_settlements';
   /** DELETE só para linhas sem valor financeiro (vínculos e opções de adicional). */
   op: 'INSERT' | 'UPDATE' | 'DELETE';
   row_id: UUID;

@@ -56,7 +56,7 @@ export const PDV_SHORTCUTS = {
     ['F2', 'Cobrar e gerar senha'],
     ['F6', 'Nome do cliente'],
     ['F8', 'Tirar o último item'],
-    ['F9', 'Viagem / Comer aqui'],
+    ['F9', 'Levar / Comer aqui / Entrega'],
     ['Esc', 'Limpar a busca'],
   ],
   checkout: [

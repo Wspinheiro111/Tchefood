@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Banknote, CheckCircle2, CreditCard, Keyboard, Minus, MonitorSmartphone, Plus, Printer, QrCode as QrIcon, Search, ShoppingBag, Trash2, UtensilsCrossed, XCircle } from 'lucide-react';
+import { Banknote, Bike, CheckCircle2, CreditCard, Keyboard, Minus, MonitorSmartphone, Plus, Printer, QrCode as QrIcon, Search, ShoppingBag, Trash2, UtensilsCrossed, XCircle } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import type { FulfillmentType, Order, Product } from '../types';
 import { computeItemTotal, formatBRL, round2 } from '../lib/money';
@@ -67,6 +67,20 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
   const [selectedQty, setSelectedQty] = useState(1);
   const [fulfillment, setFulfillment] = useState<FulfillmentType>('TAKEOUT');
   const [name, setName] = useState('');
+  const [addr, setAddr] = useState({ phone: '', address: '', reference: '', zoneId: '', payOnDelivery: false, changeFor: '' });
+  const zones = useTcheStore((s) => s.deliveryZones);
+  const pastDeliveries = useTcheStore((s) => s.ownDeliveries);
+  const activeZones = zones.filter((z) => z.active);
+  const zone = activeZones.find((z) => z.id === addr.zoneId);
+  const isDelivery = fulfillment === 'DELIVERY';
+  const deliveryFee = isDelivery ? zone?.fee ?? 0 : 0;
+  /** Cliente que já pediu: telefone preenche nome, endereço e bairro da última entrega. */
+  const fillFromPhone = (phone: string) => {
+    const digits = phone.replace(/\D/g, '');
+    const last = digits.length >= 10 ? pastDeliveries.find((d) => d.customer_phone.endsWith(digits.slice(-10))) : undefined;
+    setAddr((a) => ({ ...a, phone, ...(last ? { address: last.address, reference: last.reference ?? '', zoneId: zones.some((z) => z.id === last.zone_id && z.active) ? last.zone_id : a.zoneId } : {}) }));
+    if (last && !name) setName(last.customer_name.slice(0, 20));
+  };
   const activeCat = catId || cats[0]?.id || '';
   const list = sellable.filter((p) => p.category_id === activeCat);
   const [query, setQuery] = useState('');
@@ -99,10 +113,25 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
 
   const goPay = () => {
     if (cart.count === 0) return toast.error('Pedido vazio: lance um produto.');
-    const r = useTcheStore.getState().createPickupOrder({ lines: cart.toInput(), fulfillment, customerName: name });
+    const changeFor = addr.changeFor.trim() ? Number(addr.changeFor.replace(/\./g, '').replace(',', '.')) : null;
+    const r = useTcheStore.getState().createPickupOrder({
+      lines: cart.toInput(),
+      fulfillment,
+      customerName: name,
+      delivery: isDelivery
+        ? { customerName: name, phone: addr.phone, address: addr.address, reference: addr.reference, zoneId: addr.zoneId, payOnDelivery: addr.payOnDelivery, changeFor: addr.payOnDelivery ? changeFor : null }
+        : undefined,
+    });
     if (!r.ok) return toast.error(r.error);
     cart.clear();
     setName('');
+    if (isDelivery) setAddr({ phone: '', address: '', reference: '', zoneId: '', payOnDelivery: false, changeFor: '' });
+    if (isDelivery && addr.payOnDelivery) {
+      // Paga na entrega: vai direto para a cozinha; o dinheiro chega no acerto do entregador.
+      printPickupKitchen(r.data.id);
+      toast.success(`Entrega ${formatPickupNumber(r.data.pickup_number)} enviada para a cozinha. Recebe na entrega.`);
+      return;
+    }
     onCheckout(r.data.id);
   };
 
@@ -119,7 +148,7 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
       else if (e.key === 'F8') {
         const last = k.cart.lines.at(-1);
         if (last) k.cart.setQty(last.key, last.quantity - 1);
-      } else if (e.key === 'F9') k.setFulfillment((f) => (f === 'TAKEOUT' ? 'DINE_IN' : 'TAKEOUT'));
+      } else if (e.key === 'F9') k.setFulfillment((f) => (f === 'TAKEOUT' ? 'DINE_IN' : f === 'DINE_IN' ? 'DELIVERY' : 'TAKEOUT'));
       else return;
       e.preventDefault();
     };
@@ -203,14 +232,37 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
       </div>
 
       <aside className="h-fit rounded-2xl border-2 border-ouro/60 bg-surface p-3 lg:sticky lg:top-[72px]">
-        <div className="mb-2 grid grid-cols-2 gap-2">
-          {(['TAKEOUT', 'DINE_IN'] as FulfillmentType[]).map((f) => (
-            <button key={f} onClick={() => setFulfillment(f)} className={`flex min-h-touch items-center justify-center gap-2 rounded-xl text-sm font-black ${fulfillment === f ? 'bg-brasa text-white' : 'bg-base text-slate-700'}`}>
-              {f === 'TAKEOUT' ? <ShoppingBag className="h-4 w-4" /> : <UtensilsCrossed className="h-4 w-4" />} {FULFILLMENT_LABEL[f]}
+        <div className="mb-2 grid grid-cols-3 gap-2">
+          {(['TAKEOUT', 'DINE_IN', 'DELIVERY'] as FulfillmentType[]).map((f) => (
+            <button key={f} onClick={() => setFulfillment(f)} className={`flex min-h-touch items-center justify-center gap-1.5 rounded-xl text-sm font-black ${fulfillment === f ? 'bg-brasa text-white' : 'bg-base text-slate-700'}`}>
+              {f === 'TAKEOUT' ? <ShoppingBag className="h-4 w-4" /> : f === 'DINE_IN' ? <UtensilsCrossed className="h-4 w-4" /> : <Bike className="h-4 w-4" />} {FULFILLMENT_LABEL[f]}
             </button>
           ))}
         </div>
+        {isDelivery && (
+          <div className="mb-2 space-y-2">
+            {activeZones.length === 0 && <p className="rounded-xl bg-amarelo/20 p-2 text-xs">Cadastre os bairros em Retaguarda › Entrega própria.</p>}
+            <input inputMode="tel" value={addr.phone} onChange={(e) => fillFromPhone(e.target.value)} placeholder="Telefone com DDD" aria-label="Telefone do cliente" className="min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
+          </div>
+        )}
         <input ref={nameRef} value={name} onChange={(e) => setName(e.target.value)} maxLength={20} placeholder="Nome do cliente (para chamar)" className="mb-3 min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
+        {isDelivery && (
+          <div className="-mt-1 mb-3 space-y-2">
+            <input value={addr.address} onChange={(e) => setAddr({ ...addr, address: e.target.value })} maxLength={160} placeholder="Endereço (rua, número, complemento)" aria-label="Endereço" className="min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
+            <input value={addr.reference} onChange={(e) => setAddr({ ...addr, reference: e.target.value })} maxLength={120} placeholder="Ponto de referência (opcional)" aria-label="Referência" className="min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
+            <select value={addr.zoneId} onChange={(e) => setAddr({ ...addr, zoneId: e.target.value })} aria-label="Bairro" className="min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3">
+              <option value="">Bairro…</option>
+              {activeZones.map((z) => <option key={z.id} value={z.id}>{z.name} · {formatBRL(z.fee)} · {z.eta_minutes} min</option>)}
+            </select>
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => setAddr({ ...addr, payOnDelivery: false, changeFor: '' })} className={`min-h-touch rounded-xl text-sm font-bold ${!addr.payOnDelivery ? 'bg-verde text-white' : 'bg-base text-slate-700'}`}>Pagar agora</button>
+              <button onClick={() => setAddr({ ...addr, payOnDelivery: true })} className={`min-h-touch rounded-xl text-sm font-bold ${addr.payOnDelivery ? 'bg-verde text-white' : 'bg-base text-slate-700'}`}>Dinheiro na entrega</button>
+            </div>
+            {addr.payOnDelivery && (
+              <input inputMode="decimal" value={addr.changeFor} onChange={(e) => setAddr({ ...addr, changeFor: e.target.value.replace(/[^\d.,]/g, '') })} placeholder="Troco para (opcional)" aria-label="Troco para" className="min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
+            )}
+          </div>
+        )}
         {cart.lines.length === 0 ? (
           <p className="py-6 text-center text-sm text-slate-500">Toque nos produtos para montar o pedido.</p>
         ) : (
@@ -229,8 +281,11 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
             ))}
           </ul>
         )}
-        <div className="mb-3 flex items-end justify-between"><span className="text-slate-500">Total</span><span className="text-3xl font-black tabular-nums text-brasa">{formatBRL(cart.total)}</span></div>
-        <Btn block size="lg" variant="success" disabled={cart.count === 0} onClick={goPay}>Cobrar e gerar senha <kbd className="hidden rounded bg-white/20 px-1.5 text-xs lg:inline">F2</kbd></Btn>
+        {isDelivery && zone && <div className="flex justify-between text-sm text-slate-600"><span>Entrega {zone.name}</span><span className="tabular-nums">{formatBRL(deliveryFee)}</span></div>}
+        <div className="mb-3 flex items-end justify-between"><span className="text-slate-500">Total</span><span className="text-3xl font-black tabular-nums text-brasa">{formatBRL(round2(cart.total + deliveryFee))}</span></div>
+        <Btn block size="lg" variant="success" disabled={cart.count === 0} onClick={goPay}>
+          {isDelivery && addr.payOnDelivery ? 'Enviar para a cozinha' : 'Cobrar e gerar senha'} <kbd className="hidden rounded bg-white/20 px-1.5 text-xs lg:inline">F2</kbd>
+        </Btn>
         <p className="mt-2 text-center text-[11px] text-slate-500">Sem os 10% do garçom. O pedido vai para a cozinha assim que o pagamento for aprovado.</p>
       </aside>
 
@@ -244,7 +299,9 @@ function PickupQueue({ onCharge }: { onCharge: (orderId: string) => void }) {
   const tables = useTcheStore((s) => s.tables);
   const orders = useTcheStore((s) => s.orders);
   const items = useTcheStore((s) => s.orderItems);
+  const ownDeliveries = useTcheStore((s) => s.ownDeliveries);
   const { waiting, others } = useMemo(() => {
+    const payOnDelivery = new Set(ownDeliveries.filter((d) => d.pay_on_delivery).map((d) => d.order_id));
     const ids = kioskTableIds(tables);
     const day = brasiliaDate(new Date());
     const pickup = orders
@@ -252,10 +309,11 @@ function PickupQueue({ onCharge }: { onCharge: (orderId: string) => void }) {
       .sort((a, b) => (a.opened_at < b.opened_at ? 1 : -1));
     return {
       // Senha não paga continua na fila mesmo depois da meia-noite: é a única entrada para cobrar ou cancelar.
-      waiting: pickup.filter((o) => o.status === 'PAYING'),
+      // Entrega paga na entrega recebe no acerto do entregador, não aqui.
+      waiting: pickup.filter((o) => o.status === 'PAYING' && !payOnDelivery.has(o.id)),
       others: pickup.filter((o) => o.status !== 'PAYING' && brasiliaDate(o.opened_at) === day).slice(0, 12),
     };
-  }, [tables, orders]);
+  }, [tables, orders, ownDeliveries]);
   if (waiting.length === 0 && others.length === 0) return null;
   return (
     <div className="mt-4 space-y-3">

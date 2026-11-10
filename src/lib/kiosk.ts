@@ -8,6 +8,7 @@ export const PICKUP_NUMBER_MAX = 999;
 export const FULFILLMENT_LABEL: Record<FulfillmentType, string> = {
   DINE_IN: 'Comer aqui',
   TAKEOUT: 'Para levar',
+  DELIVERY: 'Entrega',
 };
 
 /** Data civil em Brasília (a senha reinicia à meia-noite da loja, não do UTC). */

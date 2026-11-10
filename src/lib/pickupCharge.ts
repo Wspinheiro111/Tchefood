@@ -121,11 +121,13 @@ export function printPickupReceipt(orderId: string, chassis: Chassis) {
 export function printPickupKitchen(orderId: string, preview = true) {
   const s = useTcheStore.getState();
   const order = s.orders.find((o) => o.id === orderId);
-  if (!order || order.status !== 'CLOSED') return;
+  // Entrega paga na entrega vai para a cozinha antes do pagamento (acerto do entregador).
+  const payOnDelivery = s.ownDeliveries.some((d) => d.order_id === orderId && d.pay_on_delivery);
+  if (!order || (order.status !== 'CLOSED' && !(payOnDelivery && order.status === 'PAYING'))) return;
   const items = s.orderItems.filter((i) => i.order_id === orderId && i.status !== 'CANCELED' && i.sector !== 'NONE');
   if (items.length === 0) return;
   const number = formatPickupNumber(order.pickup_number);
-  const label = [`Senha ${number}`, order.fulfillment_type === 'TAKEOUT' ? 'PARA LEVAR' : 'COMER AQUI', order.pickup_name].filter(Boolean).join(' · ');
+  const label = [`Senha ${number}`, order.fulfillment_type === 'DELIVERY' ? 'ENTREGA' : order.fulfillment_type === 'TAKEOUT' ? 'PARA LEVAR' : 'COMER AQUI', order.pickup_name].filter(Boolean).join(' · ');
   const tickets = routeDispatch({ items, printers: s.printers, products: s.products, staff: s.staff, tableLabel: label, tableNumber: order.pickup_number ?? 0, headline: `SENHA ${number}` });
   const failed = tickets.filter((t) => t.delivery.via === 'NATIVE' && !t.delivery.ok);
   if (failed.length > 0) {

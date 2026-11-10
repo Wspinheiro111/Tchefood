@@ -28,7 +28,8 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS fulfillment_type VARCHAR(10);
 ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_pickup_number_check;
 ALTER TABLE orders ADD CONSTRAINT orders_pickup_number_check CHECK (pickup_number IS NULL OR pickup_number BETWEEN 1 AND 999);
 ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_fulfillment_type_check;
-ALTER TABLE orders ADD CONSTRAINT orders_fulfillment_type_check CHECK (fulfillment_type IS NULL OR fulfillment_type IN ('DINE_IN', 'TAKEOUT'));
+-- DELIVERY vem da entrega própria (db/schema_entrega.sql); fica aqui também para este arquivo rodar de novo numa base que já tem entregas.
+ALTER TABLE orders ADD CONSTRAINT orders_fulfillment_type_check CHECK (fulfillment_type IS NULL OR fulfillment_type IN ('DINE_IN', 'TAKEOUT', 'DELIVERY'));
 
 -- Contador de senhas por loja e dia (Brasília).
 CREATE TABLE IF NOT EXISTS pickup_counters (

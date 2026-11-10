@@ -54,7 +54,7 @@ const CONFLICT_KEY: Partial<Record<SyncEvent['table'], string>> = {
 
 // ar_engagement_events: métrica imutável no banco; reenvio do mesmo evento é ignorado.
 // Movimento de caixa é só INSERT no banco (gatilho recusa UPDATE/DELETE).
-const INSERT_ONLY: ReadonlyArray<SyncEvent['table']> = ['payments', 'audit_logs', 'ar_engagement_events', 'cash_movements'];
+const INSERT_ONLY: ReadonlyArray<SyncEvent['table']> = ['payments', 'audit_logs', 'ar_engagement_events', 'cash_movements', 'courier_settlements'];
 
 /** Ações que o banco só aceita pela RPC que confere o PIN (ver tchefood_authorize_manager). */
 export const RPC_AUTHORIZED_ACTIONS: ReadonlyArray<string> = [
