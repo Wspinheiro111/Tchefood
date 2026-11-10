@@ -22,6 +22,8 @@ import type {
   CashSession,
   Courier,
   CourierSettlement,
+  Review,
+  ReviewSource,
   DeliveryZone,
   OwnDelivery,
   Category,
@@ -76,6 +78,7 @@ import {
 } from '../lib/catalog';
 import { can, PERMISSION_LABEL } from '../lib/permissions';
 import { nowISO, stableUuid, uuid } from '../lib/ids';
+import { MAX_REVIEW_COMMENT } from '../lib/reviews';
 import { idbStorage } from '../lib/idbStorage';
 import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
@@ -266,6 +269,8 @@ interface DataSlice {
   couriers: Courier[];
   ownDeliveries: OwnDelivery[];
   courierSettlements: CourierSettlement[];
+  /** Avaliações dos clientes (db/schema_avaliacoes.sql). */
+  reviews: Review[];
 }
 
 /** Sessão do aparelho na nuvem (Supabase Auth). Tokens ficam só neste aparelho. */
@@ -505,6 +510,8 @@ interface Actions {
   openCashSession: (openingFloat: number) => ActionResult<CashSession>;
   /** Suprimento: dinheiro que entra na gaveta (troco do banco, por exemplo). */
   addCashSupply: (amount: number, reason: string) => ActionResult<CashMovement>;
+  /** Nota do cliente (1 a 5) para uma conta já paga. Uma por conta. */
+  addReview: (orderId: UUID, score: number, comment: string, source: ReviewSource) => ActionResult<Review>;
   /** Sangria: dinheiro que sai da gaveta. PIN de gerente + motivo; nunca mais do que há na gaveta. */
   addCashWithdrawal: (amount: number, auth: ManagerAuthInput) => ActionResult<CashMovement>;
   /**
@@ -2139,10 +2146,10 @@ export const useTcheStore = create<TcheState>()(
                 product_id: product.id,
                 waiter_id: user.id,
                 quantity: line.quantity,
-                // Preço sempre do cadastro, nunca do aparelho.
-                unit_price: product.price,
+                // Preço sempre do cadastro (com a regra de horário, como na comanda), nunca do aparelho.
+                unit_price: effectivePrice(product, s0.priceSchedules, new Date(ts)),
                 modifiers_unit_price: mods,
-                total_item_price: computeItemTotal(line.quantity, product.price, mods),
+                total_item_price: computeItemTotal(line.quantity, effectivePrice(product, s0.priceSchedules, new Date(ts)), mods),
                 meat_doneness: line.meat_doneness,
                 notes: notes.length ? notes.join(' · ') : null,
                 sector: product.sector,
@@ -3341,6 +3348,7 @@ export const useTcheStore = create<TcheState>()(
             couriers: [],
             ownDeliveries: [],
             courierSettlements: [],
+            reviews: [],
             tray: [],
             outbox: [
               syncEvent('tenants', 'UPDATE', tenant),
@@ -3423,6 +3431,7 @@ export const useTcheStore = create<TcheState>()(
             couriers: [...snapshot.couriers],
             ownDeliveries: [],
             courierSettlements: [],
+            reviews: [],
             tables: [...tables, ...extraTables],
             orders: [],
             orderItems: [],
@@ -3726,6 +3735,27 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: closed };
         },
 
+        addReview: (orderId, score, comment, source) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          const order = get().orders.find((o) => o.id === orderId);
+          if (!order || order.status !== 'CLOSED') return fail('Só dá para avaliar uma conta já paga.');
+          if (!Number.isInteger(score) || score < 1 || score > 5) return fail('Escolha uma nota de 1 a 5.');
+          if (get().reviews.some((r) => r.order_id === orderId)) return fail('Esta conta já foi avaliada.');
+          const text = comment.trim().slice(0, MAX_REVIEW_COMMENT);
+          const review: Review = {
+            id: uuid(),
+            tenant_id: get().tenant.id,
+            order_id: orderId,
+            score: score as Review['score'],
+            comment: text || null,
+            source,
+            created_at: nowISO(),
+          };
+          set((s) => ({ reviews: [review, ...s.reviews], outbox: [...s.outbox, syncEvent('reviews', 'INSERT', review)] }));
+          return { ok: true, data: review };
+        },
+
         saveDeliveryZone: (draft) => {
           const user = currentUser();
           if (!user) return fail('Sessão expirada. Faça login novamente.');
@@ -3987,8 +4017,8 @@ export const useTcheStore = create<TcheState>()(
       // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras);
       // v6 = combos; v7 = nuvem → aparelho (pullStatus);
       // v8 = caixa (abertura, sangria, suprimento, fechamento); v9 = preço conferido pelo servidor;
-      // v10 = entrega própria.
-      version: 10,
+      // v10 = entrega própria; v11 = avaliações dos clientes.
+      version: 11,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -4115,6 +4145,9 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
     for (const key of ['deliveryZones', 'couriers', 'ownDeliveries', 'courierSettlements']) {
       if (!Array.isArray(out[key])) out[key] = [];
     }
+  }
+  if (version < 11) {
+    if (!Array.isArray(out.reviews)) out.reviews = [];
   }
   return out;
 }
