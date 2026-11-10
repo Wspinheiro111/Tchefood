@@ -798,6 +798,15 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     // Achado do Codex em 4f16b9c: nem desconto novo nem resgate enquanto o conflito está
     // pendente (a autorização descreveria a troca a partir do desconto velho daqui).
     expect(st().applyDiscount(order!.id, 10, MANAGER).ok).toBe(false);
+    // Achado do Codex em 208789d: cobrança que começou antes da recusa ainda sem resposta. O
+    // saldo não muda até a resposta ser registrada (o pagamento aprovado passaria do saldo novo).
+    const charging = { request_id: `req-${Math.random()}`, order_id: order!.id, amount: local.remaining_balance, user_id: st().currentUserId!, started_at: Date.now() };
+    useTcheStore.setState({ pendingCharges: [...st().pendingCharges, charging] });
+    const duringCharge = st().adoptCloudDiscount(conflict.event.id);
+    expect(duringCharge.ok).toBe(false);
+    if (!duringCharge.ok) expect(duringCharge.error).toContain('cobrança em andamento');
+    expect(st().orders.find((o) => o.id === order!.id)!.discount_amount).toBe(5);
+    useTcheStore.setState({ pendingCharges: st().pendingCharges.filter((c) => c.request_id !== charging.request_id) });
     // O gerente adota o desconto da nuvem: a conta converge e o pagamento do valor certo fecha.
     expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
     await expectSynced('conta com o desconto da nuvem');

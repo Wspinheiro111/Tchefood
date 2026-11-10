@@ -3695,6 +3695,9 @@ export const useTcheStore = create<TcheState>()(
           const orderId = rejected.event.row_id;
           const order = get().orders.find((o) => o.id === orderId);
           if (!order) return fail('Conta não encontrada neste aparelho.');
+          // Cobrança começada antes da recusa: o saldo não muda até a resposta da maquininha
+          // ser registrada (senão o pagamento aprovado passaria do saldo novo).
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
           // A conta recusada leva o desconto da nuvem. As mudanças seguintes dela (que
           // esperavam a recusa) são refeitas em ordem, como o banco as aplica, a partir do
           // desconto já refeito da anterior: quando o aparelho limitou o desconto ao bruto
