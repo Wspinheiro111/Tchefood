@@ -27,7 +27,7 @@ export function LoginScreen() {
     <div className="flex min-h-full flex-col items-center justify-center bg-gradient-to-b from-base to-surface px-4 py-8">
       <div className="mb-6 flex flex-col items-center text-center">
         <h1 className="mb-2">
-          <BrandLogo className="h-20 w-auto max-w-[min(90vw,360px)] sm:h-24" />
+          <BrandLogo effect className="h-20 w-auto max-w-[min(90vw,360px)] sm:h-24" />
         </h1>
         <p className="text-sm text-slate-500">{tenant.name} · {tenant.city}/{tenant.state}</p>
         <span className={`mt-2 inline-flex items-center gap-1 text-xs ${online ? 'text-verde' : 'text-brasa'}`}>

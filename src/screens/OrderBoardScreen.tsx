@@ -88,7 +88,7 @@ export function OrderBoardScreen() {
   return (
     <div ref={rootRef} className="flex min-h-[calc(100vh-56px)] flex-col bg-base text-slate-900">
       <header className="flex items-center gap-3 border-b border-slate-200 px-6 py-4">
-        <BrandLogo className="h-16 w-auto" />
+        <BrandLogo effect className="h-16 w-auto" />
         <div className="mr-auto">
           <div className="text-2xl font-black">{tenant.name}</div>
           <div className="text-sm text-slate-500">Acompanhe seu pedido</div>
