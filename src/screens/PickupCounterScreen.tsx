@@ -127,6 +127,11 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
     return () => window.removeEventListener('keydown', onKey);
   }, [selected]);
 
+  // A busca fica travada com a ficha aberta; ao fechar, o cursor volta para ela (depois de destravar).
+  useEffect(() => {
+    if (!selected) searchRef.current?.focus();
+  }, [selected]);
+
   return (
     <div className="mx-auto grid max-w-6xl gap-3 px-3 pb-10 pt-3 lg:grid-cols-[minmax(0,1fr)_360px]">
       <div className="min-w-0">
@@ -137,9 +142,12 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
             <input
               ref={searchRef}
               autoFocus
+              // Com a ficha de opções aberta a busca fica travada: digitar ou ler outro código não mexe no pedido por trás.
+              disabled={selected !== null}
               value={query}
               onChange={(e) => { setQuery(e.target.value); setHit(0); }}
               onKeyDown={(e) => {
+                if (selected) return;
                 if (e.key === 'Enter') { e.preventDefault(); launchHit(); }
                 else if (e.key === 'ArrowDown') { e.preventDefault(); setHit((h) => Math.min(h + 1, Math.max(0, results.length - 1))); }
                 else if (e.key === 'ArrowUp') { e.preventDefault(); setHit((h) => Math.max(0, h - 1)); }
