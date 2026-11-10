@@ -112,8 +112,11 @@ export function PrintSimulatorModal() {
 }
 
 /** Roteia itens recém-despachados para as impressoras das praças e abre o simulador. */
-export function printDispatchedItems(items: readonly OrderItem[]) {
+export function printDispatchedItems(all: readonly OrderItem[]) {
   const s = useTcheStore.getState();
+  // O combo é só a linha da conta: quem sai na praça são os componentes dele.
+  const items = all.filter((i) => !s.products.find((p) => p.id === i.product_id)?.is_combo);
+  if (items.length === 0) return;
   const order = s.orders.find((o) => o.id === items[0]?.order_id);
   const table = s.tables.find((t) => t.id === order?.table_id);
   if (!order || !table) return;

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertOctagon, AlertTriangle, ArrowDownRight, ArrowUpRight, Info, Pencil, Target } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import { useOwnerSettings, WEEKDAY_LABEL } from '../store/useOwnerSettings';
-import { useDeliveryOrders } from '../lib/deliveryDemo';
+import { useDeliveryOrders, useDeliveryPolling } from '../lib/deliveryDemo';
 import { DELIVERY_CHANNEL_CATALOG } from '../../server/delivery/marketplace';
 import { getReviewHold } from '../lib/payments/reviewHolds';
 import { formatBRL } from '../lib/money';
@@ -65,6 +65,9 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
   const tenant = useTcheStore((s) => s.tenant);
   const deliveryRecords = useDeliveryOrders((s) => s.orders);
   const deliveryErrors = useDeliveryOrders((s) => s.lastErrors);
+  // O painel é "ao vivo": busca os pedidos dos apps enquanto está aberto (as telas de
+  // Delivery e da TV não ficam montadas na Retaguarda).
+  useDeliveryPolling();
 
   const marketplace = useMemo<MarketplaceSale[]>(
     () =>

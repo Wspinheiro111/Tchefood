@@ -223,7 +223,7 @@ describe('importação para o estoque', () => {
 describe('migração do estado salvo', () => {
   it('v4 → v5 preenche custo, estoque e tabelas novas', () => {
     const migrated = migratePersisted({ products: [{ id: 'x', name: 'A' }] }, 4) as Record<string, unknown>;
-    expect(migrated.products).toEqual([{ id: 'x', name: 'A', cost_price: 0, stock_quantity: 0, barcode: null }]);
+    expect(migrated.products).toEqual([{ id: 'x', name: 'A', cost_price: 0, stock_quantity: 0, barcode: null, is_combo: false }]);
     expect(migrated.purchaseInvoices).toEqual([]);
     expect(migrated.stockMovements).toEqual([]);
   });

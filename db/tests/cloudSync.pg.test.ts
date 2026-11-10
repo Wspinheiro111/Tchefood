@@ -14,7 +14,10 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
-import { flushOutbox, type SyncRejection } from '../../src/lib/sync/supabaseSync';
+import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
+import { fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins } from '../../src/lib/sync/cloudPull';
+import { syncOnce } from '../../src/lib/sync/useCloudSync';
+import { useArStore } from '../../src/store/useArStore';
 import { sampleNfeXml } from '../../src/data/sampleNfe';
 import { setReviewHold } from '../../src/lib/payments/reviewHolds';
 import { createSupabaseLikeDb, pgTargetFromEnv, postgrestFetch, psql, psqlFile, type EmulatorLog, type PgTarget } from './postgrestEmulator';
@@ -90,7 +93,7 @@ const MANAGER = { managerPin: MANAGER_PIN, reason: 'Teste com o banco real' };
 afterEach(() => vi.useRealTimers());
 
 /** Requisição direta ao "PostgREST", como faria quem tem só o token do aparelho. */
-async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer = 'return=minimal') {
+async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown, prefer = 'return=minimal') {
   const fetchFn = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' });
   const res = await fetchFn(`http://cloud.test/rest/v1/${path}`, { method, headers: { Prefer: prefer }, body: JSON.stringify(body) });
   return { status: res.status, body: await res.text() };
@@ -275,6 +278,43 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
       ]),
     );
     await expectSynced('compra por XML');
+  });
+
+  it('cardápio 3D: modelo do prato, métricas do cliente e registro pelo QR da mesa', async () => {
+    login(OWNER_PIN);
+    const ar = () => useArStore.getState();
+    const draft = {
+      product_id: productId, usdz_url: null, scale_factor: 1, real_width_cm: 28, real_depth_cm: 28, real_height_cm: 6,
+      explode_animation: null, active: true,
+      components: [{ id: crypto.randomUUID(), label: 'Charque', detail: 'Desfiado', position: '0 0.03 0', normal: '0 1 0' }],
+    };
+    // Arquivo ainda só no aparelho: não sobe (o celular do cliente não abriria idb:).
+    ok(ar().saveArModel({ ...draft, glb_url: `idb:${crypto.randomUUID()}` }));
+    expect(st().outbox.some((e) => e.table === 'product_ar_models')).toBe(false);
+    // Depois do envio ao bucket, o link https sobe como INSERT.
+    const model = ok(ar().setArModelUrls(productId, { glb_url: `https://cloud.test/storage/v1/object/public/product-models/${TENANT}/m.glb`, usdz_url: null }));
+    ar().recordArEvent(productId, 'VIEW_3D', null);
+    ar().recordArEvent(productId, 'ADD_AFTER_VIEW', null);
+    await expectSynced('cardápio 3D');
+    expect(sql(`SELECT jsonb_array_length(components) || '/' || real_width_cm FROM product_ar_models WHERE id = '${model.id}'`)).toBe('1/28.0');
+    ok(ar().saveArModel({ ...draft, id: model.id, glb_url: model.glb_url, real_width_cm: 30 }));
+    await expectSynced('cardápio 3D editado');
+    expect(sql(`SELECT real_width_cm FROM product_ar_models WHERE id = '${model.id}'`)).toBe('30.0');
+
+    // Celular do cliente, sem login: registra pelo token do QR da mesa.
+    const token = sql(`SELECT qr_code_token FROM dining_tables WHERE tenant_id = '${TENANT}' AND kind = 'TABLE' AND qr_code_token IS NOT NULL LIMIT 1`);
+    expect(token).not.toBe('');
+    const track = (tok: string, kind: string) => psql(target!, `SET ROLE anon; SELECT tchefood_ar_track('${tok}', '${productId}', '${kind}');`, DB);
+    expect(track(token, 'AR_START').out).toMatch(/^[0-9a-f-]{36}$/);
+    expect(track('token-que-nao-existe', 'AR_START').out).toBe('');
+    expect(track(token, 'HACK').out).toBe('');
+    // anon não lê nem grava as tabelas direto.
+    expect(psql(target!, `SET ROLE anon; INSERT INTO ar_engagement_events (tenant_id, product_id, kind) VALUES ('${TENANT}', '${productId}', 'VIEW_3D');`, DB).ok).toBe(false);
+    expect(sql(`SELECT count(*) FROM ar_engagement_events WHERE product_id = '${productId}'`)).toBe('3');
+    // Métrica não se edita.
+    expect((await raw('PATCH', `ar_engagement_events?product_id=eq.${productId}`, { kind: 'AR_START' })).status).toBeGreaterThanOrEqual(400);
+    // Link que não é https (ex.: idb: forjado) é recusado pelo banco.
+    expect((await raw('POST', 'product_ar_models', { tenant_id: TENANT, product_id: productId, glb_url: 'idb:x', real_width_cm: 10, real_depth_cm: 10, real_height_cm: 1 })).status).toBeGreaterThanOrEqual(400);
   });
 
   it('travas: só o token do aparelho não grava equipe, permissão, desconto nem autorização', async () => {
@@ -493,6 +533,154 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     login(CASHIER_PIN);
   });
 
+  it('combo: o combo leva o preço, os componentes sobem com preço zero e o banco recusa componente forjado', async () => {
+    login(OWNER_PIN);
+    const base = st().products.find((x) => x.id === productId)!;
+    const refri = ok(
+      st().saveProduct({
+        category_id: categoryId, code: '231', name: 'Refrigerante lata', description: null, price: 7.9, sector: 'BAR', available: true, active: true,
+        requires_meat_doneness: false, allows_half_and_half: false, ncm: '22021000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+        cost_price: 0, stock_quantity: 0, barcode: null,
+      }),
+    );
+    const combo = ok(
+      st().saveProduct({
+        category_id: categoryId, code: '501', name: 'Combo Executivo', description: null, price: 49.9, sector: 'NONE', available: true, active: true,
+        requires_meat_doneness: false, allows_half_and_half: false, ncm: '21069090', cfop: '5102', csosn_cst: '102', unit: 'UN',
+        cost_price: 0, stock_quantity: 0, barcode: null, is_combo: true,
+      }),
+    );
+    const prato = ok(st().saveModifierGroup({ name: 'Prato do combo', min_selection: 1, max_selection: 1, required: true }));
+    const bebida = ok(st().saveModifierGroup({ name: 'Bebida do combo', min_selection: 1, max_selection: 1, required: true }));
+    const optPrato = ok(st().saveModifierOption({ group_id: prato.id, name: base.name, additional_price: 0, component_product_id: base.id, component_quantity: 1 }));
+    const optRefri = ok(st().saveModifierOption({ group_id: bebida.id, name: refri.name, additional_price: 0, component_product_id: refri.id, component_quantity: 2 }));
+    ok(st().setProductModifierGroups(combo.id, [prato.id, bebida.id]));
+    await expectSynced('cadastro do combo');
+    expect(sql(`SELECT is_combo FROM products WHERE id = '${combo.id}'`)).toBe('t');
+
+    login(CASHIER_PIN);
+    const mesa = st().tables.find((t) => t.number === 2)!;
+    const order = ok(st().openTable(mesa.id, 1, null));
+    const mods = [optPrato, optRefri].map((o) => ({ group_id: o.group_id, option_id: o.id, name: o.name, additional_price: o.additional_price }));
+    ok(st().addToTray({ order_id: order.id, product_id: combo.id, half_product_ids: [], quantity: 1, unit_price: combo.price, modifiers: mods, modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: combo.sector }));
+    const sent = ok(st().dispatchTray(order.id)).items;
+    expect(sent).toHaveLength(3);
+    const childEvent = st().outbox.find((e) => e.table === 'order_items' && e.row_id === sent[2]!.id)!;
+    const childRow = sanitizePayload(childEvent);
+    await expectSynced('comanda com combo');
+    expect(sql(`SELECT subtotal_items FROM orders WHERE id = '${order.id}'`)).toBe('49.90');
+    expect(sql(`SELECT count(*) || ' ' || sum(quantity) FROM order_items WHERE combo_parent_item_id = '${sent[0]!.id}' AND total_item_price = 0`)).toBe('2 3.000');
+
+    // Componente a mais (quantidade fora do cadastro) e componente com preço: recusados.
+    const extra = await raw('POST', 'order_items', { ...childRow, id: crypto.randomUUID(), quantity: 5 });
+    expect(extra.status).toBe(400);
+    expect(extra.body).toMatch(/não oferece este produto/);
+    const priced = await raw('POST', 'order_items', { ...childRow, id: crypto.randomUUID(), unit_price: 7.9, total_item_price: 15.8 });
+    expect(priced.status).toBe(400);
+    expect(priced.body).toMatch(/não tem preço próprio/);
+    // Combo dentro de combo: recusado no cadastro.
+    const nested = await raw('PATCH', `modifier_options?id=eq.${optRefri.id}`, { component_product_id: combo.id });
+    expect(nested.body).toMatch(/combo não entra dentro de outro combo/);
+
+    // Cancelar o combo cancela os componentes (um audit_log por item, com PIN).
+    forgetPinFailures();
+    ok(st().cancelOrderItem(sent[0]!.id, MANAGER));
+    await expectSynced('cancelamento do combo');
+    expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${order.id}' AND status = 'CANCELED'`)).toBe('3');
+    expect(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`)).toBe('0.00');
+  });
+
+  it('aparelho novo baixa a loja: cadastros pela RLS, equipe com PIN só com o PIN do gerente', async () => {
+    forgetPinFailures();
+    const cfg = { url: 'http://cloud.test', anonKey: 'anon', accessToken: 'jwt' };
+    const fetchFn = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-2' }, emulatorLog);
+    const productsBefore = Number(sql(`SELECT count(*) FROM products WHERE tenant_id = '${TENANT}'`));
+    const session = st().cloud!;
+
+    // O token do aparelho não lê PIN.
+    expect((await raw('GET', 'staff_users?select=pin_code', undefined)).status).toBe(403);
+
+    // Aparelho novo, ainda na demonstração.
+    st().resetDemo();
+    login('8888');
+    const team = await fetchCloudStaff(cfg, fetchFn);
+    const manager = team.find((u) => u.role === 'MANAGER')!;
+    const cashier = team.find((u) => u.role === 'CASHIER')!;
+    expect(team.length).toBeGreaterThan(3);
+    expect(Object.keys(manager)).not.toContain('pin_code');
+    // PIN errado, e PIN certo de quem não é gerente: nada de PIN.
+    expect(await fetchStaffPins(cfg, manager.id, '0000', fetchFn)).toMatchObject({ ok: false });
+    expect(await fetchStaffPins(cfg, cashier.id, CASHIER_PIN, fetchFn)).toMatchObject({ ok: false });
+    forgetPinFailures();
+    const pins = await fetchStaffPins(cfg, manager.id, MANAGER_PIN, fetchFn);
+    if (!pins.ok) throw new Error(pins.error);
+    expect(pins.staff.find((u) => u.id === cashier.id)!.pin_code).toBe(CASHIER_PIN);
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'STAFF_PULL' AND performed_by_user_id = '${manager.id}' AND metadata->>'device_user' = 'device-2'`)).toBe('1');
+
+    const snapshot = await fetchCloudSnapshot(cfg, TENANT, fetchFn);
+    expect(snapshot.tenant.name).toBe('Bar do Zé');
+    expect(Object.keys(snapshot.tenant)).not.toContain('focus_nfe_token');
+    expect(snapshot.products).toHaveLength(productsBefore);
+    ok(st().joinCloudStore({ session, snapshot, staff: pins.staff, userId: manager.id }));
+    expect(st().currentUserId).toBe(manager.id);
+    expect(st().tenant.id).toBe(TENANT);
+    expect(st().orders).toEqual([]);
+    expect(st().outbox).toEqual([]);
+    const combo = st().products.find((p) => p.code === '501')!;
+    expect(combo.is_combo).toBe(true);
+    expect(st().modifierOptions.some((o) => o.component_product_id && st().productModifierGroups.some((l) => l.product_id === combo.id && l.group_id === o.group_id))).toBe(true);
+    expect(st().tables.every((t) => t.status === 'FREE')).toBe(true);
+    // A caixa entra com o PIN dela neste aparelho.
+    login(CASHIER_PIN);
+
+    // Outro aparelho muda preço, desativa alguém e cadastra uma pessoa nova.
+    const carreteiro = st().products.find((p) => p.id === productId)!;
+    sql(`UPDATE products SET price = 51.90 WHERE id = '${productId}';
+         UPDATE staff_users SET active = FALSE WHERE name = 'Totem 1' AND tenant_id = '${TENANT}';
+         INSERT INTO staff_users (id, tenant_id, name, role, pin_code, active) VALUES (gen_random_uuid(), '${TENANT}', 'Garçom Novo', 'WAITER', '3847', TRUE);`);
+    // E este aparelho mudou outro produto ainda sem enviar.
+    login(OWNER_PIN);
+    const refri = st().products.find((p) => p.code === '231')!;
+    const { tenant_id: _t, created_at: _c, ...refriDraft } = refri;
+    ok(st().saveProduct({ ...refriDraft, price: 8.5 }));
+    useTcheStore.setState({ pullStatus: { last_pull_at: null, last_error: null, cloud_staff_unknown: 0 } });
+    expect(st().applyCloudSnapshot(await fetchCloudSnapshot(cfg, TENANT, fetchFn))).toMatchObject({ ok: true, data: { unknownStaff: 1 } });
+    expect(st().products.find((p) => p.id === productId)!.price).toBe(51.9);
+    expect(carreteiro.price).not.toBe(51.9);
+    expect(st().products.find((p) => p.id === refri.id)!.price).toBe(8.5); // pendente aqui: fica
+    expect(st().staff.find((u) => u.name === 'Totem 1')!.active).toBe(false);
+    expect(st().pullStatus.cloud_staff_unknown).toBe(1);
+    expect(st().login('3847').ok).toBe(false);
+    // A fila sobe e a leitura seguinte já traz o preço deste aparelho.
+    await expectSynced('produto alterado depois de baixar');
+    expect(sql(`SELECT price FROM products WHERE id = '${refri.id}'`)).toBe('8.50');
+
+    // "Atualizar equipe" com o PIN do gerente traz o garçom novo.
+    login(OWNER_PIN);
+    const owner = st().staff.find((u) => u.pin_code === OWNER_PIN)!;
+    const again = await fetchStaffPins(cfg, owner.id, OWNER_PIN, fetchFn);
+    if (!again.ok) throw new Error(again.error);
+    expect(st().applyCloudStaff(again.staff)).toMatchObject({ ok: true, data: { added: 1 } });
+    expect(st().pullStatus.cloud_staff_unknown).toBe(0);
+    expect(st().login('3847').ok).toBe(true);
+    login(CASHIER_PIN);
+  });
+
+  it('a rodada de sincronização lê a nuvem com a fila vazia', async () => {
+    sql(`UPDATE products SET price = 52.90 WHERE id = '${productId}';`);
+    useTcheStore.setState({ pullStatus: { last_pull_at: null, last_error: null, cloud_staff_unknown: 0 } });
+    await syncOnce(postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-2' }, emulatorLog));
+    expect(st().pullStatus.last_error).toBeNull();
+    expect(st().pullStatus.last_pull_at).not.toBeNull();
+    expect(st().products.find((p) => p.id === productId)!.price).toBe(52.9);
+    // Dentro do minuto não lê de novo; com forcePull ("Sincronizar agora") lê.
+    sql(`UPDATE products SET price = 53.90 WHERE id = '${productId}';`);
+    await syncOnce(postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-2' }, emulatorLog));
+    expect(st().products.find((p) => p.id === productId)!.price).toBe(52.9);
+    await syncOnce(postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-2' }, emulatorLog), { forcePull: true });
+    expect(st().products.find((p) => p.id === productId)!.price).toBe(53.9);
+  });
+
   it('caixa: abre, suprimento, sangria com PIN de gerente e fechamento com diferença conferido pelo banco', async () => {
     forgetPinFailures();
     login(CASHIER_PIN);
@@ -528,8 +716,16 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
       `CLOSED ${expected.toFixed(2)} ${(expected - 5).toFixed(2)} -5.00 true`,
     );
     // Caixa fechado não muda mais.
-    const reopen = await raw('PATCH', `cash_sessions?id=eq.${session.id}`, { status: 'OPEN' });
+    const closed = st().cashSessions.find((c) => c.id === session.id)!;
+    const reopen = await raw('PATCH', `cash_sessions?id=eq.${session.id}`, { status: 'CLOSED', counted_cash: closed.counted_cash! + 5, closed_at: closed.closed_at, closed_by_user_id: closed.closed_by_user_id, closing_notes: closed.closing_notes });
     expect(reopen.status).toBeGreaterThanOrEqual(400);
+    // Reenvio da fila depois de resposta perdida: abertura, movimento e fechamento iguais passam sem mudar nada.
+    const { expected_cash: _e, difference: _d, closing_authorized_by_manager_id: _m, ...sentClose } = closed;
+    expect((await raw('PATCH', `cash_sessions?id=eq.${session.id}`, sentClose)).status).toBeLessThan(300);
+    expect((await raw('POST', 'cash_sessions?on_conflict=id', session, 'resolution=merge-duplicates,return=minimal')).status).toBeLessThan(300);
+    expect((await raw('POST', 'cash_movements?on_conflict=id', wd, 'resolution=ignore-duplicates,return=minimal')).status).toBeLessThan(300);
+    expect(sql(`SELECT status || ' ' || difference FROM cash_sessions WHERE id = '${session.id}'`)).toBe('CLOSED -5.00');
+    expect(sql(`SELECT count(*) FROM cash_movements WHERE session_id = '${session.id}'`)).toBe('2');
   });
 
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {

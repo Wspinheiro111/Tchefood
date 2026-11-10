@@ -74,6 +74,13 @@ BEGIN
     IF TG_OP <> 'INSERT' THEN
         RAISE EXCEPTION 'TCHEFOOD_CAIXA: movimento de caixa é somente inserção.';
     END IF;
+    -- Reenvio da fila (resposta perdida): o mesmo movimento já gravado passa e o
+    -- ON CONFLICT DO NOTHING da fila o ignora, mesmo com o caixa já fechado.
+    IF EXISTS (SELECT 1 FROM cash_movements m
+                WHERE m.id = NEW.id AND m.tenant_id = NEW.tenant_id AND m.session_id = NEW.session_id
+                  AND m.type = NEW.type AND m.amount = NEW.amount) THEN
+        RETURN NEW;
+    END IF;
     SELECT * INTO v_session FROM cash_sessions s WHERE s.id = NEW.session_id FOR UPDATE;
     IF NOT FOUND OR v_session.tenant_id <> NEW.tenant_id THEN
         RAISE EXCEPTION 'TCHEFOOD_CAIXA: caixa não encontrado nesta loja.';
@@ -123,6 +130,20 @@ BEGIN
         NEW.difference := NULL;
         NEW.closing_authorized_by_manager_id := NULL;
         RETURN NEW;
+    END IF;
+    -- Reenvio da fila (resposta perdida): repetir a abertura ou o mesmo fechamento não muda nada.
+    IF NEW.tenant_id = OLD.tenant_id AND NEW.opened_by_user_id = OLD.opened_by_user_id
+       AND NEW.opened_at = OLD.opened_at AND NEW.opening_float = OLD.opening_float THEN
+        IF NEW.status = 'OPEN' THEN
+            RETURN OLD;
+        END IF;
+        IF OLD.status = 'CLOSED' AND NEW.status = 'CLOSED'
+           AND NEW.closed_by_user_id IS NOT DISTINCT FROM OLD.closed_by_user_id
+           AND NEW.closed_at IS NOT DISTINCT FROM OLD.closed_at
+           AND NEW.counted_cash IS NOT DISTINCT FROM OLD.counted_cash
+           AND NEW.closing_notes IS NOT DISTINCT FROM OLD.closing_notes THEN
+            RETURN OLD;
+        END IF;
     END IF;
     IF OLD.status = 'CLOSED' THEN
         RAISE EXCEPTION 'TCHEFOOD_CAIXA: caixa fechado não muda mais.';

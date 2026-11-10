@@ -400,13 +400,15 @@ export function cancellations(ix: DashboardIndex, r: Range): CancellationReport 
     if (!inRange(l.created_at, r)) continue;
     if (l.action_type === 'DISCOUNT_APPLIED') {
       discounts += 1;
-      discountsCents += Math.abs(toCents(l.amount_impact));
+      // amount_impact = total novo − total antigo: desconto que diminui volta positivo e
+      // abate o anterior (R$ 20 corrigido para R$ 10 = R$ 10 de desconto, não R$ 30).
+      discountsCents -= toCents(l.amount_impact);
     }
     if (l.action_type === 'SERVICE_FEE_REMOVED') feeRemoved += 1;
     if ((l.action_type === 'ITEM_CANCELED' || l.action_type === 'DISCOUNT_APPLIED') && l.authorized_by_manager_id) {
       const m = byManager.get(l.authorized_by_manager_id) ?? { count: 0, cents: 0 };
       m.count += 1;
-      m.cents += Math.abs(toCents(l.amount_impact));
+      m.cents -= toCents(l.amount_impact);
       byManager.set(l.authorized_by_manager_id, m);
     }
   }
@@ -416,11 +418,11 @@ export function cancellations(ix: DashboardIndex, r: Range): CancellationReport 
     itemsValue: fromCents(itemsCents),
     ordersCanceled,
     discounts,
-    discountsValue: fromCents(discountsCents),
+    discountsValue: fromCents(Math.max(0, discountsCents)),
     serviceFeeRemoved: feeRemoved,
     pctOfSales: sales > 0 ? Math.round((itemsCents / sales) * 1000) / 10 : null,
     byManager: [...byManager.entries()]
-      .map(([manager_id, v]) => ({ manager_id, count: v.count, value: fromCents(v.cents) }))
+      .map(([manager_id, v]) => ({ manager_id, count: v.count, value: fromCents(Math.max(0, v.cents)) }))
       .sort((a, b) => b.value - a.value),
   };
 }
