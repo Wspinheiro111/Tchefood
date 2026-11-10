@@ -57,10 +57,13 @@ BEGIN
     IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: motivo obrigatório (mínimo 5 caracteres).';
     END IF;
+    -- O gerente também troca o desconto manual por um menor (R$ 10 → R$ 5); a troca fica
+    -- registrada (no #35 é ela que libera a redução no gatilho do desconto).
     IF p_action_type = 'DISCOUNT_APPLIED' AND (
         (p_metadata->>'discount_before') IS NULL OR (p_metadata->>'discount_after') IS NULL
-        OR (p_metadata->>'discount_after')::numeric <= (p_metadata->>'discount_before')::numeric) THEN
-        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: desconto precisa de discount_before e discount_after (maior) no metadata.';
+        OR (p_metadata->>'discount_before')::numeric < 0 OR (p_metadata->>'discount_after')::numeric < 0
+        OR (p_metadata->>'discount_after')::numeric = (p_metadata->>'discount_before')::numeric) THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: desconto precisa de discount_before e discount_after (diferentes) no metadata.';
     END IF;
     IF p_action_type = 'ITEM_CANCELED' AND (p_metadata->>'item_id') IS NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: cancelamento precisa do item_id no metadata.';
@@ -86,7 +89,11 @@ BEGIN
                    AND jsonb_typeof(p_metadata->'modifier_option_ids') = 'array'
                    AND (v_meta->>'item_id') IS NOT NULL AND (v_meta->>'product_id') IS NOT NULL
                    AND (v_meta->>'quantity')::numeric > 0 AND (v_meta->>'unit_price')::numeric >= 0
-                   AND (v_meta->>'modifiers_unit_price') IS NOT NULL;
+                   AND (v_meta->>'modifiers_unit_price') IS NOT NULL
+                   -- NaN passa no cast e é "maior" que qualquer número no Postgres: recusa explícita.
+                   AND (v_meta->>'quantity')::numeric <> 'NaN'::numeric
+                   AND (v_meta->>'unit_price')::numeric <> 'NaN'::numeric
+                   AND (v_meta->>'modifiers_unit_price')::numeric <> 'NaN'::numeric;
         EXCEPTION WHEN others THEN
             v_valid := FALSE;
         END;
@@ -314,7 +321,9 @@ BEGIN
                  ELSE 'Item lançado com preço diferente do cadastro da nuvem' END,
             FALSE,
             jsonb_build_object(
-                'server_verified', NOT v_legacy,
+                -- Conferido só quando o servidor calculou o preço esperado; o PIN do gerente fica em
+                -- authorized_by_manager_id e price_override_id.
+                'server_verified', NOT v_legacy AND v_expected.base IS NOT NULL AND v_expected.modifiers IS NOT NULL,
                 'item_id', NEW.id, 'product_id', NEW.product_id, 'product_code', v_product.code, 'quantity', NEW.quantity,
                 'unit_price', NEW.unit_price, 'modifiers_unit_price', NEW.modifiers_unit_price,
                 'expected_unit_price', v_expected.base, 'expected_modifiers_unit_price', v_expected.modifiers,

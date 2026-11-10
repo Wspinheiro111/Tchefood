@@ -207,6 +207,13 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(first.status).toBe(200);
     expect(again.body).toBe(first.body);
     expect(sql(`SELECT count(*) FROM audit_logs WHERE metadata->>'client_audit_id' = '${clientId}'`)).toBe('1');
+    // Troca do desconto por um menor fica registrada; desconto igual ao atual, não.
+    const change = (before: number, after: number) => raw('POST', 'rpc/tchefood_authorize_manager', {
+      p_order_id: order.id, p_action_type: 'DISCOUNT_APPLIED', p_manager_pin: MANAGER_PIN, p_performed_by: st().currentUserId,
+      p_reason: 'Troca do desconto', p_amount_impact: 1, p_metadata: { discount_before: before, discount_after: after },
+    });
+    expect((await change(5, 4)).status).toBe(200);
+    expect((await change(5, 5)).body).toContain('(diferentes)');
   });
 
   it('cashback: ganha na conta fechada e resgata na próxima (vira desconto sem PIN de gerente)', async () => {
@@ -655,7 +662,9 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(withImpact.body).toContain('não tem valor próprio');
     // Autorização com campo inválido (P2-01 do GPT): recusada e não gravada; depois uma
     // válida funciona (a gravada errada quebraria a conferência do item para sempre).
-    for (const bad of [{ unit_price: 'abc' }, { quantity: 0 }, { item_id: 'não-é-uuid' }, { half_product_ids: 'x' }, { modifier_option_ids: undefined }]) {
+    for (const bad of [{ unit_price: 'abc' }, { quantity: 0 }, { item_id: 'não-é-uuid' }, { half_product_ids: 'x' }, { modifier_option_ids: undefined },
+                       // P2-01 da rodada 2: NaN em cada campo numérico.
+                       { quantity: 'NaN' }, { unit_price: 'NaN' }, { modifiers_unit_price: 'NaN' }]) {
       const r = await authorize(forgedItem, MANAGER_PIN, bad);
       expect(r.status, JSON.stringify(bad)).toBe(400);
       expect(r.body).toContain('válidos no metadata');
@@ -681,7 +690,16 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     // Com a autorização do gerente para este item exato: entra, e o alerta leva o gerente.
     expect((await raw('POST', 'order_items', forgedItem)).status).toBe(201);
     expect(mismatches()).toBe(1);
-    expect(sql(`SELECT amount_impact || ' ' || (metadata->>'expected_unit_price') || ' ' || (authorized_by_manager_id IS NOT NULL) FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}'`)).toBe('118.00 60.00 true');
+    expect(sql(`SELECT amount_impact || ' ' || (metadata->>'expected_unit_price') || ' ' || (authorized_by_manager_id IS NOT NULL) || ' ' || (metadata->>'server_verified') FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}'`)).toBe('118.00 60.00 true true');
+    // P2-02 da rodada 2: adicional que o cadastro não reconhece, com o instante do preço e a
+    // autorização do gerente. Entra, mas o alerta não diz que o servidor conferiu o preço.
+    const unknownItem = { ...forgedItem, id: crypto.randomUUID(), quantity: 1, unit_price: 60, modifier_option_ids: [crypto.randomUUID()] };
+    const unknown = await raw('POST', 'order_items', unknownItem);
+    expect(unknown.status).toBe(400);
+    expect(unknown.body).toContain('não reconhece');
+    expect((await authorize(unknownItem, MANAGER_PIN)).status).toBe(200);
+    expect((await raw('POST', 'order_items', unknownItem)).status).toBe(201);
+    expect(sql(`SELECT (metadata->>'server_verified') || ' ' || (metadata->>'expected_unit_price' IS NULL) || ' ' || (authorized_by_manager_id IS NOT NULL) FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND metadata->>'item_id' = '${unknownItem.id}'`)).toBe('false true true');
     // Item de fila antiga (sem o instante do preço) com o preço do cadastro de agora: entra, como antes.
     const legacyOk = await raw('POST', 'order_items', {
       id: crypto.randomUUID(), order_id: order.id, product_id: calabresa.id, waiter_id: st().currentUserId, quantity: 1, unit_price: 60, modifiers_unit_price: 0,
