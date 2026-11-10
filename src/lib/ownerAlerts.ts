@@ -2,6 +2,7 @@
  * Faixa de avisos do Painel do dono: o que precisa de alguém agora, com o atalho
  * para resolver. Função pura: a tela junta o estado e chama ownerAlerts().
  */
+import { formatBRL } from './money';
 import type { DiningTable, KegTap, Order, Product } from '../types';
 import { kegStatus } from './kegs';
 import type { ChannelRow, MarketplaceSale } from './ownerDashboard';
@@ -10,7 +11,7 @@ import { CHANNEL_DEPENDENCE_PCT } from './ownerDashboard';
 export type AlertTone = 'critical' | 'warning' | 'info';
 
 /** Para onde o botão do aviso leva (aba da Retaguarda ou tela do menu). */
-export type AlertTarget = 'delivery' | 'pickup' | 'map' | 'chopp' | 'cloud' | 'menu' | 'audit';
+export type AlertTarget = 'delivery' | 'pickup' | 'map' | 'caixa' | 'chopp' | 'cloud' | 'menu' | 'audit';
 
 export interface OwnerAlert {
   id: string;
@@ -41,6 +42,8 @@ export interface AlertInput {
   /** Fila da nuvem: conectado, eventos recusados e há quanto tempo não sobe nada. */
   cloud: { connected: boolean; rejected: number; pending: number; lastSuccessAt: string | null; lastError: string | null };
   channels: readonly ChannelRow[];
+  /** Dinheiro recebido hoje sem caixa aberto (não entra em nenhum fechamento). */
+  cashOutside?: { amount: number; count: number };
 }
 
 const minutesSince = (iso: string, now: Date) => (now.getTime() - new Date(iso).getTime()) / 60_000;
@@ -134,6 +137,16 @@ export function ownerAlerts(a: AlertInput): OwnerAlert[] {
       title: `${unpaidPickup.length} senha(s) esperando pagamento no caixa`,
       detail: `Há mais de ${PICKUP_UNPAID_ALERT_MIN} min. O pedido só vai para a cozinha depois de pago.`,
       action: { label: 'Abrir PDV / Caixa', target: 'pickup' },
+    });
+  }
+
+  if (a.cashOutside && a.cashOutside.count > 0) {
+    out.push({
+      id: 'cash-outside',
+      tone: 'warning',
+      title: `${formatBRL(a.cashOutside.amount)} em dinheiro recebido com o caixa fechado`,
+      detail: `${a.cashOutside.count} pagamento(s) em dinheiro hoje fora de um caixa aberto: não entram em nenhum fechamento.`,
+      action: { label: 'Abrir o Caixa', target: 'caixa' },
     });
   }
 

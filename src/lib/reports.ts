@@ -151,6 +151,8 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   STAFF_REACTIVATED: 'Acesso reativado',
   PERMISSION_CHANGED: 'Permissão alterada',
   STORE_RESET: 'Loja nova iniciada no aparelho',
+  CASH_WITHDRAWAL: 'Sangria do caixa',
+  CASH_CLOSE_DIFFERENCE: 'Caixa fechado com diferença',
 };
 
 /** Texto do alerta enviado ao WhatsApp do proprietário. */

@@ -493,6 +493,45 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     login(CASHIER_PIN);
   });
 
+  it('caixa: abre, suprimento, sangria com PIN de gerente e fechamento com diferença conferido pelo banco', async () => {
+    forgetPinFailures();
+    login(CASHIER_PIN);
+    const session = ok(st().openCashSession(100));
+    ok(st().addCashSupply(20, 'Troco do banco'));
+    await expectSynced('abertura e suprimento');
+    login(OWNER_PIN);
+    ok(st().saveTable({ number: 3, label: 'Mesa 3', area: 'Salão', capacity: 4, active: true }));
+    login(CASHIER_PIN);
+    const mesa = st().tables.find((t) => t.number === 3)!;
+    const order = ok(st().openTable(mesa.id, 2, null));
+    const p = st().products.find((x) => x.id === productId)!;
+    ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order.id));
+    ok(st().startCheckout(order.id));
+    const paid = st().orders.find((o) => o.id === order.id)!.remaining_balance;
+    payCash(order.id);
+    const wd = ok(st().addCashWithdrawal(50, { managerPin: MANAGER_PIN, reason: 'Depósito no banco' }));
+    await expectSynced('venda em dinheiro e sangria');
+    expect(sql(`SELECT authorized_by_manager_id IS NOT NULL FROM cash_movements WHERE id = '${wd.id}'`)).toBe('t');
+    const expected = 100 + 20 + paid - 50;
+    expect(sql(`SELECT tchefood_cash_expected('${session.id}', now())`)).toBe(expected.toFixed(2));
+    // Sangria sem autorização, direto pelo token do aparelho: recusada.
+    const forged = await raw('POST', 'cash_movements', {
+      id: crypto.randomUUID(), tenant_id: TENANT, session_id: session.id, type: 'WITHDRAWAL', amount: 10, reason: 'Sangria forjada',
+      performed_by_user_id: wd.performed_by_user_id, authorized_by_manager_id: wd.authorized_by_manager_id, created_at: new Date().toISOString(),
+    });
+    expect(forged.status).toBeGreaterThanOrEqual(400);
+    // Fecha com R$ 5 a menos: o banco calcula o esperado e a diferença sozinho.
+    ok(st().closeCashSession(expected - 5, null, { managerPin: MANAGER_PIN, reason: 'Troco dado errado' }));
+    await expectSynced('fechamento com diferença');
+    expect(sql(`SELECT status || ' ' || expected_cash || ' ' || counted_cash || ' ' || difference || ' ' || (closing_authorized_by_manager_id IS NOT NULL) FROM cash_sessions WHERE id = '${session.id}'`)).toBe(
+      `CLOSED ${expected.toFixed(2)} ${(expected - 5).toFixed(2)} -5.00 true`,
+    );
+    // Caixa fechado não muda mais.
+    const reopen = await raw('PATCH', `cash_sessions?id=eq.${session.id}`, { status: 'OPEN' });
+    expect(reopen.status).toBeGreaterThanOrEqual(400);
+  });
+
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
     const dir = join(ROOT, 'supabase', 'migrations');
     for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) psqlFile(target!, join(dir, f), DB);

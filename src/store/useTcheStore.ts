@@ -18,6 +18,8 @@ import type {
   AuditActionType,
   AuditLog,
   CashbackLedgerEntry,
+  CashMovement,
+  CashSession,
   Category,
   DiningTable,
   EventTicket,
@@ -82,6 +84,7 @@ import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, t
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
 import { computeNetWeight } from '../lib/scale';
+import { cashSummary, closingDifference, validCashAmount } from '../lib/cashRegister';
 import {
   availableCashback,
   balanceCashback,
@@ -242,6 +245,9 @@ interface DataSlice {
   priceSchedules: PriceSchedule[];
   /** Etapa 0 — exceções ao padrão de permissões por perfil. */
   rolePermissions: RolePermission[];
+  /** Caixa (db/schema_caixa.sql): turnos de caixa e movimentos de suprimento/sangria. */
+  cashSessions: CashSession[];
+  cashMovements: CashMovement[];
 }
 
 /** Sessão do aparelho na nuvem (Supabase Auth). Tokens ficam só neste aparelho. */
@@ -440,6 +446,19 @@ interface Actions {
    * pronto para Reenviar recusados (o servidor confere outra vez, com o bloqueio).
    */
   confirmRejectedAuthorization: (eventId: UUID, managerPin: string) => ActionResult;
+
+  // Caixa
+  /** Abre o caixa com o fundo de troco. Um caixa aberto por loja. */
+  openCashSession: (openingFloat: number) => ActionResult<CashSession>;
+  /** Suprimento: dinheiro que entra na gaveta (troco do banco, por exemplo). */
+  addCashSupply: (amount: number, reason: string) => ActionResult<CashMovement>;
+  /** Sangria: dinheiro que sai da gaveta. PIN de gerente + motivo; nunca mais do que há na gaveta. */
+  addCashWithdrawal: (amount: number, auth: ManagerAuthInput) => ActionResult<CashMovement>;
+  /**
+   * Fechamento cego: recebe só o que foi contado. Com diferença (sobra ou falta),
+   * só fecha com PIN de gerente + motivo (auth); sem auth devolve o erro com a diferença.
+   */
+  closeCashSession: (countedCash: number, notes: string | null, auth: ManagerAuthInput | null) => ActionResult<CashSession>;
 }
 
 export type TcheState = DataSlice & DeviceSlice & Actions;
@@ -608,6 +627,8 @@ const COUNTER_ROLES: ReadonlyArray<StaffUser['role']> = ['WAITER', 'CASHIER', 'M
 const PICKUP_ROLES: ReadonlyArray<StaffUser['role']> = ['KIOSK', ...COUNTER_ROLES];
 /** Perfis que operam o bar (sangria, leitura do barril). */
 const BAR_ROLES: ReadonlyArray<StaffUser['role']> = ['KITCHEN', 'CASHIER', 'MANAGER', 'OWNER'];
+/** Perfis que operam o caixa (abrir, suprimento, sangria, fechar). */
+export const CASH_ROLES: ReadonlyArray<StaffUser['role']> = ['CASHIER', 'MANAGER', 'OWNER'];
 
 function validateTenantDraft(d: TenantDraft): { ok: true } | { ok: false; error: string } {
   if (d.name.trim().length < 2) return { ok: false, error: 'Informe o nome fantasia da loja.' };
@@ -2969,6 +2990,8 @@ export const useTcheStore = create<TcheState>()(
             eventTickets: [],
             loyaltyCustomers: [],
             cashbackLedger: [],
+            cashSessions: [],
+            cashMovements: [],
             tray: [],
             outbox: [
               syncEvent('tenants', 'UPDATE', tenant),
@@ -3063,6 +3086,170 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: undefined };
         },
 
+        openCashSession: (openingFloat) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário abre o caixa.');
+          if (!validCashAmount(openingFloat, true)) return fail('Informe o fundo de troco (pode ser R$ 0,00).');
+          if (get().cashSessions.some((c) => c.status === 'OPEN')) return fail('Já existe um caixa aberto.');
+          const session: CashSession = {
+            id: uuid(),
+            tenant_id: get().tenant.id,
+            opened_by_user_id: user.id,
+            opened_at: nowISO(),
+            opening_float: round2(openingFloat),
+            status: 'OPEN',
+            closed_by_user_id: null,
+            closed_at: null,
+            counted_cash: null,
+            expected_cash: null,
+            difference: null,
+            closing_notes: null,
+            closing_authorized_by_manager_id: null,
+          };
+          let duplicated = false;
+          set((s) => {
+            // Dois toques seguidos não abrem dois caixas.
+            if (s.cashSessions.some((c) => c.status === 'OPEN')) {
+              duplicated = true;
+              return {};
+            }
+            return { cashSessions: [session, ...s.cashSessions], outbox: [...s.outbox, syncEvent('cash_sessions', 'INSERT', session)] };
+          });
+          if (duplicated) return fail('Já existe um caixa aberto.');
+          return { ok: true, data: session };
+        },
+
+        addCashSupply: (amount, reason) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário movimenta o caixa.');
+          const open = get().cashSessions.find((c) => c.status === 'OPEN');
+          if (!open) return fail('Abra o caixa primeiro.');
+          if (!validCashAmount(amount)) return fail('Informe um valor maior que zero.');
+          const why = reason.trim();
+          if (why.length < MIN_REASON_LENGTH) return fail(`Informe o motivo (mínimo ${MIN_REASON_LENGTH} caracteres).`);
+          const movement: CashMovement = {
+            id: uuid(),
+            tenant_id: get().tenant.id,
+            session_id: open.id,
+            type: 'SUPPLY',
+            amount: round2(amount),
+            reason: why,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: null,
+            created_at: nowISO(),
+          };
+          set((s) => ({ cashMovements: [...s.cashMovements, movement], outbox: [...s.outbox, syncEvent('cash_movements', 'INSERT', movement)] }));
+          return { ok: true, data: movement };
+        },
+
+        addCashWithdrawal: (amount, auth) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário movimenta o caixa.');
+          const open = get().cashSessions.find((c) => c.status === 'OPEN');
+          if (!open) return fail('Abra o caixa primeiro.');
+          if (!validCashAmount(amount)) return fail('Informe um valor maior que zero.');
+          const inDrawer = cashSummary(open, get().payments, get().cashMovements).expected;
+          if (toCents(amount) > toCents(inDrawer)) return fail(`Não há esse valor na gaveta. Esperado agora: ${formatBRL(inDrawer)}.`);
+          const authRes = authorizeManager(auth, { orderId: null, action: 'CASH_WITHDRAWAL' });
+          if (!authRes.ok) return authRes;
+          const ts = nowISO();
+          const movement: CashMovement = {
+            id: uuid(),
+            tenant_id: get().tenant.id,
+            session_id: open.id,
+            type: 'WITHDRAWAL',
+            amount: round2(amount),
+            reason: auth.reason.trim(),
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: authRes.data.id,
+            created_at: ts,
+          };
+          const log: AuditLog = {
+            id: uuid(),
+            tenant_id: get().tenant.id,
+            order_id: null,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: authRes.data.id,
+            action_type: 'CASH_WITHDRAWAL',
+            amount_impact: -movement.amount,
+            reason: movement.reason,
+            whatsapp_alert_sent: false,
+            metadata: { movement_id: movement.id, session_id: open.id },
+            created_at: ts,
+          };
+          set((s) => ({
+            cashMovements: [...s.cashMovements, movement],
+            auditLogs: [log, ...s.auditLogs],
+            // A autorização sobe antes: o banco só aceita a sangria com ela já gravada.
+            outbox: [...s.outbox, managerAuthEvent(log, auth.managerPin), syncEvent('cash_movements', 'INSERT', movement)],
+          }));
+          return { ok: true, data: movement };
+        },
+
+        closeCashSession: (countedCash, notes, auth) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário fecha o caixa.');
+          const open = get().cashSessions.find((c) => c.status === 'OPEN');
+          if (!open) return fail('Não há caixa aberto.');
+          if (!validCashAmount(countedCash, true)) return fail('Informe quanto dinheiro foi contado na gaveta.');
+          const ts = nowISO();
+          const summary = cashSummary(open, get().payments, get().cashMovements, new Date(ts));
+          const diff = closingDifference(countedCash, summary.expected);
+          let log: AuditLog | null = null;
+          let managerId: UUID | null = null;
+          if (diff !== 0) {
+            if (!auth) {
+              return fail(`${diff < 0 ? 'Faltou' : 'Sobrou'} ${formatBRL(Math.abs(diff))} no caixa. Conte de novo ou chame o gerente para fechar com a diferença.`);
+            }
+            const authRes = authorizeManager(auth, { orderId: null, action: 'CASH_CLOSE_DIFFERENCE' });
+            if (!authRes.ok) return authRes;
+            managerId = authRes.data.id;
+            log = {
+              id: uuid(),
+              tenant_id: get().tenant.id,
+              order_id: null,
+              performed_by_user_id: user.id,
+              authorized_by_manager_id: managerId,
+              action_type: 'CASH_CLOSE_DIFFERENCE',
+              amount_impact: diff,
+              reason: auth.reason.trim(),
+              // Falta grande no caixa vai para o alerta do proprietário, como os cancelamentos.
+              whatsapp_alert_sent: diff < 0,
+              metadata: { session_id: open.id, expected_cash: summary.expected, counted_cash: round2(countedCash) },
+              created_at: ts,
+            };
+          }
+          const closed: CashSession = {
+            ...open,
+            status: 'CLOSED',
+            closed_by_user_id: user.id,
+            closed_at: ts,
+            counted_cash: round2(countedCash),
+            expected_cash: summary.expected,
+            difference: diff,
+            closing_notes: notes?.trim() || null,
+            closing_authorized_by_manager_id: managerId,
+          };
+          let stale = false;
+          set((s) => {
+            if (!s.cashSessions.some((c) => c.id === open.id && c.status === 'OPEN')) {
+              stale = true;
+              return {};
+            }
+            return {
+              cashSessions: s.cashSessions.map((c) => (c.id === open.id ? closed : c)),
+              auditLogs: log ? [log, ...s.auditLogs] : s.auditLogs,
+              outbox: [...s.outbox, ...(log ? [managerAuthEvent(log, auth!.managerPin)] : []), syncEvent('cash_sessions', 'UPDATE', closed)],
+            };
+          });
+          if (stale) return fail('Este caixa já foi fechado.');
+          return { ok: true, data: closed };
+        },
+
         setSyncError: (message, blockedEventId) =>
           set((s) => ({
             syncStatus: {
@@ -3139,8 +3326,9 @@ export const useTcheStore = create<TcheState>()(
     {
       name: 'tchefood-state-v1',
       // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback);
-      // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras).
-      version: 5,
+      // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras);
+      // v6 = caixa (abertura, sangria, suprimento, fechamento).
+      version: 6,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -3213,6 +3401,12 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       }));
     }
     for (const key of ['suppliers', 'purchaseInvoices', 'purchaseInvoiceItems', 'stockMovements', 'supplierProductLinks']) {
+      if (!Array.isArray(out[key])) out[key] = [];
+    }
+  }
+  if (version < 6) {
+    // Caixa: listas vazias (a loja abre o primeiro caixa depois da atualização).
+    for (const key of ['cashSessions', 'cashMovements']) {
       if (!Array.isArray(out[key])) out[key] = [];
     }
   }

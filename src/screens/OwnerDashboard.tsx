@@ -23,6 +23,7 @@ import {
   type HourPoint,
   type MarketplaceSale,
 } from '../lib/ownerDashboard';
+import { cashOutsideSessions } from '../lib/cashRegister';
 import { ownerAlerts, type AlertTarget, type OwnerAlert } from '../lib/ownerAlerts';
 import { Btn, Sheet, toast } from '../components/ui';
 
@@ -55,6 +56,7 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
   const cashbackLedger = useTcheStore((s) => s.cashbackLedger);
   const staff = useTcheStore((s) => s.staff);
   const kegTaps = useTcheStore((s) => s.kegTaps);
+  const cashSessions = useTcheStore((s) => s.cashSessions);
   const cloud = useTcheStore((s) => s.cloud);
   const outbox = useTcheStore((s) => s.outbox.length);
   const rejected = useTcheStore((s) => s.syncRejected.length);
@@ -105,8 +107,10 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
         cloud: { connected: cloud !== null, rejected, pending: outbox, lastSuccessAt: syncStatus.last_success_at, lastError: syncStatus.last_error },
         // Dependência de app: olha sempre o dia de hoje, não o período escolhido.
         channels: channelMix(ix, periodRanges('today', now).current),
+        // Só avisa em loja que já usa o caixa; quem nunca abriu um não recebe o aviso todo dia.
+        cashOutside: cashSessions.length ? cashOutsideSessions(payments, cashSessions, shiftStart(now), now) : undefined,
       }),
-    [now, orders, tables, products, kegTaps, deliveryErrors, marketplace, cloud, rejected, outbox, syncStatus, ix],
+    [now, orders, tables, products, kegTaps, deliveryErrors, marketplace, cloud, rejected, outbox, syncStatus, ix, payments, cashSessions],
   );
 
   return (
