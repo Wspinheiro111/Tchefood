@@ -149,7 +149,8 @@ BEGIN
            AND a.action_type = 'CASHBACK_REDEEMED' AND a.authorized_by_manager_id IS NULL
            AND COALESCE(a.metadata->>'server_verified', '') <> 'true'
            AND a.metadata->>'customer_id' = p_customer_id::text
-           AND jsonb_typeof(a.metadata->'amount') = 'number' AND (a.metadata->>'amount')::numeric = p_amount) THEN
+           AND jsonb_typeof(a.metadata->'amount') = 'number' AND (a.metadata->>'amount')::numeric = p_amount
+           AND a.amount_impact = -p_amount AND a.performed_by_user_id = p_user_id) THEN
         v_legacy := TRUE;
         SELECT GREATEST(
                  COALESCE((SELECT SUM(amount - remaining_amount) FROM cashback_ledger
@@ -213,9 +214,11 @@ BEGIN
     VALUES (p_redeem_id, v_tenant, p_customer_id, p_order_id, 'REDEEM', v_amount, p_user_id, v_at);
 
     -- Fila de versão anterior: o audit_log do resgate pode já ter subido sozinho.
+    -- Só vale reaproveitar o registro que já passou pela conferência da versão anterior
+    -- acima (mesma loja, conta, cliente, valor e operador); qualquer outro com este id é recusado.
     SELECT * INTO v_audit FROM audit_logs WHERE id = p_audit_id;
     IF FOUND THEN
-        IF v_audit.tenant_id <> v_tenant OR v_audit.order_id IS DISTINCT FROM p_order_id OR v_audit.action_type <> 'CASHBACK_REDEEMED'
+        IF NOT v_legacy OR v_audit.tenant_id <> v_tenant OR v_audit.order_id IS DISTINCT FROM p_order_id OR v_audit.action_type <> 'CASHBACK_REDEEMED'
            OR (v_audit.metadata->>'discount_before')::NUMERIC IS DISTINCT FROM v_order.discount_amount
            OR (v_audit.metadata->>'discount_after')::NUMERIC IS DISTINCT FROM v_order.discount_amount + v_amount THEN
             RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o registro do resgate não confere com esta conta.';
@@ -251,6 +254,46 @@ BEGIN
 END;
 $$;
 
+-- Desconto da conta: só cresce por autorização (DISCOUNT_APPLIED) ou pela função do
+-- cashback, e o aparelho não o reduz. Uma atualização antiga da fila (feita antes de outro
+-- desconto chegar à nuvem) traria o valor velho e apagaria o desconto já gravado: o banco
+-- mantém o valor dele. Nenhuma tela do app reduz desconto.
+CREATE OR REPLACE FUNCTION tchefood_orders_keep_discount()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_user IN ('anon', 'authenticated') AND NEW.discount_amount < OLD.discount_amount THEN
+        NEW.discount_amount := OLD.discount_amount;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_orders_00_keep_discount ON orders;
+CREATE TRIGGER trg_orders_00_keep_discount BEFORE UPDATE OF discount_amount ON orders
+    FOR EACH ROW EXECUTE FUNCTION tchefood_orders_keep_discount();
+
+-- Saldo exibido do cliente (cache do extrato): o banco calcula, o valor do aparelho não
+-- vale. Sem isso, a atualização do cliente que sobe depois do resgate gravaria o saldo
+-- antigo do aparelho por cima de um crédito novo de outro aparelho.
+CREATE OR REPLACE FUNCTION tchefood_refresh_cashback_balance(p_customer_id UUID)
+RETURNS VOID LANGUAGE sql AS $$
+    UPDATE loyalty_customers c SET cashback_balance =
+        (SELECT COALESCE(SUM(l.remaining_amount), 0) FROM cashback_ledger l
+          WHERE l.tenant_id = c.tenant_id AND l.customer_id = c.id AND l.entry_type = 'EARN' AND l.expires_at > NOW())
+     WHERE c.id = p_customer_id
+$$;
+CREATE OR REPLACE FUNCTION tchefood_loyalty_balance_from_ledger()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+    NEW.cashback_balance := (SELECT COALESCE(SUM(l.remaining_amount), 0) FROM cashback_ledger l
+                              WHERE l.tenant_id = NEW.tenant_id AND l.customer_id = NEW.id
+                                AND l.entry_type = 'EARN' AND l.expires_at > NOW());
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_loyalty_customers_balance ON loyalty_customers;
+CREATE TRIGGER trg_loyalty_customers_balance BEFORE INSERT OR UPDATE ON loyalty_customers
+    FOR EACH ROW EXECUTE FUNCTION tchefood_loyalty_balance_from_ledger();
+
 -- Crédito, resgate e expiração presos à loja: cliente e conta do lançamento são da mesma
 -- loja do lançamento. NOT VALID: vale para todo lançamento novo ou alterado; o que já
 -- existe não é reprovado (as consultas acima filtram pela loja de qualquer forma).
@@ -280,6 +323,7 @@ BEGIN
         -- A função antiga roda com o papel de quem chama e agora é recusada pelo gatilho: fica só para o servidor.
         REVOKE ALL ON FUNCTION tchefood_redeem_cashback(UUID, UUID, UUID) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_cashback_now() FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_loyalty_balance_from_ledger() FROM PUBLIC, anon, authenticated;
         REVOKE DELETE ON cashback_ledger FROM anon, authenticated;
     END IF;
 END $$;

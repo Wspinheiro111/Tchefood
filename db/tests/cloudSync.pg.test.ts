@@ -414,6 +414,43 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     setCashbackClock(null);
   });
 
+  it('depois do resgate: atualização antiga da conta não apaga desconto e a do cliente não grava saldo', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [order] = await cashbackOrders(1, 31);
+    expect(order!.cap).toBeGreaterThanOrEqual(7);
+    const c = cashbackCustomer('5553988110006', [{ amount: 5, expires: '2026-12-31' }]);
+    expect((await cashbackRpc(order!.id, c.id, 5)).status).toBe(200);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('5.00');
+    // P0-01 da rodada 3: outro aparelho sobe um desconto autorizado (R$ 5 → R$ 7) antes da
+    // fila deste aparelho terminar.
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Desconto do outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    const gross = sql(`SELECT subtotal_items + service_fee_amount FROM orders WHERE id = '${order!.id}'`);
+    // A fila deste aparelho sobe a atualização da conta com o desconto antigo, e depois a
+    // conta indo para pagamento (também com o valor antigo): o desconto continua R$ 7.
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5 })).status).toBeLessThan(300);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5, status: 'PAYING' })).status).toBeLessThan(300);
+    expect(sql(`SELECT discount_amount || ' ' || status FROM orders WHERE id = '${order!.id}'`)).toBe('7.00 PAYING');
+    expect(sql(`SELECT total_amount = ${gross} - 7 FROM orders WHERE id = '${order!.id}'`)).toBe('t');
+    expect(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${order!.id}' AND entry_type = 'REDEEM'`)).toBe('5.00');
+
+    // P2-02 da rodada 3: o saldo exibido do cliente é do banco. A atualização do cliente que
+    // sobe depois do resgate (com o saldo do aparelho) e um saldo inventado não valem.
+    expect((await raw('PATCH', `loyalty_customers?id=eq.${c.id}`, { cashback_balance: 99 })).status).toBeLessThan(300);
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('0.00');
+    // Crédito novo de outro aparelho (R$ 3); a atualização antiga com saldo 0 não o apaga.
+    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         VALUES ('${TENANT}', '${c.id}', 'EARN', 3, 3, '2026-11-01', '2027-12-31');`);
+    sql(`SELECT tchefood_refresh_cashback_balance('${c.id}');`);
+    expect((await raw('PATCH', `loyalty_customers?id=eq.${c.id}`, { cashback_balance: 0, name: 'Cliente atualizado' })).status).toBeLessThan(300);
+    expect(sql(`SELECT cashback_balance || ' ' || name FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('3.00 Cliente atualizado');
+    closeCashbackOrders([order!.id]);
+    setCashbackClock(null);
+  });
+
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
     setCashbackClock('2026-11-12T20:00:00-03:00');
@@ -462,6 +499,19 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await cashbackRpc(a2!.id, d.id, 3, { p_legacy_predebited: true, p_audit_id: audit2 })).status).toBe(200);
     expect(remainingOf(d.earns[0]!) + remainingOf(d.earns[1]!)).toBe(13);
     expect(sql(`SELECT count(*) FROM cashback_ledger WHERE entry_type = 'REDEEM' AND order_id IN ('${a!.id}', '${a1!.id}', '${a2!.id}')`)).toBe('3');
+
+    // P2-01 da rodada 3: o registro antigo da conta B é do cliente C. Outro cliente (E, com
+    // crédito) não pode reaproveitá-lo, com ou sem a marca: recusado e nada gravado.
+    const auditB = legacyAudit(b!.id, c.id, 5);
+    const e = cashbackCustomer('5553988110005', [{ amount: 5, expires: '2026-12-31' }]);
+    for (const legacy of [false, true]) {
+      const r = await cashbackRpc(b!.id, e.id, 5, { p_audit_id: auditB, p_legacy_predebited: legacy });
+      expect(r.status, r.body).toBe(400);
+      expect(r.body).toContain('não confere');
+    }
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${b!.id}'`)).toBe('0');
+    expect(remainingOf(e.earns[0]!)).toBe(5);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${b!.id}'`)).toBe('0.00');
     closeCashbackOrders([a!.id, b!.id, a1!.id, a2!.id]);
     setCashbackClock(null);
   });
