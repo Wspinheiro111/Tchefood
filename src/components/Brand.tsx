@@ -9,16 +9,38 @@ export function BrandMark({ className = 'h-9 w-9' }: { className?: string }) {
 
 /**
  * Logo horizontal completa (símbolo + "TchêFood" + "Sistema para restaurantes e delivery").
- * `variant="dark"` troca o slogan preto por branco para fundos escuros.
+ * `variant="dark"` é a versão negativa oficial (Tchê branco, Food amarelo) para fundos escuros.
  */
-export function BrandLogo({ variant = 'light', className = 'h-12 w-auto' }: { variant?: 'light' | 'dark'; className?: string }) {
-  return (
+export function BrandLogo({
+  variant = 'light',
+  className = 'h-12 w-auto',
+  effect = false,
+}: {
+  variant?: 'light' | 'dark';
+  className?: string;
+  /** Entrada suave + brilho que passa pela logo de tempos em tempos (login, totem, painel TV). */
+  effect?: boolean;
+}) {
+  const src = variant === 'dark' ? logoDarkUrl : logoUrl;
+  const img = (
     <img
-      src={variant === 'dark' ? logoDarkUrl : logoUrl}
+      src={src}
       alt="Tchê Food — Sistema para restaurantes e delivery"
       draggable={false}
       className={`object-contain ${className}`}
     />
+  );
+  if (!effect) return img;
+  const mask = `url(${src})`;
+  return (
+    <span className="brand-fx relative inline-block">
+      {img}
+      <span
+        aria-hidden="true"
+        className="brand-fx-shine pointer-events-none absolute inset-0"
+        style={{ WebkitMaskImage: mask, maskImage: mask }}
+      />
+    </span>
   );
 }
 

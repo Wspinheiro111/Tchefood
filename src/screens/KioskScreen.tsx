@@ -425,7 +425,7 @@ function Welcome({ name, onStart, onLogo }: { name: string; onStart: () => void;
       <div className="pointer-events-none absolute -right-24 -top-24 h-96 w-96 rounded-full bg-ouro/30 blur-3xl" />
       <div className="pointer-events-none absolute -bottom-32 -left-24 h-96 w-96 rounded-full bg-orange-400/30 blur-3xl" />
       <button aria-label="Logo" onClick={(e) => { e.stopPropagation(); onLogo(); }} className="relative mt-6 rounded-[2rem] bg-white px-8 py-4 shadow-xl">
-        <BrandLogo className="h-24 w-auto sm:h-28" />
+        <BrandLogo effect className="h-24 w-auto sm:h-28" />
       </button>
       <div className="relative text-center">
         <div className="text-2xl font-bold uppercase tracking-[0.3em] text-orange-200">Bem-vindo ao</div>
