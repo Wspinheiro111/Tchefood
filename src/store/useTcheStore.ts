@@ -4166,7 +4166,9 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
  * CASHBACK_REDEEMED, baixa dos créditos por UPDATE e o REDEEM). Agora sobe numa chamada
  * (tchefood_register_cashback_redeem), que faz as três no banco. O REDEEM ganha o id do
  * audit_log do resgate; o audit_log e as baixas ainda na fila saem dela (o banco recusaria
- * a baixa direta). Se o audit_log já tinha subido, a função usa o que está gravado.
+ * a baixa direta). Se o audit_log já tinha subido, a função usa o que está gravado; se
+ * parte das baixas já tinha subido, a função mede o crédito já baixado sem resgate e não
+ * o consome de novo (legacy_predebited).
  */
 export function migrateCashbackRedeemQueue(events: SyncEvent[], auditLogs: AuditLog[]): SyncEvent[] {
   const redeems = events.filter((e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.entry_type === 'REDEEM' && !e.cashback_redeem);
@@ -4180,7 +4182,9 @@ export function migrateCashbackRedeemQueue(events: SyncEvent[], auditLogs: Audit
     if (e.table === 'audit_logs' && e.op === 'INSERT' && e.payload.action_type === 'CASHBACK_REDEEMED' && orderIds.has(String(e.payload.order_id))) return [];
     if (redeems.includes(e)) {
       const audit = auditFor(String(e.payload.order_id));
-      return [audit ? { ...e, cashback_redeem: { audit_id: audit } } : e];
+      // As baixas dos créditos subiam ANTES do resgate: se parte delas já subiu, o
+      // servidor encontra essa baixa sem resgate do cliente e não a consome de novo.
+      return [audit ? { ...e, cashback_redeem: { audit_id: audit, legacy_predebited: true } } : e];
     }
     return [e];
   });

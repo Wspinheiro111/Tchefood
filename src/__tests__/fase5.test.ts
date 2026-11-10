@@ -315,7 +315,7 @@ describe('cashback no WhatsApp', () => {
     const other = ev('e5', 'audit_logs', 'INSERT', { id: 'A2', order_id: 'O2', action_type: 'CASHBACK_REDEEMED' });
     const out = migrateCashbackRedeemQueue([audit, earn, redeem, order, other], []);
     expect(out.map((e) => e.id)).toEqual(['e3', 'e4', 'e5']);
-    expect(out[0]!.cashback_redeem).toEqual({ audit_id: 'A1' });
+    expect(out[0]!.cashback_redeem).toEqual({ audit_id: 'A1', legacy_predebited: true });
     // audit_log que já subiu: o id vem do histórico do aparelho e a função usa o gravado.
     const logs = [{ id: 'A9', order_id: 'O1', action_type: 'CASHBACK_REDEEMED' } as AuditLog];
     expect(migrateCashbackRedeemQueue([earn, redeem, order], logs).map((e) => [e.id, e.cashback_redeem?.audit_id])).toEqual([['e3', 'A9'], ['e4', undefined]]);
@@ -325,7 +325,7 @@ describe('cashback no WhatsApp', () => {
       syncRejected: Array<{ event: SyncEvent }>;
     };
     expect(migrated.outbox.map((e) => e.id)).toEqual(['e4']);
-    expect(migrated.syncRejected.map((r) => r.event.cashback_redeem)).toEqual([{ audit_id: 'A9' }]);
+    expect(migrated.syncRejected.map((r) => r.event.cashback_redeem)).toEqual([{ audit_id: 'A9', legacy_predebited: true }]);
   });
 
   it('valida WhatsApp brasileiro', () => {

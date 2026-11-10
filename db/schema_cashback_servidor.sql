@@ -63,9 +63,15 @@ $$;
 -- fixar a data (a regra de terça a quinta depende do dia).
 CREATE OR REPLACE FUNCTION tchefood_cashback_now() RETURNS TIMESTAMPTZ LANGUAGE sql STABLE AS $$ SELECT NOW() $$;
 
+-- p_legacy_predebited: só a fila convertida de um aparelho da versão anterior manda TRUE.
+-- Naquela versão o aparelho baixava o saldo dos créditos (UPDATE) ANTES de subir o
+-- resgate; se a internet caiu no meio, parte do crédito já saiu da nuvem sem o REDEEM.
+-- O servidor não confia na palavra do aparelho: mede essa baixa sem resgate do próprio
+-- cliente (soma de amount - remaining dos EARN menos a soma dos REDEEM) e só ela entra
+-- no cálculo, sem ser consumida de novo. Sem baixa pendente, o resgate segue a regra normal.
 CREATE OR REPLACE FUNCTION tchefood_register_cashback_redeem(
     p_redeem_id UUID, p_audit_id UUID, p_order_id UUID, p_customer_id UUID,
-    p_amount NUMERIC, p_user_id UUID, p_created_at TIMESTAMPTZ)
+    p_amount NUMERIC, p_user_id UUID, p_created_at TIMESTAMPTZ, p_legacy_predebited BOOLEAN DEFAULT FALSE)
 RETURNS NUMERIC
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
@@ -77,6 +83,7 @@ DECLARE
     v_now TIMESTAMPTZ := tchefood_cashback_now();
     v_at TIMESTAMPTZ;
     v_available NUMERIC(10,2); v_cap NUMERIC(10,2); v_amount NUMERIC(10,2); v_left NUMERIC(10,2); v_take NUMERIC(10,2);
+    v_predebited NUMERIC(10,2) := 0; v_from_predebit NUMERIC(10,2) := 0;
     r RECORD;
 BEGIN
     IF v_tenant IS NULL THEN
@@ -117,16 +124,26 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: esta conta já usou cashback.';
     END IF;
 
+    -- Baixa da versão anterior ainda sem resgate (ver o comentário da função).
+    IF COALESCE(p_legacy_predebited, FALSE) THEN
+        SELECT GREATEST(
+                 COALESCE((SELECT SUM(amount - remaining_amount) FROM cashback_ledger WHERE customer_id = p_customer_id AND entry_type = 'EARN'), 0)
+               - COALESCE((SELECT SUM(amount) FROM cashback_ledger WHERE customer_id = p_customer_id AND entry_type = 'REDEEM'), 0), 0)
+          INTO v_predebited;
+    END IF;
+
     -- Hora do resgate: a do aparelho (fila offline), nunca no futuro e no máximo 24 h atrás.
+    -- A fila da versão anterior com crédito já baixado pode ser mais velha (o aparelho
+    -- ficou sem atualizar): recusar deixaria o cliente sem o crédito que já saiu.
     v_at := LEAST(COALESCE(p_created_at, v_now), v_now);
-    IF v_at < v_now - INTERVAL '24 hours' THEN
+    IF v_at < v_now - INTERVAL '24 hours' AND v_predebited <= 0 THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: resgate feito há mais de 24 horas não sobe; refaça na conta.';
     END IF;
     IF NOT tchefood_is_cashback_day(v_at) THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: cashback só pode ser usado de terça a quinta.';
     END IF;
 
-    v_available := tchefood_cashback_available(p_customer_id, v_at);
+    v_available := tchefood_cashback_available(p_customer_id, v_at) + v_predebited;
     v_cap := round(v_order.total_amount * tchefood_cashback_max_usage_pct() / 100, 2);
     v_amount := LEAST(v_available, v_cap, v_order.remaining_balance);
     IF v_amount <= 0 THEN
@@ -136,7 +153,9 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o servidor calcula R$ % de cashback para esta conta, o aparelho mandou R$ %.', v_amount, p_amount;
     END IF;
 
-    v_left := v_amount;
+    -- O que já saiu na versão anterior não sai de novo; o resto, do crédito que vence antes.
+    v_from_predebit := LEAST(v_predebited, v_amount);
+    v_left := v_amount - v_from_predebit;
     FOR r IN SELECT id, remaining_amount FROM cashback_ledger
               WHERE customer_id = p_customer_id AND entry_type = 'EARN' AND remaining_amount > 0
                 AND valid_from <= v_at AND expires_at > v_at
@@ -165,7 +184,7 @@ BEGIN
                 'Cashback de fidelidade resgatado', FALSE,
                 jsonb_build_object('customer_id', p_customer_id, 'phone', v_customer.phone_whatsapp, 'amount', v_amount,
                                    'discount_before', v_order.discount_amount, 'discount_after', v_order.discount_amount + v_amount,
-                                   'server_verified', TRUE),
+                                   'server_verified', TRUE, 'legacy_predebited', v_from_predebit),
                 v_at);
     END IF;
     UPDATE orders SET discount_amount = discount_amount + v_amount WHERE id = p_order_id;
@@ -176,8 +195,8 @@ $$;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
-        REVOKE ALL ON FUNCTION tchefood_register_cashback_redeem(UUID, UUID, UUID, UUID, NUMERIC, UUID, TIMESTAMPTZ) FROM PUBLIC, anon;
-        GRANT EXECUTE ON FUNCTION tchefood_register_cashback_redeem(UUID, UUID, UUID, UUID, NUMERIC, UUID, TIMESTAMPTZ) TO authenticated;
+        REVOKE ALL ON FUNCTION tchefood_register_cashback_redeem(UUID, UUID, UUID, UUID, NUMERIC, UUID, TIMESTAMPTZ, BOOLEAN) FROM PUBLIC, anon;
+        GRANT EXECUTE ON FUNCTION tchefood_register_cashback_redeem(UUID, UUID, UUID, UUID, NUMERIC, UUID, TIMESTAMPTZ, BOOLEAN) TO authenticated;
         -- A função antiga roda com o papel de quem chama e agora é recusada pelo gatilho: fica só para o servidor.
         REVOKE ALL ON FUNCTION tchefood_redeem_cashback(UUID, UUID, UUID) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_cashback_now() FROM PUBLIC, anon, authenticated;

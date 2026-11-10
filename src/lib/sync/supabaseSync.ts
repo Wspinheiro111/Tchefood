@@ -261,6 +261,7 @@ function buildCashbackRedeemRequest(event: SyncEvent, cfg: SyncConfig): SyncRequ
     p_amount: p.amount,
     p_user_id: p.created_by_user_id,
     p_created_at: p.created_at ?? null,
+    p_legacy_predebited: event.cashback_redeem.legacy_predebited === true,
   });
 }
 

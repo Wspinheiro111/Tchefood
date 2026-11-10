@@ -801,7 +801,14 @@ export interface SyncEvent {
    * Sobe por tchefood_register_cashback_redeem(), que confere dia, saldo e teto,
    * baixa os créditos e grava resgate, audit_log e desconto da comanda juntos.
    */
-  cashback_redeem?: { audit_id: UUID };
+  cashback_redeem?: {
+    audit_id: UUID;
+    /**
+     * Fila convertida da versão anterior (antes da v12): os créditos podem já ter sido
+     * baixados na nuvem sem o resgate. O servidor mede essa baixa e não consome de novo.
+     */
+    legacy_predebited?: boolean;
+  };
   /**
    * Item de chopp: a torneira de onde sai. Segura o item atrás de uma troca de barril
    * recusada da mesma torneira (recordKeys). Não vai para o banco.

@@ -315,6 +315,48 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     setCashbackClock(null);
   });
 
+  it('fila da versão anterior com a baixa do crédito já na nuvem: o servidor mede a baixa e não consome de novo', async () => {
+    const mesa = st().tables.find((t) => t.number === 1)!;
+    const p = st().products.find((x) => x.id === productId)!;
+    const customer = sql(`SELECT id FROM loyalty_customers WHERE tenant_id = '${TENANT}' LIMIT 1`);
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(mesa.id, 1, null));
+    ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 2, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order.id));
+    await expectSynced('conta aberta');
+    const remaining = () => Number(sql(`SELECT COALESCE(SUM(remaining_amount), 0) FROM cashback_ledger WHERE customer_id = '${customer}' AND entry_type = 'EARN' AND expires_at > '2026-11-12T20:00:00-03:00' AND valid_from <= '2026-11-12T20:00:00-03:00'`));
+    // Crédito novo liberado (gravado pelo servidor, como se viesse de uma conta fechada).
+    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         VALUES ('${TENANT}', '${customer}', 'EARN', 20, 20, '2026-11-01', '2026-12-31');`);
+    const before = remaining();
+    expect(before).toBeGreaterThan(2);
+    const total = Number(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`));
+    const expected = Math.min(before, Math.round(total * 50) / 100);
+    const redeem = (args: Record<string, unknown>) => raw('POST', 'rpc/tchefood_register_cashback_redeem', {
+      p_redeem_id: 'cccccccc-0000-4000-8000-000000000001', p_audit_id: 'cccccccc-0000-4000-8000-000000000002', p_order_id: order.id,
+      p_customer_id: customer, p_amount: expected, p_user_id: cashier, p_created_at: '2026-11-10T20:00:00-03:00', p_legacy_predebited: true, ...args,
+    });
+    // Sem baixa pendente na nuvem, a marca da fila antiga não muda nada: o resgate de 2 dias atrás é recusado.
+    expect((await redeem({})).body).toContain('mais de 24 horas');
+    // A versão anterior baixou R$ 2,00 de um crédito e caiu antes de subir o resgate.
+    const earn = sql(`SELECT id FROM cashback_ledger WHERE customer_id = '${customer}' AND entry_type = 'EARN' AND remaining_amount >= 2 ORDER BY expires_at LIMIT 1`);
+    sql(`SET session_replication_role = replica; UPDATE cashback_ledger SET remaining_amount = remaining_amount - 2 WHERE id = '${earn}';`);
+    expect(remaining()).toBe(Math.round((before - 2) * 100) / 100);
+    // A fila convertida sobe: o valor é o mesmo que o aparelho calculou com o crédito inteiro,
+    // e só a diferença sai dos créditos (os R$ 2,00 já tinham saído).
+    const res = await redeem({});
+    expect(res.status, res.body).toBe(200);
+    expect(Number(res.body)).toBe(expected);
+    expect(remaining()).toBe(Math.round((before - expected) * 100) / 100);
+    expect(sql(`SELECT metadata->>'legacy_predebited' FROM audit_logs WHERE id = 'cccccccc-0000-4000-8000-000000000002'`)).toBe('2.00');
+    useTcheStore.setState({ orders: st().orders.filter((o) => o.id !== order.id), tables: st().tables.map((t) => (t.id === mesa.id ? { ...t, status: 'FREE' as const, current_order_id: null } : t)) });
+    sql(`SET session_replication_role = replica; UPDATE orders SET status = 'CANCELED' WHERE id = '${order.id}'; UPDATE dining_tables SET status = 'FREE', current_order_id = NULL WHERE id = '${mesa.id}';`);
+    setCashbackClock(null);
+  });
+
   it('balcão (Ficha Rápida) com fichas e retirada', async () => {
     login(CASHIER_PIN);
     const order = ok(st().createCounterSale([{ product_id: productId, quantity: 2, modifiers: [], meat_doneness: null }]));
