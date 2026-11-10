@@ -68,6 +68,7 @@ export const SEED_TENANT: Tenant = {
   csc_id: null,
   csc_token: null,
   created_at: created,
+  half_and_half_pricing: 'HIGHEST',
 };
 
 // ---------------------------------------------------------------------------
@@ -510,6 +511,9 @@ function buildItem(orderId: string, line: SeedLine, idx: number): OrderItem {
     weight_source: null,
     keg_volume_ml: kegVolume,
     combo_parent_item_id: null,
+    priced_at: createdAt,
+    half_product_ids: [],
+    modifier_option_ids: mods.map((m) => m.id),
   };
 }
 

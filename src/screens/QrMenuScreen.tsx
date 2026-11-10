@@ -102,7 +102,7 @@ function CustomerPhone({ tableId }: { tableId: string }) {
       const modifiers = c.modifiers.map((m) => ({ ...m, additional_price: s.modifierOptions.find((o) => o.id === m.option_id)?.additional_price ?? m.additional_price }));
       const mods = fromCents(modifiers.reduce((a, m) => a + toCents(m.additional_price), 0));
       const halves = c.half_product_ids.map((id) => s.products.find((x) => x.id === id)).filter((x): x is Product => Boolean(x));
-      const unit = !p ? c.unit_price : halves.length ? halfAndHalfPrice([priceOf(p), ...halves.map(priceOf)], s.halfAndHalfPricing) : priceOf(p);
+      const unit = !p ? c.unit_price : halves.length ? halfAndHalfPrice([priceOf(p), ...halves.map(priceOf)], s.tenant.half_and_half_pricing) : priceOf(p);
       return { ...c, unit_price: unit, modifiers, modifiers_unit_price: mods };
     });
 

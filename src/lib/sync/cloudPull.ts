@@ -56,7 +56,7 @@ export interface CloudSnapshot {
   purchaseInvoices: PurchaseInvoice[];
 }
 
-const TENANT_COLUMNS = ['id', 'name', 'legal_name', 'cnpj', 'state_registration', 'city', 'state', 'default_service_fee_pct', 'default_acquirer', 'default_mode', 'created_at'] as const;
+const TENANT_COLUMNS = ['id', 'name', 'legal_name', 'cnpj', 'state_registration', 'city', 'state', 'default_service_fee_pct', 'default_acquirer', 'default_mode', 'created_at', 'half_and_half_pricing'] as const;
 const STAFF_COLUMNS = ['id', 'tenant_id', 'name', 'role', 'active', 'created_at'] as const;
 
 /** Colunas lidas de cada tabela (as mesmas dos tipos em src/types.ts) e a ordem estável da paginação. */

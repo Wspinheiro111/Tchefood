@@ -6,8 +6,9 @@
  *  - A fila é enviada NA ORDEM em que foi gerada, um evento por vez. O banco tem
  *    triggers que exigem o audit_log antes do cancelamento/desconto: o store
  *    enfileira o audit_log primeiro e serverOrder() corrige filas antigas.
- *  - payments e audit_logs são só INSERT com "ignore-duplicates": reenviar o
- *    mesmo evento nunca altera um pagamento ou um log já gravado.
+ *  - audit_logs é só INSERT com "ignore-duplicates": reenviar o mesmo evento nunca
+ *    altera um log já gravado. Pagamento sobe por tchefood_register_payment(), que
+ *    confere a conta, o saldo e o NSU no banco (reenvio devolve o já gravado).
  *  - Os demais são upsert pelo id (merge-duplicates).
  *  - Segredos da loja (token Focus, CSC) e a situação fiscal da comanda
  *    (nfce_status, nfce_key) nunca saem do aparelho por aqui: o servidor é a fonte deles.
@@ -75,6 +76,7 @@ const CHANGE_KEG_RPC = 'tchefood_change_keg';
 const SAVE_STAFF_RPC = 'tchefood_save_staff';
 const SET_PERMISSION_RPC = 'tchefood_set_role_permission';
 const START_STORE_RPC = 'tchefood_start_store';
+const REGISTER_PAYMENT_RPC = 'tchefood_register_payment';
 
 /** Eventos que sobem por função do servidor que confere PIN e responde null quando ele não confere. */
 export function isPinCheckedRpc(event: SyncEvent): boolean {
@@ -227,8 +229,19 @@ function buildPermissionRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest 
   });
 }
 
+/**
+ * Pagamento sobe por tchefood_register_payment (db/schema_dinheiro_servidor.sql): o
+ * banco confere conta aberta, saldo, NSU do cartão e dinheiro no caixa antes de gravar.
+ * O aparelho não tem permissão para gravar em payments direto.
+ */
+function buildPaymentRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
+  if (event.op !== 'INSERT') throw new Error('Pagamento gravado não muda: estorno é um pagamento novo.');
+  return rpcRequest(cfg, REGISTER_PAYMENT_RPC, { p_payment: sanitizePayload(event) });
+}
+
 export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   if (isManagerAuthorization(event)) return buildAuthorizeRequest(event, cfg);
+  if (event.table === 'payments') return buildPaymentRequest(event, cfg);
   if (isKegChange(event)) return buildKegChangeRequest(event, cfg);
   if (event.table === 'staff_users') return buildStaffRequest(event, cfg);
   if (event.table === 'role_permissions') return buildPermissionRequest(event, cfg);

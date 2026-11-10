@@ -21,12 +21,12 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_ar.sql', 'schema_caixa.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
 
-  it('ordem: Fase 5 → totem → compras → equipe → autorização → barril/totem/cobrança → combos → baixar a loja, depois da Etapa 0', () => {
+  it('ordem: Fase 5 → totem → compras → equipe → autorização → barril/totem/cobrança → combos → baixar a loja → dinheiro no servidor, depois da Etapa 0', () => {
     const idx = (db: string) => files.findIndex((f) => readFileSync(join(MIGRATIONS, f), 'utf8').startsWith(`-- Cópia de db/${db} `));
     const etapa0 = files.findIndex((f) => f.includes('etapa0'));
     expect(etapa0).toBeGreaterThanOrEqual(0);
@@ -38,7 +38,8 @@ describe('supabase/migrations', () => {
     expect(idx('schema_gerente_nuvem.sql')).toBeGreaterThan(idx('schema_autorizacao.sql'));
     expect(idx('schema_combos.sql')).toBeGreaterThan(idx('schema_gerente_nuvem.sql'));
     expect(idx('schema_baixar_loja.sql')).toBeGreaterThan(idx('schema_combos.sql'));
-    expect(idx('schema_ar.sql')).toBeGreaterThan(idx('schema_baixar_loja.sql'));
+    expect(idx('schema_dinheiro_servidor.sql')).toBeGreaterThan(idx('schema_baixar_loja.sql'));
+    expect(idx('schema_ar.sql')).toBeGreaterThan(idx('schema_dinheiro_servidor.sql'));
     // O caixa redefine tchefood_authorize_manager: vem depois de toda migration que a define.
     expect(idx('schema_caixa.sql')).toBeGreaterThan(idx('schema_ar.sql'));
   });
