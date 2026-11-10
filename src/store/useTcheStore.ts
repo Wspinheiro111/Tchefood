@@ -884,9 +884,13 @@ export const useTcheStore = create<TcheState>()(
        * 10/11/2026: o cashback vale 30 dias de quando foi gerado, com ou sem cancelamento).
        * Não sobe: o banco grava o dele ao receber o ajuste, e a leitura da nuvem acerta.
        */
+      // O estorno leva a operação que o provocou (P2-01 da rodada 5 do GPT): o cancelamento
+      // do item ou a retirada dos 10%, com o operador e o gerente dela, como o banco grava.
       const cashbackRefundMirror = (
-        order: Order, discountAfter: number, userId: UUID, ts: string, meta: Record<string, unknown>,
+        order: Order, discountAfter: number, ts: string, cause: AuditLog,
       ): { refunds: CashbackLedgerEntry[]; refundLogs: AuditLog[] } => {
+        const userId = cause.performed_by_user_id;
+        const feeRemoved = cause.action_type === 'SERVICE_FEE_REMOVED';
         const ledger = get().cashbackLedger;
         const redeem = ledger.find((e) => e.order_id === order.id && e.entry_type === 'REDEEM');
         if (!redeem) return { refunds: [], refundLogs: [] };
@@ -915,10 +919,12 @@ export const useTcheStore = create<TcheState>()(
           ...buildAudit({
             order_id: order.id,
             performed_by_user_id: userId,
-            authorized_by_manager_id: null,
+            authorized_by_manager_id: cause.authorized_by_manager_id,
             action_type: 'CASHBACK_REFUNDED',
             amount_impact: refund.amount,
-            reason: 'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)',
+            reason: feeRemoved
+              ? 'Cashback devolvido ao cliente (retirada dos 10% deixou o desconto abaixo do cashback usado)'
+              : 'Cashback devolvido ao cliente (cancelamento de item deixou o desconto abaixo do cashback usado)',
             metadata: {
               table: tableLabel(order.table_id),
               customer_id: refund.customer_id,
@@ -930,7 +936,11 @@ export const useTcheStore = create<TcheState>()(
               already_expired: new Date(refund.expires_at!) <= new Date(ts),
               discount_before: order.discount_amount,
               discount_after: discountAfter,
-              ...meta,
+              cause: cause.action_type,
+              cause_audit_id: cause.id,
+              item_cancel_audit_id: feeRemoved ? null : cause.id,
+              canceled_item_id: feeRemoved ? null : (cause.metadata?.item_id ?? null),
+              service_fee_audit_id: feeRemoved ? cause.id : null,
             },
           }),
           whatsapp_alert_sent: false,
@@ -1579,7 +1589,7 @@ export const useTcheStore = create<TcheState>()(
             });
           });
 
-          const { refunds, refundLogs } = cashbackRefundMirror(order, simulated.discount_amount, user.id, ts, { item_cancel_audit_id: log.id });
+          const { refunds, refundLogs } = cashbackRefundMirror(order, simulated.discount_amount, ts, log);
 
           set((s) => {
             const orderItems = s.orderItems.map((i) => canceledById.get(i.id) ?? i);
@@ -1635,7 +1645,7 @@ export const useTcheStore = create<TcheState>()(
           // Sem os 10%, o desconto pode ficar limitado ao novo bruto e abaixo do cashback
           // usado: o banco devolve a diferença; aqui fica o mesmo espelho do cancelamento.
           const ts = nowISO();
-          const mirror = cashbackRefundMirror(order, simulated.discount_amount, user.id, ts, { service_fee_audit_id: log.id });
+          const mirror = cashbackRefundMirror(order, simulated.discount_amount, ts, log);
           set((s) => {
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, charge_service_fee: false }, s.orderItems, s.payments);

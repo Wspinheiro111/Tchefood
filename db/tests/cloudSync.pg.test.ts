@@ -608,7 +608,10 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe('50.00 50.00');
 
     const item = st().orderItems.find((i) => i.order_id === order.id && i.product_id === picanha.id)!;
+    // Quem cancela não é quem resgatou (P2-01 da rodada 5: o estorno leva o cancelamento).
+    login(OWNER_PIN);
     ok(st().cancelOrderItem(item.id, MANAGER));
+    login(CASHIER_PIN);
     const pending = [...st().outbox];
     await expectSynced('cancelamento da picanha');
     // Internet caiu antes da confirmação: a fila sobe de novo os mesmos eventos.
@@ -631,6 +634,11 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT string_agg(amount || ' ' || remaining_amount, ' | ' ORDER BY expires_at) FROM cashback_ledger WHERE id IN ('${c.earns[0]}', '${c.earns[1]}')`)).toBe('30.00 0.00 | 30.00 10.00');
     expect(sql(`SELECT count(*) || ' ' || sum(amount_impact) || ' ' || bool_and((metadata->>'server_verified')::boolean) FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'CASHBACK_REFUNDED'`)).toBe('2 30.00 true');
     expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('40.00');
+    // Cada estorno aponta o cancelamento da picanha: quem cancelou, o gerente e o registro.
+    const cancelAudit = sql(`SELECT id || ' ' || performed_by_user_id || ' ' || authorized_by_manager_id FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'ITEM_CANCELED' AND metadata->>'item_id' = '${item.id}'`);
+    expect(sql(`SELECT string_agg(DISTINCT (metadata->>'cause_audit_id') || ' ' || performed_by_user_id || ' ' || authorized_by_manager_id || ' ' || (metadata->>'cause') || ' ' || (metadata->>'item_cancel_audit_id' = metadata->>'cause_audit_id') || ' ' || (metadata->>'canceled_item_id') || ' ' || reason, ' | ') FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'CASHBACK_REFUNDED'`))
+      .toBe(`${cancelAudit} ITEM_CANCELED true ${item.id} Cashback devolvido ao cliente (cancelamento de item deixou o desconto abaixo do cashback usado)`);
+    expect(sql(`SELECT created_by_user_id <> (SELECT performed_by_user_id FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'ITEM_CANCELED' LIMIT 1) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REDEEM'`)).toBe('t');
     // O aparelho chega ao mesmo extrato sem baixar nada da nuvem.
     const localRefunds = st().cashbackLedger.filter((e) => e.order_id === order.id && e.entry_type === 'REFUND');
     expect(localRefunds.map((e) => [e.amount, e.expires_at!.slice(0, 10), e.refund_of_id])).toEqual([[20, '2026-12-31', c.earns[1]], [10, '2026-11-20', c.earns[0]]]);
@@ -708,8 +716,21 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     const refundsOf = () => st().cashbackLedger.filter((e) => e.order_id === order.id && e.entry_type === 'REFUND');
     expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND'`)).toBe('0');
     expect(refundsOf()).toEqual([]);
+    // Outro operador tira os 10% (P2-01 da rodada 5 do GPT): o estorno é dele, com o gerente
+    // e o registro da retirada, não do cancelamento anterior nem de quem resgatou.
+    login(OWNER_PIN);
     ok(st().removeServiceFee(order.id, MANAGER));
+    login(CASHIER_PIN);
     await expectSynced('tirar os 10%');
+    const feeAudit = sql(`SELECT id || ' ' || performed_by_user_id || ' ' || authorized_by_manager_id FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'SERVICE_FEE_REMOVED' ORDER BY server_seq DESC LIMIT 1`);
+    expect(sql(`SELECT (metadata->>'cause_audit_id') || ' ' || performed_by_user_id || ' ' || authorized_by_manager_id || ' ' || (metadata->>'cause') || ' ' || (metadata->>'service_fee_audit_id' = metadata->>'cause_audit_id') || ' ' || (metadata->>'item_cancel_audit_id' IS NULL) || ' ' || reason FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'CASHBACK_REFUNDED'`))
+      .toBe(`${feeAudit} SERVICE_FEE_REMOVED true true Cashback devolvido ao cliente (retirada dos 10% deixou o desconto abaixo do cashback usado)`);
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'ITEM_CANCELED' AND performed_by_user_id::text = split_part('${feeAudit}', ' ', 2)`)).toBe('0');
+    // O espelho do aparelho leva a mesma operação.
+    const localFeeLog = st().auditLogs.find((l) => l.order_id === order.id && l.action_type === 'CASHBACK_REFUNDED')!;
+    const localFee = st().auditLogs.find((l) => l.order_id === order.id && l.action_type === 'SERVICE_FEE_REMOVED')!;
+    expect([localFeeLog.metadata?.cause, localFeeLog.metadata?.service_fee_audit_id, localFeeLog.performed_by_user_id, localFeeLog.authorized_by_manager_id].join(' '))
+      .toBe(`SERVICE_FEE_REMOVED ${localFee.id} ${feeAudit.split(' ').slice(1).join(' ')}`);
     expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe('47.00 0.00');
     expect(sql(`SELECT string_agg(amount || ' ' || to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'), ' | ') FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND'`)).toBe('3.00 2026-12-31');
     expect(refundsOf().map((e) => [e.amount, e.expires_at!.slice(0, 10)])).toEqual([[3, '2026-12-31']]);

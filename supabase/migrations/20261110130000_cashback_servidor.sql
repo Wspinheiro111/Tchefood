@@ -540,7 +540,10 @@ DECLARE
     v_until TIMESTAMPTZ;
     v_refund_id UUID;
     v_user UUID;
-    v_cancel UUID;
+    v_manager UUID;
+    v_cause TEXT;
+    v_cause_audit UUID;
+    v_item UUID;
     v_now TIMESTAMPTZ := NOW();
     s RECORD;
 BEGIN
@@ -551,10 +554,37 @@ BEGIN
      WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'REFUND';
     v_amount := v_redeem.amount - v_refunded - NEW.discount_amount;
     IF v_amount <= 0 THEN RETURN NULL; END IF;
-    -- Quem cancelou: o último ITEM_CANCELED da conta (pela sequência do servidor).
-    SELECT a.id, a.performed_by_user_id INTO v_cancel, v_user FROM audit_logs a
-     WHERE a.tenant_id = NEW.tenant_id AND a.order_id = NEW.id AND a.action_type = 'ITEM_CANCELED'
-     ORDER BY a.server_seq DESC LIMIT 1;
+    -- O que provocou o estorno (P2-01 da rodada 5 do GPT), com o operador e o gerente dele:
+    --  - retirada dos 10% nesta mesma atualização: o SERVICE_FEE_REMOVED mais recente da
+    --    conta (é ele que libera a retirada, pela sequência do servidor);
+    --  - cancelamento de item: o recálculo do banco roda dentro do cancelamento, que marca
+    --    o item (tchefood_cashback_mark_cancel); vale o ITEM_CANCELED desse item. Sem ele
+    --    ainda gravado (o registro pode vir depois na mesma transação), quem cancelou o item.
+    -- Sem causa conhecida, fica o operador do resgate e a causa nula.
+    IF OLD.charge_service_fee AND NOT NEW.charge_service_fee THEN
+        v_cause := 'SERVICE_FEE_REMOVED';
+        SELECT a.id, a.performed_by_user_id, a.authorized_by_manager_id INTO v_cause_audit, v_user, v_manager
+          FROM audit_logs a
+         WHERE a.tenant_id = NEW.tenant_id AND a.order_id = NEW.id AND a.action_type = 'SERVICE_FEE_REMOVED'
+         ORDER BY a.server_seq DESC LIMIT 1;
+    ELSE
+        BEGIN
+            v_item := NULLIF(current_setting('tchefood.cashback_cancel_item', true), '')::uuid;
+        EXCEPTION WHEN others THEN
+            v_item := NULL;
+        END;
+        IF v_item IS NOT NULL THEN
+            v_cause := 'ITEM_CANCELED';
+            SELECT a.id, a.performed_by_user_id, a.authorized_by_manager_id INTO v_cause_audit, v_user, v_manager
+              FROM audit_logs a
+             WHERE a.tenant_id = NEW.tenant_id AND a.order_id = NEW.id AND a.action_type = 'ITEM_CANCELED'
+               AND a.metadata->>'item_id' = v_item::text
+             ORDER BY a.server_seq DESC LIMIT 1;
+            IF v_user IS NULL THEN
+                SELECT i.canceled_by_user_id INTO v_user FROM order_items i WHERE i.id = v_item AND i.order_id = NEW.id;
+            END IF;
+        END IF;
+    END IF;
     v_user := COALESCE(v_user, v_redeem.created_by_user_id);
     v_left := v_amount;
     FOR s IN
@@ -591,14 +621,21 @@ BEGIN
         RETURNING id INTO v_refund_id;
         INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact,
                                 reason, whatsapp_alert_sent, metadata, created_at)
-        VALUES (NEW.tenant_id, NEW.id, v_user, NULL, 'CASHBACK_REFUNDED', v_take,
-                'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)', FALSE,
+        VALUES (NEW.tenant_id, NEW.id, v_user, v_manager, 'CASHBACK_REFUNDED', v_take,
+                CASE v_cause
+                    WHEN 'SERVICE_FEE_REMOVED' THEN 'Cashback devolvido ao cliente (retirada dos 10% deixou o desconto abaixo do cashback usado)'
+                    WHEN 'ITEM_CANCELED' THEN 'Cashback devolvido ao cliente (cancelamento de item deixou o desconto abaixo do cashback usado)'
+                    ELSE 'Cashback devolvido ao cliente (o desconto da conta ficou abaixo do cashback usado)' END, FALSE,
                 jsonb_build_object('customer_id', v_redeem.customer_id, 'amount', v_take, 'redeem_id', v_redeem.id,
                                    'refund_id', v_refund_id, 'refund_of_id', s.source_id,
                                    'expires_at', v_until, 'already_expired', v_until <= v_now,
                                    'redeemed', v_redeem.amount, 'refunded_before', v_refunded,
                                    'discount_before', OLD.discount_amount, 'discount_after', NEW.discount_amount,
-                                   'item_cancel_audit_id', v_cancel, 'server_verified', TRUE),
+                                   'cause', v_cause, 'cause_audit_id', v_cause_audit,
+                                   'item_cancel_audit_id', CASE WHEN v_cause = 'ITEM_CANCELED' THEN v_cause_audit END,
+                                   'canceled_item_id', CASE WHEN v_cause = 'ITEM_CANCELED' THEN v_item END,
+                                   'service_fee_audit_id', CASE WHEN v_cause = 'SERVICE_FEE_REMOVED' THEN v_cause_audit END,
+                                   'server_verified', TRUE),
                 v_now);
         v_refunded := v_refunded + v_take;
         v_left := v_left - v_take;
@@ -606,6 +643,21 @@ BEGIN
     RETURN NULL;
 END;
 $$;
+-- Marca, na transação, o item cujo cancelamento vai recalcular a conta: o estorno do
+-- cashback (acima) sabe qual cancelamento o provocou. Só marca; não muda nada do item.
+CREATE OR REPLACE FUNCTION tchefood_cashback_mark_cancel()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.status = 'CANCELED' AND OLD.status IS DISTINCT FROM 'CANCELED' THEN
+        PERFORM set_config('tchefood.cashback_cancel_item', NEW.id::text, true);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_order_items_cashback_mark_cancel ON order_items;
+CREATE TRIGGER trg_order_items_cashback_mark_cancel BEFORE UPDATE OF status ON order_items
+    FOR EACH ROW EXECUTE FUNCTION tchefood_cashback_mark_cancel();
+
 DROP TRIGGER IF EXISTS trg_orders_cashback_refund ON orders;
 CREATE TRIGGER trg_orders_cashback_refund AFTER UPDATE OF discount_amount ON orders
     FOR EACH ROW WHEN (NEW.discount_amount < OLD.discount_amount)
