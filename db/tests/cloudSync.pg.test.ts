@@ -655,7 +655,13 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await raw('POST', 'order_items', forgedItem)).status).toBe(201);
     expect(mismatches()).toBe(1);
     expect(sql(`SELECT amount_impact || ' ' || (metadata->>'expected_unit_price') || ' ' || (authorized_by_manager_id IS NOT NULL) FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}'`)).toBe('118.00 60.00 true');
-    // Item de fila antiga (sem o instante do preço): o servidor não confere, então também só com PIN.
+    // Item de fila antiga (sem o instante do preço) com o preço do cadastro de agora: entra, como antes.
+    const legacyOk = await raw('POST', 'order_items', {
+      id: crypto.randomUUID(), order_id: order.id, product_id: calabresa.id, waiter_id: st().currentUserId, quantity: 1, unit_price: 60, modifiers_unit_price: 0,
+      sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER',
+    });
+    expect(legacyOk.status).toBe(201);
+    // Com preço diferente: só com PIN.
     const legacyItem = {
       id: crypto.randomUUID(), order_id: order.id, product_id: calabresa.id, waiter_id: st().currentUserId, quantity: 1, unit_price: 1, modifiers_unit_price: 0,
       sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER',

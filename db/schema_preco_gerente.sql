@@ -8,9 +8,11 @@
 --   1. tchefood_authorize_manager aceita PRICE_OVERRIDE, preso ao item (item_id,
 --      unit_price e modifiers_unit_price no metadata), com o PIN conferido no servidor.
 --   2. tchefood_check_item_price recusa (TCHEFOOD_PRECO) o item com preço diferente,
---      o item que o servidor não consegue conferir (sem priced_at, ou sabor/adicional
+--      o item que o servidor não consegue conferir (sabor/adicional
 --      desconhecido) e só aceita com um PRICE_OVERRIDE do mesmo item e mesmo preço.
 --      O PRICE_MISMATCH continua sendo gravado, agora com o gerente que autorizou.
+--      Item de fila antiga (sem priced_at) é conferido pelo cadastro da hora em que
+--      entrou (a mesma janela de 12 h do priced_at): com o preço certo entra, como antes.
 -- No aparelho, o item recusado aparece em Nuvem › recusados com o campo de PIN do
 -- gerente e motivo; a autorização sobe antes do item.
 -- =============================================================================
@@ -187,7 +189,7 @@ BEGIN
      LIMIT 1;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_PRECO: %', CASE
-            WHEN v_legacy THEN 'item sem o instante do preço (versão antiga do app): o servidor não confere o preço. Aceite com PIN de gerente.'
+            WHEN v_legacy THEN 'item de versão antiga do app (sem o instante do preço) com preço diferente do cadastro atual. Aceite com PIN de gerente.'
             WHEN v_expected.base IS NULL THEN 'item com sabor ou adicional que o cadastro da nuvem não reconhece. Aceite com PIN de gerente.'
             ELSE format('preço do cadastro R$ %s, o aparelho mandou R$ %s. Aceite com PIN de gerente.',
                         to_char(v_expected.base + v_expected.modifiers, 'FM999999990.00'),
