@@ -283,6 +283,7 @@ DECLARE
     v_product products%ROWTYPE;
     v_expected RECORD;
     v_impact NUMERIC;
+    v_legacy BOOLEAN;
 BEGIN
     -- Reenvio da fila (upsert do mesmo item): já foi conferido na primeira vez.
     IF EXISTS (SELECT 1 FROM order_items i WHERE i.id = NEW.id) THEN
@@ -298,15 +299,20 @@ BEGIN
        AND v_expected.base = NEW.unit_price AND v_expected.modifiers = NEW.modifiers_unit_price THEN
         RETURN NEW;
     END IF;
-    v_impact := CASE WHEN v_expected.base IS NULL THEN NULL
+    -- Item de aparelho antigo (fila gravada antes desta versão): não traz o instante do preço nem os
+    -- adicionais e sabores escolhidos, então o banco não tem como refazer a conta. Registra o alerta
+    -- como NÃO conferido e sem valor, em vez de um desvio que o servidor não verificou.
+    v_legacy := NEW.priced_at IS NULL;
+    v_impact := CASE WHEN v_legacy OR v_expected.base IS NULL THEN NULL
                      ELSE round(NEW.quantity * ((v_expected.base + v_expected.modifiers) - (NEW.unit_price + NEW.modifiers_unit_price)), 2) END;
     INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, amount_impact, reason, whatsapp_alert_sent, metadata)
     VALUES (v_product.tenant_id, NEW.order_id, NEW.waiter_id, 'PRICE_MISMATCH', COALESCE(v_impact, 0),
-            CASE WHEN v_expected.base IS NULL THEN 'Item com sabor ou adicional que o cadastro da nuvem não reconhece'
+            CASE WHEN v_legacy THEN 'Item de versão antiga do app: sem dados para o servidor conferir o preço'
+                 WHEN v_expected.base IS NULL THEN 'Item com sabor ou adicional que o cadastro da nuvem não reconhece'
                  ELSE 'Item lançado com preço diferente do cadastro da nuvem' END,
             FALSE,
             jsonb_build_object(
-                'server_verified', TRUE,
+                'server_verified', NOT v_legacy,
                 'item_id', NEW.id, 'product_id', NEW.product_id, 'product_code', v_product.code, 'quantity', NEW.quantity,
                 'unit_price', NEW.unit_price, 'modifiers_unit_price', NEW.modifiers_unit_price,
                 'expected_unit_price', v_expected.base, 'expected_modifiers_unit_price', v_expected.modifiers,

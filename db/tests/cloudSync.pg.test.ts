@@ -632,6 +632,13 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(forged.status).toBe(201);
     expect(mismatches()).toBe(1);
     expect(sql(`SELECT amount_impact || ' ' || (metadata->>'expected_unit_price') FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}'`)).toBe('118.00 60.00');
+    // Item de fila antiga (sem o instante do preço): o alerta sai como NÃO conferido e sem valor.
+    const legacy = await raw('POST', 'order_items', {
+      id: crypto.randomUUID(), order_id: order.id, product_id: calabresa.id, waiter_id: st().currentUserId, quantity: 1, unit_price: 1, modifiers_unit_price: 0,
+      sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER',
+    });
+    expect(legacy.status).toBe(201);
+    expect(sql(`SELECT amount_impact || ' ' || (metadata->>'server_verified') FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}' ORDER BY created_at DESC LIMIT 1`)).toBe('0.00 false');
   });
 
   it('dinheiro no servidor: pagamento só pela função, com saldo, NSU e caixa conferidos; conta só fecha zerada', async () => {
