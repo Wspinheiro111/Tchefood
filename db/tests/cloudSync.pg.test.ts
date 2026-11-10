@@ -908,6 +908,32 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(second.status).toBeGreaterThanOrEqual(400);
   });
 
+  it('cartão de comanda: numeração separada das mesas, abre pelo número, fecha como mesa e volta livre', async () => {
+    login(OWNER_PIN);
+    const cards = ok(st().createCards(1, 3));
+    expect(cards.map((c) => c.label)).toEqual(['Cartão 1', 'Cartão 2', 'Cartão 3']);
+    await expectSynced('cartões cadastrados');
+    // O cartão 1 convive com a Mesa 1; outro cartão 1 na mesma loja, não.
+    expect(sql(`SELECT count(*) FROM dining_tables WHERE tenant_id = '${TENANT}' AND number = 1 AND kind IN ('TABLE', 'CARD')`)).toBe('2');
+    const dup = await raw('POST', 'dining_tables', { ...cards[0]!, id: crypto.randomUUID() });
+    expect(dup.status).toBeGreaterThanOrEqual(400);
+    const withQr = await raw('POST', 'dining_tables', { ...cards[0]!, id: crypto.randomUUID(), number: 99, qr_code_token: 'cartao-com-qr' });
+    expect(withQr.status).toBeGreaterThanOrEqual(400);
+
+    login(CASHIER_PIN);
+    const order = ok(st().openCard(2));
+    expect(ok(st().openCard(2)).id).toBe(order.id);
+    const p = st().products.find((x) => x.id === productId)!;
+    ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order.id));
+    await expectSynced('cartão aberto e lançado');
+    expect(sql(`SELECT status FROM dining_tables WHERE id = '${cards[1]!.id}'`)).toBe('OCCUPIED');
+    payCash(order.id);
+    await expectSynced('cartão pago');
+    expect(sql(`SELECT o.status || ' ' || t.status || ' ' || (t.current_order_id IS NULL) FROM orders o JOIN dining_tables t ON t.id = o.table_id WHERE o.id = '${order.id}'`)).toBe('CLOSED FREE true');
+    expect(st().tables.find((t) => t.id === cards[1]!.id)!.status).toBe('FREE');
+  });
+
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
     const dir = join(ROOT, 'supabase', 'migrations');
     for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) psqlFile(target!, join(dir, f), DB);

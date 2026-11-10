@@ -1,9 +1,9 @@
 /** Etapa 0 — Salão (mesas e áreas) e Equipe (pessoas, perfis e PINs). */
 import { useState } from 'react';
-import { KeyRound, Pencil, Plus } from 'lucide-react';
+import { CreditCard, KeyRound, Pencil, Plus } from 'lucide-react';
 import { selectCurrentUser, useTcheStore } from '../../store/useTcheStore';
 import type { DiningTable, StaffUser, UserRole } from '../../types';
-import { ROLES, ROLE_LABEL } from '../../lib/catalog';
+import { MAX_CARDS_PER_BATCH, ROLES, ROLE_LABEL } from '../../lib/catalog';
 import { Badge, Btn, Sheet, toast } from '../../components/ui';
 import { ManagerAuthSheet } from '../../components/ManagerAuthSheet';
 import { isQrSelfService } from '../../data/seed';
@@ -42,6 +42,68 @@ export function TablesAdmin() {
       ))}
       {tables.length === 0 && <p className="p-4 text-center text-sm text-slate-500">Nenhuma mesa. Cadastre a primeira.</p>}
       {editing && <TableEditor table={editing === 'new' ? null : editing} areas={areas} nextNumber={nextNumber} onClose={() => setEditing(null)} />}
+    </Panel>
+  );
+}
+
+/**
+ * Cartões de comanda numerados: cadastra uma faixa (ex.: 1 a 100) de uma vez.
+ * Cartão perdido ou quebrado é desativado (nunca apagado, por causa do histórico).
+ */
+export function CardsAdmin() {
+  const allTables = useTcheStore((s) => s.tables);
+  const createCards = useTcheStore((s) => s.createCards);
+  const setCardActive = useTcheStore((s) => s.setCardActive);
+  const cards = allTables.filter((t) => t.kind === 'CARD').sort((a, b) => a.number - b.number);
+  const nextNumber = Math.max(0, ...cards.map((t) => t.number)) + 1;
+  const [from, setFrom] = useState(String(nextNumber));
+  const [to, setTo] = useState(String(nextNumber + 49));
+  const [error, setError] = useState<string | null>(null);
+  const create = () => {
+    const a = parseIntInput(from);
+    const b = parseIntInput(to);
+    if (Number.isNaN(a) || Number.isNaN(b)) return setError('Digite os números do primeiro e do último cartão.');
+    const r = createCards(a, b);
+    if (!r.ok) return setError(r.error);
+    setError(null);
+    toast.success(`${r.data.length} cartões cadastrados.`);
+    const next = Math.max(b, ...r.data.map((c) => c.number)) + 1;
+    setFrom(String(next));
+    setTo(String(next + 49));
+  };
+  const toggle = (card: DiningTable) => {
+    const r = setCardActive(card.id, !card.active);
+    if (!r.ok) return toast.error(r.error);
+    toast.success(`${card.label} ${r.data.active ? 'reativado' : 'desativado'}.`);
+  };
+  return (
+    <Panel title={`Cartões de comanda (${cards.filter((c) => c.active).length} ativos)`}>
+      <p className="mb-3 text-xs text-slate-500">
+        O cliente anda com o cartão e consome no bar, no balcão ou no salão. No Mapa, em "Cartões", o garçom digita o número para lançar e o caixa fecha a conta como a de uma mesa. A numeração é separada da das mesas.
+      </p>
+      <FormError error={error} />
+      <div className="mb-3 grid grid-cols-[1fr_1fr_auto] items-end gap-2">
+        <Field label="Do cartão"><TextInput inputMode="numeric" value={from} onChange={(e) => setFrom(e.target.value)} /></Field>
+        <Field label="Até o cartão"><TextInput inputMode="numeric" value={to} onChange={(e) => setTo(e.target.value)} /></Field>
+        <Btn variant="gold" className="mb-3" onClick={create}><Plus className="h-4 w-4" /> Cadastrar</Btn>
+      </div>
+      <p className="mb-3 text-xs text-slate-500">No máximo {MAX_CARDS_PER_BATCH} por vez. Números já cadastrados são pulados. Toque num cartão para desativar (perdido ou quebrado) ou reativar.</p>
+      {cards.length === 0 ? (
+        <p className="p-4 text-center text-sm text-slate-500">Nenhum cartão cadastrado.</p>
+      ) : (
+        <div className="grid grid-cols-4 gap-2 sm:grid-cols-8 lg:grid-cols-12">
+          {cards.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => toggle(c)}
+              title={c.active ? `Desativar ${c.label}` : `Reativar ${c.label}`}
+              className={`inline-flex items-center justify-center gap-1 rounded-lg bg-base py-2 text-sm font-bold tabular-nums ${c.active ? '' : 'line-through opacity-50'} ${c.status !== 'FREE' ? 'ring-2 ring-ouro' : ''}`}
+            >
+              <CreditCard className="h-3 w-3 text-slate-500" />{c.number}
+            </button>
+          ))}
+        </div>
+      )}
     </Panel>
   );
 }
