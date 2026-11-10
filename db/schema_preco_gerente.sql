@@ -58,10 +58,21 @@ BEGIN
     END IF;
     -- O gerente também troca o desconto manual por um menor (R$ 10 → R$ 5); a troca fica
     -- registrada (no #35 é ela que libera a redução no gatilho do desconto).
-    IF p_action_type = 'DISCOUNT_APPLIED' AND (
-        (p_metadata->>'discount_before') IS NULL OR (p_metadata->>'discount_after') IS NULL
-        OR (p_metadata->>'discount_before')::numeric < 0 OR (p_metadata->>'discount_after')::numeric < 0
-        OR (p_metadata->>'discount_after')::numeric = (p_metadata->>'discount_before')::numeric) THEN
+    -- Os dois valores precisam ser números finitos, não negativos e diferentes. NaN e
+    -- Infinity passam por "< 0" e por "=" sem recusa (NaN é maior que qualquer número no
+    -- PostgreSQL), então o teto finito é conferido à parte; texto que não é número recusa igual.
+    IF p_action_type = 'DISCOUNT_APPLIED' THEN
+        BEGIN
+            v_valid := (p_metadata->>'discount_before')::numeric >= 0
+                   AND (p_metadata->>'discount_before')::numeric < 1000000000
+                   AND (p_metadata->>'discount_after')::numeric >= 0
+                   AND (p_metadata->>'discount_after')::numeric < 1000000000
+                   AND (p_metadata->>'discount_after')::numeric <> (p_metadata->>'discount_before')::numeric;
+        EXCEPTION WHEN others THEN
+            v_valid := FALSE;
+        END;
+    END IF;
+    IF p_action_type = 'DISCOUNT_APPLIED' AND NOT COALESCE(v_valid, FALSE) THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: desconto precisa de discount_before e discount_after (diferentes) no metadata.';
     END IF;
     IF p_action_type = 'ITEM_CANCELED' AND (p_metadata->>'item_id') IS NULL THEN
@@ -272,7 +283,9 @@ BEGIN
     SELECT * INTO v_product FROM products p WHERE p.id = NEW.product_id AND p.tenant_id = v_tenant;
     IF NOT FOUND
        OR (COALESCE(v_claims->>'role', '') IN ('anon', 'authenticated') AND v_tenant IS DISTINCT FROM tchefood_tenant()) THEN
-        RAISE EXCEPTION 'TCHEFOOD_PRECO: produto ou conta não encontrado nesta loja.';
+        -- Prefixo próprio: não é preço divergente e o PIN de gerente não resolve (o app não
+        -- oferece "Aceitar este preço" para ele). Corrige-se o cadastro ou o vínculo da loja.
+        RAISE EXCEPTION 'TCHEFOOD_REGISTRO_LOJA: produto ou conta não encontrado nesta loja.';
     END IF;
     -- Pesado (o banco já fixa preço e quantidade) e componente de combo (preço zero, schema_combos.sql).
     IF v_product.sold_by_weight OR NEW.combo_parent_item_id IS NOT NULL THEN

@@ -678,9 +678,16 @@ function tableEventForOrder(table: DiningTable, orderId: UUID): SyncEvent {
  * audit_log de autorização de gerente para a fila: leva o PIN digitado para o servidor
  * conferir de novo (tchefood_authorize_manager). O PIN não entra no audit_log.
  */
-/** Item recusado pela nuvem por preço diferente do cadastro (db/schema_preco_gerente.sql). */
+/**
+ * Item recusado pela nuvem por preço diferente do cadastro, ou que ela não consegue conferir
+ * (db/schema_preco_gerente.sql): só esses o gerente aceita com PIN. Produto ou conta fora da
+ * loja (TCHEFOOD_REGISTRO_LOJA; antes da rodada 4 vinha como TCHEFOOD_PRECO com "não encontrado
+ * nesta loja") não é preço: o PIN não resolve, então fica na lista sem o botão.
+ */
 export function isRejectedItemPrice(r: RejectedSyncEvent): boolean {
-  return r.event.table === 'order_items' && r.event.op === 'INSERT' && /TCHEFOOD_PRECO/.test(r.message ?? '');
+  const message = r.message ?? '';
+  return r.event.table === 'order_items' && r.event.op === 'INSERT'
+    && /TCHEFOOD_PRECO:/.test(message) && !/não encontrado nesta loja/.test(message);
 }
 
 function managerAuthEvent(log: AuditLog, managerPin: string | null): SyncEvent {

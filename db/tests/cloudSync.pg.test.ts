@@ -214,6 +214,14 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     });
     expect((await change(5, 4)).status).toBe(200);
     expect((await change(5, 5)).body).toContain('(diferentes)');
+    // P2-01 da rodada 3 do #36: NaN, Infinity, negativo e texto não viram autorização.
+    const before = sql(`SELECT count(*) FROM audit_logs WHERE reason = 'Troca do desconto'`);
+    for (const [b, a] of [['NaN', 4], ['Infinity', 4], [5, 'NaN'], [5, 'Infinity'], ['-Infinity', 4], [-1, 4], ['abc', 4], [5, '1e12']] as const) {
+      const r = await change(b as number, a as number);
+      expect(r.status, `${b} → ${a}`).toBe(400);
+      expect(r.body).toContain('(diferentes)');
+    }
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE reason = 'Troca do desconto'`)).toBe(before);
   });
 
   it('cashback: ganha na conta fechada e resgata na próxima (vira desconto sem PIN de gerente)', async () => {
@@ -783,12 +791,34 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       const r = await raw('POST', 'order_items', leak);
       expect(r.status).toBe(400);
       expect(r.body).not.toMatch(/77[.,]77|Segredo|60[.,]00/);
+      // P2-02 da rodada 3: não é preço divergente, então não leva o prefixo do preço.
+      expect(r.body).toContain('TCHEFOOD_REGISTRO_LOJA');
+      expect(r.body).not.toContain('TCHEFOOD_PRECO');
       expect(sql(`SELECT count(*) FROM order_items WHERE id = '${leak.id}'`)).toBe('0');
     }
     // Autorização de preço com produto de outra loja: recusada.
     const crossAuth = await authorize({ id: crypto.randomUUID(), product_id: productB, quantity: 1, unit_price: 1 }, MANAGER_PIN);
     expect(crossAuth.status).toBe(400);
     expect(crossAuth.body).toContain('produto não encontrado nesta loja');
+
+    // Pelo app: item de um produto que a nuvem não tem nesta loja. Fica nos recusados sem o
+    // botão de aceitar o preço, e nenhuma autorização de preço entra na fila.
+    login(MANAGER_PIN);
+    ok(st().addToTray({ order_id: order.id, product_id: marguerita.id, half_product_ids: [], quantity: 1, unit_price: 55.15, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: marguerita.sector }));
+    const strayItem = ok(st().dispatchTray(order.id)).items[0]!;
+    sql(`SET session_replication_role = replica; UPDATE products SET tenant_id = '${TENANT_B}' WHERE id = '${marguerita.id}'; SET session_replication_role = origin;`);
+    await sync();
+    sql(`SET session_replication_role = replica; UPDATE products SET tenant_id = '${TENANT}' WHERE id = '${marguerita.id}'; SET session_replication_role = origin;`);
+    const stray = st().syncRejected.find((r) => r.event.row_id === strayItem.id)!;
+    expect(stray.message).toContain('TCHEFOOD_REGISTRO_LOJA');
+    expect(isRejectedItemPrice(stray)).toBe(false);
+    // Recusa gravada por aparelho antes desta versão (mesmo texto, prefixo antigo): também sem botão.
+    expect(isRejectedItemPrice({ ...stray, message: 'TCHEFOOD_PRECO: produto ou conta não encontrado nesta loja.' })).toBe(false);
+    const queued = st().outbox.length;
+    expect(st().approveRejectedItemPrice(stray.event.id, { managerPin: MANAGER_PIN, reason: 'Tentativa de aceitar' }).ok).toBe(false);
+    expect(st().outbox.length).toBe(queued);
+    expect(st().outbox.some((e) => e.table === 'audit_logs' && (e.payload as { action_type?: string }).action_type === 'PRICE_OVERRIDE')).toBe(false);
+    expect(st().syncRejected.some((r) => r.event.id === stray.event.id)).toBe(true);
   });
 
   it('dinheiro no servidor: pagamento só pela função, com saldo, NSU e caixa conferidos; conta só fecha zerada', async () => {
