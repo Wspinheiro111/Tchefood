@@ -239,8 +239,8 @@ describe('entrega própria — fluxo', () => {
     expect(c.ok && c.data.phone).toBe('55988887777');
   });
 
-  it('migração da versão 8 cria as listas da entrega', () => {
-    const out = migratePersisted({ orders: [] }, 8) as Record<string, unknown>;
+  it('migração da versão 9 cria as listas da entrega', () => {
+    const out = migratePersisted({ orders: [] }, 9) as Record<string, unknown>;
     expect(out.deliveryZones).toEqual([]);
     expect(out.couriers).toEqual([]);
     expect(out.ownDeliveries).toEqual([]);

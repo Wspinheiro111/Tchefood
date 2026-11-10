@@ -76,9 +76,9 @@ describe('preço por horário', () => {
   it('preço efetivo dentro e fora da janela', () => {
     const p = product('101');
     const rules = [schedule()];
-    const monday19 = new Date(2026, 10, 9, 19, 0); // 09/11/2026 é segunda
-    const monday20 = new Date(2026, 10, 9, 20, 0);
-    const saturday19 = new Date(2026, 10, 14, 19, 0);
+    const monday19 = new Date('2026-11-09T19:00:00-03:00'); // 09/11/2026 é segunda
+    const monday20 = new Date('2026-11-09T20:00:00-03:00');
+    const saturday19 = new Date('2026-11-14T19:00:00-03:00');
     expect(effectivePrice(p, rules, monday19)).toBe(9.9);
     expect(effectivePrice(p, rules, monday20)).toBe(p.price);
     expect(effectivePrice(p, rules, saturday19)).toBe(p.price);
@@ -87,7 +87,7 @@ describe('preço por horário', () => {
 
   it('a bandeja usa o preço do cardápio no horário, não o que a tela mandou', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 10, 9, 19, 0));
+    vi.setSystemTime(new Date('2026-11-09T19:00:00-03:00'));
     login(OWNER);
     const p = product('101');
     const r = st().savePriceSchedule({ product_id: p.id, name: 'Happy hour', weekdays: [1], start_time: '18:00', end_time: '20:00', price: 50, active: true });
@@ -465,7 +465,7 @@ describe('migração do armazenamento local', () => {
     expect(tables.every((t) => t.tenant_id === 'loja')).toBe(true);
     // Loja real não ganha o usuário de demonstração do totem.
     expect(v3.staff).toEqual([]);
-    expect(v3.orderItems).toEqual([{ id: 'i', weight_gross_grams: null, weight_tare_grams: null, weight_source: null, keg_volume_ml: null, combo_parent_item_id: null }]);
+    expect(v3.orderItems).toEqual([{ id: 'i', weight_gross_grams: null, weight_tare_grams: null, weight_source: null, keg_volume_ml: null, combo_parent_item_id: null, priced_at: null, half_product_ids: [], modifier_option_ids: [] }]);
     expect(v3.orders).toEqual([{ id: 'o', pickup_number: null, pickup_name: null, fulfillment_type: null }]);
     expect(v3.kegTaps).toEqual([]);
     expect(v3.cashbackLedger).toEqual([]);
@@ -483,8 +483,10 @@ describe('sincronização com o Supabase', () => {
     expect(up.headers.Prefer).toContain('merge-duplicates');
     expect(up.headers.Authorization).toBe('Bearer jwt');
 
-    const pay = buildSyncRequest(ev({ table: 'payments' }), cfg);
-    expect(pay.headers.Prefer).toContain('ignore-duplicates');
+    // Pagamento sobe pela função do banco que confere saldo e NSU.
+    const pay = buildSyncRequest(ev({ table: 'payments', payload: { id: 'P1', amount: 10 } }), cfg);
+    expect(pay.url).toBe('https://abc.supabase.co/rest/v1/rpc/tchefood_register_payment');
+    expect(JSON.parse(pay.body!)).toEqual({ p_payment: { id: 'P1', amount: 10 } });
 
     const link = buildSyncRequest(ev({ table: 'product_modifier_groups', payload: { product_id: 'p', group_id: 'g' } }), cfg);
     expect(link.url).toContain('on_conflict=product_id,group_id');
@@ -737,7 +739,7 @@ describe('sincronização com o Supabase', () => {
 
     const payEvent = st().outbox.find((e) => e.table === 'payments' && e.payload.order_id === orderId)!;
     const fetchFn: FetchLike = async (url) =>
-      url.includes('/payments') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
+      url.includes('/tchefood_register_payment') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
     const tail = st().outbox.slice(st().outbox.indexOf(payEvent));
     const r = await flushOutbox(tail, cfg, fetchFn);
     expect(r.rejected.map((x) => x.eventId)).toEqual([payEvent.id]);
@@ -751,7 +753,7 @@ describe('sincronização com o Supabase', () => {
 
   it('mesa liberada segurada não é ultrapassada pela ocupação da mesma mesa por outra comanda', async () => {
     const fetchFn: FetchLike = async (url) =>
-      url.includes('/payments') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
+      url.includes('/tchefood_register_payment') ? { ok: false, status: 400, text: async () => '{"message":"recusado"}' } : { ok: true, status: 204, text: async () => '' };
     const payA = ev({ id: 'pa', table: 'payments', row_id: 'PA', payload: { id: 'PA', order_id: 'A' } });
     const releaseA = ev({ id: 'ra', table: 'dining_tables', op: 'UPDATE', row_id: 'T1', payload: { id: 'T1', status: 'FREE', current_order_id: null }, depends_on_order_id: 'A' });
     const occupyB = ev({ id: 'ob', table: 'dining_tables', op: 'UPDATE', row_id: 'T1', payload: { id: 'T1', status: 'OCCUPIED', current_order_id: 'B' } });
@@ -860,14 +862,14 @@ describe('sincronização com o Supabase', () => {
 
   it('Cardápio QR não envia com preço diferente do que o cliente viu', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 10, 9, 19, 0));
+    vi.setSystemTime(new Date('2026-11-09T19:00:00-03:00'));
     login(OWNER);
     const p = product('105');
     expect(st().savePriceSchedule({ product_id: p.id, name: 'Happy hour', weekdays: [1], start_time: '18:00', end_time: '20:00', price: 20, active: true }).ok).toBe(true);
     st().logout();
     const line = { product_id: p.id, half_product_ids: [], quantity: 1, unit_price: 20, modifiers: [], modifiers_unit_price: 0, meat_doneness: p.requires_meat_doneness ? 'Ao Ponto' : null, quick_tags: [], free_notes: '', sector: p.sector };
     // O happy hour acabou entre montar o carrinho e enviar.
-    vi.setSystemTime(new Date(2026, 10, 9, 20, 1));
+    vi.setSystemTime(new Date('2026-11-09T20:01:00-03:00'));
     const r = st().qrPlaceOrder(table(4).id, [line]);
     expect(r).toMatchObject({ ok: false });
     if (!r.ok) expect(r.error).toContain(QR_PRICE_CHANGED);

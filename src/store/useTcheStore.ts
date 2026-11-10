@@ -362,7 +362,6 @@ interface DeviceSlice {
   managerPinFailures: number;
   managerPinLockedUntil: number | null;
   soundEnabled: boolean;
-  halfAndHalfPricing: HalfAndHalfPricing;
   hydrated: boolean;
   /** Sequencial de numeração da NFC-e (série 1) deste aparelho emissor. */
   nfceSeq: number;
@@ -573,7 +572,6 @@ function initialDevice(): DeviceSlice {
     managerPinFailures: 0,
     managerPinLockedUntil: null,
     soundEnabled: true,
-    halfAndHalfPricing: 'HIGHEST',
     hydrated: false,
     nfceSeq: 1000,
     showPrintSimulator: true,
@@ -847,7 +845,7 @@ export const useTcheStore = create<TcheState>()(
         }
         return {
           ok: true,
-          data: halves.length ? halfAndHalfPrice([salePrice(product), ...halves.map(salePrice)], get().halfAndHalfPricing) : salePrice(product),
+          data: halves.length ? halfAndHalfPrice([salePrice(product), ...halves.map(salePrice)], get().tenant.half_and_half_pricing) : salePrice(product),
         };
       };
 
@@ -1333,6 +1331,10 @@ export const useTcheStore = create<TcheState>()(
               weight_source: t.weight?.source ?? null,
               keg_volume_ml: resolveKegVolume(t.product_id, t.modifiers, get().kegTapProducts, get().modifierOptions),
               combo_parent_item_id: null,
+              // O preço foi tirado do cadastro quando o item entrou na bandeja.
+              priced_at: t.added_at,
+              half_product_ids: [...t.half_product_ids],
+              modifier_option_ids: t.modifiers.map((m) => m.option_id),
             };
             if (!product) return fail('Produto não encontrado.');
             // Combo: o item do combo leva o preço; cada escolha vira um item na praça dela.
@@ -1972,6 +1974,9 @@ export const useTcheStore = create<TcheState>()(
                 weight_source: null,
                 keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
                 combo_parent_item_id: null,
+                priced_at: ts,
+                half_product_ids: [...d.half_product_ids],
+                modifier_option_ids: d.modifiers.map((m) => m.option_id),
               },
               product,
               d.modifiers,
@@ -2148,6 +2153,9 @@ export const useTcheStore = create<TcheState>()(
                 weight_source: null,
                 keg_volume_ml: resolveKegVolume(product.id, line.modifiers, s0.kegTapProducts, s0.modifierOptions),
                 combo_parent_item_id: null,
+                priced_at: ts,
+                half_product_ids: [],
+                modifier_option_ids: line.modifiers.map((m) => m.option_id),
               },
               product,
               line.modifiers,
@@ -2369,6 +2377,9 @@ export const useTcheStore = create<TcheState>()(
                 weight_source: null,
                 keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
                 combo_parent_item_id: null,
+                priced_at: ts,
+                half_product_ids: [...d.half_product_ids],
+                modifier_option_ids: d.modifiers.map((m) => m.option_id),
               },
               product,
               d.modifiers,
@@ -2416,6 +2427,9 @@ export const useTcheStore = create<TcheState>()(
                 weight_source: null,
                 keg_volume_ml: null,
                 combo_parent_item_id: null,
+                priced_at: ts,
+                half_product_ids: [],
+                modifier_option_ids: [],
               });
             }
             delivery = {
@@ -2457,8 +2471,9 @@ export const useTcheStore = create<TcheState>()(
                 ...(feeCatalog.category ? [syncEvent('categories', 'INSERT', feeCatalog.category)] : []),
                 ...(feeCatalog.product ? [syncEvent('products', 'INSERT', feeCatalog.product)] : []),
                 syncEvent('orders', 'INSERT', recalculated),
-                ...items.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
+                // A entrega sobe antes dos itens: o banco confere o preço da taxa pela entrega (schema_entrega.sql).
                 ...(delivery ? [syncEvent('own_deliveries', 'INSERT', delivery)] : []),
+                ...items.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
                 ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
               ],
             };
@@ -2775,7 +2790,11 @@ export const useTcheStore = create<TcheState>()(
         },
 
         setSoundEnabled: (enabled) => set({ soundEnabled: enabled }),
-        setHalfAndHalfPricing: (rule) => set({ halfAndHalfPricing: rule }),
+        setHalfAndHalfPricing: (rule) => {
+          // Regra da loja: sobe para a nuvem, que confere o preço do item com ela.
+          const tenant: Tenant = { ...get().tenant, half_and_half_pricing: rule };
+          set((s) => ({ tenant, outbox: [...s.outbox, syncEvent('tenants', 'UPDATE', tenant)] }));
+        },
 
         // ---------------------------------------------------------------------
         // Etapa 0 — cadastros
@@ -3187,6 +3206,7 @@ export const useTcheStore = create<TcheState>()(
             id: tenantId,
             default_acquirer: state.tenant.default_acquirer,
             default_mode: state.tenant.default_mode,
+            half_and_half_pricing: state.tenant.half_and_half_pricing,
             focus_nfe_token: null,
             csc_id: null,
             csc_token: null,
@@ -3906,8 +3926,9 @@ export const useTcheStore = create<TcheState>()(
       // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback);
       // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras);
       // v6 = combos; v7 = nuvem → aparelho (pullStatus);
-      // v8 = caixa (abertura, sangria, suprimento, fechamento); v9 = entrega própria.
-      version: 9,
+      // v8 = caixa (abertura, sangria, suprimento, fechamento); v9 = preço conferido pelo servidor;
+      // v10 = entrega própria.
+      version: 10,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -4006,6 +4027,30 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
     }
   }
   if (version < 9) {
+    // A regra do meio a meio deixa de ser do aparelho e passa a ser da loja.
+    const rule = out.halfAndHalfPricing === 'AVERAGE' ? 'AVERAGE' : 'HIGHEST';
+    if (out.tenant && typeof out.tenant === 'object') {
+      const t = out.tenant as Record<string, unknown>;
+      const migrated: Record<string, unknown> = { ...t, half_and_half_pricing: t.half_and_half_pricing === 'AVERAGE' || t.half_and_half_pricing === 'HIGHEST' ? t.half_and_half_pricing : rule };
+      out.tenant = migrated;
+      // Loja já ligada à nuvem com "média": o banco nasce com "maior preço" e o próximo download
+      // trocaria a regra em silêncio. Sobe a regra do aparelho antes.
+      if (out.cloud && migrated.half_and_half_pricing === 'AVERAGE' && typeof migrated.id === 'string') {
+        const queue = Array.isArray(out.outbox) ? (out.outbox as unknown[]) : [];
+        out.outbox = [...queue, syncEvent('tenants', 'UPDATE', migrated as { id: UUID })];
+      }
+    }
+    delete out.halfAndHalfPricing;
+    if (Array.isArray(out.orderItems)) {
+      out.orderItems = (out.orderItems as Array<Record<string, unknown>>).map((i) => ({
+        ...i,
+        priced_at: typeof i.priced_at === 'string' ? i.priced_at : null,
+        half_product_ids: Array.isArray(i.half_product_ids) ? i.half_product_ids : [],
+        modifier_option_ids: Array.isArray(i.modifier_option_ids) ? i.modifier_option_ids : [],
+      }));
+    }
+  }
+  if (version < 10) {
     // Entrega própria: a loja cadastra bairros e entregadores depois da atualização.
     for (const key of ['deliveryZones', 'couriers', 'ownDeliveries', 'courierSettlements']) {
       if (!Array.isArray(out[key])) out[key] = [];

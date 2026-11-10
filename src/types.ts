@@ -51,6 +51,8 @@ export interface Tenant {
   csc_id: string | null;
   csc_token: string | null;
   created_at: ISODateTime;
+  /** Preço do meio a meio: o maior sabor ou a média (db/schema_dinheiro_servidor.sql). */
+  half_and_half_pricing: HalfAndHalfPricing;
 }
 
 export interface StaffUser {
@@ -285,6 +287,13 @@ export interface OrderItem {
    * que leva o preço e vai para a NFC-e. null em item comum e no próprio combo.
    */
   combo_parent_item_id: UUID | null;
+  // Para o banco refazer a conta do preço (db/schema_dinheiro_servidor.sql)
+  /** Quando o preço foi tirado do cadastro (item na bandeja); null = created_at. */
+  priced_at: ISODateTime | null;
+  /** Sabores do meio a meio além do produto principal. */
+  half_product_ids: UUID[];
+  /** Adicionais escolhidos (opções de modificador). */
+  modifier_option_ids: UUID[];
 }
 
 export type WeightSource = 'SCALE' | 'MANUAL';
