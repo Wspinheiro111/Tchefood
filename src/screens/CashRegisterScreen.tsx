@@ -319,7 +319,15 @@ export function CashRegisterScreen() {
         open={closeAuthOpen}
         onClose={() => setCloseAuthOpen(false)}
         title="Fechar caixa com diferença"
-        summary={pendingDiff !== null && <span>{pendingDiff < 0 ? 'Falta' : 'Sobra'} de <b>{formatBRL(Math.abs(pendingDiff))}</b> no fechamento.</span>}
+        summary={
+          // O caixa não vê a diferença nem ao chamar o gerente (o PIN ainda não foi conferido):
+          // bastaria cancelar e digitar o esperado. O valor sai no cupom do fechamento.
+          isManager && pendingDiff !== null ? (
+            <span>{pendingDiff < 0 ? 'Falta' : 'Sobra'} de <b>{formatBRL(Math.abs(pendingDiff))}</b> no fechamento.</span>
+          ) : (
+            <span>A contagem não bateu com o esperado. A diferença sai no cupom do fechamento.</span>
+          )
+        }
         confirmLabel="Fechar com diferença"
         quickReasons={['Troco dado errado', 'Pagamento lançado no método errado', 'Diferença não encontrada']}
         successMessage="Caixa fechado com diferença. Proprietário avisado."

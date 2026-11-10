@@ -716,8 +716,16 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       `CLOSED ${expected.toFixed(2)} ${(expected - 5).toFixed(2)} -5.00 true`,
     );
     // Caixa fechado não muda mais.
-    const reopen = await raw('PATCH', `cash_sessions?id=eq.${session.id}`, { status: 'OPEN' });
+    const closed = st().cashSessions.find((c) => c.id === session.id)!;
+    const reopen = await raw('PATCH', `cash_sessions?id=eq.${session.id}`, { status: 'CLOSED', counted_cash: closed.counted_cash! + 5, closed_at: closed.closed_at, closed_by_user_id: closed.closed_by_user_id, closing_notes: closed.closing_notes });
     expect(reopen.status).toBeGreaterThanOrEqual(400);
+    // Reenvio da fila depois de resposta perdida: abertura, movimento e fechamento iguais passam sem mudar nada.
+    const { expected_cash: _e, difference: _d, closing_authorized_by_manager_id: _m, ...sentClose } = closed;
+    expect((await raw('PATCH', `cash_sessions?id=eq.${session.id}`, sentClose)).status).toBeLessThan(300);
+    expect((await raw('POST', 'cash_sessions?on_conflict=id', session, 'resolution=merge-duplicates,return=minimal')).status).toBeLessThan(300);
+    expect((await raw('POST', 'cash_movements?on_conflict=id', wd, 'resolution=ignore-duplicates,return=minimal')).status).toBeLessThan(300);
+    expect(sql(`SELECT status || ' ' || difference FROM cash_sessions WHERE id = '${session.id}'`)).toBe('CLOSED -5.00');
+    expect(sql(`SELECT count(*) FROM cash_movements WHERE session_id = '${session.id}'`)).toBe('2');
   });
 
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
