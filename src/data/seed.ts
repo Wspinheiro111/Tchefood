@@ -7,6 +7,8 @@
  */
 import type {
   CashbackLedgerEntry,
+  CashMovement,
+  CashSession,
   Category,
   DiningTable,
   EventTicket,
@@ -704,5 +706,7 @@ export function createSeedData() {
     cashbackLedger: [] as CashbackLedgerEntry[],
     priceSchedules: [] as PriceSchedule[],
     rolePermissions: [] as RolePermission[],
+    cashSessions: [] as CashSession[],
+    cashMovements: [] as CashMovement[],
   };
 }

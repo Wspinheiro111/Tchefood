@@ -66,13 +66,13 @@ export function useBackOfficeTabs(): typeof TABS {
 }
 
 /** Telas fora da Retaguarda que um aviso do Painel do dono pode abrir. */
-export type BackOfficeExit = 'delivery' | 'pickup' | 'map';
+export type BackOfficeExit = 'delivery' | 'pickup' | 'map' | 'caixa';
 
 export function BackOffice({ onExit }: { onExit?: (view: BackOfficeExit) => void } = {}) {
   const tabs = useBackOfficeTabs();
   const [picked, setTab] = useState<Tab>('owner');
   const navigate = (target: DashboardNavTarget) => {
-    if (target === 'delivery' || target === 'pickup' || target === 'map') onExit?.(target);
+    if (target === 'delivery' || target === 'pickup' || target === 'map' || target === 'caixa') onExit?.(target);
     else setTab(target);
   };
   const tab: Tab | undefined = tabs.some((t) => t.key === picked) ? picked : tabs[0]?.key;

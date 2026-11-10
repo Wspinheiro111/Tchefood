@@ -52,7 +52,8 @@ const CONFLICT_KEY: Partial<Record<SyncEvent['table'], string>> = {
 };
 
 // ar_engagement_events: métrica imutável no banco; reenvio do mesmo evento é ignorado.
-const INSERT_ONLY: ReadonlyArray<SyncEvent['table']> = ['payments', 'audit_logs', 'ar_engagement_events'];
+// Movimento de caixa é só INSERT no banco (gatilho recusa UPDATE/DELETE).
+const INSERT_ONLY: ReadonlyArray<SyncEvent['table']> = ['payments', 'audit_logs', 'ar_engagement_events', 'cash_movements'];
 
 /** Ações que o banco só aceita pela RPC que confere o PIN (ver tchefood_authorize_manager). */
 export const RPC_AUTHORIZED_ACTIONS: ReadonlyArray<string> = [
@@ -63,6 +64,9 @@ export const RPC_AUTHORIZED_ACTIONS: ReadonlyArray<string> = [
   'KIOSK_EXIT',
   // Só a fila gravada antes de a troca de barril subir por tchefood_change_keg.
   'KEG_CHANGED',
+  // Caixa (db/schema_caixa.sql): sangria e fechamento com diferença.
+  'CASH_WITHDRAWAL',
+  'CASH_CLOSE_DIFFERENCE',
 ];
 /** Autorizações que destravam uma atualização da comanda no banco (ver serverOrder). */
 const ORDER_UNLOCKING_ACTIONS: ReadonlyArray<string> = ['ITEM_CANCELED', 'SERVICE_FEE_REMOVED', 'DISCOUNT_APPLIED'];
@@ -104,6 +108,9 @@ const NEVER_UPLOAD: Partial<Record<SyncEvent['table'], ReadonlyArray<string>>> =
   // Coluna gerada no banco (capacidade − faturado − desperdício): o banco recusa
   // qualquer valor nela, e toda mudança de barril (leitura, desperdício, troca) caía.
   keg_taps: ['remaining_volume_ml'],
+  // O banco calcula o esperado e a diferença no fechamento e liga o gerente pela
+  // autorização gravada; o valor do aparelho nunca vale.
+  cash_sessions: ['expected_cash', 'difference', 'closing_authorized_by_manager_id'],
 };
 
 export function sanitizePayload(event: SyncEvent): Record<string, unknown> {

@@ -163,6 +163,16 @@ describe('Quanto cancelei?', () => {
     expect(c.serviceFeeRemoved).toBe(1);
     expect(c.byManager).toEqual([{ manager_id: 'g1', count: 2, value: 42.5 }]);
   });
+
+  it('desconto corrigido para menos abate o anterior (sinal do amount_impact)', () => {
+    const auditLogs = [
+      { action_type: 'DISCOUNT_APPLIED', amount_impact: -20, authorized_by_manager_id: 'g1', created_at: at(0, 14) },
+      { action_type: 'DISCOUNT_APPLIED', amount_impact: 10, authorized_by_manager_id: 'g1', created_at: at(0, 15) },
+    ] as AuditLog[];
+    const c = cancellations(indexDashboard(input({ auditLogs })), periodRanges('today', NOW).current);
+    expect(c.discountsValue).toBe(10);
+    expect(c.byManager).toEqual([{ manager_id: 'g1', count: 2, value: 10 }]);
+  });
 });
 
 describe('O cliente volta?', () => {

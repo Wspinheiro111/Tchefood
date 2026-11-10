@@ -55,6 +55,8 @@ npm run build
    - **Avisos no topo** com o atalho para resolver: app de delivery fora do ar, pedido de app sem aceite, cobrança da maquininha para conferir, barril crítico ou acabando, nuvem recusando ou parada, conta de mesa aberta há 3 h, senha do totem sem pagar e produto esgotado.
    - Vendido = pagamentos aprovados (sem gorjeta) + pedidos de app não cancelados. O dia operacional começa às 05:00, igual ao relatório do turno (agora na aba **Turno**).
 
+16. **Caixa** (menu Caixa, perfis Caixa, Gerente e Proprietário): abre com o fundo de troco, lança suprimento (entrada) e sangria (saída, com PIN de gerente e motivo, nunca mais do que há na gaveta) e fecha **às cegas**: o operador digita o que contou sem ver o esperado; se não bater, só o gerente vê a diferença e fecha com PIN + motivo (falta vai para o alerta do proprietário). Sai o cupom de fechamento na bobina. Dinheiro recebido com o caixa fechado aparece na tela do Caixa e no Painel do dono. No banco (`db/schema_caixa.sql`) o esperado e a diferença são calculados pelo servidor, movimento é só inserção e caixa fechado não muda mais. Um caixa aberto por loja.
+
 ## Etapa 0: cadastros na tela e sincronização
 **Cardápio** — categorias, produtos (código único, preço com 2 casas, NCM/CFOP/CSOSN validados), grupos de adicionais e opções, vínculo produto ↔ adicionais em ordem, **preço por dia/horário** (happy hour; janela que vira a meia-noite; duas regras do mesmo produto não podem se sobrepor) e **esgotado** em um toque, também no KDS para a cozinha.
 - O preço da bandeja é recalculado no store a partir do cardápio (regra de horário + meio a meio). O valor que a tela manda é ignorado.

@@ -426,7 +426,10 @@ export type AuditActionType =
   | 'STAFF_DEACTIVATED'
   | 'STAFF_REACTIVATED'
   | 'PERMISSION_CHANGED'
-  | 'STORE_RESET';
+  | 'STORE_RESET'
+  // Caixa (db/schema_caixa.sql)
+  | 'CASH_WITHDRAWAL'
+  | 'CASH_CLOSE_DIFFERENCE';
 
 export interface AuditLog {
   id: UUID;
@@ -547,6 +550,50 @@ export interface CashbackLedgerEntry {
 }
 
 // ---------------------------------------------------------------------------
+// CAIXA (db/schema_caixa.sql)
+// ---------------------------------------------------------------------------
+
+export type CashSessionStatus = 'OPEN' | 'CLOSED';
+
+/** Turno de caixa: abre com o fundo de troco e fecha com a contagem cega. Um aberto por loja. */
+export interface CashSession {
+  id: UUID;
+  tenant_id: UUID;
+  opened_by_user_id: UUID;
+  opened_at: ISODateTime;
+  /** Fundo de troco colocado na gaveta na abertura. */
+  opening_float: number;
+  status: CashSessionStatus;
+  closed_by_user_id: UUID | null;
+  closed_at: ISODateTime | null;
+  /** O que o operador contou na gaveta (fechamento cego: digitado antes de ver o esperado). */
+  counted_cash: number | null;
+  /** Fundo + vendas em dinheiro + suprimentos − sangrias. Na nuvem quem calcula é o banco. */
+  expected_cash: number | null;
+  /** Contado − esperado (negativo = faltou). */
+  difference: number | null;
+  closing_notes: string | null;
+  /** Gerente que autorizou fechar com diferença. */
+  closing_authorized_by_manager_id: UUID | null;
+}
+
+/** SUPPLY = suprimento (entra dinheiro); WITHDRAWAL = sangria/retirada (sai dinheiro, com PIN de gerente). */
+export type CashMovementType = 'SUPPLY' | 'WITHDRAWAL';
+
+/** Movimento de dinheiro do caixa fora das vendas. Somente inserção. */
+export interface CashMovement {
+  id: UUID;
+  tenant_id: UUID;
+  session_id: UUID;
+  type: CashMovementType;
+  amount: number;
+  reason: string;
+  performed_by_user_id: UUID;
+  authorized_by_manager_id: UUID | null;
+  created_at: ISODateTime;
+}
+
+// ---------------------------------------------------------------------------
 // TIPOS DE APLICAÇÃO (não persistidos no PostgreSQL)
 // ---------------------------------------------------------------------------
 
@@ -618,7 +665,10 @@ export interface SyncEvent {
     | 'role_permissions'
     // Cardápio em realidade aumentada (db/schema_ar.sql)
     | 'product_ar_models'
-    | 'ar_engagement_events';
+    | 'ar_engagement_events'
+    // Caixa (db/schema_caixa.sql)
+    | 'cash_sessions'
+    | 'cash_movements';
   /** DELETE só para linhas sem valor financeiro (vínculos e opções de adicional). */
   op: 'INSERT' | 'UPDATE' | 'DELETE';
   row_id: UUID;
