@@ -437,7 +437,19 @@ BEGIN
         -- resgate. Sem esta trava, depois de um estorno o aparelho subia o desconto de volta
         -- e a conferência de tchefood_require_order_audit aceitava pelo registro do resgate
         -- original (antes/depois iguais de novo): o cliente ficava com o estorno e o desconto.
-        IF v_redeemed > 0 AND NOT COALESCE(v_ok, false) THEN
+        -- Exceção: fila da versão anterior que subiu o REDEEM e o registro do resgate, mas
+        -- caiu antes da atualização da conta. Ela traz o aumento que bate com esse registro
+        -- (gravado pelo aparelho antigo, sem server_verified) e com o REDEEM, e só vale se a
+        -- conta nunca teve estorno.
+        IF v_redeemed > 0 AND NOT COALESCE(v_ok, false) AND NOT (
+            NOT EXISTS (SELECT 1 FROM cashback_ledger r WHERE r.tenant_id = NEW.tenant_id AND r.order_id = NEW.id AND r.entry_type = 'REFUND')
+            AND EXISTS (SELECT 1 FROM cashback_ledger c JOIN audit_logs a ON a.tenant_id = c.tenant_id AND a.order_id = c.order_id
+                         WHERE c.tenant_id = NEW.tenant_id AND c.order_id = NEW.id AND c.entry_type = 'REDEEM'
+                           AND c.amount = NEW.discount_amount - OLD.discount_amount
+                           AND a.action_type = 'CASHBACK_REDEEMED' AND a.authorized_by_manager_id IS NULL
+                           AND COALESCE(a.metadata->>'server_verified', '') <> 'true'
+                           AND (a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
+                           AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount)) THEN
             RAISE EXCEPTION 'TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ % e este aparelho mandou R$ % (outro aparelho ou o cashback mudou a conta). Use o desconto da nuvem antes de cobrar.',
                 to_char(OLD.discount_amount, 'FM999999990.00'), to_char(NEW.discount_amount, 'FM999999990.00');
         END IF;

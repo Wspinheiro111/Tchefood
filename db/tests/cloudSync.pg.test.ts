@@ -646,6 +646,34 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     setCashbackClock(null);
   });
 
+  it('fila da versão anterior que caiu antes da atualização da conta: o desconto do resgate ainda sobe', async () => {
+    // Achado do Codex em da2a794: a versão anterior subia o registro do resgate, as baixas e
+    // o REDEEM antes da conta. Se caiu ali, a atualização da conta com o desconto ainda está
+    // na fila e precisa subir; com estorno na conta, não (seria o reaproveitamento).
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [a, b] = await cashbackOrders(2, 49);
+    const legacyRedeem = (orderId: string, refund: boolean) => {
+      const c = cashbackCustomer(`55539881100${refund ? '20' : '19'}`, [{ amount: 10, expires: '2026-12-31' }]);
+      legacyAudit(orderId, c.id, 5);
+      debit(c.earns[0]!, 5);
+      sql(`SET session_replication_role = replica;
+           INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount) VALUES ('${TENANT}', '${c.id}', '${orderId}', 'REDEEM', 5);
+           ${refund ? `INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+                       VALUES ('${TENANT}', '${c.id}', '${orderId}', 'REFUND', 5, 5, '2026-11-12', '2026-12-12');` : ''}`);
+    };
+    legacyRedeem(a!.id, false);
+    legacyRedeem(b!.id, true);
+    expect((await raw('PATCH', `orders?id=eq.${a!.id}`, { discount_amount: 5 })).status).toBeLessThan(300);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${a!.id}'`)).toBe('5.00');
+    const reused = await raw('PATCH', `orders?id=eq.${b!.id}`, { discount_amount: 5 });
+    expect(reused.status).toBe(400);
+    expect(reused.body).toContain('TCHEFOOD_DESCONTO');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${b!.id}'`)).toBe('0.00');
+    closeCashbackOrders([a!.id, b!.id]);
+    setCashbackClock(null);
+  });
+
   it('dois aparelhos: desconto antigo da fila vira conflito, o aparelho não cobra e adota o desconto da nuvem', async () => {
     // P1-01 da rodada 4: antes o banco ignorava a atualização antiga em silêncio e o aparelho
     // cobrava com o desconto velho (pagamento recusado depois).
