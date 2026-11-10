@@ -3649,19 +3649,28 @@ export const useTcheStore = create<TcheState>()(
           const orderId = rejected.event.row_id;
           const order = get().orders.find((o) => o.id === orderId);
           if (!order) return fail('Conta não encontrada neste aparelho.');
-          const recalculated = applyOrderTotals({ ...order, discount_amount: cloud }, get().orderItems, get().payments);
+          const deltaCents = toCents(cloud) - toCents(Number(rejected.event.payload.discount_amount ?? order.discount_amount));
+          const recalculated = applyOrderTotals(
+            { ...order, discount_amount: Math.max(toCents(order.discount_amount) + deltaCents, 0) / 100 }, get().orderItems, get().payments);
           if (toCents(recalculated.total_amount) < toCents(order.paid_amount)) {
             return fail('Com o desconto da nuvem a conta fica abaixo do já pago neste aparelho. Chame o gerente para conferir os pagamentos.');
           }
-          const fix = (e: SyncEvent): SyncEvent =>
-            e.table === 'orders' && e.row_id === orderId && 'discount_amount' in e.payload
-              ? { ...e, payload: { ...e.payload, discount_amount: cloud } }
-              : e;
+          // A conta recusada leva o desconto da nuvem. As mudanças seguintes dela (que
+          // esperavam a recusa) levam a mesma diferença sobre o desconto que cada uma tinha,
+          // limitada ao bruto daquele momento (um cancelamento depois pode ter limitado o
+          // desconto local; o banco limita o dele do mesmo jeito ao receber o cancelamento).
+          const rebase = (e: SyncEvent): SyncEvent => {
+            if (e.table !== 'orders' || e.row_id !== orderId || typeof e.payload.discount_amount !== 'number') return e;
+            const p = e.payload as Partial<Order>;
+            let cents = Math.max(toCents(p.discount_amount!) + deltaCents, 0);
+            if (typeof p.subtotal_items === 'number' && typeof p.service_fee_amount === 'number') {
+              cents = Math.min(cents, toCents(p.subtotal_items) + toCents(p.service_fee_amount));
+            }
+            return { ...e, payload: { ...e.payload, discount_amount: cents / 100 } };
+          };
           set((s) => ({
             orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
-            // A conta volta à frente da fila com o desconto da nuvem; as mudanças seguintes
-            // dela (que esperavam a recusa) também levam o valor certo.
-            outbox: [fix(rejected.event), ...s.outbox.map(fix)],
+            outbox: [{ ...rejected.event, payload: { ...rejected.event.payload, discount_amount: cloud } }, ...s.outbox.map(rebase)],
             syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
           }));
           return { ok: true, data: cloud };

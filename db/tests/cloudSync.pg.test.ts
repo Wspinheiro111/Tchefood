@@ -709,6 +709,42 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT status || ' ' || discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 7.00');
   });
 
+  it('desconto da nuvem adotado com cancelamento na fila: a conta seguinte leva a diferença, limitada ao bruto', async () => {
+    // Achado do Codex em b03d23a: trocar todas as versões da conta na fila pelo desconto da
+    // nuvem (R$ 7) levava o desconto acima do bruto que um cancelamento seguinte deixou
+    // (R$ 3,30), e o banco recusava o aumento sem autorização.
+    login(OWNER_PIN);
+    const agua = ok(st().saveProduct({
+      category_id: categoryId, code: '453', name: 'Água', description: null, price: 3, sector: 'BAR', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '22011000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    await expectSynced('água');
+    const [order] = await cashbackOrders(1, 52);
+    login(CASHIER_PIN);
+    ok(st().addToTray({ order_id: order!.id, product_id: agua.id, half_product_ids: [], quantity: 1, unit_price: 3, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: agua.sector }));
+    ok(st().dispatchTray(order!.id));
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    await expectSynced('água e desconto de R$ 5');
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    ok(st().startCheckout(order!.id));
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    // Na fila, atrás da recusa: o cancelamento do prato (fica só a água, R$ 3,30 com os 10%).
+    const prato = st().orderItems.find((i) => i.order_id === order!.id && i.product_id === productId)!;
+    ok(st().cancelOrderItem(prato.id, MANAGER));
+    expect(st().orders.find((o) => o.id === order!.id)!.discount_amount).toBe(3.3);
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
+    await expectSynced('conta com o desconto da nuvem e o cancelamento');
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order!.id}'`)).toBe(`${local.discount_amount.toFixed(2)} ${local.total_amount.toFixed(2)}`);
+    expect(local.discount_amount).toBe(3.3);
+    closeCashbackOrders([order!.id]);
+  });
+
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
     setCashbackClock('2026-11-12T20:00:00-03:00');
