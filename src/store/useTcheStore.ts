@@ -954,6 +954,17 @@ export const useTcheStore = create<TcheState>()(
        * Produto técnico "Taxa de entrega" (e a categoria inativa dele), criado na primeira
        * entrega com taxa. Fica fora do cardápio (inativo) e da cozinha (setor NONE).
        */
+      /** A senha de entrega foi desfeita: a entrega em andamento sai do quadro junto. */
+      const cancelDeliveryOf = (orderId: UUID): void => {
+        const d = get().ownDeliveries.find((x) => x.order_id === orderId);
+        if (!d || d.status === 'DELIVERED' || d.status === 'CANCELED') return;
+        const updated: OwnDelivery = { ...d, status: 'CANCELED' };
+        set((s) => ({
+          ownDeliveries: s.ownDeliveries.map((x) => (x.id === d.id ? updated : x)),
+          outbox: [...s.outbox, syncEvent('own_deliveries', 'UPDATE', updated)],
+        }));
+      };
+
       const ensureDeliveryFeeProduct = (s0: TcheState): { category: Category | null; product: Product | null } => {
         if (s0.products.some((p) => p.code === DELIVERY_FEE_CODE)) return { category: null, product: null };
         const existingCat = s0.categories.find((c) => c.name === 'Taxas (fora do cardápio)');
@@ -2460,7 +2471,9 @@ export const useTcheStore = create<TcheState>()(
           if (getReviewHold(orderId)) {
             return fail('Há uma cobrança sem confirmação nesta senha. Confira o extrato da maquininha antes de cancelar.');
           }
-          return voidTechnicalSale(orderId, auth, 'KIOSK');
+          const voided = voidTechnicalSale(orderId, auth, 'KIOSK');
+          if (voided.ok) cancelDeliveryOf(orderId);
+          return voided;
         },
 
         exitKioskMode: (auth) => {
@@ -3718,14 +3731,18 @@ export const useTcheStore = create<TcheState>()(
           const d = get().ownDeliveries.find((x) => x.id === deliveryId);
           if (!d) return fail('Entrega não encontrada.');
           if (d.status === 'DELIVERED' || d.status === 'CANCELED') return fail('Entrega já encerrada.');
-          // Desfaz a senha (PIN de gerente, itens auditados); paga não desfaz aqui.
-          const voided = get().voidPickupOrder(d.order_id, auth);
-          if (!voided.ok) return voided;
-          const updated: OwnDelivery = { ...d, status: 'CANCELED' };
-          set((s) => ({
-            ownDeliveries: s.ownDeliveries.map((x) => (x.id === d.id ? updated : x)),
-            outbox: [...s.outbox, syncEvent('own_deliveries', 'UPDATE', updated)],
-          }));
+          const order = get().orders.find((o) => o.id === d.order_id);
+          if (order && order.status !== 'CLOSED' && order.status !== 'CANCELED') {
+            // Conta em aberto: desfaz a senha (PIN de gerente, itens auditados) e a entrega sai junto.
+            const voided = get().voidPickupOrder(d.order_id, auth);
+            if (!voided.ok) return voided;
+          } else {
+            // Conta já paga (ou já desfeita no caixa): só a entrega sai do quadro, com PIN de gerente.
+            // O estorno do dinheiro, se houver, é feito à parte no caixa.
+            const authRes = authorizeManager(auth, { orderId: d.order_id, action: 'ITEM_CANCELED' });
+            if (!authRes.ok) return authRes;
+          }
+          cancelDeliveryOf(d.order_id);
           return { ok: true, data: undefined };
         },
 
@@ -3743,8 +3760,20 @@ export const useTcheStore = create<TcheState>()(
             if (!open) return fail('Abra o caixa para pagar o entregador com o dinheiro da gaveta.');
             if (!opts.auth) return fail('Pagar o entregador pelo caixa é sangria: precisa do PIN do gerente.');
           }
+          // O PIN da sangria é conferido antes de receber qualquer conta: PIN errado não deixa acerto pela metade.
+          const withdrawalAuth = opts.payFromDrawer && feesCents > 0
+            ? {
+                managerPin: opts.auth!.managerPin,
+                reason: opts.auth!.reason.trim().length >= MIN_REASON_LENGTH ? opts.auth!.reason : `Acerto do entregador ${courier.name}`,
+              }
+            : null;
+          if (withdrawalAuth) {
+            const pre = authorizeManager(withdrawalAuth, { orderId: null, action: 'CASH_WITHDRAWAL' });
+            if (!pre.ok) return pre;
+          }
           // 1) O dinheiro que o entregador trouxe vira o pagamento de cada senha paga na entrega.
-          let cashCents = 0;
+          // Senha já recebida numa tentativa anterior deste acerto (que parou no meio) não paga de novo,
+          // mas o dinheiro dela conta no acerto (pela chave entrega-<id> do pagamento).
           for (const d of own) {
             if (!d.pay_on_delivery) continue;
             const order = get().orders.find((o) => o.id === d.order_id);
@@ -3766,15 +3795,15 @@ export const useTcheStore = create<TcheState>()(
               item_ids: [],
             });
             if (!r.ok) return fail(`Senha ${order.pickup_number ?? ''}: ${r.error} Acerto parado; as anteriores já foram recebidas.`);
-            cashCents += toCents(amount);
           }
+          const keys = new Set(own.filter((d) => d.pay_on_delivery).map((d) => `entrega-${d.id}`));
+          const cashCents = get().payments
+            .filter((p) => p.status === 'APPROVED' && p.idempotency_key !== null && keys.has(p.idempotency_key))
+            .reduce((a, p) => a + toCents(p.amount), 0);
           // 2) O ganho do entregador sai da gaveta (sangria com PIN de gerente).
           let movementId: UUID | null = null;
           if (opts.payFromDrawer && feesCents > 0) {
-            const wd = get().addCashWithdrawal(fromCentsLocal(feesCents), {
-              managerPin: opts.auth!.managerPin,
-              reason: opts.auth!.reason.trim().length >= MIN_REASON_LENGTH ? opts.auth!.reason : `Acerto do entregador ${courier.name}`,
-            });
+            const wd = get().addCashWithdrawal(fromCentsLocal(feesCents), withdrawalAuth!);
             if (!wd.ok) return fail(`${wd.error} As senhas já foram recebidas; pague o entregador e acerte de novo sem a gaveta.`);
             movementId = wd.data.id;
           }
