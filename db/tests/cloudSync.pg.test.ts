@@ -532,6 +532,26 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT status FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED');
   });
 
+  it('tirar os 10% de conta com desconto maior que o consumo: o desconto limitado ao novo bruto sobe', async () => {
+    // Achado do Codex em b8b9106: o app limita o desconto ao bruto sem os 10% e sobe os dois
+    // juntos; a trava do desconto não pode tratar isso como desconto antigo.
+    const [order] = await cashbackOrders(1, 48);
+    login(CASHIER_PIN);
+    const before = st().orders.find((o) => o.id === order!.id)!;
+    const gross = Math.round((before.subtotal_items + before.service_fee_amount) * 100) / 100;
+    ok(st().applyDiscount(order!.id, gross, MANAGER));
+    await expectSynced('desconto da conta inteira com os 10%');
+    ok(st().removeServiceFee(order!.id, MANAGER));
+    await expectSynced('tirar os 10%');
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    expect(local.discount_amount).toBe(before.subtotal_items);
+    expect(sql(`SELECT charge_service_fee || ' ' || discount_amount || ' ' || total_amount FROM orders WHERE id = '${order!.id}'`))
+      .toBe(`false ${before.subtotal_items.toFixed(2)} 0.00`);
+    // Reduzir abaixo do bruto sem autorização continua recusado.
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 10 })).status).toBe(400);
+    closeCashbackOrders([order!.id]);
+  });
+
   it('conta com cashback: cancelamento que deixa o desconto abaixo do cashback usado devolve a diferença ao cliente', async () => {
     // P0-01 da rodada 4 (decisão do Will: "devolva"): R$ 50 de cashback numa conta de R$ 100;
     // o cancelamento leva o bruto a R$ 30, o recálculo limita o desconto a R$ 30 e os R$ 20
@@ -604,12 +624,25 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       amount_impact: 5, reason: 'forjado', whatsapp_alert_sent: false, metadata: {},
     })).status).toBe(400);
 
+    // Achado do Codex em b8b9106: depois do estorno, consumo novo e o aparelho sobe o
+    // desconto de volta para R$ 50. O registro do resgate original não serve mais: recusa,
+    // e o cliente não fica com o estorno e o desconto.
+    ok(st().addToTray({ order_id: order.id, product_id: picanha.id, half_product_ids: [], quantity: 1, unit_price: picanha.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: picanha.sector }));
+    ok(st().dispatchTray(order.id));
+    await expectSynced('consumo novo depois do estorno');
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe('30.00 70.00');
+    const reuse = await raw('PATCH', `orders?id=eq.${order.id}`, { discount_amount: 50 });
+    expect(reuse.status).toBe(400);
+    expect(reuse.body).toContain('TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ 30.00');
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe('30.00 70.00');
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND'`)).toBe('1');
+
     // O crédito devolvido vale como o ganho: entra no próximo resgate (pelo FIFO do servidor).
     const [next] = await cashbackOrders(1, 46);
     const cap = next!.cap;
     expect((await cashbackRpc(next!.id, c.id, Math.min(30, cap))).status).toBe(200);
     expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe((30 - Math.min(30, cap)).toFixed(2));
-    closeCashbackOrders([next!.id, ...(local.status === 'CLOSED' ? [] : [order.id])]);
+    closeCashbackOrders([next!.id, order.id]);
     setCashbackClock(null);
   });
 

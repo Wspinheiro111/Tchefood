@@ -395,35 +395,34 @@ BEGIN
 END $$;
 
 -- Desconto da conta: só cresce por autorização (DISCOUNT_APPLIED) ou pela função do
--- cashback. O aparelho só o reduz quando o gerente troca o desconto manual por um menor.
--- Qualquer outra redução vinda do aparelho é uma atualização antiga da fila (feita antes de
--- outro desconto chegar à nuvem) e apagaria o desconto já gravado: o banco recusa.
+-- cashback. O aparelho só o reduz quando o gerente troca o desconto manual por um menor,
+-- ou quando o limita ao novo bruto da conta (tirar os 10% de uma conta com desconto maior
+-- que o consumo). Qualquer outra redução vinda do aparelho é uma atualização antiga da fila
+-- (feita antes de outro desconto chegar à nuvem) e apagaria o desconto já gravado: o banco
+-- recusa.
 CREATE OR REPLACE FUNCTION tchefood_orders_keep_discount()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
     v_ok BOOLEAN;
     v_redeemed NUMERIC(10,2);
+    v_subtotal NUMERIC(10,2);
+    v_fee NUMERIC(10,2);
 BEGIN
-    IF NEW.discount_amount >= OLD.discount_amount THEN
+    IF NEW.discount_amount = OLD.discount_amount THEN
         RETURN NEW;
     END IF;
     -- Profundidade > 1: o recálculo do banco (tchefood_recalc_order, dentro de outro gatilho)
     -- limita o desconto ao bruto da conta quando um item é cancelado. Em conta com cashback,
     -- o que o desconto perder abaixo do cashback consumido volta para o cliente
-    -- (tchefood_orders_cashback_refund, depois da atualização).
-    IF pg_trigger_depth() > 1 THEN
-        RETURN NEW;
-    END IF;
-    IF current_user NOT IN ('anon', 'authenticated') THEN
+    -- (tchefood_orders_cashback_refund, depois da atualização). A função do resgate roda
+    -- como dona do banco (não é o aparelho).
+    IF pg_trigger_depth() > 1 OR current_user NOT IN ('anon', 'authenticated') THEN
         RETURN NEW;
     END IF;
     SELECT COALESCE(SUM(l.amount), 0) INTO v_redeemed FROM cashback_ledger l
      WHERE l.order_id = NEW.id AND l.tenant_id = NEW.tenant_id AND l.entry_type = 'REDEEM';
-    -- Atualização direta do aparelho: só reduz com a última DISCOUNT_APPLIED da conta (pela
-    -- sequência do servidor), de gerente ativo, conferindo com o valor do banco e o novo, e
-    -- nunca em conta com cashback. Qualquer outra redução é um conflito: o aparelho tem um
-    -- desconto antigo. Recusa (em vez de ignorar) para o aparelho saber antes de cobrar; a
-    -- fila segura o resto da conta e o gerente adota o desconto da nuvem em Nuvem › recusados.
+    -- A última DISCOUNT_APPLIED da conta (pela sequência do servidor), de gerente ativo,
+    -- conferindo com o valor do banco e o novo.
     SELECT (a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
        AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
        AND m.role IN ('MANAGER', 'OWNER') AND m.active
@@ -432,6 +431,31 @@ BEGIN
      WHERE a.order_id = NEW.id AND a.tenant_id = NEW.tenant_id AND a.action_type = 'DISCOUNT_APPLIED'
      ORDER BY a.server_seq DESC
      LIMIT 1;
+    IF NEW.discount_amount > OLD.discount_amount THEN
+        -- Aumento em conta com cashback: o desconto do cashback só entra pela função do
+        -- resgate. Sem esta trava, depois de um estorno o aparelho subia o desconto de volta
+        -- e a conferência de tchefood_require_order_audit aceitava pelo registro do resgate
+        -- original (antes/depois iguais de novo): o cliente ficava com o estorno e o desconto.
+        IF v_redeemed > 0 AND NOT COALESCE(v_ok, false) THEN
+            RAISE EXCEPTION 'TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ % e este aparelho mandou R$ % (outro aparelho ou o cashback mudou a conta). Use o desconto da nuvem antes de cobrar.',
+                to_char(OLD.discount_amount, 'FM999999990.00'), to_char(NEW.discount_amount, 'FM999999990.00');
+        END IF;
+        -- Sem cashback, o aumento é conferido por tchefood_require_order_audit (PIN de gerente).
+        RETURN NEW;
+    END IF;
+    -- Redução que só limita o desconto ao bruto que a conta terá com esta mesma atualização
+    -- (os 10% vindo junto, pela regra de tchefood_recalc_order): é o que o banco faria no
+    -- recálculo, então não apaga nada. A retirada dos 10% é conferida pelo seu gatilho.
+    SELECT COALESCE(SUM(total_item_price), 0) INTO v_subtotal
+      FROM order_items WHERE order_id = NEW.id AND status <> 'CANCELED';
+    v_fee := CASE WHEN NEW.charge_service_fee THEN round(v_subtotal * NEW.service_fee_pct / 100, 2) ELSE 0 END;
+    IF NEW.discount_amount = LEAST(OLD.discount_amount, v_subtotal + v_fee) THEN
+        RETURN NEW;
+    END IF;
+    -- Outra redução: só com a troca autorizada e nunca em conta com cashback. Qualquer outra
+    -- é um conflito: o aparelho tem um desconto antigo. Recusa (em vez de ignorar) para o
+    -- aparelho saber antes de cobrar; a fila segura o resto da conta e o gerente adota o
+    -- desconto da nuvem em Nuvem › recusados.
     IF NOT COALESCE(v_ok, false) OR v_redeemed > 0 THEN
         RAISE EXCEPTION 'TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ % e este aparelho mandou R$ % (outro aparelho ou o cashback mudou a conta). Use o desconto da nuvem antes de cobrar.',
             to_char(OLD.discount_amount, 'FM999999990.00'), to_char(NEW.discount_amount, 'FM999999990.00');
