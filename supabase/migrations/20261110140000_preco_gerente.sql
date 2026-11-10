@@ -6,17 +6,22 @@
 -- Antes: o banco recalculava o preço do item e, se viesse diferente, gravava o alerta
 -- PRICE_MISMATCH e aceitava a venda. Decisão do Will (10/11/2026): aceitar só com PIN
 -- de gerente.
---   1. tchefood_authorize_manager aceita PRICE_OVERRIDE, preso ao item (item_id,
---      unit_price e modifiers_unit_price no metadata), com o PIN conferido no servidor.
+--   1. tchefood_authorize_manager aceita PRICE_OVERRIDE, preso ao item inteiro (item_id,
+--      product_id, quantity, unit_price, modifiers_unit_price, half_product_ids e
+--      modifier_option_ids no metadata), com o PIN conferido no servidor. Os campos são
+--      conferidos e gravados já convertidos: autorização com valor inválido é recusada e
+--      não fica gravada (senão a conferência do item quebraria para sempre).
 --   2. tchefood_check_item_price recusa (TCHEFOOD_PRECO) o item com preço diferente,
 --      o item que o servidor não consegue conferir (sabor/adicional
 --      desconhecido) e só aceita com um PRICE_OVERRIDE do mesmo item e mesmo preço.
 --      O PRICE_MISMATCH continua sendo gravado, agora com o gerente que autorizou.
+--      Produto ou conta de outra loja: recusa genérica, sem preço nem nome na mensagem.
 --   3. tchefood_expected_item_price (cópia da versão de schema_entrega.sql): a Ficha
 --      Rápida segue a regra de horário, como o app (PR #27). Sem isso a venda certa
 --      de happy hour no balcão seria recusada.
---      Item de fila antiga (sem priced_at) é conferido pelo cadastro da hora em que
---      entrou (a mesma janela de 12 h do priced_at): com o preço certo entra, como antes.
+--      O instante do preço é o relógio do servidor (NOW), nunca o horário que o aparelho
+--      manda (created_at/priced_at podem ser forjados). Venda de happy hour que só sobe
+--      depois da janela fica recusada até o gerente aceitar com PIN.
 -- No aparelho, o item recusado aparece em Nuvem › recusados com o campo de PIN do
 -- gerente e motivo; a autorização sobe antes do item.
 -- =============================================================================
@@ -37,6 +42,8 @@ DECLARE
     v_performer staff_users%ROWTYPE;
     v_failures INT;
     v_id UUID;
+    v_meta JSONB := COALESCE(p_metadata, '{}'::jsonb);
+    v_valid BOOLEAN;
     v_without_order BOOLEAN := p_action_type IN ('KIOSK_EXIT', 'KEG_CHANGED', 'CASH_WITHDRAWAL', 'CASH_CLOSE_DIFFERENCE');
 BEGIN
     IF v_tenant IS NULL THEN
@@ -58,12 +65,38 @@ BEGIN
     IF p_action_type = 'ITEM_CANCELED' AND (p_metadata->>'item_id') IS NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: cancelamento precisa do item_id no metadata.';
     END IF;
-    -- Preço diferente do cadastro: a autorização é presa ao item (id e preço exatos) e vem
-    -- antes dele. Não mexe no valor por si: a diferença sai no PRICE_MISMATCH do item.
-    IF p_action_type = 'PRICE_OVERRIDE' AND (
-        (p_metadata->>'item_id') IS NULL OR (p_metadata->>'unit_price') IS NULL
-        OR (p_metadata->>'modifiers_unit_price') IS NULL OR COALESCE(p_amount_impact, 0) <> 0) THEN
-        RAISE EXCEPTION 'TCHEFOOD_PRECO: autorização de preço precisa de item_id, unit_price e modifiers_unit_price no metadata, sem valor próprio.';
+    -- Preço diferente do cadastro: a autorização é presa ao item inteiro (id, produto,
+    -- quantidade, preços, sabores e adicionais) e vem antes dele. Não mexe no valor por si:
+    -- a diferença sai no PRICE_MISMATCH do item. Os campos são gravados já convertidos
+    -- (o gatilho do item compara sem conversão); valor inválido recusa sem gravar nada.
+    IF p_action_type = 'PRICE_OVERRIDE' THEN
+        IF COALESCE(p_amount_impact, 0) <> 0 THEN
+            RAISE EXCEPTION 'TCHEFOOD_PRECO: autorização de preço não tem valor próprio (a diferença sai no alerta do item).';
+        END IF;
+        BEGIN
+            v_meta := v_meta || jsonb_build_object(
+                'item_id', (p_metadata->>'item_id')::uuid,
+                'product_id', (p_metadata->>'product_id')::uuid,
+                'quantity', (p_metadata->>'quantity')::numeric(10,3),
+                'unit_price', (p_metadata->>'unit_price')::numeric(10,2),
+                'modifiers_unit_price', (p_metadata->>'modifiers_unit_price')::numeric(10,2),
+                'half_product_ids', to_jsonb(ARRAY(SELECT jsonb_array_elements_text(p_metadata->'half_product_ids'))::uuid[]),
+                'modifier_option_ids', to_jsonb(ARRAY(SELECT jsonb_array_elements_text(p_metadata->'modifier_option_ids'))::uuid[]));
+            v_valid := jsonb_typeof(p_metadata->'half_product_ids') = 'array'
+                   AND jsonb_typeof(p_metadata->'modifier_option_ids') = 'array'
+                   AND (v_meta->>'item_id') IS NOT NULL AND (v_meta->>'product_id') IS NOT NULL
+                   AND (v_meta->>'quantity')::numeric > 0 AND (v_meta->>'unit_price')::numeric >= 0
+                   AND (v_meta->>'modifiers_unit_price') IS NOT NULL;
+        EXCEPTION WHEN others THEN
+            v_valid := FALSE;
+        END;
+        IF NOT COALESCE(v_valid, FALSE) THEN
+            RAISE EXCEPTION 'TCHEFOOD_PRECO: autorização de preço precisa de item_id, product_id, quantity, unit_price, modifiers_unit_price, half_product_ids e modifier_option_ids válidos no metadata.';
+        END IF;
+        PERFORM 1 FROM products pr WHERE pr.id = (v_meta->>'product_id')::uuid AND pr.tenant_id = v_tenant;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'TCHEFOOD_PRECO: produto não encontrado nesta loja.';
+        END IF;
     END IF;
 
     IF v_without_order THEN
@@ -145,7 +178,7 @@ BEGIN
 
     INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
     VALUES (v_tenant, p_order_id, p_performed_by, v_manager.id, p_action_type, COALESCE(p_amount_impact, 0), trim(p_reason),
-            COALESCE(p_metadata, '{}'::jsonb) || jsonb_build_object('manager_name', v_manager.name, 'server_verified', true))
+            v_meta || jsonb_build_object('manager_name', v_manager.name, 'server_verified', true))
     RETURNING id INTO v_id;
     RETURN v_id;
 END;
@@ -176,9 +209,10 @@ BEGIN
         RETURN;
     END IF;
     SELECT t.half_and_half_pricing INTO v_rule FROM tenants t WHERE t.id = v_product.tenant_id;
-    -- Instante do preço: quando o item foi para a bandeja, dentro de 12 h antes do envio
-    -- e nunca no futuro (relógio do aparelho adiantado não vale).
-    v_at := LEAST(GREATEST(COALESCE(p_item.priced_at, p_item.created_at, NOW()), COALESCE(p_item.created_at, NOW()) - INTERVAL '12 hours'), NOW());
+    -- Instante do preço: o relógio do servidor. O created_at/priced_at vem do aparelho e
+    -- pode ser forjado (happy hour fora da janela sem PIN). Item que sobe depois da
+    -- janela fica recusado e o gerente aceita com PIN (PRICE_OVERRIDE).
+    v_at := NOW();
 
     -- Ficha Rápida (origem SMARTPOS) segue a regra de horário como a comanda: o app cobra
     -- o happy hour no balcão desde o PR #27 (createCounterSale usa effectivePrice). Antes
@@ -218,14 +252,24 @@ DECLARE
     v_impact NUMERIC;
     v_legacy BOOLEAN;
     v_override audit_logs%ROWTYPE;
+    v_tenant UUID;
+    v_claims JSONB := NULLIF(current_setting('request.jwt.claims', true), '')::jsonb;
 BEGIN
     -- Reenvio da fila (upsert do mesmo item): já foi conferido na primeira vez.
     IF EXISTS (SELECT 1 FROM order_items i WHERE i.id = NEW.id) THEN
         RETURN NEW;
     END IF;
-    SELECT * INTO v_product FROM products WHERE id = NEW.product_id;
+    -- Produto e conta da mesma loja de quem grava. A conferência roda antes da política de
+    -- acesso (RLS) e com permissão do dono, então sem isso a mensagem de recusa mostraria o
+    -- preço de outra loja. Recusa genérica, sem preço nem nome.
+    SELECT o.tenant_id INTO v_tenant FROM orders o WHERE o.id = NEW.order_id;
+    SELECT * INTO v_product FROM products p WHERE p.id = NEW.product_id AND p.tenant_id = v_tenant;
+    IF NOT FOUND
+       OR (COALESCE(v_claims->>'role', '') IN ('anon', 'authenticated') AND v_tenant IS DISTINCT FROM tchefood_tenant()) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PRECO: produto ou conta não encontrado nesta loja.';
+    END IF;
     -- Pesado (o banco já fixa preço e quantidade) e componente de combo (preço zero, schema_combos.sql).
-    IF NOT FOUND OR v_product.sold_by_weight OR NEW.combo_parent_item_id IS NOT NULL THEN
+    IF v_product.sold_by_weight OR NEW.combo_parent_item_id IS NOT NULL THEN
         RETURN NEW;
     END IF;
     SELECT * INTO v_expected FROM tchefood_expected_item_price(NEW);
@@ -241,13 +285,18 @@ BEGIN
                      ELSE round(NEW.quantity * ((v_expected.base + v_expected.modifiers) - (NEW.unit_price + NEW.modifiers_unit_price)), 2) END;
     -- Decisão do Will (10/11/2026): item com preço diferente do cadastro, ou que o servidor
     -- não consegue conferir, só entra com PIN de gerente. A autorização (PRICE_OVERRIDE,
-    -- conferida por tchefood_authorize_manager) sobe antes do item, presa ao id e ao preço.
+    -- conferida por tchefood_authorize_manager) sobe antes do item, presa ao item inteiro.
+    -- Comparação em jsonb, sem conversão: o RPC já gravou os campos convertidos.
     SELECT * INTO v_override FROM audit_logs a
      WHERE a.tenant_id = v_product.tenant_id AND a.order_id = NEW.order_id AND a.action_type = 'PRICE_OVERRIDE'
        AND a.authorized_by_manager_id IS NOT NULL
-       AND a.metadata->>'item_id' = NEW.id::text
-       AND (a.metadata->>'unit_price')::numeric = NEW.unit_price
-       AND (a.metadata->>'modifiers_unit_price')::numeric = NEW.modifiers_unit_price
+       AND a.metadata->'item_id' = to_jsonb(NEW.id)
+       AND a.metadata->'product_id' = to_jsonb(NEW.product_id)
+       AND a.metadata->'quantity' = to_jsonb(NEW.quantity)
+       AND a.metadata->'unit_price' = to_jsonb(NEW.unit_price)
+       AND a.metadata->'modifiers_unit_price' = to_jsonb(NEW.modifiers_unit_price)
+       AND a.metadata->'half_product_ids' = to_jsonb(COALESCE(NEW.half_product_ids, '{}'::uuid[]))
+       AND a.metadata->'modifier_option_ids' = to_jsonb(COALESCE(NEW.modifier_option_ids, '{}'::uuid[]))
      ORDER BY a.server_seq
      LIMIT 1;
     IF NOT FOUND THEN

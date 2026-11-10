@@ -634,24 +634,51 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(forged.body).toContain('preço do cadastro R$ 60.00, o aparelho mandou R$ 1.00');
     expect(sql(`SELECT count(*) FROM order_items WHERE id = '${forgedItem.id}'`)).toBe('0');
     expect(mismatches()).toBe(0);
-    const authorize = (item: { id: string; unit_price: number }, pin: string) => raw('POST', 'rpc/tchefood_authorize_manager', {
+    type PricedItem = { id: string; product_id: string; quantity: number; unit_price: number; modifiers_unit_price?: number; half_product_ids?: string[]; modifier_option_ids?: string[] };
+    const overrideMeta = (item: PricedItem) => ({
+      item_id: item.id, product_id: item.product_id, quantity: item.quantity, unit_price: item.unit_price,
+      modifiers_unit_price: item.modifiers_unit_price ?? 0, half_product_ids: item.half_product_ids ?? [], modifier_option_ids: item.modifier_option_ids ?? [],
+    });
+    const authorize = (item: PricedItem, pin: string, meta: Record<string, unknown> = {}) => raw('POST', 'rpc/tchefood_authorize_manager', {
       p_order_id: order.id, p_action_type: 'PRICE_OVERRIDE', p_manager_pin: pin, p_performed_by: st().currentUserId,
       p_reason: 'Preço combinado com o cliente', p_amount_impact: 0,
-      p_metadata: { item_id: item.id, unit_price: item.unit_price, modifiers_unit_price: 0, client_audit_id: crypto.randomUUID() },
+      p_metadata: { ...overrideMeta(item), client_audit_id: crypto.randomUUID(), ...meta },
     });
+    const overridesOf = (itemId: string) => sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'PRICE_OVERRIDE' AND metadata->>'item_id' = '${itemId}'`);
     // PIN errado não autoriza; autorização com valor próprio é recusada.
     await authorize(forgedItem, '0000');
     expect((await raw('POST', 'order_items', forgedItem)).status).toBe(400);
     const withImpact = await raw('POST', 'rpc/tchefood_authorize_manager', {
       p_order_id: order.id, p_action_type: 'PRICE_OVERRIDE', p_manager_pin: MANAGER_PIN, p_performed_by: st().currentUserId,
-      p_reason: 'Preço combinado com o cliente', p_amount_impact: -50, p_metadata: { item_id: forgedItem.id, unit_price: 1, modifiers_unit_price: 0 },
+      p_reason: 'Preço combinado com o cliente', p_amount_impact: -50, p_metadata: overrideMeta(forgedItem),
     });
-    expect(withImpact.body).toContain('sem valor próprio');
+    expect(withImpact.body).toContain('não tem valor próprio');
+    // Autorização com campo inválido (P2-01 do GPT): recusada e não gravada; depois uma
+    // válida funciona (a gravada errada quebraria a conferência do item para sempre).
+    for (const bad of [{ unit_price: 'abc' }, { quantity: 0 }, { item_id: 'não-é-uuid' }, { half_product_ids: 'x' }, { modifier_option_ids: undefined }]) {
+      const r = await authorize(forgedItem, MANAGER_PIN, bad);
+      expect(r.status, JSON.stringify(bad)).toBe(400);
+      expect(r.body).toContain('válidos no metadata');
+    }
+    expect(overridesOf(forgedItem.id)).toBe('0');
     // Autorização de outro preço não vale para este item.
-    expect((await authorize({ id: forgedItem.id, unit_price: 2 }, MANAGER_PIN)).status).toBe(200);
+    expect((await authorize({ ...forgedItem, unit_price: 2 }, MANAGER_PIN)).status).toBe(200);
     expect((await raw('POST', 'order_items', forgedItem)).status).toBe(400);
-    // Com a autorização do gerente para este item e este preço: entra, e o alerta leva o gerente.
+    // P0-01 do GPT: a autorização é do item inteiro. Com o mesmo id e o mesmo preço, trocar
+    // o produto, a quantidade, os sabores ou os adicionais não passa.
     expect((await authorize(forgedItem, MANAGER_PIN)).status).toBe(200);
+    const group = crypto.randomUUID();
+    const option = crypto.randomUUID();
+    sql(`INSERT INTO modifier_groups (id, tenant_id, name) VALUES ('${group}', '${TENANT}', 'Borda');
+         INSERT INTO modifier_options (id, group_id, name, additional_price) VALUES ('${option}', '${group}', 'Borda recheada', 12);
+         INSERT INTO product_modifier_groups (product_id, group_id) VALUES ('${calabresa.id}', '${group}');`);
+    for (const swap of [{ product_id: marguerita.id }, { quantity: 5 }, { half_product_ids: [marguerita.id] }, { modifier_option_ids: [option] }]) {
+      const r = await raw('POST', 'order_items', { ...forgedItem, ...swap });
+      expect(r.status, JSON.stringify(swap)).toBe(400);
+      expect(r.body).toContain('TCHEFOOD_PRECO');
+    }
+    expect(sql(`SELECT count(*) FROM order_items WHERE id = '${forgedItem.id}'`)).toBe('0');
+    // Com a autorização do gerente para este item exato: entra, e o alerta leva o gerente.
     expect((await raw('POST', 'order_items', forgedItem)).status).toBe(201);
     expect(mismatches()).toBe(1);
     expect(sql(`SELECT amount_impact || ' ' || (metadata->>'expected_unit_price') || ' ' || (authorized_by_manager_id IS NOT NULL) FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}'`)).toBe('118.00 60.00 true');
@@ -694,6 +721,56 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(st().orderItems.find((i) => i.order_id === counter.id)!.unit_price).toBe(39.9);
     await expectSynced('Ficha Rápida no happy hour');
     expect(sql(`SELECT unit_price FROM order_items WHERE order_id = '${counter.id}'`)).toBe('39.90');
+
+    // P0-02 do GPT: o instante do preço é o relógio do servidor. Promoção das 12h às 13h
+    // num dia que não é hoje; item de Ficha Rápida com created_at/priced_at forjados dentro
+    // dessa janela: recusado sem PIN. Pelo preço normal, entra.
+    const spDay = (d: Date) => new Date(d.toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+    const past = new Date(Date.now() - 3 * 86_400_000);
+    const pastSp = spDay(past);
+    const promoDay = pastSp.getDay();
+    const lanche = pizza('703', 'Xis Promoção', 50);
+    ok(st().savePriceSchedule({ product_id: lanche.id, name: 'Almoço', weekdays: [promoDay], start_time: '12:00', end_time: '13:00', price: 20, active: true }));
+    await expectSynced('promoção do almoço');
+    const ymd = `${pastSp.getFullYear()}-${String(pastSp.getMonth() + 1).padStart(2, '0')}-${String(pastSp.getDate()).padStart(2, '0')}`;
+    const forgedAt = new Date(`${ymd}T12:30:00-03:00`).toISOString();
+    const promoItem = {
+      id: crypto.randomUUID(), order_id: counter.id, product_id: lanche.id, waiter_id: st().currentUserId, quantity: 1, unit_price: 20, modifiers_unit_price: 0,
+      sector: 'KITCHEN', status: 'PENDING', origin: 'SMARTPOS', priced_at: forgedAt, created_at: forgedAt,
+    };
+    const promo = await raw('POST', 'order_items', promoItem);
+    expect(promo.status).toBe(400);
+    expect(promo.body).toContain('preço do cadastro R$ 50.00, o aparelho mandou R$ 20.00');
+    expect((await raw('POST', 'order_items', { ...promoItem, id: crypto.randomUUID(), unit_price: 50 })).status).toBe(201);
+
+    // P0-03 do GPT: produto ou conta de outra loja. A recusa não mostra preço nem nome.
+    const TENANT_B = '22222222-2222-4222-8222-222222222222';
+    const productB = crypto.randomUUID();
+    const orderB = crypto.randomUUID();
+    const tableB = crypto.randomUUID();
+    sql(`SET session_replication_role = replica;
+         INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT_B}', 'Outra loja', 'Outra loja Ltda', '22333444000181');
+         INSERT INTO categories (id, tenant_id, name) VALUES ('${productB}', '${TENANT_B}', 'Cat B');
+         INSERT INTO products (id, tenant_id, category_id, code, name, price, sector) VALUES ('${productB}', '${TENANT_B}', '${productB}', 'B1', 'Segredo da Casa B', 77.77, 'KITCHEN');
+         INSERT INTO dining_tables (id, tenant_id, number, label) VALUES ('${tableB}', '${TENANT_B}', 1, 'Mesa B');
+         INSERT INTO staff_users (id, tenant_id, name, role, pin_code) VALUES ('${tableB}', '${TENANT_B}', 'Dono B', 'OWNER', '9137');
+         INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${orderB}', '${TENANT_B}', '${tableB}', '${tableB}');
+         SET session_replication_role = origin;`);
+    const leaks = [
+      { ...promoItem, id: crypto.randomUUID(), order_id: order.id, product_id: productB, unit_price: 1, origin: 'WAITER' },
+      { ...promoItem, id: crypto.randomUUID(), order_id: orderB, product_id: productB, unit_price: 1, origin: 'WAITER' },
+      { ...promoItem, id: crypto.randomUUID(), order_id: orderB, product_id: calabresa.id, unit_price: 1, origin: 'WAITER' },
+    ];
+    for (const leak of leaks) {
+      const r = await raw('POST', 'order_items', leak);
+      expect(r.status).toBe(400);
+      expect(r.body).not.toMatch(/77[.,]77|Segredo|60[.,]00/);
+      expect(sql(`SELECT count(*) FROM order_items WHERE id = '${leak.id}'`)).toBe('0');
+    }
+    // Autorização de preço com produto de outra loja: recusada.
+    const crossAuth = await authorize({ id: crypto.randomUUID(), product_id: productB, quantity: 1, unit_price: 1 }, MANAGER_PIN);
+    expect(crossAuth.status).toBe(400);
+    expect(crossAuth.body).toContain('produto não encontrado nesta loja');
   });
 
   it('dinheiro no servidor: pagamento só pela função, com saldo, NSU e caixa conferidos; conta só fecha zerada', async () => {

@@ -3607,6 +3607,9 @@ export const useTcheStore = create<TcheState>()(
               quantity: p.quantity,
               unit_price: p.unit_price,
               modifiers_unit_price: p.modifiers_unit_price,
+              // O servidor prende a autorização ao item inteiro: sabores e adicionais também.
+              half_product_ids: Array.isArray(p.half_product_ids) ? p.half_product_ids : [],
+              modifier_option_ids: Array.isArray(p.modifier_option_ids) ? p.modifier_option_ids : [],
               server_message: rejected.message,
               waiter_name: user.name,
               manager_name: authRes.data.name,
