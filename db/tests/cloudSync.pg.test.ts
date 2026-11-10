@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
+import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
 import { availableCashback } from '../../src/lib/loyalty';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
 import { fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins } from '../../src/lib/sync/cloudPull';
@@ -965,6 +965,53 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     // Limpa o caso para os testes seguintes (na loja, o gerente confere com o cliente).
     useTcheStore.setState({ outbox: [], syncRejected: st().syncRejected.filter((r) => r.event.id !== conflict.event.id) });
     closeCashbackOrders([order!.id]);
+  });
+
+  it('duas trocas de desconto sem internet e outra na nuvem: o gerente confirma de novo e a autorização nova descreve a troca', async () => {
+    // P1-01 da rodada 5 do GPT: sem internet o gerente autoriza R$ 5 e depois R$ 6; na nuvem,
+    // outro aparelho deixou R$ 7. Antes, adotar a nuvem refazia a conta para R$ 8 e mandava a
+    // autorização 5 → 6 sem mudar (o PIN do gerente valia para outra troca, e o banco recusava).
+    const [order] = await cashbackOrders(1, 58);
+    login(CASHIER_PIN);
+    // As duas trocas com um minuto entre elas (não são a mesma operação para a fila).
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    vi.setSystemTime(new Date('2026-11-12T20:01:00-03:00'));
+    ok(st().applyDiscount(order!.id, 6, MANAGER));
+    const firstAuths = st().auditLogs.filter((l) => l.order_id === order!.id && l.action_type === 'DISCOUNT_APPLIED');
+    expect(firstAuths.map((l) => `${l.metadata?.discount_before}→${l.metadata?.discount_after}`).sort()).toEqual(['0→5', '5→6']);
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -7, 'Outro aparelho', '{"discount_before": 0, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 7.00');
+    // Sem o PIN do gerente não adota: a troca 5 → 6 da fila ficaria descrevendo outra troca.
+    const withoutPin = st().adoptCloudDiscount(conflict.event.id);
+    expect(withoutPin.ok).toBe(false);
+    if (!withoutPin.ok) expect(withoutPin.error).toBe(ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER);
+    expect(st().syncRejected.some((r) => r.event.id === conflict.event.id)).toBe(true);
+    expect(ok(st().adoptCloudDiscount(conflict.event.id, MANAGER))).toBe(7);
+    // A autorização original fica no histórico; a nova aponta para ela.
+    const auths = st().auditLogs.filter((l) => l.order_id === order!.id && l.action_type === 'DISCOUNT_APPLIED');
+    const original = auths.find((l) => l.metadata?.discount_before === 5)!;
+    const renewed = auths.find((l) => l.metadata?.replaces_audit_id === original.id)!;
+    expect(renewed.metadata).toMatchObject({ discount_before: 7, discount_after: 6, original_discount_before: 5, original_discount_after: 6 });
+    expect(renewed.amount_impact).toBe(1);
+    expect(renewed.id).not.toBe(original.id);
+    expect(st().orders.find((o) => o.id === order!.id)!.discount_amount).toBe(6);
+    await expectSynced('trocas reautorizadas pelo gerente');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('6.00');
+    // No banco: a última autorização é a nova (R$ 7 → R$ 6), ligada à troca original, e a
+    // original (R$ 5 → R$ 6) nunca subiu como autorização válida da conta.
+    expect(sql(`SELECT (metadata->>'discount_before') || '→' || (metadata->>'discount_after') || ' ' || (metadata->>'replaces_audit_id')
+                  FROM audit_logs WHERE order_id = '${order!.id}' AND action_type = 'DISCOUNT_APPLIED' ORDER BY server_seq DESC LIMIT 1`))
+      .toBe(`7→6 ${original.id}`);
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE id = '${original.id}'`)).toBe('0');
+    payCash(order!.id);
+    await expectSynced('pagamento com o desconto reautorizado');
+    expect(sql(`SELECT status || ' ' || discount_amount || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 6.00 0.00');
   });
 
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {

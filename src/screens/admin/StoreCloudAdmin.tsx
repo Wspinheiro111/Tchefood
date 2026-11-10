@@ -1,7 +1,7 @@
 /** Etapa 0 — Loja (dados, permissões, loja nova) e Nuvem (login do aparelho e envio da fila). */
 import { useEffect, useState } from 'react';
 import { Cloud, CloudDownload, CloudOff, RefreshCw, Store, Users } from 'lucide-react';
-import { selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
+import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
 import type { Permission, SyncEvent, UserRole } from '../../types';
 import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../lib/permissions';
 import { ROLE_LABEL } from '../../lib/catalog';
@@ -446,21 +446,45 @@ function needsManagerPin(e: SyncEvent): boolean {
 function AdoptCloudDiscount({ eventId, value }: { eventId: string; value: number }) {
   const adopt = useTcheStore((s) => s.adoptCloudDiscount);
   const online = useOnline();
+  const [askManager, setAskManager] = useState(false);
+  const brl = value.toFixed(2).replace('.', ',');
+  const done = () => {
+    toast.success(`Desconto da nuvem (R$ ${brl}) aplicado nesta conta.`);
+    void syncOnce();
+  };
   return (
     <div className="mt-1">
       <Btn
         disabled={!online}
         onClick={() => {
           const r = adopt(eventId);
-          if (!r.ok) toast.error(r.error);
-          else {
-            toast.success(`Desconto da nuvem (R$ ${value.toFixed(2).replace('.', ',')}) aplicado nesta conta.`);
-            void syncOnce();
-          }
+          // Troca de desconto com PIN ainda na fila desta conta: o gerente confirma de novo.
+          if (!r.ok && r.error === ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER) setAskManager(true);
+          else if (!r.ok) toast.error(r.error);
+          else done();
         }}
       >
-        Usar o desconto da nuvem (R$ {value.toFixed(2).replace('.', ',')})
+        Usar o desconto da nuvem (R$ {brl})
       </Btn>
+      <ManagerAuthSheet
+        open={askManager}
+        onClose={() => setAskManager(false)}
+        title="Confirmar a troca de desconto de novo"
+        summary={
+          <>
+            A conta tem na nuvem <b>R$ {brl}</b> de desconto. A troca de desconto feita aqui sem internet foi autorizada a
+            partir do desconto antigo deste aparelho: confirme com o PIN para registrar a troca a partir do desconto da nuvem.
+          </>
+        }
+        confirmLabel="Confirmar com o PIN do gerente"
+        quickReasons={['Desconto revisto com a nuvem', 'Conta mudou em outro aparelho']}
+        successMessage="Troca de desconto autorizada de novo e registrada na auditoria."
+        onSubmit={(managerPin, reason) => adopt(eventId, { managerPin, reason })}
+        onSuccess={() => {
+          setAskManager(false);
+          done();
+        }}
+      />
     </div>
   );
 }

@@ -134,6 +134,10 @@ export const RECEIPT_CARD_BRANDS: ReadonlyArray<string> = ['VISA', 'MASTERCARD',
 /** Início da mensagem do Cardápio QR quando o preço do carrinho ficou diferente do atual. */
 export const QR_PRICE_CHANGED = 'Preço atualizado:';
 
+/** adoptCloudDiscount sem PIN, com troca de desconto autorizada na fila da conta. */
+export const ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER =
+  'Esta conta tem troca de desconto com PIN de gerente ainda na fila. Com o desconto da nuvem, a troca muda de valor: o gerente confirma de novo com o PIN.';
+
 const MANAGER_ROLES: ReadonlyArray<StaffUser['role']> = ['MANAGER', 'OWNER'];
 
 export interface ManagerAuthInput {
@@ -510,8 +514,10 @@ interface Actions {
   /**
    * Conta recusada pela nuvem porque o desconto dela lá é outro (outro aparelho ou o
    * cashback mudou a conta): adota o desconto da nuvem neste aparelho e reenvia a conta.
+   * Com troca de desconto autorizada ainda na fila desta conta, o gerente confirma de novo
+   * com o PIN (auth): a autorização da fila descreve a troca a partir do desconto velho.
    */
-  adoptCloudDiscount: (eventId: UUID) => ActionResult<number>;
+  adoptCloudDiscount: (eventId: UUID, auth?: ManagerAuthInput) => ActionResult<number>;
 
   // Caixa
   /** Abre o caixa com o fundo de troco. Um caixa aberto por loja. */
@@ -968,6 +974,7 @@ export const useTcheStore = create<TcheState>()(
       /** A nuvem recusou a conta por ter outro desconto lá (outro aparelho ou o cashback). */
       const cloudDiscountConflict = (orderId: UUID): boolean =>
         (get().syncRejected ?? []).some((r) => r.event.table === 'orders' && r.event.row_id === orderId && cloudDiscountOf(r.message) !== null);
+      const CLOUD_DISCOUNT_NEEDS_MANAGER = ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER;
       const CLOUD_DISCOUNT_CONFLICT = 'A nuvem tem outro desconto para esta conta (outro aparelho ou o cashback mudou). Em Retaguarda › Nuvem, use o desconto da nuvem antes de cobrar.';
 
       /**
@@ -3697,7 +3704,7 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: undefined };
         },
 
-        adoptCloudDiscount: (eventId) => {
+        adoptCloudDiscount: (eventId, auth) => {
           const rejected = (get().syncRejected ?? []).find((r) => r.event.id === eventId);
           if (!rejected || rejected.event.table !== 'orders') return fail('Conta recusada não encontrada.');
           const cloud = cloudDiscountOf(rejected.message);
@@ -3724,15 +3731,73 @@ export const useTcheStore = create<TcheState>()(
             prevNew = cents;
             return cents;
           };
-          const outbox = get().outbox.map((e): SyncEvent => {
-            if (e.table !== 'orders' || e.row_id !== orderId || typeof e.payload.discount_amount !== 'number') return e;
+          // P1-01 da rodada 5 do GPT: troca de desconto autorizada que ficou na fila atrás da
+          // recusa. A autorização dela descreve a troca a partir do desconto velho deste
+          // aparelho; mudar os valores dela em silêncio reusaria o PIN do gerente para outra
+          // troca. O gerente confirma de novo com o PIN: cada troca da fila vira uma
+          // autorização nova, do desconto refeito até o valor que o gerente digitou (o desconto
+          // manual é o valor final, não uma diferença). A autorização original fica no
+          // histórico deste aparelho, e a nova aponta para ela (replaces_audit_id).
+          const queuedAuths = get().outbox.filter(
+            (e) => e.table === 'audit_logs' && e.payload.order_id === orderId && e.payload.action_type === 'DISCOUNT_APPLIED',
+          );
+          let manager: StaffUser | null = null;
+          if (queuedAuths.length > 0) {
+            if (!auth) return fail(CLOUD_DISCOUNT_NEEDS_MANAGER);
+            const authRes = authorizeManager(auth, { orderId, action: 'DISCOUNT_APPLIED' });
+            if (!authRes.ok) return authRes;
+            manager = authRes.data;
+          }
+          const user = currentUser();
+          if (manager && !user) return fail('Sessão expirada. Faça login novamente.');
+          const reauthorized: AuditLog[] = [];
+          let manualTarget: number | null = null;
+          const outbox = get().outbox.flatMap((e): SyncEvent[] => {
+            if (manager && queuedAuths.includes(e)) {
+              const original = e.payload as unknown as AuditLog;
+              const after = toCents(Number(original.metadata?.discount_after));
+              manualTarget = after;
+              // A nuvem já tem esse desconto: não há troca a autorizar.
+              if (after === prevNew) return [];
+              const log = buildAudit({
+                order_id: orderId,
+                performed_by_user_id: user!.id,
+                authorized_by_manager_id: manager.id,
+                action_type: 'DISCOUNT_APPLIED',
+                amount_impact: (prevNew - after) / 100,
+                reason: auth!.reason.trim(),
+                metadata: {
+                  ...(original.metadata ?? {}),
+                  discount_before: prevNew / 100,
+                  discount_after: after / 100,
+                  replaces_audit_id: original.id,
+                  original_discount_before: original.metadata?.discount_before ?? null,
+                  original_discount_after: original.metadata?.discount_after ?? null,
+                  waiter_name: user!.name,
+                  manager_name: manager.name,
+                },
+              });
+              reauthorized.push(log);
+              return [managerAuthEvent(log, auth!.managerPin)];
+            }
+            if (e.table !== 'orders' || e.row_id !== orderId || typeof e.payload.discount_amount !== 'number') return [e];
             const p = e.payload as Partial<Order>;
             const gross =
               typeof p.subtotal_items === 'number' && typeof p.service_fee_amount === 'number'
                 ? toCents(p.subtotal_items) + toCents(p.service_fee_amount)
                 : null;
-            const cents = rebase(toCents(p.discount_amount!), gross);
-            return { ...e, payload: { ...e.payload, discount_amount: cents / 100 } };
+            const own = toCents(p.discount_amount!);
+            let cents: number;
+            if (manualTarget !== null && own === manualTarget) {
+              // A versão da conta que leva o desconto que o gerente digitou: vale o valor dele.
+              cents = gross !== null ? Math.min(own, gross) : own;
+              prevOwn = own;
+              prevNew = cents;
+              manualTarget = null;
+            } else {
+              cents = rebase(own, gross);
+            }
+            return [{ ...e, payload: { ...e.payload, discount_amount: cents / 100 } }];
           });
           const localCents = rebase(toCents(order.discount_amount), toCents(order.subtotal_items) + toCents(order.service_fee_amount));
           const recalculated = applyOrderTotals({ ...order, discount_amount: localCents / 100 }, get().orderItems, get().payments);
@@ -3751,6 +3816,7 @@ export const useTcheStore = create<TcheState>()(
             orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
             outbox: [{ ...rejected.event, payload: { ...rejected.event.payload, discount_amount: cloud } }, ...outbox],
             syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
+            ...(reauthorized.length ? { auditLogs: [...[...reauthorized].reverse(), ...s.auditLogs] } : {}),
           }));
           return { ok: true, data: cloud };
         },
