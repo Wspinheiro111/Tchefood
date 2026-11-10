@@ -890,6 +890,24 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(wrong.status).toBeGreaterThanOrEqual(400);
   });
 
+  it('avaliação: só de conta paga, uma por conta, somente inserção', async () => {
+    login(CASHIER_PIN);
+    const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
+    const order = ok(st().createPickupOrder({ lines: [line], fulfillment: 'TAKEOUT', customerName: 'Ana' }));
+    payCash(order.id);
+    const review = ok(st().addReview(order.id, 4, 'Muito bom', 'COUNTER'));
+    await expectSynced('avaliação');
+    expect(sql(`SELECT score || ' ' || comment FROM reviews WHERE order_id = '${order.id}'`)).toBe('4 Muito bom');
+    expect((await raw('POST', 'reviews?on_conflict=id', review, 'resolution=ignore-duplicates,return=minimal')).status).toBeLessThan(300);
+    expect((await raw('PATCH', `reviews?id=eq.${review.id}`, { score: 5 })).status).toBeGreaterThanOrEqual(400);
+    const open = ok(st().createPickupOrder({ lines: [line], fulfillment: 'TAKEOUT', customerName: 'Bia' }));
+    await expectSynced('senha aberta');
+    const forged = await raw('POST', 'reviews', { ...review, id: crypto.randomUUID(), order_id: open.id });
+    expect(forged.status).toBeGreaterThanOrEqual(400);
+    const second = await raw('POST', 'reviews', { ...review, id: crypto.randomUUID(), score: 1 });
+    expect(second.status).toBeGreaterThanOrEqual(400);
+  });
+
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
     const dir = join(ROOT, 'supabase', 'migrations');
     for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) psqlFile(target!, join(dir, f), DB);

@@ -614,6 +614,20 @@ export interface OwnDelivery {
 }
 
 /** Acerto com o entregador: dinheiro que ele trouxe e o que ele ganhou. */
+/** Onde o cliente deu a nota: na mesa (garçom), no balcão (Ficha Rápida / caixa). */
+export type ReviewSource = 'TABLE' | 'COUNTER';
+
+/** Avaliação do cliente (nota 1 a 5) depois de pagar. Somente inserção (db/schema_avaliacoes.sql). */
+export interface Review {
+  id: UUID;
+  tenant_id: UUID;
+  order_id: UUID;
+  score: 1 | 2 | 3 | 4 | 5;
+  comment: string | null;
+  source: ReviewSource;
+  created_at: ISODateTime;
+}
+
 export interface CourierSettlement {
   id: UUID;
   tenant_id: UUID;
@@ -753,7 +767,9 @@ export interface SyncEvent {
     | 'delivery_zones'
     | 'couriers'
     | 'own_deliveries'
-    | 'courier_settlements';
+    | 'courier_settlements'
+    // Avaliações (db/schema_avaliacoes.sql)
+    | 'reviews';
   /** DELETE só para linhas sem valor financeiro (vínculos e opções de adicional). */
   op: 'INSERT' | 'UPDATE' | 'DELETE';
   row_id: UUID;

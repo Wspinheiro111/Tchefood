@@ -25,6 +25,7 @@ import {
 } from '../lib/ownerDashboard';
 import { cashOutsideSessions } from '../lib/cashRegister';
 import { leftover, type LeftoverReport } from '../lib/cardFees';
+import { reviewSummary, type ReviewSummary } from '../lib/reviews';
 import { ownerAlerts, type AlertTarget, type OwnerAlert } from '../lib/ownerAlerts';
 import { Btn, Sheet, toast } from '../components/ui';
 
@@ -58,6 +59,7 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
   const staff = useTcheStore((s) => s.staff);
   const kegTaps = useTcheStore((s) => s.kegTaps);
   const cashSessions = useTcheStore((s) => s.cashSessions);
+  const reviews = useTcheStore((s) => s.reviews);
   const cloud = useTcheStore((s) => s.cloud);
   const outbox = useTcheStore((s) => s.outbox.length);
   const rejected = useTcheStore((s) => s.syncRejected.length);
@@ -96,6 +98,7 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
   const feeRules = useOwnerSettings((s) => s.feeRules);
   const appCommissionPct = useOwnerSettings((s) => s.appCommissionPct);
   const left = useMemo(() => leftover(ix, range, feeRules, appCommissionPct), [ix, range, feeRules, appCommissionPct]);
+  const rating = useMemo(() => reviewSummary(reviews, range), [reviews, range]);
 
   const alerts = useMemo(
     () =>
@@ -193,8 +196,13 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
             <Stat value={String(ret.customers)} label="clientes identificados no período" />
             <Stat value={String(ret.lapsed)} label={`sumidos há ${LAPSED_DAYS}+ dias`} tone={ret.lapsed > 0 ? 'text-rose-600' : undefined} />
           </div>
-          <p className="mt-3 border-t border-slate-200 pt-2 text-xs text-slate-500">Conta os clientes que deram o WhatsApp no cashback. Quanto mais clientes identificados, mais certo o número.</p>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 pt-2 text-xs text-slate-500">
+            <span>Conta os clientes que deram o WhatsApp no cashback. Quanto mais clientes identificados, mais certo o número.</span>
+            {ret.lapsed > 0 && <Btn variant="gold" className="!min-h-0 py-1.5 text-sm" onClick={() => onNavigate('crm')}>Chamar de volta</Btn>}
+          </div>
         </Card>
+
+        <RatingCard r={rating} badge={PERIOD_LABEL[period]} />
 
         <Card title="Quanto cancelei?" badge={PERIOD_LABEL[period]}>
           {cancel.itemsCanceled === 0 && cancel.discounts === 0 && cancel.ordersCanceled === 0 && cancel.serviceFeeRemoved === 0 ? (
@@ -316,6 +324,48 @@ function LeftoverCard({ r, badge, onSetup }: { r: LeftoverReport; badge: string;
         <span>Antes de aluguel, salários e outras despesas fixas.</span>
         <Btn variant={missing ? 'gold' : 'ghost'} className="!min-h-0 py-1.5 text-sm" onClick={onSetup}>{missing ? 'Cadastrar taxas' : 'Taxas e recebíveis'}</Btn>
       </div>
+    </Card>
+  );
+}
+
+/** "O que os clientes acharam?": notas de 1 a 5 dadas depois de pagar. */
+function RatingCard({ r, badge }: { r: ReviewSummary; badge: string }) {
+  return (
+    <Card title="O que os clientes acharam?" badge={badge}>
+      {r.count === 0 ? (
+        <Empty>Nenhuma avaliação no período. O cliente dá a nota na tela de conta encerrada.</Empty>
+      ) : (
+        <>
+          <div className="grid grid-cols-[auto_1fr] items-center gap-4">
+            <div className="text-center">
+              <div className={`text-4xl font-black tabular-nums ${r.average !== null && r.average < 4 ? 'text-rose-600' : 'text-verde'}`}>{r.average?.toFixed(1).replace('.', ',')}</div>
+              <div className="text-xs text-slate-500">{r.count} nota(s)</div>
+            </div>
+            <ul className="space-y-0.5 text-xs" aria-label="Notas por estrela">
+              {[5, 4, 3, 2, 1].map((n) => {
+                const qty = r.distribution[n - 1] ?? 0;
+                return (
+                  <li key={n} className="grid grid-cols-[1.5rem_1fr_2rem] items-center gap-2">
+                    <span className="font-bold">{n}★</span>
+                    <Bar pct={(qty / r.count) * 100} tone={n >= 4 ? 'bg-verde' : n === 3 ? 'bg-amarelo' : 'bg-brasa'} />
+                    <span className="text-right tabular-nums">{qty}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+          {r.complaints.length > 0 && (
+            <div className="mt-3 border-t border-slate-200 pt-2">
+              <div className="mb-1 text-xs font-black uppercase text-slate-500">O que reclamaram</div>
+              <ul className="space-y-1 text-sm">
+                {r.complaints.map((c) => (
+                  <li key={c.id}><b>{c.score}★</b> “{c.comment}” <span className="text-xs text-slate-500">{new Date(c.created_at).toLocaleDateString('pt-BR')}</span></li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </>
+      )}
     </Card>
   );
 }

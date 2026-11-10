@@ -12,6 +12,7 @@ import { formatTicketToken, ticketPrint } from '../lib/eventTickets';
 import { ProductSheet, type ProductDraft } from '../components/ProductSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
+import { ReviewCapture } from '../components/ReviewCapture';
 import { CashbackCapture } from '../components/CashbackPanel';
 import { Badge, Btn, toast } from '../components/ui';
 import { CategoryIcon } from './OrderScreen';
@@ -280,6 +281,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
           <Btn size="lg" variant="success" onClick={onDone}>Nova venda</Btn>
         </div>
         <CashbackCapture orderId={orderId} />
+        <ReviewCapture orderId={orderId} source="COUNTER" />
       </div>
     );
   }
