@@ -3729,6 +3729,14 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(recalculated.total_amount) < toCents(order.paid_amount)) {
             return fail('Com o desconto da nuvem a conta fica abaixo do já pago neste aparelho. Chame o gerente para conferir os pagamentos.');
           }
+          // Conta fechada aqui sem internet com o desconto deste aparelho: com o desconto menor
+          // da nuvem ficaria fechada com saldo (não dá para cobrar a diferença, e o banco não
+          // aceita fechar com saldo). Não adota: o gerente confere com o cliente.
+          if (order.status === 'CLOSED' && toCents(recalculated.remaining_balance) > 0) {
+            return fail(
+              `Esta conta já foi fechada neste aparelho com o desconto daqui. Com o desconto da nuvem ficariam faltando ${formatBRL(recalculated.remaining_balance)}, que não foram cobrados. O desconto da nuvem não é adotado: a conta segue nos recusados para o gerente conferir com o cliente.`,
+            );
+          }
           set((s) => ({
             orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
             outbox: [{ ...rejected.event, payload: { ...rejected.event.payload, discount_amount: cloud } }, ...outbox],

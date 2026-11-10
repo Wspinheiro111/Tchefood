@@ -909,6 +909,43 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     closeCashbackOrders([order.id]);
   });
 
+  it('conta fechada sem internet com o desconto daqui: o desconto menor da nuvem não é adotado', async () => {
+    // Achado do Codex em 8f543cb: aparelho com R$ 7 de cashback fecha a conta sem internet;
+    // a nuvem tem R$ 5. Adotar deixaria a conta fechada com R$ 2 de saldo, que o aparelho não
+    // cobra e o banco não aceita fechar.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [order] = await cashbackOrders(1, 56);
+    const phone = '5553988119056';
+    const c = cashbackCustomer(phone, [{ amount: 7, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 7, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 7, remaining_amount: 7 }],
+    });
+    expect(ok(st().redeemCashback(order!.id, phone)).amount).toBe(7);
+    await expectSynced('resgate de R$ 7');
+    sql(`UPDATE orders SET discount_amount = 5 WHERE id = '${order!.id}';`);
+    // Sem internet: vai para o pagamento, recebe e fecha com o desconto daqui.
+    ok(st().startCheckout(order!.id));
+    payCash(order!.id);
+    const closed = st().orders.find((o) => o.id === order!.id)!;
+    expect(closed.status).toBe('CLOSED');
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 5.00');
+    const adopted = st().adoptCloudDiscount(conflict.event.id);
+    expect(adopted.ok).toBe(false);
+    if (!adopted.ok) expect(adopted.error).toContain('já foi fechada neste aparelho');
+    const after = st().orders.find((o) => o.id === order!.id)!;
+    expect([after.status, after.discount_amount, after.remaining_balance]).toEqual(['CLOSED', 7, 0]);
+    expect(st().syncRejected.some((r) => r.event.id === conflict.event.id)).toBe(true);
+    // Limpa o caso para os testes seguintes (na loja, o gerente confere com o cliente).
+    useTcheStore.setState({ outbox: [], syncRejected: st().syncRejected.filter((r) => r.event.id !== conflict.event.id) });
+    closeCashbackOrders([order!.id]);
+  });
+
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
     setCashbackClock('2026-11-12T20:00:00-03:00');
