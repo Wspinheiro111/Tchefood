@@ -1014,6 +1014,63 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT status || ' ' || discount_amount || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 6.00 0.00');
   });
 
+  it('resgate com o estorno de outra conta feito aqui: espera o cancelamento ser aceito, mesmo recusado', async () => {
+    // P1-02 da rodada 5 do GPT: o cancelamento na conta A devolve R$ 10 ao cliente neste
+    // aparelho (espelho do estorno), e a conta B usa esse crédito. Se o cancelamento de A for
+    // recusado, o estorno não existe na nuvem: o resgate de B não pode subir antes.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [a, b] = await cashbackOrders(2, 59);
+    const phone = '5553988119059';
+    const c = cashbackCustomer(phone, [{ amount: 10, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 10, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 10, remaining_amount: 10 }],
+    });
+    expect(ok(st().redeemCashback(a!.id, phone)).amount).toBe(10);
+    await expectSynced('resgate de R$ 10 na conta A');
+    // O PIN do gerente mudou em outro aparelho: o cancelamento de A vai ser recusado.
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active AND pin_code = '${MANAGER_PIN}'`);
+    sql(`UPDATE staff_users SET pin_code = '8462' WHERE id = '${manager}';`);
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === a!.id && i.status !== 'CANCELED')!.id, MANAGER));
+    const refund = st().cashbackLedger.find((e) => e.order_id === a!.id && e.entry_type === 'REFUND')!;
+    expect(refund.amount).toBe(10);
+    // A conta B usa o crédito do estorno (o único do cliente).
+    expect(ok(st().redeemCashback(b!.id, phone)).amount).toBe(10);
+    const redeemB = st().outbox.find((e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.order_id === b!.id)!;
+    expect(redeemB.depends_on_order_ids).toEqual([a!.id]);
+    const rejected = await sync();
+    expect(rejected.map((r) => r.message)).toEqual(['O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).']);
+    // O resgate de B não foi chamado: segue na fila, sem recusa, e nada de B mudou na nuvem.
+    expect(st().outbox.some((e) => e.id === redeemB.id)).toBe(true);
+    expect(st().syncRejected.some((r) => r.event.id === redeemB.id)).toBe(false);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${b!.id}'`)).toBe('0');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${b!.id}'`)).toBe('0.00');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('0.00');
+    // Outra rodada com a recusa guardada (como a sincronização do app): o resgate continua esperando.
+    const cloud = st().cloud!;
+    const again = await flushOutbox(st().outbox, { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000, st().syncRejected.map((r) => r.event));
+    expect([again.sent, again.rejected]).toEqual([[], []]);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${b!.id}'`)).toBe('0');
+    // O PIN volta a conferir e o cancelamento é reenviado: o estorno nasce na nuvem e o
+    // resgate de B sobe depois, com o crédito do estorno.
+    sql(`UPDATE staff_users SET pin_code = '${MANAGER_PIN}' WHERE id = '${manager}';`);
+    st().retryRejectedSync();
+    await expectSynced('cancelamento de A e resgate de B');
+    expect(sql(`SELECT string_agg(entry_type || ' ' || amount || ' ' || remaining_amount, ' | ' ORDER BY created_at) FROM cashback_ledger WHERE order_id IN ('${a!.id}', '${b!.id}') AND entry_type IN ('REFUND', 'REDEEM') AND (order_id = '${b!.id}' OR entry_type = 'REFUND')`))
+      .toBe('REFUND 10.00 0.00 | REDEEM 10.00 0.00');
+    expect(sql(`SELECT (redeem_sources->0->>'source_id') = (SELECT id::text FROM cashback_ledger WHERE order_id = '${a!.id}' AND entry_type = 'REFUND') FROM cashback_ledger WHERE order_id = '${b!.id}' AND entry_type = 'REDEEM'`)).toBe('t');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${b!.id}'`)).toBe('10.00');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('0.00');
+    // A falha de PIN deste teste não conta para o bloqueio dos testes seguintes (60 s).
+    sql(`SET session_replication_role = replica; DELETE FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED' AND order_id = '${a!.id}';`);
+    closeCashbackOrders([a!.id, b!.id]);
+    setCashbackClock(null);
+  });
+
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
     setCashbackClock('2026-11-12T20:00:00-03:00');

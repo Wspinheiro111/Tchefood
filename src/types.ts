@@ -834,6 +834,13 @@ export interface SyncEvent {
    * comanda for recusado, a mesa fica segurada junto e não aparece livre na nuvem.
    */
   depends_on_order_id?: UUID;
+  /**
+   * Outras comandas de que esta mudança depende: o resgate de cashback que usa o estorno
+   * gerado neste aparelho pelo cancelamento (ou retirada dos 10%) de outra comanda espera a
+   * operação daquela comanda ser aceita. Se ela for recusada, o crédito do estorno não existe
+   * na nuvem, e o resgate fica segurado junto (recordKeys). Não vai para o banco.
+   */
+  depends_on_order_ids?: UUID[];
 }
 
 export interface KegChangeSync {

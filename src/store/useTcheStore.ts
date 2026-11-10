@@ -2886,6 +2886,17 @@ export const useTcheStore = create<TcheState>()(
             return fail((e as Error).message);
           }
           const updatedCustomer: LoyaltyCustomer = { ...customer, cashback_balance: balanceCashback(ledger, customer.id, now) };
+          // P1-02 da rodada 5 do GPT: crédito que é estorno de outra comanda (cancelamento ou
+          // retirada dos 10% feitos aqui): o resgate só sobe depois da operação daquela comanda.
+          // Se ela for recusada, o estorno não existe na nuvem e o resgate espera com ela.
+          const refundOrders = [
+            ...new Set(
+              (entry.redeem_sources ?? [])
+                .map((src) => get().cashbackLedger.find((e) => e.id === src.source_id))
+                .filter((e): e is CashbackLedgerEntry => e?.entry_type === 'REFUND' && !!e.order_id && e.order_id !== orderId)
+                .map((e) => e.order_id!),
+            ),
+          ];
           const log: AuditLog = {
             ...buildAudit({
               order_id: orderId,
@@ -2923,7 +2934,12 @@ export const useTcheStore = create<TcheState>()(
               loyaltyCustomers: s.loyaltyCustomers.map((c) => (c.id === customer.id ? updatedCustomer : c)),
               outbox: [
                 ...s.outbox,
-                { ...syncEvent('cashback_ledger', 'INSERT', entry), depends_on_order_id: orderId, cashback_redeem: { audit_id: log.id } },
+                {
+                  ...syncEvent('cashback_ledger', 'INSERT', entry),
+                  depends_on_order_id: orderId,
+                  ...(refundOrders.length ? { depends_on_order_ids: refundOrders } : {}),
+                  cashback_redeem: { audit_id: log.id },
+                },
                 ...orderEvents,
                 { ...syncEvent('loyalty_customers', 'UPDATE', updatedCustomer), depends_on_order_id: orderId },
               ],

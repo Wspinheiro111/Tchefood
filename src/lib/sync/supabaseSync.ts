@@ -426,6 +426,8 @@ export function recordKeys(event: SyncEvent): string[] {
   // Mudança que depende de uma operação da comanda sem apontar para ela no registro:
   // a liberação da mesa no fechamento, o consumo do cashback no resgate.
   order(event.depends_on_order_id);
+  // Resgate que usa estorno de outra comanda: espera a operação que gerou o estorno.
+  for (const id of event.depends_on_order_ids ?? []) order(id);
   return keys;
 }
 
