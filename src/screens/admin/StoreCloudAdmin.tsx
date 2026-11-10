@@ -1,7 +1,7 @@
 /** Etapa 0 — Loja (dados, permissões, loja nova) e Nuvem (login do aparelho e envio da fila). */
 import { useEffect, useState } from 'react';
 import { Cloud, CloudDownload, CloudOff, RefreshCw, Store, Users } from 'lucide-react';
-import { selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
+import { isRejectedItemPrice, selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
 import type { Permission, SyncEvent, UserRole } from '../../types';
 import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../lib/permissions';
 import { ROLE_LABEL } from '../../lib/catalog';
@@ -470,6 +470,45 @@ function RejectedAuthPin({ eventId }: { eventId: string }) {
   );
 }
 
+/** Item recusado por preço diferente do cadastro: o gerente aceita com PIN e motivo. */
+function RejectedItemPrice({ eventId }: { eventId: string }) {
+  const approve = useTcheStore((s) => s.approveRejectedItemPrice);
+  const [pin, setPin] = useState('');
+  const [reason, setReason] = useState('');
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2">
+      <input
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+        placeholder="Motivo (ex.: preço combinado com o cliente)"
+        className="w-56 rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-xs"
+      />
+      <input
+        type="password"
+        inputMode="numeric"
+        maxLength={4}
+        value={pin}
+        onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+        placeholder="PIN do gerente"
+        className="w-28 rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-xs"
+      />
+      <Btn
+        disabled={pin.length !== 4 || reason.trim().length < 5}
+        onClick={() => {
+          const r = approve(eventId, { managerPin: pin, reason });
+          if (r.ok) {
+            toast.success('Preço aceito pelo gerente. O item volta para a fila.');
+            void syncOnce();
+          } else toast.error(r.error);
+          setPin('');
+        }}
+      >
+        Aceitar este preço
+      </Btn>
+    </span>
+  );
+}
+
 function CloudStatus() {
   const cloud = useTcheStore((s) => s.cloud)!;
   const status = useTcheStore((s) => s.syncStatus);
@@ -527,6 +566,7 @@ function CloudStatus() {
               <li key={r.event.id} className="text-slate-700">
                 <b>{r.event.table}</b> {r.event.op} (registro {r.event.row_id.slice(0, 8)}…) · HTTP {r.status}: {r.message}
                 {needsManagerPin(r.event) && <RejectedAuthPin eventId={r.event.id} />}
+                {isRejectedItemPrice(r) && <RejectedItemPrice eventId={r.event.id} />}
               </li>
             ))}
           </ul>

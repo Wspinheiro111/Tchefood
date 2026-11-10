@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
+import { isRejectedItemPrice, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
 import { fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins } from '../../src/lib/sync/cloudPull';
 import { syncOnce } from '../../src/lib/sync/useCloudSync';
@@ -590,7 +590,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`)).toBe('0.00');
   });
 
-  it('dinheiro no servidor: preço de horário e meio a meio conferem; item com preço forjado vira alerta', async () => {
+  it('dinheiro no servidor: preço de horário e meio a meio conferem; item com preço diferente só entra com PIN de gerente', async () => {
     forgetPinFailures();
     login(OWNER_PIN);
     const pizza = (code: string, name: string, price: number) =>
@@ -624,21 +624,64 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(mismatches()).toBe(0);
     expect(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`)).toBe(st().orders.find((o) => o.id === order.id)!.total_amount.toFixed(2));
 
-    // Item gravado direto com preço menor que o do cadastro: entra, e o alerta fica para o gerente.
-    const forged = await raw('POST', 'order_items', {
+    // Item gravado direto com preço menor que o do cadastro: recusado (decisão do Will: só com PIN de gerente).
+    const forgedItem = {
       id: crypto.randomUUID(), order_id: order.id, product_id: calabresa.id, waiter_id: st().currentUserId, quantity: 2, unit_price: 1, modifiers_unit_price: 0,
       sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER', priced_at: new Date().toISOString(),
+    };
+    const forged = await raw('POST', 'order_items', forgedItem);
+    expect(forged.status).toBe(400);
+    expect(forged.body).toContain('preço do cadastro R$ 60.00, o aparelho mandou R$ 1.00');
+    expect(sql(`SELECT count(*) FROM order_items WHERE id = '${forgedItem.id}'`)).toBe('0');
+    expect(mismatches()).toBe(0);
+    const authorize = (item: { id: string; unit_price: number }, pin: string) => raw('POST', 'rpc/tchefood_authorize_manager', {
+      p_order_id: order.id, p_action_type: 'PRICE_OVERRIDE', p_manager_pin: pin, p_performed_by: st().currentUserId,
+      p_reason: 'Preço combinado com o cliente', p_amount_impact: 0,
+      p_metadata: { item_id: item.id, unit_price: item.unit_price, modifiers_unit_price: 0, client_audit_id: crypto.randomUUID() },
     });
-    expect(forged.status).toBe(201);
+    // PIN errado não autoriza; autorização com valor próprio é recusada.
+    await authorize(forgedItem, '0000');
+    expect((await raw('POST', 'order_items', forgedItem)).status).toBe(400);
+    const withImpact = await raw('POST', 'rpc/tchefood_authorize_manager', {
+      p_order_id: order.id, p_action_type: 'PRICE_OVERRIDE', p_manager_pin: MANAGER_PIN, p_performed_by: st().currentUserId,
+      p_reason: 'Preço combinado com o cliente', p_amount_impact: -50, p_metadata: { item_id: forgedItem.id, unit_price: 1, modifiers_unit_price: 0 },
+    });
+    expect(withImpact.body).toContain('sem valor próprio');
+    // Autorização de outro preço não vale para este item.
+    expect((await authorize({ id: forgedItem.id, unit_price: 2 }, MANAGER_PIN)).status).toBe(200);
+    expect((await raw('POST', 'order_items', forgedItem)).status).toBe(400);
+    // Com a autorização do gerente para este item e este preço: entra, e o alerta leva o gerente.
+    expect((await authorize(forgedItem, MANAGER_PIN)).status).toBe(200);
+    expect((await raw('POST', 'order_items', forgedItem)).status).toBe(201);
     expect(mismatches()).toBe(1);
-    expect(sql(`SELECT amount_impact || ' ' || (metadata->>'expected_unit_price') FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}'`)).toBe('118.00 60.00');
-    // Item de fila antiga (sem o instante do preço): o alerta sai como NÃO conferido e sem valor.
-    const legacy = await raw('POST', 'order_items', {
+    expect(sql(`SELECT amount_impact || ' ' || (metadata->>'expected_unit_price') || ' ' || (authorized_by_manager_id IS NOT NULL) FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}'`)).toBe('118.00 60.00 true');
+    // Item de fila antiga (sem o instante do preço): o servidor não confere, então também só com PIN.
+    const legacyItem = {
       id: crypto.randomUUID(), order_id: order.id, product_id: calabresa.id, waiter_id: st().currentUserId, quantity: 1, unit_price: 1, modifiers_unit_price: 0,
       sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER',
-    });
-    expect(legacy.status).toBe(201);
+    };
+    const legacy = await raw('POST', 'order_items', legacyItem);
+    expect(legacy.status).toBe(400);
+    expect(legacy.body).toContain('sem o instante do preço');
+    expect((await authorize(legacyItem, MANAGER_PIN)).status).toBe(200);
+    expect((await raw('POST', 'order_items', legacyItem)).status).toBe(201);
     expect(sql(`SELECT amount_impact || ' ' || (metadata->>'server_verified') FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND order_id = '${order.id}' ORDER BY created_at DESC LIMIT 1`)).toBe('0.00 false');
+
+    // Pelo app: preço trocado em outro aparelho (este ainda tem o antigo). O item é recusado,
+    // o gerente aceita com PIN em Nuvem › recusados, e a autorização sobe antes do item.
+    sql(`UPDATE products SET price = 61 WHERE id = '${marguerita.id}'`);
+    ok(st().addToTray({ order_id: order.id, product_id: marguerita.id, half_product_ids: [], quantity: 1, unit_price: 55.15, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: marguerita.sector }));
+    const staleItem = ok(st().dispatchTray(order.id)).items[0]!;
+    await sync();
+    const rejected = st().syncRejected.find((r) => r.event.row_id === staleItem.id)!;
+    expect(rejected.message).toContain('TCHEFOOD_PRECO');
+    expect(isRejectedItemPrice(rejected)).toBe(true);
+    expect(st().approveRejectedItemPrice(rejected.event.id, { managerPin: '9999', reason: 'Preço antigo da casa' }).ok).toBe(false);
+    ok(st().approveRejectedItemPrice(rejected.event.id, { managerPin: MANAGER_PIN, reason: 'Preço antigo da casa' }));
+    await expectSynced('item com preço aceito pelo gerente');
+    expect(sql(`SELECT unit_price FROM order_items WHERE id = '${staleItem.id}'`)).toBe('55.15');
+    expect(sql(`SELECT reason FROM audit_logs WHERE action_type = 'PRICE_OVERRIDE' AND metadata->>'item_id' = '${staleItem.id}' AND authorized_by_manager_id IS NOT NULL`)).toBe('Preço antigo da casa');
+    sql(`UPDATE products SET price = 55.15 WHERE id = '${marguerita.id}'`);
   });
 
   it('dinheiro no servidor: pagamento só pela função, com saldo, NSU e caixa conferidos; conta só fecha zerada', async () => {

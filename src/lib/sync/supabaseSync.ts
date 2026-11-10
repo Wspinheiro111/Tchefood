@@ -63,6 +63,7 @@ export const RPC_AUTHORIZED_ACTIONS: ReadonlyArray<string> = [
   'DISCOUNT_APPLIED',
   'CHARGE_CONFIRMED_MANUALLY',
   'KIOSK_EXIT',
+  'PRICE_OVERRIDE',
   // Só a fila gravada antes de a troca de barril subir por tchefood_change_keg.
   'KEG_CHANGED',
   // Caixa (db/schema_caixa.sql): sangria e fechamento com diferença.
