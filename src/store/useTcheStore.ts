@@ -3768,7 +3768,58 @@ export const useTcheStore = create<TcheState>()(
           if (manager && !user) return fail('Sessão expirada. Faça login novamente.');
           const reauthorized: AuditLog[] = [];
           let manualTarget: number | null = null;
+          // Achado do Codex em f793339: resgate de cashback na fila atrás da recusa. O banco
+          // calcula o valor com a conta dele (teto de 50% do total com o desconto da nuvem) e
+          // recusa outro valor; o resgate é refeito com a conta refeita até ali, e a baixa dos
+          // créditos deste aparelho acompanha. As versões seguintes da conta levam o valor novo.
+          const rejectedPayload = rejected.event.payload as Partial<Order>;
+          const own0 = toCents(Number(rejectedPayload.discount_amount ?? order.discount_amount));
+          let lastTotal: number | null =
+            typeof rejectedPayload.total_amount === 'number' ? toCents(rejectedPayload.total_amount) + own0 - toCents(cloud) : null;
+          let lastRemaining: number | null =
+            typeof rejectedPayload.remaining_balance === 'number' ? toCents(rejectedPayload.remaining_balance) + own0 - toCents(cloud) : null;
+          let ledger = get().cashbackLedger;
+          const redeemFixes: { auditId: UUID; amount: number; before: number }[] = [];
+          let redeemError: string | null = null;
+          const now = new Date();
           const outbox = get().outbox.flatMap((e): SyncEvent[] => {
+            if (e.table === 'cashback_ledger' && e.op === 'INSERT' && e.cashback_redeem && !e.cashback_redeem.legacy_predebited && e.payload.order_id === orderId) {
+              const entry = (ledger.find((x) => x.id === e.row_id) ?? e.payload) as CashbackLedgerEntry;
+              const old = toCents(Number(entry.amount));
+              if (lastTotal === null || lastRemaining === null) {
+                redeemError = 'Esta conta tem resgate de cashback na fila e a conta recusada não traz o total. Chame o suporte.';
+                return [e];
+              }
+              const sources = entry.redeem_sources ?? [];
+              const reverted = ledger
+                .filter((x) => x.id !== entry.id)
+                .map((x) => {
+                  const back = sources.filter((src) => src.source_id === x.id).reduce((sum, src) => sum + toCents(src.amount), 0);
+                  return back ? { ...x, remaining_amount: (toCents(x.remaining_amount) + back) / 100 } : x;
+                });
+              const amount = cashbackUsable(availableCashback(reverted, entry.customer_id, now), {
+                total_amount: lastTotal / 100,
+                remaining_balance: lastRemaining / 100,
+              });
+              const cents = toCents(amount);
+              if (cents === old) return [e];
+              if (cents <= 0) {
+                redeemError = 'Com o desconto da nuvem esta conta não tem mais espaço para o cashback resgatado aqui. O desconto da nuvem não é adotado: chame o gerente para conferir a conta com o cliente.';
+                return [e];
+              }
+              let fixed: CashbackLedgerEntry;
+              try {
+                fixed = { ...entry, amount, redeem_sources: cashbackFifoSources(reverted, entry.customer_id, amount, now) };
+                ledger = [...consumeCashbackFifo(reverted, entry.customer_id, amount, now), fixed];
+              } catch (err) {
+                redeemError = (err as Error).message;
+                return [e];
+              }
+              redeemFixes.push({ auditId: e.cashback_redeem.audit_id, amount: cents, before: prevNew });
+              // A versão seguinte da conta leva o resgate antigo no desconto: vale o novo.
+              prevOwn += old - cents;
+              return [{ ...e, payload: { ...e.payload, amount, redeem_sources: fixed.redeem_sources } }];
+            }
             if (manager && queuedAuths.includes(e)) {
               const original = e.payload as unknown as AuditLog;
               const after = toCents(Number(original.metadata?.discount_after));
@@ -3813,8 +3864,11 @@ export const useTcheStore = create<TcheState>()(
             } else {
               cents = rebase(own, gross);
             }
+            if (typeof p.total_amount === 'number') lastTotal = toCents(p.total_amount) + own - cents;
+            if (typeof p.remaining_balance === 'number') lastRemaining = toCents(p.remaining_balance) + own - cents;
             return [{ ...e, payload: { ...e.payload, discount_amount: cents / 100 } }];
           });
+          if (redeemError) return fail(redeemError);
           const localCents = rebase(toCents(order.discount_amount), toCents(order.subtotal_items) + toCents(order.service_fee_amount));
           const recalculated = applyOrderTotals({ ...order, discount_amount: localCents / 100 }, get().orderItems, get().payments);
           if (toCents(recalculated.total_amount) < toCents(order.paid_amount)) {
@@ -3832,7 +3886,38 @@ export const useTcheStore = create<TcheState>()(
             orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
             outbox: [{ ...rejected.event, payload: { ...rejected.event.payload, discount_amount: cloud } }, ...outbox],
             syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
-            ...(reauthorized.length ? { auditLogs: [...[...reauthorized].reverse(), ...s.auditLogs] } : {}),
+            ...(reauthorized.length || redeemFixes.length
+              ? {
+                  auditLogs: [
+                    ...[...reauthorized].reverse(),
+                    ...s.auditLogs.map((l) => {
+                      const fix = redeemFixes.find((f) => f.auditId === l.id);
+                      if (!fix) return l;
+                      return {
+                        ...l,
+                        amount_impact: -fix.amount / 100,
+                        metadata: {
+                          ...(l.metadata ?? {}),
+                          amount: fix.amount / 100,
+                          discount_before: fix.before / 100,
+                          discount_after: (fix.before + fix.amount) / 100,
+                          amount_before_cloud_discount: l.metadata?.amount ?? null,
+                        },
+                      };
+                    }),
+                  ],
+                }
+              : {}),
+            ...(redeemFixes.length
+              ? {
+                  cashbackLedger: ledger,
+                  loyaltyCustomers: s.loyaltyCustomers.map((c) =>
+                    ledger.some((x) => x.customer_id === c.id && x.order_id === orderId && x.entry_type === 'REDEEM')
+                      ? { ...c, cashback_balance: balanceCashback(ledger, c.id, now) }
+                      : c,
+                  ),
+                }
+              : {}),
           }));
           return { ok: true, data: cloud };
         },

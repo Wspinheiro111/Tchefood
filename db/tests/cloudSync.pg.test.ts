@@ -1014,6 +1014,51 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT status || ' ' || discount_amount || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 6.00 0.00');
   });
 
+  it('resgate de cashback na fila atrás da recusa: adotar o desconto da nuvem refaz o valor do resgate', async () => {
+    // Achado do Codex em f793339: desconto 5 aqui e 7 na nuvem; o resgate feito aqui antes de
+    // a recusa aparecer pedia 50% da conta com desconto 5, e o banco (que calcula com 7)
+    // recusava o valor depois de adotar o desconto da nuvem.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [order] = await cashbackOrders(1, 61);
+    login(CASHIER_PIN);
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    await expectSynced('desconto de R$ 5');
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    const phone = '5553988119061';
+    const c = cashbackCustomer(phone, [{ amount: 200, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 200, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 200, remaining_amount: 200 }],
+    });
+    // Sem internet: tira os 10% (a conta sobe com desconto 5 e vai ser recusada) e resgata.
+    ok(st().removeServiceFee(order!.id, MANAGER));
+    const gross = Math.round(st().orders.find((o) => o.id === order!.id)!.subtotal_items * 100);
+    const redeemed = ok(st().redeemCashback(order!.id, phone)).amount;
+    expect(redeemed).toBe(Math.round((gross - 500) / 2) / 100);
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 7.00');
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order!.id}'`)).toBe('0');
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
+    const amount = Math.round((gross - 700) / 2) / 100;
+    expect(st().cashbackLedger.find((e) => e.order_id === order!.id && e.entry_type === 'REDEEM')!.amount).toBe(amount);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(Math.round((200 - amount) * 100) / 100);
+    await expectSynced('conta com o desconto da nuvem e o resgate refeito');
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    expect(local.discount_amount).toBe(Math.round((7 + amount) * 100) / 100);
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order!.id}'`)).toBe(`${local.discount_amount.toFixed(2)} ${local.total_amount.toFixed(2)}`);
+    expect(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${order!.id}' AND entry_type = 'REDEEM'`)).toBe(amount.toFixed(2));
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe((200 - amount).toFixed(2));
+    closeCashbackOrders([order!.id]);
+    setCashbackClock(null);
+  });
+
   it('resgate com o estorno de outra conta feito aqui: espera o cancelamento ser aceito, mesmo recusado', async () => {
     // P1-02 da rodada 5 do GPT: o cancelamento na conta A devolve R$ 10 ao cliente neste
     // aparelho (espelho do estorno), e a conta B usa esse crédito. Se o cancelamento de A for
