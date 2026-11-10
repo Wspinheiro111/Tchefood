@@ -21,7 +21,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -43,6 +43,7 @@ describe('supabase/migrations', () => {
     expect(idx('schema_caixa.sql')).toBeGreaterThan(idx('schema_ar.sql'));
     // A entrega aponta para a sangria do caixa (cash_movements).
     expect(idx('schema_entrega.sql')).toBeGreaterThan(idx('schema_caixa.sql'));
+    expect(idx('schema_avaliacoes.sql')).toBeGreaterThan(idx('schema_entrega.sql'));
   });
 
   it('permissões padrão do banco iguais às do app (src/lib/permissions.ts)', async () => {

@@ -9,6 +9,7 @@ import { uuid } from '../lib/ids';
 import { clearReviewHold, getReviewHold, setReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
 import { Btn, Stepper, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
+import { ReviewCapture } from '../components/ReviewCapture';
 import { CashbackCapture, CashbackRedeem } from '../components/CashbackPanel';
 import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
 
@@ -336,6 +337,7 @@ function ClosedView({ orderId, label, total, onDone }: { orderId: string; label:
       <p className="mb-6 text-sm text-slate-500">Mesa liberada no mapa e NFC-e modelo 65 gerada (tpIntegra = 1).</p>
       <div className="grid w-full gap-2">
         <CashbackCapture orderId={orderId} />
+        <ReviewCapture orderId={orderId} source="TABLE" />
         <Btn variant="gold" size="lg" onClick={() => setShowNfce(true)}>Ver NFC-e / Imprimir DANFE</Btn>
         <Btn size="lg" onClick={onDone}>Voltar ao mapa de mesas</Btn>
       </div>

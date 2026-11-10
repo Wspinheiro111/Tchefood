@@ -11,6 +11,7 @@ import type {
   CashSession,
   Courier,
   CourierSettlement,
+  Review,
   DeliveryZone,
   OwnDelivery,
   Category,
@@ -685,6 +686,37 @@ const zone = (key: string, name: string, fee: number, eta: number): DeliveryZone
 export const SEED_DELIVERY_ZONES: DeliveryZone[] = [zone('centro', 'Centro', 5, 30), zone('pippi', 'Pippi', 7, 40), zone('sao-carlos', 'São Carlos', 8, 45)];
 export const SEED_COURIERS: Courier[] = [{ id: seedId('entregador:juca'), tenant_id: T, name: 'Juca (moto)', phone: '55999990000', fee_per_delivery: 6, active: true }];
 
+/**
+ * Clientes do cashback da demonstração: três sumidos (40, 55 e 90 dias sem comprar)
+ * e uma cliente que veio na semana, para a tela "Clientes sumidos" ter o que mostrar.
+ */
+const DEMO_CUSTOMERS = (() => {
+  const DAY = 24 * 60;
+  const people: Array<[string, string, string, boolean, number[]]> = [
+    ['cli:carla', 'Carla Menezes', '5555991112233', true, [40, 70, 110]],
+    ['cli:rafael', 'Rafael Dutra', '5555992223344', true, [55, 85]],
+    ['cli:sonia', 'Sônia Prates', '5555993334455', false, [90]],
+    ['cli:bianca', 'Bianca Lopes', '5555994445566', true, [3, 20]],
+  ];
+  const customers: LoyaltyCustomer[] = [];
+  const ledger: CashbackLedgerEntry[] = [];
+  for (const [key, name, phone, optIn, daysAgo] of people) {
+    const id = seedId(key);
+    const spentEach = 180;
+    customers.push({
+      id, tenant_id: T, name, phone_whatsapp: phone, cpf: null, whatsapp_opt_in: optIn, opt_in_at: optIn ? minutesAgoISO(Math.max(...daysAgo) * DAY) : null,
+      cashback_balance: 0, total_spent: spentEach * daysAgo.length, visits_count: daysAgo.length, last_visit_at: minutesAgoISO(Math.min(...daysAgo) * DAY), created_at: minutesAgoISO(Math.max(...daysAgo) * DAY),
+    });
+    for (const d of daysAgo) {
+      ledger.push({
+        id: seedId(`${key}:earn:${d}`), tenant_id: T, customer_id: id, order_id: null, entry_type: 'EARN', amount: 9, remaining_amount: 0, base_amount: spentEach, pct: 5,
+        valid_from: minutesAgoISO((d - 1) * DAY), expires_at: minutesAgoISO((d - 30) * DAY), created_by_user_id: null, created_at: minutesAgoISO(d * DAY),
+      });
+    }
+  }
+  return { customers, ledger };
+})();
+
 export function createSeedData() {
   const dyn = buildSeedState();
   return {
@@ -711,8 +743,8 @@ export function createSeedData() {
     kegTapProducts: SEED_KEG_TAP_PRODUCTS,
     kegHistory: [] as KegHistory[],
     eventTickets: [] as EventTicket[],
-    loyaltyCustomers: [] as LoyaltyCustomer[],
-    cashbackLedger: [] as CashbackLedgerEntry[],
+    loyaltyCustomers: DEMO_CUSTOMERS.customers,
+    cashbackLedger: DEMO_CUSTOMERS.ledger,
     priceSchedules: [] as PriceSchedule[],
     rolePermissions: [] as RolePermission[],
     cashSessions: [] as CashSession[],
@@ -721,5 +753,6 @@ export function createSeedData() {
     couriers: SEED_COURIERS,
     ownDeliveries: [] as OwnDelivery[],
     courierSettlements: [] as CourierSettlement[],
+    reviews: [] as Review[],
   };
 }

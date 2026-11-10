@@ -2,14 +2,16 @@
  * Preferências do Painel do dono guardadas no aparelho: a meta de venda de cada dia
  * da semana, as taxas da maquininha do contrato e a comissão de cada app de delivery.
  * Não movimentam dinheiro (só as contas do painel), então ficam fora da fila da nuvem;
- * cada aparelho da gerência guarda as suas.
+ * cada aparelho da gerência guarda as suas. A campanha "cliente sumido" (mensagem,
+ * cupom e quem já recebeu) também fica aqui.
  */
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import { idbStorage } from '../lib/idbStorage';
 import { round2 } from '../lib/money';
 import { validateFeeRule, type FeeRule } from '../lib/cardFees';
-import { uuid } from '../lib/ids';
+import { nowISO, uuid } from '../lib/ids';
+import { DEFAULT_WINBACK_TEMPLATE, normalizeCouponCode, validateCampaign, type WinbackCampaign, type WinbackContact } from '../lib/winback';
 
 /** 0 = domingo … 6 = sábado (Date.getDay()). Null = sem meta naquele dia. */
 export type WeekdayGoals = Record<0 | 1 | 2 | 3 | 4 | 5 | 6, number | null>;
@@ -33,7 +35,15 @@ interface OwnerSettingsState {
   /** Comissão de cada app de delivery em % (chave do canal). Null = não cadastrada. */
   appCommissionPct: Record<string, number | null>;
   setAppCommission: (channel: string, pct: number | null) => string | null;
+  /** Campanha para chamar de volta o cliente sumido. */
+  winbackCampaign: WinbackCampaign;
+  saveWinbackCampaign: (c: WinbackCampaign) => string | null;
+  /** Quem já recebeu a mensagem (para não mandar duas vezes e medir quem voltou). */
+  winbackContacts: WinbackContact[];
+  markWinbackSent: (customerId: string) => void;
 }
+
+const DEFAULT_CAMPAIGN: WinbackCampaign = { template: DEFAULT_WINBACK_TEMPLATE, offer: '10% de desconto', coupon: 'VOLTA10' };
 
 export const useOwnerSettings = create<OwnerSettingsState>()(
   persist(
@@ -75,17 +85,35 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
         set((s) => ({ appCommissionPct: { ...s.appCommissionPct, [channel]: pct === null ? null : round2(pct) } }));
         return null;
       },
+      winbackCampaign: DEFAULT_CAMPAIGN,
+      saveWinbackCampaign: (c) => {
+        const err = validateCampaign(c);
+        if (err) return err;
+        set({ winbackCampaign: { template: c.template.trim(), offer: c.offer.trim(), coupon: normalizeCouponCode(c.coupon)! } });
+        return null;
+      },
+      winbackContacts: [],
+      markWinbackSent: (customerId) =>
+        set((s) => ({ winbackContacts: [...s.winbackContacts, { customer_id: customerId, coupon: s.winbackCampaign.coupon, contacted_at: nowISO() }] })),
     }),
     {
       name: 'tchefood-owner-settings',
       storage: createJSONStorage(() => idbStorage),
-      // v2 = taxas da maquininha e comissão dos apps.
-      version: 2,
-      partialize: (s) => ({ dailyGoals: s.dailyGoals, feeRules: s.feeRules, appCommissionPct: s.appCommissionPct }),
+      // v2 = taxas da maquininha e comissão dos apps; v3 = campanha do cliente sumido.
+      version: 3,
+      partialize: (s) => ({
+        dailyGoals: s.dailyGoals,
+        feeRules: s.feeRules,
+        appCommissionPct: s.appCommissionPct,
+        winbackCampaign: s.winbackCampaign,
+        winbackContacts: s.winbackContacts,
+      }),
       migrate: (persisted) => {
         const out = { ...(persisted as Record<string, unknown>) };
         if (!Array.isArray(out.feeRules)) out.feeRules = [];
         if (typeof out.appCommissionPct !== 'object' || out.appCommissionPct === null) out.appCommissionPct = {};
+        if (typeof out.winbackCampaign !== 'object' || out.winbackCampaign === null) out.winbackCampaign = DEFAULT_CAMPAIGN;
+        if (!Array.isArray(out.winbackContacts)) out.winbackContacts = [];
         return out as unknown as OwnerSettingsState;
       },
     },

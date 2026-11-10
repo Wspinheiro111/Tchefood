@@ -13,6 +13,7 @@ import {
   isCashbackDay,
 } from '../lib/loyalty';
 import { Badge } from '../components/ui';
+import { WinbackPanel } from './WinbackPanel';
 
 const ENTRY_LABEL = { EARN: 'Crédito', REDEEM: 'Resgate', EXPIRE: 'Vencido' } as const;
 
@@ -53,6 +54,7 @@ export function CrmPanel() {
       <p className="text-sm text-slate-500">
         Regras: {CASHBACK_PCT}% sobre o consumo sem os 10%, liberado a partir do dia seguinte, válido por {CASHBACK_VALIDITY_DAYS} dias, resgate de {CASHBACK_DAYS_LABEL} em até {CASHBACK_MAX_USAGE_PCT}% da conta. Hoje {isCashbackDay(now) ? 'é' : 'não é'} dia de resgate.
       </p>
+      <WinbackPanel />
       <div className="relative">
         <Search className="pointer-events-none absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-500" />
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar por nome ou WhatsApp" className="min-h-touch w-full rounded-xl border border-slate-200 bg-surface pl-11 pr-3 outline-none focus:border-ouro" />
