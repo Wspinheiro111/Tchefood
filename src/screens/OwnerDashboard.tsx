@@ -24,6 +24,7 @@ import {
   type MarketplaceSale,
 } from '../lib/ownerDashboard';
 import { cashOutsideSessions } from '../lib/cashRegister';
+import { leftover, type LeftoverReport } from '../lib/cardFees';
 import { ownerAlerts, type AlertTarget, type OwnerAlert } from '../lib/ownerAlerts';
 import { Btn, Sheet, toast } from '../components/ui';
 
@@ -92,6 +93,9 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
   const cancel = useMemo(() => cancellations(ix, range), [ix, range]);
   const ret = useMemo(() => customerReturn(ix, range, now), [ix, range, now]);
   const deliveries = useMemo(() => deliveryStatus(marketplace, range), [marketplace, range]);
+  const feeRules = useOwnerSettings((s) => s.feeRules);
+  const appCommissionPct = useOwnerSettings((s) => s.appCommissionPct);
+  const left = useMemo(() => leftover(ix, range, feeRules, appCommissionPct), [ix, range, feeRules, appCommissionPct]);
 
   const alerts = useMemo(
     () =>
@@ -147,6 +151,8 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
         <DayCard period={period} overview={overview} now={now} />
         <DeliveriesCard d={deliveries} onOpen={() => onNavigate('delivery')} />
       </div>
+
+      <LeftoverCard r={left} badge={PERIOD_LABEL[period]} onSetup={() => onNavigate('fees')} />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card title="Dependo demais de um canal?" badge={PERIOD_LABEL[period]}>
@@ -270,6 +276,47 @@ function Card({ title, badge, children, className = '' }: { title: string; badge
       </div>
       {children}
     </section>
+  );
+}
+
+/** "Quanto sobrou?": vendido menos custo dos produtos, taxas da maquininha e comissão dos apps. */
+function LeftoverCard({ r, badge, onSetup }: { r: LeftoverReport; badge: string; onSetup: () => void }) {
+  const rows: Array<{ label: string; value: number; hint?: string }> = [
+    { label: 'Vendido', value: r.sales },
+    { label: 'Custo dos produtos (contas fechadas)', value: -r.productCost, hint: r.productsWithoutCost ? `${r.productsWithoutCost} produto(s) vendido(s) sem custo no cadastro` : undefined },
+    { label: 'Taxas da maquininha', value: -r.cardFees, hint: r.cardWithoutRule ? `${formatBRL(r.cardWithoutRule)} passado na maquininha sem taxa cadastrada` : undefined },
+    { label: 'Comissão dos apps', value: -r.appCommission, hint: r.appWithoutCommission ? `${formatBRL(r.appWithoutCommission)} vendido em app sem comissão cadastrada` : undefined },
+  ];
+  const missing = r.cardWithoutRule > 0 || r.appWithoutCommission > 0;
+  return (
+    <Card title="Quanto sobrou?" badge={badge}>
+      {r.sales === 0 ? (
+        <Empty>Nenhuma venda no período.</Empty>
+      ) : (
+        <div className="grid gap-4 md:grid-cols-[1fr_auto] md:items-end">
+          <ul className="divide-y divide-slate-100 text-sm">
+            {rows.map((row) => (
+              <li key={row.label} className="py-1.5">
+                <div className="flex justify-between gap-2">
+                  <span className="font-semibold">{row.label}</span>
+                  <span className={`tabular-nums ${row.value < 0 ? 'text-rose-700' : ''}`}>{row.value < 0 ? '− ' : ''}{formatBRL(Math.abs(row.value))}</span>
+                </div>
+                {row.hint && <div className="text-xs text-amber-700">{row.hint}</div>}
+              </li>
+            ))}
+          </ul>
+          <div className="rounded-2xl bg-surface p-4 text-right">
+            <div className="text-xs font-bold uppercase text-slate-500">Sobrou</div>
+            <div className={`text-3xl font-black tabular-nums ${r.leftover < 0 ? 'text-rose-700' : 'text-verde'}`}>{formatBRL(r.leftover)}</div>
+            {r.leftoverPct !== null && <div className="text-sm text-slate-600">{pctLabel(r.leftoverPct)} do vendido</div>}
+          </div>
+        </div>
+      )}
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 pt-2 text-xs text-slate-500">
+        <span>Antes de aluguel, salários e outras despesas fixas.</span>
+        <Btn variant={missing ? 'gold' : 'ghost'} className="!min-h-0 py-1.5 text-sm" onClick={onSetup}>{missing ? 'Cadastrar taxas' : 'Taxas e recebíveis'}</Btn>
+      </div>
+    </Card>
   );
 }
 
