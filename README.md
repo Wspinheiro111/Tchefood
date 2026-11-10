@@ -62,6 +62,8 @@ npm run build
    - **Agenda de recebíveis**: o que cai na conta em cada dia dos próximos 35 dias, já sem a taxa, por maquininha. Pagamento sem taxa cadastrada fica fora da agenda e é avisado (nada é inventado). Feriados não entram no prazo.
    - As taxas ficam no aparelho da gerência (como a meta do dia), não na nuvem.
 
+18. **PDV por teclado** (Pedido no Caixa): campo de busca sempre pronto. Digite parte do nome (sem acento), o código do cardápio ou leia o código de barras, e o Enter lança o produto marcado (↑ ↓ escolhe). `3*101` lança 3 do código 101; produto com opções abre a ficha já com a quantidade. Atalhos: F1 busca, F2 cobra e gera a senha, F6 nome do cliente, F8 tira o último item, F9 Viagem/Comer aqui, Esc limpa a busca. Na cobrança: F3 crédito, F4 débito, F6 Pix, F7 dinheiro, F2 cobra, Esc volta. A barra de atalhos só aparece em tela larga.
+
 ## Etapa 0: cadastros na tela e sincronização
 **Cardápio** — categorias, produtos (código único, preço com 2 casas, NCM/CFOP/CSOSN validados), grupos de adicionais e opções, vínculo produto ↔ adicionais em ordem, **preço por dia/horário** (happy hour; janela que vira a meia-noite; duas regras do mesmo produto não podem se sobrepor) e **esgotado** em um toque, também no KDS para a cozinha.
 - O preço da bandeja é recalculado no store a partir do cardápio (regra de horário + meio a meio). O valor que a tela manda é ignorado.
