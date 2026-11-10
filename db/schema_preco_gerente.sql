@@ -345,6 +345,27 @@ BEGIN
 END;
 $$;
 
+-- Composição do item travada depois do envio (P0-01 da rodada 4 do GPT): a conferência
+-- de preço (tchefood_check_item_price) roda só na inserção. Sabores e adicionais também
+-- formam o preço; trocá-los depois, sem mudar o valor, deixaria um item mais caro cobrado
+-- pelo preço do mais barato, sem PIN nem alerta. Status, preparo, entrega e cancelamento
+-- continuam podendo mudar. Mesma função de schema.sql com os dois campos a mais.
+CREATE OR REPLACE FUNCTION tchefood_lock_item_financials()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.unit_price IS DISTINCT FROM OLD.unit_price
+       OR NEW.modifiers_unit_price IS DISTINCT FROM OLD.modifiers_unit_price
+       OR NEW.quantity IS DISTINCT FROM OLD.quantity
+       OR NEW.product_id IS DISTINCT FROM OLD.product_id
+       OR NEW.order_id IS DISTINCT FROM OLD.order_id
+       OR NEW.half_product_ids IS DISTINCT FROM OLD.half_product_ids
+       OR NEW.modifier_option_ids IS DISTINCT FROM OLD.modifier_option_ids THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: item % já enviado não pode ter preço, quantidade, produto, sabores ou adicionais alterados. Cancele com PIN do gerente e lance de novo.', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN

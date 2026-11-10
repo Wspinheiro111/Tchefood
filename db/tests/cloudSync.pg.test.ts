@@ -714,6 +714,35 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER',
     });
     expect(legacyOk.status).toBe(201);
+    // P0-01 da rodada 4 do GPT: a conferência do preço roda na inserção. Depois do envio, os
+    // sabores e adicionais do item (que formam o preço) não mudam: com a borda de R$ 12 o
+    // item custaria R$ 72 e continuaria cobrado por R$ 60.
+    const sent = {
+      id: crypto.randomUUID(), order_id: order.id, product_id: calabresa.id, waiter_id: st().currentUserId, quantity: 1, unit_price: 60, modifiers_unit_price: 0,
+      sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER', priced_at: new Date().toISOString(), half_product_ids: [] as string[], modifier_option_ids: [] as string[],
+    };
+    expect((await raw('POST', 'order_items', sent)).status).toBe(201);
+    const snapshot = () => sql(`SELECT i.half_product_ids::text || ' ' || i.modifier_option_ids::text || ' ' || i.total_item_price || ' ' || o.total_amount || ' ' || (SELECT count(*) FROM audit_logs WHERE order_id = o.id)
+                                FROM order_items i JOIN orders o ON o.id = i.order_id WHERE i.id = '${sent.id}'`);
+    const before = snapshot();
+    expect(before.startsWith('{} {} 60.00')).toBe(true);
+    for (const change of [{ modifier_option_ids: [option] }, { half_product_ids: [marguerita.id] }]) {
+      const r = await raw('PATCH', `order_items?id=eq.${sent.id}`, change);
+      expect(r.status, JSON.stringify(change)).toBe(400);
+      expect(r.body).toContain('TCHEFOOD_ANTIFRAUDE');
+      expect(snapshot()).toBe(before);
+    }
+    // Reenvio do mesmo item (como a fila faz) e upsert sem mudar a composição: aceitos.
+    expect((await raw('PATCH', `order_items?id=eq.${sent.id}`, sent)).status).toBeLessThan(300);
+    expect((await raw('POST', 'order_items?on_conflict=id', sent, 'resolution=merge-duplicates,return=minimal')).status).toBeLessThan(300);
+    // Upsert do mesmo id com outra composição: recusado.
+    const upsert = await raw('POST', 'order_items?on_conflict=id', { ...sent, half_product_ids: [marguerita.id] }, 'resolution=merge-duplicates,return=minimal');
+    expect(upsert.status).toBe(400);
+    expect(snapshot()).toBe(before);
+    // O status segue mudando (PENDING → PREPARING).
+    expect((await raw('PATCH', `order_items?id=eq.${sent.id}`, { status: 'PREPARING' })).status).toBeLessThan(300);
+    expect(sql(`SELECT status FROM order_items WHERE id = '${sent.id}'`)).toBe('PREPARING');
+    expect(snapshot()).toBe(before);
     // Com preço diferente: só com PIN.
     const legacyItem = {
       id: crypto.randomUUID(), order_id: order.id, product_id: calabresa.id, waiter_id: st().currentUserId, quantity: 1, unit_price: 1, modifiers_unit_price: 0,
