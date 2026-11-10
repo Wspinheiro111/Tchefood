@@ -172,13 +172,27 @@ export function postgrestFetch(t: PgTarget, db: string, claims: Record<string, u
     const table = path;
     const cols = columns(table);
     if (cols.length === 0) return done(404, { message: `relation public.${table} does not exist` }, 'tabela não existe');
-    const filters = [...u.searchParams.entries()].filter(([k]) => k !== 'on_conflict');
+    const RESERVED = ['on_conflict', 'select', 'order', 'limit', 'offset'];
+    const filters = [...u.searchParams.entries()].filter(([k]) => !RESERVED.includes(k));
     const where = filters
       .map(([k, v]) => {
         if (!v.startsWith('eq.')) throw new Error(`filtro não suportado: ${k}=${v}`);
         return `${ident(k)} = ${lit(v.slice(3))}`;
       })
       .join(' AND ');
+
+    if (init.method === 'GET') {
+      // select=a,b&order=x,y&limit=n&offset=m, como o PostgREST (a RLS e as permissões de coluna valem).
+      const select = (u.searchParams.get('select') ?? '*').split(',').map((c) => (c === '*' ? '*' : ident(c.trim()))).join(', ');
+      const order = u.searchParams.get('order');
+      const orderBy = order ? ` ORDER BY ${order.split(',').map((c) => ident(c.trim())).join(', ')}` : '';
+      const limit = u.searchParams.get('limit');
+      const offset = u.searchParams.get('offset');
+      const page = `${limit ? ` LIMIT ${Number(limit)}` : ''}${offset ? ` OFFSET ${Number(offset)}` : ''}`;
+      const r = run(`SELECT coalesce(jsonb_agg(to_jsonb(q)), '[]'::jsonb) FROM (SELECT ${select} FROM public.${ident(table)}${where ? ` WHERE ${where}` : ''}${orderBy}${page}) q;`);
+      if (!r.ok) return done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message }, r.message ?? undefined);
+      return done(200, JSON.parse(r.out.split('\n').filter(Boolean).pop() ?? '[]'));
+    }
 
     if (init.method === 'DELETE') {
       const r = run(`DELETE FROM public.${ident(table)} WHERE ${where};`);

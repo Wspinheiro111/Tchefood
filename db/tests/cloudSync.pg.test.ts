@@ -15,6 +15,8 @@ import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
+import { fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins } from '../../src/lib/sync/cloudPull';
+import { syncOnce } from '../../src/lib/sync/useCloudSync';
 import { useArStore } from '../../src/store/useArStore';
 import { sampleNfeXml } from '../../src/data/sampleNfe';
 import { setReviewHold } from '../../src/lib/payments/reviewHolds';
@@ -91,7 +93,7 @@ const MANAGER = { managerPin: MANAGER_PIN, reason: 'Teste com o banco real' };
 afterEach(() => vi.useRealTimers());
 
 /** Requisição direta ao "PostgREST", como faria quem tem só o token do aparelho. */
-async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer = 'return=minimal') {
+async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown, prefer = 'return=minimal') {
   const fetchFn = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' });
   const res = await fetchFn(`http://cloud.test/rest/v1/${path}`, { method, headers: { Prefer: prefer }, body: JSON.stringify(body) });
   return { status: res.status, body: await res.text() };
@@ -586,6 +588,97 @@ async function raw(method: 'POST' | 'PATCH', path: string, body: unknown, prefer
     await expectSynced('cancelamento do combo');
     expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${order.id}' AND status = 'CANCELED'`)).toBe('3');
     expect(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`)).toBe('0.00');
+  });
+
+  it('aparelho novo baixa a loja: cadastros pela RLS, equipe com PIN só com o PIN do gerente', async () => {
+    forgetPinFailures();
+    const cfg = { url: 'http://cloud.test', anonKey: 'anon', accessToken: 'jwt' };
+    const fetchFn = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-2' }, emulatorLog);
+    const productsBefore = Number(sql(`SELECT count(*) FROM products WHERE tenant_id = '${TENANT}'`));
+    const session = st().cloud!;
+
+    // O token do aparelho não lê PIN.
+    expect((await raw('GET', 'staff_users?select=pin_code', undefined)).status).toBe(403);
+
+    // Aparelho novo, ainda na demonstração.
+    st().resetDemo();
+    login('8888');
+    const team = await fetchCloudStaff(cfg, fetchFn);
+    const manager = team.find((u) => u.role === 'MANAGER')!;
+    const cashier = team.find((u) => u.role === 'CASHIER')!;
+    expect(team.length).toBeGreaterThan(3);
+    expect(Object.keys(manager)).not.toContain('pin_code');
+    // PIN errado, e PIN certo de quem não é gerente: nada de PIN.
+    expect(await fetchStaffPins(cfg, manager.id, '0000', fetchFn)).toMatchObject({ ok: false });
+    expect(await fetchStaffPins(cfg, cashier.id, CASHIER_PIN, fetchFn)).toMatchObject({ ok: false });
+    forgetPinFailures();
+    const pins = await fetchStaffPins(cfg, manager.id, MANAGER_PIN, fetchFn);
+    if (!pins.ok) throw new Error(pins.error);
+    expect(pins.staff.find((u) => u.id === cashier.id)!.pin_code).toBe(CASHIER_PIN);
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'STAFF_PULL' AND performed_by_user_id = '${manager.id}' AND metadata->>'device_user' = 'device-2'`)).toBe('1');
+
+    const snapshot = await fetchCloudSnapshot(cfg, TENANT, fetchFn);
+    expect(snapshot.tenant.name).toBe('Bar do Zé');
+    expect(Object.keys(snapshot.tenant)).not.toContain('focus_nfe_token');
+    expect(snapshot.products).toHaveLength(productsBefore);
+    ok(st().joinCloudStore({ session, snapshot, staff: pins.staff, userId: manager.id }));
+    expect(st().currentUserId).toBe(manager.id);
+    expect(st().tenant.id).toBe(TENANT);
+    expect(st().orders).toEqual([]);
+    expect(st().outbox).toEqual([]);
+    const combo = st().products.find((p) => p.code === '501')!;
+    expect(combo.is_combo).toBe(true);
+    expect(st().modifierOptions.some((o) => o.component_product_id && st().productModifierGroups.some((l) => l.product_id === combo.id && l.group_id === o.group_id))).toBe(true);
+    expect(st().tables.every((t) => t.status === 'FREE')).toBe(true);
+    // A caixa entra com o PIN dela neste aparelho.
+    login(CASHIER_PIN);
+
+    // Outro aparelho muda preço, desativa alguém e cadastra uma pessoa nova.
+    const carreteiro = st().products.find((p) => p.id === productId)!;
+    sql(`UPDATE products SET price = 51.90 WHERE id = '${productId}';
+         UPDATE staff_users SET active = FALSE WHERE name = 'Totem 1' AND tenant_id = '${TENANT}';
+         INSERT INTO staff_users (id, tenant_id, name, role, pin_code, active) VALUES (gen_random_uuid(), '${TENANT}', 'Garçom Novo', 'WAITER', '3847', TRUE);`);
+    // E este aparelho mudou outro produto ainda sem enviar.
+    login(OWNER_PIN);
+    const refri = st().products.find((p) => p.code === '231')!;
+    const { tenant_id: _t, created_at: _c, ...refriDraft } = refri;
+    ok(st().saveProduct({ ...refriDraft, price: 8.5 }));
+    useTcheStore.setState({ pullStatus: { last_pull_at: null, last_error: null, cloud_staff_unknown: 0 } });
+    expect(st().applyCloudSnapshot(await fetchCloudSnapshot(cfg, TENANT, fetchFn))).toMatchObject({ ok: true, data: { unknownStaff: 1 } });
+    expect(st().products.find((p) => p.id === productId)!.price).toBe(51.9);
+    expect(carreteiro.price).not.toBe(51.9);
+    expect(st().products.find((p) => p.id === refri.id)!.price).toBe(8.5); // pendente aqui: fica
+    expect(st().staff.find((u) => u.name === 'Totem 1')!.active).toBe(false);
+    expect(st().pullStatus.cloud_staff_unknown).toBe(1);
+    expect(st().login('3847').ok).toBe(false);
+    // A fila sobe e a leitura seguinte já traz o preço deste aparelho.
+    await expectSynced('produto alterado depois de baixar');
+    expect(sql(`SELECT price FROM products WHERE id = '${refri.id}'`)).toBe('8.50');
+
+    // "Atualizar equipe" com o PIN do gerente traz o garçom novo.
+    login(OWNER_PIN);
+    const owner = st().staff.find((u) => u.pin_code === OWNER_PIN)!;
+    const again = await fetchStaffPins(cfg, owner.id, OWNER_PIN, fetchFn);
+    if (!again.ok) throw new Error(again.error);
+    expect(st().applyCloudStaff(again.staff)).toMatchObject({ ok: true, data: { added: 1 } });
+    expect(st().pullStatus.cloud_staff_unknown).toBe(0);
+    expect(st().login('3847').ok).toBe(true);
+    login(CASHIER_PIN);
+  });
+
+  it('a rodada de sincronização lê a nuvem com a fila vazia', async () => {
+    sql(`UPDATE products SET price = 52.90 WHERE id = '${productId}';`);
+    useTcheStore.setState({ pullStatus: { last_pull_at: null, last_error: null, cloud_staff_unknown: 0 } });
+    await syncOnce(postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-2' }, emulatorLog));
+    expect(st().pullStatus.last_error).toBeNull();
+    expect(st().pullStatus.last_pull_at).not.toBeNull();
+    expect(st().products.find((p) => p.id === productId)!.price).toBe(52.9);
+    // Dentro do minuto não lê de novo; com forcePull ("Sincronizar agora") lê.
+    sql(`UPDATE products SET price = 53.90 WHERE id = '${productId}';`);
+    await syncOnce(postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-2' }, emulatorLog));
+    expect(st().products.find((p) => p.id === productId)!.price).toBe(52.9);
+    await syncOnce(postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-2' }, emulatorLog), { forcePull: true });
+    expect(st().products.find((p) => p.id === productId)!.price).toBe(53.9);
   });
 
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
