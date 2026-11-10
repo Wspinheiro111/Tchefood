@@ -94,6 +94,9 @@ export function expandComboItem(
     // A opção do combo pode trazer o tamanho do chopp (volume_ml); sem ele vale o padrão da torneira.
     keg_volume_ml: resolveKegVolume(comp.id, [{ option_id: option.id }], ctx.kegTapProducts, ctx.modifierOptions),
     combo_parent_item_id: parent.id,
+    // As escolhas e o preço ficam no combo; o componente não tem adicional próprio.
+    half_product_ids: [],
+    modifier_option_ids: [],
   }));
   return { ok: true, data: [parent, ...children] };
 }

@@ -367,7 +367,6 @@ interface DeviceSlice {
   managerPinFailures: number;
   managerPinLockedUntil: number | null;
   soundEnabled: boolean;
-  halfAndHalfPricing: HalfAndHalfPricing;
   hydrated: boolean;
   /** Sequencial de numeração da NFC-e (série 1) deste aparelho emissor. */
   nfceSeq: number;
@@ -580,7 +579,6 @@ function initialDevice(): DeviceSlice {
     managerPinFailures: 0,
     managerPinLockedUntil: null,
     soundEnabled: true,
-    halfAndHalfPricing: 'HIGHEST',
     hydrated: false,
     nfceSeq: 1000,
     showPrintSimulator: true,
@@ -854,7 +852,7 @@ export const useTcheStore = create<TcheState>()(
         }
         return {
           ok: true,
-          data: halves.length ? halfAndHalfPrice([salePrice(product), ...halves.map(salePrice)], get().halfAndHalfPricing) : salePrice(product),
+          data: halves.length ? halfAndHalfPrice([salePrice(product), ...halves.map(salePrice)], get().tenant.half_and_half_pricing) : salePrice(product),
         };
       };
 
@@ -961,6 +959,17 @@ export const useTcheStore = create<TcheState>()(
        * Produto técnico "Taxa de entrega" (e a categoria inativa dele), criado na primeira
        * entrega com taxa. Fica fora do cardápio (inativo) e da cozinha (setor NONE).
        */
+      /** A senha de entrega foi desfeita: a entrega em andamento sai do quadro junto. */
+      const cancelDeliveryOf = (orderId: UUID): void => {
+        const d = get().ownDeliveries.find((x) => x.order_id === orderId);
+        if (!d || d.status === 'DELIVERED' || d.status === 'CANCELED') return;
+        const updated: OwnDelivery = { ...d, status: 'CANCELED' };
+        set((s) => ({
+          ownDeliveries: s.ownDeliveries.map((x) => (x.id === d.id ? updated : x)),
+          outbox: [...s.outbox, syncEvent('own_deliveries', 'UPDATE', updated)],
+        }));
+      };
+
       const ensureDeliveryFeeProduct = (s0: TcheState): { category: Category | null; product: Product | null } => {
         if (s0.products.some((p) => p.code === DELIVERY_FEE_CODE)) return { category: null, product: null };
         const existingCat = s0.categories.find((c) => c.name === 'Taxas (fora do cardápio)');
@@ -1329,6 +1338,10 @@ export const useTcheStore = create<TcheState>()(
               weight_source: t.weight?.source ?? null,
               keg_volume_ml: resolveKegVolume(t.product_id, t.modifiers, get().kegTapProducts, get().modifierOptions),
               combo_parent_item_id: null,
+              // O preço foi tirado do cadastro quando o item entrou na bandeja.
+              priced_at: t.added_at,
+              half_product_ids: [...t.half_product_ids],
+              modifier_option_ids: t.modifiers.map((m) => m.option_id),
             };
             if (!product) return fail('Produto não encontrado.');
             // Combo: o item do combo leva o preço; cada escolha vira um item na praça dela.
@@ -1968,6 +1981,9 @@ export const useTcheStore = create<TcheState>()(
                 weight_source: null,
                 keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
                 combo_parent_item_id: null,
+                priced_at: ts,
+                half_product_ids: [...d.half_product_ids],
+                modifier_option_ids: d.modifiers.map((m) => m.option_id),
               },
               product,
               d.modifiers,
@@ -2144,6 +2160,9 @@ export const useTcheStore = create<TcheState>()(
                 weight_source: null,
                 keg_volume_ml: resolveKegVolume(product.id, line.modifiers, s0.kegTapProducts, s0.modifierOptions),
                 combo_parent_item_id: null,
+                priced_at: ts,
+                half_product_ids: [],
+                modifier_option_ids: line.modifiers.map((m) => m.option_id),
               },
               product,
               line.modifiers,
@@ -2365,6 +2384,9 @@ export const useTcheStore = create<TcheState>()(
                 weight_source: null,
                 keg_volume_ml: resolveKegVolume(product.id, d.modifiers, s0.kegTapProducts, s0.modifierOptions),
                 combo_parent_item_id: null,
+                priced_at: ts,
+                half_product_ids: [...d.half_product_ids],
+                modifier_option_ids: d.modifiers.map((m) => m.option_id),
               },
               product,
               d.modifiers,
@@ -2412,6 +2434,9 @@ export const useTcheStore = create<TcheState>()(
                 weight_source: null,
                 keg_volume_ml: null,
                 combo_parent_item_id: null,
+                priced_at: ts,
+                half_product_ids: [],
+                modifier_option_ids: [],
               });
             }
             delivery = {
@@ -2453,8 +2478,9 @@ export const useTcheStore = create<TcheState>()(
                 ...(feeCatalog.category ? [syncEvent('categories', 'INSERT', feeCatalog.category)] : []),
                 ...(feeCatalog.product ? [syncEvent('products', 'INSERT', feeCatalog.product)] : []),
                 syncEvent('orders', 'INSERT', recalculated),
-                ...items.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
+                // A entrega sobe antes dos itens: o banco confere o preço da taxa pela entrega (schema_entrega.sql).
                 ...(delivery ? [syncEvent('own_deliveries', 'INSERT', delivery)] : []),
+                ...items.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
                 ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k)),
               ],
             };
@@ -2467,7 +2493,9 @@ export const useTcheStore = create<TcheState>()(
           if (getReviewHold(orderId)) {
             return fail('Há uma cobrança sem confirmação nesta senha. Confira o extrato da maquininha antes de cancelar.');
           }
-          return voidTechnicalSale(orderId, auth, 'KIOSK');
+          const voided = voidTechnicalSale(orderId, auth, 'KIOSK');
+          if (voided.ok) cancelDeliveryOf(orderId);
+          return voided;
         },
 
         exitKioskMode: (auth) => {
@@ -2769,7 +2797,11 @@ export const useTcheStore = create<TcheState>()(
         },
 
         setSoundEnabled: (enabled) => set({ soundEnabled: enabled }),
-        setHalfAndHalfPricing: (rule) => set({ halfAndHalfPricing: rule }),
+        setHalfAndHalfPricing: (rule) => {
+          // Regra da loja: sobe para a nuvem, que confere o preço do item com ela.
+          const tenant: Tenant = { ...get().tenant, half_and_half_pricing: rule };
+          set((s) => ({ tenant, outbox: [...s.outbox, syncEvent('tenants', 'UPDATE', tenant)] }));
+        },
 
         // ---------------------------------------------------------------------
         // Etapa 0 — cadastros
@@ -3181,6 +3213,7 @@ export const useTcheStore = create<TcheState>()(
             id: tenantId,
             default_acquirer: state.tenant.default_acquirer,
             default_mode: state.tenant.default_mode,
+            half_and_half_pricing: state.tenant.half_and_half_pricing,
             focus_nfe_token: null,
             csc_id: null,
             csc_token: null,
@@ -3748,14 +3781,18 @@ export const useTcheStore = create<TcheState>()(
           const d = get().ownDeliveries.find((x) => x.id === deliveryId);
           if (!d) return fail('Entrega não encontrada.');
           if (d.status === 'DELIVERED' || d.status === 'CANCELED') return fail('Entrega já encerrada.');
-          // Desfaz a senha (PIN de gerente, itens auditados); paga não desfaz aqui.
-          const voided = get().voidPickupOrder(d.order_id, auth);
-          if (!voided.ok) return voided;
-          const updated: OwnDelivery = { ...d, status: 'CANCELED' };
-          set((s) => ({
-            ownDeliveries: s.ownDeliveries.map((x) => (x.id === d.id ? updated : x)),
-            outbox: [...s.outbox, syncEvent('own_deliveries', 'UPDATE', updated)],
-          }));
+          const order = get().orders.find((o) => o.id === d.order_id);
+          if (order && order.status !== 'CLOSED' && order.status !== 'CANCELED') {
+            // Conta em aberto: desfaz a senha (PIN de gerente, itens auditados) e a entrega sai junto.
+            const voided = get().voidPickupOrder(d.order_id, auth);
+            if (!voided.ok) return voided;
+          } else {
+            // Conta já paga (ou já desfeita no caixa): só a entrega sai do quadro, com PIN de gerente.
+            // O estorno do dinheiro, se houver, é feito à parte no caixa.
+            const authRes = authorizeManager(auth, { orderId: d.order_id, action: 'ITEM_CANCELED' });
+            if (!authRes.ok) return authRes;
+          }
+          cancelDeliveryOf(d.order_id);
           return { ok: true, data: undefined };
         },
 
@@ -3773,8 +3810,20 @@ export const useTcheStore = create<TcheState>()(
             if (!open) return fail('Abra o caixa para pagar o entregador com o dinheiro da gaveta.');
             if (!opts.auth) return fail('Pagar o entregador pelo caixa é sangria: precisa do PIN do gerente.');
           }
+          // O PIN da sangria é conferido antes de receber qualquer conta: PIN errado não deixa acerto pela metade.
+          const withdrawalAuth = opts.payFromDrawer && feesCents > 0
+            ? {
+                managerPin: opts.auth!.managerPin,
+                reason: opts.auth!.reason.trim().length >= MIN_REASON_LENGTH ? opts.auth!.reason : `Acerto do entregador ${courier.name}`,
+              }
+            : null;
+          if (withdrawalAuth) {
+            const pre = authorizeManager(withdrawalAuth, { orderId: null, action: 'CASH_WITHDRAWAL' });
+            if (!pre.ok) return pre;
+          }
           // 1) O dinheiro que o entregador trouxe vira o pagamento de cada senha paga na entrega.
-          let cashCents = 0;
+          // Senha já recebida numa tentativa anterior deste acerto (que parou no meio) não paga de novo,
+          // mas o dinheiro dela conta no acerto (pela chave entrega-<id> do pagamento).
           for (const d of own) {
             if (!d.pay_on_delivery) continue;
             const order = get().orders.find((o) => o.id === d.order_id);
@@ -3796,15 +3845,15 @@ export const useTcheStore = create<TcheState>()(
               item_ids: [],
             });
             if (!r.ok) return fail(`Senha ${order.pickup_number ?? ''}: ${r.error} Acerto parado; as anteriores já foram recebidas.`);
-            cashCents += toCents(amount);
           }
+          const keys = new Set(own.filter((d) => d.pay_on_delivery).map((d) => `entrega-${d.id}`));
+          const cashCents = get().payments
+            .filter((p) => p.status === 'APPROVED' && p.idempotency_key !== null && keys.has(p.idempotency_key))
+            .reduce((a, p) => a + toCents(p.amount), 0);
           // 2) O ganho do entregador sai da gaveta (sangria com PIN de gerente).
           let movementId: UUID | null = null;
           if (opts.payFromDrawer && feesCents > 0) {
-            const wd = get().addCashWithdrawal(fromCentsLocal(feesCents), {
-              managerPin: opts.auth!.managerPin,
-              reason: opts.auth!.reason.trim().length >= MIN_REASON_LENGTH ? opts.auth!.reason : `Acerto do entregador ${courier.name}`,
-            });
+            const wd = get().addCashWithdrawal(fromCentsLocal(feesCents), withdrawalAuth!);
             if (!wd.ok) return fail(`${wd.error} As senhas já foram recebidas; pague o entregador e acerte de novo sem a gaveta.`);
             movementId = wd.data.id;
           }
@@ -3907,9 +3956,9 @@ export const useTcheStore = create<TcheState>()(
       // v2 = Etapa 0 (cadastros e nuvem); v3 = Fase 5 (barril, fichas, balança, cashback);
       // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras);
       // v6 = combos; v7 = nuvem → aparelho (pullStatus);
-      // v8 = caixa (abertura, sangria, suprimento, fechamento); v9 = entrega própria;
-      // v10 = avaliações dos clientes.
-      version: 10,
+      // v8 = caixa (abertura, sangria, suprimento, fechamento); v9 = preço conferido pelo servidor;
+      // v10 = entrega própria; v11 = avaliações dos clientes.
+      version: 11,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -4008,12 +4057,36 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
     }
   }
   if (version < 9) {
+    // A regra do meio a meio deixa de ser do aparelho e passa a ser da loja.
+    const rule = out.halfAndHalfPricing === 'AVERAGE' ? 'AVERAGE' : 'HIGHEST';
+    if (out.tenant && typeof out.tenant === 'object') {
+      const t = out.tenant as Record<string, unknown>;
+      const migrated: Record<string, unknown> = { ...t, half_and_half_pricing: t.half_and_half_pricing === 'AVERAGE' || t.half_and_half_pricing === 'HIGHEST' ? t.half_and_half_pricing : rule };
+      out.tenant = migrated;
+      // Loja já ligada à nuvem com "média": o banco nasce com "maior preço" e o próximo download
+      // trocaria a regra em silêncio. Sobe a regra do aparelho antes.
+      if (out.cloud && migrated.half_and_half_pricing === 'AVERAGE' && typeof migrated.id === 'string') {
+        const queue = Array.isArray(out.outbox) ? (out.outbox as unknown[]) : [];
+        out.outbox = [...queue, syncEvent('tenants', 'UPDATE', migrated as { id: UUID })];
+      }
+    }
+    delete out.halfAndHalfPricing;
+    if (Array.isArray(out.orderItems)) {
+      out.orderItems = (out.orderItems as Array<Record<string, unknown>>).map((i) => ({
+        ...i,
+        priced_at: typeof i.priced_at === 'string' ? i.priced_at : null,
+        half_product_ids: Array.isArray(i.half_product_ids) ? i.half_product_ids : [],
+        modifier_option_ids: Array.isArray(i.modifier_option_ids) ? i.modifier_option_ids : [],
+      }));
+    }
+  }
+  if (version < 10) {
     // Entrega própria: a loja cadastra bairros e entregadores depois da atualização.
     for (const key of ['deliveryZones', 'couriers', 'ownDeliveries', 'courierSettlements']) {
       if (!Array.isArray(out[key])) out[key] = [];
     }
   }
-  if (version < 10) {
+  if (version < 11) {
     if (!Array.isArray(out.reviews)) out.reviews = [];
   }
   return out;

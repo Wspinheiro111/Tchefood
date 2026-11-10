@@ -27,7 +27,7 @@ export function lineKey(d: Pick<PickupLine, 'product_id' | 'meat_doneness' | 'mo
 export function usePickupCart() {
   const products = useTcheStore((s) => s.products);
   const links = useTcheStore((s) => s.productModifierGroups);
-  const pricing = useTcheStore((s) => s.halfAndHalfPricing);
+  const pricing = useTcheStore((s) => s.tenant.half_and_half_pricing);
   // Mostra o preço com a regra de horário; o valor cobrado é recalculado no store.
   const priceOf = useSalePrice();
   const [lines, setLines] = useState<PickupCartLine[]>([]);

@@ -92,7 +92,7 @@ describe('avaliações', () => {
     expect(reviewSummary([], { from: 0, to: 1 }).average).toBeNull();
   });
 
-  it('migração da versão 9 cria a lista de avaliações', () => {
-    expect((migratePersisted({ orders: [] }, 9) as Record<string, unknown>).reviews).toEqual([]);
+  it('migração da versão 10 cria a lista de avaliações', () => {
+    expect((migratePersisted({ orders: [] }, 10) as Record<string, unknown>).reviews).toEqual([]);
   });
 });

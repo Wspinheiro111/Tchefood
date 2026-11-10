@@ -34,7 +34,7 @@ export function ProductSheet({ product, onClose, onConfirm, confirmLabel = 'Adic
   const links = useTcheStore((s) => s.productModifierGroups);
   const groupsAll = useTcheStore((s) => s.modifierGroups);
   const optionsAll = useTcheStore((s) => s.modifierOptions);
-  const pricingRule = useTcheStore((s) => s.halfAndHalfPricing);
+  const pricingRule = useTcheStore((s) => s.tenant.half_and_half_pricing);
   const priceOf = useSalePrice();
 
   const [qty, setQty] = useState(1);

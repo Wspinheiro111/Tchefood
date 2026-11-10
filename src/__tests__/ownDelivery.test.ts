@@ -175,6 +175,59 @@ describe('entrega própria — fluxo', () => {
     expect(st().orders.find((x) => x.id === o.id)!.status).toBe('CANCELED');
   });
 
+  it('PIN errado na sangria do acerto não recebe nenhuma conta; o acerto certo depois leva o dinheiro todo', () => {
+    asCashier();
+    expect(st().openCashSession(100).ok).toBe(true);
+    const o = deliveryOrder();
+    const d = deliveryOf(o.id);
+    const courier = st().couriers[0]!;
+    st().setOwnDeliveryStatus(d.id, 'READY');
+    st().dispatchOwnDeliveries([d.id], courier.id);
+    st().setOwnDeliveryStatus(d.id, 'DELIVERED');
+    expect(st().settleCourier(courier.id, { payFromDrawer: true, auth: { managerPin: '0000', reason: 'Acerto do entregador' } }).ok).toBe(false);
+    expect(st().orders.find((x) => x.id === o.id)!.status).toBe('PAYING');
+    expect(st().payments.filter((p) => p.order_id === o.id)).toHaveLength(0);
+    const s = st().settleCourier(courier.id, { payFromDrawer: true, auth: MANAGER });
+    expect(s.ok && s.data.cash_collected).toBe(o.total_amount);
+  });
+
+  it('acerto que parou no meio: na nova tentativa o dinheiro já recebido continua no acerto', () => {
+    asCashier();
+    const o = deliveryOrder();
+    const d = deliveryOf(o.id);
+    const courier = st().couriers[0]!;
+    st().setOwnDeliveryStatus(d.id, 'READY');
+    st().dispatchOwnDeliveries([d.id], courier.id);
+    st().setOwnDeliveryStatus(d.id, 'DELIVERED');
+    // A senha foi recebida (chave da entrega) mas o acerto não foi gravado.
+    const r = st().registerPayment({
+      orderId: o.id, amount: o.remaining_balance, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
+      acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: `entrega-${d.id}`, item_ids: [],
+    });
+    expect(r.ok).toBe(true);
+    const s = st().settleCourier(courier.id, { payFromDrawer: false, auth: null });
+    expect(s.ok && s.data.cash_collected).toBe(o.total_amount);
+  });
+
+  it('desfazer a senha no caixa tira a entrega do quadro; entrega já paga sai com PIN de gerente', () => {
+    asCashier();
+    const unpaid = deliveryOrder({ payOnDelivery: false });
+    expect(st().voidPickupOrder(unpaid.id, MANAGER).ok).toBe(true);
+    expect(deliveryOf(unpaid.id).status).toBe('CANCELED');
+    expect(st().outbox.at(-1)).toMatchObject({ table: 'own_deliveries', op: 'UPDATE' });
+
+    const paid = deliveryOrder({ payOnDelivery: false });
+    st().registerPayment({
+      orderId: paid.id, amount: paid.remaining_balance, method: 'PIX', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
+      acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'pix-paid', item_ids: [],
+    });
+    const d = deliveryOf(paid.id);
+    expect(st().cancelOwnDelivery(d.id, { managerPin: '0000', reason: 'Cliente desistiu' }).ok).toBe(false);
+    expect(st().cancelOwnDelivery(d.id, { managerPin: '9999', reason: 'Cliente desistiu' }).ok).toBe(true);
+    expect(deliveryOf(paid.id).status).toBe('CANCELED');
+    expect(st().orders.find((x) => x.id === paid.id)!.status).toBe('CLOSED');
+  });
+
   it('cadastro de bairro e entregador só para gerente', () => {
     asCashier();
     expect(st().saveDeliveryZone({ name: 'Camobi', fee: 10, eta_minutes: 50, active: true }).ok).toBe(false);
@@ -186,8 +239,8 @@ describe('entrega própria — fluxo', () => {
     expect(c.ok && c.data.phone).toBe('55988887777');
   });
 
-  it('migração da versão 8 cria as listas da entrega', () => {
-    const out = migratePersisted({ orders: [] }, 8) as Record<string, unknown>;
+  it('migração da versão 9 cria as listas da entrega', () => {
+    const out = migratePersisted({ orders: [] }, 9) as Record<string, unknown>;
     expect(out.deliveryZones).toEqual([]);
     expect(out.couriers).toEqual([]);
     expect(out.ownDeliveries).toEqual([]);
