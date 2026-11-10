@@ -20,8 +20,16 @@
 --    própria loja (chaves compostas).
 --  - Fila da versão anterior com o crédito já baixado: só com prova na nuvem (abaixo).
 --  - Cancelamento de item que deixa o desconto abaixo do cashback usado devolve a
---    diferença ao cliente (REFUND + audit_log CASHBACK_REFUNDED, só pelo banco).
+--    diferença ao cliente (REFUND + audit_log CASHBACK_REFUNDED, só pelo banco). O valor
+--    devolvido vence junto com o crédito de onde saiu (decisão do Will, 10/11/2026: o
+--    cashback vale 30 dias de quando foi gerado, com ou sem cancelamento).
 -- =============================================================================
+
+-- De onde saiu cada resgate (redeem_sources: [{source_id, amount}], gravado só pela função
+-- do resgate) e de qual crédito é cada estorno (refund_of_id). É o que faz o estorno herdar
+-- a validade do crédito original.
+ALTER TABLE cashback_ledger ADD COLUMN IF NOT EXISTS redeem_sources JSONB;
+ALTER TABLE cashback_ledger ADD COLUMN IF NOT EXISTS refund_of_id UUID REFERENCES cashback_ledger(id);
 
 -- O aparelho grava o crédito (EARN, conferido abaixo); resgate e expiração não.
 CREATE OR REPLACE FUNCTION tchefood_cashback_ledger_check()
@@ -32,6 +40,9 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: resgate de cashback só pela função do servidor (tchefood_register_cashback_redeem).';
     END IF;
     IF NEW.entry_type = 'EARN' THEN
+        IF NEW.redeem_sources IS NOT NULL OR NEW.refund_of_id IS NOT NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_CASHBACK: crédito não leva origem de resgate nem de estorno.';
+        END IF;
         SELECT * INTO v_order FROM orders WHERE id = NEW.order_id;
         IF NOT FOUND OR v_order.status <> 'CLOSED' THEN
             RAISE EXCEPTION 'TCHEFOOD_CASHBACK: crédito só para conta encerrada.';
@@ -55,7 +66,8 @@ BEGIN
     IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'TCHEFOOD_CASHBACK: extrato é somente inserção.'; END IF;
     IF NEW.amount <> OLD.amount OR NEW.entry_type <> OLD.entry_type OR NEW.customer_id <> OLD.customer_id
        OR NEW.order_id IS DISTINCT FROM OLD.order_id OR NEW.valid_from IS DISTINCT FROM OLD.valid_from
-       OR NEW.expires_at IS DISTINCT FROM OLD.expires_at OR NEW.remaining_amount > OLD.remaining_amount THEN
+       OR NEW.expires_at IS DISTINCT FROM OLD.expires_at OR NEW.remaining_amount > OLD.remaining_amount
+       OR NEW.redeem_sources IS DISTINCT FROM OLD.redeem_sources OR NEW.refund_of_id IS DISTINCT FROM OLD.refund_of_id THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: extrato é somente inserção.';
     END IF;
     IF NEW.remaining_amount <> OLD.remaining_amount AND current_user IN ('anon', 'authenticated') THEN
@@ -98,6 +110,7 @@ DECLARE
     -- (p_created_at) pode ser forjada e só fica registrada no audit_log.
     v_at TIMESTAMPTZ := tchefood_cashback_now();
     v_available NUMERIC(10,2); v_cap NUMERIC(10,2); v_amount NUMERIC(10,2); v_left NUMERIC(10,2); v_take NUMERIC(10,2);
+    v_sources JSONB := '[]'::jsonb;
     v_predebited NUMERIC(10,2) := 0; v_from_predebit NUMERIC(10,2) := 0;
     v_orphan NUMERIC(10,2); v_pending_count INT; v_pending_sum NUMERIC(10,2); v_legacy BOOLEAN := FALSE;
     r RECORD;
@@ -201,6 +214,10 @@ BEGIN
     -- O que já saiu na versão anterior não sai de novo; o resto, do crédito que vence antes.
     v_from_predebit := LEAST(v_predebited, v_amount);
     v_left := v_amount - v_from_predebit;
+    -- A parte já baixada na versão anterior não tem origem conhecida (source_id nulo).
+    IF v_from_predebit > 0 THEN
+        v_sources := v_sources || jsonb_build_array(jsonb_build_object('source_id', NULL, 'amount', v_from_predebit));
+    END IF;
     FOR r IN SELECT id, remaining_amount FROM cashback_ledger
               WHERE tenant_id = v_tenant AND customer_id = p_customer_id AND entry_type IN ('EARN', 'REFUND') AND remaining_amount > 0
                 AND valid_from <= v_at AND expires_at > v_at
@@ -208,11 +225,12 @@ BEGIN
         EXIT WHEN v_left <= 0;
         v_take := LEAST(r.remaining_amount, v_left);
         UPDATE cashback_ledger SET remaining_amount = remaining_amount - v_take WHERE id = r.id;
+        v_sources := v_sources || jsonb_build_array(jsonb_build_object('source_id', r.id, 'amount', v_take));
         v_left := v_left - v_take;
     END LOOP;
 
-    INSERT INTO cashback_ledger (id, tenant_id, customer_id, order_id, entry_type, amount, created_by_user_id, created_at)
-    VALUES (p_redeem_id, v_tenant, p_customer_id, p_order_id, 'REDEEM', v_amount, p_user_id, v_at);
+    INSERT INTO cashback_ledger (id, tenant_id, customer_id, order_id, entry_type, amount, created_by_user_id, created_at, redeem_sources)
+    VALUES (p_redeem_id, v_tenant, p_customer_id, p_order_id, 'REDEEM', v_amount, p_user_id, v_at, v_sources);
 
     -- Fila de versão anterior: o audit_log do resgate pode já ter subido sozinho.
     -- Só vale reaproveitar o registro que já passou pela conferência da versão anterior
@@ -276,6 +294,7 @@ DECLARE
     v_performer staff_users%ROWTYPE;
     v_failures INT;
     v_id UUID;
+    v_discount_ok BOOLEAN;
     v_without_order BOOLEAN := p_action_type IN ('KIOSK_EXIT', 'KEG_CHANGED', 'CASH_WITHDRAWAL', 'CASH_CLOSE_DIFFERENCE');
 BEGIN
     IF v_tenant IS NULL THEN
@@ -291,10 +310,21 @@ BEGIN
     END IF;
     -- O gerente também troca o desconto manual por um menor (R$ 10 → R$ 5): a troca fica
     -- registrada e é ela que libera a redução em tchefood_orders_keep_discount.
-    IF p_action_type = 'DISCOUNT_APPLIED' AND (
-        (p_metadata->>'discount_before') IS NULL OR (p_metadata->>'discount_after') IS NULL
-        OR (p_metadata->>'discount_before')::numeric < 0 OR (p_metadata->>'discount_after')::numeric < 0
-        OR (p_metadata->>'discount_after')::numeric = (p_metadata->>'discount_before')::numeric) THEN
+    -- Os dois valores precisam ser números finitos, não negativos e diferentes. NaN e
+    -- Infinity passam por "< 0" e por "=" sem recusa (NaN é maior que qualquer número no
+    -- PostgreSQL), então o teto finito é conferido à parte; texto que não é número recusa igual.
+    IF p_action_type = 'DISCOUNT_APPLIED' THEN
+        BEGIN
+            v_discount_ok := (p_metadata->>'discount_before')::numeric >= 0
+                         AND (p_metadata->>'discount_before')::numeric < 1000000000
+                         AND (p_metadata->>'discount_after')::numeric >= 0
+                         AND (p_metadata->>'discount_after')::numeric < 1000000000
+                         AND (p_metadata->>'discount_after')::numeric <> (p_metadata->>'discount_before')::numeric;
+        EXCEPTION WHEN others THEN
+            v_discount_ok := FALSE;
+        END;
+    END IF;
+    IF p_action_type = 'DISCOUNT_APPLIED' AND NOT COALESCE(v_discount_ok, FALSE) THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: desconto precisa de discount_before e discount_after (diferentes) no metadata.';
     END IF;
     IF p_action_type = 'ITEM_CANCELED' AND (p_metadata->>'item_id') IS NULL THEN
@@ -481,10 +511,18 @@ CREATE TRIGGER trg_orders_00_keep_discount BEFORE UPDATE OF discount_amount ON o
 
 -- Estorno do cashback (decisão do Will, 10/11/2026: "devolva"). Quando o cancelamento de
 -- item deixa o desconto da conta abaixo do cashback que ela consumiu, a diferença volta
--- para o cliente como um lançamento REFUND: crédito novo, com saldo próprio, liberado na
--- hora e válido por tchefood_cashback_validity_days(). O EARN original não é tocado (o
--- extrato continua somente inserção). Cada estorno grava um audit_log CASHBACK_REFUNDED.
--- Idempotente: o valor é sempre (resgatado − já estornado) − desconto atual, calculado do
+-- para o cliente como lançamento REFUND: crédito com saldo próprio. O EARN original não é
+-- tocado (o extrato continua somente inserção). Cada estorno grava um audit_log
+-- CASHBACK_REFUNDED.
+-- Validade (decisão do Will, 10/11/2026): o cashback vale 30 dias de quando foi gerado,
+-- com ou sem cancelamento. O estorno não ganha prazo novo: cada parte volta com o
+-- valid_from e o expires_at do crédito de onde saiu (redeem_sources do resgate). Parte de
+-- crédito já vencido volta vencida (fica no extrato, não entra no saldo). Volta primeiro
+-- o crédito que vence por último (desfaz o resgate na ordem inversa da baixa).
+-- Resgate sem origem registrada (parte já baixada por aparelho da versão anterior): vence
+-- com o crédito consumido desse cliente que vence por último; sem nenhum, nada é
+-- inventado e o prazo conta do resgate.
+-- Idempotente: o total é sempre (resgatado − já estornado) − desconto atual, calculado do
 -- extrato com a conta travada; o reenvio do mesmo cancelamento não muda o desconto e não
 -- estorna de novo. Gatilho (não função chamável): o aparelho não consegue pedir estorno
 -- com um valor seu.
@@ -494,9 +532,16 @@ DECLARE
     v_redeem cashback_ledger%ROWTYPE;
     v_refunded NUMERIC(10,2);
     v_amount NUMERIC(10,2);
+    v_left NUMERIC(10,2);
+    v_back NUMERIC(10,2);
+    v_take NUMERIC(10,2);
+    v_from TIMESTAMPTZ;
+    v_until TIMESTAMPTZ;
+    v_refund_id UUID;
     v_user UUID;
     v_cancel UUID;
     v_now TIMESTAMPTZ := NOW();
+    s RECORD;
 BEGIN
     SELECT * INTO v_redeem FROM cashback_ledger
      WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'REDEEM';
@@ -510,19 +555,53 @@ BEGIN
      WHERE a.tenant_id = NEW.tenant_id AND a.order_id = NEW.id AND a.action_type = 'ITEM_CANCELED'
      ORDER BY a.server_seq DESC LIMIT 1;
     v_user := COALESCE(v_user, v_redeem.created_by_user_id);
-    INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount,
-                                 valid_from, expires_at, created_by_user_id, created_at)
-    VALUES (NEW.tenant_id, v_redeem.customer_id, NEW.id, 'REFUND', v_amount, v_amount,
-            v_now, v_now + make_interval(days => tchefood_cashback_validity_days()), v_user, v_now);
-    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact,
-                            reason, whatsapp_alert_sent, metadata, created_at)
-    VALUES (NEW.tenant_id, NEW.id, v_user, NULL, 'CASHBACK_REFUNDED', v_amount,
-            'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)', FALSE,
-            jsonb_build_object('customer_id', v_redeem.customer_id, 'amount', v_amount, 'redeem_id', v_redeem.id,
-                               'redeemed', v_redeem.amount, 'refunded_before', v_refunded,
-                               'discount_before', OLD.discount_amount, 'discount_after', NEW.discount_amount,
-                               'item_cancel_audit_id', v_cancel, 'server_verified', TRUE),
-            v_now);
+    v_left := v_amount;
+    FOR s IN
+        SELECT (x->>'source_id')::uuid AS source_id, (x->>'amount')::numeric AS taken, l.valid_from, l.expires_at
+          FROM jsonb_array_elements(COALESCE(v_redeem.redeem_sources,
+                 jsonb_build_array(jsonb_build_object('source_id', NULL, 'amount', v_redeem.amount)))) x
+          LEFT JOIN cashback_ledger l ON l.id = (x->>'source_id')::uuid AND l.tenant_id = NEW.tenant_id
+         ORDER BY l.expires_at DESC NULLS LAST, l.created_at DESC
+    LOOP
+        EXIT WHEN v_left <= 0;
+        SELECT COALESCE(SUM(amount), 0) INTO v_back FROM cashback_ledger
+         WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'REFUND'
+           AND refund_of_id IS NOT DISTINCT FROM s.source_id;
+        v_take := LEAST(s.taken - v_back, v_left);
+        CONTINUE WHEN v_take <= 0;
+        IF s.source_id IS NOT NULL THEN
+            v_from := s.valid_from;
+            v_until := s.expires_at;
+        ELSE
+            SELECT l.valid_from, l.expires_at INTO v_from, v_until FROM cashback_ledger l
+             WHERE l.tenant_id = NEW.tenant_id AND l.customer_id = v_redeem.customer_id
+               AND l.entry_type IN ('EARN', 'REFUND') AND l.amount > l.remaining_amount
+               AND l.created_at <= v_redeem.created_at
+             ORDER BY l.expires_at DESC LIMIT 1;
+            IF NOT FOUND THEN
+                v_from := v_redeem.created_at;
+                v_until := v_redeem.created_at + make_interval(days => tchefood_cashback_validity_days());
+            END IF;
+        END IF;
+        INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount,
+                                     valid_from, expires_at, created_by_user_id, created_at, refund_of_id)
+        VALUES (NEW.tenant_id, v_redeem.customer_id, NEW.id, 'REFUND', v_take, v_take,
+                v_from, v_until, v_user, v_now, s.source_id)
+        RETURNING id INTO v_refund_id;
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact,
+                                reason, whatsapp_alert_sent, metadata, created_at)
+        VALUES (NEW.tenant_id, NEW.id, v_user, NULL, 'CASHBACK_REFUNDED', v_take,
+                'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)', FALSE,
+                jsonb_build_object('customer_id', v_redeem.customer_id, 'amount', v_take, 'redeem_id', v_redeem.id,
+                                   'refund_id', v_refund_id, 'refund_of_id', s.source_id,
+                                   'expires_at', v_until, 'already_expired', v_until <= v_now,
+                                   'redeemed', v_redeem.amount, 'refunded_before', v_refunded,
+                                   'discount_before', OLD.discount_amount, 'discount_after', NEW.discount_amount,
+                                   'item_cancel_audit_id', v_cancel, 'server_verified', TRUE),
+                v_now);
+        v_refunded := v_refunded + v_take;
+        v_left := v_left - v_take;
+    END LOOP;
     RETURN NULL;
 END;
 $$;

@@ -560,6 +560,15 @@ export interface CashbackLedgerEntry {
   expires_at: ISODateTime | null;
   created_by_user_id: UUID | null;
   created_at: ISODateTime;
+  /** REDEEM: de quais créditos saiu (gravado pelo banco; source_id nulo = origem desconhecida). */
+  redeem_sources?: CashbackRedeemSource[] | null;
+  /** REFUND: de qual crédito é esta devolução (vence com ele). */
+  refund_of_id?: UUID | null;
+}
+
+export interface CashbackRedeemSource {
+  source_id: UUID | null;
+  amount: number;
 }
 
 // ---------------------------------------------------------------------------

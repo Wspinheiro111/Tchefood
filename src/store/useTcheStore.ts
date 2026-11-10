@@ -102,12 +102,13 @@ import {
   balanceCashback,
   CASHBACK_DAYS_LABEL,
   CASHBACK_PCT,
-  CASHBACK_VALIDITY_DAYS,
   cashbackBase,
   cashbackEarnAmount,
   cashbackUsable,
   cashbackValidity,
+  cashbackFifoSources,
   consumeCashbackFifo,
+  planCashbackRefund,
   isCashbackDay,
   normalizeWhatsapp,
 } from '../lib/loyalty';
@@ -1507,45 +1508,50 @@ export const useTcheStore = create<TcheState>()(
             });
           });
 
-          const refund: CashbackLedgerEntry | null = redeem && refundCents > 0
-            ? {
+          // Cada parte volta com a validade do crédito de onde saiu (decisão do Will,
+          // 10/11/2026: o cashback vale 30 dias de quando foi gerado, com ou sem cancelamento).
+          const refunds: CashbackLedgerEntry[] = redeem && refundCents > 0
+            ? planCashbackRefund(get().cashbackLedger, redeem, fromCentsLocal(refundCents)).map((part) => ({
               id: uuid(),
               tenant_id: order.tenant_id,
               customer_id: redeem.customer_id,
               order_id: order.id,
               entry_type: 'REFUND',
-              amount: fromCentsLocal(refundCents),
-              remaining_amount: fromCentsLocal(refundCents),
+              amount: part.amount,
+              remaining_amount: part.amount,
               base_amount: null,
               pct: null,
-              valid_from: ts,
-              expires_at: new Date(new Date(ts).getTime() + CASHBACK_VALIDITY_DAYS * 86_400_000).toISOString(),
+              valid_from: part.valid_from,
+              expires_at: part.expires_at,
               created_by_user_id: user.id,
               created_at: ts,
-            }
-            : null;
-          const refundLog: AuditLog | null = refund
-            ? {
-              ...buildAudit({
-                order_id: order.id,
-                performed_by_user_id: user.id,
-                authorized_by_manager_id: null,
-                action_type: 'CASHBACK_REFUNDED',
-                amount_impact: refund.amount,
-                reason: 'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)',
-                metadata: {
-                  table: tableLabel(order.table_id),
-                  customer_id: refund.customer_id,
-                  amount: refund.amount,
-                  redeem_id: redeem!.id,
-                  discount_before: order.discount_amount,
-                  discount_after: simulated.discount_amount,
-                  item_cancel_audit_id: log.id,
-                },
-              }),
-              whatsapp_alert_sent: false,
-            }
-            : null;
+              refund_of_id: part.refund_of_id,
+            }))
+            : [];
+          const refundLogs: AuditLog[] = refunds.map((refund) => ({
+            ...buildAudit({
+              order_id: order.id,
+              performed_by_user_id: user.id,
+              authorized_by_manager_id: null,
+              action_type: 'CASHBACK_REFUNDED',
+              amount_impact: refund.amount,
+              reason: 'Cashback devolvido ao cliente (cancelamento deixou o desconto abaixo do cashback usado)',
+              metadata: {
+                table: tableLabel(order.table_id),
+                customer_id: refund.customer_id,
+                amount: refund.amount,
+                redeem_id: redeem!.id,
+                refund_id: refund.id,
+                refund_of_id: refund.refund_of_id ?? null,
+                expires_at: refund.expires_at,
+                already_expired: new Date(refund.expires_at!) <= new Date(ts),
+                discount_before: order.discount_amount,
+                discount_after: simulated.discount_amount,
+                item_cancel_audit_id: log.id,
+              },
+            }),
+            whatsapp_alert_sent: false,
+          }));
 
           set((s) => {
             const orderItems = s.orderItems.map((i) => canceledById.get(i.id) ?? i);
@@ -1558,13 +1564,14 @@ export const useTcheStore = create<TcheState>()(
             }
             const patch = commitAdjustment(s, recalculated, orderItems, [...canceledById.values()], [log, ...partLogs], auth.managerPin);
             // Estorno: só local (o banco grava o dele ao receber o cancelamento).
-            const cashbackLedger = refund ? [...s.cashbackLedger, refund] : s.cashbackLedger;
-            const loyaltyCustomers = refund
-              ? s.loyaltyCustomers.map((c) => (c.id === refund.customer_id ? { ...c, cashback_balance: balanceCashback(cashbackLedger, c.id, new Date(ts)) } : c))
+            const cashbackLedger = refunds.length ? [...s.cashbackLedger, ...refunds] : s.cashbackLedger;
+            const refundCustomer = refunds[0]?.customer_id;
+            const loyaltyCustomers = refundCustomer
+              ? s.loyaltyCustomers.map((c) => (c.id === refundCustomer ? { ...c, cashback_balance: balanceCashback(cashbackLedger, c.id, new Date(ts)) } : c))
               : s.loyaltyCustomers;
             return {
               ...patch,
-              ...(refundLog ? { auditLogs: [refundLog, ...patch.auditLogs!] } : {}),
+              ...(refundLogs.length ? { auditLogs: [...refundLogs.reverse(), ...patch.auditLogs!] } : {}),
               cashbackLedger,
               loyaltyCustomers,
               kegTaps,
@@ -2825,6 +2832,8 @@ export const useTcheStore = create<TcheState>()(
           };
           let ledger: CashbackLedgerEntry[];
           try {
+            // De onde saiu o resgate: o estorno de um cancelamento vence junto com o crédito.
+            entry.redeem_sources = cashbackFifoSources(get().cashbackLedger, customer.id, amount, now);
             ledger = [...consumeCashbackFifo(get().cashbackLedger, customer.id, amount, now), entry];
           } catch (e) {
             return fail((e as Error).message);
