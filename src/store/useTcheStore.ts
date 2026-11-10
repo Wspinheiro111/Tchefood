@@ -2139,10 +2139,10 @@ export const useTcheStore = create<TcheState>()(
                 product_id: product.id,
                 waiter_id: user.id,
                 quantity: line.quantity,
-                // Preço sempre do cadastro, nunca do aparelho.
-                unit_price: product.price,
+                // Preço sempre do cadastro (com a regra de horário, como na comanda), nunca do aparelho.
+                unit_price: effectivePrice(product, s0.priceSchedules, new Date(ts)),
                 modifiers_unit_price: mods,
-                total_item_price: computeItemTotal(line.quantity, product.price, mods),
+                total_item_price: computeItemTotal(line.quantity, effectivePrice(product, s0.priceSchedules, new Date(ts)), mods),
                 meat_doneness: line.meat_doneness,
                 notes: notes.length ? notes.join(' · ') : null,
                 sector: product.sector,
