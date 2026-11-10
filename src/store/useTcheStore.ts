@@ -3487,7 +3487,14 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
     const rule = out.halfAndHalfPricing === 'AVERAGE' ? 'AVERAGE' : 'HIGHEST';
     if (out.tenant && typeof out.tenant === 'object') {
       const t = out.tenant as Record<string, unknown>;
-      out.tenant = { ...t, half_and_half_pricing: t.half_and_half_pricing === 'AVERAGE' || t.half_and_half_pricing === 'HIGHEST' ? t.half_and_half_pricing : rule };
+      const migrated: Record<string, unknown> = { ...t, half_and_half_pricing: t.half_and_half_pricing === 'AVERAGE' || t.half_and_half_pricing === 'HIGHEST' ? t.half_and_half_pricing : rule };
+      out.tenant = migrated;
+      // Loja já ligada à nuvem com "média": o banco nasce com "maior preço" e o próximo download
+      // trocaria a regra em silêncio. Sobe a regra do aparelho antes.
+      if (out.cloud && migrated.half_and_half_pricing === 'AVERAGE' && typeof migrated.id === 'string') {
+        const queue = Array.isArray(out.outbox) ? (out.outbox as unknown[]) : [];
+        out.outbox = [...queue, syncEvent('tenants', 'UPDATE', migrated as { id: UUID })];
+      }
     }
     delete out.halfAndHalfPricing;
     if (Array.isArray(out.orderItems)) {

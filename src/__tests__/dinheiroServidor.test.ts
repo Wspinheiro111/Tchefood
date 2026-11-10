@@ -51,4 +51,12 @@ describe('dados para o servidor refazer o preço', () => {
     expect(out.halfAndHalfPricing).toBeUndefined();
     expect(out.orderItems).toEqual([{ id: 'i', priced_at: null, half_product_ids: [], modifier_option_ids: [] }]);
   });
+
+  it('migração v8: loja ligada à nuvem com "média" sobe a regra antes do próximo download', () => {
+    const out = migratePersisted({ tenant: { id: 't' }, halfAndHalfPricing: 'AVERAGE', cloud: { tenant_id: 't' }, outbox: [] }, 7) as { outbox: Array<{ table: string; op: string; payload: Record<string, unknown> }> };
+    expect(out.outbox).toHaveLength(1);
+    expect(out.outbox[0]).toMatchObject({ table: 'tenants', op: 'UPDATE', payload: { half_and_half_pricing: 'AVERAGE' } });
+    const highest = migratePersisted({ tenant: { id: 't' }, cloud: { tenant_id: 't' }, outbox: [] }, 7) as { outbox: unknown[] };
+    expect(highest.outbox).toHaveLength(0);
+  });
 });
