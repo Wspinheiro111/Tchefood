@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react';
-import { Banknote, CheckCircle2, CreditCard, Minus, MonitorSmartphone, Plus, Printer, QrCode as QrIcon, ShoppingBag, Trash2, UtensilsCrossed, XCircle } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Banknote, CheckCircle2, CreditCard, Keyboard, Minus, MonitorSmartphone, Plus, Printer, QrCode as QrIcon, Search, ShoppingBag, Trash2, UtensilsCrossed, XCircle } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
 import type { FulfillmentType, Order, Product } from '../types';
 import { computeItemTotal, formatBRL, round2 } from '../lib/money';
@@ -14,6 +14,19 @@ import { usePickupCart, usePickupMenu } from '../components/pickup/usePickupCart
 import { Badge, Btn, toast } from '../components/ui';
 import { CategoryIcon } from './OrderScreen';
 import { useSalePrice } from '../lib/useSalePrice';
+import { parsePdvQuery, PDV_SHORTCUTS, searchProducts } from '../lib/pdvSearch';
+
+/** Barra com os atalhos de teclado (só em tela larga, onde há teclado). */
+function ShortcutBar({ items }: { items: ReadonlyArray<readonly [string, string]> }) {
+  return (
+    <div className="mb-3 hidden flex-wrap items-center gap-x-3 gap-y-1 rounded-xl bg-surface px-3 py-2 text-xs text-slate-600 lg:flex" aria-label="Atalhos de teclado">
+      <Keyboard className="h-4 w-4" />
+      {items.map(([k, l]) => (
+        <span key={k}><kbd className="rounded border border-slate-300 bg-base px-1.5 py-0.5 font-mono font-bold text-slate-800">{k}</kbd> {l}</span>
+      ))}
+    </div>
+  );
+}
 
 type Method = 'CREDIT' | 'DEBIT' | 'PIX' | 'CASH';
 
@@ -23,6 +36,8 @@ const METHODS: Array<{ key: Method; label: string; icon: typeof CreditCard }> = 
   { key: 'PIX', label: 'Pix', icon: QrIcon },
   { key: 'CASH', label: 'Dinheiro', icon: Banknote },
 ];
+
+const METHOD_KEY: Record<Method, string> = { CREDIT: 'F3', DEBIT: 'F4', PIX: 'F6', CASH: 'F7' };
 
 const STAGE_BADGE: Record<KioskStage, { label: string; className: string }> = {
   AWAITING_PAYMENT: { label: 'Aguardando pagamento', className: 'bg-ouro text-slate-950' },
@@ -49,18 +64,41 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
   const { cats, sellable } = usePickupMenu();
   const [catId, setCatId] = useState('');
   const [selected, setSelected] = useState<Product | null>(null);
+  const [selectedQty, setSelectedQty] = useState(1);
   const [fulfillment, setFulfillment] = useState<FulfillmentType>('TAKEOUT');
   const [name, setName] = useState('');
   const activeCat = catId || cats[0]?.id || '';
   const list = sellable.filter((p) => p.category_id === activeCat);
+  const [query, setQuery] = useState('');
+  const [hit, setHit] = useState(0);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const parsed = parsePdvQuery(query);
+  const results = useMemo(() => searchProducts(sellable, parsed.term), [sellable, parsed.term]);
 
-  const tap = (p: Product) => {
+  const tap = (p: Product, qty = 1) => {
     if (!p.available) return toast.error(`${p.name} em falta hoje.`);
-    if (cart.needsOptions(p)) return setSelected(p);
-    cart.addSimple(p);
+    if (cart.needsOptions(p)) {
+      setSelectedQty(qty);
+      return setSelected(p);
+    }
+    cart.add({ product_id: p.id, quantity: qty, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' });
+  };
+
+  /** Enter na busca: lança o produto marcado e volta para a busca vazia. */
+  const launchHit = () => {
+    const p = results[Math.min(hit, results.length - 1)];
+    if (!p) {
+      if (parsed.term) toast.error(`Nenhum produto com "${parsed.term}".`);
+      return;
+    }
+    tap(p, parsed.qty);
+    setQuery('');
+    setHit(0);
   };
 
   const goPay = () => {
+    if (cart.count === 0) return toast.error('Pedido vazio: lance um produto.');
     const r = useTcheStore.getState().createPickupOrder({ lines: cart.toInput(), fulfillment, customerName: name });
     if (!r.ok) return toast.error(r.error);
     cart.clear();
@@ -68,9 +106,81 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
     onCheckout(r.data.id);
   };
 
+  // Atalhos de teclado do PDV (fora quando a ficha de opções está aberta).
+  const keys = useRef({ goPay, cart, setFulfillment });
+  keys.current = { goPay, cart, setFulfillment };
+  useEffect(() => {
+    if (selected) return;
+    const onKey = (e: KeyboardEvent) => {
+      const k = keys.current;
+      if (e.key === 'F1') searchRef.current?.focus();
+      else if (e.key === 'F2') k.goPay();
+      else if (e.key === 'F6') nameRef.current?.focus();
+      else if (e.key === 'F8') {
+        const last = k.cart.lines.at(-1);
+        if (last) k.cart.setQty(last.key, last.quantity - 1);
+      } else if (e.key === 'F9') k.setFulfillment((f) => (f === 'TAKEOUT' ? 'DINE_IN' : 'TAKEOUT'));
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selected]);
+
+  // A busca fica travada com a ficha aberta; ao fechar, o cursor volta para ela (depois de destravar).
+  useEffect(() => {
+    if (!selected) searchRef.current?.focus();
+  }, [selected]);
+
   return (
     <div className="mx-auto grid max-w-6xl gap-3 px-3 pb-10 pt-3 lg:grid-cols-[minmax(0,1fr)_360px]">
       <div className="min-w-0">
+        <ShortcutBar items={PDV_SHORTCUTS.builder} />
+        <div className="relative mb-3">
+          <label className="flex items-center gap-2 rounded-xl border-2 border-slate-300 bg-base px-3 focus-within:border-ouro">
+            <Search className="h-5 w-5 text-slate-400" />
+            <input
+              ref={searchRef}
+              autoFocus
+              // Com a ficha de opções aberta a busca fica travada: digitar ou ler outro código não mexe no pedido por trás.
+              disabled={selected !== null}
+              value={query}
+              onChange={(e) => { setQuery(e.target.value); setHit(0); }}
+              onKeyDown={(e) => {
+                if (selected) return;
+                if (e.key === 'Enter') { e.preventDefault(); launchHit(); }
+                else if (e.key === 'ArrowDown') { e.preventDefault(); setHit((h) => Math.min(h + 1, Math.max(0, results.length - 1))); }
+                else if (e.key === 'ArrowUp') { e.preventDefault(); setHit((h) => Math.max(0, h - 1)); }
+                else if (e.key === 'Escape') { setQuery(''); setHit(0); }
+              }}
+              placeholder="Buscar: nome, código ou código de barras (3*101 = 3 do código 101)"
+              aria-label="Buscar produto"
+              role="combobox"
+              aria-expanded={results.length > 0}
+              aria-controls="pdv-results"
+              className="min-h-touch w-full bg-transparent outline-none"
+            />
+            {parsed.qty > 1 && <Badge className="bg-ouro text-slate-950">{parsed.qty}x</Badge>}
+          </label>
+          {results.length > 0 && (
+            <ul id="pdv-results" role="listbox" className="absolute inset-x-0 top-full z-10 mt-1 overflow-hidden rounded-xl border border-slate-200 bg-base shadow-lg">
+              {results.map((p, i) => (
+                <li key={p.id} role="option" aria-selected={i === hit}>
+                  <button
+                    onMouseEnter={() => setHit(i)}
+                    onClick={() => { tap(p, parsed.qty); setQuery(''); setHit(0); searchRef.current?.focus(); }}
+                    className={`flex min-h-touch w-full items-center gap-3 px-3 text-left text-sm ${i === hit ? 'bg-ouro/25' : ''} ${p.available ? '' : 'opacity-50'}`}
+                  >
+                    <span className="w-12 font-mono text-xs text-slate-500">{p.code}</span>
+                    <span className="flex-1 font-semibold">{p.name}{!p.available && ' · em falta'}</span>
+                    {cart.needsOptions(p) && <Badge className="bg-slate-200">opções</Badge>}
+                    <span className="font-black tabular-nums text-brasa">{formatBRL(priceOf(p))}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
         <div className="scroll-thin -mx-3 mb-3 flex gap-2 overflow-x-auto px-3 pb-1">
           {cats.map((c) => (
             <button key={c.id} onClick={() => setCatId(c.id)} className={`flex min-h-touch shrink-0 items-center gap-2 rounded-full px-4 font-semibold ${activeCat === c.id ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}>
@@ -100,7 +210,7 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
             </button>
           ))}
         </div>
-        <input value={name} onChange={(e) => setName(e.target.value)} maxLength={20} placeholder="Nome do cliente (para chamar)" className="mb-3 min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
+        <input ref={nameRef} value={name} onChange={(e) => setName(e.target.value)} maxLength={20} placeholder="Nome do cliente (para chamar)" className="mb-3 min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
         {cart.lines.length === 0 ? (
           <p className="py-6 text-center text-sm text-slate-500">Toque nos produtos para montar o pedido.</p>
         ) : (
@@ -120,11 +230,11 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
           </ul>
         )}
         <div className="mb-3 flex items-end justify-between"><span className="text-slate-500">Total</span><span className="text-3xl font-black tabular-nums text-brasa">{formatBRL(cart.total)}</span></div>
-        <Btn block size="lg" variant="success" disabled={cart.count === 0} onClick={goPay}>Cobrar e gerar senha</Btn>
+        <Btn block size="lg" variant="success" disabled={cart.count === 0} onClick={goPay}>Cobrar e gerar senha <kbd className="hidden rounded bg-white/20 px-1.5 text-xs lg:inline">F2</kbd></Btn>
         <p className="mt-2 text-center text-[11px] text-slate-500">Sem os 10% do garçom. O pedido vai para a cozinha assim que o pagamento for aprovado.</p>
       </aside>
 
-      <ProductSheet product={selected} onClose={() => setSelected(null)} onConfirm={(d) => { cart.addDraft(d); setSelected(null); }} confirmLabel="Adicionar ao pedido" />
+      <ProductSheet product={selected} initialQty={selectedQty} onClose={() => { setSelected(null); searchRef.current?.focus(); }} onConfirm={(d) => { cart.addDraft(d); setSelected(null); searchRef.current?.focus(); }} confirmLabel="Adicionar ao pedido" />
     </div>
   );
 }
@@ -208,6 +318,26 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
   const [hold, setHold] = useState(() => getReviewHold(orderId));
   const [voidOpen, setVoidOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const cashRef = useRef<HTMLInputElement>(null);
+
+  // Atalhos da cobrança (desligados com o PIN do gerente ou o comprovante abertos).
+  const keys = useRef({ charge: () => {}, onDone, blocked: false });
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const k = keys.current;
+      if (k.blocked) return;
+      const pick: Record<string, Method> = { F3: 'CREDIT', F4: 'DEBIT', F6: 'PIX', F7: 'CASH' };
+      if (e.key === 'F2') void k.charge();
+      else if (pick[e.key]) {
+        setMethod(pick[e.key]!);
+        if (pick[e.key] === 'CASH') setTimeout(() => cashRef.current?.focus(), 0);
+      } else if (e.key === 'Escape') k.onDone();
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   if (!order) return null;
   const number = formatPickupNumber(order.pickup_number);
@@ -229,6 +359,8 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
       setBusy(false);
     }
   };
+
+  keys.current = { charge: hold || order.status !== 'PAYING' ? () => {} : charge, onDone, blocked: voidOpen || confirmOpen };
 
   if (order.status === 'CLOSED') {
     return (
@@ -258,6 +390,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
 
   return (
     <div className="mx-auto max-w-xl px-3 pb-10 pt-3">
+      <ShortcutBar items={PDV_SHORTCUTS.checkout} />
       <div className="mb-3 rounded-2xl border border-slate-200 bg-surface p-3">
         <div className="mb-2 flex items-baseline justify-between">
           <div>
@@ -282,11 +415,14 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
 
       <div className="mb-3 grid grid-cols-4 gap-2">
         {METHODS.map((m) => (
-          <button key={m.key} onClick={() => setMethod(m.key)} className={`flex min-h-touch-lg flex-col items-center justify-center gap-1 rounded-xl text-sm font-bold ${method === m.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}><m.icon className="h-5 w-5" /> {m.label}</button>
+          <button key={m.key} onClick={() => setMethod(m.key)} className={`flex min-h-touch-lg flex-col items-center justify-center gap-1 rounded-xl text-sm font-bold ${method === m.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}>
+            <m.icon className="h-5 w-5" /> {m.label}
+            <kbd className="hidden text-[10px] font-mono text-slate-500 lg:block">{METHOD_KEY[m.key]}</kbd>
+          </button>
         ))}
       </div>
       {method === 'CASH' ? (
-        <input inputMode="decimal" value={cashGiven} onChange={(e) => setCashGiven(e.target.value.replace(/[^\d.,]/g, ''))} placeholder="Valor recebido (para troco)" className="mb-3 min-h-touch-lg w-full rounded-xl border border-slate-300 bg-base px-3 text-lg outline-none focus:border-ouro" />
+        <input ref={cashRef} inputMode="decimal" value={cashGiven} onChange={(e) => setCashGiven(e.target.value.replace(/[^\d.,]/g, ''))} placeholder="Valor recebido (para troco)" className="mb-3 min-h-touch-lg w-full rounded-xl border border-slate-300 bg-base px-3 text-lg outline-none focus:border-ouro" />
       ) : (
         <div className="mb-3 grid grid-cols-2 gap-2">
           <button onClick={() => setChassis('STONE')} className={`min-h-touch-lg rounded-xl font-bold ${chassis === 'STONE' ? 'bg-stone text-white' : 'bg-base'}`}>SmartPOS Stone</button>

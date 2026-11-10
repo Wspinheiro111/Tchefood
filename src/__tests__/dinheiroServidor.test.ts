@@ -45,18 +45,18 @@ describe('dados para o servidor refazer o preço', () => {
     expect(() => buildSyncRequest({ id: 'e', table: 'payments', op: 'UPDATE', row_id: 'P', payload: { id: 'P' }, created_at: '' }, cfg)).toThrow();
   });
 
-  it('migração v8: a regra do aparelho vira a da loja e os itens antigos ficam sem os campos novos', () => {
-    const out = migratePersisted({ tenant: { id: 't' }, halfAndHalfPricing: 'AVERAGE', orderItems: [{ id: 'i' }] }, 7) as Record<string, unknown>;
+  it('migração v9: a regra do aparelho vira a da loja e os itens antigos ficam sem os campos novos', () => {
+    const out = migratePersisted({ tenant: { id: 't' }, halfAndHalfPricing: 'AVERAGE', orderItems: [{ id: 'i' }] }, 8) as Record<string, unknown>;
     expect(out.tenant).toEqual({ id: 't', half_and_half_pricing: 'AVERAGE' });
     expect(out.halfAndHalfPricing).toBeUndefined();
     expect(out.orderItems).toEqual([{ id: 'i', priced_at: null, half_product_ids: [], modifier_option_ids: [] }]);
   });
 
-  it('migração v8: loja ligada à nuvem com "média" sobe a regra antes do próximo download', () => {
-    const out = migratePersisted({ tenant: { id: 't' }, halfAndHalfPricing: 'AVERAGE', cloud: { tenant_id: 't' }, outbox: [] }, 7) as { outbox: Array<{ table: string; op: string; payload: Record<string, unknown> }> };
+  it('migração v9: loja ligada à nuvem com "média" sobe a regra antes do próximo download', () => {
+    const out = migratePersisted({ tenant: { id: 't' }, halfAndHalfPricing: 'AVERAGE', cloud: { tenant_id: 't' }, outbox: [] }, 8) as { outbox: Array<{ table: string; op: string; payload: Record<string, unknown> }> };
     expect(out.outbox).toHaveLength(1);
     expect(out.outbox[0]).toMatchObject({ table: 'tenants', op: 'UPDATE', payload: { half_and_half_pricing: 'AVERAGE' } });
-    const highest = migratePersisted({ tenant: { id: 't' }, cloud: { tenant_id: 't' }, outbox: [] }, 7) as { outbox: unknown[] };
+    const highest = migratePersisted({ tenant: { id: 't' }, cloud: { tenant_id: 't' }, outbox: [] }, 8) as { outbox: unknown[] };
     expect(highest.outbox).toHaveLength(0);
   });
 });
