@@ -431,14 +431,25 @@ END $$;
 -- que o consumo). Qualquer outra redução vinda do aparelho é uma atualização antiga da fila
 -- (feita antes de outro desconto chegar à nuvem) e apagaria o desconto já gravado: o banco
 -- recusa.
+-- P0-01 da rodada 7 do GPT: a autorização de desconto vale uma vez. orders.discount_auth_seq
+-- guarda a sequência (server_seq) da última DISCOUNT_APPLIED usada nesta conta; só uma
+-- autorização mais nova libera outra troca. Assim a autorização 0 → 5 já aplicada não volta a
+-- valer quando o desconto cai a 0 (itens cancelados, estorno do cashback) e o aparelho manda 5
+-- de novo. O aparelho não grava a coluna (o gatilho mantém a do banco).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_auth_seq BIGINT NOT NULL DEFAULT 0;
+
 CREATE OR REPLACE FUNCTION tchefood_orders_keep_discount()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
     v_ok BOOLEAN;
+    v_auth_seq BIGINT;
     v_redeemed NUMERIC(10,2);
     v_subtotal NUMERIC(10,2);
     v_fee NUMERIC(10,2);
 BEGIN
+    IF current_user IN ('anon', 'authenticated') AND pg_trigger_depth() = 1 THEN
+        NEW.discount_auth_seq := OLD.discount_auth_seq;
+    END IF;
     IF NEW.discount_amount = OLD.discount_amount THEN
         RETURN NEW;
     END IF;
@@ -453,11 +464,18 @@ BEGIN
     SELECT COALESCE(SUM(l.amount), 0) INTO v_redeemed FROM cashback_ledger l
      WHERE l.order_id = NEW.id AND l.tenant_id = NEW.tenant_id AND l.entry_type = 'REDEEM';
     -- A última DISCOUNT_APPLIED da conta (pela sequência do servidor), de gerente ativo,
-    -- conferindo com o valor do banco e o novo.
+    -- conferindo com o valor do banco e o novo, ainda não usada nesta conta e mais nova que o
+    -- último resgate ou estorno do cashback da conta (autorização de antes do estorno não
+    -- vale depois dele).
     SELECT (a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
        AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
        AND m.role IN ('MANAGER', 'OWNER') AND m.active
-      INTO v_ok
+       AND a.server_seq > OLD.discount_auth_seq
+       AND a.server_seq > COALESCE((SELECT max(c.server_seq) FROM audit_logs c
+                                     WHERE c.tenant_id = NEW.tenant_id AND c.order_id = NEW.id
+                                       AND c.action_type IN ('CASHBACK_REDEEMED', 'CASHBACK_REFUNDED')), 0),
+           a.server_seq
+      INTO v_ok, v_auth_seq
       FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id AND m.tenant_id = a.tenant_id
      WHERE a.order_id = NEW.id AND a.tenant_id = NEW.tenant_id AND a.action_type = 'DISCOUNT_APPLIED'
      ORDER BY a.server_seq DESC
@@ -484,6 +502,7 @@ BEGIN
                 to_char(OLD.discount_amount, 'FM999999990.00'), to_char(NEW.discount_amount, 'FM999999990.00');
         END IF;
         -- Sem cashback, o aumento é conferido por tchefood_require_order_audit (PIN de gerente).
+        IF COALESCE(v_ok, false) THEN NEW.discount_auth_seq := v_auth_seq; END IF;
         RETURN NEW;
     END IF;
     -- Redução que só limita o desconto ao bruto que a conta terá com esta mesma atualização
@@ -503,11 +522,12 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ % e este aparelho mandou R$ % (outro aparelho ou o cashback mudou a conta). Use o desconto da nuvem antes de cobrar.',
             to_char(OLD.discount_amount, 'FM999999990.00'), to_char(NEW.discount_amount, 'FM999999990.00');
     END IF;
+    NEW.discount_auth_seq := v_auth_seq;
     RETURN NEW;
 END;
 $$;
 DROP TRIGGER IF EXISTS trg_orders_00_keep_discount ON orders;
-CREATE TRIGGER trg_orders_00_keep_discount BEFORE UPDATE OF discount_amount ON orders
+CREATE TRIGGER trg_orders_00_keep_discount BEFORE UPDATE OF discount_amount, discount_auth_seq ON orders
     FOR EACH ROW EXECUTE FUNCTION tchefood_orders_keep_discount();
 
 -- Estorno do cashback (decisão do Will, 10/11/2026: "devolva"). Quando o cancelamento de

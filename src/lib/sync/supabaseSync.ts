@@ -449,9 +449,10 @@ export async function flushOutbox(
   const sent: string[] = [];
   const rejected: SyncRejection[] = [];
   const blocked = new Set(held.flatMap(recordKeys));
-  // Eventos que não subiram (recusados guardados, recusados ou segurados nesta rodada): quem
-  // depende de um deles (depends_on_event_ids) espera.
-  const unsent = new Set(held.map((e) => e.id));
+  // Eventos que ainda não subiram: recusados guardados e toda a fila, até cada um ser aceito
+  // nesta rodada. Quem depende de um deles (depends_on_event_ids) espera, também quando a
+  // dependência está mais adiante na fila (P2-01 da rodada 7 do GPT) ou passou do limite.
+  const unsent = new Set([...held, ...events].map((e) => e.id));
   const reject = (event: SyncEvent, status: number, message: string) => {
     rejected.push({ eventId: event.id, status, message });
     unsent.add(event.id);
@@ -507,6 +508,7 @@ export async function flushOutbox(
         continue;
       }
       sent.push(event.id);
+      unsent.delete(event.id);
       continue;
     }
     if (res.status === 401) return { sent, retryLater: 'Sessão da nuvem expirada. Renovando o acesso.', rejected };

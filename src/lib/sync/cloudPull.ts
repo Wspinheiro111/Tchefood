@@ -325,12 +325,13 @@ export function mergeCashback(
     if (e.table === 'cashback_ledger' && typeof e.payload.customer_id === 'string') kept.add(e.payload.customer_id);
   }
   for (const l of local.cashbackLedger) if (l.order_id && pendingOrders.has(l.order_id)) kept.add(l.customer_id);
-  const cloudIds = new Set(cloud.cashbackLedger.map((e) => e.id));
   const customers = mergeRows(local.loyaltyCustomers, cloud.loyaltyCustomers, new Set([...kept].map((id) => `loyalty_customers:${id}`)), {
     table: 'loyalty_customers', key: (r: LoyaltyCustomer) => r.id, dropMissing: false,
   });
   const ledger = [
-    ...local.cashbackLedger.filter((l) => kept.has(l.customer_id) || (!cloudIds.has(l.id) && l.entry_type !== 'REFUND')),
+    // P2-01 da rodada 7 do GPT: sem nada do cliente na fila ou recusado, o extrato da nuvem
+    // substitui todo o daqui (crédito ou resgate que só existe aqui não fica como saldo).
+    ...local.cashbackLedger.filter((l) => kept.has(l.customer_id)),
     ...cloud.cashbackLedger.filter((c) => !kept.has(c.customer_id)),
   ];
   return { loyaltyCustomers: customers, cashbackLedger: ledger };

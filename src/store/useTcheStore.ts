@@ -3846,7 +3846,14 @@ export const useTcheStore = create<TcheState>()(
           // cashback ainda usado volta ao cliente. Estorno já aceito pela nuvem fica como está.
           const queueIds = new Set(get().outbox.map((e) => e.id));
           const localRedeem = get().cashbackLedger.find((e) => e.order_id === orderId && e.entry_type === 'REDEEM');
-          const redeemQueued = !!localRedeem && queueIds.has(localRedeem.id);
+          // P1-01 da rodada 7 do GPT: o resgate está na fila (ou recusado) pelo registro que o
+          // evento leva (row_id), não pelo id do evento. Enquanto ele não sobe, o banco não tem o
+          // resgate: os estornos só contam a partir do ponto da fila em que ele entra.
+          const redeemQueued =
+            !!localRedeem &&
+            [...get().outbox, ...(get().syncRejected ?? []).map((r) => r.event)].some(
+              (e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.entry_type === 'REDEEM' && e.row_id === localRedeem.id,
+            );
           const refundGroups = new Map<UUID, CashbackLedgerEntry[]>();
           for (const r of get().cashbackLedger) {
             if (r.order_id !== orderId || r.entry_type !== 'REFUND' || !r.source_event_id || !queueIds.has(r.source_event_id)) continue;

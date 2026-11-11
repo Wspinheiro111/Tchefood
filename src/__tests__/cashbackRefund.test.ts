@@ -70,4 +70,19 @@ describe('cashback vindo da nuvem', () => {
       expect(out.loyaltyCustomers[0]!.cashback_balance).toBe(0);
     }
   });
+
+  // P2-01 da rodada 7 do GPT: o que só existe aqui e não está na fila nem recusado sai.
+  it('crédito ou resgate que só existe aqui, sem nada na fila, sai do extrato', () => {
+    const none = { loyaltyCustomers: [{ ...customer, cashback_balance: 0 }], cashbackLedger: [] as CashbackLedgerEntry[] };
+    const orphanEarn = mergeCashback({ loyaltyCustomers: [customer], cashbackLedger: [earn] }, none, []);
+    expect(orphanEarn.cashbackLedger).toEqual([]);
+    expect(orphanEarn.loyaltyCustomers[0]!.cashback_balance).toBe(0);
+    const redeem = entry({ id: 'r', customer_id: 'c1', order_id: 'o', entry_type: 'REDEEM', amount: 10 });
+    const orphanRedeem = mergeCashback({ loyaltyCustomers: [customer], cashbackLedger: [{ ...earn, remaining_amount: 0 }, redeem] }, { ...none, cashbackLedger: [earn] }, []);
+    expect(orphanRedeem.cashbackLedger.map((e) => [e.id, e.remaining_amount])).toEqual([['e1', 10]]);
+    // Crédito ainda na fila continua aqui.
+    const pending = mergeCashback({ loyaltyCustomers: [customer], cashbackLedger: [earn] }, none, [{ table: 'cashback_ledger', row_id: 'e1', payload: { customer_id: 'c1' } }]);
+    expect(pending.cashbackLedger.map((e) => e.id)).toEqual(['e1']);
+    expect(pending.loyaltyCustomers[0]!.cashback_balance).toBe(10);
+  });
 });
