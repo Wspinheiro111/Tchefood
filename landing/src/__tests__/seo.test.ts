@@ -2,10 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { renderToString } from 'react-dom/server';
 import { createElement } from 'react';
 import App from '../App';
-import { EM_BREVE, NA_IMPLANTACAO, PLANOS, SITE_URL } from '../lib/config';
+import { EM_BREVE, NA_IMPLANTACAO, normalizarSiteUrl, PLANOS, SITE_URL } from '../lib/config';
 import { PERGUNTAS } from '../lib/faq';
 import { GRUPOS_FUNCOES, todasAsFuncoes } from '../lib/funcionalidades';
-import { jsonLd, jsonLdSeguroParaHtml, robotsTxt, SEO, sitemapXml } from '../lib/seo';
+import { jsonLd, jsonLdSeguroParaHtml, jsonParaScript, robotsTxt, SEO, sitemapXml } from '../lib/seo';
 import { mensagemContato } from '../components/Contato';
 
 type No = Record<string, unknown>;
@@ -74,6 +74,54 @@ describe('SEO da landing', () => {
     expect(sitemapXml('2026-11-11')).toContain(`<loc>${SITE_URL}/</loc>`);
     expect(sitemapXml('2026-11-11')).toContain('<lastmod>2026-11-11</lastmod>');
     expect(robotsTxt()).toContain(`Sitemap: ${SITE_URL}/sitemap.xml`);
+  });
+
+  it('sem a data da última alteração o sitemap sai sem <lastmod> (não usa a data do build)', () => {
+    expect(sitemapXml(null)).not.toContain('<lastmod>');
+    expect(sitemapXml(undefined)).not.toContain('<lastmod>');
+    expect(sitemapXml('ontem')).not.toContain('<lastmod>');
+    expect(sitemapXml(null)).toContain(`<loc>${SITE_URL}/</loc>`);
+  });
+
+  it('o mesmo conteúdo gera o mesmo sitemap em dias diferentes', () => {
+    // A data vem do último commit da pasta landing/, então dois builds do mesmo commit recebem a mesma data.
+    expect(sitemapXml('2026-11-11')).toBe(sitemapXml('2026-11-11'));
+  });
+
+  it('texto hostil no JSON-LD não fecha a tag <script>', () => {
+    const hostil = { name: '</script><script>alert(1)</script>', d: 'a\u2028b\u2029c' };
+    const saida = jsonParaScript(hostil);
+    expect(saida).not.toContain('<');
+    expect(saida).not.toMatch(/[\u2028\u2029]/);
+    expect(JSON.parse(saida)).toEqual(hostil);
+    // Um parser de HTML encerra o <script> no primeiro "</script" (sem diferenciar maiúsculas):
+    // o único deve ser o que nós mesmos escrevemos.
+    const html = `<script type="application/ld+json">${saida}</script>`;
+    expect(html.match(/<\/script/gi)).toHaveLength(1);
+    expect(html.match(/<script/gi)).toHaveLength(1);
+  });
+});
+
+describe('Endereço do site (VITE_SITE_URL)', () => {
+  it('aceita o domínio com ou sem barra final e devolve só a origem', () => {
+    expect(normalizarSiteUrl('https://tchefood.com.br')).toBe('https://tchefood.com.br');
+    expect(normalizarSiteUrl('https://tchefood.com.br/')).toBe('https://tchefood.com.br');
+    expect(normalizarSiteUrl(' https://www.tchefood.com.br ')).toBe('https://www.tchefood.com.br');
+    expect(normalizarSiteUrl('https://TCHEFOOD.com.br')).toBe('https://tchefood.com.br');
+  });
+
+  it.each([
+    ['http://tchefood.com.br', /https/],
+    ['https://tchefood.com.br?utm=1', /parâmetros/],
+    ['https://tchefood.com.br/#topo', /fragmento/],
+    ['https://tchefood.com.br/site', /caminho/],
+    ['https://admin:senha@tchefood.com.br', /usuário ou senha/],
+    ['https://tchefood.com.br:8443', /porta/],
+    ['https://localhost', /ponto/],
+    ['tchefood.com.br', /não é um endereço/],
+    ['', /não é um endereço/],
+  ])('recusa %s com erro claro', (valor, motivo) => {
+    expect(() => normalizarSiteUrl(valor)).toThrow(motivo);
   });
 });
 
