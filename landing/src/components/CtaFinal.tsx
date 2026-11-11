@@ -10,9 +10,9 @@ export default function CtaFinal() {
             aria-hidden
             className="pointer-events-none absolute -bottom-32 left-1/2 h-72 w-[700px] -translate-x-1/2 rounded-full bg-[radial-gradient(closest-side,rgba(245,158,11,0.25),transparent)]"
           />
-          <h2 className="relative text-3xl font-bold sm:text-4xl">Veja o Tchê Food rodando na sua maquininha.</h2>
+          <h2 className="relative text-3xl font-bold sm:text-4xl">Pronto para organizar o seu restaurante?</h2>
           <p className="relative mx-auto mt-4 max-w-xl text-slate-700">
-            Em 20 minutos mostramos a comanda, a rachadinha e a NFC-e funcionando com o seu cardápio.
+            Comanda no celular, PDV, cozinha, totem, delivery e painel do dono. Fale com a gente e veja tudo funcionando.
           </p>
           <a
             className="btn-primario relative mt-8 text-base"
