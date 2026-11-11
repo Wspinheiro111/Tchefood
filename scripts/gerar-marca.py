@@ -217,7 +217,10 @@ def main():
         f'  top: {-(ly0 - y0) / lh * 100:.3f},\n'
         f'  width: {(x1 - x0) / lw * 100:.3f},\n'
         f'  height: {(y1 - y0) / lh * 100:.3f},\n'
-        '} as const;\n')
+        '} as const;\n'
+        '\n'
+        '/** Proporção (largura / altura) do conteúdo de logo.png; a animada só encaixa numa caixa com esta proporção. */\n'
+        f'export const LOGO_PARADA_PROPORCAO = {logo.width} / {logo.height};\n')
     print('ok', logo.size, dark.size, icon.size, mono.size, (x1 - x0, y1 - y0))
 
 

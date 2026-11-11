@@ -7,3 +7,6 @@ export const LOGO_ANIMADA_ENCAIXE = {
   width: 102.932,
   height: 164.596,
 } as const;
+
+/** Proporção (largura / altura) do conteúdo de logo.png; a animada só encaixa numa caixa com esta proporção. */
+export const LOGO_PARADA_PROPORCAO = 1816 / 451;

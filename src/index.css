@@ -44,9 +44,9 @@
 }
 .animate-nfc { animation: nfc-wave 1.4s ease-out infinite; }
 
-/* Logo oficial animada: a parada só reserva o espaço; com movimento reduzido ela aparece e a animada some. */
-.brand-fx-still { visibility: hidden; }
+/* Logo oficial animada: a parada só some quando a animada já carregou (Brand.tsx); com movimento reduzido ela aparece e a animada some. */
+.brand-fx-still-oculta { visibility: hidden; }
 @media (prefers-reduced-motion: reduce) {
-  .brand-fx-still { visibility: visible; }
+  .brand-fx-still-oculta { visibility: visible; }
   .brand-fx-anim { display: none; }
 }
