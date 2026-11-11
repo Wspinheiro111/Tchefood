@@ -21,7 +21,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -51,6 +51,9 @@ describe('supabase/migrations', () => {
     expect(idx('schema_cartao.sql')).toBeGreaterThan(idx('schema_kiosk.sql'));
     // A trava dos segredos libera as colunas de tenants que existem quando ela roda: coluna nova em
     // tenants numa migration posterior ficaria sem leitura para o aparelho (a pull da loja quebraria).
+    // O preço com PIN refaz a autorização do gerente (versão do caixa) e a conferência do preço.
+    expect(idx('schema_preco_gerente.sql')).toBeGreaterThan(idx('schema_caixa.sql'));
+    expect(idx('schema_preco_gerente.sql')).toBeGreaterThan(idx('schema_dinheiro_servidor.sql'));
     const segredos = idx('schema_segredos.sql');
     for (const f of files.slice(segredos + 1)) {
       expect(/ALTER TABLE (IF EXISTS )?tenants\b/i.test(readFileSync(join(MIGRATIONS, f), 'utf8')), `${f} mexe em tenants depois de schema_segredos.sql: libere a coluna nova para authenticated`).toBe(false);

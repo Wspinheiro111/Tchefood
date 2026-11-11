@@ -153,6 +153,7 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   STORE_RESET: 'Loja nova iniciada no aparelho',
   CASH_WITHDRAWAL: 'Sangria do caixa',
   CASH_CLOSE_DIFFERENCE: 'Caixa fechado com diferença',
+  PRICE_OVERRIDE: 'Preço diferente do cadastro aceito pelo gerente',
 };
 
 /** Texto do alerta enviado ao WhatsApp do proprietário. */
