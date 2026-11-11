@@ -44,7 +44,8 @@ cd "$raiz"
 # A limpeza, o Gradle e a publicação usam as mesmas pastas. A exclusão mútua é um flock do sistema operacional
 # num arquivo de trava: o próprio sistema solta a trava quando o processo morre (até com kill -9), então não há
 # "trava velha" para recuperar nem PID para conferir. O perl (presente no Linux e no macOS) pega o flock e roda
-# este mesmo script já com a trava na mão.
+# este mesmo script já com a trava na mão. O arquivo é .apk-build.flock (a pasta .apk-build.lock de uma versão
+# antiga do script, se sobrou, é ignorada: não serve de trava nem é removida).
 if [ -z "${TCHEFOOD_BUILD_LOCK_HELD:-}" ]; then
   command -v perl >/dev/null 2>&1 || falha "perl não encontrado (usado para a trava de execução única)."
   export TCHEFOOD_BUILD_LOCK_HELD=1
@@ -58,8 +59,10 @@ if [ -z "${TCHEFOOD_BUILD_LOCK_HELD:-}" ]; then
     };
     fcntl($fh, F_SETFD, 0);
     exec @ARGV or die "ERRO: exec falhou: $!\n";
-  ' "$raiz/.apk-build.lock" bash "$raiz/scripts/$(basename "$0")" "$@"
+  ' "$raiz/.apk-build.flock" bash "$raiz/scripts/$(basename "$0")" "$@"
 fi
+# A marca só vale para esta chamada: os processos filhos (npm, Gradle) não a herdam.
+unset TCHEFOOD_BUILD_LOCK_HELD
 
 staging=""
 link_novo=""
@@ -77,6 +80,14 @@ trap 'exit 143' TERM
 
 # Sobras de uma execução morta à força (kill -9): só o conjunto apontado por apk/ é guardado, o resto sai.
 rm -f "$raiz"/.apk-link.*
+# Migração da pasta apk/ antiga interrompida entre as duas etapas (pasta já guardada, link ainda não criado):
+# devolve o conjunto guardado antes de qualquer limpeza, para ele não ser apagado como sobra.
+if [ ! -e "$raiz/apk" ] && [ ! -L "$raiz/apk" ]; then
+  for r in "$raiz"/.apk-releases/legado.*; do
+    [ -d "$r" ] || continue
+    ln -s ".apk-releases/$(basename "$r")" "$raiz/apk" && break
+  done
+fi
 atual=""
 if [ -L "$raiz/apk" ]; then atual="$(basename "$(readlink "$raiz/apk")")"; fi
 for r in "$raiz"/.apk-releases/*; do
@@ -206,7 +217,9 @@ done
 chmod 755 "$staging"
 nome="$(basename "$staging")"
 if [ -d "$raiz/apk" ] && [ ! -L "$raiz/apk" ]; then
-  # apk/ de uma versão antiga do script era uma pasta de verdade: migra uma única vez para o formato de link
+  # apk/ de uma versão antiga do script era uma pasta de verdade: migra uma única vez para o formato de link.
+  # Uma pasta não pode ser trocada por um link numa operação só; se o processo morrer entre as duas linhas abaixo,
+  # a próxima execução devolve o link para esse mesmo conjunto logo no início (ver acima), sem apagá-lo.
   mv "$raiz/apk" "$raiz/.apk-releases/legado.$$" || falha "não consegui migrar o apk/ antigo; nada foi alterado"
   ln -s ".apk-releases/legado.$$" "$raiz/apk" || falha "não consegui migrar o apk/ antigo"
 fi

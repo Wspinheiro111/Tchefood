@@ -39,15 +39,23 @@ fi
 exit 0
 `;
 
-// mv falso: age como o mv de verdade e, quando FAKE_TROCA_MARCA está definida, para logo depois de tirar um
-// apk/ de verdade do caminho (a publicação antiga fazia isso). Serve para provar que apk/ não some se o processo
-// morrer ali.
+// mv falso: age como o mv de verdade, com três pontos de parada controlados por variáveis de ambiente:
+//   FAKE_TROCA_MARCA/PAUSA   logo depois de tirar um apk/ de verdade do caminho (publicação da rodada 3)
+//   FAKE_LEGADO_MARCA/PAUSA  logo depois de guardar a pasta apk/ antiga em .apk-releases/legado.* (migração)
+//   FAKE_LOCK_MARCA/PAUSA    logo ANTES de renomear uma trava velha para .velha.* (recuperação da rodada 3,
+//                            entre "vi que o dono morreu" e "tirei a trava")
 const MV_FALSO = `#!/bin/sh
 for ultimo; do :; done
+case "$ultimo" in
+  *.apk-build.lock.velha.*)
+    if [ -n "$FAKE_LOCK_MARCA" ]; then : > "$FAKE_LOCK_MARCA"; while [ -e "$FAKE_LOCK_PAUSA" ]; do sleep 0.1; done; fi ;;
+esac
 /bin/mv "$@" || exit $?
 case "$ultimo" in
   */.apk-old.*)
     if [ -n "$FAKE_TROCA_MARCA" ]; then : > "$FAKE_TROCA_MARCA"; while [ -e "$FAKE_TROCA_PAUSA" ]; do sleep 0.1; done; fi ;;
+  */.apk-releases/legado.*)
+    if [ -n "$FAKE_LEGADO_MARCA" ]; then : > "$FAKE_LEGADO_MARCA"; while [ -e "$FAKE_LEGADO_PAUSA" ]; do sleep 0.1; done; fi ;;
 esac
 `;
 
@@ -91,6 +99,7 @@ function criarRepo() {
 type Opcoes = {
   gerar: string; build?: string; vazio?: string; falhar?: boolean; renameFalhar?: boolean;
   pausa?: string; marca?: string; trocaPausa?: string; trocaMarca?: string;
+  lockPausa?: string; lockMarca?: string; legadoPausa?: string; legadoMarca?: string;
 };
 
 function ambiente(raiz: string, o: Opcoes) {
@@ -108,6 +117,10 @@ function ambiente(raiz: string, o: Opcoes) {
     FAKE_RENAME_FALHAR: o.renameFalhar ? '1' : '',
     FAKE_TROCA_PAUSA: o.trocaPausa ?? '',
     FAKE_TROCA_MARCA: o.trocaMarca ?? '',
+    FAKE_LOCK_PAUSA: o.lockPausa ?? '',
+    FAKE_LOCK_MARCA: o.lockMarca ?? '',
+    FAKE_LEGADO_PAUSA: o.legadoPausa ?? '',
+    FAKE_LEGADO_MARCA: o.legadoMarca ?? '',
     FAKE_PAUSA: o.pausa ?? '',
     FAKE_MARCA: o.marca ?? '',
   };
@@ -119,9 +132,13 @@ function rodar(raiz: string, variante: string, o: Opcoes) {
 }
 
 function rodarEmSegundoPlano(raiz: string, variante: string, o: Opcoes) {
-  const filho = spawn('bash', ['scripts/build-apk.sh', variante], { cwd: raiz, env: ambiente(raiz, o), stdio: 'ignore', detached: true });
-  const fim = new Promise<number | null>((ok) => filho.on('close', (c) => ok(c)));
-  return { filho, fim };
+  const filho = spawn('bash', ['scripts/build-apk.sh', variante], { cwd: raiz, env: ambiente(raiz, o), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  let saida = '';
+  filho.stdout?.on('data', (d) => { saida += String(d); });
+  filho.stderr?.on('data', (d) => { saida += String(d); });
+  let terminou = false;
+  const fim = new Promise<number | null>((ok) => filho.on('close', (c) => { terminou = true; ok(c); }));
+  return { filho, fim, saida: () => saida, terminou: () => terminou };
 }
 
 async function esperar(cond: () => boolean, ms = 10000) {
@@ -320,13 +337,77 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'N-pagbank' });
       expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(1);
     });
+    it('SIGKILL na migração da pasta apk/ antiga: a execução seguinte devolve o conjunto antigo antes de limpar', async () => {
+      const raiz = criarRepo();
+      mkdirSync(join(raiz, 'apk'));
+      writeFileSync(join(raiz, 'apk', 'tchefood-pagbank-debug.apk'), 'velho');
+      const legadoPausa = join(raiz, 'pausa-legado');
+      const legadoMarca = join(raiz, 'na-migracao');
+      writeFileSync(legadoPausa, '');
+      const b = rodarEmSegundoPlano(raiz, 'pagbank', { gerar: 'pagbank', build: 'N', legadoPausa, legadoMarca });
+      await esperar(() => existsSync(legadoMarca) || b.terminou());
+      process.kill(-(b.filho.pid as number), 'SIGKILL');
+      await b.fim;
+      // a execução seguinte falha no Gradle: o conjunto antigo tem de continuar em apk/, não apagado como sobra
+      expect(rodar(raiz, 'pagbank', { gerar: 'pagbank', falhar: true }).codigo).not.toBe(0);
+      expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'velho' });
+      expect(rodar(raiz, 'pagbank', { gerar: 'pagbank', build: 'M' }).codigo).toBe(0);
+      expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'M-pagbank' });
+      expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(1);
+    }, 30000);
   });
 
   describe('trava entre execuções (flock do sistema operacional)', () => {
+    it('trava velha de processo morto e três execuções, uma parada entre ver a trava velha e tirá-la: só uma compila', async () => {
+      const raiz = criarRepo();
+      // sobras de um processo morto nos dois formatos: a pasta de trava da rodada 3 (com pid morto) e o arquivo de flock
+      mkdirSync(join(raiz, '.apk-build.lock'));
+      writeFileSync(join(raiz, '.apk-build.lock', 'pid'), '999999');
+      writeFileSync(join(raiz, '.apk-build.flock'), '');
+      const pausa = join(raiz, 'pausa-gradle');
+      writeFileSync(pausa, '');
+      const lockPausa = join(raiz, 'pausa-trava');
+      const lockMarca = join(raiz, 'na-trava');
+      writeFileSync(lockPausa, '');
+      const marcaB = join(raiz, 'gradle-B');
+      const marcaA = join(raiz, 'gradle-A');
+
+      // B vê a trava velha e para logo antes de tirá-la (só o script com recuperação por PID chega nesse ponto)
+      const b = rodarEmSegundoPlano(raiz, 'all', { gerar: 'pagbank tablet', build: 'B', pausa, marca: marcaB, lockPausa, lockMarca });
+      await esperar(() => existsSync(lockMarca) || existsSync(marcaB) || b.terminou());
+      // A chega enquanto B está parado
+      const a = rodarEmSegundoPlano(raiz, 'all', { gerar: 'pagbank tablet', build: 'A', pausa, marca: marcaA });
+      await esperar(() => existsSync(marcaA) || a.terminou());
+      // B continua
+      rmSync(lockPausa);
+      await esperar(() => (existsSync(marcaB) || b.terminou()) && (existsSync(marcaA) || a.terminou()));
+      // C chega com uma execução ativa
+      const c = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'C' });
+      expect(c.codigo).not.toBe(0);
+      expect(c.saida).toContain('outra execução');
+
+      // só uma das execuções chegou ao Gradle; a outra parou com aviso, sem compilar
+      const noGradle = [existsSync(marcaA), existsSync(marcaB)].filter(Boolean).length;
+      expect(noGradle).toBe(1);
+      const vencedora = existsSync(marcaA) ? 'A' : 'B';
+      const perdedora = vencedora === 'A' ? b : a;
+      expect(await perdedora.fim).not.toBe(0);
+      expect(perdedora.saida()).toContain('outra execução');
+      expect(apks(raiz)).toEqual({});
+
+      rmSync(pausa);
+      const [fa, fb] = await Promise.all([a.fim, b.fim]);
+      expect([fa, fb].filter((x) => x === 0)).toHaveLength(1);
+      expect(apks(raiz)).toEqual({
+        'tchefood-pagbank-debug.apk': `${vencedora}-pagbank`,
+        'tchefood-tablet-debug.apk': `${vencedora}-tablet`,
+      });
+    }, 30000);
+
     it('com a trava ocupada, as outras execuções falham sem tocar em nada e a vencedora publica só o seu', async () => {
       const raiz = criarRepo();
       // arquivo de trava deixado por um processo morto: não pode bloquear nem confundir
-      writeFileSync(join(raiz, '.apk-build.lock'), '99999');
+      writeFileSync(join(raiz, '.apk-build.flock'), '99999');
       const pausa = join(raiz, 'pausa');
       const marca = join(raiz, 'gradle-rodando');
       writeFileSync(pausa, '');

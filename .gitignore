@@ -9,4 +9,5 @@ android/local.properties
 /apk
 /.apk-releases
 /.apk-build.lock
+/.apk-build.flock
 /.apk-link.*
