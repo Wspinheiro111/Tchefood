@@ -4,6 +4,8 @@ import Beneficios from './components/Beneficios';
 import Calculadora from './components/Calculadora';
 import Comparativo from './components/Comparativo';
 import Planos from './components/Planos';
+import Funcionalidades from './components/Funcionalidades';
+import Contato from './components/Contato';
 import Faq from './components/Faq';
 import CtaFinal from './components/CtaFinal';
 import Rodape from './components/Rodape';
@@ -16,9 +18,11 @@ export default function App() {
       <main>
         <Hero />
         <Beneficios />
+        <Funcionalidades />
         <Calculadora />
         <Comparativo />
         <Planos />
+        <Contato />
         <Faq />
         <CtaFinal />
       </main>

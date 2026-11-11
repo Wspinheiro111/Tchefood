@@ -1,7 +1,7 @@
 import { Check, MessageCircle, Star } from 'lucide-react';
-import { EM_BREVE, linkWhatsApp, PLANOS } from '../lib/config';
+import { EM_BREVE, linkWhatsApp, NA_IMPLANTACAO, PLANOS } from '../lib/config';
 import { formatarBRL } from '../lib/calculadora';
-import { SeloEmBreve } from './Comparativo';
+import { SeloStatus } from './Funcionalidades';
 
 export default function Planos() {
   return (
@@ -9,7 +9,7 @@ export default function Planos() {
       <div className="container-lp">
         <div className="mx-auto max-w-2xl text-center">
           <p className="eyebrow">Planos</p>
-          <h2 className="mt-3 text-3xl font-bold sm:text-4xl">Planos transparentes. Garçons ilimitados em todos.</h2>
+          <h2 className="mt-3 text-3xl font-bold sm:text-4xl">Planos e preços do sistema. Garçons ilimitados em todos.</h2>
           <p className="mt-4 text-slate-600">
             Sem cobrança por tela ou por garçom. TEF integrado à maquininha a partir do plano Churrascaria &amp; Salão Pro.
           </p>
@@ -54,8 +54,9 @@ export default function Planos() {
                   <li key={r} className="flex items-start gap-2 text-slate-800">
                     <Check className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" aria-hidden />
                     <span>
-                      {r}
-                      {EM_BREVE.has(r) && <SeloEmBreve />}
+                      {r}{' '}
+                      {EM_BREVE.has(r) && <SeloStatus status="em-breve" />}
+                      {NA_IMPLANTACAO.has(r) && <SeloStatus status="implantacao" />}
                     </span>
                   </li>
                 ))}

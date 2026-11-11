@@ -12,6 +12,13 @@ export const EMPRESA = {
   fabricante: 'W9 Sistemas',
 };
 
+/**
+ * Endereço público do site, sem barra no fim. Usado no canonical, nas tags OG, no JSON-LD,
+ * no sitemap.xml e no robots.txt. Troque com a variável de ambiente VITE_SITE_URL no build
+ * (ou no arquivo .env) quando o domínio definitivo estiver registrado.
+ */
+export const SITE_URL = (import.meta.env?.VITE_SITE_URL ?? 'https://tchefood.com.br').replace(/\/+$/, '');
+
 export interface Plano {
   id: 'bistro' | 'salao-pro' | 'rede-eventos';
   nome: string;
@@ -33,7 +40,7 @@ export const PLANOS: Plano[] = [
     limites: ['1 unidade', 'Garçons ilimitados', 'Sem TEF integrado'],
     recursos: [
       'Comanda no celular do garçom',
-      'NFC-e automática (SEFAZ-RS)',
+      'NFC-e modelo 65 (SEFAZ-RS)',
       'Cardápio QR Code na mesa',
       'Impressão em bobina 58/80 mm',
       'Relatórios de vendas e caixa',
@@ -53,7 +60,7 @@ export const PLANOS: Plano[] = [
       'Mapa de mesas e tela de cozinha (KDS)',
       'Cancelamento só com PIN de gerente',
       'Alerta de cancelamento no WhatsApp',
-      'Taxa de serviço e couvert configuráveis',
+      'Taxa de serviço configurável, com rateio por garçom',
       'Painel do proprietário em tempo real',
     ],
   },
@@ -77,9 +84,18 @@ export const PLANOS: Plano[] = [
 
 /** Recursos anunciados que ainda estão em desenvolvimento (aparecem com selo "Em breve"). */
 export const EM_BREVE = new Set<string>([
-  'Ficha rápida para balcão e eventos',
-  'Controle de barril de chopp',
-  'Cashback e fidelidade no WhatsApp',
+  'Painel consolidado de todas as unidades',
+  'Alerta de cancelamento no WhatsApp',
+]);
+
+/**
+ * Recursos prontos no sistema que dependem de credencial ou contrato da própria loja
+ * (certificado A1 e CSC na Focus NFe, contrato da maquininha). Aparecem com o selo
+ * "Ativado na implantação".
+ */
+export const NA_IMPLANTACAO = new Set<string>([
+  'NFC-e modelo 65 (SEFAZ-RS)',
+  'TEF integrado à maquininha Stone ou PagBank',
 ]);
 
 export function linkWhatsApp(mensagem: string): string {

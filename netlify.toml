@@ -1,0 +1,8 @@
+# Hospedagem da landing page comercial (pasta landing/). Ver landing/README.md, "Publicar".
+[build]
+  base = "landing"
+  command = "npm ci && npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"

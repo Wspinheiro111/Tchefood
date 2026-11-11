@@ -10,7 +10,7 @@ interface Linha {
 const LINHAS: Linha[] = [
   {
     criterio: 'Equipamento',
-    tche: 'Usa a maquininha Stone ou PagBank e o celular que você já tem',
+    tche: 'Usa o celular, o computador e a maquininha Smart que você já tem',
     tradicional: 'Costuma exigir tablets, computadores e terminais dedicados',
   },
   {
@@ -25,18 +25,18 @@ const LINHAS: Linha[] = [
   },
   {
     criterio: 'Divisão de conta',
-    tche: 'Rachadinha nativa na maquininha, na própria mesa',
+    tche: 'Rachadinha nativa por pessoa, por item ou valor livre, na própria mesa',
     tradicional: 'Geralmente feita no caixa, com calculadora',
   },
   {
     criterio: 'NFC-e',
-    tche: 'Emitida automaticamente no pagamento, já vinculada à transação',
+    tche: 'NFC-e modelo 65 com os dados do pagamento vinculados',
     tradicional: 'Muitas vezes emitida à parte, no caixa',
   },
   {
     criterio: 'Cancelamentos',
-    tche: 'PIN de gerente obrigatório e alerta no WhatsApp do dono',
-    tradicional: 'Nem sempre têm trava ou aviso em tempo real',
+    tche: 'PIN de gerente obrigatório, motivo e registro de quem autorizou',
+    tradicional: 'Nem sempre têm trava ou registro de quem autorizou',
   },
   {
     criterio: 'Cardápio QR Code',
@@ -47,7 +47,11 @@ const LINHAS: Linha[] = [
     criterio: 'Barril de chopp',
     tche: 'Controle de volume por torneira e alerta de desperdício',
     tradicional: 'Raramente disponível',
-    emBreve: true,
+  },
+  {
+    criterio: 'Internet',
+    tche: 'Continua vendendo sem internet e sincroniza quando volta',
+    tradicional: 'Muitos param quando a conexão cai',
   },
 ];
 
@@ -59,8 +63,8 @@ export default function Comparativo() {
           <p className="eyebrow">Comparativo</p>
           <h2 className="mt-3 text-3xl font-bold sm:text-4xl">Tchê Food vs. sistemas tradicionais</h2>
           <p className="mt-4 text-slate-600">
-            Sistemas antigos foram feitos para o computador do caixa. O Tchê Food foi feito para a maquininha que anda pelo
-            salão.
+            Sistemas antigos foram feitos para o computador do caixa. O Tchê Food foi feito para o celular do garçom e a
+            maquininha que andam pelo salão.
           </p>
         </div>
 
