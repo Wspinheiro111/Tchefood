@@ -60,7 +60,9 @@ export interface ReconRow {
   count: number;
 }
 
-export function reconciliation(payments: readonly Payment[]): ReconRow[] {
+/** Conciliação por adquirente: só pagamentos aprovados desde o início do turno (`since`). */
+export function reconciliation(payments: readonly Payment[], since: Date = shiftStart()): ReconRow[] {
+  const from = since.getTime();
   const rows: Record<ReconKey, ReconRow> = {
     STONE: { acquirer: 'STONE', cnpj: '16501555000157', byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
     PAGBANK: { acquirer: 'PAGBANK', cnpj: '08561701000101', byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
@@ -72,7 +74,7 @@ export function reconciliation(payments: readonly Payment[]): ReconRow[] {
     CASH_DESK: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 },
   };
   for (const p of payments) {
-    if (p.status !== 'APPROVED') continue;
+    if (p.status !== 'APPROVED' || new Date(p.created_at).getTime() < from) continue;
     const key: ReconKey = p.acquirer === 'STONE' || p.acquirer === 'PAGBANK' ? p.acquirer : 'CASH_DESK';
     cents[key][p.method] += toCents(p.amount);
     rows[key].count += 1;
@@ -100,14 +102,16 @@ export interface WaiterRow {
  * cobrada é distribuída entre os garçons proporcionalmente ao valor que cada
  * um lançou (maiores restos → Σ comissões == Σ taxas, sem perder centavo).
  */
-export function waiterSplit(orders: readonly Order[], items: readonly OrderItem[], staff: readonly StaffUser[]): WaiterRow[] {
+export function waiterSplit(orders: readonly Order[], items: readonly OrderItem[], staff: readonly StaffUser[], since: Date = shiftStart()): WaiterRow[] {
+  const from = since.getTime();
   const sales = new Map<string, { cents: number; qty: number; commission: number }>();
   const bump = (id: string) => {
     if (!sales.has(id)) sales.set(id, { cents: 0, qty: 0, commission: 0 });
     return sales.get(id)!;
   };
   for (const o of orders) {
-    if (o.status !== 'CLOSED') continue;
+    // Só contas fechadas dentro do turno entram no rateio.
+    if (o.status !== 'CLOSED' || o.closed_at === null || new Date(o.closed_at).getTime() < from) continue;
     const valid = items.filter((i) => i.order_id === o.id && i.status !== 'CANCELED');
     const perWaiter = new Map<string, number>();
     for (const i of valid) {
