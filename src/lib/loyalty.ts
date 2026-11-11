@@ -166,7 +166,7 @@ export function cashbackFifoSources(
  */
 export type CashbackRefundPart =
   | { refund_of_id: UUID; amount: number; valid_from: string; expires_at: string; hold?: undefined }
-  | { refund_of_id: UUID | null; amount: number; valid_from: null; expires_at: null; hold: true };
+  | { refund_of_id: null; amount: number; valid_from: null; expires_at: null; hold: true; reported_source_ids: UUID[] };
 
 /**
  * Como o estorno de um resgate volta ao cliente (decisão do Will, 10/11/2026: o cashback
@@ -183,30 +183,41 @@ export function planCashbackRefund(
   amount: number,
 ): CashbackRefundPart[] {
   const byId = new Map(ledger.map((e) => [e.id, e]));
-  const sources = (redeem.redeem_sources ?? [{ source_id: null, amount: redeem.amount }])
-    .map((src) => ({ src, credit: src.source_id ? byId.get(src.source_id) ?? null : null }))
+  // Origem comprovada: crédito desta loja, com validade. O resto (sem source_id, UUID que
+  // não está no extrato ou de outra loja: P2-01 da rodada 9 do GPT) é um único balde
+  // retido (HOLD) sem refund_of_id; o que o balde já reteve é a soma dos HOLD da conta.
+  const all = (redeem.redeem_sources ?? [{ source_id: null, amount: redeem.amount }]).map((src) => {
+    const credit = src.source_id ? byId.get(src.source_id) ?? null : null;
+    const proven = credit && credit.tenant_id === redeem.tenant_id && credit.valid_from && credit.expires_at ? credit : null;
+    return { src, credit: proven };
+  });
+  const proven = all
+    .filter((x): x is { src: (typeof all)[number]['src']; credit: CashbackLedgerEntry & { valid_from: string; expires_at: string } } => x.credit !== null)
     .sort((a, b) => {
-      const ea = a.credit?.expires_at ?? null;
-      const eb = b.credit?.expires_at ?? null;
-      if (ea === eb) return (b.credit?.created_at ?? '') < (a.credit?.created_at ?? '') ? -1 : 1;
-      if (ea === null) return 1;
-      if (eb === null) return -1;
-      return ea > eb ? -1 : 1;
+      if (a.credit.expires_at === b.credit.expires_at) return b.credit.created_at < a.credit.created_at ? -1 : 1;
+      return a.credit.expires_at > b.credit.expires_at ? -1 : 1;
     });
+  const unproven = all.filter((x) => x.credit === null);
   const refunds = ledger.filter((e) => e.order_id === redeem.order_id && isCashbackRefund(e));
   let left = toCents(amount);
   const parts: CashbackRefundPart[] = [];
-  for (const { src, credit } of sources) {
+  for (const { src, credit } of proven) {
     if (left <= 0) break;
-    const back = refunds.filter((r) => (r.refund_of_id ?? null) === src.source_id).reduce((sum, r) => sum + toCents(r.amount), 0);
+    const back = refunds.filter((r) => r.entry_type === 'REFUND' && r.refund_of_id === credit.id).reduce((sum, r) => sum + toCents(r.amount), 0);
     const take = Math.min(toCents(src.amount) - back, left);
     if (take <= 0) continue;
-    if (src.source_id !== null && credit?.valid_from && credit.expires_at) {
-      parts.push({ refund_of_id: src.source_id, amount: fromCents(take), valid_from: credit.valid_from, expires_at: credit.expires_at });
-    } else {
-      parts.push({ refund_of_id: src.source_id, amount: fromCents(take), valid_from: null, expires_at: null, hold: true });
-    }
+    parts.push({ refund_of_id: credit.id, amount: fromCents(take), valid_from: credit.valid_from, expires_at: credit.expires_at });
     left -= take;
+  }
+  if (left > 0 && unproven.length > 0) {
+    const held = refunds.filter((r) => r.entry_type === 'HOLD').reduce((sum, r) => sum + toCents(r.amount), 0);
+    const take = Math.min(unproven.reduce((sum, x) => sum + toCents(x.src.amount), 0) - held, left);
+    if (take > 0) {
+      parts.push({
+        refund_of_id: null, amount: fromCents(take), valid_from: null, expires_at: null, hold: true,
+        reported_source_ids: unproven.flatMap((x) => (x.src.source_id ? [x.src.source_id] : [])),
+      });
+    }
   }
   return parts;
 }

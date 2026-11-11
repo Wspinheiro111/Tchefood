@@ -944,7 +944,8 @@ export const useTcheStore = create<TcheState>()(
         const feeRemoved = cause.action_type === 'SERVICE_FEE_REMOVED';
         // Parte sem origem comprovada (P0-03 da rodada 8 do GPT): HOLD, sem saldo nem
         // validade, para conciliação; não entra no saldo do cliente.
-        const refunds: CashbackLedgerEntry[] = planCashbackRefund(ledger, redeem, fromCentsLocal(refundCents)).map((part) => ({
+        const parts = planCashbackRefund(ledger, redeem, fromCentsLocal(refundCents));
+        const refunds: CashbackLedgerEntry[] = parts.map((part) => ({
           id: uuid(),
           tenant_id: order.tenant_id,
           customer_id: redeem.customer_id,
@@ -960,7 +961,7 @@ export const useTcheStore = create<TcheState>()(
           created_at: ts,
           refund_of_id: part.refund_of_id,
         }));
-        const refundLogs: AuditLog[] = refunds.map((refund) => ({
+        const refundLogs: AuditLog[] = refunds.map((refund, i) => ({
           ...buildAudit({
             order_id: order.id,
             performed_by_user_id: userId,
@@ -981,7 +982,9 @@ export const useTcheStore = create<TcheState>()(
               refund_of_id: refund.refund_of_id ?? null,
               expires_at: refund.expires_at,
               already_expired: refund.expires_at ? new Date(refund.expires_at) <= new Date(ts) : null,
-              ...(refund.entry_type === 'HOLD' ? { hold_id: refund.id, reconciliation: 'PENDING' } : {}),
+              ...(refund.entry_type === 'HOLD'
+                ? { hold_id: refund.id, reconciliation: 'PENDING', reported_source_ids: parts[i]!.hold ? parts[i]!.reported_source_ids : [] }
+                : {}),
               discount_before: discountBefore,
               discount_after: discountAfter,
               cause: cause.action_type,

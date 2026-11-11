@@ -584,6 +584,9 @@ CREATE TRIGGER trg_orders_00_keep_discount BEFORE UPDATE OF discount_amount, dis
 -- volta ao saldo, nem com a validade de outro crédito nem com prazo novo. Fica retida para
 -- conciliação: lançamento HOLD (sem saldo e sem validade, fora do saldo do cliente)
 -- e audit_log CASHBACK_REFUND_HELD com o valor e o motivo. O gerente confere com o cliente.
+-- O HOLD não aponta para crédito nenhum (refund_of_id NULL, P2-01 da rodada 9 do GPT): um
+-- UUID que não existe quebraria a FK e um de outra loja seria vínculo cruzado; os UUIDs
+-- informados no resgate ficam em metadata.reported_source_ids.
 -- Desconto manual (P0-02 da rodada 8 do GPT): o desconto da conta é o manual mais o
 -- cashback ainda aplicado (resgatado − já devolvido ou retido). Quando o desconto cai, o
 -- desconto manual fica (até o novo desconto) e o cashback é que absorve a queda: devolve
@@ -615,7 +618,8 @@ DECLARE
     v_applied NUMERIC(10,2);
     v_manual_before NUMERIC(10,2);
     v_manual_after NUMERIC(10,2);
-    v_hold BOOLEAN;
+    v_unproven NUMERIC;
+    v_unproven_ids JSONB;
     s RECORD;
 BEGIN
     SELECT * INTO v_redeem FROM cashback_ledger
@@ -662,53 +666,35 @@ BEGIN
     END IF;
     v_user := COALESCE(v_user, v_redeem.created_by_user_id);
     v_left := v_amount;
+    -- Origem comprovada = crédito desta loja, com validade (refund_of_id aponta para ele).
+    -- O que não tem origem comprovada (source_id NULL, UUID que não existe no extrato ou
+    -- que é de outra loja: P2-01 da rodada 9 do GPT) vira um único balde de retenção
+    -- (HOLD) com refund_of_id NULL, para não violar a FK nem ligar o estorno a um
+    -- lançamento de outra loja; os UUIDs informados ficam em audit_logs.metadata
+    -- (reported_source_ids). Os HOLD desta conta somados dão o que o balde já reteve, e
+    -- é isso que deixa o reenvio idempotente.
     FOR s IN
-        SELECT (x->>'source_id')::uuid AS source_id, (x->>'amount')::numeric AS taken, l.valid_from, l.expires_at
+        SELECT (x->>'source_id')::uuid AS source_id, (x->>'amount')::numeric AS taken,
+               l.id AS proven_id, l.valid_from, l.expires_at, l.created_at
           FROM jsonb_array_elements(COALESCE(v_redeem.redeem_sources,
                  jsonb_build_array(jsonb_build_object('source_id', NULL, 'amount', v_redeem.amount)))) x
           LEFT JOIN cashback_ledger l ON l.id = (x->>'source_id')::uuid AND l.tenant_id = NEW.tenant_id
-         ORDER BY l.expires_at DESC NULLS LAST, l.created_at DESC
+                                     AND l.valid_from IS NOT NULL AND l.expires_at IS NOT NULL
+         WHERE l.id IS NOT NULL
+         ORDER BY l.expires_at DESC, l.created_at DESC
     LOOP
         EXIT WHEN v_left <= 0;
         SELECT COALESCE(SUM(amount), 0) INTO v_back FROM cashback_ledger
-         WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type IN ('REFUND', 'HOLD')
-           AND refund_of_id IS NOT DISTINCT FROM s.source_id;
+         WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'REFUND'
+           AND refund_of_id = s.proven_id;
         v_take := LEAST(s.taken - v_back, v_left);
         CONTINUE WHEN v_take <= 0;
-        -- Origem comprovada: o crédito do resgate, desta loja, com validade. Sem isso, retém.
-        v_hold := s.source_id IS NULL OR s.valid_from IS NULL OR s.expires_at IS NULL;
-        IF v_hold THEN
-            INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount,
-                                         valid_from, expires_at, created_by_user_id, created_at, refund_of_id)
-            VALUES (NEW.tenant_id, v_redeem.customer_id, NEW.id, 'HOLD', v_take, 0,
-                    NULL, NULL, v_user, v_now, s.source_id)
-            RETURNING id INTO v_refund_id;
-            INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact,
-                                    reason, whatsapp_alert_sent, metadata, created_at)
-            VALUES (NEW.tenant_id, NEW.id, v_user, v_manager, 'CASHBACK_REFUND_HELD', v_take,
-                    'Cashback a devolver retido para conciliação: o crédito de onde saiu não está comprovado (resgate da versão anterior do aparelho). Não volta ao saldo até o gerente conferir com o cliente.',
-                    FALSE,
-                    jsonb_build_object('customer_id', v_redeem.customer_id, 'amount', v_take, 'redeem_id', v_redeem.id,
-                                       'hold_id', v_refund_id, 'refund_of_id', s.source_id,
-                                       'reconciliation', 'PENDING',
-                                       'reason_code', CASE WHEN s.source_id IS NULL THEN 'SOURCE_UNKNOWN' ELSE 'SOURCE_NOT_FOUND' END,
-                                       'redeemed', v_redeem.amount, 'refunded_before', v_refunded,
-                                       'cashback_applied_before', v_applied,
-                                       'manual_discount_before', v_manual_before, 'manual_discount_after', v_manual_after,
-                                       'discount_before', OLD.discount_amount, 'discount_after', NEW.discount_amount,
-                                       'cause', v_cause, 'cause_audit_id', v_cause_audit,
-                                       'server_verified', TRUE),
-                    v_now);
-            v_refunded := v_refunded + v_take;
-            v_left := v_left - v_take;
-            CONTINUE;
-        END IF;
         v_from := s.valid_from;
         v_until := s.expires_at;
         INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount,
                                      valid_from, expires_at, created_by_user_id, created_at, refund_of_id)
         VALUES (NEW.tenant_id, v_redeem.customer_id, NEW.id, 'REFUND', v_take, v_take,
-                v_from, v_until, v_user, v_now, s.source_id)
+                v_from, v_until, v_user, v_now, s.proven_id)
         RETURNING id INTO v_refund_id;
         INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact,
                                 reason, whatsapp_alert_sent, metadata, created_at)
@@ -718,7 +704,7 @@ BEGIN
                     WHEN 'ITEM_CANCELED' THEN 'Cashback devolvido ao cliente (cancelamento de item deixou o desconto abaixo do cashback usado)'
                     ELSE 'Cashback devolvido ao cliente (o desconto da conta ficou abaixo do cashback usado)' END, FALSE,
                 jsonb_build_object('customer_id', v_redeem.customer_id, 'amount', v_take, 'redeem_id', v_redeem.id,
-                                   'refund_id', v_refund_id, 'refund_of_id', s.source_id,
+                                   'refund_id', v_refund_id, 'refund_of_id', s.proven_id,
                                    'expires_at', v_until, 'already_expired', v_until <= v_now,
                                    'redeemed', v_redeem.amount, 'refunded_before', v_refunded,
                                    'cashback_applied_before', v_applied,
@@ -733,6 +719,45 @@ BEGIN
         v_refunded := v_refunded + v_take;
         v_left := v_left - v_take;
     END LOOP;
+    IF v_left > 0 THEN
+        SELECT COALESCE(SUM((x->>'amount')::numeric), 0),
+               COALESCE(jsonb_agg(x->'source_id' ORDER BY ord) FILTER (WHERE x->>'source_id' IS NOT NULL), '[]'::jsonb)
+          INTO v_unproven, v_unproven_ids
+          FROM jsonb_array_elements(COALESCE(v_redeem.redeem_sources,
+                 jsonb_build_array(jsonb_build_object('source_id', NULL, 'amount', v_redeem.amount)))) WITH ORDINALITY AS t(x, ord)
+         WHERE NOT EXISTS (SELECT 1 FROM cashback_ledger l
+                            WHERE l.id = (x->>'source_id')::uuid AND l.tenant_id = NEW.tenant_id
+                              AND l.valid_from IS NOT NULL AND l.expires_at IS NOT NULL);
+        SELECT COALESCE(SUM(amount), 0) INTO v_back FROM cashback_ledger
+         WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'HOLD';
+        v_take := LEAST(v_unproven - v_back, v_left);
+        IF v_take > 0 THEN
+            INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount,
+                                         valid_from, expires_at, created_by_user_id, created_at, refund_of_id)
+            VALUES (NEW.tenant_id, v_redeem.customer_id, NEW.id, 'HOLD', v_take, 0,
+                    NULL, NULL, v_user, v_now, NULL)
+            RETURNING id INTO v_refund_id;
+            INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact,
+                                    reason, whatsapp_alert_sent, metadata, created_at)
+            VALUES (NEW.tenant_id, NEW.id, v_user, v_manager, 'CASHBACK_REFUND_HELD', v_take,
+                    'Cashback a devolver retido para conciliação: o crédito de onde saiu não está comprovado (resgate da versão anterior do aparelho). Não volta ao saldo até o gerente conferir com o cliente.',
+                    FALSE,
+                    jsonb_build_object('customer_id', v_redeem.customer_id, 'amount', v_take, 'redeem_id', v_redeem.id,
+                                       'hold_id', v_refund_id, 'refund_of_id', NULL,
+                                       'reported_source_ids', v_unproven_ids,
+                                       'reconciliation', 'PENDING',
+                                       'reason_code', CASE WHEN jsonb_array_length(v_unproven_ids) = 0 THEN 'SOURCE_UNKNOWN' ELSE 'SOURCE_NOT_FOUND' END,
+                                       'redeemed', v_redeem.amount, 'refunded_before', v_refunded,
+                                       'cashback_applied_before', v_applied,
+                                       'manual_discount_before', v_manual_before, 'manual_discount_after', v_manual_after,
+                                       'discount_before', OLD.discount_amount, 'discount_after', NEW.discount_amount,
+                                       'cause', v_cause, 'cause_audit_id', v_cause_audit,
+                                       'server_verified', TRUE),
+                    v_now);
+            v_refunded := v_refunded + v_take;
+            v_left := v_left - v_take;
+        END IF;
+    END IF;
     RETURN NULL;
 END;
 $$;
@@ -795,6 +820,12 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cashback_ledger_hold_no_validity') THEN
         ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_hold_no_validity
             CHECK (entry_type <> 'HOLD' OR (valid_from IS NULL AND expires_at IS NULL));
+    END IF;
+    -- HOLD não aponta para crédito nenhum (P2-01 da rodada 9 do GPT): a origem não está
+    -- comprovada; o UUID informado no resgate fica só em audit_logs.metadata.
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cashback_ledger_hold_no_link') THEN
+        ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_hold_no_link
+            CHECK (entry_type <> 'HOLD' OR refund_of_id IS NULL);
     END IF;
 END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS cashback_ledger_one_earn_redeem_per_order

@@ -42,29 +42,47 @@ describe('estorno do cashback', () => {
     const b = entry({ id: 'B', amount: 20, remaining_amount: 0, valid_from: '2026-12-01T03:00:00.000Z', expires_at: '2026-12-31T03:00:00.000Z' });
     const legacy = { ...redeem, amount: 20, redeem_sources: [{ source_id: null, amount: 20 }], created_at: '2026-11-05T12:00:00.000Z' };
     const parts = planCashbackRefund([a, b, legacy], legacy, 20);
-    expect(parts).toEqual([{ refund_of_id: null, amount: 20, valid_from: null, expires_at: null, hold: true }]);
+    expect(parts).toEqual([{ refund_of_id: null, amount: 20, valid_from: null, expires_at: null, hold: true, reported_source_ids: [] }]);
     // Resgate de antes deste PR (sem redeem_sources): o mesmo.
     const older = { ...legacy, redeem_sources: null };
-    expect(planCashbackRefund([a, b, older], older, 5)).toEqual([{ refund_of_id: null, amount: 5, valid_from: null, expires_at: null, hold: true }]);
+    expect(planCashbackRefund([a, b, older], older, 5)).toEqual([{ refund_of_id: null, amount: 5, valid_from: null, expires_at: null, hold: true, reported_source_ids: [] }]);
   });
 
   it('resgate misto: a parte com origem volta com a validade dela; só a sem origem fica retida', () => {
     const mixed = { ...redeem, amount: 40, redeem_sources: [{ source_id: null, amount: 15 }, { source_id: 'e2', amount: 25 }] };
     expect(planCashbackRefund([old, fresh, mixed], mixed, 30)).toEqual([
       { refund_of_id: 'e2', amount: 25, valid_from: fresh.valid_from, expires_at: fresh.expires_at },
-      { refund_of_id: null, amount: 5, valid_from: null, expires_at: null, hold: true },
+      { refund_of_id: null, amount: 5, valid_from: null, expires_at: null, hold: true, reported_source_ids: [] },
     ]);
     // O que já foi retido não é retido de novo (reenvio): conta como devolvido daquela parte.
     const held = entry({ id: 'h', order_id: 'o', entry_type: 'HOLD', amount: 5, refund_of_id: null });
     const back = entry({ id: 'b', order_id: 'o', entry_type: 'REFUND', amount: 25, refund_of_id: 'e2' });
     expect(planCashbackRefund([old, fresh, mixed, held, back], mixed, 10)).toEqual([
-      { refund_of_id: null, amount: 10, valid_from: null, expires_at: null, hold: true },
+      { refund_of_id: null, amount: 10, valid_from: null, expires_at: null, hold: true, reported_source_ids: [] },
     ]);
   });
 
-  it('crédito de origem que não está no extrato: retido, sem validade inventada', () => {
+  // P2-01 da rodada 9 do GPT: o HOLD não aponta para o UUID informado (no banco, a FK
+  // recusaria um UUID que não existe); o UUID fica só no registro (reported_source_ids).
+  it('crédito de origem que não está no extrato: retido sem vínculo, sem validade inventada', () => {
     const orphan = { ...redeem, amount: 10, redeem_sources: [{ source_id: 'sumiu', amount: 10 }] };
-    expect(planCashbackRefund([orphan], orphan, 10)).toEqual([{ refund_of_id: 'sumiu', amount: 10, valid_from: null, expires_at: null, hold: true }]);
+    expect(planCashbackRefund([orphan], orphan, 10)).toEqual([
+      { refund_of_id: null, amount: 10, valid_from: null, expires_at: null, hold: true, reported_source_ids: ['sumiu'] },
+    ]);
+  });
+
+  it('crédito de origem de outra loja: retido sem vínculo cruzado; só o desta loja volta', () => {
+    const foreign = entry({ id: 'F', tenant_id: 'outra', amount: 5, valid_from: '2026-11-02T03:00:00.000Z', expires_at: '2027-01-31T03:00:00.000Z' });
+    const r = { ...redeem, amount: 20, redeem_sources: [{ source_id: null, amount: 5 }, { source_id: 'sumiu', amount: 5 }, { source_id: 'F', amount: 5 }, { source_id: 'e2', amount: 5 }] };
+    const parts = planCashbackRefund([fresh, foreign, r], r, 20);
+    expect(parts).toEqual([
+      { refund_of_id: 'e2', amount: 5, valid_from: fresh.valid_from, expires_at: fresh.expires_at },
+      { refund_of_id: null, amount: 15, valid_from: null, expires_at: null, hold: true, reported_source_ids: ['sumiu', 'F'] },
+    ]);
+    // Reenvio do mesmo cancelamento: com o REFUND e o HOLD já no extrato, nada mais sai.
+    const back = entry({ id: 'b', order_id: 'o', entry_type: 'REFUND', amount: 5, refund_of_id: 'e2' });
+    const held = entry({ id: 'h', order_id: 'o', entry_type: 'HOLD', amount: 15, refund_of_id: null });
+    expect(planCashbackRefund([fresh, foreign, r, back, held], r, 20)).toEqual([]);
   });
 });
 

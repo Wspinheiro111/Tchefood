@@ -1741,6 +1741,81 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     setCashbackClock(null);
   });
 
+  it('retenção com origem que não existe ou é de outra loja: grava o HOLD sem FK quebrada nem vínculo cruzado (P2-01 da rodada 9)', async () => {
+    // Critério do GPT: resgate recuperado com quatro origens — nula, UUID que não existe em
+    // cashback_ledger, crédito de outra loja e crédito válido desta loja. O cancelamento
+    // devolve tudo: só o crédito desta loja volta (com a validade dele); o resto fica retido
+    // num HOLD sem refund_of_id (a FK recusaria o UUID inexistente) e os UUIDs informados
+    // ficam no registro. Reenvio e segundo aparelho não duplicam nada.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [order] = await cashbackOrders(1, 85);
+    expect(order!.cap).toBeGreaterThanOrEqual(20);
+    const cust = cashbackCustomer('5553988119085', [{ amount: 20, expires: '2027-01-31' }]);
+    const cId = cust.earns[0]!;
+    const TENANT_D = '44444444-4444-4444-8444-444444444444';
+    sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT_D}', 'Loja D', 'Loja D Ltda', '44555666000181');`);
+    const foreign = cashbackCustomer('5553988119086', [{ amount: 5, expires: '2027-02-28' }], TENANT_D).earns[0]!;
+    const ghost = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE id = '${ghost}'`)).toBe('0');
+    const redeemed = await cashbackRpc(order!.id, cust.id, 20);
+    expect(redeemed.status, redeemed.body).toBe(200);
+    // O resgate recuperado chegou com as quatro origens (R$ 5 cada); só R$ 5 saíram de C.
+    sql(`SET session_replication_role = replica;
+         UPDATE cashback_ledger SET redeem_sources = '[{"source_id": null, "amount": 5}, {"source_id": "${ghost}", "amount": 5}, {"source_id": "${foreign}", "amount": 5}, {"source_id": "${cId}", "amount": 5}]'
+          WHERE order_id = '${order!.id}' AND entry_type = 'REDEEM';
+         UPDATE cashback_ledger SET remaining_amount = 15 WHERE id = '${cId}';
+         UPDATE loyalty_customers SET cashback_balance = 15 WHERE id = '${cust.id}';`);
+    const cloudOrder = JSON.parse(sql(`SELECT row_to_json(o) FROM orders o WHERE id = '${order!.id}'`));
+    expect(Number(cloudOrder.discount_amount)).toBe(20);
+    const ledgerRows = JSON.parse(sql(`SELECT json_agg(row_to_json(x)) FROM cashback_ledger x WHERE customer_id = '${cust.id}'`)) as CashbackLedgerEntry[];
+    const num = (e: CashbackLedgerEntry) => ({ ...e, amount: Number(e.amount), remaining_amount: Number(e.remaining_amount),
+      redeem_sources: e.redeem_sources?.map((x) => ({ ...x, amount: Number(x.amount) })) ?? null });
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${cust.id}'`));
+    useTcheStore.setState({
+      orders: st().orders.map((o) => (o.id === order!.id ? { ...o, discount_amount: 20, total_amount: Number(cloudOrder.total_amount), remaining_balance: Number(cloudOrder.remaining_balance) } : o)),
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 15, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, ...ledgerRows.map(num)],
+    });
+    const item = st().orderItems.find((i) => i.order_id === order!.id && i.status !== 'CANCELED')!;
+    ok(st().cancelOrderItem(item.id, MANAGER));
+    const pending = [...st().outbox];
+    await expectSynced('cancelamento com origens não comprovadas');
+    const cloud = st().cloud!;
+    const resend = await flushOutbox(pending, { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000);
+    expect(resend.rejected).toEqual([]);
+    const now = JSON.parse(sql(`SELECT row_to_json(o) FROM orders o WHERE id = '${order!.id}'`));
+    const otherDevice = await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: Number(now.discount_amount), total_amount: Number(now.total_amount), remaining_balance: Number(now.remaining_balance) });
+    expect(otherDevice.status, otherDevice.body).toBe(204);
+
+    // Banco: R$ 5 de C com a validade de C; R$ 15 num HOLD só, sem vínculo, sem saldo, sem validade.
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('0.00');
+    expect(sql(`SELECT string_agg(entry_type || ' ' || amount || ' ' || remaining_amount || ' ' || COALESCE(refund_of_id::text, '-') || ' ' || COALESCE(to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'), '-'), ' | ' ORDER BY entry_type) FROM cashback_ledger WHERE order_id = '${order!.id}' AND entry_type <> 'REDEEM'`))
+      .toBe(`HOLD 15.00 0.00 - - | REFUND 5.00 5.00 ${cId} 2027-01-31`);
+    // Nenhum lançamento desta loja aponta para a outra loja ou para o UUID inexistente.
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE refund_of_id IN ('${foreign}', '${ghost}')`)).toBe('0');
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE tenant_id = '${TENANT_D}' AND order_id IS NOT NULL`)).toBe('0');
+    expect(sql(`SELECT remaining_amount FROM cashback_ledger WHERE id = '${foreign}'`)).toBe('5.00');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${cust.id}'`)).toBe('20.00');
+    // Registro: um só, com os UUIDs informados para investigação.
+    expect(sql(`SELECT count(*) || ' ' || sum(amount_impact) || ' ' || max(metadata->>'reason_code') || ' ' || max((metadata->'reported_source_ids')::text) FROM audit_logs WHERE order_id = '${order!.id}' AND action_type = 'CASHBACK_REFUND_HELD'`))
+      .toBe(`1 15.00 SOURCE_NOT_FOUND ["${ghost}", "${foreign}"]`);
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE order_id = '${order!.id}' AND action_type = 'CASHBACK_REFUNDED'`)).toBe('1');
+    // Aparelho: o mesmo extrato e o mesmo saldo.
+    const local = st().cashbackLedger.filter((e) => e.order_id === order!.id && e.entry_type !== 'REDEEM')
+      .map((e) => [e.entry_type, e.amount, e.remaining_amount, e.refund_of_id ?? null, e.expires_at?.slice(0, 10) ?? null]);
+    expect(local.sort()).toEqual([['HOLD', 15, 0, null, null], ['REFUND', 5, 5, cId, '2027-01-31']]);
+    expect(st().loyaltyCustomers.find((x) => x.id === cust.id)!.cashback_balance).toBe(20);
+    const localHeld = st().auditLogs.filter((x) => x.order_id === order!.id && x.action_type === 'CASHBACK_REFUND_HELD');
+    expect(localHeld.map((x) => [x.amount_impact, x.metadata?.reported_source_ids])).toEqual([[15, [ghost, foreign]]]);
+    // Banco protege: HOLD com vínculo é recusado mesmo pelo servidor.
+    expect(() => sql(`INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, refund_of_id)
+                      VALUES ('${TENANT}', '${cust.id}', '${order!.id}', 'HOLD', 1, 0, '${cId}');`)).toThrow(/cashback_ledger_hold_no_link/);
+    closeCashbackOrders([order!.id]);
+    setCashbackClock(null);
+  });
+
   it('balcão (Ficha Rápida) com fichas e retirada', async () => {
     login(CASHIER_PIN);
     const order = ok(st().createCounterSale([{ product_id: productId, quantity: 2, modifiers: [], meat_doneness: null }]));
