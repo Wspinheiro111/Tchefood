@@ -25,6 +25,73 @@ export function shiftStart(now: Date = new Date(), cutoffHour = SHIFT_CUTOFF_HOU
   return start;
 }
 
+/** Fuso da loja: o turno vira às 05:00 de Brasília, não do relógio do aparelho. */
+export const SHIFT_TIME_ZONE = 'America/Sao_Paulo';
+
+/** Período de relatório [start, end): `start` entra, `end` fica de fora. */
+export interface ShiftPeriod {
+  start: Date;
+  end: Date;
+}
+
+const SHIFT_CLOCK = new Intl.DateTimeFormat('en-US', {
+  timeZone: SHIFT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+});
+
+/** Relógio de parede de Brasília no instante `ms`, como se fosse UTC (para calcular a diferença de fuso). */
+function wallClockAsUtc(ms: number): number {
+  const p = Object.fromEntries(SHIFT_CLOCK.formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), Number(p.hour), Number(p.minute), Number(p.second));
+}
+
+/** Instante em que o relógio de Brasília marca `y-m-d hh:00`. */
+function brasiliaInstant(y: number, m: number, d: number, hour: number): number {
+  const guess = Date.UTC(y, m, d, hour);
+  let at = guess - (wallClockAsUtc(guess) - guess);
+  at = guess - (wallClockAsUtc(at) - at);
+  return at;
+}
+
+/**
+ * Início do turno corrente no horário de Brasília (America/Sao_Paulo): hoje às
+ * 05:00, ou ontem às 05:00 se ainda é madrugada. Não depende do fuso do aparelho.
+ */
+export function shiftStartBrasilia(now: Date = new Date(), cutoffHour = SHIFT_CUTOFF_HOUR): Date {
+  const p = Object.fromEntries(SHIFT_CLOCK.formatToParts(now).map((x) => [x.type, x.value]));
+  const y = Number(p.year);
+  const m = Number(p.month) - 1;
+  const d = Number(p.day);
+  const today = brasiliaInstant(y, m, d, cutoffHour);
+  if (now.getTime() >= today) return new Date(today);
+  return new Date(brasiliaInstant(y, m, d - 1, cutoffHour));
+}
+
+/** Início do turno seguinte ao que começou em `start` (05:00 do dia seguinte em Brasília). */
+export function nextShiftStart(start: Date, cutoffHour = SHIFT_CUTOFF_HOUR): Date {
+  return shiftStartBrasilia(new Date(start.getTime() + 36 * 3600_000), cutoffHour);
+}
+
+/**
+ * Período do turno corrente: de `start` até agora (inclusive), nunca além do
+ * início do turno seguinte. Registro com data no futuro não entra.
+ */
+export function currentShiftPeriod(start: Date = shiftStartBrasilia(), now: Date = new Date()): ShiftPeriod {
+  return { start, end: new Date(Math.min(nextShiftStart(start).getTime(), now.getTime() + 1)) };
+}
+
+/** true se a data é válida e cai em [start, end). Data inválida, vazia ou null fica de fora. */
+export function inShiftPeriod(iso: string | null | undefined, period: ShiftPeriod): boolean {
+  if (typeof iso !== 'string' || iso === '') return false;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) && t >= period.start.getTime() && t < period.end.getTime();
+}
+
+/** Legenda "dd/mm, hh:mm" do início do turno, sempre no horário de Brasília. */
+export function formatShiftStart(start: Date): string {
+  return start.toLocaleString('pt-BR', { timeZone: SHIFT_TIME_ZONE, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
 /**
  * KPIs do turno: faturamento, contas fechadas, ticket médio e 10% contam só o
  * que aconteceu desde `since`; o saldo em aberto no salão é sempre o atual.
@@ -60,9 +127,8 @@ export interface ReconRow {
   count: number;
 }
 
-/** Conciliação por adquirente: só pagamentos aprovados desde o início do turno (`since`). */
-export function reconciliation(payments: readonly Payment[], since: Date = shiftStart()): ReconRow[] {
-  const from = since.getTime();
+/** Conciliação por adquirente: só pagamentos aprovados dentro do período do turno [start, end). */
+export function reconciliation(payments: readonly Payment[], period: ShiftPeriod = currentShiftPeriod()): ReconRow[] {
   const rows: Record<ReconKey, ReconRow> = {
     STONE: { acquirer: 'STONE', cnpj: '16501555000157', byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
     PAGBANK: { acquirer: 'PAGBANK', cnpj: '08561701000101', byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
@@ -74,7 +140,7 @@ export function reconciliation(payments: readonly Payment[], since: Date = shift
     CASH_DESK: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 },
   };
   for (const p of payments) {
-    if (p.status !== 'APPROVED' || new Date(p.created_at).getTime() < from) continue;
+    if (p.status !== 'APPROVED' || !inShiftPeriod(p.created_at, period)) continue;
     const key: ReconKey = p.acquirer === 'STONE' || p.acquirer === 'PAGBANK' ? p.acquirer : 'CASH_DESK';
     cents[key][p.method] += toCents(p.amount);
     rows[key].count += 1;
@@ -102,16 +168,15 @@ export interface WaiterRow {
  * cobrada é distribuída entre os garçons proporcionalmente ao valor que cada
  * um lançou (maiores restos → Σ comissões == Σ taxas, sem perder centavo).
  */
-export function waiterSplit(orders: readonly Order[], items: readonly OrderItem[], staff: readonly StaffUser[], since: Date = shiftStart()): WaiterRow[] {
-  const from = since.getTime();
+export function waiterSplit(orders: readonly Order[], items: readonly OrderItem[], staff: readonly StaffUser[], period: ShiftPeriod = currentShiftPeriod()): WaiterRow[] {
   const sales = new Map<string, { cents: number; qty: number; commission: number }>();
   const bump = (id: string) => {
     if (!sales.has(id)) sales.set(id, { cents: 0, qty: 0, commission: 0 });
     return sales.get(id)!;
   };
   for (const o of orders) {
-    // Só contas fechadas dentro do turno entram no rateio.
-    if (o.status !== 'CLOSED' || o.closed_at === null || new Date(o.closed_at).getTime() < from) continue;
+    // Só contas fechadas dentro do turno [start, end) entram no rateio.
+    if (o.status !== 'CLOSED' || o.closed_at === null || !inShiftPeriod(o.closed_at, period)) continue;
     const valid = items.filter((i) => i.order_id === o.id && i.status !== 'CANCELED');
     const perWaiter = new Map<string, number>();
     for (const i of valid) {

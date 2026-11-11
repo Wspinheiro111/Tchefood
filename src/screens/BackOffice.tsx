@@ -5,7 +5,8 @@ import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../st
 import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
-import { AUDIT_LABEL, reconciliation, shiftKpis, shiftStart, waiterSplit, whatsappAlertText } from '../lib/reports';
+import { AUDIT_LABEL, currentShiftPeriod, formatShiftStart, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
+import { useShiftStart } from '../lib/useShiftStart';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
@@ -138,14 +139,16 @@ function Dashboard() {
   const orders = useTcheStore((s) => s.orders);
   const payments = useTcheStore((s) => s.payments);
   const tables = useTcheStore((s) => s.tables);
-  const k = useMemo(() => shiftKpis(orders, payments), [orders, payments]);
+  // O início do turno é dependência: na virada das 05:00 os números e a legenda mudam juntos.
+  const start = useShiftStart();
+  const k = useMemo(() => shiftKpis(orders, payments, start), [orders, payments, start]);
   const occupied = tables.filter((t) => t.status !== 'FREE' && t.status !== 'DIRTY').length;
-  const recon = useMemo(() => reconciliation(payments), [payments]);
+  const recon = useMemo(() => reconciliation(payments, currentShiftPeriod(start)), [payments, start]);
   const max = Math.max(1, ...recon.map((r) => r.total));
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi label="Faturamento bruto do turno" value={formatBRL(k.grossRevenue)} hint={`Σ aprovados desde ${shiftStart().toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}`} tone="text-verde" />
+        <Kpi label="Faturamento bruto do turno" value={formatBRL(k.grossRevenue)} hint={`Σ aprovados desde ${formatShiftStart(start)}`} tone="text-verde" />
         <Kpi label="Ticket médio por mesa" value={formatBRL(k.averageTicket)} hint={`${k.closedOrders} conta(s) fechada(s)`} />
         <Kpi label="Taxa de serviço (10%)" value={formatBRL(k.serviceFeeTotal)} hint="Contas fechadas" tone="text-brasa" />
         <Kpi label="Mesas atendidas" value={String(k.tablesServed)} hint={`${occupied} ocupada(s) agora`} />
@@ -168,7 +171,8 @@ function Dashboard() {
 
 function Reconciliation() {
   const payments = useTcheStore((s) => s.payments);
-  const rows = useMemo(() => reconciliation(payments), [payments]);
+  const start = useShiftStart();
+  const rows = useMemo(() => reconciliation(payments, currentShiftPeriod(start)), [payments, start]);
   const methods = ['CREDIT', 'DEBIT', 'PIX', 'CASH'] as const;
   const label = { CREDIT: 'Crédito', DEBIT: 'Débito', PIX: 'Pix', CASH: 'Dinheiro' } as const;
   const totals = methods.map((m) => rows.reduce((a, r) => a + r.byMethod[m], 0));
@@ -213,11 +217,12 @@ function WaiterSplit() {
   const orders = useTcheStore((s) => s.orders);
   const items = useTcheStore((s) => s.orderItems);
   const staff = useTcheStore((s) => s.staff);
-  const rows = useMemo(() => waiterSplit(orders, items, staff), [orders, items, staff]);
+  const start = useShiftStart();
+  const rows = useMemo(() => waiterSplit(orders, items, staff, currentShiftPeriod(start)), [orders, items, staff, start]);
   const total = rows.reduce((a, r) => a + r.commission, 0);
   return (
     <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-surface">
-      <p className="p-3 text-xs text-slate-500">Base: contas fechadas no turno (desde {shiftStart().toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}). A taxa de serviço efetivamente cobrada de cada conta é rateada entre os garçons proporcionalmente ao que cada um lançou (sem perder centavos).</p>
+      <p className="p-3 text-xs text-slate-500">Base: contas fechadas no turno (desde {formatShiftStart(start)}). A taxa de serviço efetivamente cobrada de cada conta é rateada entre os garçons proporcionalmente ao que cada um lançou (sem perder centavos).</p>
       <table className="w-full min-w-[520px] text-sm">
         <thead className="bg-base text-left text-xs uppercase text-slate-500">
           <tr><th className="p-3">Garçom</th><th className="p-3 text-right">Itens</th><th className="p-3 text-right">Total vendido</th><th className="p-3 text-right">Comissão 10%</th></tr>
