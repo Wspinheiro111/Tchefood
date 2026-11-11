@@ -212,6 +212,7 @@ DECLARE
     v_half UUID;
     v_mods NUMERIC;
     v_count INT;
+    v_regular BOOLEAN;
 BEGIN
     SELECT * INTO v_product FROM products WHERE id = p_item.product_id;
     IF NOT FOUND THEN RETURN; END IF;
@@ -229,18 +230,22 @@ BEGIN
     -- Instante do preço: o relógio do servidor. O created_at/priced_at vem do aparelho e
     -- pode ser forjado (happy hour fora da janela sem PIN). Item que sobe depois da
     -- janela fica recusado e o gerente aceita com PIN (PRICE_OVERRIDE).
-    v_at := NOW();
+    -- A conferência da promoção no instante declarado da venda (tchefood_check_item_price) pede
+    -- outro instante ou o preço sem regra de horário: só por estas duas marcas locais da transação.
+    v_at := COALESCE(NULLIF(current_setting('tchefood.price_at', true), '')::timestamptz, NOW());
+    v_regular := current_setting('tchefood.price_mode', true) = 'regular';
 
     -- Ficha Rápida (origem SMARTPOS) segue a regra de horário como a comanda: o app cobra
     -- o happy hour no balcão desde o PR #27 (createCounterSale usa effectivePrice). Antes
     -- o banco usava o preço base e, com a recusa abaixo, travaria a venda certa.
-    v_prices := ARRAY[tchefood_sale_price(v_product.id, v_at)];
+    v_prices := ARRAY[CASE WHEN v_regular THEN round(v_product.price, 2) ELSE tchefood_sale_price(v_product.id, v_at) END];
     FOREACH v_half IN ARRAY COALESCE(p_item.half_product_ids, '{}') LOOP
         IF NOT EXISTS (SELECT 1 FROM products h WHERE h.id = v_half AND h.tenant_id = v_product.tenant_id AND h.allows_half_and_half)
            OR NOT v_product.allows_half_and_half THEN
             RETURN;
         END IF;
-        v_prices := v_prices || tchefood_sale_price(v_half, v_at);
+        v_prices := v_prices || CASE WHEN v_regular THEN (SELECT round(h.price, 2) FROM products h WHERE h.id = v_half)
+                                     ELSE tchefood_sale_price(v_half, v_at) END;
     END LOOP;
     IF array_length(v_prices, 1) > 1 THEN
         base := CASE WHEN v_rule = 'AVERAGE'
@@ -266,6 +271,9 @@ RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
     v_product products%ROWTYPE;
     v_expected RECORD;
+    v_regular RECORD;
+    v_at_sale RECORD;
+    v_promo BOOLEAN := FALSE;
     v_impact NUMERIC;
     v_legacy BOOLEAN;
     v_override audit_logs%ROWTYPE;
@@ -292,9 +300,36 @@ BEGIN
         RETURN NEW;
     END IF;
     SELECT * INTO v_expected FROM tchefood_expected_item_price(NEW);
-    IF v_expected.base IS NOT NULL
-       AND v_expected.base = NEW.unit_price AND v_expected.modifiers = NEW.modifiers_unit_price THEN
-        RETURN NEW;
+    PERFORM set_config('tchefood.price_mode', 'regular', true);
+    SELECT * INTO v_regular FROM tchefood_expected_item_price(NEW);
+    PERFORM set_config('tchefood.price_mode', '', true);
+    IF v_expected.base IS NOT NULL AND v_regular.base IS NOT NULL THEN
+        -- Preço sem regra de horário, ou o da regra valendo agora: o maior dos dois entra a
+        -- qualquer momento (não cobra menos que o outro).
+        IF (v_regular.base = NEW.unit_price AND v_regular.base >= v_expected.base
+            OR v_expected.base = NEW.unit_price AND v_expected.base >= v_regular.base)
+           AND v_expected.modifiers = NEW.modifiers_unit_price THEN
+            RETURN NEW;
+        END IF;
+        -- O menor (promoção valendo agora), P0-01 da rodada 5 do GPT: a promoção estar valendo
+        -- quando o item chega não prova que valia na venda. Sem PIN, só entra o item que chega
+        -- na hora em que foi lançado (aparelho com internet: o instante declarado está a até
+        -- 5 minutos do relógio do servidor) e cujo instante declarado também está na promoção.
+        -- Item que ficou na fila sem internet e chega depois, com a promoção valendo ou não,
+        -- precisa do PIN de gerente (PRICE_OVERRIDE), como qualquer preço que o servidor não confere.
+        IF v_expected.base = NEW.unit_price AND v_expected.modifiers = NEW.modifiers_unit_price THEN
+            IF NEW.priced_at IS NOT NULL AND NEW.priced_at BETWEEN NOW() - interval '5 minutes' AND NOW() + interval '5 minutes' THEN
+                PERFORM set_config('tchefood.price_at', NEW.priced_at::text, true);
+                SELECT * INTO v_at_sale FROM tchefood_expected_item_price(NEW);
+                PERFORM set_config('tchefood.price_at', '', true);
+                IF v_at_sale.base = NEW.unit_price AND v_at_sale.modifiers = NEW.modifiers_unit_price THEN
+                    RETURN NEW;
+                END IF;
+            END IF;
+            -- Valor e alerta contra o preço sem promoção.
+            v_promo := TRUE;
+            v_expected := v_regular;
+        END IF;
     END IF;
     -- Item de aparelho antigo (fila gravada antes desta versão): não traz o instante do preço nem os
     -- adicionais e sabores escolhidos, então o banco não tem como refazer a conta. Registra o alerta
@@ -322,6 +357,9 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_PRECO: %', CASE
             WHEN v_legacy THEN 'item de versão antiga do app (sem o instante do preço) com preço diferente do cadastro atual. Aceite com PIN de gerente.'
             WHEN v_expected.base IS NULL THEN 'item com sabor ou adicional que o cadastro da nuvem não reconhece. Aceite com PIN de gerente.'
+            WHEN v_promo THEN format('preço de promoção R$ %s num item que chegou à nuvem fora da hora do lançamento (sem internet); sem a promoção, R$ %s. Aceite com PIN de gerente.',
+                        to_char(NEW.unit_price + NEW.modifiers_unit_price, 'FM999999990.00'),
+                        to_char(v_expected.base + v_expected.modifiers, 'FM999999990.00'))
             ELSE format('preço do cadastro R$ %s, o aparelho mandou R$ %s. Aceite com PIN de gerente.',
                         to_char(v_expected.base + v_expected.modifiers, 'FM999999990.00'),
                         to_char(NEW.unit_price + NEW.modifiers_unit_price, 'FM999999990.00')) END;
@@ -330,6 +368,7 @@ BEGIN
     VALUES (v_product.tenant_id, NEW.order_id, NEW.waiter_id, v_override.authorized_by_manager_id, 'PRICE_MISMATCH', COALESCE(v_impact, 0),
             CASE WHEN v_legacy THEN 'Item de versão antiga do app: sem dados para o servidor conferir o preço'
                  WHEN v_expected.base IS NULL THEN 'Item com sabor ou adicional que o cadastro da nuvem não reconhece'
+                 WHEN v_promo THEN 'Item com preço de promoção que chegou à nuvem fora da hora do lançamento'
                  ELSE 'Item lançado com preço diferente do cadastro da nuvem' END,
             FALSE,
             jsonb_build_object(
@@ -339,7 +378,7 @@ BEGIN
                 'item_id', NEW.id, 'product_id', NEW.product_id, 'product_code', v_product.code, 'quantity', NEW.quantity,
                 'unit_price', NEW.unit_price, 'modifiers_unit_price', NEW.modifiers_unit_price,
                 'expected_unit_price', v_expected.base, 'expected_modifiers_unit_price', v_expected.modifiers,
-                'priced_at', NEW.priced_at, 'origin', NEW.origin,
+                'priced_at', NEW.priced_at, 'origin', NEW.origin, 'promotion_unverified', v_promo,
                 'price_override_id', v_override.id, 'override_reason', v_override.reason));
     RETURN NEW;
 END;

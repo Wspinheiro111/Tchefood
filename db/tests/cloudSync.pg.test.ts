@@ -798,6 +798,51 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(promo.body).toContain('preço do cadastro R$ 50.00, o aparelho mandou R$ 20.00');
     expect((await raw('POST', 'order_items', { ...promoItem, id: crypto.randomUUID(), unit_price: 50 })).status).toBe(201);
 
+    // P0-01 da rodada 5 do GPT: promoção valendo agora não prova que valia na venda. Produto de
+    // R$ 50 com promoção de R$ 20 em volta deste instante (todos os dias, para não depender
+    // do dia); item de R$ 20 lançado há duas horas e guardado sem internet: recusado sem PIN.
+    const hhmm = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
+    const allDays = [0, 1, 2, 3, 4, 5, 6];
+    const almoco = pizza('704', 'Prato do Almoço', 50);
+    ok(st().savePriceSchedule({ product_id: almoco.id, name: 'Agora', weekdays: allDays, start_time: hhmm(Date.now() - 30 * 60_000), end_time: hhmm(Date.now() + 60 * 60_000), price: 20, active: true }));
+    // Promoção que começou há 2 minutos: item lançado 4 minutos atrás está perto do relógio
+    // do servidor, mas antes da promoção.
+    const recente = pizza('705', 'Prato Recém-promovido', 50);
+    ok(st().savePriceSchedule({ product_id: recente.id, name: 'Começou agora', weekdays: allDays, start_time: hhmm(Date.now() - 2 * 60_000), end_time: hhmm(Date.now() + 60 * 60_000), price: 20, active: true }));
+    await expectSynced('promoção valendo agora');
+    const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    const lateItem = {
+      id: crypto.randomUUID(), order_id: order.id, product_id: almoco.id, waiter_id: st().currentUserId, quantity: 1, unit_price: 20, modifiers_unit_price: 0,
+      sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER', priced_at: twoHoursAgo, created_at: twoHoursAgo,
+    };
+    const late = await raw('POST', 'order_items', lateItem);
+    expect(late.status).toBe(400);
+    expect(late.body).toContain('TCHEFOOD_PRECO: preço de promoção R$ 20.00 num item que chegou à nuvem fora da hora do lançamento (sem internet); sem a promoção, R$ 50.00');
+    expect(sql(`SELECT count(*) FROM order_items WHERE id = '${lateItem.id}'`)).toBe('0');
+    // O mesmo item dizendo que foi lançado agora, mas fora da janela de 5 minutos por 1 minuto: recusado.
+    const sixMin = { ...lateItem, id: crypto.randomUUID(), priced_at: new Date(Date.now() - 6 * 60_000).toISOString() };
+    expect((await raw('POST', 'order_items', sixMin)).status).toBe(400);
+    const fourMinAgo = new Date(Date.now() - 4 * 60_000).toISOString();
+    const beforeStart = { ...lateItem, id: crypto.randomUUID(), product_id: recente.id, priced_at: fourMinAgo, created_at: fourMinAgo };
+    const early = await raw('POST', 'order_items', beforeStart);
+    expect(early.status).toBe(400);
+    expect(early.body).toContain('preço de promoção R$ 20.00');
+    // Pelo preço normal, o item atrasado entra sem PIN.
+    expect((await raw('POST', 'order_items', { ...lateItem, id: crypto.randomUUID(), unit_price: 50 })).status).toBe(201);
+    // Com o PIN do gerente, o item atrasado entra e o alerta mostra os R$ 30 contra o preço sem promoção.
+    expect((await authorize(lateItem, MANAGER_PIN)).status).toBe(200);
+    expect((await raw('POST', 'order_items', lateItem)).status).toBe(201);
+    expect(sql(`SELECT amount_impact || ' ' || (metadata->>'promotion_unverified') || ' ' || (metadata->>'expected_unit_price') || ' ' || (authorized_by_manager_id IS NOT NULL)
+                FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND metadata->>'item_id' = '${lateItem.id}'`)).toBe('30.00 true 50.00 true');
+    // Venda legítima com internet: o app lança e sobe na hora, pelo preço da promoção, sem PIN.
+    ok(st().addToTray({ order_id: order.id, product_id: almoco.id, half_product_ids: [], quantity: 1, unit_price: 20, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: almoco.sector }));
+    ok(st().dispatchTray(order.id));
+    const live = st().orderItems.filter((i) => i.order_id === order.id && i.product_id === almoco.id).at(-1)!;
+    expect(live.unit_price).toBe(20);
+    await expectSynced('promoção com internet');
+    expect(sql(`SELECT unit_price FROM order_items WHERE id = '${live.id}'`)).toBe('20.00');
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND metadata->>'item_id' = '${live.id}'`)).toBe('0');
+
     // P0-03 do GPT: produto ou conta de outra loja. A recusa não mostra preço nem nome.
     const TENANT_B = '22222222-2222-4222-8222-222222222222';
     const productB = crypto.randomUUID();
