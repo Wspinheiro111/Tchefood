@@ -13,11 +13,56 @@ export const EMPRESA = {
 };
 
 /**
+ * Nome DNS válido na forma em que o `URL` o entrega (minúsculo, nomes acentuados já em punycode
+ * `xn--`): até 253 caracteres, rótulos de 1 a 63 caracteres com a-z, 0-9 e hífen, sem hífen no
+ * começo ou no fim, sem rótulo vazio (`..`, ponto inicial ou final) e com a terminação não só de
+ * números (recusa IP).
+ */
+function hostnameDnsValido(host: string): boolean {
+  if (host.length > 253) return false;
+  const rotulos = host.split('.');
+  if (rotulos.length < 2) return false;
+  // Sem lookbehind: o Safari anterior ao 16.4 não aceita essa sintaxe e o módulo inteiro deixaria de carregar.
+  const rotuloOk = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+  if (!rotulos.every((r) => rotuloOk.test(r))) return false;
+  return !/^\d+$/.test(rotulos[rotulos.length - 1]);
+}
+
+/**
+ * Confere o endereço do site e devolve a origem sem barra no fim (ex.: https://tchefood.com.br).
+ * Recusa com erro claro, que derruba o build: endereço malformado, sem https, com usuário/senha,
+ * porta, caminho (o site é publicado na raiz do domínio), query ou fragmento.
+ */
+export function normalizarSiteUrl(bruto: string): string {
+  const texto = bruto.trim();
+  let url: URL;
+  try {
+    url = new URL(texto);
+  } catch {
+    throw new Error(`VITE_SITE_URL inválido: "${bruto}" não é um endereço. Use, por exemplo, https://tchefood.com.br`);
+  }
+  const problemas: string[] = [];
+  if (url.protocol !== 'https:') problemas.push('precisa começar com https://');
+  if (url.username || url.password) problemas.push('não pode ter usuário ou senha');
+  if (url.port) problemas.push('não pode ter porta');
+  if (url.pathname !== '/') problemas.push('não pode ter caminho: o site fica na raiz do domínio');
+  if (url.search || texto.includes('?')) problemas.push('não pode ter ?parâmetros');
+  if (url.hash || texto.includes('#')) problemas.push('não pode ter #fragmento');
+  if (!url.hostname.includes('.')) problemas.push('o domínio precisa ter ponto (ex.: tchefood.com.br)');
+  else if (!hostnameDnsValido(url.hostname))
+    problemas.push('o domínio não é um nome válido (só letras, números e hífen, sem partes vazias, hífen nas pontas ou final só com números)');
+  if (problemas.length) throw new Error(`VITE_SITE_URL inválido ("${bruto}"): ${problemas.join('; ')}.`);
+  return url.origin;
+}
+
+/**
  * Endereço público do site, sem barra no fim. Usado no canonical, nas tags OG, no JSON-LD,
  * no sitemap.xml e no robots.txt. Troque com a variável de ambiente VITE_SITE_URL no build
  * (ou no arquivo .env) quando o domínio definitivo estiver registrado.
  */
-export const SITE_URL = (import.meta.env?.VITE_SITE_URL ?? 'https://tchefood.com.br').replace(/\/+$/, '');
+// `??` e não `||`: só a variável AUSENTE usa o padrão. VITE_SITE_URL="" (ou só espaços) é erro de
+// configuração e derruba o build, em vez de publicar com o domínio padrão sem ninguém perceber.
+export const SITE_URL = normalizarSiteUrl(import.meta.env?.VITE_SITE_URL ?? 'https://tchefood.com.br');
 
 export interface Plano {
   id: 'bistro' | 'salao-pro' | 'rede-eventos';

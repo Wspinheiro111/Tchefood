@@ -8,6 +8,7 @@
 import { readFile, writeFile, rm } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
+import { dataUltimaAlteracao } from './ultimaAlteracao.mjs';
 
 const raiz = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(raiz, 'dist');
@@ -55,8 +56,10 @@ const corpo = render().replace(/(src|href)="\/assets\//g, '$1="./assets/');
 html = html.replace('<!--seo-head-->', head).replace('<!--app-html-->', corpo);
 await writeFile(arquivo, html);
 
-const hoje = new Date().toISOString().slice(0, 10);
-await writeFile(path.join(dist, 'sitemap.xml'), sitemapXml(hoje));
+// lastmod = data do último commit que mexeu na pasta landing/ (não a data do build). Sem git,
+// ou num clone raso, a data não é confiável e o sitemap sai sem <lastmod>.
+const ultimaAlteracao = dataUltimaAlteracao(raiz);
+await writeFile(path.join(dist, 'sitemap.xml'), sitemapXml(ultimaAlteracao));
 await writeFile(path.join(dist, 'robots.txt'), robotsTxt());
 await rm(ssr, { recursive: true, force: true });
 
