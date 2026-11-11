@@ -1223,6 +1223,70 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SET ROLE service_role; SELECT focus_nfe_token FROM tenants WHERE id = '${TENANT}';`)).toContain('focus-secreto');
   });
 
+  it('autorização de desconto vale uma vez: depois de usada, não serve de novo na mesma conta', async () => {
+    // Desconto 0→5 com PIN; o cancelamento do item leva o desconto a 0; item novo; o aparelho
+    // manda 0→5 de novo sem autorização nova: recusado. Com o PIN de novo, vale (uma vez).
+    login(OWNER_PIN);
+    ok(st().saveTable({ number: 81, label: 'Mesa 81', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('mesa 81');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 81)!.id, 1, null));
+    const p = st().products.find((x) => x.id === productId)!;
+    const launch = () => {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      return ok(st().dispatchTray(order.id)).items;
+    };
+    const [first] = launch();
+    ok(st().applyDiscount(order.id, 5, MANAGER));
+    await expectSynced('desconto 0→5 autorizado');
+    ok(st().cancelOrderItem(first!.id, MANAGER));
+    await expectSynced('item cancelado');
+    launch();
+    await expectSynced('item novo');
+    const snapshot = () => sql(`SELECT o.discount_amount || ' ' || o.total_amount || ' '
+      || (SELECT count(*) FROM audit_logs a WHERE a.order_id = o.id AND a.action_type = 'DISCOUNT_APPLIED') FROM orders o WHERE o.id = '${order.id}'`);
+    const before = snapshot();
+    expect(before.split(' ')[0]).toBe('0.00');
+    expect(before.split(' ')[2]).toBe('1');
+    const reuse = await raw('PATCH', `orders?id=eq.${order.id}`, { discount_amount: 5 });
+    expect(reuse.status).toBe(400);
+    expect(reuse.body).toContain('DISCOUNT_APPLIED sem PIN de gerente');
+    expect(snapshot()).toBe(before);
+    // Zerar o marcador da autorização usada junto não adianta.
+    expect((await raw('PATCH', `orders?id=eq.${order.id}`, { discount_amount: 5, discount_auth_seq: 0 })).status).toBe(400);
+    expect(snapshot()).toBe(before);
+    expect(sql(`SELECT discount_auth_seq > 0 FROM orders WHERE id = '${order.id}'`)).toBe('t');
+    // Autorização nova com PIN: vale, e o reenvio da fila (resposta perdida) não pede outra.
+    const local = st().orders.find((o) => o.id === order.id)!;
+    expect(local.discount_amount).toBe(0);
+    ok(st().applyDiscount(order.id, 5, MANAGER));
+    const pending = [...st().outbox];
+    await expectSynced('desconto 0→5 com autorização nova');
+    const after = snapshot();
+    expect(after.split(' ')[0]).toBe('5.00');
+    expect(after.split(' ')[2]).toBe('2');
+    const cloud = st().cloud!;
+    const resend = await flushOutbox(pending, { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000);
+    expect(resend.rejected).toEqual([]);
+    expect(snapshot()).toBe(after);
+    // Duas subidas na mesma transação com a mesma autorização: a segunda é recusada.
+    const fresh = await raw('POST', 'rpc/tchefood_authorize_manager', {
+      p_order_id: order.id, p_action_type: 'DISCOUNT_APPLIED', p_manager_pin: MANAGER_PIN, p_performed_by: st().currentUserId,
+      p_reason: 'Troca do desconto', p_amount_impact: -2, p_metadata: { discount_before: 5, discount_after: 7 },
+    });
+    expect(fresh.status).toBe(200);
+    const twice = psql(target!, `BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"role":"authenticated","tenant_id":"${TENANT}","sub":"device"}', true);
+      UPDATE orders SET discount_amount = 7 WHERE id = '${order.id}'; UPDATE orders SET discount_amount = 5 WHERE id = '${order.id}'; UPDATE orders SET discount_amount = 7 WHERE id = '${order.id}'; COMMIT;`, DB);
+    expect(twice.ok).toBe(false);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order.id}'`)).toBe('5.00');
+    sql(`SET session_replication_role = replica; UPDATE orders SET status = 'CANCELED' WHERE id = '${order.id}'; UPDATE dining_tables SET status = 'FREE', current_order_id = NULL WHERE current_order_id = '${order.id}';`);
+    useTcheStore.setState({
+      orders: st().orders.filter((o) => o.id !== order.id),
+      tables: st().tables.map((t) => (t.current_order_id === order.id ? { ...t, status: 'FREE' as const, current_order_id: null } : t)),
+    });
+  });
+
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
     const dir = join(ROOT, 'supabase', 'migrations');
     for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) psqlFile(target!, join(dir, f), DB);
