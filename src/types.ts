@@ -564,6 +564,12 @@ export interface CashbackLedgerEntry {
   redeem_sources?: CashbackRedeemSource[] | null;
   /** REFUND: de qual crédito é esta devolução (vence com ele). */
   refund_of_id?: UUID | null;
+  /**
+   * Só no espelho do estorno feito neste aparelho (não existe no banco): o evento da fila
+   * (atualização da conta) que faz o banco gravar este estorno. Enquanto ele não subir, o
+   * crédito não existe na nuvem. O estorno lido da nuvem não tem este campo.
+   */
+  source_event_id?: UUID;
 }
 
 export interface CashbackRedeemSource {
@@ -835,12 +841,13 @@ export interface SyncEvent {
    */
   depends_on_order_id?: UUID;
   /**
-   * Outras comandas de que esta mudança depende: o resgate de cashback que usa o estorno
-   * gerado neste aparelho pelo cancelamento (ou retirada dos 10%) de outra comanda espera a
-   * operação daquela comanda ser aceita. Se ela for recusada, o crédito do estorno não existe
-   * na nuvem, e o resgate fica segurado junto (recordKeys). Não vai para o banco.
+   * Eventos da fila de que esta mudança depende: o resgate de cashback que usa o estorno
+   * gerado neste aparelho pelo cancelamento (ou retirada dos 10%) de outra comanda espera o
+   * evento que faz o banco gravar aquele estorno. Enquanto ele estiver na fila ou recusado, o
+   * resgate fica segurado (flushOutbox); só ele, não as operações seguintes daquela comanda.
+   * Não vai para o banco.
    */
-  depends_on_order_ids?: UUID[];
+  depends_on_event_ids?: UUID[];
 }
 
 export interface KegChangeSync {

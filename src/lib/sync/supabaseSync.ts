@@ -426,8 +426,6 @@ export function recordKeys(event: SyncEvent): string[] {
   // Mudança que depende de uma operação da comanda sem apontar para ela no registro:
   // a liberação da mesa no fechamento, o consumo do cashback no resgate.
   order(event.depends_on_order_id);
-  // Resgate que usa estorno de outra comanda: espera a operação que gerou o estorno.
-  for (const id of event.depends_on_order_ids ?? []) order(id);
   return keys;
 }
 
@@ -451,8 +449,12 @@ export async function flushOutbox(
   const sent: string[] = [];
   const rejected: SyncRejection[] = [];
   const blocked = new Set(held.flatMap(recordKeys));
+  // Eventos que não subiram (recusados guardados, recusados ou segurados nesta rodada): quem
+  // depende de um deles (depends_on_event_ids) espera.
+  const unsent = new Set(held.map((e) => e.id));
   const reject = (event: SyncEvent, status: number, message: string) => {
     rejected.push({ eventId: event.id, status, message });
+    unsent.add(event.id);
     for (const k of recordKeys(event)) blocked.add(k);
   };
   let attempts = 0;
@@ -460,12 +462,13 @@ export async function flushOutbox(
     // Eventos segurados não contam no limite: senão um bloco segurado no começo da fila
     // impediria para sempre que registros sem relação subissem.
     const keys = recordKeys(event);
-    if (keys.some((k) => blocked.has(k))) {
+    if (keys.some((k) => blocked.has(k)) || (event.depends_on_event_ids ?? []).some((id) => unsent.has(id))) {
       // O segurado também segura o que vem depois dele em QUALQUER registro que ele
       // toca: a liberação da mesa da comanda A, segurada pelo pagamento recusado de A,
       // não pode ser ultrapassada pela ocupação da mesma mesa pela comanda B (senão,
       // ao reenviar A, a liberação antiga sobrescreveria a mesa ocupada na nuvem).
       for (const k of keys) blocked.add(k);
+      unsent.add(event.id);
       continue;
     }
     if (attempts >= limit) break;
