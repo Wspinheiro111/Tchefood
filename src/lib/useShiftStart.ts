@@ -1,10 +1,12 @@
 /**
- * Início do turno como estado reativo: muda sozinho na virada das 05:00 de
- * Brasília, mesmo sem nenhuma venda nova, e é conferido de novo quando o app
- * volta para a frente (aparelho dormindo atrasa ou pula timers).
+ * Relógio dos relatórios do turno: um "agora" reativo que avança a cada virada
+ * de minuto (a virada das 05:00 é uma delas) e é conferido de novo quando o app
+ * volta para a frente (aparelho dormindo atrasa ou pula timers). O período do
+ * turno sai desse relógio, então o início (na virada das 05:00) e o fim (registro
+ * que deixou de estar no futuro) mudam mesmo sem nenhuma venda nova.
  */
-import { useEffect, useState } from 'react';
-import { nextShiftStart, shiftStartBrasilia } from './reports';
+import { useEffect, useMemo, useState } from 'react';
+import { currentShiftPeriod, shiftStartBrasilia, type ShiftPeriod } from './reports';
 
 export interface ShiftClockDeps {
   now: () => Date;
@@ -15,8 +17,9 @@ export interface ShiftClockDeps {
 }
 
 const RESUME_EVENTS = ['visibilitychange', 'focus', 'pageshow'] as const;
-/** Folga depois das 05:00 para o timer não disparar um instante antes da virada. */
-const ROLLOVER_SLACK_MS = 250;
+export const REPORT_TICK_MS = 60_000;
+/** Folga depois da virada do minuto para o timer não disparar um instante antes. */
+const TICK_SLACK_MS = 250;
 
 function defaultDeps(): ShiftClockDeps {
   return {
@@ -28,44 +31,56 @@ function defaultDeps(): ShiftClockDeps {
 }
 
 /**
- * Agenda a próxima virada e reagenda a cada disparo. Chama `onChange` com o novo
- * início sempre que ele difere de `initial` (ou do último informado). Devolve a
- * função que cancela tudo.
+ * Chama `onTick(agora)` logo depois de cada virada de minuto e sempre que o app
+ * volta para a frente. Reagenda a cada disparo. Devolve a função que cancela tudo.
  */
-export function watchShiftRollover(initial: Date, onChange: (start: Date) => void, deps: ShiftClockDeps = defaultDeps()): () => void {
-  let current = initial.getTime();
+export function watchReportClock(onTick: (now: Date) => void, deps: ShiftClockDeps = defaultDeps()): () => void {
   let handle: unknown = null;
   let stopped = false;
 
-  const check = () => {
+  const schedule = () => {
+    if (handle !== null) deps.clearTimer(handle);
+    const t = deps.now().getTime();
+    const wait = REPORT_TICK_MS - (t % REPORT_TICK_MS) + TICK_SLACK_MS;
+    handle = deps.setTimer(tick, wait);
+  };
+
+  const tick = () => {
     if (stopped) return;
-    const start = shiftStartBrasilia(deps.now());
-    if (start.getTime() !== current) {
-      current = start.getTime();
-      onChange(start);
-    }
+    onTick(deps.now());
     schedule();
   };
 
-  const schedule = () => {
-    if (handle !== null) deps.clearTimer(handle);
-    const wait = nextShiftStart(new Date(current)).getTime() - deps.now().getTime() + ROLLOVER_SLACK_MS;
-    handle = deps.setTimer(check, Math.max(ROLLOVER_SLACK_MS, wait));
-  };
-
-  for (const ev of RESUME_EVENTS) deps.target?.addEventListener(ev, check);
-  check();
+  for (const ev of RESUME_EVENTS) deps.target?.addEventListener(ev, tick);
+  schedule();
 
   return () => {
     stopped = true;
     if (handle !== null) deps.clearTimer(handle);
-    for (const ev of RESUME_EVENTS) deps.target?.removeEventListener(ev, check);
+    for (const ev of RESUME_EVENTS) deps.target?.removeEventListener(ev, tick);
   };
 }
 
-/** Hook: início do turno corrente (Brasília), atualizado na virada das 05:00. */
-export function useShiftStart(): Date {
-  const [start, setStart] = useState(() => shiftStartBrasilia());
-  useEffect(() => watchShiftRollover(start, setStart), []); // eslint-disable-line react-hooks/exhaustive-deps
-  return start;
+/** Período do turno no instante `now` (Brasília): [05:00 do dia operacional, agora]. */
+export function shiftPeriodAt(now: Date): ShiftPeriod {
+  return currentShiftPeriod(shiftStartBrasilia(now), now);
+}
+
+/** Hook: "agora" reativo dos relatórios (ms), atualizado por minuto e na volta do app. */
+export function useReportClock(deps?: ShiftClockDeps): number {
+  const [now, setNow] = useState(() => (deps ?? defaultDeps()).now().getTime());
+  useEffect(() => watchReportClock((d) => setNow(d.getTime()), deps), [deps]);
+  return now;
+}
+
+/**
+ * Hook: um único período do turno para todos os números de uma tela. Recalcula a
+ * cada minuto, na volta do app e quando os dados da tela mudam (`data`), sempre
+ * com o horário de agora: uma venda que acabou de entrar já aparece.
+ */
+export function useShiftPeriod(data: readonly unknown[], deps?: ShiftClockDeps): ShiftPeriod {
+  const tick = useReportClock(deps);
+  const clockNow = deps?.now ?? (() => new Date());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  return useMemo(() => shiftPeriodAt(new Date(Math.max(tick, clockNow().getTime()))), [tick, ...data]);
 }

@@ -4,12 +4,14 @@ import {
   formatShiftStart,
   inShiftPeriod,
   nextShiftStart,
+  parseIsoInstant,
   reconciliation,
+  shiftKpis,
   shiftStartBrasilia,
   waiterSplit,
   type ShiftPeriod,
 } from '../lib/reports';
-import { watchShiftRollover, type ShiftClockDeps } from '../lib/useShiftStart';
+import { shiftPeriodAt, watchReportClock, type ShiftClockDeps } from '../lib/useShiftStart';
 import type { Order, OrderItem, Payment, StaffUser } from '../types';
 
 // Instantes absolutos. Brasília = UTC-3 (sem horário de verão desde 2019).
@@ -179,7 +181,7 @@ describe('P2-03: período [início, fim) — 05:00 exato entra, antes e futuro n
   });
 });
 
-describe('P1-01: virada das 05:00 sem mudar os arrays', () => {
+describe('P1-01 / rodada 3 P2-02: relógio dos relatórios sem mudar os arrays', () => {
   /** Relógio e timers controlados à mão. */
   function fakeClock(startIso: Date) {
     let t = startIso.getTime();
@@ -199,14 +201,16 @@ describe('P1-01: virada das 05:00 sem mudar os arrays', () => {
     return {
       deps,
       target,
-      /** Avança o relógio e dispara o timer se chegou a hora. */
+      /** Avança o relógio disparando os timers que vencerem no caminho. */
       advance(ms: number) {
-        t += ms;
-        const due = timer;
-        if (due && due.at <= t) {
+        const until = t + ms;
+        while (timer && timer.at <= until) {
+          const due = timer;
           timer = null;
+          t = due.at;
           due.fn();
         }
+        t = until;
       },
       /** Avança o relógio sem disparar timer (aparelho dormindo). */
       jump(ms: number) {
@@ -222,67 +226,121 @@ describe('P1-01: virada das 05:00 sem mudar os arrays', () => {
   const orders = [ord('o1', BRT('2026-11-11T02:00:00').toISOString(), 80)];
   const items = [item('o1', 800)];
   const payments = [pay(880, BRT('2026-11-11T02:00:00').toISOString())];
-  const telas = (start: Date, agora: Date) => {
-    const p = currentShiftPeriod(start, agora);
+  const telas = (agora: Date) => {
+    const p = shiftPeriodAt(agora);
     const recon = reconciliation(payments, p);
     return {
       dashboardTotal: recon.reduce((a, r) => a + r.total, 0),
       conciliacaoTransacoes: recon.reduce((a, r) => a + r.count, 0),
       rateioComissao: waiterSplit(orders, items, staff, p).reduce((a, r) => a + r.commission, 0),
-      legenda: formatShiftStart(start),
+      legenda: formatShiftStart(p.start),
     };
   };
 
-  it('timer agendado para a virada troca o turno das 04:59 para as 05:01', () => {
+  it('virada das 04:59 para as 05:01: o tick do minuto troca o turno', () => {
     const clock = fakeClock(BRT('2026-11-11T04:59:00'));
-    let start = shiftStartBrasilia(clock.deps.now());
-    const mudancas: Date[] = [];
-    const stop = watchShiftRollover(start, (s) => { start = s; mudancas.push(s); }, clock.deps);
+    let agora = clock.deps.now();
+    const stop = watchReportClock((d) => { agora = d; }, clock.deps);
 
-    const antes = telas(start, clock.deps.now());
+    const antes = telas(agora);
     expect(antes.rateioComissao).toBe(80);
     expect(antes.dashboardTotal).toBe(880);
     expect(antes.conciliacaoTransacoes).toBe(1);
     expect(antes.legenda).toContain('10/11');
-    // O próximo disparo é logo depois das 05:00, não daqui a um dia.
+    // O próximo disparo é logo depois das 05:00.
     expect(clock.pendingAt! - BRT('2026-11-11T05:00:00').getTime()).toBeGreaterThan(0);
     expect(clock.pendingAt! - BRT('2026-11-11T05:00:00').getTime()).toBeLessThan(1000);
 
     clock.advance(2 * 60_000); // 05:01
-    expect(mudancas).toHaveLength(1);
-    const depois = telas(start, clock.deps.now());
+    const depois = telas(agora);
     expect(depois.rateioComissao).toBe(0);
     expect(depois.dashboardTotal).toBe(0);
     expect(depois.conciliacaoTransacoes).toBe(0);
     expect(depois.legenda).toContain('11/11');
     expect(depois.legenda).toContain('05:00');
-    // Reagendou para a virada seguinte.
-    expect(clock.pendingAt! - BRT('2026-11-12T05:00:00').getTime()).toBeGreaterThan(0);
-    expect(clock.pendingAt! - BRT('2026-11-12T05:00:00').getTime()).toBeLessThan(1000);
     stop();
   });
 
-  it('ao voltar para o app (timer perdido com o aparelho dormindo) o turno é conferido de novo', () => {
+  it('o tick é a cada minuto: pagamento das 10:01 entra às 10:02 sem mudar os arrays', () => {
+    const clock = fakeClock(BRT('2026-11-11T10:00:00'));
+    let agora = clock.deps.now();
+    const stop = watchReportClock((d) => { agora = d; }, clock.deps);
+    const futuro = [pay(70, BRT('2026-11-11T10:01:00').toISOString())];
+    expect(reconciliation(futuro, shiftPeriodAt(agora))[0]!.total).toBe(0);
+    clock.advance(2 * 60_000);
+    expect(reconciliation(futuro, shiftPeriodAt(agora))[0]!.total).toBe(70);
+    stop();
+  });
+
+  it('ao voltar para o app (timer perdido com o aparelho dormindo) o relógio é conferido de novo', () => {
     const clock = fakeClock(BRT('2026-11-11T04:59:00'));
-    let start = shiftStartBrasilia(clock.deps.now());
-    const stop = watchShiftRollover(start, (s) => { start = s; }, clock.deps);
+    let agora = clock.deps.now();
+    const stop = watchReportClock((d) => { agora = d; }, clock.deps);
     clock.jump(2 * 60_000);
-    expect(start.toISOString()).toBe('2026-11-10T08:00:00.000Z');
+    expect(telas(agora).rateioComissao).toBe(80);
     clock.target.dispatchEvent(new Event('visibilitychange'));
-    expect(start.toISOString()).toBe('2026-11-11T08:00:00.000Z');
-    expect(telas(start, clock.deps.now()).rateioComissao).toBe(0);
+    expect(telas(agora).rateioComissao).toBe(0);
     stop();
     // Depois de parar, não reage mais.
+    const parado = agora;
     clock.jump(24 * 3600_000);
     clock.target.dispatchEvent(new Event('focus'));
-    expect(start.toISOString()).toBe('2026-11-11T08:00:00.000Z');
+    expect(agora).toBe(parado);
+  });
+});
+
+describe('Rodada 3 P2-01: KPIs usam o mesmo período da conciliação e do rateio', () => {
+  it('às 10:00, pagamento das 09:00 entra, o das 10:05 e a conta fechada às 10:05 não', () => {
+    const agora = BRT('2026-11-11T10:00:00');
+    const p = shiftPeriodAt(agora);
+    const pagamentos = [pay(50, BRT('2026-11-11T09:00:00').toISOString()), pay(110, BRT('2026-11-11T10:05:00').toISOString())];
+    const contas = [ord('f', BRT('2026-11-11T10:05:00').toISOString(), 10)];
+    const k = shiftKpis(contas, pagamentos, p);
+    const recon = reconciliation(pagamentos, p);
+    expect(k.grossRevenue).toBe(50);
+    expect(recon.reduce((a, r) => a + r.total, 0)).toBe(50);
+    expect(k.serviceFeeTotal).toBe(0);
+    expect(k.closedOrders).toBe(0);
+    expect(waiterSplit(contas, [item('f')], staff, p)).toHaveLength(0);
   });
 
-  it('se o turno já virou entre o primeiro render e o efeito, avisa na hora', () => {
-    const clock = fakeClock(BRT('2026-11-11T05:01:00'));
-    const mudancas: Date[] = [];
-    const stop = watchShiftRollover(new Date('2026-11-10T08:00:00Z'), (s) => mudancas.push(s), clock.deps);
-    expect(mudancas.map((d) => d.toISOString())).toEqual(['2026-11-11T08:00:00.000Z']);
-    stop();
+  it('com Date continua contando desde o início (chamadas antigas)', () => {
+    const k = shiftKpis([], [pay(50, BRT('2026-11-11T09:00:00').toISOString())], new Date('2026-11-11T08:00:00Z'));
+    expect(k.grossRevenue).toBe(50);
+  });
+});
+
+describe('Rodada 3 P2-03: datas impossíveis ou sem fuso ficam de fora', () => {
+  const dia1Dez: ShiftPeriod = { start: BRT('2026-12-01T05:00:00'), end: BRT('2026-12-01T10:00:00') };
+  const dia2Mar: ShiftPeriod = { start: BRT('2026-03-02T05:00:00'), end: BRT('2026-03-02T10:00:00') };
+
+  it('31/11 e 30/02 não viram 01/12 e 02/03', () => {
+    expect(inShiftPeriod('2026-11-31T06:00:00-03:00', dia1Dez)).toBe(false);
+    expect(inShiftPeriod('2026-02-30T06:00:00-03:00', dia2Mar)).toBe(false);
+    expect(reconciliation([pay(99, '2026-11-31T06:00:00-03:00')], dia1Dez)[0]!.total).toBe(0);
+    expect(waiterSplit([ord('x', '2026-11-31T06:00:00-03:00')], [item('x')], staff, dia1Dez)).toHaveLength(0);
+  });
+
+  it('hora, minuto, segundo e fuso impossíveis, e data sem fuso', () => {
+    for (const bad of [
+      '2026-12-01T24:00:00Z', '2026-12-01T08:60:00Z', '2026-12-01T08:00:60Z', '2026-13-01T08:00:00Z',
+      '2026-12-00T08:00:00Z', '2026-12-01T08:00:00+24:00', '2026-12-01T08:00:00', '2026-12-01', '2026-12-01 08:00:00Z',
+    ]) {
+      expect(parseIsoInstant(bad), bad).toBeNull();
+    }
+  });
+
+  it('datas válidas: limite exato das 05:00, offsets equivalentes, microssegundos e 29/02 bissexto', () => {
+    expect(inShiftPeriod('2026-12-01T05:00:00-03:00', dia1Dez)).toBe(true);
+    expect(inShiftPeriod('2026-12-01T08:00:00Z', dia1Dez)).toBe(true);
+    expect(inShiftPeriod('2026-12-01T08:00:00.000Z', dia1Dez)).toBe(true);
+    expect(inShiftPeriod('2026-12-01T08:00:00+00:00', dia1Dez)).toBe(true);
+    expect(inShiftPeriod('2026-12-01T08:00:00.123456+00:00', dia1Dez)).toBe(true);
+    expect(inShiftPeriod('2026-12-01T04:59:59.999-03:00', dia1Dez)).toBe(false);
+    expect(parseIsoInstant('2028-02-29T12:00:00Z')).toBe(Date.parse('2028-02-29T12:00:00Z'));
+    expect(parseIsoInstant('2027-02-29T12:00:00Z')).toBeNull();
+    expect(parseIsoInstant('2026-12-01T05:00:00.5-03:00')).toBe(Date.parse('2026-12-01T08:00:00.500Z'));
+    const iso = new Date(2026, 10, 11, 9, 30).toISOString();
+    expect(parseIsoInstant(iso)).toBe(Date.parse(iso));
   });
 });

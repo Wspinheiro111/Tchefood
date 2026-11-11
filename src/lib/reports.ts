@@ -80,11 +80,37 @@ export function currentShiftPeriod(start: Date = shiftStartBrasilia(), now: Date
   return { start, end: new Date(Math.min(nextShiftStart(start).getTime(), now.getTime() + 1)) };
 }
 
-/** true se a data é válida e cai em [start, end). Data inválida, vazia ou null fica de fora. */
+/**
+ * Instante ISO 8601 com fuso explícito (Z ou ±hh:mm), validado no calendário:
+ * 31/11, 30/02, 25h etc. são recusados em vez de normalizados. Sem fuso também é
+ * recusado, porque seria lido no fuso do aparelho. Devolve ms ou null.
+ */
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|([+-])(\d{2}):?(\d{2}))$/;
+export function parseIsoInstant(iso: unknown): number | null {
+  if (typeof iso !== 'string') return null;
+  const m = ISO_INSTANT.exec(iso);
+  if (!m) return null;
+  const [y, mo, d, h, mi] = [m[1], m[2], m[3], m[4], m[5]].map(Number) as [number, number, number, number, number];
+  const sec = m[6] === undefined ? 0 : Number(m[6]);
+  const ms = m[7] === undefined ? 0 : Number(m[7].slice(0, 3).padEnd(3, '0'));
+  if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || sec > 59) return null;
+  const daysInMonth = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  if (d > daysInMonth) return null;
+  let offsetMin = 0;
+  if (m[8] !== 'Z') {
+    const oh = Number(m[10]);
+    const om = Number(m[11]);
+    if (oh > 23 || om > 59) return null;
+    offsetMin = (m[9] === '-' ? -1 : 1) * (oh * 60 + om);
+  }
+  const t = Date.UTC(y, mo - 1, d, h, mi, sec, ms) - offsetMin * 60_000;
+  return Number.isFinite(t) ? t : null;
+}
+
+/** true se a data é válida e cai em [start, end). Data inválida, impossível, sem fuso, vazia ou null fica de fora. */
 export function inShiftPeriod(iso: string | null | undefined, period: ShiftPeriod): boolean {
-  if (typeof iso !== 'string' || iso === '') return false;
-  const t = Date.parse(iso);
-  return Number.isFinite(t) && t >= period.start.getTime() && t < period.end.getTime();
+  const t = parseIsoInstant(iso);
+  return t !== null && t >= period.start.getTime() && t < period.end.getTime();
 }
 
 /** Legenda "dd/mm, hh:mm" do início do turno, sempre no horário de Brasília. */
@@ -94,11 +120,15 @@ export function formatShiftStart(start: Date): string {
 
 /**
  * KPIs do turno: faturamento, contas fechadas, ticket médio e 10% contam só o
- * que aconteceu desde `since`; o saldo em aberto no salão é sempre o atual.
+ * que aconteceu no turno; o saldo em aberto no salão é sempre o atual. Com um
+ * `ShiftPeriod`, usa o mesmo filtro [início, fim) da conciliação e do rateio;
+ * com um `Date`, conta desde ele (comportamento anterior).
  */
-export function shiftKpis(orders: readonly Order[], payments: readonly Payment[], since: Date = shiftStart()): ShiftKpis {
-  const from = since.getTime();
-  const inShift = (iso: string | null) => iso !== null && new Date(iso).getTime() >= from;
+export function shiftKpis(orders: readonly Order[], payments: readonly Payment[], since: Date | ShiftPeriod = shiftStart()): ShiftKpis {
+  const inShift =
+    since instanceof Date
+      ? (iso: string | null) => iso !== null && new Date(iso).getTime() >= since.getTime()
+      : (iso: string | null) => inShiftPeriod(iso, since);
   const approved = payments.filter((p) => p.status === 'APPROVED' && inShift(p.created_at));
   const grossCents = approved.reduce((a, p) => a + toCents(p.amount), 0);
   const closed = orders.filter((o) => o.status === 'CLOSED' && inShift(o.closed_at));

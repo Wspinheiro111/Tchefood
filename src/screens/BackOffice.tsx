@@ -5,8 +5,8 @@ import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../st
 import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
-import { AUDIT_LABEL, currentShiftPeriod, formatShiftStart, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
-import { useShiftStart } from '../lib/useShiftStart';
+import { AUDIT_LABEL, formatShiftStart, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
+import { useShiftPeriod } from '../lib/useShiftStart';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
@@ -135,20 +135,21 @@ function Kpi({ label, value, hint, tone = 'text-slate-900' }: { label: string; v
   );
 }
 
-function Dashboard() {
+export function Dashboard() {
   const orders = useTcheStore((s) => s.orders);
   const payments = useTcheStore((s) => s.payments);
   const tables = useTcheStore((s) => s.tables);
-  // O início do turno é dependência: na virada das 05:00 os números e a legenda mudam juntos.
-  const start = useShiftStart();
-  const k = useMemo(() => shiftKpis(orders, payments, start), [orders, payments, start]);
+  // Um só período para todos os números e a legenda: muda na virada das 05:00,
+  // a cada minuto (registro que deixou de estar no futuro) e quando os dados mudam.
+  const period = useShiftPeriod([orders, payments]);
+  const k = useMemo(() => shiftKpis(orders, payments, period), [orders, payments, period]);
   const occupied = tables.filter((t) => t.status !== 'FREE' && t.status !== 'DIRTY').length;
-  const recon = useMemo(() => reconciliation(payments, currentShiftPeriod(start)), [payments, start]);
+  const recon = useMemo(() => reconciliation(payments, period), [payments, period]);
   const max = Math.max(1, ...recon.map((r) => r.total));
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi label="Faturamento bruto do turno" value={formatBRL(k.grossRevenue)} hint={`Σ aprovados desde ${formatShiftStart(start)}`} tone="text-verde" />
+        <Kpi label="Faturamento bruto do turno" value={formatBRL(k.grossRevenue)} hint={`Σ aprovados desde ${formatShiftStart(period.start)}`} tone="text-verde" />
         <Kpi label="Ticket médio por mesa" value={formatBRL(k.averageTicket)} hint={`${k.closedOrders} conta(s) fechada(s)`} />
         <Kpi label="Taxa de serviço (10%)" value={formatBRL(k.serviceFeeTotal)} hint="Contas fechadas" tone="text-brasa" />
         <Kpi label="Mesas atendidas" value={String(k.tablesServed)} hint={`${occupied} ocupada(s) agora`} />
@@ -169,10 +170,10 @@ function Dashboard() {
   );
 }
 
-function Reconciliation() {
+export function Reconciliation() {
   const payments = useTcheStore((s) => s.payments);
-  const start = useShiftStart();
-  const rows = useMemo(() => reconciliation(payments, currentShiftPeriod(start)), [payments, start]);
+  const period = useShiftPeriod([payments]);
+  const rows = useMemo(() => reconciliation(payments, period), [payments, period]);
   const methods = ['CREDIT', 'DEBIT', 'PIX', 'CASH'] as const;
   const label = { CREDIT: 'Crédito', DEBIT: 'Débito', PIX: 'Pix', CASH: 'Dinheiro' } as const;
   const totals = methods.map((m) => rows.reduce((a, r) => a + r.byMethod[m], 0));
@@ -213,16 +214,16 @@ function Reconciliation() {
   );
 }
 
-function WaiterSplit() {
+export function WaiterSplit() {
   const orders = useTcheStore((s) => s.orders);
   const items = useTcheStore((s) => s.orderItems);
   const staff = useTcheStore((s) => s.staff);
-  const start = useShiftStart();
-  const rows = useMemo(() => waiterSplit(orders, items, staff, currentShiftPeriod(start)), [orders, items, staff, start]);
+  const period = useShiftPeriod([orders, items, staff]);
+  const rows = useMemo(() => waiterSplit(orders, items, staff, period), [orders, items, staff, period]);
   const total = rows.reduce((a, r) => a + r.commission, 0);
   return (
     <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-surface">
-      <p className="p-3 text-xs text-slate-500">Base: contas fechadas no turno (desde {formatShiftStart(start)}). A taxa de serviço efetivamente cobrada de cada conta é rateada entre os garçons proporcionalmente ao que cada um lançou (sem perder centavos).</p>
+      <p className="p-3 text-xs text-slate-500">Base: contas fechadas no turno (desde {formatShiftStart(period.start)}). A taxa de serviço efetivamente cobrada de cada conta é rateada entre os garçons proporcionalmente ao que cada um lançou (sem perder centavos).</p>
       <table className="w-full min-w-[520px] text-sm">
         <thead className="bg-base text-left text-xs uppercase text-slate-500">
           <tr><th className="p-3">Garçom</th><th className="p-3 text-right">Itens</th><th className="p-3 text-right">Total vendido</th><th className="p-3 text-right">Comissão 10%</th></tr>
