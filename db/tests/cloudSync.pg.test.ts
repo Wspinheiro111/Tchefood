@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
+import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, migratePersisted, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
 import { availableCashback } from '../../src/lib/loyalty';
 import type { CashbackLedgerEntry } from '../../src/types';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
@@ -1834,18 +1834,35 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       });
     };
     const balanceOf = (rows: CashbackLedgerEntry[]) => rows.filter((e) => e.entry_type === 'EARN' || e.entry_type === 'REFUND').reduce((a, e) => a + Number(e.remaining_amount), 0);
-    /** Resgate como a versão 11 deixava (sem redeem_sources) e a fila como a migração 11 → 12 a converte. */
+    /**
+     * Resgate como a versão 11 deixava: REDEEM sem redeem_sources e a fila na ordem daquela
+     * versão (audit_log CASHBACK_REDEEMED, baixa dos créditos por UPDATE, REDEEM). O estado
+     * passa pela migração 11 → 12 de verdade (migratePersisted), como na abertura do aparelho.
+     */
     const asLegacy = (orderId: string) => {
       const redeem = st().cashbackLedger.find((e) => e.order_id === orderId && e.entry_type === 'REDEEM')!;
-      useTcheStore.setState({
-        cashbackLedger: st().cashbackLedger.map((e) => (e.id === redeem.id ? { ...e, redeem_sources: null } : e)),
-        outbox: st().outbox.map((e) => {
-          if (e.table !== 'cashback_ledger' || e.row_id !== redeem.id || !e.cashback_redeem) return e;
-          const { depends_on_event_ids: _deps, ...ev } = e;
-          const { redeem_sources: _src, ...payload } = e.payload;
-          return { ...ev, payload, cashback_redeem: { audit_id: e.cashback_redeem.audit_id, legacy_predebited: true } };
-        }),
+      const ev = st().outbox.find((e) => e.table === 'cashback_ledger' && e.row_id === redeem.id && e.cashback_redeem)!;
+      const audit = st().auditLogs.find((l) => l.id === ev.cashback_redeem!.audit_id)!;
+      const at = ev.created_at;
+      const { redeem_sources: _src, ...v11Payload } = ev.payload;
+      const debits = (redeem.redeem_sources ?? []).map((src) => {
+        const credit = st().cashbackLedger.find((e) => e.id === src.source_id)!;
+        return { id: crypto.randomUUID(), table: 'cashback_ledger' as const, op: 'UPDATE' as const, row_id: credit.id, payload: { ...credit }, created_at: at, depends_on_order_id: orderId };
       });
+      const v11Outbox = st().outbox.flatMap((e) => (e.id !== ev.id ? [e] : [
+        { id: crypto.randomUUID(), table: 'audit_logs' as const, op: 'INSERT' as const, row_id: audit.id, payload: { ...audit }, created_at: at },
+        ...debits,
+        { id: ev.id, table: 'cashback_ledger' as const, op: 'INSERT' as const, row_id: redeem.id, payload: v11Payload, created_at: at, depends_on_order_id: orderId },
+      ]));
+      const v11Ledger = st().cashbackLedger.map((e) => (e.id === redeem.id ? { ...e, redeem_sources: undefined } : e));
+      const migrated = migratePersisted({ outbox: v11Outbox, syncRejected: st().syncRejected, auditLogs: st().auditLogs, cashbackLedger: v11Ledger }, 11) as {
+        outbox: typeof v11Outbox; syncRejected: ReturnType<typeof st>['syncRejected']; cashbackLedger: CashbackLedgerEntry[];
+      };
+      const converted = migrated.outbox.find((e) => e.row_id === redeem.id)!;
+      expect(converted.cashback_redeem).toEqual({ audit_id: audit.id, legacy_predebited: true });
+      expect(migrated.outbox.some((e) => e.table === 'cashback_ledger' && e.op === 'UPDATE')).toBe(false);
+      expect(migrated.cashbackLedger.find((e) => e.id === redeem.id)!.redeem_sources ?? null).toBeNull();
+      useTcheStore.setState({ outbox: migrated.outbox, syncRejected: migrated.syncRejected, cashbackLedger: migrated.cashbackLedger });
       return redeem;
     };
     const rejectedFor = (orderId: string) => st().syncRejected.find((r) => r.event.table === 'cashback_ledger' && r.event.payload.order_id === orderId)!;
@@ -1858,20 +1875,33 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     const localCredit = (customerId: string) => cents(balanceOf(st().cashbackLedger.filter((e) => e.customer_id === customerId)));
     const snapshot = () => JSON.stringify({ o: st().orders, l: st().cashbackLedger, r: st().syncRejected, q: st().outbox, a: st().auditLogs, c: st().loyaltyCustomers });
 
-    it('sem baixa na nuvem: o crédito volta ao que a nuvem tem (R$ 10,00 nos dois lados)', async () => {
+    it('sem baixa na nuvem: crédito de R$ 10,00, resgate de R$ 5,00 recusado; o crédito volta a R$ 10,00 nos dois lados', async () => {
       vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
       setCashbackClock('2026-11-13T10:00:00-03:00');
-      const [order] = await cashbackOrders(1, 87);
+      // Conta de R$ 10,00 sem os 10%: o teto de 50% deixa o resgate em R$ 5,00.
+      login(OWNER_PIN);
+      const p = ok(st().saveProduct({
+        category_id: categoryId, code: '493', name: 'Pastel', description: null, price: 10, sector: 'KITCHEN', available: true, active: true,
+        requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+        cost_price: 0, stock_quantity: 0, barcode: null,
+      }));
+      ok(st().saveTable({ number: 87, label: 'Mesa 87', area: 'Salão', capacity: 4, active: true }));
+      await expectSynced('produto e mesa');
+      login(CASHIER_PIN);
+      const order = ok(st().openTable(st().tables.find((t) => t.number === 87)!.id, 1, null));
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: 10, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      ok(st().removeServiceFee(order.id, MANAGER));
+      await expectSynced('conta de R$ 10');
       const phone = '5553988119087';
       const cust = cashbackCustomer(phone, [{ amount: 10, expires: '2026-12-31' }]);
       loadCustomer(cust.id);
-      login(CASHIER_PIN);
-      const r = ok(st().redeemCashback(order!.id, phone)).amount;
-      expect(r).toBeGreaterThan(0);
-      asLegacy(order!.id);
-      expect(localCredit(cust.id)).toBe(1000 - cents(r));
+      const r = ok(st().redeemCashback(order.id, phone)).amount;
+      expect(cents(r)).toBe(500);
+      asLegacy(order.id);
+      expect(localCredit(cust.id)).toBe(500);
       expect(await sync()).toHaveLength(1);
-      const refused = rejectedFor(order!.id);
+      const refused = rejectedFor(order.id);
       expect(refused.message).toContain('terça a quinta');
       expect(cloudCredit(cust.id)).toBe(1000);
       // Sem o extrato da nuvem: não desfaz e nada muda.
@@ -1884,15 +1914,15 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(localCredit(cust.id)).toBe(1000);
       expect(cents(st().cashbackLedger.find((e) => e.id === cust.earns[0])!.remaining_amount)).toBe(1000);
       expect(cents(st().loyaltyCustomers.find((c) => c.id === cust.id)!.cashback_balance)).toBe(1000);
-      expect(st().cashbackLedger.filter((e) => e.order_id === order!.id)).toEqual([]);
-      const log = st().auditLogs.find((l) => l.order_id === order!.id && l.action_type === 'CASHBACK_REDEEMED')!;
+      expect(st().cashbackLedger.filter((e) => e.order_id === order.id)).toEqual([]);
+      const log = st().auditLogs.find((l) => l.order_id === order.id && l.action_type === 'CASHBACK_REDEEMED')!;
       expect([log.amount_impact, log.metadata?.legacy_redeem, log.metadata?.cloud_orphan_cents, typeof log.metadata?.rejected_by_cloud]).toEqual([0, true, 0, 'string']);
       expect(st().syncRejected.some((x) => x.event.id === refused.event.id)).toBe(false);
       await expectSynced('conta sem o resgate antigo');
       expect(cloudCredit(cust.id)).toBe(1000);
-      expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order!.id}'`)).toBe('0');
-      expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('0.00');
-      closeCashbackOrders([order!.id]);
+      expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}'`)).toBe('0');
+      expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order.id}'`)).toBe('0.00');
+      closeCashbackOrders([order.id]);
       setCashbackClock(null);
     });
 
