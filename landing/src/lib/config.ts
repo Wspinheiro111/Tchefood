@@ -13,11 +13,36 @@ export const EMPRESA = {
 };
 
 /**
+ * Confere o endereço do site e devolve a origem sem barra no fim (ex.: https://tchefood.com.br).
+ * Recusa com erro claro, que derruba o build: endereço malformado, sem https, com usuário/senha,
+ * porta, caminho (o site é publicado na raiz do domínio), query ou fragmento.
+ */
+export function normalizarSiteUrl(bruto: string): string {
+  const texto = bruto.trim();
+  let url: URL;
+  try {
+    url = new URL(texto);
+  } catch {
+    throw new Error(`VITE_SITE_URL inválido: "${bruto}" não é um endereço. Use, por exemplo, https://tchefood.com.br`);
+  }
+  const problemas: string[] = [];
+  if (url.protocol !== 'https:') problemas.push('precisa começar com https://');
+  if (url.username || url.password) problemas.push('não pode ter usuário ou senha');
+  if (url.port) problemas.push('não pode ter porta');
+  if (url.pathname !== '/') problemas.push('não pode ter caminho: o site fica na raiz do domínio');
+  if (url.search || texto.includes('?')) problemas.push('não pode ter ?parâmetros');
+  if (url.hash || texto.includes('#')) problemas.push('não pode ter #fragmento');
+  if (!url.hostname.includes('.')) problemas.push('o domínio precisa ter ponto (ex.: tchefood.com.br)');
+  if (problemas.length) throw new Error(`VITE_SITE_URL inválido ("${bruto}"): ${problemas.join('; ')}.`);
+  return url.origin;
+}
+
+/**
  * Endereço público do site, sem barra no fim. Usado no canonical, nas tags OG, no JSON-LD,
  * no sitemap.xml e no robots.txt. Troque com a variável de ambiente VITE_SITE_URL no build
  * (ou no arquivo .env) quando o domínio definitivo estiver registrado.
  */
-export const SITE_URL = (import.meta.env?.VITE_SITE_URL ?? 'https://tchefood.com.br').replace(/\/+$/, '');
+export const SITE_URL = normalizarSiteUrl(import.meta.env?.VITE_SITE_URL || 'https://tchefood.com.br');
 
 export interface Plano {
   id: 'bistro' | 'salao-pro' | 'rede-eventos';
