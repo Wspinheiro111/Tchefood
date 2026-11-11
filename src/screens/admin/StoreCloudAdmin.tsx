@@ -7,7 +7,7 @@ import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../li
 import { ROLE_LABEL } from '../../lib/catalog';
 import { signInDevice, type SyncConfig } from '../../lib/sync/supabaseSync';
 import { cloudDiscountOf } from '../../lib/sync/cloudDiscount';
-import { fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, type CloudStaff } from '../../lib/sync/cloudPull';
+import { fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, type CloudCashback, type CloudStaff } from '../../lib/sync/cloudPull';
 import { defaultCloudConfig, syncOnce } from '../../lib/sync/useCloudSync';
 import { useOnline } from '../../lib/useOnline';
 import { Btn, Sheet, toast } from '../../components/ui';
@@ -492,11 +492,29 @@ function AdoptCloudDiscount({ eventId, value }: { eventId: string; value: number
 /** Resgate de cashback recusado pela nuvem: a conta não é cobrada até desfazer o cashback aqui. */
 function UndoRejectedCashback({ eventId }: { eventId: string }) {
   const undo = useTcheStore((s) => s.undoRejectedCashbackRedeem);
+  const [busy, setBusy] = useState(false);
   return (
     <div className="mt-1">
       <Btn
-        onClick={() => {
-          const r = undo(eventId);
+        disabled={busy}
+        onClick={async () => {
+          // O extrato do cliente lido agora da nuvem: sem ele, resgate da versão anterior do
+          // aparelho (sem a lista de origens) não é desfeito (ver undoRejectedCashbackRedeem).
+          const st = useTcheStore.getState();
+          const ev = (st.syncRejected ?? []).find((x) => x.event.id === eventId)?.event;
+          const customerId = ev ? String(ev.payload.customer_id ?? '') : '';
+          let cloud: CloudCashback | undefined;
+          if (st.cloud && customerId) {
+            setBusy(true);
+            try {
+              cloud = await fetchCloudCustomerCashback(cloudConfig(st.cloud), browserFetch, customerId);
+            } catch {
+              cloud = undefined;
+            } finally {
+              setBusy(false);
+            }
+          }
+          const r = undo(eventId, cloud);
           if (!r.ok) toast.error(r.error);
           else {
             toast.success(`Cashback de R$ ${r.data.toFixed(2).replace('.', ',')} desfeito: a conta volta ao valor sem ele.`);

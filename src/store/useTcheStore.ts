@@ -92,7 +92,7 @@ import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
 import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
 import { comboChildrenOf, comboComponents, comboNeedsDoneness, expandComboItem } from '../lib/combos';
-import { adaptTable, MERGE, mergeCashback, mergeRows, mergeStaffWithoutPins, mergeStaffWithPins, pendingRowKeys, type CloudSnapshot } from '../lib/sync/cloudPull';
+import { adaptTable, MERGE, mergeCashback, mergeRows, mergeStaffWithoutPins, mergeStaffWithPins, pendingRowKeys, type CloudCashback, type CloudSnapshot } from '../lib/sync/cloudPull';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
 import { computeNetWeight } from '../lib/scale';
@@ -108,6 +108,7 @@ import {
   cashbackUsable,
   cashbackValidity,
   cashbackFifoSources,
+  cashbackOrphanCents,
   consumeCashbackFifo,
   planCashbackRefund,
   cashbackRefundCents,
@@ -530,9 +531,12 @@ interface Actions {
   /**
    * Resgate de cashback recusado pela nuvem (o banco não concedeu o crédito): desfaz aqui o
    * resgate, a baixa dos créditos e o desconto da conta, e refaz as versões seguintes da conta
-   * na fila sem o cashback. Até isso, a conta não é cobrada nem encerrada.
+   * na fila sem o cashback. Até isso, a conta não é cobrada nem encerrada. Resgate da
+   * versão anterior do aparelho (sem redeem_sources): não se sabe de quais créditos saiu;
+   * só desfaz com o extrato do cliente lido agora da nuvem (cloud), e só se ele não tiver
+   * crédito baixado sem resgate (P0-01 da rodada 10 do GPT).
    */
-  undoRejectedCashbackRedeem: (eventId: UUID) => ActionResult<number>;
+  undoRejectedCashbackRedeem: (eventId: UUID, cloud?: CloudCashback) => ActionResult<number>;
 
   // Caixa
   /** Abre o caixa com o fundo de troco. Um caixa aberto por loja. */
@@ -4124,7 +4128,7 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: cloud };
         },
 
-        undoRejectedCashbackRedeem: (eventId) => {
+        undoRejectedCashbackRedeem: (eventId, cloud) => {
           const user = currentUser();
           if (!user) return fail('Sessão expirada.');
           const rejected = (get().syncRejected ?? []).find((r) => r.event.id === eventId);
@@ -4182,17 +4186,99 @@ export const useTcheStore = create<TcheState>()(
               `Esta conta já foi fechada neste aparelho com o cashback. Sem ele ficariam faltando ${formatBRL(recalculated.remaining_balance)}, que não foram cobrados. A conta segue nos recusados para o gerente conferir com o cliente.`,
             );
           }
-          // Os créditos voltam ao que eram antes do resgate.
-          const sources = redeem?.redeem_sources ?? [];
           const refundIds = new Set(refunds.map((r) => r.id));
-          const ledger = get()
-            .cashbackLedger.filter((e) => e.id !== redeem?.id && !refundIds.has(e.id))
-            .map((x) => {
+          const customerId = redeem?.customer_id ?? String(rejected.event.payload.customer_id);
+          const ts = nowISO();
+          const rest = get().cashbackLedger.filter((e) => e.id !== redeem?.id && !refundIds.has(e.id));
+          const sources = redeem?.redeem_sources ?? null;
+          const proven = sources !== null && sources.length > 0 && sources.every((src) => src.source_id !== null)
+            && sources.reduce((sum, src) => sum + toCents(src.amount), 0) === amount
+            && sources.every((src) => rest.some((e) => e.id === src.source_id && e.customer_id === customerId));
+          let ledger: CashbackLedgerEntry[];
+          let reconciled: Record<string, unknown> = {};
+          if (proven) {
+            // Resgate desta versão: os créditos voltam ao que eram antes dele, pela lista de origens.
+            ledger = rest.map((x) => {
               const back = sources.filter((src) => src.source_id === x.id).reduce((sum, src) => sum + toCents(src.amount), 0);
               return back ? { ...x, remaining_amount: (toCents(x.remaining_amount) + back) / 100 } : x;
             });
-          const ts = nowISO();
-          const customerId = redeem?.customer_id ?? String(rejected.event.payload.customer_id);
+          } else {
+            // Resgate da versão anterior (P0-01 da rodada 10 do GPT): sem a lista de origens,
+            // somar o valor de volta a um crédito qualquer inventa saldo, e deixar como está
+            // perde o que foi baixado. O extrato do cliente vem da nuvem, lido agora.
+            if (!cloud) {
+              return fail('Este resgate é da versão anterior do aparelho e não diz de quais créditos saiu. Para desfazer, o aparelho confere o extrato do cliente na nuvem: conecte à internet e toque de novo.');
+            }
+            const cloudLedger = cloud.cashbackLedger.filter((e) => e.customer_id === customerId && e.tenant_id === order.tenant_id);
+            if (!cloud.loyaltyCustomers.some((c) => c.id === customerId && c.tenant_id === order.tenant_id)) {
+              return fail('O cliente deste resgate não foi encontrado na nuvem. Nada foi alterado; chame o gerente para conferir com o cliente.');
+            }
+            if (cloudLedger.some((e) => e.entry_type === 'REDEEM' && e.order_id === orderId)) {
+              return fail('A nuvem já tem um resgate para esta conta. Nada foi alterado; toque em Sincronizar agora e confira a conta.');
+            }
+            // Baixa que subiu da versão anterior sem o resgate: não há como provar a qual
+            // resgate pertence. Nada muda aqui; o recusado fica para o gerente conciliar.
+            const orphan = cashbackOrphanCents(cloudLedger, customerId);
+            if (orphan > 0) {
+              return fail(
+                `Na nuvem, ${formatBRL(orphan / 100)} do cashback deste cliente já foram baixados sem resgate (versão anterior do aparelho). Não dá para desfazer sem conferir de qual resgate é: nada foi alterado e a conta segue nos recusados para o gerente conciliar com o cliente.`,
+              );
+            }
+            // Outros resgates do mesmo cliente ainda recusados aqui continuam aplicados neste
+            // aparelho: saem de novo do extrato da nuvem (pela lista de origens ou, sem ela,
+            // do mais antigo para o mais novo). Qualquer outro lançamento do extrato do cliente
+            // ainda não aceito pela nuvem: espera (o extrato da nuvem ainda não o tem).
+            const otherRejected = (get().syncRejected ?? []).filter(
+              (r) => r.event.id !== eventId && r.event.table === 'cashback_ledger' && r.event.cashback_redeem && r.event.payload.customer_id === customerId,
+            );
+            const heldOrders = new Set([orderId, ...otherRejected.map((r) => String(r.event.payload.order_id))]);
+            const unsettled = [...get().outbox, ...(get().syncRejected ?? []).map((r) => r.event)].some(
+              (e) =>
+                e.id !== eventId &&
+                !otherRejected.some((r) => r.event.id === e.id) &&
+                !(e.depends_on_order_id && heldOrders.has(e.depends_on_order_id)) &&
+                // Só o extrato conta: o cadastro do cliente (loyalty_customers) não muda saldo,
+                // que o banco calcula pelo extrato.
+                e.table === 'cashback_ledger' && e.payload.customer_id === customerId,
+            );
+            if (unsettled) {
+              return fail('Há outra operação de cashback deste cliente esperando a nuvem. Nada foi alterado; toque em Sincronizar agora e tente de novo.');
+            }
+            let fromCloud: CashbackLedgerEntry[] = cloudLedger;
+            for (const r of otherRejected) {
+              const other = get().cashbackLedger.find((e) => e.id === r.event.row_id && e.entry_type === 'REDEEM');
+              const v = toCents(Number(other?.amount ?? r.event.payload.amount));
+              const otherSources = other?.redeem_sources ?? null;
+              try {
+                if (otherSources && otherSources.length > 0 && otherSources.every((src) => src.source_id !== null)) {
+                  fromCloud = fromCloud.map((x) => {
+                    const out = otherSources.filter((src) => src.source_id === x.id).reduce((sum, src) => sum + toCents(src.amount), 0);
+                    if (out > toCents(x.remaining_amount)) throw new Error('crédito');
+                    return out ? { ...x, remaining_amount: (toCents(x.remaining_amount) - out) / 100 } : x;
+                  });
+                  if (otherSources.some((src) => !fromCloud.some((x) => x.id === src.source_id))) throw new Error('crédito');
+                } else {
+                  fromCloud = consumeCashbackFifo(fromCloud, customerId, v / 100, new Date(other?.created_at ?? ts));
+                }
+              } catch {
+                return fail('Outro resgate recusado deste cliente não fecha com o extrato da nuvem. Nada foi alterado; chame o gerente para conciliar com o cliente.');
+              }
+              if (other) fromCloud = [...fromCloud, other];
+            }
+            // Reaplicados acima (os resgates e os estornos locais das outras contas recusadas
+            // saem da troca e voltam pelo que foi reaplicado).
+            const localOthers = rest.filter((e) => e.customer_id !== customerId);
+            const keptOtherRows = rest.filter(
+              (e) => e.customer_id === customerId && e.order_id !== null && heldOrders.has(e.order_id) && e.entry_type !== 'REDEEM',
+            );
+            ledger = [...localOthers, ...fromCloud, ...keptOtherRows];
+            reconciled = {
+              legacy_redeem: true,
+              reconciled_with_cloud_at: ts,
+              cloud_orphan_cents: orphan,
+              local_balance_before: balanceCashback(get().cashbackLedger, customerId, new Date(ts)),
+            };
+          }
           set((s) => ({
             orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
             outbox,
@@ -4208,7 +4294,7 @@ export const useTcheStore = create<TcheState>()(
                   ? {
                       ...l,
                       amount_impact: 0,
-                      metadata: { ...(l.metadata ?? {}), rejected_by_cloud: rejected.message, undone_at: ts, undone_by_user_id: user.id },
+                      metadata: { ...(l.metadata ?? {}), rejected_by_cloud: rejected.message, undone_at: ts, undone_by_user_id: user.id, ...reconciled },
                     }
                   : l,
               ),

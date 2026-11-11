@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cashbackRefundCents, planCashbackRefund } from '../lib/loyalty';
+import { cashbackOrphanCents, cashbackRefundCents, planCashbackRefund } from '../lib/loyalty';
 import { mergeCashback } from '../lib/sync/cloudPull';
 import type { CashbackLedgerEntry } from '../types';
 
@@ -150,5 +150,15 @@ describe('cashback vindo da nuvem', () => {
     const pending = mergeCashback({ loyaltyCustomers: [customer], cashbackLedger: [earn] }, none, [{ table: 'cashback_ledger', row_id: 'e1', payload: { customer_id: 'c1' } }]);
     expect(pending.cashbackLedger.map((e) => e.id)).toEqual(['e1']);
     expect(pending.loyaltyCustomers[0]!.cashback_balance).toBe(10);
+  });
+
+  // P0-01 da rodada 10 do GPT: baixa da versão anterior que subiu sem o resgate.
+  it('crédito baixado sem resgate: mesma conta do servidor (EARN e REFUND baixados menos REDEEM)', () => {
+    const earn = entry({ id: 'E', amount: 10, remaining_amount: 7 });
+    const refund = entry({ id: 'R', entry_type: 'REFUND', amount: 2, remaining_amount: 2 });
+    expect(cashbackOrphanCents([earn, refund], 'c')).toBe(300);
+    const redeem = entry({ id: 'D', entry_type: 'REDEEM', amount: 3, order_id: 'o' });
+    expect(cashbackOrphanCents([earn, refund, redeem], 'c')).toBe(0);
+    expect(cashbackOrphanCents([earn, refund], 'outro')).toBe(0);
   });
 });

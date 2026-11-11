@@ -129,6 +129,19 @@ export function balanceCashback(ledger: readonly CashbackLedgerEntry[], customer
   );
 }
 
+/**
+ * Crédito do cliente baixado sem resgate que o explique: soma de (amount − remaining) dos
+ * EARN e REFUND menos a soma dos REDEEM. Mesma conta de v_orphan em
+ * tchefood_register_cashback_redeem (db/schema_cashback_servidor.sql). Na versão 11 do
+ * aparelho a baixa subia antes do resgate; se só ela chegou à nuvem, aparece aqui.
+ */
+export function cashbackOrphanCents(ledger: readonly CashbackLedgerEntry[], customerId: UUID): number {
+  const mine = ledger.filter((e) => e.customer_id === customerId);
+  const debited = mine.filter(isCashbackCredit).reduce((a, e) => a + toCents(e.amount) - toCents(e.remaining_amount), 0);
+  const redeemed = mine.filter((e) => e.entry_type === 'REDEEM').reduce((a, e) => a + toCents(e.amount), 0);
+  return Math.max(debited - redeemed, 0);
+}
+
 /** Quanto do cashback pode abater desta conta. */
 export function cashbackUsable(available: number, order: Pick<Order, 'total_amount' | 'remaining_balance'>): number {
   const capCents = Math.round((toCents(order.total_amount) * CASHBACK_MAX_USAGE_PCT) / 100);

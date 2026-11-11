@@ -146,10 +146,10 @@ async function readError(res: { status: number; text: () => Promise<string> }): 
   }
 }
 
-async function getAll<T>(cfg: SyncConfig, fetchFn: FetchLike, table: string, columns: readonly string[], order: string): Promise<T[]> {
+async function getAll<T>(cfg: SyncConfig, fetchFn: FetchLike, table: string, columns: readonly string[], order: string, filter = ''): Promise<T[]> {
   const out: T[] = [];
   for (let offset = 0; ; offset += PULL_PAGE_SIZE) {
-    const q = `select=${columns.join(',')}&order=${order}&limit=${PULL_PAGE_SIZE}&offset=${offset}`;
+    const q = `select=${columns.join(',')}${filter ? `&${filter}` : ''}&order=${order}&limit=${PULL_PAGE_SIZE}&offset=${offset}`;
     const res = await fetchFn(`${root(cfg)}/${table}?${q}`, { method: 'GET', headers: headers(cfg) });
     if (!res.ok) throw new Error(`Não foi possível ler ${table} da nuvem: ${await readError(res)}`);
     const page = JSON.parse(await res.text()) as T[];
@@ -186,7 +186,6 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
   const couriers = await read('couriers');
   const loyaltyCustomers = await getAll<LoyaltyCustomer>(cfg, fetchFn, CASHBACK_TABLES.loyaltyCustomers.table, CASHBACK_TABLES.loyaltyCustomers.columns, 'id');
   const cashbackLedger = await getAll<CashbackLedgerEntry>(cfg, fetchFn, CASHBACK_TABLES.cashbackLedger.table, CASHBACK_TABLES.cashbackLedger.columns, 'id');
-  const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
   return {
     tenant,
     staff,
@@ -204,6 +203,15 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
     purchaseInvoices: purchaseInvoices as PurchaseInvoice[],
     deliveryZones: (deliveryZones as DeliveryZone[]).map((z) => ({ ...z, fee: Number(z.fee) })),
     couriers: (couriers as Courier[]).map((c) => ({ ...c, fee_per_delivery: Number(c.fee_per_delivery) })),
+    ...cashbackRows(loyaltyCustomers, cashbackLedger),
+  };
+}
+
+const numOrNull = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+
+/** Cashback como veio do PostgREST (numeric em texto) com os valores em número. */
+function cashbackRows(loyaltyCustomers: LoyaltyCustomer[], cashbackLedger: CashbackLedgerEntry[]): CloudCashback {
+  return {
     loyaltyCustomers: loyaltyCustomers.map((c) => ({
       ...c, cashback_balance: Number(c.cashback_balance), total_spent: Number(c.total_spent), visits_count: Number(c.visits_count),
     })),
@@ -211,11 +219,24 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
       ...e,
       amount: Number(e.amount),
       remaining_amount: Number(e.remaining_amount),
-      base_amount: num(e.base_amount),
-      pct: num(e.pct),
+      base_amount: numOrNull(e.base_amount),
+      pct: numOrNull(e.pct),
       redeem_sources: e.redeem_sources ? e.redeem_sources.map((x) => ({ source_id: x.source_id, amount: Number(x.amount) })) : null,
     })),
   };
+}
+
+export type CloudCashback = { loyaltyCustomers: LoyaltyCustomer[]; cashbackLedger: CashbackLedgerEntry[] };
+
+/**
+ * Cadastro e extrato de cashback de um cliente, lidos agora da nuvem. Usado para conferir
+ * um resgate da versão anterior do aparelho (sem redeem_sources) antes de desfazê-lo.
+ */
+export async function fetchCloudCustomerCashback(cfg: SyncConfig, fetchFn: FetchLike, customerId: string): Promise<CloudCashback> {
+  const id = encodeURIComponent(customerId);
+  const customers = await getAll<LoyaltyCustomer>(cfg, fetchFn, CASHBACK_TABLES.loyaltyCustomers.table, CASHBACK_TABLES.loyaltyCustomers.columns, 'id', `id=eq.${id}`);
+  const ledger = await getAll<CashbackLedgerEntry>(cfg, fetchFn, CASHBACK_TABLES.cashbackLedger.table, CASHBACK_TABLES.cashbackLedger.columns, 'id', `customer_id=eq.${id}`);
+  return cashbackRows(customers, ledger);
 }
 
 export type StaffPinsResult = { ok: true; staff: StaffUser[] } | { ok: false; error: string };
