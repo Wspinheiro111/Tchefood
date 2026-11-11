@@ -17,10 +17,17 @@
 
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_auth_seq BIGINT NOT NULL DEFAULT 0;
 
--- O marcador só muda pelo banco (gatilho abaixo, um nível de gatilho a mais).
+-- O marcador só muda pelo banco (gatilho abaixo, um nível de gatilho a mais). A conta nasce
+-- sempre com zero, por qualquer papel: um INSERT com marcador alto (ex.: o maior BIGINT)
+-- deixaria toda autorização legítima "mais velha" que ele e bloquearia descontos (achado
+-- P2-01 do GPT na auditoria do PR #41).
 CREATE OR REPLACE FUNCTION tchefood_orders_keep_discount_auth_seq()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.discount_auth_seq := 0;
+        RETURN NEW;
+    END IF;
     IF current_user IN ('anon', 'authenticated') AND pg_trigger_depth() = 1 THEN
         NEW.discount_auth_seq := OLD.discount_auth_seq;
     END IF;
@@ -28,7 +35,8 @@ BEGIN
 END;
 $$;
 DROP TRIGGER IF EXISTS trg_orders_keep_discount_auth_seq ON orders;
-CREATE TRIGGER trg_orders_keep_discount_auth_seq BEFORE UPDATE OF discount_auth_seq ON orders
+CREATE TRIGGER trg_orders_keep_discount_auth_seq BEFORE INSERT OR UPDATE OF discount_auth_seq
+    ON orders
     FOR EACH ROW EXECUTE FUNCTION tchefood_orders_keep_discount_auth_seq();
 
 -- Cópia da versão de schema_expansion.sql; muda só o aumento do desconto.

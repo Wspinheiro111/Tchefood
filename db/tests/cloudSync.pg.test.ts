@@ -1287,6 +1287,55 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     });
   });
 
+  it('conta criada com marcador de autorização forjado nasce com zero e o desconto com PIN vale (uma vez)', async () => {
+    // Achado P2-01 do GPT (PR #41): o gatilho do marcador cobria só UPDATE. Um INSERT com o
+    // maior BIGINT deixava toda autorização legítima "mais velha" e bloqueava o desconto.
+    login(OWNER_PIN);
+    ok(st().saveTable({ number: 82, label: 'Mesa 82', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('mesa 82');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 82)!.id, 1, null));
+    // O aparelho adulterado manda a conta com o marcador no máximo, pelo PostgREST com o token dele.
+    const MAX = '9223372036854775807';
+    useTcheStore.setState({
+      outbox: st().outbox.map((e) =>
+        e.table === 'orders' && e.op === 'INSERT' && e.row_id === order.id ? { ...e, payload: { ...e.payload, discount_auth_seq: MAX } } : e,
+      ),
+    });
+    expect(st().outbox.some((e) => e.table === 'orders' && e.op === 'INSERT' && e.payload.discount_auth_seq === MAX)).toBe(true);
+    await expectSynced('conta aberta com marcador forjado');
+    expect(sql(`SELECT discount_auth_seq FROM orders WHERE id = '${order.id}'`)).toBe('0');
+    // Direto pelo PostgREST também: outra conta com o marcador no máximo nasce com zero.
+    const otherId = crypto.randomUUID();
+    const tableId = st().tables.find((t) => t.number === 82)!.id;
+    const forged = await raw('POST', 'orders', {
+      id: otherId, tenant_id: TENANT, table_id: tableId, opened_by_user_id: st().currentUserId, status: 'CANCELED', discount_auth_seq: MAX,
+    });
+    expect([201, 403]).toContain(forged.status);
+    if (forged.status === 201) expect(sql(`SELECT discount_auth_seq FROM orders WHERE id = '${otherId}'`)).toBe('0');
+    // Desconto 0→5 com PIN e motivo: vale, e o marcador fica com o server_seq da autorização usada.
+    const p = st().products.find((x) => x.id === productId)!;
+    ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order.id));
+    await expectSynced('item lançado');
+    ok(st().applyDiscount(order.id, 5, MANAGER));
+    await expectSynced('desconto 0→5 com PIN na conta de marcador forjado');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order.id}'`)).toBe('5.00');
+    const usedSeq = sql(`SELECT max(server_seq) FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'DISCOUNT_APPLIED'`);
+    expect(sql(`SELECT discount_auth_seq FROM orders WHERE id = '${order.id}'`)).toBe(usedSeq);
+    // A mesma autorização não vale de novo: desconto volta a 0 (redução não pede PIN) e o aumento é recusado.
+    expect((await raw('PATCH', `orders?id=eq.${order.id}`, { discount_amount: 0 })).status).toBe(204);
+    const reuse = await raw('PATCH', `orders?id=eq.${order.id}`, { discount_amount: 5 });
+    expect(reuse.status).toBe(400);
+    expect(reuse.body).toContain('DISCOUNT_APPLIED sem PIN de gerente');
+    expect(sql(`SELECT discount_amount || ' ' || discount_auth_seq FROM orders WHERE id = '${order.id}'`)).toBe(`0.00 ${usedSeq}`);
+    sql(`SET session_replication_role = replica; UPDATE orders SET status = 'CANCELED' WHERE id = '${order.id}'; UPDATE dining_tables SET status = 'FREE', current_order_id = NULL WHERE current_order_id = '${order.id}';`);
+    useTcheStore.setState({
+      orders: st().orders.filter((o) => o.id !== order.id),
+      tables: st().tables.map((t) => (t.current_order_id === order.id ? { ...t, status: 'FREE' as const, current_order_id: null } : t)),
+    });
+  });
+
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
     const dir = join(ROOT, 'supabase', 'migrations');
     for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) psqlFile(target!, join(dir, f), DB);
