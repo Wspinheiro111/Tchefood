@@ -398,8 +398,11 @@ BEGIN
        OR NEW.product_id IS DISTINCT FROM OLD.product_id
        OR NEW.order_id IS DISTINCT FROM OLD.order_id
        OR NEW.half_product_ids IS DISTINCT FROM OLD.half_product_ids
-       OR NEW.modifier_option_ids IS DISTINCT FROM OLD.modifier_option_ids THEN
-        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: item % já enviado não pode ter preço, quantidade, produto, sabores ou adicionais alterados. Cancele com PIN do gerente e lance de novo.', OLD.id;
+       OR NEW.modifier_option_ids IS DISTINCT FROM OLD.modifier_option_ids
+       -- P2-01 da rodada 6 do GPT: o horário do lançamento decidiu se o preço de promoção
+       -- passou sem PIN (tchefood_check_item_price); depois de gravado, não muda.
+       OR NEW.priced_at IS DISTINCT FROM OLD.priced_at THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: item % já enviado não pode ter preço, quantidade, produto, sabores, adicionais ou horário do lançamento alterados. Cancele com PIN do gerente e lance de novo.', OLD.id;
     END IF;
     RETURN NEW;
 END;

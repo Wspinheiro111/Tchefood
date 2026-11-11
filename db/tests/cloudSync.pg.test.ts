@@ -842,6 +842,19 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     await expectSynced('promoção com internet');
     expect(sql(`SELECT unit_price FROM order_items WHERE id = '${live.id}'`)).toBe('20.00');
     expect(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'PRICE_MISMATCH' AND metadata->>'item_id' = '${live.id}'`)).toBe('0');
+    // P2-01 da rodada 6 do GPT: o horário que liberou o preço de promoção não muda depois.
+    const evidence = () => sql(`SELECT i.priced_at || ' ' || i.unit_price || ' ' || o.total_amount || ' '
+      || (SELECT count(*) FROM audit_logs a WHERE a.order_id = o.id) FROM order_items i JOIN orders o ON o.id = i.order_id WHERE i.id = '${live.id}'`);
+    const sealed = evidence();
+    const backdate = await raw('PATCH', `order_items?id=eq.${live.id}`, { priced_at: new Date(Date.now() - 2 * 3_600_000).toISOString() });
+    expect(backdate.status).toBe(400);
+    expect(backdate.body).toContain('TCHEFOOD_ANTIFRAUDE');
+    expect(evidence()).toBe(sealed);
+    // Reenvio com o mesmo horário (o do aparelho) continua aceito, e o status segue mudando.
+    expect((await raw('PATCH', `order_items?id=eq.${live.id}`, { priced_at: live.priced_at, unit_price: 20 })).status).toBe(204);
+    expect((await raw('PATCH', `order_items?id=eq.${live.id}`, { status: 'PREPARING' })).status).toBe(204);
+    expect(sql(`SELECT status FROM order_items WHERE id = '${live.id}'`)).toBe('PREPARING');
+    expect(evidence()).toBe(sealed);
 
     // P0-03 do GPT: produto ou conta de outra loja. A recusa não mostra preço nem nome.
     const TENANT_B = '22222222-2222-4222-8222-222222222222';
