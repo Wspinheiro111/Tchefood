@@ -22,7 +22,8 @@ function hostnameDnsValido(host: string): boolean {
   if (host.length > 253) return false;
   const rotulos = host.split('.');
   if (rotulos.length < 2) return false;
-  const rotuloOk = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
+  // Sem lookbehind: o Safari anterior ao 16.4 não aceita essa sintaxe e o módulo inteiro deixaria de carregar.
+  const rotuloOk = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
   if (!rotulos.every((r) => rotuloOk.test(r))) return false;
   return !/^\d+$/.test(rotulos[rotulos.length - 1]);
 }

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { normalizarSiteUrl } from '../lib/config';
@@ -14,7 +14,8 @@ describe('P2-01: VITE_SITE_URL vazio não cai no domínio padrão', () => {
 
   const carregar = async () => (await import('../lib/config')).SITE_URL;
 
-  it('variável ausente usa o domínio padrão', async () => {
+  it('variável ausente usa o domínio padrão (mesmo que a máquina ou o CI tenha VITE_SITE_URL)', async () => {
+    vi.stubEnv('VITE_SITE_URL', undefined);
     vi.resetModules();
     expect(await carregar()).toBe('https://tchefood.com.br');
   });
@@ -55,6 +56,30 @@ describe('P2-02: hostname precisa ser um nome DNS válido', () => {
     ['https://tchê.com.br', 'https://xn--tch-hma.com.br'],
   ])('aceita %s', (valor, esperado) => {
     expect(normalizarSiteUrl(valor)).toBe(esperado);
+  });
+});
+
+describe('Rodada 3: compatível com Safari 14 a 16.3', () => {
+  // Safari só aceita lookbehind ("(?<!" e "(?<=") a partir do 16.4; o Vite 5 mira Safari 14 e o
+  // esbuild não converte essa sintaxe. Um único uso derruba o módulo e a hidratação da página.
+  const lookbehind = /\(\?<[!=]/;
+  function arquivos(pasta: string, ext: RegExp): string[] {
+    return readdirSync(pasta).flatMap((nome) => {
+      const p = path.join(pasta, nome);
+      if (statSync(p).isDirectory()) return nome === '__tests__' ? [] : arquivos(p, ext);
+      return ext.test(nome) ? [p] : [];
+    });
+  }
+
+  it('nenhum código da página usa lookbehind em expressão regular', () => {
+    const raiz = path.resolve(__dirname, '..');
+    const comLookbehind = arquivos(raiz, /\.(ts|tsx|js|mjs)$/).filter((f) => lookbehind.test(readFileSync(f, 'utf8')));
+    expect(comLookbehind).toEqual([]);
+  });
+
+  it('o rótulo DNS continua com 1 a 63 caracteres e sem hífen nas pontas', () => {
+    for (const ok of ['a', 'a1', 'a-b', 'xn--tch-hma', 'a'.repeat(63)]) expect(normalizarSiteUrl(`https://${ok}.com.br`)).toBe(`https://${ok}.com.br`);
+    for (const ruim of ['-a', 'a-', '-', 'a'.repeat(64)]) expect(() => normalizarSiteUrl(`https://${ruim}.com.br`)).toThrow(/VITE_SITE_URL inválido/);
   });
 });
 
