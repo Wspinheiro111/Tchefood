@@ -11,7 +11,7 @@
  *    vencem primeiro (FIFO).
  *  - WhatsApp só com opt-in registrado (LGPD / política do WhatsApp Business).
  */
-import type { CashbackLedgerEntry, LoyaltyCustomer, Order, UUID } from '../types';
+import type { CashbackLedgerEntry, CashbackRedeemSource, LoyaltyCustomer, Order, UUID } from '../types';
 import { formatBRL, fromCents, toCents } from './money';
 
 export const CASHBACK_PCT = 5;
@@ -76,10 +76,15 @@ export function cashbackValidity(earnedAt: Date): { valid_from: string; expires_
   return { valid_from: from.toISOString(), expires_at: until.toISOString() };
 }
 
+/** Lançamento que é crédito do cliente: o ganho (EARN) e a devolução de um resgate (REFUND). */
+export function isCashbackCredit(e: CashbackLedgerEntry): boolean {
+  return e.entry_type === 'EARN' || e.entry_type === 'REFUND';
+}
+
 function isUsableEarn(e: CashbackLedgerEntry, customerId: UUID, at: Date): boolean {
   return (
     e.customer_id === customerId &&
-    e.entry_type === 'EARN' &&
+    isCashbackCredit(e) &&
     e.remaining_amount > 0 &&
     e.valid_from !== null &&
     e.expires_at !== null &&
@@ -97,7 +102,7 @@ export function availableCashback(ledger: readonly CashbackLedgerEntry[], custom
 export function balanceCashback(ledger: readonly CashbackLedgerEntry[], customerId: UUID, at: Date): number {
   return fromCents(
     ledger
-      .filter((e) => e.customer_id === customerId && e.entry_type === 'EARN' && e.expires_at !== null && new Date(e.expires_at) > at)
+      .filter((e) => e.customer_id === customerId && isCashbackCredit(e) && e.expires_at !== null && new Date(e.expires_at) > at)
       .reduce((a, e) => a + toCents(e.remaining_amount), 0),
   );
 }
@@ -106,6 +111,90 @@ export function balanceCashback(ledger: readonly CashbackLedgerEntry[], customer
 export function cashbackUsable(available: number, order: Pick<Order, 'total_amount' | 'remaining_balance'>): number {
   const capCents = Math.round((toCents(order.total_amount) * CASHBACK_MAX_USAGE_PCT) / 100);
   return fromCents(Math.max(Math.min(toCents(available), capCents, toCents(order.remaining_balance)), 0));
+}
+
+/**
+ * De quais créditos sai um resgate (FIFO: vence antes, sai antes), na ordem da baixa.
+ * O resgate guarda essa lista (redeem_sources) para o estorno herdar a validade.
+ */
+export function cashbackFifoSources(
+  ledger: readonly CashbackLedgerEntry[],
+  customerId: UUID,
+  amount: number,
+  at: Date,
+): CashbackRedeemSource[] {
+  let left = toCents(amount);
+  const usable = ledger
+    .filter((e) => isUsableEarn(e, customerId, at))
+    .sort((a, b) => (a.expires_at! < b.expires_at! ? -1 : a.expires_at! > b.expires_at! ? 1 : a.created_at < b.created_at ? -1 : 1));
+  const sources: CashbackRedeemSource[] = [];
+  for (const e of usable) {
+    if (left <= 0) break;
+    const t = Math.min(toCents(e.remaining_amount), left);
+    sources.push({ source_id: e.id, amount: fromCents(t) });
+    left -= t;
+  }
+  if (left > 0) throw new Error('Saldo de cashback insuficiente.');
+  return sources;
+}
+
+/** Uma parte do estorno: valor e a validade do crédito de onde saiu. */
+export interface CashbackRefundPart {
+  refund_of_id: UUID | null;
+  amount: number;
+  valid_from: string;
+  expires_at: string;
+}
+
+/**
+ * Como o estorno de um resgate volta ao cliente (decisão do Will, 10/11/2026: o cashback
+ * vale 30 dias de quando foi gerado, com ou sem cancelamento). Mesma regra de
+ * tchefood_orders_cashback_refund (db/schema_cashback_servidor.sql): cada parte volta com
+ * a validade do crédito de onde saiu, primeiro o que vence por último; parte de crédito
+ * vencido volta vencida. Resgate sem origem registrada vence com o crédito consumido do
+ * cliente que vence por último (sem nenhum, conta do resgate).
+ */
+export function planCashbackRefund(
+  ledger: readonly CashbackLedgerEntry[],
+  redeem: CashbackLedgerEntry,
+  amount: number,
+): CashbackRefundPart[] {
+  const byId = new Map(ledger.map((e) => [e.id, e]));
+  const sources = (redeem.redeem_sources ?? [{ source_id: null, amount: redeem.amount }])
+    .map((src) => ({ src, credit: src.source_id ? byId.get(src.source_id) ?? null : null }))
+    .sort((a, b) => {
+      const ea = a.credit?.expires_at ?? null;
+      const eb = b.credit?.expires_at ?? null;
+      if (ea === eb) return (b.credit?.created_at ?? '') < (a.credit?.created_at ?? '') ? -1 : 1;
+      if (ea === null) return 1;
+      if (eb === null) return -1;
+      return ea > eb ? -1 : 1;
+    });
+  const refunds = ledger.filter((e) => e.order_id === redeem.order_id && e.entry_type === 'REFUND');
+  let left = toCents(amount);
+  const parts: CashbackRefundPart[] = [];
+  for (const { src, credit } of sources) {
+    if (left <= 0) break;
+    const back = refunds.filter((r) => (r.refund_of_id ?? null) === src.source_id).reduce((sum, r) => sum + toCents(r.amount), 0);
+    const take = Math.min(toCents(src.amount) - back, left);
+    if (take <= 0) continue;
+    let validity: { valid_from: string; expires_at: string } | null =
+      credit?.valid_from && credit.expires_at ? { valid_from: credit.valid_from, expires_at: credit.expires_at } : null;
+    if (!validity && src.source_id === null) {
+      const consumed = ledger
+        .filter((e) => e.customer_id === redeem.customer_id && isCashbackCredit(e) && e.amount > e.remaining_amount
+          && e.created_at <= redeem.created_at && e.valid_from && e.expires_at)
+        .sort((a, b) => (a.expires_at! > b.expires_at! ? -1 : 1))[0];
+      validity = consumed ? { valid_from: consumed.valid_from!, expires_at: consumed.expires_at! } : null;
+    }
+    validity ??= {
+      valid_from: redeem.created_at,
+      expires_at: new Date(new Date(redeem.created_at).getTime() + CASHBACK_VALIDITY_DAYS * DAY_MS).toISOString(),
+    };
+    parts.push({ refund_of_id: src.source_id, amount: fromCents(take), ...validity });
+    left -= take;
+  }
+  return parts;
 }
 
 /** Consome créditos FIFO (vence antes, sai antes). Devolve o extrato atualizado. */

@@ -11,14 +11,18 @@
  *
  * O que vem: loja (sem token Focus nem CSC), equipe, maquininhas, categorias,
  * produtos, adicionais e vínculos, preços por horário, mesas (sem a ocupação),
- * permissões, fornecedores e vínculos de compra. Contas, pagamentos, barris e
- * fidelidade ficam em cada aparelho (a nuvem recebe, mas ainda não manda de volta).
+ * permissões, fornecedores e vínculos de compra, e o cashback (clientes e extrato:
+ * o banco decide de quais créditos sai cada resgate e grava os estornos, então o saldo
+ * daqui é acertado pelo da nuvem). Contas, pagamentos e barris ficam em cada aparelho
+ * (a nuvem recebe, mas ainda não manda de volta).
  */
 import type {
+  CashbackLedgerEntry,
   Category,
   Courier,
   DeliveryZone,
   DiningTable,
+  LoyaltyCustomer,
   ModifierGroup,
   ModifierOption,
   PosTerminal,
@@ -59,6 +63,9 @@ export interface CloudSnapshot {
   /** Entrega própria: bairros com taxa e entregadores. */
   deliveryZones: DeliveryZone[];
   couriers: Courier[];
+  /** Cashback: clientes (saldo calculado pelo banco) e extrato. Opcional só para snapshots montados à mão. */
+  loyaltyCustomers?: LoyaltyCustomer[];
+  cashbackLedger?: CashbackLedgerEntry[];
 }
 
 const TENANT_COLUMNS = ['id', 'name', 'legal_name', 'cnpj', 'state_registration', 'city', 'state', 'default_service_fee_pct', 'default_acquirer', 'default_mode', 'created_at', 'half_and_half_pricing'] as const;
@@ -99,6 +106,23 @@ const TABLES = {
   },
   deliveryZones: { table: 'delivery_zones', order: 'id', columns: ['id', 'tenant_id', 'name', 'fee', 'eta_minutes', 'active'] },
   couriers: { table: 'couriers', order: 'id', columns: ['id', 'tenant_id', 'name', 'phone', 'fee_per_delivery', 'active'] },
+} as const;
+
+/** Cashback: lido à parte (não passa pelo mergeRows; ver mergeCashback). */
+const CASHBACK_TABLES = {
+  loyaltyCustomers: {
+    table: 'loyalty_customers',
+    order: 'id',
+    columns: ['id', 'tenant_id', 'name', 'phone_whatsapp', 'cpf', 'whatsapp_opt_in', 'opt_in_at', 'cashback_balance', 'total_spent', 'visits_count', 'last_visit_at', 'created_at'],
+  },
+  cashbackLedger: {
+    table: 'cashback_ledger',
+    order: 'id',
+    columns: [
+      'id', 'tenant_id', 'customer_id', 'order_id', 'entry_type', 'amount', 'remaining_amount', 'base_amount', 'pct', 'valid_from', 'expires_at',
+      'created_by_user_id', 'created_at', 'redeem_sources', 'refund_of_id',
+    ],
+  },
 } as const;
 
 /** Linhas por página (o Supabase limita a 1000 por padrão). */
@@ -160,6 +184,9 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
   const purchaseInvoices = await read('purchaseInvoices');
   const deliveryZones = await read('deliveryZones');
   const couriers = await read('couriers');
+  const loyaltyCustomers = await getAll<LoyaltyCustomer>(cfg, fetchFn, CASHBACK_TABLES.loyaltyCustomers.table, CASHBACK_TABLES.loyaltyCustomers.columns, 'id');
+  const cashbackLedger = await getAll<CashbackLedgerEntry>(cfg, fetchFn, CASHBACK_TABLES.cashbackLedger.table, CASHBACK_TABLES.cashbackLedger.columns, 'id');
+  const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
   return {
     tenant,
     staff,
@@ -177,6 +204,17 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
     purchaseInvoices: purchaseInvoices as PurchaseInvoice[],
     deliveryZones: (deliveryZones as DeliveryZone[]).map((z) => ({ ...z, fee: Number(z.fee) })),
     couriers: (couriers as Courier[]).map((c) => ({ ...c, fee_per_delivery: Number(c.fee_per_delivery) })),
+    loyaltyCustomers: loyaltyCustomers.map((c) => ({
+      ...c, cashback_balance: Number(c.cashback_balance), total_spent: Number(c.total_spent), visits_count: Number(c.visits_count),
+    })),
+    cashbackLedger: cashbackLedger.map((e) => ({
+      ...e,
+      amount: Number(e.amount),
+      remaining_amount: Number(e.remaining_amount),
+      base_amount: num(e.base_amount),
+      pct: num(e.pct),
+      redeem_sources: e.redeem_sources ? e.redeem_sources.map((x) => ({ source_id: x.source_id, amount: Number(x.amount) })) : null,
+    })),
   };
 }
 
@@ -267,6 +305,37 @@ export const MERGE = {
   deliveryZones: { table: 'delivery_zones', key: (r: DeliveryZone) => r.id, dropMissing: false },
   couriers: { table: 'couriers', key: (r: Courier) => r.id, dropMissing: false },
 } satisfies { [K in keyof typeof TABLES]: MergeSpec<CloudSnapshot[K][number]> };
+
+/**
+ * Cashback vindo da nuvem: o banco é quem decide de quais créditos sai cada resgate e
+ * grava os estornos (inclusive os que o aparelho não espelha), então clientes e extrato
+ * da nuvem substituem os daqui. Fica como está o cliente com mudança daqui ainda não
+ * aceita (resgate, crédito, cadastro ou conta com cashback na fila ou recusada). O
+ * estorno local é só espelho (nunca sobe): sai quando o cliente é acertado pela nuvem.
+ */
+export function mergeCashback(
+  local: { loyaltyCustomers: readonly LoyaltyCustomer[]; cashbackLedger: readonly CashbackLedgerEntry[] },
+  cloud: { loyaltyCustomers: readonly LoyaltyCustomer[]; cashbackLedger: readonly CashbackLedgerEntry[] },
+  pendingEvents: ReadonlyArray<Pick<SyncEvent, 'table' | 'row_id' | 'payload'>>,
+): { loyaltyCustomers: LoyaltyCustomer[]; cashbackLedger: CashbackLedgerEntry[] } {
+  const pendingOrders = new Set(pendingEvents.filter((e) => e.table === 'orders').map((e) => e.row_id));
+  const kept = new Set<string>();
+  for (const e of pendingEvents) {
+    if (e.table === 'loyalty_customers') kept.add(e.row_id);
+    if (e.table === 'cashback_ledger' && typeof e.payload.customer_id === 'string') kept.add(e.payload.customer_id);
+  }
+  for (const l of local.cashbackLedger) if (l.order_id && pendingOrders.has(l.order_id)) kept.add(l.customer_id);
+  const customers = mergeRows(local.loyaltyCustomers, cloud.loyaltyCustomers, new Set([...kept].map((id) => `loyalty_customers:${id}`)), {
+    table: 'loyalty_customers', key: (r: LoyaltyCustomer) => r.id, dropMissing: false,
+  });
+  const ledger = [
+    // P2-01 da rodada 7 do GPT: sem nada do cliente na fila ou recusado, o extrato da nuvem
+    // substitui todo o daqui (crédito ou resgate que só existe aqui não fica como saldo).
+    ...local.cashbackLedger.filter((l) => kept.has(l.customer_id)),
+    ...cloud.cashbackLedger.filter((c) => !kept.has(c.customer_id)),
+  ];
+  return { loyaltyCustomers: customers, cashbackLedger: ledger };
+}
 
 /**
  * Equipe vinda da nuvem sem PIN: nome, perfil e ativo de quem este aparelho já

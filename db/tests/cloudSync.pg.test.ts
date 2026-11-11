@@ -13,7 +13,8 @@ import { spawn } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { isRejectedItemPrice, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
+import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
+import { availableCashback } from '../../src/lib/loyalty';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
 import { fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins } from '../../src/lib/sync/cloudPull';
 import { syncOnce } from '../../src/lib/sync/useCloudSync';
@@ -89,6 +90,11 @@ function payCash(orderId: string) {
 }
 
 const MANAGER = { managerPin: MANAGER_PIN, reason: 'Teste com o banco real' };
+
+/** Fixa a data do servidor para a regra do cashback (terça a quinta); null volta para NOW(). */
+function setCashbackClock(at: string | null) {
+  sql(`CREATE OR REPLACE FUNCTION tchefood_cashback_now() RETURNS TIMESTAMPTZ LANGUAGE sql STABLE AS $$ SELECT ${at ? `'${at}'::timestamptz` : 'NOW()'} $$;`);
+}
 
 afterEach(() => vi.useRealTimers());
 
@@ -241,16 +247,1348 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     await expectSynced('cashback ganho');
 
     vi.setSystemTime(new Date('2026-11-12T13:00:00-03:00'));
+    setCashbackClock('2026-11-12T13:05:00-03:00');
     login(CASHIER_PIN);
     const second = ok(st().openTable(mesa.id, 1, null));
     launch(second.id, 1);
     const redeemed = ok(st().redeemCashback(second.id, '55999887766'));
     expect(redeemed.amount).toBeGreaterThan(0);
     await expectSynced('cashback resgatado');
+    // Gravado pela função do servidor: resgate, baixa do crédito e audit_log conferido.
+    expect(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${second.id}' AND entry_type = 'REDEEM'`)).toBe(redeemed.amount.toFixed(2));
+    expect(sql(`SELECT remaining_amount FROM cashback_ledger WHERE order_id = '${first.id}' AND entry_type = 'EARN'`)).toBe(
+      (Math.round((Number(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${first.id}' AND entry_type = 'EARN'`)) - redeemed.amount) * 100) / 100).toFixed(2),
+    );
+    expect(sql(`SELECT metadata->>'server_verified' FROM audit_logs WHERE order_id = '${second.id}' AND action_type = 'CASHBACK_REDEEMED'`)).toBe('true');
     payCash(second.id);
     await expectSynced('conta com cashback paga');
     expect(sql(`SELECT discount_amount FROM orders WHERE id = '${second.id}'`)).toBe(redeemed.amount.toFixed(2));
     expect(sql(`SELECT status FROM orders WHERE id = '${second.id}'`)).toBe('CLOSED');
+  });
+
+  it('travas do cashback: o token do aparelho não resgata direto, e a função confere dia, valor, conta e repetição', async () => {
+    const mesa = st().tables.find((t) => t.number === 1)!;
+    const p = st().products.find((x) => x.id === productId)!;
+    const customer = sql(`SELECT id FROM loyalty_customers WHERE tenant_id = '${TENANT}' LIMIT 1`);
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    // Crédito novo liberado (gravado pelo servidor, como se viesse de uma conta fechada).
+    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         SELECT '${TENANT}', '${customer}', o.id, 'EARN', 20, 20, '2026-11-01', '2026-12-31'
+           FROM orders o WHERE o.tenant_id = '${TENANT}' AND o.status = 'CLOSED'
+            AND NOT EXISTS (SELECT 1 FROM cashback_ledger c WHERE c.order_id = o.id AND c.entry_type = 'EARN') LIMIT 1;`);
+    const earn = sql(`SELECT id FROM cashback_ledger WHERE customer_id = '${customer}' AND entry_type = 'EARN' AND remaining_amount = 20`);
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(mesa.id, 1, null));
+    ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 2, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order.id));
+    await expectSynced('conta aberta');
+    const total = Number(sql(`SELECT total_amount FROM orders WHERE id = '${order.id}'`));
+    const expected = Math.min(20, Math.round(total * 50) / 100);
+    const redeem = (args: Record<string, unknown>) => raw('POST', 'rpc/tchefood_register_cashback_redeem', {
+      p_redeem_id: 'aaaaaaaa-0000-4000-8000-000000000001', p_audit_id: 'aaaaaaaa-0000-4000-8000-000000000002', p_order_id: order.id,
+      p_customer_id: customer, p_amount: expected, p_user_id: cashier, p_created_at: '2026-11-12T19:59:00-03:00', ...args,
+    });
+
+    // Direto na tabela: resgate, baixa do saldo e expiração são recusados.
+    const direct = await raw('POST', 'cashback_ledger', { tenant_id: TENANT, customer_id: customer, order_id: order.id, entry_type: 'REDEEM', amount: 5 });
+    expect(direct.status).toBe(400);
+    expect(direct.body).toContain('só pela função do servidor');
+    expect((await raw('PATCH', `cashback_ledger?id=eq.${earn}`, { remaining_amount: 0 })).body).toContain('só baixa pela função do servidor');
+    expect((await raw('POST', 'cashback_ledger', { tenant_id: TENANT, customer_id: customer, entry_type: 'EXPIRE', amount: 20 })).status).toBe(400);
+    expect(sql(`SELECT remaining_amount FROM cashback_ledger WHERE id = '${earn}'`)).toBe('20.00');
+    // A função antiga (sem conferir quem chama) não é do aparelho.
+    expect(sql(`SELECT has_function_privilege('authenticated', 'tchefood_redeem_cashback(uuid,uuid,uuid)', 'EXECUTE')`)).toBe('f');
+
+    // Valor diferente do que o banco calcula: recusado.
+    expect((await redeem({ p_amount: expected + 1 })).body).toContain(`o servidor calcula R$ ${expected.toFixed(2)}`);
+    // P0-02 do GPT: o dia é o do servidor. Sexta 00h10 no servidor e o aparelho dizendo
+    // quinta 23h59: recusado, com ou sem a marca da versão anterior.
+    setCashbackClock('2026-11-13T00:10:00-03:00');
+    for (const legacy of [false, true]) {
+      const r = await redeem({ p_created_at: '2026-11-12T23:59:00-03:00', p_legacy_predebited: legacy });
+      expect(r.status, r.body).toBe(400);
+      expect(r.body).toContain('terça a quinta');
+    }
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    // O aparelho não grava o registro do resgate direto (seria prova forjada da versão anterior).
+    const fakeAudit = await raw('POST', 'audit_logs', {
+      id: crypto.randomUUID(), tenant_id: TENANT, order_id: order.id, performed_by_user_id: cashier, action_type: 'CASHBACK_REDEEMED',
+      amount_impact: -expected, reason: 'Cashback de fidelidade resgatado', metadata: { customer_id: customer, amount: expected, discount_before: 0, discount_after: expected },
+    });
+    expect(fakeAudit.status).toBe(400);
+    expect(fakeAudit.body).toContain('só é gravado por tchefood_register_cashback_redeem');
+    // Segunda-feira (pelo relógio do servidor): recusado.
+    setCashbackClock('2026-11-16T20:00:00-03:00');
+    expect((await redeem({ p_created_at: null })).body).toContain('terça a quinta');
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    // Quem resgata tem de ser da equipe ativa da loja.
+    expect((await redeem({ p_user_id: 'bbbbbbbb-0000-4000-8000-000000000009' })).body).toContain('equipe ativa');
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}'`)).toBe('0');
+
+    // Certo: grava o resgate, baixa o crédito, grava o audit_log e o desconto.
+    const okRes = await redeem({});
+    expect(okRes.status).toBe(200);
+    expect(Number(okRes.body)).toBe(expected);
+    expect(sql(`SELECT remaining_amount FROM cashback_ledger WHERE id = '${earn}'`)).toBe((20 - expected).toFixed(2));
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order.id}'`)).toBe(expected.toFixed(2));
+    // Reenvio da fila: devolve o gravado sem consumir de novo.
+    expect(Number((await redeem({})).body)).toBe(expected);
+    expect(sql(`SELECT remaining_amount FROM cashback_ledger WHERE id = '${earn}'`)).toBe((20 - expected).toFixed(2));
+    // Segundo resgate na mesma conta, com outro id: recusado.
+    expect((await redeem({ p_redeem_id: 'aaaaaaaa-0000-4000-8000-000000000003', p_audit_id: 'aaaaaaaa-0000-4000-8000-000000000004' })).body).toContain('já usou cashback');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order.id}'`)).toBe(expected.toFixed(2));
+    // Fecha a conta para não atrapalhar os próximos testes.
+    useTcheStore.setState({ orders: st().orders.filter((o) => o.id !== order.id), tables: st().tables.map((t) => (t.id === mesa.id ? { ...t, status: 'FREE' as const, current_order_id: null } : t)) });
+    sql(`SET session_replication_role = replica; UPDATE orders SET status = 'CANCELED' WHERE id = '${order.id}'; UPDATE dining_tables SET status = 'FREE', current_order_id = NULL WHERE id = '${mesa.id}';`);
+    setCashbackClock(null);
+  });
+
+  /** Abre contas novas (mesas 11 em diante) com dois itens, para os testes de cashback. */
+  async function cashbackOrders(n: number, first: number) {
+    login(OWNER_PIN);
+    for (let i = 0; i < n; i++) ok(st().saveTable({ number: first + i, label: `Mesa ${first + i}`, area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('mesas do cashback');
+    login(CASHIER_PIN);
+    const p = st().products.find((x) => x.id === productId)!;
+    const orders = Array.from({ length: n }, (_, i) => {
+      const mesa = st().tables.find((t) => t.number === first + i)!;
+      const order = ok(st().openTable(mesa.id, 1, null));
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 2, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      return order;
+    });
+    await expectSynced('contas do cashback');
+    return orders.map((o) => ({ id: o.id, cap: Math.round(Number(sql(`SELECT total_amount FROM orders WHERE id = '${o.id}'`)) * 50) / 100 }));
+  }
+  function closeCashbackOrders(ids: string[]) {
+    useTcheStore.setState({
+      orders: st().orders.filter((o) => !ids.includes(o.id)),
+      tables: st().tables.map((t) => (t.current_order_id && ids.includes(t.current_order_id) ? { ...t, status: 'FREE' as const, current_order_id: null } : t)),
+    });
+    const list = ids.map((x) => `'${x}'`).join(',');
+    sql(`SET session_replication_role = replica; UPDATE orders SET status = 'CANCELED' WHERE id IN (${list}); UPDATE dining_tables SET status = 'FREE', current_order_id = NULL WHERE current_order_id IN (${list});`);
+  }
+  /** Cliente novo da loja com créditos liberados (como se viessem de contas fechadas). */
+  function cashbackCustomer(phone: string, credits: { amount: number; remaining?: number; expires: string }[], tenant = TENANT) {
+    const id = crypto.randomUUID();
+    sql(`INSERT INTO loyalty_customers (id, tenant_id, phone_whatsapp, name) VALUES ('${id}', '${tenant}', '${phone}', 'Cliente ${phone}');`);
+    const earns = credits.map((c) => {
+      const earn = crypto.randomUUID();
+      sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (id, tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+           VALUES ('${earn}', '${tenant}', '${id}', 'EARN', ${c.amount}, ${c.remaining ?? c.amount}, '2026-11-01', '${c.expires}');`);
+      return earn;
+    });
+    return { id, earns };
+  }
+  /** O que a versão anterior deixava na nuvem quando a internet caía no meio do resgate: o registro do resgate (sem REDEEM). */
+  function legacyAudit(orderId: string, customerId: string, amount: number) {
+    const id = crypto.randomUUID();
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    sql(`INSERT INTO audit_logs (id, tenant_id, order_id, performed_by_user_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${id}', '${TENANT}', '${orderId}', '${cashier}', 'CASHBACK_REDEEMED', ${-amount}, 'Cashback de fidelidade resgatado',
+                 '{"customer_id": "${customerId}", "amount": ${amount}, "discount_before": 0, "discount_after": ${amount}}');`);
+    return id;
+  }
+  const remainingOf = (earn: string) => Number(sql(`SELECT remaining_amount FROM cashback_ledger WHERE id = '${earn}'`));
+  const debit = (earn: string, v: number) => sql(`SET session_replication_role = replica; UPDATE cashback_ledger SET remaining_amount = remaining_amount - ${v} WHERE id = '${earn}';`);
+  const cashbackRpc = (orderId: string, customerId: string, amount: number, args: Record<string, unknown> = {}) => raw('POST', 'rpc/tchefood_register_cashback_redeem', {
+    p_redeem_id: crypto.randomUUID(), p_audit_id: crypto.randomUUID(), p_order_id: orderId, p_customer_id: customerId, p_amount: amount,
+    p_user_id: sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`), p_created_at: '2026-11-12T19:00:00-03:00', ...args,
+  });
+
+  it('cashback entre lojas: crédito de outra loja não conta nem baixa, e lançamento cruzado novo é recusado', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [order, other] = await cashbackOrders(2, 11);
+    const amount = Math.min(5, order!.cap);
+    const customer = cashbackCustomer('5553988110001', [{ amount, expires: '2026-12-31' }]);
+    // Outra loja com um crédito de R$ 30 que aponta (de propósito) para o cliente desta loja.
+    const TENANT_B = '33333333-3333-4333-8333-333333333333';
+    const cross = crypto.randomUUID();
+    sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT_B}', 'Outra loja', 'Outra loja Ltda', '33444555000181');
+         SET session_replication_role = replica;
+         INSERT INTO cashback_ledger (id, tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         VALUES ('${cross}', '${TENANT_B}', '${customer.id}', 'EARN', 30, 30, '2026-11-01', '2026-12-31');`);
+    // O servidor só conta o crédito desta loja: pedir mais que ele é recusado, e o da outra loja não baixa.
+    const greedy = await cashbackRpc(order!.id, customer.id, Math.min(amount + 30, order!.cap));
+    if (order!.cap > amount) expect(greedy.body).toContain(`o servidor calcula R$ ${amount.toFixed(2)}`);
+    expect(remainingOf(cross)).toBe(30);
+    const res = await cashbackRpc(order!.id, customer.id, amount);
+    expect(res.status, res.body).toBe(200);
+    expect(remainingOf(customer.earns[0]!)).toBe(0);
+    expect(remainingOf(cross)).toBe(30);
+    // Lançamento novo com cliente ou conta de outra loja: recusado pelas chaves compostas.
+    expect(() => sql(`INSERT INTO cashback_ledger (tenant_id, customer_id, entry_type, amount)
+                      VALUES ('${TENANT_B}', '${customer.id}', 'REDEEM', 1);`)).toThrow(/cashback_ledger_customer_same_tenant/);
+    const customerB = crypto.randomUUID();
+    sql(`INSERT INTO loyalty_customers (id, tenant_id, phone_whatsapp, name) VALUES ('${customerB}', '${TENANT_B}', '5553988110009', 'Cliente B');`);
+    expect(() => sql(`INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount)
+                      VALUES ('${TENANT_B}', '${customerB}', '${other!.id}', 'REDEEM', 1);`)).toThrow(/cashback_ledger_order_same_tenant/);
+    closeCashbackOrders([order!.id, other!.id]);
+    setCashbackClock(null);
+  });
+
+  it('depois do resgate: atualização antiga da conta não apaga desconto e a do cliente não grava saldo', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [order] = await cashbackOrders(1, 31);
+    expect(order!.cap).toBeGreaterThanOrEqual(7);
+    const c = cashbackCustomer('5553988110006', [{ amount: 5, expires: '2026-12-31' }]);
+    expect((await cashbackRpc(order!.id, c.id, 5)).status).toBe(200);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('5.00');
+    // P0-01 da rodada 3: outro aparelho sobe um desconto autorizado (R$ 5 → R$ 7) antes da
+    // fila deste aparelho terminar.
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Desconto do outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    const gross = sql(`SELECT subtotal_items + service_fee_amount FROM orders WHERE id = '${order!.id}'`);
+    // A fila deste aparelho sobe a atualização da conta com o desconto antigo, e depois a
+    // conta indo para pagamento (também com o valor antigo): as duas são recusadas como
+    // conflito (rodada 5: o aparelho fica sabendo antes de cobrar) e o desconto continua R$ 7.
+    const stale = await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5 });
+    expect(stale.status).toBe(400);
+    expect(stale.body).toContain('TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ 7.00 e este aparelho mandou R$ 5.00');
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5, status: 'PAYING' })).status).toBe(400);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 7, status: 'PAYING' })).status).toBeLessThan(300);
+    expect(sql(`SELECT discount_amount || ' ' || status FROM orders WHERE id = '${order!.id}'`)).toBe('7.00 PAYING');
+    expect(sql(`SELECT total_amount = ${gross} - 7 FROM orders WHERE id = '${order!.id}'`)).toBe('t');
+    expect(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${order!.id}' AND entry_type = 'REDEEM'`)).toBe('5.00');
+
+    // P2-02 da rodada 3: o saldo exibido do cliente é do banco. A atualização do cliente que
+    // sobe depois do resgate (com o saldo do aparelho) e um saldo inventado não valem.
+    expect((await raw('PATCH', `loyalty_customers?id=eq.${c.id}`, { cashback_balance: 99 })).status).toBeLessThan(300);
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('0.00');
+    // Crédito novo de outro aparelho (R$ 3); a atualização antiga com saldo 0 não o apaga.
+    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         VALUES ('${TENANT}', '${c.id}', 'EARN', 3, 3, '2026-11-01', '2027-12-31');`);
+    sql(`SELECT tchefood_refresh_cashback_balance('${c.id}');`);
+    expect((await raw('PATCH', `loyalty_customers?id=eq.${c.id}`, { cashback_balance: 0, name: 'Cliente atualizado' })).status).toBeLessThan(300);
+    expect(sql(`SELECT cashback_balance || ' ' || name FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('3.00 Cliente atualizado');
+    closeCashbackOrders([order!.id]);
+    setCashbackClock(null);
+  });
+
+  it('gerente troca o desconto manual por um menor: o banco aceita; redução sem autorização não', async () => {
+    // Achado do Codex em e5ce9cb: a trava do desconto (P0-01 da rodada 3) não pode barrar a
+    // troca de R$ 10 por R$ 5 autorizada pelo gerente; senão o pagamento do valor certo é recusado.
+    const [order, withCashback] = await cashbackOrders(2, 41);
+    login(CASHIER_PIN);
+    ok(st().applyDiscount(order!.id, 10, MANAGER));
+    await expectSynced('desconto de R$ 10');
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    await expectSynced('troca para R$ 5');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('5.00');
+    // Atualização antiga da fila (sem autorização dessa troca): recusada, o desconto fica.
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 3 })).status).toBe(400);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('5.00');
+    // Reenvio da troca já feita (R$ 10 → R$ 5) depois de outra autorização (R$ 5 → R$ 8): não vale.
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -3, 'Outro aparelho', '{"discount_before": 5, "discount_after": 8}');
+         UPDATE orders SET discount_amount = 8 WHERE id = '${order!.id}';`);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5 })).status).toBe(400);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('8.00');
+    sql(`UPDATE orders SET discount_amount = 5 WHERE id = '${order!.id}';`);
+    // P2-01 da rodada 4: duas trocas na mesma transação têm o mesmo created_at; a última é a
+    // da sequência do servidor (R$ 5 → R$ 4), não a de UUID maior (R$ 5 → R$ 3).
+    sql(`BEGIN;
+         INSERT INTO audit_logs (id, tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('ffffffff-ffff-4fff-bfff-ffffffffffff', '${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', 2, 'Primeira troca', '{"discount_before": 5, "discount_after": 3}');
+         INSERT INTO audit_logs (id, tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('00000000-0000-4000-8000-000000000001', '${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', 1, 'Segunda troca', '{"discount_before": 5, "discount_after": 4}');
+         COMMIT;`);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 3 })).status).toBe(400);
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 4 })).status).toBeLessThan(300);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -1, 'Volta', '{"discount_before": 4, "discount_after": 5}');
+         UPDATE orders SET discount_amount = 5 WHERE id = '${order!.id}';`);
+    // O pagamento do valor que o aparelho calcula (com R$ 5 de desconto) entra e fecha a conta.
+    payCash(order!.id);
+    await expectSynced('pagamento com o desconto trocado');
+    expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 0.00');
+
+    // Conta com resgate de cashback: nem com autorização o aparelho reduz o desconto.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const c = cashbackCustomer('5553988110007', [{ amount: 5, expires: '2026-12-31' }]);
+    expect((await cashbackRpc(withCashback!.id, c.id, 5)).status).toBe(200);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${withCashback!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', 2, 'Troca', '{"discount_before": 5, "discount_after": 3}');`);
+    expect((await raw('PATCH', `orders?id=eq.${withCashback!.id}`, { discount_amount: 3 })).status).toBe(400);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${withCashback!.id}'`)).toBe('5.00');
+    closeCashbackOrders([withCashback!.id]);
+    setCashbackClock(null);
+  });
+
+  it('item cancelado deixa o bruto abaixo do desconto: o recálculo do banco limita o desconto como o app', async () => {
+    // Achado do Codex em 0ed2531: a trava do desconto não pode barrar o recálculo do banco.
+    const [order] = await cashbackOrders(1, 43);
+    login(CASHIER_PIN);
+    const gross = st().orders.find((o) => o.id === order!.id)!.subtotal_items;
+    ok(st().applyDiscount(order!.id, gross, MANAGER));
+    await expectSynced('desconto do valor todo');
+    const item = st().orderItems.find((i) => i.order_id === order!.id && i.status !== 'CANCELED')!;
+    ok(st().cancelOrderItem(item.id, MANAGER));
+    await expectSynced('cancelamento do item');
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    expect(local.discount_amount).toBe(0);
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order!.id}'`)).toBe('0.00 0.00');
+    // Consumo novo depois: o saldo do banco é o mesmo do aparelho.
+    const p = st().products.find((x) => x.id === productId)!;
+    ok(st().addToTray({ order_id: order!.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order!.id));
+    await expectSynced('consumo novo');
+    const after = st().orders.find((o) => o.id === order!.id)!;
+    expect(sql(`SELECT discount_amount || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe(`${after.discount_amount.toFixed(2)} ${after.remaining_balance.toFixed(2)}`);
+    payCash(order!.id);
+    await expectSynced('pagamento depois do cancelamento');
+    expect(sql(`SELECT status FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED');
+  });
+
+  it('tirar os 10% de conta com desconto maior que o consumo: o desconto limitado ao novo bruto sobe', async () => {
+    // Achado do Codex em b8b9106: o app limita o desconto ao bruto sem os 10% e sobe os dois
+    // juntos; a trava do desconto não pode tratar isso como desconto antigo.
+    const [order] = await cashbackOrders(1, 48);
+    login(CASHIER_PIN);
+    const before = st().orders.find((o) => o.id === order!.id)!;
+    const gross = Math.round((before.subtotal_items + before.service_fee_amount) * 100) / 100;
+    ok(st().applyDiscount(order!.id, gross, MANAGER));
+    await expectSynced('desconto da conta inteira com os 10%');
+    ok(st().removeServiceFee(order!.id, MANAGER));
+    await expectSynced('tirar os 10%');
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    expect(local.discount_amount).toBe(before.subtotal_items);
+    expect(sql(`SELECT charge_service_fee || ' ' || discount_amount || ' ' || total_amount FROM orders WHERE id = '${order!.id}'`))
+      .toBe(`false ${before.subtotal_items.toFixed(2)} 0.00`);
+    // Reduzir abaixo do bruto sem autorização continua recusado.
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 10 })).status).toBe(400);
+    closeCashbackOrders([order!.id]);
+  });
+
+  it('conta com cashback: cancelamento que deixa o desconto abaixo do cashback usado devolve a diferença ao cliente', async () => {
+    // P0-01 da rodada 4 (decisão do Will: "devolva"): R$ 50 de cashback numa conta de R$ 100;
+    // o cancelamento leva o bruto a R$ 30, o recálculo limita o desconto a R$ 30 e os R$ 20
+    // que sobram voltam ao cliente (REFUND + CASHBACK_REFUNDED), uma vez só, mesmo com o
+    // reenvio da fila depois de a internet cair antes da confirmação.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(OWNER_PIN);
+    const product = (code: string, name: string, price: number) => ok(st().saveProduct({
+      category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    const picanha = product('451', 'Picanha', 80);
+    const salada = product('452', 'Salada', 20);
+    ok(st().saveTable({ number: 45, label: 'Mesa 45', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('produtos e mesa');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 45)!.id, 1, null));
+    for (const p of [picanha, salada]) {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    }
+    ok(st().dispatchTray(order.id));
+    ok(st().removeServiceFee(order.id, MANAGER));
+    await expectSynced('conta de R$ 100');
+    // Cliente com R$ 60 liberados em dois créditos (R$ 30 vence em 20/11, R$ 30 em 31/12),
+    // na nuvem e no aparelho.
+    const phone = '5553988110008';
+    const c = cashbackCustomer(phone, [{ amount: 30, expires: '2026-11-20' }, { amount: 30, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarns = c.earns.map((id) => JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${id}'`)));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 60, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, ...cloudEarns.map((e) => ({ ...e, amount: 30, remaining_amount: 30 }))],
+    });
+    expect(ok(st().redeemCashback(order.id, phone)).amount).toBe(50);
+    await expectSynced('resgate de R$ 50');
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe('50.00 50.00');
+
+    const item = st().orderItems.find((i) => i.order_id === order.id && i.product_id === picanha.id)!;
+    // Quem cancela não é quem resgatou (P2-01 da rodada 5: o estorno leva o cancelamento).
+    login(OWNER_PIN);
+    ok(st().cancelOrderItem(item.id, MANAGER));
+    login(CASHIER_PIN);
+    const pending = [...st().outbox];
+    await expectSynced('cancelamento da picanha');
+    // Internet caiu antes da confirmação: a fila sobe de novo os mesmos eventos.
+    const cloud = st().cloud!;
+    const resend = await flushOutbox(pending, { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000);
+    expect(resend.rejected).toEqual([]);
+
+    const local = st().orders.find((o) => o.id === order.id)!;
+    expect([local.discount_amount, local.total_amount]).toEqual([20, 0]);
+    expect(sql(`SELECT discount_amount || ' ' || total_amount || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`)).toBe('20.00 0.00 0.00');
+    // O resgate saiu R$ 30 do crédito de 20/11 e R$ 20 do de 31/12 (vence antes, sai antes).
+    expect(sql(`SELECT string_agg((x->>'amount') || ' ' || (x->>'source_id'), ' | ' ORDER BY n) FROM cashback_ledger l, jsonb_array_elements(l.redeem_sources) WITH ORDINALITY AS t(x, n) WHERE l.order_id = '${order.id}' AND l.entry_type = 'REDEEM'`))
+      .toBe(`30.00 ${c.earns[0]} | 20.00 ${c.earns[1]}`);
+    // Decisão do Will: o estorno de R$ 30 não ganha prazo novo. Volta primeiro o que vence por
+    // último: R$ 20 com a validade do crédito de 31/12 e R$ 10 com a do de 20/11. Uma vez só,
+    // mesmo com o reenvio; os EARN originais não mudam.
+    const refundRows = () => sql(`SELECT string_agg(amount || ' ' || remaining_amount || ' ' || to_char(valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD') || ' ' || to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') || ' ' || (refund_of_id = '${c.earns[1]}'), ' | ' ORDER BY expires_at DESC) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND'`);
+    expect(refundRows()).toBe('20.00 20.00 2026-11-01 2026-12-31 true | 10.00 10.00 2026-11-01 2026-11-20 false');
+    expect(sql(`SELECT string_agg(amount || ' ' || remaining_amount, ' | ' ORDER BY expires_at) FROM cashback_ledger WHERE id IN ('${c.earns[0]}', '${c.earns[1]}')`)).toBe('30.00 0.00 | 30.00 10.00');
+    expect(sql(`SELECT count(*) || ' ' || sum(amount_impact) || ' ' || bool_and((metadata->>'server_verified')::boolean) FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'CASHBACK_REFUNDED'`)).toBe('2 30.00 true');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('40.00');
+    // Cada estorno aponta o cancelamento da picanha: quem cancelou, o gerente e o registro.
+    const cancelAudit = sql(`SELECT id || ' ' || performed_by_user_id || ' ' || authorized_by_manager_id FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'ITEM_CANCELED' AND metadata->>'item_id' = '${item.id}'`);
+    expect(sql(`SELECT string_agg(DISTINCT (metadata->>'cause_audit_id') || ' ' || performed_by_user_id || ' ' || authorized_by_manager_id || ' ' || (metadata->>'cause') || ' ' || (metadata->>'item_cancel_audit_id' = metadata->>'cause_audit_id') || ' ' || (metadata->>'canceled_item_id') || ' ' || reason, ' | ') FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'CASHBACK_REFUNDED'`))
+      .toBe(`${cancelAudit} ITEM_CANCELED true ${item.id} Cashback devolvido ao cliente (cancelamento de item deixou o desconto abaixo do cashback usado)`);
+    expect(sql(`SELECT created_by_user_id <> (SELECT performed_by_user_id FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'ITEM_CANCELED' LIMIT 1) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REDEEM'`)).toBe('t');
+    // O aparelho chega ao mesmo extrato sem baixar nada da nuvem.
+    const localRefunds = st().cashbackLedger.filter((e) => e.order_id === order.id && e.entry_type === 'REFUND');
+    expect(localRefunds.map((e) => [e.amount, e.expires_at!.slice(0, 10), e.refund_of_id])).toEqual([[20, '2026-12-31', c.earns[1]], [10, '2026-11-20', c.earns[0]]]);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(40);
+
+    // O aparelho não grava estorno nem o registro dele.
+    const user = st().currentUserId;
+    expect((await raw('POST', 'cashback_ledger', {
+      id: crypto.randomUUID(), tenant_id: TENANT, customer_id: c.id, order_id: order.id, entry_type: 'REFUND', amount: 5, remaining_amount: 5,
+      valid_from: '2026-11-12T20:00:00-03:00', expires_at: '2026-12-12T20:00:00-03:00', created_by_user_id: user,
+    })).status).toBe(400);
+    expect((await raw('POST', 'audit_logs', {
+      id: crypto.randomUUID(), tenant_id: TENANT, order_id: order.id, performed_by_user_id: user, action_type: 'CASHBACK_REFUNDED',
+      amount_impact: 5, reason: 'forjado', whatsapp_alert_sent: false, metadata: {},
+    })).status).toBe(400);
+
+    // Achado do Codex em b8b9106: depois do estorno, consumo novo e o aparelho sobe o
+    // desconto de volta para R$ 50. O registro do resgate original não serve mais: recusa,
+    // e o cliente não fica com o estorno e o desconto.
+    ok(st().addToTray({ order_id: order.id, product_id: picanha.id, half_product_ids: [], quantity: 1, unit_price: picanha.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: picanha.sector }));
+    ok(st().dispatchTray(order.id));
+    await expectSynced('consumo novo depois do estorno');
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe('20.00 80.00');
+    const reuse = await raw('PATCH', `orders?id=eq.${order.id}`, { discount_amount: 50 });
+    expect(reuse.status).toBe(400);
+    expect(reuse.body).toContain('TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ 20.00');
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe('20.00 80.00');
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND'`)).toBe('2');
+
+    // O crédito devolvido vale como o ganho: entra no próximo resgate (pelo FIFO do servidor).
+    const [next] = await cashbackOrders(1, 46);
+    const cap = next!.cap;
+    expect((await cashbackRpc(next!.id, c.id, Math.min(40, cap))).status).toBe(200);
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe((40 - Math.min(40, cap)).toFixed(2));
+    closeCashbackOrders([next!.id, order.id]);
+    setCashbackClock(null);
+  });
+
+  it('tirar os 10% de conta com cashback: o estorno do banco tem espelho no aparelho e a leitura da nuvem acerta o extrato', async () => {
+    // Achado do Codex em 4f16b9c: o estorno nasce no banco em qualquer redução do desconto,
+    // mas o aparelho só espelhava o do cancelamento. R$ 100 + 10%, resgate de R$ 50; o
+    // cancelamento de R$ 53 deixa R$ 51,70 (sem estorno); tirar os 10% limita o desconto a
+    // R$ 47 e devolve R$ 3.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(OWNER_PIN);
+    const product = (code: string, name: string, price: number) => ok(st().saveProduct({
+      category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    const costela = product('454', 'Costela', 53);
+    const arroz = product('455', 'Arroz carreteiro', 47);
+    ok(st().saveTable({ number: 54, label: 'Mesa 54', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('produtos e mesa');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 54)!.id, 1, null));
+    for (const p of [costela, arroz]) {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    }
+    ok(st().dispatchTray(order.id));
+    await expectSynced('conta de R$ 100 + 10%');
+    const phone = '5553988110018';
+    const c = cashbackCustomer(phone, [{ amount: 50, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 50, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 50, remaining_amount: 50 }],
+    });
+    expect(ok(st().redeemCashback(order.id, phone)).amount).toBe(50);
+    await expectSynced('resgate de R$ 50');
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === order.id && i.product_id === costela.id)!.id, MANAGER));
+    await expectSynced('cancelamento da costela');
+    const refundsOf = () => st().cashbackLedger.filter((e) => e.order_id === order.id && e.entry_type === 'REFUND');
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND'`)).toBe('0');
+    expect(refundsOf()).toEqual([]);
+    // Outro operador tira os 10% (P2-01 da rodada 5 do GPT): o estorno é dele, com o gerente
+    // e o registro da retirada, não do cancelamento anterior nem de quem resgatou.
+    login(OWNER_PIN);
+    ok(st().removeServiceFee(order.id, MANAGER));
+    login(CASHIER_PIN);
+    await expectSynced('tirar os 10%');
+    const feeAudit = sql(`SELECT id || ' ' || performed_by_user_id || ' ' || authorized_by_manager_id FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'SERVICE_FEE_REMOVED' ORDER BY server_seq DESC LIMIT 1`);
+    expect(sql(`SELECT (metadata->>'cause_audit_id') || ' ' || performed_by_user_id || ' ' || authorized_by_manager_id || ' ' || (metadata->>'cause') || ' ' || (metadata->>'service_fee_audit_id' = metadata->>'cause_audit_id') || ' ' || (metadata->>'item_cancel_audit_id' IS NULL) || ' ' || reason FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'CASHBACK_REFUNDED'`))
+      .toBe(`${feeAudit} SERVICE_FEE_REMOVED true true Cashback devolvido ao cliente (retirada dos 10% deixou o desconto abaixo do cashback usado)`);
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'ITEM_CANCELED' AND performed_by_user_id::text = split_part('${feeAudit}', ' ', 2)`)).toBe('0');
+    // O espelho do aparelho leva a mesma operação.
+    const localFeeLog = st().auditLogs.find((l) => l.order_id === order.id && l.action_type === 'CASHBACK_REFUNDED')!;
+    const localFee = st().auditLogs.find((l) => l.order_id === order.id && l.action_type === 'SERVICE_FEE_REMOVED')!;
+    expect([localFeeLog.metadata?.cause, localFeeLog.metadata?.service_fee_audit_id, localFeeLog.performed_by_user_id, localFeeLog.authorized_by_manager_id].join(' '))
+      .toBe(`SERVICE_FEE_REMOVED ${localFee.id} ${feeAudit.split(' ').slice(1).join(' ')}`);
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe('47.00 0.00');
+    expect(sql(`SELECT string_agg(amount || ' ' || to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'), ' | ') FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND'`)).toBe('3.00 2026-12-31');
+    expect(refundsOf().map((e) => [e.amount, e.expires_at!.slice(0, 10)])).toEqual([[3, '2026-12-31']]);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(3);
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('3.00');
+
+    // Achado do Codex em 634d682: o banco pode baixar outro crédito que o aparelho (crédito
+    // que venceu entre o resgate e a subida) ou gravar o que o aparelho não espelha. A
+    // leitura da nuvem (fila vazia) traz clientes e extrato: o espelho dá lugar ao estorno
+    // do banco, e um crédito gravado por outro aparelho aparece aqui.
+    const other = crypto.randomUUID();
+    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (id, tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         VALUES ('${other}', '${TENANT}', '${c.id}', 'EARN', 4, 4, '2026-11-01', '2026-12-20'); SET session_replication_role = origin;
+         SELECT tchefood_refresh_cashback_balance('${c.id}');`);
+    const mirrorId = refundsOf()[0]!.id;
+    await syncOnce(postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }, emulatorLog), { forcePull: true });
+    expect(st().pullStatus.last_error).toBeNull();
+    const cloudRefund = sql(`SELECT id FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND'`);
+    expect(refundsOf().map((e) => e.id)).toEqual([cloudRefund]);
+    expect(refundsOf()[0]!.id).not.toBe(mirrorId);
+    expect(st().cashbackLedger.find((e) => e.id === other)?.remaining_amount).toBe(4);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(7);
+    expect(availableCashback(st().cashbackLedger, c.id, new Date())).toBe(7);
+    closeCashbackOrders([order.id]);
+    setCashbackClock(null);
+  });
+
+  it('fila da versão anterior que caiu antes da atualização da conta: o desconto do resgate ainda sobe', async () => {
+    // Achado do Codex em da2a794: a versão anterior subia o registro do resgate, as baixas e
+    // o REDEEM antes da conta. Se caiu ali, a atualização da conta com o desconto ainda está
+    // na fila e precisa subir; com estorno na conta, não (seria o reaproveitamento).
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [a, b] = await cashbackOrders(2, 49);
+    const legacyRedeem = (orderId: string, refund: boolean) => {
+      const c = cashbackCustomer(`55539881100${refund ? '20' : '19'}`, [{ amount: 10, expires: '2026-12-31' }]);
+      legacyAudit(orderId, c.id, 5);
+      debit(c.earns[0]!, 5);
+      sql(`SET session_replication_role = replica;
+           INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount) VALUES ('${TENANT}', '${c.id}', '${orderId}', 'REDEEM', 5);
+           ${refund ? `INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+                       VALUES ('${TENANT}', '${c.id}', '${orderId}', 'REFUND', 5, 5, '2026-11-12', '2026-12-12');` : ''}`);
+    };
+    legacyRedeem(a!.id, false);
+    legacyRedeem(b!.id, true);
+    expect((await raw('PATCH', `orders?id=eq.${a!.id}`, { discount_amount: 5 })).status).toBeLessThan(300);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${a!.id}'`)).toBe('5.00');
+    const reused = await raw('PATCH', `orders?id=eq.${b!.id}`, { discount_amount: 5 });
+    expect(reused.status).toBe(400);
+    expect(reused.body).toContain('TCHEFOOD_DESCONTO');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${b!.id}'`)).toBe('0.00');
+    closeCashbackOrders([a!.id, b!.id]);
+    setCashbackClock(null);
+  });
+
+  it('dois aparelhos: desconto antigo da fila vira conflito, o aparelho não cobra e adota o desconto da nuvem', async () => {
+    // P1-01 da rodada 4: antes o banco ignorava a atualização antiga em silêncio e o aparelho
+    // cobrava com o desconto velho (pagamento recusado depois).
+    const [order] = await cashbackOrders(1, 47);
+    login(CASHIER_PIN);
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    await expectSynced('desconto de R$ 5');
+    // Outro aparelho: desconto autorizado R$ 5 → R$ 7.
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    // Este aparelho vai para o pagamento com o desconto antigo: a conta sobe e é recusada.
+    ok(st().startCheckout(order!.id));
+    const rejected = await sync();
+    expect(rejected).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 7.00');
+    // Antes de cobrar o aparelho sabe do conflito e não registra o pagamento.
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    const blocked = st().registerPayment({
+      orderId: order!.id, amount: local.remaining_balance, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
+      acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: `k-${Math.random()}`, item_ids: [],
+    });
+    expect(blocked.ok).toBe(false);
+    expect(st().startCheckout(order!.id).ok).toBe(false);
+    // Achado do Codex em 9b525b6: nem a maquininha começa uma cobrança nova com o valor antigo.
+    const terminal = st().beginTerminalCharge(order!.id, `req-${Math.random()}`, local.remaining_balance);
+    expect(terminal.ok).toBe(false);
+    if (!terminal.ok) expect(terminal.error).toContain('use o desconto da nuvem');
+    // Achado do Codex em 4f16b9c: nem desconto novo nem resgate enquanto o conflito está
+    // pendente (a autorização descreveria a troca a partir do desconto velho daqui).
+    expect(st().applyDiscount(order!.id, 10, MANAGER).ok).toBe(false);
+    // Achado do Codex em 208789d: cobrança que começou antes da recusa ainda sem resposta. O
+    // saldo não muda até a resposta ser registrada (o pagamento aprovado passaria do saldo novo).
+    const charging = { request_id: `req-${Math.random()}`, order_id: order!.id, amount: local.remaining_balance, user_id: st().currentUserId!, started_at: Date.now() };
+    useTcheStore.setState({ pendingCharges: [...st().pendingCharges, charging] });
+    const duringCharge = st().adoptCloudDiscount(conflict.event.id);
+    expect(duringCharge.ok).toBe(false);
+    if (!duringCharge.ok) expect(duringCharge.error).toContain('cobrança em andamento');
+    expect(st().orders.find((o) => o.id === order!.id)!.discount_amount).toBe(5);
+    useTcheStore.setState({ pendingCharges: st().pendingCharges.filter((c) => c.request_id !== charging.request_id) });
+    // O gerente adota o desconto da nuvem: a conta converge e o pagamento do valor certo fecha.
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
+    await expectSynced('conta com o desconto da nuvem');
+    expect(st().orders.find((o) => o.id === order!.id)!.remaining_balance.toFixed(2)).toBe(sql(`SELECT remaining_balance FROM orders WHERE id = '${order!.id}'`));
+    payCash(order!.id);
+    await expectSynced('pagamento depois do conflito');
+    expect(sql(`SELECT status || ' ' || discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 7.00');
+  });
+
+  it('desconto da nuvem adotado com cancelamento na fila: a conta seguinte leva a diferença, limitada ao bruto', async () => {
+    // Achado do Codex em b03d23a: trocar todas as versões da conta na fila pelo desconto da
+    // nuvem (R$ 7) levava o desconto acima do bruto que um cancelamento seguinte deixou
+    // (R$ 3,30), e o banco recusava o aumento sem autorização.
+    login(OWNER_PIN);
+    const agua = ok(st().saveProduct({
+      category_id: categoryId, code: '453', name: 'Água', description: null, price: 3, sector: 'BAR', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '22011000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    await expectSynced('água');
+    const [order] = await cashbackOrders(1, 52);
+    login(CASHIER_PIN);
+    ok(st().addToTray({ order_id: order!.id, product_id: agua.id, half_product_ids: [], quantity: 1, unit_price: 3, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: agua.sector }));
+    ok(st().dispatchTray(order!.id));
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    await expectSynced('água e desconto de R$ 5');
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    ok(st().startCheckout(order!.id));
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    // Na fila, atrás da recusa: o cancelamento do prato (fica só a água, R$ 3,30 com os 10%).
+    const prato = st().orderItems.find((i) => i.order_id === order!.id && i.product_id === productId)!;
+    ok(st().cancelOrderItem(prato.id, MANAGER));
+    expect(st().orders.find((o) => o.id === order!.id)!.discount_amount).toBe(3.3);
+    // Achado do Codex em cd47453: consumo novo depois do cancelamento (o desconto fica 3,30).
+    // A diferença que o cancelamento já absorveu não volta na versão seguinte da conta.
+    ok(st().addToTray({ order_id: order!.id, product_id: agua.id, half_product_ids: [], quantity: 2, unit_price: 3, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: agua.sector }));
+    ok(st().dispatchTray(order!.id));
+    expect(st().orders.find((o) => o.id === order!.id)!.discount_amount).toBe(3.3);
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
+    await expectSynced('conta com o desconto da nuvem, o cancelamento e o consumo novo');
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order!.id}'`)).toBe(`${local.discount_amount.toFixed(2)} ${local.total_amount.toFixed(2)}`);
+    expect(local.discount_amount).toBe(3.3);
+    closeCashbackOrders([order!.id]);
+  });
+
+  it('desconto da nuvem menor adotado com cancelamento na fila: o limite ao bruto não leva a diferença do aparelho', async () => {
+    // Achado do Codex em 38c5497: aparelho com R$ 7 de cashback, nuvem com R$ 5 (outro
+    // aparelho reduziu e o banco estornou). O cancelamento atrás da recusa limita o desconto
+    // do aparelho ao bruto de R$ 5,50; o banco fica com 5 (abaixo do bruto). Levar a diferença
+    // (−2) para a versão seguinte dava 3,50, e o banco recusava a redução.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(OWNER_PIN);
+    const product = (code: string, name: string, price: number) => ok(st().saveProduct({
+      category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    const big = product('456', 'Vazio', 100);
+    const small = product('457', 'Farofa', 5);
+    ok(st().saveTable({ number: 55, label: 'Mesa 55', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('produtos e mesa');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 55)!.id, 1, null));
+    for (const p of [big, small]) {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    }
+    ok(st().dispatchTray(order.id));
+    await expectSynced('conta de R$ 105 + 10%');
+    const phone = '5553988119055';
+    const c = cashbackCustomer(phone, [{ amount: 7, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 7, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 7, remaining_amount: 7 }],
+    });
+    expect(ok(st().redeemCashback(order.id, phone)).amount).toBe(7);
+    await expectSynced('resgate de R$ 7');
+    // Outro aparelho: a conta fica com R$ 5 na nuvem (o banco devolve R$ 2 ao cliente).
+    sql(`UPDATE orders SET discount_amount = 5 WHERE id = '${order.id}';`);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order.id}'`)).toBe('5.00');
+    ok(st().startCheckout(order.id));
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order.id)!;
+    expect(conflict.message).toContain('TCHEFOOD_DESCONTO');
+    // Na fila, atrás da recusa: o cancelamento do vazio (fica a farofa, R$ 5,50 com os 10%).
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === order.id && i.product_id === big.id)!.id, MANAGER));
+    expect(st().orders.find((o) => o.id === order.id)!.discount_amount).toBe(5.5);
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(5);
+    await expectSynced('conta com o desconto menor da nuvem e o cancelamento');
+    const local = st().orders.find((o) => o.id === order.id)!;
+    expect(local.discount_amount).toBe(5);
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe(`${local.discount_amount.toFixed(2)} ${local.total_amount.toFixed(2)}`);
+    closeCashbackOrders([order.id]);
+  });
+
+  it('conta fechada sem internet com o desconto daqui: o desconto menor da nuvem não é adotado', async () => {
+    // Achado do Codex em 8f543cb: aparelho com R$ 7 de cashback fecha a conta sem internet;
+    // a nuvem tem R$ 5. Adotar deixaria a conta fechada com R$ 2 de saldo, que o aparelho não
+    // cobra e o banco não aceita fechar.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [order] = await cashbackOrders(1, 56);
+    const phone = '5553988119056';
+    const c = cashbackCustomer(phone, [{ amount: 7, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 7, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 7, remaining_amount: 7 }],
+    });
+    expect(ok(st().redeemCashback(order!.id, phone)).amount).toBe(7);
+    await expectSynced('resgate de R$ 7');
+    sql(`UPDATE orders SET discount_amount = 5 WHERE id = '${order!.id}';`);
+    // Sem internet: vai para o pagamento, recebe e fecha com o desconto daqui.
+    ok(st().startCheckout(order!.id));
+    payCash(order!.id);
+    const closed = st().orders.find((o) => o.id === order!.id)!;
+    expect(closed.status).toBe('CLOSED');
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 5.00');
+    const adopted = st().adoptCloudDiscount(conflict.event.id);
+    expect(adopted.ok).toBe(false);
+    if (!adopted.ok) expect(adopted.error).toContain('já foi fechada neste aparelho');
+    const after = st().orders.find((o) => o.id === order!.id)!;
+    expect([after.status, after.discount_amount, after.remaining_balance]).toEqual(['CLOSED', 7, 0]);
+    expect(st().syncRejected.some((r) => r.event.id === conflict.event.id)).toBe(true);
+    // Limpa o caso para os testes seguintes (na loja, o gerente confere com o cliente).
+    useTcheStore.setState({ outbox: [], syncRejected: st().syncRejected.filter((r) => r.event.id !== conflict.event.id) });
+    closeCashbackOrders([order!.id]);
+  });
+
+  it('duas trocas de desconto sem internet e outra na nuvem: o gerente confirma de novo e a autorização nova descreve a troca', async () => {
+    // P1-01 da rodada 5 do GPT: sem internet o gerente autoriza R$ 5 e depois R$ 6; na nuvem,
+    // outro aparelho deixou R$ 7. Antes, adotar a nuvem refazia a conta para R$ 8 e mandava a
+    // autorização 5 → 6 sem mudar (o PIN do gerente valia para outra troca, e o banco recusava).
+    const [order] = await cashbackOrders(1, 58);
+    login(CASHIER_PIN);
+    // As duas trocas com um minuto entre elas (não são a mesma operação para a fila).
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    vi.setSystemTime(new Date('2026-11-12T20:01:00-03:00'));
+    ok(st().applyDiscount(order!.id, 6, MANAGER));
+    const firstAuths = st().auditLogs.filter((l) => l.order_id === order!.id && l.action_type === 'DISCOUNT_APPLIED');
+    expect(firstAuths.map((l) => `${l.metadata?.discount_before}→${l.metadata?.discount_after}`).sort()).toEqual(['0→5', '5→6']);
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -7, 'Outro aparelho', '{"discount_before": 0, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 7.00');
+    // Sem o PIN do gerente não adota: a troca 5 → 6 da fila ficaria descrevendo outra troca.
+    const withoutPin = st().adoptCloudDiscount(conflict.event.id);
+    expect(withoutPin.ok).toBe(false);
+    if (!withoutPin.ok) expect(withoutPin.error).toBe(ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER);
+    expect(st().syncRejected.some((r) => r.event.id === conflict.event.id)).toBe(true);
+    expect(ok(st().adoptCloudDiscount(conflict.event.id, MANAGER))).toBe(7);
+    // A autorização original fica no histórico; a nova aponta para ela.
+    const auths = st().auditLogs.filter((l) => l.order_id === order!.id && l.action_type === 'DISCOUNT_APPLIED');
+    const original = auths.find((l) => l.metadata?.discount_before === 5)!;
+    const renewed = auths.find((l) => l.metadata?.replaces_audit_id === original.id)!;
+    expect(renewed.metadata).toMatchObject({ discount_before: 7, discount_after: 6, original_discount_before: 5, original_discount_after: 6 });
+    expect(renewed.amount_impact).toBe(1);
+    expect(renewed.id).not.toBe(original.id);
+    expect(st().orders.find((o) => o.id === order!.id)!.discount_amount).toBe(6);
+    await expectSynced('trocas reautorizadas pelo gerente');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('6.00');
+    // No banco: a última autorização é a nova (R$ 7 → R$ 6), ligada à troca original, e a
+    // original (R$ 5 → R$ 6) nunca subiu como autorização válida da conta.
+    expect(sql(`SELECT (metadata->>'discount_before') || '→' || (metadata->>'discount_after') || ' ' || (metadata->>'replaces_audit_id')
+                  FROM audit_logs WHERE order_id = '${order!.id}' AND action_type = 'DISCOUNT_APPLIED' ORDER BY server_seq DESC LIMIT 1`))
+      .toBe(`7→6 ${original.id}`);
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE id = '${original.id}'`)).toBe('0');
+    payCash(order!.id);
+    await expectSynced('pagamento com o desconto reautorizado');
+    expect(sql(`SELECT status || ' ' || discount_amount || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 6.00 0.00');
+  });
+
+  it('resgate de cashback na fila atrás da recusa: adotar o desconto da nuvem refaz o valor do resgate', async () => {
+    // Achado do Codex em f793339: desconto 5 aqui e 7 na nuvem; o resgate feito aqui antes de
+    // a recusa aparecer pedia 50% da conta com desconto 5, e o banco (que calcula com 7)
+    // recusava o valor depois de adotar o desconto da nuvem.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [order] = await cashbackOrders(1, 61);
+    login(CASHIER_PIN);
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    await expectSynced('desconto de R$ 5');
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order!.id}';`);
+    const phone = '5553988119061';
+    const c = cashbackCustomer(phone, [{ amount: 200, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 200, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 200, remaining_amount: 200 }],
+    });
+    // Sem internet: tira os 10% (a conta sobe com desconto 5 e vai ser recusada) e resgata.
+    ok(st().removeServiceFee(order!.id, MANAGER));
+    const gross = Math.round(st().orders.find((o) => o.id === order!.id)!.subtotal_items * 100);
+    const redeemed = ok(st().redeemCashback(order!.id, phone)).amount;
+    expect(redeemed).toBe(Math.round((gross - 500) / 2) / 100);
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order!.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 7.00');
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order!.id}'`)).toBe('0');
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
+    const amount = Math.round((gross - 700) / 2) / 100;
+    expect(st().cashbackLedger.find((e) => e.order_id === order!.id && e.entry_type === 'REDEEM')!.amount).toBe(amount);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(Math.round((200 - amount) * 100) / 100);
+    await expectSynced('conta com o desconto da nuvem e o resgate refeito');
+    const local = st().orders.find((o) => o.id === order!.id)!;
+    expect(local.discount_amount).toBe(Math.round((7 + amount) * 100) / 100);
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order!.id}'`)).toBe(`${local.discount_amount.toFixed(2)} ${local.total_amount.toFixed(2)}`);
+    expect(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${order!.id}' AND entry_type = 'REDEEM'`)).toBe(amount.toFixed(2));
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe((200 - amount).toFixed(2));
+    closeCashbackOrders([order!.id]);
+    setCashbackClock(null);
+  });
+
+  it('resgate com o estorno de outra conta feito aqui: espera o cancelamento ser aceito, mesmo recusado', async () => {
+    // P1-02 da rodada 5 do GPT: o cancelamento na conta A devolve R$ 10 ao cliente neste
+    // aparelho (espelho do estorno), e a conta B usa esse crédito. Se o cancelamento de A for
+    // recusado, o estorno não existe na nuvem: o resgate de B não pode subir antes.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [a, b] = await cashbackOrders(2, 59);
+    const phone = '5553988119059';
+    const c = cashbackCustomer(phone, [{ amount: 10, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 10, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 10, remaining_amount: 10 }],
+    });
+    expect(ok(st().redeemCashback(a!.id, phone)).amount).toBe(10);
+    await expectSynced('resgate de R$ 10 na conta A');
+    // O PIN do gerente mudou em outro aparelho: o cancelamento de A vai ser recusado.
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active AND pin_code = '${MANAGER_PIN}'`);
+    sql(`UPDATE staff_users SET pin_code = '8462' WHERE id = '${manager}';`);
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === a!.id && i.status !== 'CANCELED')!.id, MANAGER));
+    const refund = st().cashbackLedger.find((e) => e.order_id === a!.id && e.entry_type === 'REFUND')!;
+    expect(refund.amount).toBe(10);
+    // A conta B usa o crédito do estorno (o único do cliente).
+    expect(ok(st().redeemCashback(b!.id, phone)).amount).toBe(10);
+    const redeemB = st().outbox.find((e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.order_id === b!.id)!;
+    // O resgate espera o evento da conta A que faz o banco gravar o estorno.
+    const refundEvent = st().outbox.find((e) => e.id === refund.source_event_id)!;
+    expect([refundEvent.table, refundEvent.row_id]).toEqual(['orders', a!.id]);
+    expect(redeemB.depends_on_event_ids).toEqual([refund.source_event_id]);
+    const rejected = await sync();
+    expect(rejected.map((r) => r.message)).toEqual(['O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).']);
+    // O resgate de B não foi chamado: segue na fila, sem recusa, e nada de B mudou na nuvem.
+    expect(st().outbox.some((e) => e.id === redeemB.id)).toBe(true);
+    expect(st().syncRejected.some((r) => r.event.id === redeemB.id)).toBe(false);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${b!.id}'`)).toBe('0');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${b!.id}'`)).toBe('0.00');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('0.00');
+    // Outra rodada com a recusa guardada (como a sincronização do app): o resgate continua esperando.
+    const cloud = st().cloud!;
+    const again = await flushOutbox(st().outbox, { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000, st().syncRejected.map((r) => r.event));
+    expect([again.sent, again.rejected]).toEqual([[], []]);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${b!.id}'`)).toBe('0');
+    // O PIN volta a conferir e o cancelamento é reenviado: o estorno nasce na nuvem e o
+    // resgate de B sobe depois, com o crédito do estorno.
+    sql(`UPDATE staff_users SET pin_code = '${MANAGER_PIN}' WHERE id = '${manager}';`);
+    st().retryRejectedSync();
+    await expectSynced('cancelamento de A e resgate de B');
+    expect(sql(`SELECT string_agg(entry_type || ' ' || amount || ' ' || remaining_amount, ' | ' ORDER BY created_at) FROM cashback_ledger WHERE order_id IN ('${a!.id}', '${b!.id}') AND entry_type IN ('REFUND', 'REDEEM') AND (order_id = '${b!.id}' OR entry_type = 'REFUND')`))
+      .toBe('REFUND 10.00 0.00 | REDEEM 10.00 0.00');
+    expect(sql(`SELECT (redeem_sources->0->>'source_id') = (SELECT id::text FROM cashback_ledger WHERE order_id = '${a!.id}' AND entry_type = 'REFUND') FROM cashback_ledger WHERE order_id = '${b!.id}' AND entry_type = 'REDEEM'`)).toBe('t');
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${b!.id}'`)).toBe('10.00');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('0.00');
+    // A falha de PIN deste teste não conta para o bloqueio dos testes seguintes (60 s).
+    sql(`SET session_replication_role = replica; DELETE FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED' AND order_id = '${a!.id}';`);
+    closeCashbackOrders([a!.id, b!.id]);
+    setCashbackClock(null);
+  });
+
+  it('resgate refeito com o desconto da nuvem: o estorno da conta feito aqui é refeito junto', async () => {
+    // P1-01 da rodada 6 do GPT: R$ 100 sem os 10%, desconto 5 aqui e 7 na nuvem. Sem internet:
+    // resgate de R$ 47,50 e cancelamento que deixa o bruto em R$ 20 (estorno local de R$ 27,50).
+    // Adotar o desconto da nuvem refaz o resgate para R$ 46,50; o estorno tem de ser R$ 26,50.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(OWNER_PIN);
+    const product = (code: string, name: string, price: number) => ok(st().saveProduct({
+      category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    const maminha = product('461', 'Maminha', 80);
+    const fritas = product('462', 'Fritas', 20);
+    ok(st().saveTable({ number: 63, label: 'Mesa 63', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('produtos e mesa');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 63)!.id, 1, null));
+    for (const p of [maminha, fritas]) {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    }
+    ok(st().dispatchTray(order.id));
+    ok(st().removeServiceFee(order.id, MANAGER));
+    ok(st().applyDiscount(order.id, 5, MANAGER));
+    await expectSynced('conta de R$ 100 com desconto de R$ 5');
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order.id}';`);
+    const phone = '5553988119063';
+    const c = cashbackCustomer(phone, [{ amount: 200, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 200, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 200, remaining_amount: 200 }],
+    });
+    // Sem internet: a conta vai para pagamento (sobe com desconto 5 e será recusada), resgate e cancelamento.
+    ok(st().startCheckout(order.id));
+    expect(ok(st().redeemCashback(order.id, phone)).amount).toBe(47.5);
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === order.id && i.product_id === maminha.id)!.id, MANAGER));
+    const localRefund = () => st().cashbackLedger.filter((e) => e.order_id === order.id && e.entry_type === 'REFUND').reduce((sum, e) => sum + Math.round(e.amount * 100), 0) / 100;
+    const localRefundLogs = () => st().auditLogs.filter((l) => l.order_id === order.id && l.action_type === 'CASHBACK_REFUNDED');
+    expect(localRefund()).toBe(27.5);
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 7.00');
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
+    // Espelho refeito: resgate 46,50, estorno 26,50 (com o registro do valor anterior), saldo 180.
+    expect(st().cashbackLedger.find((e) => e.order_id === order.id && e.entry_type === 'REDEEM')!.amount).toBe(46.5);
+    expect(localRefund()).toBe(26.5);
+    expect(localRefundLogs().reduce((sum, l) => sum + Math.round(Number(l.amount_impact) * 100), 0) / 100).toBe(26.5);
+    expect(localRefundLogs().every((l) => l.metadata?.amount_before_cloud_discount === 27.5 && l.metadata?.cause === 'ITEM_CANCELED')).toBe(true);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(180);
+    const pending = [...st().outbox];
+    await expectSynced('conta, resgate e cancelamento depois de adotar a nuvem');
+    // O reenvio do cancelamento (internet caiu antes da confirmação) não repete o estorno.
+    const cloud = st().cloud!;
+    const cancelAt = pending.findIndex((e) => e.table === 'audit_logs' && e.payload.action_type === 'ITEM_CANCELED' && e.payload.order_id === order.id);
+    expect(cancelAt).toBeGreaterThan(0);
+    const resend = await flushOutbox(pending.slice(cancelAt), { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000);
+    expect(resend.rejected).toEqual([]);
+    expect(sql(`SELECT (SELECT amount FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REDEEM') || ' ' || (SELECT sum(amount) || ' ' || count(*) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND')`))
+      .toBe(`46.50 26.50 ${st().cashbackLedger.filter((e) => e.order_id === order.id && e.entry_type === 'REFUND').length}`);
+    expect(sql(`SELECT sum(amount_impact) FROM audit_logs WHERE order_id = '${order.id}' AND action_type = 'CASHBACK_REFUNDED'`)).toBe('26.50');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('180.00');
+    const local = st().orders.find((o) => o.id === order.id)!;
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe(`${local.discount_amount.toFixed(2)} ${local.total_amount.toFixed(2)}`);
+    expect(local.discount_amount).toBe(20);
+    closeCashbackOrders([order.id]);
+    setCashbackClock(null);
+  });
+
+  it('resgate na fila ao adotar o desconto da nuvem, sem cancelamento: nenhum estorno é criado', async () => {
+    // P1-01 da rodada 7 do GPT: o resgate na fila era procurado pelo id do evento, não pelo
+    // id do registro. Conta de R$ 100 + 10%, desconto 5 aqui e 7 na nuvem. Sem internet:
+    // pagamento (recusado), remoção dos 10% e resgate. Adotar a nuvem refaz o resgate para
+    // R$ 46,50 sem estorno: saldo 153,50 aqui e no banco.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    login(OWNER_PIN);
+    const product = (code: string, name: string, price: number) => ok(st().saveProduct({
+      category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    const picanha = product('481', 'Picanha', 80);
+    const arroz = product('482', 'Arroz', 20);
+    ok(st().saveTable({ number: 71, label: 'Mesa 71', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('produtos e mesa');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 71)!.id, 1, null));
+    for (const p of [picanha, arroz]) {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    }
+    ok(st().dispatchTray(order.id));
+    ok(st().applyDiscount(order.id, 5, MANAGER));
+    await expectSynced('conta de R$ 100 + 10% com desconto de R$ 5');
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active LIMIT 1`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${order.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${order.id}';`);
+    const phone = '5553988119071';
+    const c = cashbackCustomer(phone, [{ amount: 200, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 200, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 200, remaining_amount: 200 }],
+    });
+    ok(st().startCheckout(order.id));
+    ok(st().removeServiceFee(order.id, MANAGER));
+    expect(ok(st().redeemCashback(order.id, phone)).amount).toBe(47.5);
+    expect(await sync()).toHaveLength(1);
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === order.id)!;
+    expect(conflict.message).toContain('na nuvem é R$ 7.00');
+    // O resgate ainda não subiu (está na fila, segurado pela conta recusada).
+    expect(st().outbox.some((e) => e.table === 'cashback_ledger' && e.payload.order_id === order.id && e.payload.entry_type === 'REDEEM')).toBe(true);
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
+    const refunds = () => st().cashbackLedger.filter((e) => e.order_id === order.id && e.entry_type === 'REFUND');
+    expect(refunds()).toEqual([]);
+    expect(st().auditLogs.filter((l) => l.order_id === order.id && l.action_type === 'CASHBACK_REFUNDED')).toEqual([]);
+    expect(st().cashbackLedger.find((e) => e.order_id === order.id && e.entry_type === 'REDEEM')!.amount).toBe(46.5);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(153.5);
+    const pending = [...st().outbox];
+    await expectSynced('conta, taxa e resgate depois de adotar a nuvem');
+    const cloudState = () => sql(`SELECT (SELECT string_agg(amount::text, ',') FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REDEEM') || ' '
+      || (SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}' AND entry_type = 'REFUND') || ' '
+      || (SELECT count(*) FROM audit_logs WHERE order_id = '${order.id}' AND action_type IN ('CASHBACK_REDEEMED', 'CASHBACK_REFUNDED')) || ' '
+      || (SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}')`);
+    expect(cloudState()).toBe('46.50 0 1 153.50');
+    expect(refunds()).toEqual([]);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(153.5);
+    // Reenvio de tudo (internet caiu antes da confirmação): o resgate não duplica, e a conta
+    // antiga (desconto 7, de antes do resgate) é recusada sem mexer em nada.
+    const cloud = st().cloud!;
+    const resend = await flushOutbox(pending, { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000);
+    const ordersEvents = new Set(pending.filter((e) => e.table === 'orders').map((e) => e.id));
+    expect(resend.rejected.length).toBeGreaterThan(0);
+    expect(resend.rejected.every((r) => ordersEvents.has(r.eventId) && r.message.startsWith('TCHEFOOD_DESCONTO'))).toBe(true);
+    const redeemAgain = await flushOutbox(pending.filter((e) => e.table === 'cashback_ledger'), { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000);
+    expect(redeemAgain.rejected).toEqual([]);
+    expect(redeemAgain.sent.length).toBeGreaterThan(0);
+    expect(cloudState()).toBe('46.50 0 1 153.50');
+    const local = st().orders.find((o) => o.id === order.id)!;
+    expect(sql(`SELECT discount_amount || ' ' || total_amount FROM orders WHERE id = '${order.id}'`)).toBe(`${local.discount_amount.toFixed(2)} ${local.total_amount.toFixed(2)}`);
+    closeCashbackOrders([order.id]);
+    setCashbackClock(null);
+  });
+
+  it('autorização de desconto de antes do estorno do cashback não vale depois dele', async () => {
+    // P0-01 (versão B) da rodada 7 do GPT: desconto 0→5 autorizado, resgate, todos os itens
+    // cancelados (o desconto cai a zero e o cashback volta), itens novos. Um PATCH com
+    // desconto 5 sem autorização nova não pode reaproveitar a autorização antiga.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [order] = await cashbackOrders(1, 72);
+    login(CASHIER_PIN);
+    ok(st().applyDiscount(order!.id, 5, MANAGER));
+    const phone = '5553988119072';
+    const c = cashbackCustomer(phone, [{ amount: 200, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 200, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 200, remaining_amount: 200 }],
+    });
+    ok(st().redeemCashback(order!.id, phone));
+    await expectSynced('desconto 0→5 e resgate');
+    for (const item of st().orderItems.filter((i) => i.order_id === order!.id && i.status !== 'CANCELED')) ok(st().cancelOrderItem(item.id, MANAGER));
+    const cancelEvents = [...st().outbox];
+    await expectSynced('todos os itens cancelados');
+    expect(sql(`SELECT discount_amount || ' ' || (SELECT count(*) FROM cashback_ledger WHERE order_id = '${order!.id}' AND entry_type = 'REFUND') FROM orders WHERE id = '${order!.id}'`)).toMatch(/^0\.00 [1-9]/);
+    const p = st().products.find((x) => x.id === productId)!;
+    ok(st().addToTray({ order_id: order!.id, product_id: p.id, half_product_ids: [], quantity: 2, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    ok(st().dispatchTray(order!.id));
+    await expectSynced('itens novos');
+    const snapshot = () => sql(`SELECT o.discount_amount || ' ' || o.total_amount || ' '
+      || (SELECT count(*) FROM audit_logs a WHERE a.order_id = o.id AND a.action_type IN ('DISCOUNT_APPLIED', 'CASHBACK_REFUNDED', 'CASHBACK_REDEEMED')) || ' '
+      || (SELECT count(*) FROM cashback_ledger l WHERE l.order_id = o.id) || ' '
+      || (SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}') FROM orders o WHERE o.id = '${order!.id}'`);
+    const before = snapshot();
+    expect(before.split(' ')[0]).toBe('0.00');
+    const reuse = await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5 });
+    expect(reuse.status).toBe(400);
+    expect(reuse.body).toContain('TCHEFOOD_');
+    expect(snapshot()).toBe(before);
+    // Nem quem tenta zerar o marcador da autorização já usada passa.
+    expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 5, discount_auth_seq: 0 })).status).toBe(400);
+    expect(snapshot()).toBe(before);
+    // Autorização nova com PIN: a regra da loja não combina desconto manual com cashback.
+    const fresh = st().applyDiscount(order!.id, 5, MANAGER);
+    expect(fresh.ok).toBe(false);
+    expect(!fresh.ok && fresh.error).toContain('já usou cashback');
+    // O reenvio do cancelamento (internet caiu antes da confirmação) não repete o estorno.
+    const cloud = st().cloud!;
+    const resend = await flushOutbox(cancelEvents, { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000);
+    expect(resend.rejected).toEqual([]);
+    expect(snapshot()).toBe(before);
+    closeCashbackOrders([order!.id]);
+    setCashbackClock(null);
+  });
+
+  it('resgate refeito com o desconto da nuvem passa a usar o estorno de outra conta: espera o cancelamento dela', async () => {
+    // P1-02 da rodada 6 do GPT: na terça o resgate de B sai de um crédito que vence na terça à
+    // noite. Na quarta, ao adotar o desconto da nuvem, o crédito venceu e o resgate refeito sai
+    // do estorno local da conta A, cujo cancelamento é recusado: B espera A.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-10T20:00:00-03:00') });
+    setCashbackClock('2026-11-10T20:00:00-03:00');
+    const [a, b] = await cashbackOrders(2, 64);
+    login(CASHIER_PIN);
+    ok(st().applyDiscount(b!.id, 5, MANAGER));
+    await expectSynced('desconto de R$ 5 em B');
+    const phone = '5553988119064';
+    const c = cashbackCustomer(phone, [{ amount: 10, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 10, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 10, remaining_amount: 10 }],
+    });
+    expect(ok(st().redeemCashback(a!.id, phone)).amount).toBe(10);
+    await expectSynced('resgate de R$ 10 em A');
+    // Crédito novo de R$ 60 que vence na terça às 23h.
+    const earnE = crypto.randomUUID();
+    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (id, tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         VALUES ('${earnE}', '${TENANT}', '${c.id}', 'EARN', 60, 60, '2026-11-01', '2026-11-10T23:00:00-03:00');`);
+    const cloudE = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${earnE}'`));
+    useTcheStore.setState({ cashbackLedger: [...st().cashbackLedger, { ...cloudE, amount: 60, remaining_amount: 60 }] });
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active AND pin_code = '${MANAGER_PIN}'`);
+    sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+         VALUES ('${TENANT}', '${b!.id}', '${manager}', '${manager}', 'DISCOUNT_APPLIED', -2, 'Outro aparelho', '{"discount_before": 5, "discount_after": 7}');
+         UPDATE orders SET discount_amount = 7 WHERE id = '${b!.id}';
+         UPDATE staff_users SET pin_code = '8462' WHERE id = '${manager}';`);
+    // Sem internet: cancelamento em A (estorno local de R$ 10, até 31/12) e resgate em B só do crédito de terça.
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === a!.id && i.status !== 'CANCELED')!.id, MANAGER));
+    const refundA = st().cashbackLedger.find((e) => e.order_id === a!.id && e.entry_type === 'REFUND')!;
+    expect(refundA.amount).toBe(10);
+    ok(st().startCheckout(b!.id));
+    const first = ok(st().redeemCashback(b!.id, phone)).amount;
+    const redeemB = () => st().outbox.find((e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.order_id === b!.id)!;
+    expect(redeemB().payload.redeem_sources).toEqual([{ source_id: earnE, amount: first }]);
+    expect(redeemB().depends_on_event_ids).toBeUndefined();
+    // Quarta: o crédito de terça venceu.
+    vi.setSystemTime(new Date('2026-11-11T20:00:00-03:00'));
+    setCashbackClock('2026-11-11T20:00:00-03:00');
+    const rejected = await sync();
+    expect(rejected.map((r) => r.message).sort()).toEqual([
+      'O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).',
+      expect.stringContaining('na nuvem é R$ 7.00'),
+    ].sort());
+    const conflict = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === b!.id)!;
+    expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
+    // O resgate refeito sai do estorno de A e espera o evento que o grava no banco.
+    expect(redeemB().payload.amount).toBe(10);
+    expect(redeemB().payload.redeem_sources).toEqual([{ source_id: refundA.id, amount: 10 }]);
+    expect(redeemB().depends_on_event_ids).toEqual([refundA.source_event_id]);
+    const cloud = st().cloud!;
+    const round = await flushOutbox(st().outbox, { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token },
+      postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }), 10_000, st().syncRejected.map((r) => r.event));
+    st().ackSyncedEvents(round.sent);
+    expect(round.rejected).toEqual([]);
+    expect(round.sent).not.toContain(redeemB().id);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${b!.id}'`)).toBe('0');
+    // O PIN volta a conferir e o cancelamento de A é reenviado: A e depois B sobem.
+    sql(`UPDATE staff_users SET pin_code = '${MANAGER_PIN}' WHERE id = '${manager}';`);
+    st().retryRejectedSync();
+    await expectSynced('cancelamento de A e resgate refeito de B');
+    expect(sql(`SELECT amount || ' ' || ((redeem_sources->0->>'source_id') = (SELECT id::text FROM cashback_ledger WHERE order_id = '${a!.id}' AND entry_type = 'REFUND')) FROM cashback_ledger WHERE order_id = '${b!.id}' AND entry_type = 'REDEEM'`)).toBe('10.00 true');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('0.00');
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(0);
+    sql(`SET session_replication_role = replica; DELETE FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED' AND order_id = '${a!.id}';`);
+    closeCashbackOrders([a!.id, b!.id]);
+    setCashbackClock(null);
+  });
+
+  it('estorno de outra conta já aceito pela nuvem: o resgate sobe mesmo com outra operação daquela conta recusada', async () => {
+    // P2-01 da rodada 6 do GPT: o resgate de B só espera o evento que grava o estorno de A.
+    // Depois que ele subiu, uma operação recusada e independente em A não segura B.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [a, b] = await cashbackOrders(2, 66);
+    const phone = '5553988119066';
+    const c = cashbackCustomer(phone, [{ amount: 10, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 10, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 10, remaining_amount: 10 }],
+    });
+    expect(ok(st().redeemCashback(a!.id, phone)).amount).toBe(10);
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === a!.id && i.status !== 'CANCELED')!.id, MANAGER));
+    await expectSynced('resgate e cancelamento de A');
+    expect(sql(`SELECT sum(amount) FROM cashback_ledger WHERE order_id = '${a!.id}' AND entry_type = 'REFUND'`)).toBe('10.00');
+    // Outra operação de A, recusada (o PIN do gerente mudou em outro aparelho).
+    const manager = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'MANAGER' AND active AND pin_code = '${MANAGER_PIN}'`);
+    sql(`UPDATE staff_users SET pin_code = '8462' WHERE id = '${manager}';`);
+    ok(st().removeServiceFee(a!.id, MANAGER));
+    // B resgata do estorno já gravado no banco: não espera nada de A.
+    const amount = ok(st().redeemCashback(b!.id, phone)).amount;
+    expect(amount).toBe(10);
+    const redeemB = st().outbox.find((e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.order_id === b!.id)!;
+    expect(redeemB.depends_on_event_ids).toBeUndefined();
+    const rejected = await sync();
+    expect(rejected.map((r) => r.message)).toEqual(['O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).']);
+    expect(st().outbox.some((e) => e.id === redeemB.id)).toBe(false);
+    expect(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${b!.id}' AND entry_type = 'REDEEM'`)).toBe('10.00');
+    expect(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`)).toBe('0.00');
+    // Só a operação recusada de A (e o que depende dela) fica para o gerente.
+    expect(st().syncRejected.every((r) => r.event.row_id === a!.id || r.event.payload.order_id === a!.id)).toBe(true);
+    sql(`UPDATE staff_users SET pin_code = '${MANAGER_PIN}' WHERE id = '${manager}';
+         SET session_replication_role = replica; DELETE FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED' AND order_id = '${a!.id}';`);
+    useTcheStore.setState({ outbox: st().outbox.filter((e) => e.row_id !== a!.id && e.payload.order_id !== a!.id), syncRejected: st().syncRejected.filter((r) => r.event.row_id !== a!.id && r.event.payload.order_id !== a!.id) });
+    closeCashbackOrders([a!.id, b!.id]);
+    setCashbackClock(null);
+  });
+
+  it('cashback recusado pela nuvem: a conta não é cobrada nem encerrada até desfazer o cashback', async () => {
+    // P0-01 da rodada 7 do GPT: aparelho na quinta 23h50, servidor já na sexta 00h10. Conta de
+    // R$ 100 sem os 10%, resgate de R$ 50 sem internet; a nuvem recusa o resgate (sexta).
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T23:50:00-03:00') });
+    setCashbackClock('2026-11-13T00:10:00-03:00');
+    login(OWNER_PIN);
+    const product = (code: string, name: string, price: number) => ok(st().saveProduct({
+      category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    const costela = product('471', 'Costela', 80);
+    const salada = product('472', 'Salada', 20);
+    ok(st().saveTable({ number: 69, label: 'Mesa 69', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('produtos e mesa');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 69)!.id, 1, null));
+    for (const p of [costela, salada]) {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    }
+    ok(st().dispatchTray(order.id));
+    ok(st().removeServiceFee(order.id, MANAGER));
+    await expectSynced('conta de R$ 100');
+    const phone = '5553988119067';
+    const c = cashbackCustomer(phone, [{ amount: 100, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 100, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 100, remaining_amount: 100 }],
+    });
+    expect(ok(st().redeemCashback(order.id, phone)).amount).toBe(50);
+    expect(st().orders.find((o) => o.id === order.id)!.remaining_balance).toBe(50);
+    const rejected = await sync();
+    expect(rejected).toHaveLength(1);
+    const refused = st().syncRejected.find((r) => r.event.table === 'cashback_ledger')!;
+    expect(refused.status).toBe(400);
+    expect(refused.message).toContain('terça a quinta');
+    // Nenhuma cobrança pelo valor com o cashback recusado.
+    const blocked = 'A nuvem recusou o cashback desta conta';
+    const charges = st().pendingCharges.length;
+    const payments = st().payments.length;
+    const tryCash = () => st().registerPayment({
+      orderId: order.id, amount: 50, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
+      acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null,
+      idempotency_key: `k-${Math.random()}`, item_ids: [],
+    });
+    for (const r of [st().startCheckout(order.id), tryCash(), st().beginTerminalCharge(order.id, `req-${Math.random()}`, 50)]) {
+      expect(r.ok).toBe(false);
+      expect(!r.ok && r.error).toContain(blocked);
+    }
+    expect(st().pendingCharges.length).toBe(charges);
+    expect(st().payments.length).toBe(payments);
+    // Cancelar a costela deixa a conta zerada pelo cashback (bruto 20, estorno local de 30): não encerra.
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === order.id && i.product_id === costela.id)!.id, MANAGER));
+    expect(st().orders.find((o) => o.id === order.id)!.remaining_balance).toBe(0);
+    const zero = st().closeZeroOrder(order.id);
+    expect(!zero.ok && zero.error).toContain(blocked);
+    expect(st().orders.find((o) => o.id === order.id)!.status).not.toBe('CLOSED');
+    // Conciliação: desfazer o cashback. Conta sem desconto (R$ 20 a cobrar), crédito de volta,
+    // sem estorno nem resgate aqui, e o registro do resgate fica sem valor, marcado como recusado.
+    expect(ok(st().undoRejectedCashbackRedeem(refused.event.id))).toBe(50);
+    const local = () => st().orders.find((o) => o.id === order.id)!;
+    expect([local().discount_amount, local().total_amount, local().remaining_balance]).toEqual([0, 20, 20]);
+    expect(st().cashbackLedger.filter((e) => e.order_id === order.id)).toEqual([]);
+    expect(st().cashbackLedger.find((e) => e.id === c.earns[0])!.remaining_amount).toBe(100);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(100);
+    const redeemLog = st().auditLogs.find((l) => l.order_id === order.id && l.action_type === 'CASHBACK_REDEEMED')!;
+    expect([redeemLog.amount_impact, typeof redeemLog.metadata?.rejected_by_cloud]).toEqual([0, 'string']);
+    expect(st().auditLogs.filter((l) => l.order_id === order.id && l.action_type === 'CASHBACK_REFUNDED')).toEqual([]);
+    expect(st().syncRejected.some((r) => r.event.id === refused.event.id)).toBe(false);
+    // A fila sobe sem recusa, e nuvem e aparelho ficam com a mesma conta, em centavos.
+    await expectSynced('conta sem o cashback recusado');
+    const cents = (v: string | number) => Math.round(Number(v) * 100);
+    const cloudOrder = sql(`SELECT discount_amount || ' ' || total_amount || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`).split(' ').map(cents);
+    expect(cloudOrder).toEqual([local().discount_amount, local().total_amount, local().remaining_balance].map(cents));
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}'`)).toBe('0');
+    expect(cents(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`))).toBe(cents(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance));
+    // Cobrança pelo valor que a nuvem reconhece: R$ 20, e a conta fecha nos dois lados.
+    ok(st().startCheckout(order.id));
+    payCash(order.id);
+    await expectSynced('pagamento sem o cashback');
+    expect(sql(`SELECT status || ' ' || paid_amount FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 20.00');
+    setCashbackClock(null);
+  });
+
+  it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const [a, b, a1, a2] = await cashbackOrders(4, 21);
+    for (const o of [a, b, a1, a2]) expect(o!.cap).toBeGreaterThanOrEqual(5);
+
+    // P0-03 do GPT: a conta A da versão anterior baixou R$ 5 (todo o crédito) e caiu antes do REDEEM.
+    const c = cashbackCustomer('5553988110002', [{ amount: 5, expires: '2026-12-31' }]);
+    const auditA = legacyAudit(a!.id, c.id, 5);
+    debit(c.earns[0]!, 5);
+    // Outra conta (B) com a marca da versão anterior e sem prova: a baixa de A não vale para ela.
+    const stolen = await cashbackRpc(b!.id, c.id, 5, { p_legacy_predebited: true });
+    expect(stolen.status).toBe(400);
+    expect(stolen.body).toContain('sem saldo');
+    // Mesmo com o registro de A como prova, mas na conta B: não confere.
+    expect((await cashbackRpc(b!.id, c.id, 5, { p_legacy_predebited: true, p_audit_id: auditA })).status).toBe(400);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${b!.id}'`)).toBe('0');
+    // A sem a marca: segue a regra normal e não tem saldo.
+    expect((await cashbackRpc(a!.id, c.id, 5, { p_audit_id: auditA })).body).toContain('sem saldo');
+    // Crédito novo do cliente: a recuperação de A não pode consumi-lo.
+    const earn2 = crypto.randomUUID();
+    sql(`SET session_replication_role = replica; INSERT INTO cashback_ledger (id, tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         VALUES ('${earn2}', '${TENANT}', '${c.id}', 'EARN', 5, 5, '2026-11-01', '2027-01-31');`);
+    // A com a marca e a prova: o resgate entra com a baixa que já tinha saído.
+    const recovered = await cashbackRpc(a!.id, c.id, 5, { p_legacy_predebited: true, p_audit_id: auditA });
+    expect(recovered.status, recovered.body).toBe(200);
+    expect(Number(recovered.body)).toBe(5);
+    expect(remainingOf(earn2)).toBe(5);
+    expect(remainingOf(c.earns[0]!)).toBe(0);
+
+    // Duas contas da versão anterior com baixa parcial (créditos com validades diferentes):
+    // R$ 5 baixados para resgates de R$ 4 e R$ 3. Não dá para saber de quem é: recusa as duas.
+    const d = cashbackCustomer('5553988110004', [{ amount: 10, expires: '2026-11-20' }, { amount: 10, expires: '2026-12-31' }]);
+    const audit1 = legacyAudit(a1!.id, d.id, 4);
+    const audit2 = legacyAudit(a2!.id, d.id, 3);
+    debit(d.earns[0]!, 5);
+    for (const [o, audit, v] of [[a1!, audit1, 4], [a2!, audit2, 3]] as const) {
+      const r = await cashbackRpc(o.id, d.id, v, { p_legacy_predebited: true, p_audit_id: audit });
+      expect(r.status).toBe(400);
+      expect(r.body).toContain('ambíguo');
+    }
+    expect(remainingOf(d.earns[0]!) + remainingOf(d.earns[1]!)).toBe(15);
+    // O resto das baixas sobe (R$ 7, a soma dos dois): sem ambiguidade, cada um entra com o seu valor e nada é consumido de novo.
+    debit(d.earns[0]!, 2);
+    expect((await cashbackRpc(a1!.id, d.id, 4, { p_legacy_predebited: true, p_audit_id: audit1 })).status).toBe(200);
+    expect((await cashbackRpc(a2!.id, d.id, 3, { p_legacy_predebited: true, p_audit_id: audit2 })).status).toBe(200);
+    expect(remainingOf(d.earns[0]!) + remainingOf(d.earns[1]!)).toBe(13);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE entry_type = 'REDEEM' AND order_id IN ('${a!.id}', '${a1!.id}', '${a2!.id}')`)).toBe('3');
+
+    // P2-01 da rodada 3: o registro antigo da conta B é do cliente C. Outro cliente (E, com
+    // crédito) não pode reaproveitá-lo, com ou sem a marca: recusado e nada gravado.
+    const auditB = legacyAudit(b!.id, c.id, 5);
+    const e = cashbackCustomer('5553988110005', [{ amount: 5, expires: '2026-12-31' }]);
+    for (const legacy of [false, true]) {
+      const r = await cashbackRpc(b!.id, e.id, 5, { p_audit_id: auditB, p_legacy_predebited: legacy });
+      expect(r.status, r.body).toBe(400);
+      expect(r.body).toContain('não confere');
+    }
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${b!.id}'`)).toBe('0');
+    expect(remainingOf(e.earns[0]!)).toBe(5);
+    expect(sql(`SELECT discount_amount FROM orders WHERE id = '${b!.id}'`)).toBe('0.00');
+    closeCashbackOrders([a!.id, b!.id, a1!.id, a2!.id]);
+    setCashbackClock(null);
   });
 
   it('balcão (Ficha Rápida) com fichas e retirada', async () => {
