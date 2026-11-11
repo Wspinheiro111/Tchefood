@@ -9,7 +9,8 @@
 #
 # Faz, nessa ordem: confere Java e Node, baixa o SDK Android e o Gradle se faltarem
 # (em ~/.cache/tchefood-android, nunca dentro do projeto), roda `npm ci && npm run build`,
-# compila e deixa os APKs em ./apk/. O APK é debug: instala direto na maquininha ou no
+# compila e deixa os APKs em ./apk/ (só os desta execução: os antigos saem, e se o build falhar a
+# pasta fica como estava). O APK é debug: instala direto na maquininha ou no
 # tablet (fontes desconhecidas ou `adb install`). Release assinado e loja ficam fora daqui.
 set -euo pipefail
 
@@ -20,7 +21,7 @@ BUILD_TOOLS="34.0.0"
 CACHE="${TCHEFOOD_ANDROID_CACHE:-$HOME/.cache/tchefood-android}"
 
 uso() {
-  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 falha() {
@@ -46,6 +47,8 @@ java_major="$(java -version 2>&1 | sed -n 's/.*version "\([0-9]*\).*/\1/p' | hea
   || falha "precisa de Java 17 a 21; achei: ${java_major:-desconhecido}"
 
 command -v node >/dev/null 2>&1 || falha "Node não encontrado (precisa do Node 20 para gerar o sistema web)."
+node_major="$(node -v 2>/dev/null | sed -n 's/^v\([0-9]*\).*/\1/p')"
+{ [ -n "$node_major" ] && [ "$node_major" -ge 20 ]; } || falha "precisa do Node 20 ou mais; achei: ${node_major:-desconhecido}"
 command -v npm >/dev/null 2>&1 || falha "npm não encontrado."
 command -v curl >/dev/null 2>&1 || falha "curl não encontrado."
 command -v unzip >/dev/null 2>&1 || falha "unzip não encontrado."
@@ -125,26 +128,41 @@ fi
 
 # --- APK -------------------------------------------------------------------------------------
 case "$variante" in
-  pagbank) tarefas=(assemblePagbankDebug) ;;
-  tablet) tarefas=(assembleTabletDebug) ;;
-  all) tarefas=(assemblePagbankDebug assembleTabletDebug) ;;
+  pagbank) variantes=(pagbank); tarefas=(assemblePagbankDebug) ;;
+  tablet) variantes=(tablet); tarefas=(assembleTabletDebug) ;;
+  all) variantes=(pagbank tablet); tarefas=(assemblePagbankDebug assembleTabletDebug) ;;
 esac
+
+# Apaga a saída antiga das variantes pedidas: um APK de um build anterior nunca pode passar por novo.
+for v in "${variantes[@]}"; do
+  rm -rf "android/app/build/outputs/apk/$v/debug"
+done
 
 echo "-> compilando: ${tarefas[*]}"
 "$gradle_cmd" -p android --no-daemon ${gradle_props[@]+"${gradle_props[@]}"} "${tarefas[@]}"
 
-mkdir -p apk
-encontrados=0
-for v in pagbank tablet; do
-  for apk in android/app/build/outputs/apk/"$v"/debug/*.apk; do
-    [ -f "$apk" ] || continue
-    case "$variante" in all|"$v") ;; *) continue ;; esac
-    cp "$apk" "apk/tchefood-$v-debug.apk"
-    echo "OK: apk/tchefood-$v-debug.apk"
-    encontrados=$((encontrados + 1))
+# Cada variante pedida precisa ter exatamente um APK, não vazio, antes de qualquer coisa ir para apk/.
+# Os arquivos vão primeiro para uma pasta temporária (no mesmo disco, para o mv ser instantâneo).
+staging="$(mktemp -d "$raiz/.apk-staging.XXXXXX")"
+trap 'rm -rf "$staging"' EXIT
+for v in "${variantes[@]}"; do
+  saida="android/app/build/outputs/apk/$v/debug"
+  achados=()
+  for f in "$saida"/*.apk; do
+    [ -f "$f" ] && achados+=("$f")
   done
+  [ "${#achados[@]}" -eq 1 ] || falha "esperava 1 APK da variante $v em $saida e achei ${#achados[@]}; apk/ ficou como estava"
+  [ -s "${achados[0]}" ] || falha "o APK da variante $v está vazio (${achados[0]}); apk/ ficou como estava"
+  cp "${achados[0]}" "$staging/tchefood-$v-debug.apk"
 done
-[ "$encontrados" -gt 0 ] || falha "o Gradle terminou, mas não achei nenhum APK em android/app/build/outputs/apk/"
+
+# Tudo validado: troca o conjunto de apk/ de uma vez e tira os APKs que este build não gerou.
+mkdir -p apk
+rm -f apk/tchefood-*-debug.apk
+for v in "${variantes[@]}"; do
+  mv "$staging/tchefood-$v-debug.apk" "apk/tchefood-$v-debug.apk"
+  echo "OK: apk/tchefood-$v-debug.apk"
+done
 
 echo
 echo "Pronto. No Cloud Shell, baixe com:  cloudshell download apk/tchefood-pagbank-debug.apk"
