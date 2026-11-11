@@ -165,4 +165,7 @@ for v in "${variantes[@]}"; do
 done
 
 echo
-echo "Pronto. No Cloud Shell, baixe com:  cloudshell download apk/tchefood-pagbank-debug.apk"
+echo "Pronto. No Cloud Shell, baixe com:"
+for v in "${variantes[@]}"; do
+  echo "  cloudshell download apk/tchefood-$v-debug.apk"
+done

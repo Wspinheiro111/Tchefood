@@ -170,4 +170,24 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
     rodar(raiz, 'all', { gerar: 'pagbank' });
     expect(readdirSync(raiz).filter((n) => n.startsWith('.apk-staging'))).toEqual([]);
   });
+
+  it('a instrução final de download lista só os APKs da execução', () => {
+    const raiz = criarRepo();
+    const pb = rodar(raiz, 'pagbank', { gerar: 'pagbank' });
+    expect(pb.saida).toContain('cloudshell download apk/tchefood-pagbank-debug.apk');
+    expect(pb.saida).not.toContain('tchefood-tablet-debug.apk');
+    const tb = rodar(raiz, 'tablet', { gerar: 'tablet' });
+    expect(tb.saida).toContain('cloudshell download apk/tchefood-tablet-debug.apk');
+    expect(tb.saida).not.toContain('tchefood-pagbank-debug.apk');
+    const todos = rodar(raiz, 'all', { gerar: 'pagbank tablet' });
+    expect(todos.saida).toContain('cloudshell download apk/tchefood-pagbank-debug.apk');
+    expect(todos.saida).toContain('cloudshell download apk/tchefood-tablet-debug.apk');
+  });
+
+  it('quando o build falha, nenhuma instrução de download aparece', () => {
+    const raiz = criarRepo();
+    const r = rodar(raiz, 'all', { gerar: 'pagbank' });
+    expect(r.codigo).not.toBe(0);
+    expect(r.saida).not.toContain('cloudshell download');
+  });
 });
