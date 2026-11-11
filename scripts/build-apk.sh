@@ -40,6 +40,54 @@ raiz="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$raiz"
 [ -f android/settings.gradle.kts ] || falha "rode a partir do repositório do Tchê Food (não achei android/settings.gradle.kts)"
 
+# --- Trava: uma execução por repositório (a limpeza, o Gradle e a publicação usam as mesmas pastas) ----------
+staging=""
+old_apk=""
+lock="$raiz/.apk-build.lock"
+tenho_lock=0
+
+limpar() {
+  local codigo=$?
+  trap - EXIT
+  # publicação interrompida entre as duas renomeações: devolve o conjunto anterior
+  if [ -n "$old_apk" ] && [ -d "$old_apk" ] && [ ! -e "$raiz/apk" ]; then
+    mv "$old_apk" "$raiz/apk" || echo "AVISO: não consegui restaurar $old_apk em apk/" >&2
+  fi
+  if [ -n "$staging" ]; then rm -rf "$staging"; fi
+  if [ "$tenho_lock" = 1 ]; then rm -rf "$lock"; fi
+  exit "$codigo"
+}
+trap limpar EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+pegar_lock() {
+  local tentativa pid
+  for tentativa in 1 2; do
+    if mkdir "$lock" 2>/dev/null; then
+      echo $$ > "$lock/pid"
+      tenho_lock=1
+      return 0
+    fi
+    pid="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [ -z "$pid" ]; then sleep 1; pid="$(cat "$lock/pid" 2>/dev/null || true)"; fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      falha "outra execução do build-apk.sh está em andamento (pid $pid, trava $lock); nada foi alterado. Espere terminar e rode de novo."
+    fi
+    # trava velha (processo morto): sai de cena por uma renomeação atômica, e só quem conseguiu remove
+    if mv "$lock" "$lock.velha.$$" 2>/dev/null; then rm -rf "$lock.velha.$$"; fi
+  done
+  falha "não consegui a trava $lock"
+}
+pegar_lock
+
+# Sobras de uma execução morta à força (kill -9): devolve o apk/ guardado e apaga a pasta temporária.
+for o in "$raiz"/.apk-old.*; do
+  [ -d "$o" ] || continue
+  if [ ! -e "$raiz/apk" ]; then mv "$o" "$raiz/apk"; else rm -rf "$o"; fi
+done
+rm -rf "$raiz"/.apk-staging.*
+
 # --- Java 17 a 21 (o plugin Android 8.4 exige 17 ou mais; o Gradle 8.7 roda até o 21) ----------
 command -v java >/dev/null 2>&1 || falha "Java não encontrado. Instale o JDK 17 (Cloud Shell já traz)."
 java_major="$(java -version 2>&1 | sed -n 's/.*version "\([0-9]*\).*/\1/p' | head -1)"
@@ -144,7 +192,6 @@ echo "-> compilando: ${tarefas[*]}"
 # Cada variante pedida precisa ter exatamente um APK, não vazio, antes de qualquer coisa ir para apk/.
 # Os arquivos vão primeiro para uma pasta temporária (no mesmo disco, para o mv ser instantâneo).
 staging="$(mktemp -d "$raiz/.apk-staging.XXXXXX")"
-trap 'rm -rf "$staging"' EXIT
 for v in "${variantes[@]}"; do
   saida="android/app/build/outputs/apk/$v/debug"
   achados=()
@@ -156,11 +203,18 @@ for v in "${variantes[@]}"; do
   cp "${achados[0]}" "$staging/tchefood-$v-debug.apk"
 done
 
-# Tudo validado: troca o conjunto de apk/ de uma vez e tira os APKs que este build não gerou.
-mkdir -p apk
-rm -f apk/tchefood-*-debug.apk
+# Tudo validado: troca a pasta apk/ inteira. Nada é apagado antes de o conjunto novo estar pronto ao lado;
+# se a troca falhar (ou o processo for interrompido), o conjunto anterior volta (ver `limpar`).
+chmod 755 "$staging"
+old_apk="$raiz/.apk-old.$$"
+if [ -e "$raiz/apk" ]; then
+  mv "$raiz/apk" "$old_apk" || falha "não consegui guardar o apk/ atual; nada foi alterado"
+fi
+mv "$staging" "$raiz/apk" || falha "não consegui publicar o novo apk/; o conjunto anterior foi mantido"
+staging=""
+rm -rf "$old_apk"
+old_apk=""
 for v in "${variantes[@]}"; do
-  mv "$staging/tchefood-$v-debug.apk" "apk/tchefood-$v-debug.apk"
   echo "OK: apk/tchefood-$v-debug.apk"
 done
 
