@@ -44,25 +44,9 @@
 }
 .animate-nfc { animation: nfc-wave 1.4s ease-out infinite; }
 
-/* Logo oficial com efeito: entra suave e um brilho passa por ela de tempos em tempos. */
-@keyframes brand-in {
-  0% { opacity: 0; transform: translateY(6px) scale(0.96); }
-  100% { opacity: 1; transform: none; }
-}
-@keyframes brand-shine {
-  0%, 70% { background-position: 150% 0; }
-  100% { background-position: -50% 0; }
-}
-.brand-fx { animation: brand-in 0.7s cubic-bezier(0.2, 0.8, 0.2, 1) both; filter: drop-shadow(0 6px 14px rgba(210, 35, 42, 0.18)); }
-.brand-fx-shine {
-  background: linear-gradient(105deg, transparent 35%, rgba(255, 255, 255, 0.75) 50%, transparent 65%) no-repeat;
-  background-size: 250% 100%;
-  animation: brand-shine 4.5s ease-in-out 1s infinite;
-  -webkit-mask-size: contain; mask-size: contain;
-  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
-  -webkit-mask-position: center; mask-position: center;
-}
+/* Logo oficial animada: a parada só reserva o espaço; com movimento reduzido ela aparece e a animada some. */
+.brand-fx-still { visibility: hidden; }
 @media (prefers-reduced-motion: reduce) {
-  .brand-fx, .brand-fx-shine { animation: none; }
-  .brand-fx-shine { background: none; }
+  .brand-fx-still { visibility: visible; }
+  .brand-fx-anim { display: none; }
 }
