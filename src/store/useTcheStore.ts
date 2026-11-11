@@ -1843,13 +1843,17 @@ export const useTcheStore = create<TcheState>()(
           if (!res.ok) return res;
           const order = res.data;
           // A resposta de uma cobrança da maquininha já em andamento continua sendo registrada.
-          const block = input.status === 'APPROVED' && !input.charge_request_id ? chargeBlock(order.id) : null;
+          // "Em andamento" é a trava ativa com o mesmo request_id (fromLockedCharge), não a
+          // simples presença de um charge_request_id: id arbitrário ou de cobrança já encerrada
+          // (trava expirada ou liberada) passa pela mesma recusa e, se a maquininha aprovou,
+          // a tela manda para a conferência pelo comprovante (REGISTER_FAILED).
+          const lock = activeCharge(order.id);
+          const fromLockedCharge = Boolean(lock && input.charge_request_id && lock.request_id === input.charge_request_id);
+          const block = input.status === 'APPROVED' && !fromLockedCharge ? chargeBlock(order.id) : null;
           if (block) return fail(block);
           if (input.status === 'APPROVED' && get().tray.some((t) => t.order_id === order.id)) {
             return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
           }
-          const lock = activeCharge(order.id);
-          const fromLockedCharge = Boolean(lock && input.charge_request_id && lock.request_id === input.charge_request_id);
           if (lock && !fromLockedCharge) return fail(CHARGE_LOCK_ERROR);
           // A maquininha já cobrou: o pagamento pertence a quem iniciou a cobrança,
           // mesmo que a sessão tenha mudado nesse meio-tempo.
