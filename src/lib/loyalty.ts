@@ -81,6 +81,28 @@ export function isCashbackCredit(e: CashbackLedgerEntry): boolean {
   return e.entry_type === 'EARN' || e.entry_type === 'REFUND';
 }
 
+/**
+ * Parte de um resgate que já saiu da conta: devolvida ao cliente (REFUND) ou retida para
+ * conciliação por não ter origem comprovada (HOLD, sem saldo e sem validade).
+ */
+export function isCashbackRefund(e: CashbackLedgerEntry): boolean {
+  return e.entry_type === 'REFUND' || e.entry_type === 'HOLD';
+}
+
+/**
+ * Quanto do cashback volta quando o desconto da conta cai (P0-02 da rodada 8 do GPT; mesma
+ * conta de tchefood_orders_cashback_refund). O desconto é o manual mais o cashback ainda
+ * aplicado; o desconto manual fica (até o novo desconto) e o cashback absorve a queda.
+ * Bruto 100, manual 10, resgate 45 (desconto 55), cancelamento deixa o bruto em 20:
+ * manual 10, cashback 10, volta 35. Tudo em centavos.
+ */
+export function cashbackRefundCents(appliedCents: number, discountBeforeCents: number, discountAfterCents: number): number {
+  const applied = Math.max(appliedCents, 0);
+  const manualBefore = Math.max(discountBeforeCents - applied, 0);
+  const manualAfter = Math.min(manualBefore, Math.max(discountAfterCents, 0));
+  return Math.max(applied - (discountAfterCents - manualAfter), 0);
+}
+
 function isUsableEarn(e: CashbackLedgerEntry, customerId: UUID, at: Date): boolean {
   return (
     e.customer_id === customerId &&
@@ -138,21 +160,22 @@ export function cashbackFifoSources(
   return sources;
 }
 
-/** Uma parte do estorno: valor e a validade do crédito de onde saiu. */
-export interface CashbackRefundPart {
-  refund_of_id: UUID | null;
-  amount: number;
-  valid_from: string;
-  expires_at: string;
-}
+/**
+ * Uma parte do estorno: valor e a validade do crédito de onde saiu. Parte sem origem
+ * comprovada (hold) não tem validade: fica retida para conciliação, fora do saldo.
+ */
+export type CashbackRefundPart =
+  | { refund_of_id: UUID; amount: number; valid_from: string; expires_at: string; hold?: undefined }
+  | { refund_of_id: UUID | null; amount: number; valid_from: null; expires_at: null; hold: true };
 
 /**
  * Como o estorno de um resgate volta ao cliente (decisão do Will, 10/11/2026: o cashback
  * vale 30 dias de quando foi gerado, com ou sem cancelamento). Mesma regra de
  * tchefood_orders_cashback_refund (db/schema_cashback_servidor.sql): cada parte volta com
  * a validade do crédito de onde saiu, primeiro o que vence por último; parte de crédito
- * vencido volta vencida. Resgate sem origem registrada vence com o crédito consumido do
- * cliente que vence por último (sem nenhum, conta do resgate).
+ * vencido volta vencida. Parte sem origem comprovada (resgate da versão anterior com
+ * source_id nulo, ou crédito de origem que não está no extrato) não ganha validade de outro
+ * crédito nem prazo novo (P0-03 da rodada 8 do GPT): sai como hold, para conciliação.
  */
 export function planCashbackRefund(
   ledger: readonly CashbackLedgerEntry[],
@@ -170,7 +193,7 @@ export function planCashbackRefund(
       if (eb === null) return -1;
       return ea > eb ? -1 : 1;
     });
-  const refunds = ledger.filter((e) => e.order_id === redeem.order_id && e.entry_type === 'REFUND');
+  const refunds = ledger.filter((e) => e.order_id === redeem.order_id && isCashbackRefund(e));
   let left = toCents(amount);
   const parts: CashbackRefundPart[] = [];
   for (const { src, credit } of sources) {
@@ -178,20 +201,11 @@ export function planCashbackRefund(
     const back = refunds.filter((r) => (r.refund_of_id ?? null) === src.source_id).reduce((sum, r) => sum + toCents(r.amount), 0);
     const take = Math.min(toCents(src.amount) - back, left);
     if (take <= 0) continue;
-    let validity: { valid_from: string; expires_at: string } | null =
-      credit?.valid_from && credit.expires_at ? { valid_from: credit.valid_from, expires_at: credit.expires_at } : null;
-    if (!validity && src.source_id === null) {
-      const consumed = ledger
-        .filter((e) => e.customer_id === redeem.customer_id && isCashbackCredit(e) && e.amount > e.remaining_amount
-          && e.created_at <= redeem.created_at && e.valid_from && e.expires_at)
-        .sort((a, b) => (a.expires_at! > b.expires_at! ? -1 : 1))[0];
-      validity = consumed ? { valid_from: consumed.valid_from!, expires_at: consumed.expires_at! } : null;
+    if (src.source_id !== null && credit?.valid_from && credit.expires_at) {
+      parts.push({ refund_of_id: src.source_id, amount: fromCents(take), valid_from: credit.valid_from, expires_at: credit.expires_at });
+    } else {
+      parts.push({ refund_of_id: src.source_id, amount: fromCents(take), valid_from: null, expires_at: null, hold: true });
     }
-    validity ??= {
-      valid_from: redeem.created_at,
-      expires_at: new Date(new Date(redeem.created_at).getTime() + CASHBACK_VALIDITY_DAYS * DAY_MS).toISOString(),
-    };
-    parts.push({ refund_of_id: src.source_id, amount: fromCents(take), ...validity });
     left -= take;
   }
   return parts;

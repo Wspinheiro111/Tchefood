@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { planCashbackRefund } from '../lib/loyalty';
+import { cashbackRefundCents, planCashbackRefund } from '../lib/loyalty';
 import { mergeCashback } from '../lib/sync/cloudPull';
 import type { CashbackLedgerEntry } from '../types';
 
@@ -33,11 +33,59 @@ describe('estorno do cashback', () => {
     ]);
   });
 
-  it('resgate sem origem registrada vence com o crédito consumido que vence por último', () => {
-    const legacy = { ...redeem, redeem_sources: null, created_at: '2026-11-05T12:00:00.000Z' };
-    expect(planCashbackRefund([old, fresh, legacy], legacy, 10)).toEqual([
-      { refund_of_id: null, amount: 10, valid_from: fresh.valid_from, expires_at: fresh.expires_at },
+  // P0-03 da rodada 8 do GPT: parte sem origem comprovada não herda a validade de outro
+  // crédito nem ganha prazo novo; fica retida para conciliação (hold, sem validade).
+  it('resgate antigo sem origem: não herda a validade de outro crédito consumido nem ganha 30 dias novos', () => {
+    // A vence 20/11, B vence 31/12 (já usado em outra conta). O resgate antigo veio de A, mas
+    // a baixa chegou sem o vínculo: a parte sem origem não pode voltar com o vencimento de B.
+    const a = entry({ id: 'A', amount: 20, remaining_amount: 0, valid_from: '2026-10-21T03:00:00.000Z', expires_at: '2026-11-20T03:00:00.000Z' });
+    const b = entry({ id: 'B', amount: 20, remaining_amount: 0, valid_from: '2026-12-01T03:00:00.000Z', expires_at: '2026-12-31T03:00:00.000Z' });
+    const legacy = { ...redeem, amount: 20, redeem_sources: [{ source_id: null, amount: 20 }], created_at: '2026-11-05T12:00:00.000Z' };
+    const parts = planCashbackRefund([a, b, legacy], legacy, 20);
+    expect(parts).toEqual([{ refund_of_id: null, amount: 20, valid_from: null, expires_at: null, hold: true }]);
+    // Resgate de antes deste PR (sem redeem_sources): o mesmo.
+    const older = { ...legacy, redeem_sources: null };
+    expect(planCashbackRefund([a, b, older], older, 5)).toEqual([{ refund_of_id: null, amount: 5, valid_from: null, expires_at: null, hold: true }]);
+  });
+
+  it('resgate misto: a parte com origem volta com a validade dela; só a sem origem fica retida', () => {
+    const mixed = { ...redeem, amount: 40, redeem_sources: [{ source_id: null, amount: 15 }, { source_id: 'e2', amount: 25 }] };
+    expect(planCashbackRefund([old, fresh, mixed], mixed, 30)).toEqual([
+      { refund_of_id: 'e2', amount: 25, valid_from: fresh.valid_from, expires_at: fresh.expires_at },
+      { refund_of_id: null, amount: 5, valid_from: null, expires_at: null, hold: true },
     ]);
+    // O que já foi retido não é retido de novo (reenvio): conta como devolvido daquela parte.
+    const held = entry({ id: 'h', order_id: 'o', entry_type: 'HOLD', amount: 5, refund_of_id: null });
+    const back = entry({ id: 'b', order_id: 'o', entry_type: 'REFUND', amount: 25, refund_of_id: 'e2' });
+    expect(planCashbackRefund([old, fresh, mixed, held, back], mixed, 10)).toEqual([
+      { refund_of_id: null, amount: 10, valid_from: null, expires_at: null, hold: true },
+    ]);
+  });
+
+  it('crédito de origem que não está no extrato: retido, sem validade inventada', () => {
+    const orphan = { ...redeem, amount: 10, redeem_sources: [{ source_id: 'sumiu', amount: 10 }] };
+    expect(planCashbackRefund([orphan], orphan, 10)).toEqual([{ refund_of_id: 'sumiu', amount: 10, valid_from: null, expires_at: null, hold: true }]);
+  });
+});
+
+// P0-02 da rodada 8 do GPT: o desconto manual não é tratado como cashback no estorno.
+describe('estorno com desconto manual anterior ao resgate', () => {
+  const c = (v: number) => Math.round(v * 100);
+  it('bruto 100, manual 10, resgate 45, cancelamento deixa o bruto em 20: devolve 35', () => {
+    expect(cashbackRefundCents(c(45), c(55), c(20))).toBe(c(35));
+  });
+  it('sem desconto manual, igual à regra anterior', () => {
+    expect(cashbackRefundCents(c(45), c(45), c(20))).toBe(c(25));
+    expect(cashbackRefundCents(c(45), c(45), c(45))).toBe(0);
+  });
+  it('reenvio (desconto igual) não devolve de novo; queda em duas etapas soma o mesmo que numa só', () => {
+    expect(cashbackRefundCents(c(10), c(20), c(20))).toBe(0);
+    const first = cashbackRefundCents(c(45), c(55), c(40)); // 15
+    const second = cashbackRefundCents(c(45) - first, c(40), c(20)); // 20
+    expect([first, second, first + second]).toEqual([c(15), c(20), c(35)]);
+  });
+  it('bruto abaixo do desconto manual: o manual cai ao bruto e todo o cashback volta', () => {
+    expect(cashbackRefundCents(c(45), c(55), c(5))).toBe(c(45));
   });
 });
 

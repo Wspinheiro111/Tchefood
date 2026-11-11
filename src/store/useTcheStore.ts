@@ -110,6 +110,8 @@ import {
   cashbackFifoSources,
   consumeCashbackFifo,
   planCashbackRefund,
+  cashbackRefundCents,
+  isCashbackRefund,
   isCashbackDay,
   normalizeWhatsapp,
 } from '../lib/loyalty';
@@ -923,10 +925,12 @@ export const useTcheStore = create<TcheState>()(
         const ledger = get().cashbackLedger;
         const redeem = ledger.find((e) => e.order_id === order.id && e.entry_type === 'REDEEM');
         if (!redeem) return { refunds: [], refundLogs: [] };
-        const netRedeemed = toCents(redeem.amount) - ledger
-          .filter((e) => e.order_id === order.id && e.entry_type === 'REFUND')
+        // Cashback ainda aplicado: resgatado − devolvido ou retido. O desconto manual da conta
+        // fica e o cashback absorve a queda do desconto (P0-02 da rodada 8 do GPT).
+        const applied = toCents(redeem.amount) - ledger
+          .filter((e) => e.order_id === order.id && isCashbackRefund(e))
           .reduce((sum, e) => sum + toCents(e.amount), 0);
-        const refundCents = netRedeemed - toCents(discountAfter);
+        const refundCents = cashbackRefundCents(applied, toCents(order.discount_amount), toCents(discountAfter));
         if (refundCents <= 0) return { refunds: [], refundLogs: [] };
         return buildRefundMirror(ledger, redeem, order, order.discount_amount, discountAfter, refundCents, ts, cause);
       };
@@ -938,14 +942,16 @@ export const useTcheStore = create<TcheState>()(
       ): { refunds: CashbackLedgerEntry[]; refundLogs: AuditLog[] } => {
         const userId = cause.performed_by_user_id;
         const feeRemoved = cause.action_type === 'SERVICE_FEE_REMOVED';
+        // Parte sem origem comprovada (P0-03 da rodada 8 do GPT): HOLD, sem saldo nem
+        // validade, para conciliação; não entra no saldo do cliente.
         const refunds: CashbackLedgerEntry[] = planCashbackRefund(ledger, redeem, fromCentsLocal(refundCents)).map((part) => ({
           id: uuid(),
           tenant_id: order.tenant_id,
           customer_id: redeem.customer_id,
           order_id: order.id,
-          entry_type: 'REFUND',
+          entry_type: part.hold ? 'HOLD' : 'REFUND',
           amount: part.amount,
-          remaining_amount: part.amount,
+          remaining_amount: part.hold ? 0 : part.amount,
           base_amount: null,
           pct: null,
           valid_from: part.valid_from,
@@ -959,11 +965,13 @@ export const useTcheStore = create<TcheState>()(
             order_id: order.id,
             performed_by_user_id: userId,
             authorized_by_manager_id: cause.authorized_by_manager_id,
-            action_type: 'CASHBACK_REFUNDED',
+            action_type: refund.entry_type === 'HOLD' ? 'CASHBACK_REFUND_HELD' : 'CASHBACK_REFUNDED',
             amount_impact: refund.amount,
-            reason: feeRemoved
-              ? 'Cashback devolvido ao cliente (retirada dos 10% deixou o desconto abaixo do cashback usado)'
-              : 'Cashback devolvido ao cliente (cancelamento de item deixou o desconto abaixo do cashback usado)',
+            reason: refund.entry_type === 'HOLD'
+              ? 'Cashback a devolver retido para conciliação: o crédito de onde saiu não está comprovado (resgate da versão anterior do aparelho). Não volta ao saldo até o gerente conferir com o cliente.'
+              : feeRemoved
+                ? 'Cashback devolvido ao cliente (retirada dos 10% deixou o desconto abaixo do cashback usado)'
+                : 'Cashback devolvido ao cliente (cancelamento de item deixou o desconto abaixo do cashback usado)',
             metadata: {
               table: tableLabel(order.table_id),
               customer_id: refund.customer_id,
@@ -972,7 +980,8 @@ export const useTcheStore = create<TcheState>()(
               refund_id: refund.id,
               refund_of_id: refund.refund_of_id ?? null,
               expires_at: refund.expires_at,
-              already_expired: new Date(refund.expires_at!) <= new Date(ts),
+              already_expired: refund.expires_at ? new Date(refund.expires_at) <= new Date(ts) : null,
+              ...(refund.entry_type === 'HOLD' ? { hold_id: refund.id, reconciliation: 'PENDING' } : {}),
               discount_before: discountBefore,
               discount_after: discountAfter,
               cause: cause.action_type,
@@ -3919,7 +3928,7 @@ export const useTcheStore = create<TcheState>()(
             );
           const refundGroups = new Map<UUID, CashbackLedgerEntry[]>();
           for (const r of get().cashbackLedger) {
-            if (r.order_id !== orderId || r.entry_type !== 'REFUND' || !r.source_event_id || !queueIds.has(r.source_event_id)) continue;
+            if (r.order_id !== orderId || !isCashbackRefund(r) || !r.source_event_id || !queueIds.has(r.source_event_id)) continue;
             refundGroups.set(r.source_event_id, [...(refundGroups.get(r.source_event_id) ?? []), r]);
           }
           const rebuiltRefundIds = new Set<UUID>();
@@ -3928,7 +3937,7 @@ export const useTcheStore = create<TcheState>()(
             localRedeem && !redeemQueued
               ? toCents(localRedeem.amount) -
                 get().cashbackLedger
-                  .filter((r) => r.order_id === orderId && r.entry_type === 'REFUND' && !(r.source_event_id && refundGroups.has(r.source_event_id)))
+                  .filter((r) => r.order_id === orderId && isCashbackRefund(r) && !(r.source_event_id && refundGroups.has(r.source_event_id)))
                   .reduce((sum, r) => sum + toCents(r.amount), 0)
               : null;
           let lastCause: AuditLog | null = null;
@@ -4026,11 +4035,11 @@ export const useTcheStore = create<TcheState>()(
             if (typeof p.total_amount === 'number') lastTotal = toCents(p.total_amount) + own - cents;
             if (typeof p.remaining_balance === 'number') lastRemaining = toCents(p.remaining_balance) + own - cents;
             if (net !== null) {
-              const refundCents = Math.max(net - cents, 0);
+              const refundCents = cashbackRefundCents(net, before, cents);
               const group = refundGroups.get(e.id) ?? [];
               const oldCents = group.reduce((sum, r) => sum + toCents(r.amount), 0);
-              const oldLogs = get().auditLogs.filter((l) => l.action_type === 'CASHBACK_REFUNDED' && group.some((r) => r.id === l.metadata?.refund_id));
-              if (group.length && refundCents !== oldCents && group.some((r) => toCents(r.remaining_amount) < toCents(r.amount))) {
+              const oldLogs = get().auditLogs.filter((l) => (l.action_type === 'CASHBACK_REFUNDED' || l.action_type === 'CASHBACK_REFUND_HELD') && group.some((r) => r.id === l.metadata?.refund_id));
+              if (group.length && refundCents !== oldCents && group.some((r) => r.entry_type === 'REFUND' && toCents(r.remaining_amount) < toCents(r.amount))) {
                 redeemError = 'O cashback devolvido nesta conta já foi usado em outro resgate neste aparelho, e com o desconto da nuvem a devolução muda de valor. O desconto da nuvem não é adotado: chame o gerente para conferir com o cliente.';
               } else if (group.length && refundCents === oldCents) {
                 // Mesmo valor: o espelho fica como está.
@@ -4052,7 +4061,7 @@ export const useTcheStore = create<TcheState>()(
                   );
                 }
               }
-              if (refundCents > 0) net = cents;
+              net -= refundCents;
             }
             if (e.table === 'orders') lastCause = null;
             return [{ ...e, payload: { ...e.payload, discount_amount: cents / 100 } }];
@@ -4080,7 +4089,7 @@ export const useTcheStore = create<TcheState>()(
                   auditLogs: [
                     ...[...reauthorized].reverse(),
                     ...[...rebuiltLogs].reverse(),
-                    ...s.auditLogs.filter((l) => !(l.action_type === 'CASHBACK_REFUNDED' && rebuiltRefundIds.has(String(l.metadata?.refund_id)))).map((l) => {
+                    ...s.auditLogs.filter((l) => !((l.action_type === 'CASHBACK_REFUNDED' || l.action_type === 'CASHBACK_REFUND_HELD') && rebuiltRefundIds.has(String(l.metadata?.refund_id)))).map((l) => {
                       const fix = redeemFixes.find((f) => f.auditId === l.id);
                       if (!fix) return l;
                       return {
@@ -4129,8 +4138,8 @@ export const useTcheStore = create<TcheState>()(
           if (!Number.isFinite(before)) return fail('O registro do resgate não traz o desconto de antes. Chame o suporte.');
           // Estornos feitos aqui nesta conta (cancelamento, tirar os 10%) saíram deste resgate,
           // que o banco não concedeu: somem junto. Se já foram usados em outro resgate, não dá.
-          const refunds = get().cashbackLedger.filter((e) => e.order_id === orderId && e.entry_type === 'REFUND');
-          if (refunds.some((r) => toCents(r.remaining_amount) < toCents(r.amount))) {
+          const refunds = get().cashbackLedger.filter((e) => e.order_id === orderId && isCashbackRefund(e));
+          if (refunds.some((r) => r.entry_type === 'REFUND' && toCents(r.remaining_amount) < toCents(r.amount))) {
             return fail('O cashback devolvido nesta conta já foi usado em outro resgate neste aparelho. Desfaça aquele resgate primeiro ou chame o gerente para conferir com o cliente.');
           }
           // A conta e as versões dela na fila voltam ao desconto sem o cashback, em ordem, como
@@ -4190,7 +4199,7 @@ export const useTcheStore = create<TcheState>()(
             // O registro do resgate fica no histórico deste aparelho, sem valor e marcado como
             // recusado pela nuvem; os estornos que saíram dele somem com eles.
             auditLogs: s.auditLogs
-              .filter((l) => !(l.action_type === 'CASHBACK_REFUNDED' && refundIds.has(String(l.metadata?.refund_id))))
+              .filter((l) => !((l.action_type === 'CASHBACK_REFUNDED' || l.action_type === 'CASHBACK_REFUND_HELD') && refundIds.has(String(l.metadata?.refund_id))))
               .map((l) =>
                 l.id === redeemLog!.id
                   ? {

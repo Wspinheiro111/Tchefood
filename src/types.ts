@@ -428,6 +428,7 @@ export type AuditActionType =
   | 'KEG_CHANGED'
   | 'CASHBACK_REDEEMED'
   | 'CASHBACK_REFUNDED'
+  | 'CASHBACK_REFUND_HELD'
   | 'KIOSK_EXIT'
   | 'CHARGE_CONFIRMED_MANUALLY'
   // Etapa 0 — cadastros
@@ -546,7 +547,8 @@ export interface LoyaltyCustomer {
 }
 
 /** REFUND: cashback devolvido ao cliente quando um cancelamento deixa o desconto abaixo do resgate (crédito como o EARN). */
-export type CashbackEntryType = 'EARN' | 'REDEEM' | 'EXPIRE' | 'REFUND';
+/** HOLD: parte de um resgate que saiu da conta sem origem comprovada, retida para conciliação (sem saldo nem validade). */
+export type CashbackEntryType = 'EARN' | 'REDEEM' | 'EXPIRE' | 'REFUND' | 'HOLD';
 
 export interface CashbackLedgerEntry {
   id: UUID;

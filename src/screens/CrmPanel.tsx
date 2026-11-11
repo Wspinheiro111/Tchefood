@@ -16,7 +16,7 @@ import {
 import { Badge } from '../components/ui';
 import { WinbackPanel } from './WinbackPanel';
 
-const ENTRY_LABEL = { EARN: 'Crédito', REDEEM: 'Resgate', EXPIRE: 'Vencido', REFUND: 'Devolvido' } as const;
+const ENTRY_LABEL = { EARN: 'Crédito', REDEEM: 'Resgate', EXPIRE: 'Vencido', REFUND: 'Devolvido', HOLD: 'A devolver (retido para conciliação)' } as const;
 
 /** Retaguarda · CRM: clientes do programa, saldo de cashback e extrato. */
 export function CrmPanel() {
@@ -84,7 +84,7 @@ export function CrmPanel() {
                     <tr key={e.id} className="border-t border-slate-200">
                       <td className="py-1">{new Date(e.created_at).toLocaleDateString('pt-BR')}</td>
                       <td>{ENTRY_LABEL[e.entry_type]}</td>
-                      <td className={`text-right tabular-nums ${isCashbackCredit(e) ? 'text-verde' : 'text-rose-600'}`}>{isCashbackCredit(e) ? '+' : '−'}{formatBRL(e.amount)}</td>
+                      <td className={`text-right tabular-nums ${e.entry_type === 'HOLD' ? 'text-amber-700' : isCashbackCredit(e) ? 'text-verde' : 'text-rose-600'}`}>{e.entry_type === 'HOLD' ? '' : isCashbackCredit(e) ? '+' : '−'}{formatBRL(e.amount)}</td>
                       <td className="text-right tabular-nums">{isCashbackCredit(e) ? formatBRL(e.remaining_amount) : ''}</td>
                       <td className="text-right">{e.expires_at ? new Date(e.expires_at).toLocaleDateString('pt-BR') : ''}</td>
                     </tr>

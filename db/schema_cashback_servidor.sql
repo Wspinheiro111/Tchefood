@@ -269,7 +269,7 @@ BEGIN
     IF NEW.action_type = 'CASHBACK_REDEEMED' AND current_user IN ('anon', 'authenticated') THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o registro do resgate só é gravado por tchefood_register_cashback_redeem.';
     END IF;
-    IF NEW.action_type = 'CASHBACK_REFUNDED' AND current_user IN ('anon', 'authenticated') THEN
+    IF NEW.action_type IN ('CASHBACK_REFUNDED', 'CASHBACK_REFUND_HELD') AND current_user IN ('anon', 'authenticated') THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o estorno do cashback só é gravado pelo banco, no cancelamento do item.';
     END IF;
     RETURN NEW;
@@ -511,7 +511,7 @@ BEGIN
        AND a.server_seq > OLD.discount_auth_seq
        AND a.server_seq > COALESCE((SELECT max(c.server_seq) FROM audit_logs c
                                      WHERE c.tenant_id = NEW.tenant_id AND c.order_id = NEW.id
-                                       AND c.action_type IN ('CASHBACK_REDEEMED', 'CASHBACK_REFUNDED')), 0),
+                                       AND c.action_type IN ('CASHBACK_REDEEMED', 'CASHBACK_REFUNDED', 'CASHBACK_REFUND_HELD')), 0),
            a.server_seq
       INTO v_ok, v_auth_seq
       FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id AND m.tenant_id = a.tenant_id
@@ -528,7 +528,7 @@ BEGIN
         -- (gravado pelo aparelho antigo, sem server_verified) e com o REDEEM, e só vale se a
         -- conta nunca teve estorno.
         IF v_redeemed > 0 AND NOT COALESCE(v_ok, false) AND NOT (
-            NOT EXISTS (SELECT 1 FROM cashback_ledger r WHERE r.tenant_id = NEW.tenant_id AND r.order_id = NEW.id AND r.entry_type = 'REFUND')
+            NOT EXISTS (SELECT 1 FROM cashback_ledger r WHERE r.tenant_id = NEW.tenant_id AND r.order_id = NEW.id AND r.entry_type IN ('REFUND', 'HOLD'))
             AND EXISTS (SELECT 1 FROM cashback_ledger c JOIN audit_logs a ON a.tenant_id = c.tenant_id AND a.order_id = c.order_id
                          WHERE c.tenant_id = NEW.tenant_id AND c.order_id = NEW.id AND c.entry_type = 'REDEEM'
                            AND c.amount = NEW.discount_amount - OLD.discount_amount
@@ -578,12 +578,20 @@ CREATE TRIGGER trg_orders_00_keep_discount BEFORE UPDATE OF discount_amount, dis
 -- valid_from e o expires_at do crédito de onde saiu (redeem_sources do resgate). Parte de
 -- crédito já vencido volta vencida (fica no extrato, não entra no saldo). Volta primeiro
 -- o crédito que vence por último (desfaz o resgate na ordem inversa da baixa).
--- Resgate sem origem registrada (parte já baixada por aparelho da versão anterior): vence
--- com o crédito consumido desse cliente que vence por último; sem nenhum, nada é
--- inventado e o prazo conta do resgate.
--- Idempotente: o total é sempre (resgatado − já estornado) − desconto atual, calculado do
--- extrato com a conta travada; o reenvio do mesmo cancelamento não muda o desconto e não
--- estorna de novo. Gatilho (não função chamável): o aparelho não consegue pedir estorno
+-- Parte sem origem comprovada (P0-03 da rodada 8 do GPT: parte já baixada por aparelho da
+-- versão anterior, source_id NULL, ou crédito de origem não encontrado nesta loja): não
+-- volta ao saldo, nem com a validade de outro crédito nem com prazo novo. Fica retida para
+-- conciliação: lançamento HOLD (sem saldo e sem validade, fora do saldo do cliente)
+-- e audit_log CASHBACK_REFUND_HELD com o valor e o motivo. O gerente confere com o cliente.
+-- Desconto manual (P0-02 da rodada 8 do GPT): o desconto da conta é o manual mais o
+-- cashback ainda aplicado (resgatado − já devolvido ou retido). Quando o desconto cai, o
+-- desconto manual fica (até o novo desconto) e o cashback é que absorve a queda: devolve
+-- (cashback aplicado antes) − (novo desconto − manual que fica). Ex.: bruto 100, manual
+-- 10, resgate 45 (desconto 55); cancelamento deixa o bruto em 20: manual 10, cashback 10,
+-- devolve 35.
+-- Idempotente: o valor sai do extrato e do desconto antes/depois, com a conta travada; o
+-- reenvio do mesmo cancelamento não muda o desconto (o gatilho só roda quando o desconto
+-- cai) e não estorna de novo. Gatilho (não função chamável): o aparelho não consegue pedir estorno
 -- com um valor seu.
 CREATE OR REPLACE FUNCTION tchefood_orders_cashback_refund()
 RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
@@ -603,14 +611,22 @@ DECLARE
     v_cause_audit UUID;
     v_item UUID;
     v_now TIMESTAMPTZ := NOW();
+    v_applied NUMERIC(10,2);
+    v_manual_before NUMERIC(10,2);
+    v_manual_after NUMERIC(10,2);
+    v_hold BOOLEAN;
     s RECORD;
 BEGIN
     SELECT * INTO v_redeem FROM cashback_ledger
      WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'REDEEM';
     IF NOT FOUND THEN RETURN NULL; END IF;
     SELECT COALESCE(SUM(amount), 0) INTO v_refunded FROM cashback_ledger
-     WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'REFUND';
-    v_amount := v_redeem.amount - v_refunded - NEW.discount_amount;
+     WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type IN ('REFUND', 'HOLD');
+    -- Cashback ainda aplicado na conta e o desconto manual que fica (P0-02 da rodada 8).
+    v_applied := GREATEST(v_redeem.amount - v_refunded, 0);
+    v_manual_before := GREATEST(OLD.discount_amount - v_applied, 0);
+    v_manual_after := LEAST(v_manual_before, GREATEST(NEW.discount_amount, 0));
+    v_amount := v_applied - (NEW.discount_amount - v_manual_after);
     IF v_amount <= 0 THEN RETURN NULL; END IF;
     -- O que provocou o estorno (P2-01 da rodada 5 do GPT), com o operador e o gerente dele:
     --  - retirada dos 10% nesta mesma atualização: o SERVICE_FEE_REMOVED mais recente da
@@ -654,24 +670,40 @@ BEGIN
     LOOP
         EXIT WHEN v_left <= 0;
         SELECT COALESCE(SUM(amount), 0) INTO v_back FROM cashback_ledger
-         WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type = 'REFUND'
+         WHERE tenant_id = NEW.tenant_id AND order_id = NEW.id AND entry_type IN ('REFUND', 'HOLD')
            AND refund_of_id IS NOT DISTINCT FROM s.source_id;
         v_take := LEAST(s.taken - v_back, v_left);
         CONTINUE WHEN v_take <= 0;
-        IF s.source_id IS NOT NULL THEN
-            v_from := s.valid_from;
-            v_until := s.expires_at;
-        ELSE
-            SELECT l.valid_from, l.expires_at INTO v_from, v_until FROM cashback_ledger l
-             WHERE l.tenant_id = NEW.tenant_id AND l.customer_id = v_redeem.customer_id
-               AND l.entry_type IN ('EARN', 'REFUND') AND l.amount > l.remaining_amount
-               AND l.created_at <= v_redeem.created_at
-             ORDER BY l.expires_at DESC LIMIT 1;
-            IF NOT FOUND THEN
-                v_from := v_redeem.created_at;
-                v_until := v_redeem.created_at + make_interval(days => tchefood_cashback_validity_days());
-            END IF;
+        -- Origem comprovada: o crédito do resgate, desta loja, com validade. Sem isso, retém.
+        v_hold := s.source_id IS NULL OR s.valid_from IS NULL OR s.expires_at IS NULL;
+        IF v_hold THEN
+            INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount,
+                                         valid_from, expires_at, created_by_user_id, created_at, refund_of_id)
+            VALUES (NEW.tenant_id, v_redeem.customer_id, NEW.id, 'HOLD', v_take, 0,
+                    NULL, NULL, v_user, v_now, s.source_id)
+            RETURNING id INTO v_refund_id;
+            INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact,
+                                    reason, whatsapp_alert_sent, metadata, created_at)
+            VALUES (NEW.tenant_id, NEW.id, v_user, v_manager, 'CASHBACK_REFUND_HELD', v_take,
+                    'Cashback a devolver retido para conciliação: o crédito de onde saiu não está comprovado (resgate da versão anterior do aparelho). Não volta ao saldo até o gerente conferir com o cliente.',
+                    FALSE,
+                    jsonb_build_object('customer_id', v_redeem.customer_id, 'amount', v_take, 'redeem_id', v_redeem.id,
+                                       'hold_id', v_refund_id, 'refund_of_id', s.source_id,
+                                       'reconciliation', 'PENDING',
+                                       'reason_code', CASE WHEN s.source_id IS NULL THEN 'SOURCE_UNKNOWN' ELSE 'SOURCE_NOT_FOUND' END,
+                                       'redeemed', v_redeem.amount, 'refunded_before', v_refunded,
+                                       'cashback_applied_before', v_applied,
+                                       'manual_discount_before', v_manual_before, 'manual_discount_after', v_manual_after,
+                                       'discount_before', OLD.discount_amount, 'discount_after', NEW.discount_amount,
+                                       'cause', v_cause, 'cause_audit_id', v_cause_audit,
+                                       'server_verified', TRUE),
+                    v_now);
+            v_refunded := v_refunded + v_take;
+            v_left := v_left - v_take;
+            CONTINUE;
         END IF;
+        v_from := s.valid_from;
+        v_until := s.expires_at;
         INSERT INTO cashback_ledger (tenant_id, customer_id, order_id, entry_type, amount, remaining_amount,
                                      valid_from, expires_at, created_by_user_id, created_at, refund_of_id)
         VALUES (NEW.tenant_id, v_redeem.customer_id, NEW.id, 'REFUND', v_take, v_take,
@@ -688,6 +720,8 @@ BEGIN
                                    'refund_id', v_refund_id, 'refund_of_id', s.source_id,
                                    'expires_at', v_until, 'already_expired', v_until <= v_now,
                                    'redeemed', v_redeem.amount, 'refunded_before', v_refunded,
+                                   'cashback_applied_before', v_applied,
+                                   'manual_discount_before', v_manual_before, 'manual_discount_after', v_manual_after,
                                    'discount_before', OLD.discount_amount, 'discount_after', NEW.discount_amount,
                                    'cause', v_cause, 'cause_audit_id', v_cause_audit,
                                    'item_cancel_audit_id', CASE WHEN v_cause = 'ITEM_CANCELED' THEN v_cause_audit END,
@@ -746,6 +780,20 @@ BEGIN
             CHECK (entry_type NOT IN ('EARN', 'REFUND') OR (valid_from IS NOT NULL AND expires_at > valid_from AND remaining_amount <= amount));
         ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_debit_no_balance
             CHECK (entry_type IN ('EARN', 'REFUND') OR remaining_amount = 0);
+    END IF;
+END $$;
+-- Devolução retida para conciliação (HOLD, P0-03 da rodada 8 do GPT): sem saldo
+-- (remaining_amount 0, pela restrição acima) e sem validade; não entra no saldo do cliente.
+DO $$
+BEGIN
+    IF pg_get_constraintdef((SELECT oid FROM pg_constraint WHERE conname = 'cashback_ledger_entry_type_refund')) NOT LIKE '%HOLD%' THEN
+        ALTER TABLE cashback_ledger DROP CONSTRAINT cashback_ledger_entry_type_refund;
+        ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_entry_type_refund
+            CHECK (entry_type IN ('EARN', 'REDEEM', 'EXPIRE', 'REFUND', 'HOLD'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cashback_ledger_hold_no_validity') THEN
+        ALTER TABLE cashback_ledger ADD CONSTRAINT cashback_ledger_hold_no_validity
+            CHECK (entry_type <> 'HOLD' OR (valid_from IS NULL AND expires_at IS NULL));
     END IF;
 END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS cashback_ledger_one_earn_redeem_per_order
