@@ -489,6 +489,27 @@ function AdoptCloudDiscount({ eventId, value }: { eventId: string; value: number
   );
 }
 
+/** Resgate de cashback recusado pela nuvem: a conta não é cobrada até desfazer o cashback aqui. */
+function UndoRejectedCashback({ eventId }: { eventId: string }) {
+  const undo = useTcheStore((s) => s.undoRejectedCashbackRedeem);
+  return (
+    <div className="mt-1">
+      <Btn
+        onClick={() => {
+          const r = undo(eventId);
+          if (!r.ok) toast.error(r.error);
+          else {
+            toast.success(`Cashback de R$ ${r.data.toFixed(2).replace('.', ',')} desfeito: a conta volta ao valor sem ele.`);
+            void syncOnce();
+          }
+        }}
+      >
+        Desfazer o cashback desta conta
+      </Btn>
+    </div>
+  );
+}
+
 function RejectedAuthPin({ eventId }: { eventId: string }) {
   const confirm = useTcheStore((s) => s.confirmRejectedAuthorization);
   const [pin, setPin] = useState('');
@@ -578,6 +599,7 @@ function CloudStatus() {
                 {r.event.table === 'orders' && cloudDiscountOf(r.message) !== null && (
                   <AdoptCloudDiscount eventId={r.event.id} value={cloudDiscountOf(r.message)!} />
                 )}
+                {r.event.table === 'cashback_ledger' && r.event.cashback_redeem && <UndoRejectedCashback eventId={r.event.id} />}
               </li>
             ))}
           </ul>

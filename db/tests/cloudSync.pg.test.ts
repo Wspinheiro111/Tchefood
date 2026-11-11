@@ -1307,6 +1307,92 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     setCashbackClock(null);
   });
 
+  it('cashback recusado pela nuvem: a conta não é cobrada nem encerrada até desfazer o cashback', async () => {
+    // P0-01 da rodada 7 do GPT: aparelho na quinta 23h50, servidor já na sexta 00h10. Conta de
+    // R$ 100 sem os 10%, resgate de R$ 50 sem internet; a nuvem recusa o resgate (sexta).
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T23:50:00-03:00') });
+    setCashbackClock('2026-11-13T00:10:00-03:00');
+    login(OWNER_PIN);
+    const product = (code: string, name: string, price: number) => ok(st().saveProduct({
+      category_id: categoryId, code, name, description: null, price, sector: 'KITCHEN', available: true, active: true,
+      requires_meat_doneness: false, allows_half_and_half: false, ncm: '19022000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+      cost_price: 0, stock_quantity: 0, barcode: null,
+    }));
+    const costela = product('471', 'Costela', 80);
+    const salada = product('472', 'Salada', 20);
+    ok(st().saveTable({ number: 69, label: 'Mesa 69', area: 'Salão', capacity: 4, active: true }));
+    await expectSynced('produtos e mesa');
+    login(CASHIER_PIN);
+    const order = ok(st().openTable(st().tables.find((t) => t.number === 69)!.id, 1, null));
+    for (const p of [costela, salada]) {
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+    }
+    ok(st().dispatchTray(order.id));
+    ok(st().removeServiceFee(order.id, MANAGER));
+    await expectSynced('conta de R$ 100');
+    const phone = '5553988119067';
+    const c = cashbackCustomer(phone, [{ amount: 100, expires: '2026-12-31' }]);
+    const cloudCustomer = JSON.parse(sql(`SELECT row_to_json(c) FROM loyalty_customers c WHERE id = '${c.id}'`));
+    const cloudEarn = JSON.parse(sql(`SELECT row_to_json(l) FROM cashback_ledger l WHERE id = '${c.earns[0]}'`));
+    useTcheStore.setState({
+      loyaltyCustomers: [...st().loyaltyCustomers, { ...cloudCustomer, cashback_balance: 100, total_spent: 0, visits_count: 1 }],
+      cashbackLedger: [...st().cashbackLedger, { ...cloudEarn, amount: 100, remaining_amount: 100 }],
+    });
+    expect(ok(st().redeemCashback(order.id, phone)).amount).toBe(50);
+    expect(st().orders.find((o) => o.id === order.id)!.remaining_balance).toBe(50);
+    const rejected = await sync();
+    expect(rejected).toHaveLength(1);
+    const refused = st().syncRejected.find((r) => r.event.table === 'cashback_ledger')!;
+    expect(refused.status).toBe(400);
+    expect(refused.message).toContain('terça a quinta');
+    // Nenhuma cobrança pelo valor com o cashback recusado.
+    const blocked = 'A nuvem recusou o cashback desta conta';
+    const charges = st().pendingCharges.length;
+    const payments = st().payments.length;
+    const tryCash = () => st().registerPayment({
+      orderId: order.id, amount: 50, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
+      acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null,
+      idempotency_key: `k-${Math.random()}`, item_ids: [],
+    });
+    for (const r of [st().startCheckout(order.id), tryCash(), st().beginTerminalCharge(order.id, `req-${Math.random()}`, 50)]) {
+      expect(r.ok).toBe(false);
+      expect(!r.ok && r.error).toContain(blocked);
+    }
+    expect(st().pendingCharges.length).toBe(charges);
+    expect(st().payments.length).toBe(payments);
+    // Cancelar a costela deixa a conta zerada pelo cashback (bruto 20, estorno local de 30): não encerra.
+    ok(st().cancelOrderItem(st().orderItems.find((i) => i.order_id === order.id && i.product_id === costela.id)!.id, MANAGER));
+    expect(st().orders.find((o) => o.id === order.id)!.remaining_balance).toBe(0);
+    const zero = st().closeZeroOrder(order.id);
+    expect(!zero.ok && zero.error).toContain(blocked);
+    expect(st().orders.find((o) => o.id === order.id)!.status).not.toBe('CLOSED');
+    // Conciliação: desfazer o cashback. Conta sem desconto (R$ 20 a cobrar), crédito de volta,
+    // sem estorno nem resgate aqui, e o registro do resgate fica sem valor, marcado como recusado.
+    expect(ok(st().undoRejectedCashbackRedeem(refused.event.id))).toBe(50);
+    const local = () => st().orders.find((o) => o.id === order.id)!;
+    expect([local().discount_amount, local().total_amount, local().remaining_balance]).toEqual([0, 20, 20]);
+    expect(st().cashbackLedger.filter((e) => e.order_id === order.id)).toEqual([]);
+    expect(st().cashbackLedger.find((e) => e.id === c.earns[0])!.remaining_amount).toBe(100);
+    expect(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance).toBe(100);
+    const redeemLog = st().auditLogs.find((l) => l.order_id === order.id && l.action_type === 'CASHBACK_REDEEMED')!;
+    expect([redeemLog.amount_impact, typeof redeemLog.metadata?.rejected_by_cloud]).toEqual([0, 'string']);
+    expect(st().auditLogs.filter((l) => l.order_id === order.id && l.action_type === 'CASHBACK_REFUNDED')).toEqual([]);
+    expect(st().syncRejected.some((r) => r.event.id === refused.event.id)).toBe(false);
+    // A fila sobe sem recusa, e nuvem e aparelho ficam com a mesma conta, em centavos.
+    await expectSynced('conta sem o cashback recusado');
+    const cents = (v: string | number) => Math.round(Number(v) * 100);
+    const cloudOrder = sql(`SELECT discount_amount || ' ' || total_amount || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`).split(' ').map(cents);
+    expect(cloudOrder).toEqual([local().discount_amount, local().total_amount, local().remaining_balance].map(cents));
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE order_id = '${order.id}'`)).toBe('0');
+    expect(cents(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`))).toBe(cents(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance));
+    // Cobrança pelo valor que a nuvem reconhece: R$ 20, e a conta fecha nos dois lados.
+    ok(st().startCheckout(order.id));
+    payCash(order.id);
+    await expectSynced('pagamento sem o cashback');
+    expect(sql(`SELECT status || ' ' || paid_amount FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 20.00');
+    setCashbackClock(null);
+  });
+
   it('fila da versão anterior com o crédito já baixado: só com o registro do resgate na nuvem, sem consumir de novo', async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
     setCashbackClock('2026-11-12T20:00:00-03:00');
