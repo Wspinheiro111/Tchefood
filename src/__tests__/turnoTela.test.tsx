@@ -67,15 +67,51 @@ describe('Retaguarda: relógio reativo sem mudar os arrays', () => {
     expect(has(brl(9))).toBe(true);
   });
 
-  it('volta do app no mesmo turno (timer perdido) atualiza o fim do período', () => {
+  it('volta do app no mesmo turno: só o visibilitychange nativo do document mostra o pagamento das 10:01', () => {
     vi.setSystemTime(BRT('2026-11-11T10:00:00'));
     seed([], [pay('p1', 70, '2026-11-11T10:01:00')], []);
     render(<Reconciliation />);
-    // Aparelho dormindo: o relógio anda, mas o timer não dispara.
-    vi.setSystemTime(BRT('2026-11-11T10:00:30').getTime() + 2 * 60_000);
+    // Aparelho dormindo: o relógio anda até 10:02, mas o timer não dispara.
+    vi.setSystemTime(BRT('2026-11-11T10:02:00'));
     expect(has(brl(70))).toBe(false);
-    act(() => { document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new Event('visibilitychange')); });
+    act(() => { document.dispatchEvent(new Event('visibilitychange')); });
     expect(has(brl(70))).toBe(true);
+  });
+
+  it('volta do app atravessando a virada das 05:00: só o visibilitychange do document troca o turno', () => {
+    vi.setSystemTime(BRT('2026-11-11T04:59:00'));
+    seed([ord('o1', '2026-11-11T02:00:00', 80)], [], [item('o1', 800)]);
+    render(<WaiterSplit />);
+    expect(has(brl(80))).toBe(true);
+    vi.setSystemTime(BRT('2026-11-11T05:02:00'));
+    expect(screen.getByText(/desde 10\/11, 05:00/)).toBeTruthy();
+    act(() => { document.dispatchEvent(new Event('visibilitychange')); });
+    expect(has(brl(80))).toBe(false);
+    expect(screen.getByText(/desde 11\/11, 05:00/)).toBeTruthy();
+  });
+
+  it('ao desmontar, os listeners saem do document e do window e o timer é cancelado', () => {
+    const docAdd = vi.spyOn(document, 'addEventListener');
+    const docRemove = vi.spyOn(document, 'removeEventListener');
+    const winAdd = vi.spyOn(window, 'addEventListener');
+    const winRemove = vi.spyOn(window, 'removeEventListener');
+    vi.setSystemTime(BRT('2026-11-11T10:00:00'));
+    seed([], [], []);
+    const timersAntes = vi.getTimerCount();
+    const { unmount } = render(<Reconciliation />);
+    expect(vi.getTimerCount()).toBe(timersAntes + 1);
+    const docVis = docAdd.mock.calls.filter(([ev]) => ev === 'visibilitychange');
+    expect(docVis).toHaveLength(1);
+    expect(winAdd.mock.calls.filter(([ev]) => ev === 'visibilitychange')).toHaveLength(0);
+    const winResume = winAdd.mock.calls.filter(([ev]) => ev === 'focus' || ev === 'pageshow');
+    expect(winResume.map(([ev]) => ev).sort()).toEqual(['focus', 'pageshow']);
+    unmount();
+    expect(docRemove.mock.calls.some(([ev, fn]) => ev === 'visibilitychange' && fn === docVis[0]![1])).toBe(true);
+    for (const [ev, fn] of winResume) {
+      expect(winRemove.mock.calls.some(([e, f]) => e === ev && f === fn)).toBe(true);
+    }
+    expect(vi.getTimerCount()).toBe(timersAntes);
+    docAdd.mockRestore(); docRemove.mockRestore(); winAdd.mockRestore(); winRemove.mockRestore();
   });
 
   it('Dashboard: KPI e conciliação usam o mesmo período (pagamento futuro fora dos dois)', () => {

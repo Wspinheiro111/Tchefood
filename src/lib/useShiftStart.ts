@@ -12,11 +12,17 @@ export interface ShiftClockDeps {
   now: () => Date;
   setTimer: (fn: () => void, ms: number) => unknown;
   clearTimer: (handle: unknown) => void;
-  /** Onde ouvir a volta do app (visibilitychange/focus/pageshow); null em teste ou fora do navegador. */
-  target: Pick<EventTarget, 'addEventListener' | 'removeEventListener'> | null;
+  /** Onde o navegador dispara `focus` e `pageshow` (window); null em teste ou fora do navegador. */
+  windowTarget: Listenable | null;
+  /** Onde o navegador dispara `visibilitychange` (document; não chega ao window); null fora do navegador. */
+  documentTarget: Listenable | null;
 }
 
-const RESUME_EVENTS = ['visibilitychange', 'focus', 'pageshow'] as const;
+type Listenable = Pick<EventTarget, 'addEventListener' | 'removeEventListener'>;
+
+/** Volta do app para a frente: cada evento no alvo em que o navegador o dispara. */
+const WINDOW_RESUME_EVENTS = ['focus', 'pageshow'] as const;
+const DOCUMENT_RESUME_EVENTS = ['visibilitychange'] as const;
 export const REPORT_TICK_MS = 60_000;
 /** Folga depois da virada do minuto para o timer não disparar um instante antes. */
 const TICK_SLACK_MS = 250;
@@ -26,7 +32,8 @@ function defaultDeps(): ShiftClockDeps {
     now: () => new Date(),
     setTimer: (fn, ms) => setTimeout(fn, ms),
     clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
-    target: typeof window !== 'undefined' ? window : null,
+    windowTarget: typeof window !== 'undefined' ? window : null,
+    documentTarget: typeof document !== 'undefined' ? document : null,
   };
 }
 
@@ -51,13 +58,15 @@ export function watchReportClock(onTick: (now: Date) => void, deps: ShiftClockDe
     schedule();
   };
 
-  for (const ev of RESUME_EVENTS) deps.target?.addEventListener(ev, tick);
+  for (const ev of WINDOW_RESUME_EVENTS) deps.windowTarget?.addEventListener(ev, tick);
+  for (const ev of DOCUMENT_RESUME_EVENTS) deps.documentTarget?.addEventListener(ev, tick);
   schedule();
 
   return () => {
     stopped = true;
     if (handle !== null) deps.clearTimer(handle);
-    for (const ev of RESUME_EVENTS) deps.target?.removeEventListener(ev, tick);
+    for (const ev of WINDOW_RESUME_EVENTS) deps.windowTarget?.removeEventListener(ev, tick);
+    for (const ev of DOCUMENT_RESUME_EVENTS) deps.documentTarget?.removeEventListener(ev, tick);
   };
 }
 

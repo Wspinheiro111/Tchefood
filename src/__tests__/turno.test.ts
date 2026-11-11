@@ -186,7 +186,8 @@ describe('P1-01 / rodada 3 P2-02: relógio dos relatórios sem mudar os arrays',
   function fakeClock(startIso: Date) {
     let t = startIso.getTime();
     let timer: { fn: () => void; at: number } | null = null;
-    const target = new EventTarget();
+    const win = new EventTarget();
+    const doc = new EventTarget();
     const deps: ShiftClockDeps = {
       now: () => new Date(t),
       setTimer: (fn, ms) => {
@@ -196,11 +197,13 @@ describe('P1-01 / rodada 3 P2-02: relógio dos relatórios sem mudar os arrays',
       clearTimer: (h) => {
         if (timer === h) timer = null;
       },
-      target,
+      windowTarget: win,
+      documentTarget: doc,
     };
     return {
       deps,
-      target,
+      win,
+      doc,
       /** Avança o relógio disparando os timers que vencerem no caminho. */
       advance(ms: number) {
         const until = t + ms;
@@ -278,13 +281,17 @@ describe('P1-01 / rodada 3 P2-02: relógio dos relatórios sem mudar os arrays',
     const stop = watchReportClock((d) => { agora = d; }, clock.deps);
     clock.jump(2 * 60_000);
     expect(telas(agora).rateioComissao).toBe(80);
-    clock.target.dispatchEvent(new Event('visibilitychange'));
+    // visibilitychange chega no document; no window ele não faz nada.
+    clock.win.dispatchEvent(new Event('visibilitychange'));
+    expect(telas(agora).rateioComissao).toBe(80);
+    clock.doc.dispatchEvent(new Event('visibilitychange'));
     expect(telas(agora).rateioComissao).toBe(0);
     stop();
     // Depois de parar, não reage mais.
     const parado = agora;
     clock.jump(24 * 3600_000);
-    clock.target.dispatchEvent(new Event('focus'));
+    clock.win.dispatchEvent(new Event('focus'));
+    clock.doc.dispatchEvent(new Event('visibilitychange'));
     expect(agora).toBe(parado);
   });
 });
