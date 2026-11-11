@@ -440,7 +440,9 @@ export type AuditActionType =
   | 'STORE_RESET'
   // Caixa (db/schema_caixa.sql)
   | 'CASH_WITHDRAWAL'
-  | 'CASH_CLOSE_DIFFERENCE';
+  | 'CASH_CLOSE_DIFFERENCE'
+  // Item com preço diferente do cadastro aceito com PIN de gerente (db/schema_preco_gerente.sql)
+  | 'PRICE_OVERRIDE';
 
 export interface AuditLog {
   id: UUID;

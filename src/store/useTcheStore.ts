@@ -504,6 +504,12 @@ interface Actions {
    * pronto para Reenviar recusados (o servidor confere outra vez, com o bloqueio).
    */
   confirmRejectedAuthorization: (eventId: UUID, managerPin: string) => ActionResult;
+  /**
+   * Item recusado pela nuvem porque o preço não bate com o cadastro (ou o servidor não
+   * consegue conferir): o gerente aceita com PIN e motivo. A autorização (PRICE_OVERRIDE,
+   * presa ao id e ao preço do item) sobe antes do item, que volta para a frente da fila.
+   */
+  approveRejectedItemPrice: (eventId: UUID, auth: ManagerAuthInput) => ActionResult<AuditLog>;
 
   // Caixa
   /** Abre o caixa com o fundo de troco. Um caixa aberto por loja. */
@@ -672,6 +678,18 @@ function tableEventForOrder(table: DiningTable, orderId: UUID): SyncEvent {
  * audit_log de autorização de gerente para a fila: leva o PIN digitado para o servidor
  * conferir de novo (tchefood_authorize_manager). O PIN não entra no audit_log.
  */
+/**
+ * Item recusado pela nuvem por preço diferente do cadastro, ou que ela não consegue conferir
+ * (db/schema_preco_gerente.sql): só esses o gerente aceita com PIN. Produto ou conta fora da
+ * loja (TCHEFOOD_REGISTRO_LOJA; antes da rodada 4 vinha como TCHEFOOD_PRECO com "não encontrado
+ * nesta loja") não é preço: o PIN não resolve, então fica na lista sem o botão.
+ */
+export function isRejectedItemPrice(r: RejectedSyncEvent): boolean {
+  const message = r.message ?? '';
+  return r.event.table === 'order_items' && r.event.op === 'INSERT'
+    && /TCHEFOOD_PRECO:/.test(message) && !/não encontrado nesta loja/.test(message);
+}
+
 function managerAuthEvent(log: AuditLog, managerPin: string | null): SyncEvent {
   const event = syncEvent('audit_logs', 'INSERT', log);
   // Sem gerente (ex.: resgate de cashback), o audit_log sobe direto, sem RPC.
@@ -3569,6 +3587,47 @@ export const useTcheStore = create<TcheState>()(
             ),
           }));
           return { ok: true, data: undefined };
+        },
+
+        approveRejectedItemPrice: (eventId, auth) => {
+          const rejected = (get().syncRejected ?? []).find((r) => r.event.id === eventId);
+          if (!rejected) return fail('Evento recusado não encontrado.');
+          const ev = rejected.event;
+          if (!isRejectedItemPrice(rejected)) return fail('Este evento não é um item recusado pelo preço.');
+          const p = ev.payload;
+          const orderId = String(p.order_id);
+          const authRes = authorizeManager(auth, { orderId, action: 'PRICE_OVERRIDE' });
+          if (!authRes.ok) return authRes;
+          const user = currentUser()!;
+          const product = get().products.find((x) => x.id === p.product_id);
+          const log = buildAudit({
+            order_id: orderId,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: authRes.data.id,
+            action_type: 'PRICE_OVERRIDE',
+            amount_impact: 0,
+            reason: auth.reason.trim(),
+            metadata: {
+              item_id: ev.row_id,
+              product_id: p.product_id,
+              product_name: product?.name ?? null,
+              quantity: p.quantity,
+              unit_price: p.unit_price,
+              modifiers_unit_price: p.modifiers_unit_price,
+              // O servidor prende a autorização ao item inteiro: sabores e adicionais também.
+              half_product_ids: Array.isArray(p.half_product_ids) ? p.half_product_ids : [],
+              modifier_option_ids: Array.isArray(p.modifier_option_ids) ? p.modifier_option_ids : [],
+              server_message: rejected.message,
+              waiter_name: user.name,
+              manager_name: authRes.data.name,
+            },
+          });
+          set((s) => ({
+            auditLogs: [log, ...s.auditLogs],
+            syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
+            outbox: [managerAuthEvent(log, auth.managerPin), ev, ...s.outbox],
+          }));
+          return { ok: true, data: log };
         },
 
         openCashSession: (openingFloat) => {

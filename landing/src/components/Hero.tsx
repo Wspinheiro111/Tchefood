@@ -3,9 +3,9 @@ import { linkWhatsApp } from '../lib/config';
 import MockupDispositivos from './MockupDispositivos';
 
 const PROVAS = [
-  'Roda na Stone ou PagBank que você já tem',
   'Garçons ilimitados em todos os planos',
-  'NFC-e automática na SEFAZ-RS',
+  'Funciona sem internet e sincroniza depois',
+  'Sem servidor no restaurante',
 ];
 
 export default function Hero() {
@@ -19,17 +19,18 @@ export default function Hero() {
         aria-hidden
         className="pointer-events-none absolute right-[-200px] top-40 h-[420px] w-[420px] rounded-full bg-[radial-gradient(closest-side,rgba(245,158,11,0.14),transparent)]"
       />
-      <div className="container-lp relative grid items-center gap-12 pb-20 pt-10 md:pt-16 lg:grid-cols-[1.1fr_1fr] lg:pb-28">
-        <div className="animate-fade-up">
+      <div className="container-lp relative grid grid-cols-1 items-center gap-12 pb-20 pt-10 md:pt-16 lg:grid-cols-[1.1fr_1fr] lg:pb-28">
+        <div className="min-w-0 animate-fade-up">
           <p className="eyebrow">Da comanda à maquininha</p>
           <h1 className="mt-4 text-4xl font-extrabold leading-[1.08] tracking-tight sm:text-5xl lg:text-[3.1rem]">
-            Transforme as maquininhas{' '}
-            <span className="bg-gradient-to-r from-brasa to-ouro bg-clip-text text-transparent">Stone e PagBank</span>{' '}
-            que você já tem no sistema mais rápido para o seu salão.
+            Sistema para{' '}
+            <span className="bg-gradient-to-r from-brasa to-ouro bg-clip-text text-transparent">restaurantes, bares e delivery</span>{' '}
+            que roda no celular do garçom.
           </h1>
           <p className="mt-6 max-w-xl text-lg leading-relaxed text-slate-700">
-            Elimine a compra de tablets caros, faça a “rachadinha” na mesa em 45 segundos, emita a NFC-e automática na
-            SEFAZ-RS e receba alertas de cancelamento direto no seu WhatsApp.
+            PDV, comanda eletrônica, tela da cozinha (KDS), totem de autoatendimento, cardápio digital QR Code, delivery
+            próprio, controle de caixa, cashback e NFC-e num sistema só, integrado às maquininhas Smart Stone, PagBank e
+            Mercado Pago.
           </p>
           <div className="mt-8 flex flex-col gap-3 sm:flex-row">
             <a
@@ -41,8 +42,8 @@ export default function Hero() {
               <MessageCircle className="h-5 w-5" aria-hidden />
               Agendar demonstração no WhatsApp
             </a>
-            <a className="btn-secundario text-base" href="#calculadora">
-              Calcular minha economia
+            <a className="btn-secundario text-base" href="#funcionalidades">
+              Ver todas as funções
               <ArrowRight className="h-5 w-5" aria-hidden />
             </a>
           </div>
