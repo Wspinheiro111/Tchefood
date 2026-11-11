@@ -8,7 +8,7 @@
 import { readFile, writeFile, rm } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { dataUltimaAlteracao } from './ultimaAlteracao.mjs';
 
 const raiz = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(raiz, 'dist');
@@ -56,15 +56,9 @@ const corpo = render().replace(/(src|href)="\/assets\//g, '$1="./assets/');
 html = html.replace('<!--seo-head-->', head).replace('<!--app-html-->', corpo);
 await writeFile(arquivo, html);
 
-// lastmod = data do último commit que mexeu na pasta landing/ (não a data do build).
-// Fora de um checkout git (ou sem histórico), o sitemap sai sem <lastmod>.
-let ultimaAlteracao = null;
-try {
-  ultimaAlteracao =
-    execFileSync('git', ['log', '-1', '--format=%cs', '--', '.'], { cwd: raiz, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
-} catch {
-  ultimaAlteracao = null;
-}
+// lastmod = data do último commit que mexeu na pasta landing/ (não a data do build). Sem git,
+// ou num clone raso, a data não é confiável e o sitemap sai sem <lastmod>.
+const ultimaAlteracao = dataUltimaAlteracao(raiz);
 await writeFile(path.join(dist, 'sitemap.xml'), sitemapXml(ultimaAlteracao));
 await writeFile(path.join(dist, 'robots.txt'), robotsTxt());
 await rm(ssr, { recursive: true, force: true });

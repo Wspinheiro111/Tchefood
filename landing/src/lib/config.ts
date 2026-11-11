@@ -13,6 +13,21 @@ export const EMPRESA = {
 };
 
 /**
+ * Nome DNS válido na forma em que o `URL` o entrega (minúsculo, nomes acentuados já em punycode
+ * `xn--`): até 253 caracteres, rótulos de 1 a 63 caracteres com a-z, 0-9 e hífen, sem hífen no
+ * começo ou no fim, sem rótulo vazio (`..`, ponto inicial ou final) e com a terminação não só de
+ * números (recusa IP).
+ */
+function hostnameDnsValido(host: string): boolean {
+  if (host.length > 253) return false;
+  const rotulos = host.split('.');
+  if (rotulos.length < 2) return false;
+  const rotuloOk = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
+  if (!rotulos.every((r) => rotuloOk.test(r))) return false;
+  return !/^\d+$/.test(rotulos[rotulos.length - 1]);
+}
+
+/**
  * Confere o endereço do site e devolve a origem sem barra no fim (ex.: https://tchefood.com.br).
  * Recusa com erro claro, que derruba o build: endereço malformado, sem https, com usuário/senha,
  * porta, caminho (o site é publicado na raiz do domínio), query ou fragmento.
@@ -33,6 +48,8 @@ export function normalizarSiteUrl(bruto: string): string {
   if (url.search || texto.includes('?')) problemas.push('não pode ter ?parâmetros');
   if (url.hash || texto.includes('#')) problemas.push('não pode ter #fragmento');
   if (!url.hostname.includes('.')) problemas.push('o domínio precisa ter ponto (ex.: tchefood.com.br)');
+  else if (!hostnameDnsValido(url.hostname))
+    problemas.push('o domínio não é um nome válido (só letras, números e hífen, sem partes vazias, hífen nas pontas ou final só com números)');
   if (problemas.length) throw new Error(`VITE_SITE_URL inválido ("${bruto}"): ${problemas.join('; ')}.`);
   return url.origin;
 }
@@ -42,7 +59,9 @@ export function normalizarSiteUrl(bruto: string): string {
  * no sitemap.xml e no robots.txt. Troque com a variável de ambiente VITE_SITE_URL no build
  * (ou no arquivo .env) quando o domínio definitivo estiver registrado.
  */
-export const SITE_URL = normalizarSiteUrl(import.meta.env?.VITE_SITE_URL || 'https://tchefood.com.br');
+// `??` e não `||`: só a variável AUSENTE usa o padrão. VITE_SITE_URL="" (ou só espaços) é erro de
+// configuração e derruba o build, em vez de publicar com o domínio padrão sem ninguém perceber.
+export const SITE_URL = normalizarSiteUrl(import.meta.env?.VITE_SITE_URL ?? 'https://tchefood.com.br');
 
 export interface Plano {
   id: 'bistro' | 'salao-pro' | 'rede-eventos';
