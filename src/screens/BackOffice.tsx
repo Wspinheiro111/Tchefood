@@ -217,7 +217,7 @@ function WaiterSplit() {
   const total = rows.reduce((a, r) => a + r.commission, 0);
   return (
     <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-surface">
-      <p className="p-3 text-xs text-slate-500">Base: contas fechadas. A taxa de serviço efetivamente cobrada de cada conta é rateada entre os garçons proporcionalmente ao que cada um lançou (sem perder centavos).</p>
+      <p className="p-3 text-xs text-slate-500">Base: contas fechadas no turno (desde {shiftStart().toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}). A taxa de serviço efetivamente cobrada de cada conta é rateada entre os garçons proporcionalmente ao que cada um lançou (sem perder centavos).</p>
       <table className="w-full min-w-[520px] text-sm">
         <thead className="bg-base text-left text-xs uppercase text-slate-500">
           <tr><th className="p-3">Garçom</th><th className="p-3 text-right">Itens</th><th className="p-3 text-right">Total vendido</th><th className="p-3 text-right">Comissão 10%</th></tr>
