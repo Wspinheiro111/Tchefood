@@ -36,10 +36,11 @@ nunca ficarem visíveis a uma página de terceiros.
 
 `scripts/build-apk.sh` faz tudo: confere Java 17 a 21 e Node, baixa o SDK Android e o Gradle 8.7 se faltarem
 (em `~/.cache/tchefood-android`, fora do projeto), roda `npm ci && npm run build`, compila e deixa os APKs
-debug em `apk/`. A pasta `apk/` só guarda os APKs da última execução e é trocada inteira, de uma vez:
-os antigos saem, e se o build ou a troca falhar ela fica como estava. Só roda um build por vez no mesmo
-repositório (trava em `.apk-build.lock`): uma segunda execução simultânea para com aviso e não altera nada.
-Não guarde outros arquivos em `apk/`.
+debug em `apk/`. A pasta `apk/` só guarda os APKs da última execução: ela é um link para a versão atual
+(em `.apk-releases/`), trocado de uma vez, então quem lê `apk/` vê sempre o conjunto anterior inteiro ou o novo
+inteiro, mesmo se o script for morto no meio; se o build falhar, fica como estava. Só roda um build por vez no
+mesmo repositório (trava do sistema operacional em `.apk-build.lock`, solta sozinha se o processo morrer): uma
+segunda execução simultânea para com aviso e não altera nada. Precisa de `perl` (já vem no Linux e no Mac).
 
 ```bash
 bash scripts/build-apk.sh            # pagbank e tablet

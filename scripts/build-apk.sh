@@ -10,7 +10,7 @@
 # Faz, nessa ordem: confere Java e Node, baixa o SDK Android e o Gradle se faltarem
 # (em ~/.cache/tchefood-android, nunca dentro do projeto), roda `npm ci && npm run build`,
 # compila e deixa os APKs em ./apk/ (só os desta execução: os antigos saem, e se o build falhar a
-# pasta fica como estava). O APK é debug: instala direto na maquininha ou no
+# pasta fica como estava; apk/ é um link para a versão atual, trocado de uma vez). O APK é debug: instala direto na maquininha ou no
 # tablet (fontes desconhecidas ou `adb install`). Release assinado e loja ficam fora daqui.
 set -euo pipefail
 
@@ -40,53 +40,49 @@ raiz="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$raiz"
 [ -f android/settings.gradle.kts ] || falha "rode a partir do repositório do Tchê Food (não achei android/settings.gradle.kts)"
 
-# --- Trava: uma execução por repositório (a limpeza, o Gradle e a publicação usam as mesmas pastas) ----------
+# --- Trava: uma execução por repositório --------------------------------------------------------------------
+# A limpeza, o Gradle e a publicação usam as mesmas pastas. A exclusão mútua é um flock do sistema operacional
+# num arquivo de trava: o próprio sistema solta a trava quando o processo morre (até com kill -9), então não há
+# "trava velha" para recuperar nem PID para conferir. O perl (presente no Linux e no macOS) pega o flock e roda
+# este mesmo script já com a trava na mão.
+if [ -z "${TCHEFOOD_BUILD_LOCK_HELD:-}" ]; then
+  command -v perl >/dev/null 2>&1 || falha "perl não encontrado (usado para a trava de execução única)."
+  export TCHEFOOD_BUILD_LOCK_HELD=1
+  exec perl -e '
+    use Fcntl qw(:flock F_SETFD);
+    my $trava = shift @ARGV;
+    open(my $fh, ">>", $trava) or die "ERRO: não consegui abrir $trava: $!\n";
+    flock($fh, LOCK_EX | LOCK_NB) or do {
+      print STDERR "ERRO: outra execução do build-apk.sh está em andamento (trava $trava); nada foi alterado. Espere terminar e rode de novo.\n";
+      exit 1;
+    };
+    fcntl($fh, F_SETFD, 0);
+    exec @ARGV or die "ERRO: exec falhou: $!\n";
+  ' "$raiz/.apk-build.lock" bash "$raiz/scripts/$(basename "$0")" "$@"
+fi
+
 staging=""
-old_apk=""
-lock="$raiz/.apk-build.lock"
-tenho_lock=0
+link_novo=""
 
 limpar() {
   local codigo=$?
   trap - EXIT
-  # publicação interrompida entre as duas renomeações: devolve o conjunto anterior
-  if [ -n "$old_apk" ] && [ -d "$old_apk" ] && [ ! -e "$raiz/apk" ]; then
-    mv "$old_apk" "$raiz/apk" || echo "AVISO: não consegui restaurar $old_apk em apk/" >&2
-  fi
+  if [ -n "$link_novo" ]; then rm -f "$link_novo"; fi
   if [ -n "$staging" ]; then rm -rf "$staging"; fi
-  if [ "$tenho_lock" = 1 ]; then rm -rf "$lock"; fi
   exit "$codigo"
 }
 trap limpar EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-pegar_lock() {
-  local tentativa pid
-  for tentativa in 1 2; do
-    if mkdir "$lock" 2>/dev/null; then
-      echo $$ > "$lock/pid"
-      tenho_lock=1
-      return 0
-    fi
-    pid="$(cat "$lock/pid" 2>/dev/null || true)"
-    if [ -z "$pid" ]; then sleep 1; pid="$(cat "$lock/pid" 2>/dev/null || true)"; fi
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      falha "outra execução do build-apk.sh está em andamento (pid $pid, trava $lock); nada foi alterado. Espere terminar e rode de novo."
-    fi
-    # trava velha (processo morto): sai de cena por uma renomeação atômica, e só quem conseguiu remove
-    if mv "$lock" "$lock.velha.$$" 2>/dev/null; then rm -rf "$lock.velha.$$"; fi
-  done
-  falha "não consegui a trava $lock"
-}
-pegar_lock
-
-# Sobras de uma execução morta à força (kill -9): devolve o apk/ guardado e apaga a pasta temporária.
-for o in "$raiz"/.apk-old.*; do
-  [ -d "$o" ] || continue
-  if [ ! -e "$raiz/apk" ]; then mv "$o" "$raiz/apk"; else rm -rf "$o"; fi
+# Sobras de uma execução morta à força (kill -9): só o conjunto apontado por apk/ é guardado, o resto sai.
+rm -f "$raiz"/.apk-link.*
+atual=""
+if [ -L "$raiz/apk" ]; then atual="$(basename "$(readlink "$raiz/apk")")"; fi
+for r in "$raiz"/.apk-releases/*; do
+  [ -e "$r" ] || continue
+  [ "$(basename "$r")" = "$atual" ] || rm -rf "$r"
 done
-rm -rf "$raiz"/.apk-staging.*
 
 # --- Java 17 a 21 (o plugin Android 8.4 exige 17 ou mais; o Gradle 8.7 roda até o 21) ----------
 command -v java >/dev/null 2>&1 || falha "Java não encontrado. Instale o JDK 17 (Cloud Shell já traz)."
@@ -190,8 +186,9 @@ echo "-> compilando: ${tarefas[*]}"
 "$gradle_cmd" -p android --no-daemon ${gradle_props[@]+"${gradle_props[@]}"} "${tarefas[@]}"
 
 # Cada variante pedida precisa ter exatamente um APK, não vazio, antes de qualquer coisa ir para apk/.
-# Os arquivos vão primeiro para uma pasta temporária (no mesmo disco, para o mv ser instantâneo).
-staging="$(mktemp -d "$raiz/.apk-staging.XXXXXX")"
+# Os arquivos vão primeiro para uma pasta de versão nova em .apk-releases/, que ainda não aparece em apk/.
+mkdir -p "$raiz/.apk-releases"
+staging="$(mktemp -d "$raiz/.apk-releases/r.XXXXXX")"
 for v in "${variantes[@]}"; do
   saida="android/app/build/outputs/apk/$v/debug"
   achados=()
@@ -203,17 +200,27 @@ for v in "${variantes[@]}"; do
   cp "${achados[0]}" "$staging/tchefood-$v-debug.apk"
 done
 
-# Tudo validado: troca a pasta apk/ inteira. Nada é apagado antes de o conjunto novo estar pronto ao lado;
-# se a troca falhar (ou o processo for interrompido), o conjunto anterior volta (ver `limpar`).
+# Tudo validado: apk/ é um link simbólico para a pasta da versão atual e a troca é uma única renomeação
+# (rename do link novo sobre o antigo), atômica no Linux e no macOS: quem lê apk/ vê sempre o conjunto anterior
+# inteiro ou o novo inteiro, nunca apk/ ausente nem um conjunto misto, mesmo se o processo morrer a qualquer momento.
 chmod 755 "$staging"
-old_apk="$raiz/.apk-old.$$"
-if [ -e "$raiz/apk" ]; then
-  mv "$raiz/apk" "$old_apk" || falha "não consegui guardar o apk/ atual; nada foi alterado"
+nome="$(basename "$staging")"
+if [ -d "$raiz/apk" ] && [ ! -L "$raiz/apk" ]; then
+  # apk/ de uma versão antiga do script era uma pasta de verdade: migra uma única vez para o formato de link
+  mv "$raiz/apk" "$raiz/.apk-releases/legado.$$" || falha "não consegui migrar o apk/ antigo; nada foi alterado"
+  ln -s ".apk-releases/legado.$$" "$raiz/apk" || falha "não consegui migrar o apk/ antigo"
 fi
-mv "$staging" "$raiz/apk" || falha "não consegui publicar o novo apk/; o conjunto anterior foi mantido"
+link_novo="$raiz/.apk-link.$$"
+ln -s ".apk-releases/$nome" "$link_novo" || falha "não consegui preparar o link do novo apk/; o conjunto anterior foi mantido"
+perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$link_novo" "$raiz/apk" \
+  || falha "não consegui publicar o novo apk/; o conjunto anterior foi mantido"
+link_novo=""
 staging=""
-rm -rf "$old_apk"
-old_apk=""
+# Só agora, com apk/ apontando para o conjunto novo, as versões antigas saem.
+for r in "$raiz"/.apk-releases/*; do
+  [ -e "$r" ] || continue
+  [ "$(basename "$r")" = "$nome" ] || rm -rf "$r"
+done
 for v in "${variantes[@]}"; do
   echo "OK: apk/tchefood-$v-debug.apk"
 done

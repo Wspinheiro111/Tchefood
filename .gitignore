@@ -7,3 +7,6 @@ android/build
 android/app/build
 android/local.properties
 /apk
+/.apk-releases
+/.apk-build.lock
+/.apk-link.*
