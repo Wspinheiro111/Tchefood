@@ -123,17 +123,17 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
     expect(kept.chains).toHaveLength(2);
   });
 
-  it('r3 2ª revisão: recusa do primeiro envio e devolução da posse só valem para a posse desta chamada, em "creating" e sem ordem', async () => {
+  it('r3 2ª e 3ª revisão: recusa do primeiro envio só vale para a posse desta chamada, em "creating" e sem ordem; não existe devolução de posse', async () => {
     const rej = fakeDb({ update: { ...ROW, status: 'rejected', raw_status: 'create_failed:terminal_busy' } });
     expect((await supabaseChargeStore(rej.db, TENANT).rejectFirstSend({ ...ROW, status: 'creating', dispatch_attempts: 1 }, 'terminal_busy')).status).toBe('rejected');
     expect(rej.chains[0]).toEqual(expect.arrayContaining(['eq:id,r1', `eq:tenant_id,${TENANT}`, 'eq:status,creating', 'eq:dispatch_attempts,1', 'is:external_order_id,null']));
     // Outra posse já foi dada: nada é gravado e volta a linha atual.
     const lost = fakeDb({ update: null, select: { ...ROW, status: 'creating', dispatch_attempts: 2 } });
     expect(await supabaseChargeStore(lost.db, TENANT).rejectFirstSend({ ...ROW, status: 'creating', dispatch_attempts: 1 }, 'terminal_busy')).toMatchObject({ status: 'creating', dispatch_attempts: 2 });
-    const rel = fakeDb({ update: { id: 'r1' } });
-    await supabaseChargeStore(rel.db, TENANT).releaseDispatch({ ...ROW, status: 'creating', dispatch_attempts: 2 });
-    expect(rel.chains).toHaveLength(1);
-    expect(rel.chains[0]).toEqual(expect.arrayContaining([`update:${JSON.stringify(['dispatch_lease_until', 'updated_at'])}`, 'eq:id,r1', `eq:tenant_id,${TENANT}`, 'eq:status,creating', 'eq:dispatch_attempts,2', 'is:external_order_id,null']));
+    // Terceira revisão: a posse nunca é devolvida antes da hora; o repositório nem tem como.
+    expect('releaseDispatch' in supabaseChargeStore(fakeDb({}).db, TENANT)).toBe(false);
+    // Nenhum método do repositório grava dispatch_lease_until direto: só as funções do banco mexem na posse.
+    expect(lost.chains.concat(rej.chains).every((c) => !c.some((x) => x.startsWith('update') && x.includes('dispatch_lease_until')))).toBe(true);
   });
 
   it('r3 2ª revisão: revisão manual do envio sem resposta e encerramento por prazo são decididos pelo banco', async () => {

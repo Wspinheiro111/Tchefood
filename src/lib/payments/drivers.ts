@@ -507,7 +507,8 @@ export function createDriver(params: { terminal: PosTerminal | null; chassis: Ch
       config: async () => (await import('../sync/useCloudSync')).freshCloudConfig(),
       fetch: (url, init) => fetch(url, init),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-      now: () => Date.now(),
+      // Relógio monotônico: ajuste da hora do aparelho no meio da cobrança não encurta nem estica os prazos.
+      now: () => (typeof performance !== 'undefined' ? performance.now() : Date.now()),
       timer: (ms) => new Promise((r) => setTimeout(r, ms)),
       operator: async () => (await import('../../store/useTcheStore')).useTcheStore.getState().currentUserId,
       // A conta precisa estar no servidor (ele confere conta aberta e saldo antes de cobrar).

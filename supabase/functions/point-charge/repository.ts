@@ -162,21 +162,6 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
       if (!current) throw new Error('Cobrança não encontrada para gravar a recusa.');
       return current;
     },
-    async releaseDispatch(row: TerminalChargeRow): Promise<void> {
-      check(
-        await db
-          .from('terminal_charges')
-          .update({ dispatch_lease_until: new Date(0).toISOString(), updated_at: new Date().toISOString() })
-          .eq('id', row.id)
-          .eq('tenant_id', tenantId)
-          .eq('status', 'creating')
-          .eq('dispatch_attempts', row.dispatch_attempts)
-          .is('external_order_id', null)
-          .select('id')
-          .maybeSingle(),
-        'devolver a posse do envio',
-      );
-    },
     async settleDispatch(row: TerminalChargeRow): Promise<TerminalChargeRow> {
       check(await db.rpc('tchefood_settle_point_dispatch', { p_tenant: tenantId, p_id: row.id }), 'levar o envio sem resposta à revisão manual');
       const current = await this.findByKey(row.idempotency_key);

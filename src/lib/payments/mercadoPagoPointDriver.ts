@@ -180,8 +180,10 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     const b = parseObject(text);
     if (b && typeof b.error === 'string') error = b.error;
     if (b && typeof b.message === 'string') message = b.message;
-    // 5xx, 401 (sessão vencida no meio) e afins não provam nada sobre a maquininha.
-    if (res.status >= 500 || res.status === 401) return { kind: 'unknown' };
+    // 5xx, 401 (sessão vencida no meio), 408/425/429 (podem vir de um proxy depois de repassar o pedido) e
+    // qualquer resposta que não seja da própria função (sem o campo "error") não provam nada sobre a maquininha.
+    if (res.status >= 500 || res.status === 401 || res.status === 408 || res.status === 425 || res.status === 429) return { kind: 'unknown' };
+    if (!b || typeof b.error !== 'string') return { kind: 'unknown' };
     return { kind: 'rejected', httpStatus: res.status, error, message };
   }
 

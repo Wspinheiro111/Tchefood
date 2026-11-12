@@ -29,6 +29,12 @@ const INACTIVE = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const OTHER_STAFF = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const ORDER3 = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const MANAGER_PIN = '8642';
+const OTHER_TERMINAL = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+const OTHER_MP_ID = 'OUTRA-POINT';
+const ORDER4 = 'abababab-abab-4bab-8bab-abababababab';
+const ORDER5 = 'cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd';
+const EX_MANAGER = 'e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1';
+const OTHER_MANAGER = 'e2e2e2e2-e2e2-4e2e-8e2e-e2e2e2e2e2e2';
 
 function applySchema(t: PgTarget, db: string): void {
   createSupabaseLikeDb(t, db);
@@ -175,16 +181,19 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
          INSERT INTO staff_users (id, tenant_id, name, role, pin_code, active) VALUES ('${INACTIVE}', '${TENANT}', 'Saiu', 'CASHIER', '7777', false);
          INSERT INTO dining_tables (id, tenant_id, number, label) VALUES ('${TABLE}', '${TENANT}', 1, 'Mesa 1');
          INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${TERMINAL}', '${TENANT}', 'Point Smart', '${MP_ID}', 'MERCADO_PAGO'),
-                ('${STONE_TERMINAL}', '${TENANT}', 'Stone 01', 'STONE-01', 'STONE');
+                ('${STONE_TERMINAL}', '${TENANT}', 'Stone 01', 'STONE-01', 'STONE'), ('${OTHER_TERMINAL}', '${OTHER}', 'Point da outra', '${OTHER_MP_ID}', 'MERCADO_PAGO');
+         INSERT INTO staff_users (id, tenant_id, name, role, pin_code, active) VALUES ('${EX_MANAGER}', '${TENANT}', 'Gerente que saiu', 'MANAGER', '3197', false),
+                ('${OTHER_MANAGER}', '${OTHER}', 'Gerente da outra', 'MANAGER', '9753', true);
          INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER}', '${TENANT}', '${TABLE}', '${STAFF}');
          INSERT INTO payment_provider_secrets (tenant_id, provider, access_token) VALUES ('${TENANT}', 'mercado_pago_point', 'APP_USR-segredo');
          INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER2}', '${TENANT}', '${TABLE}', '${STAFF}'), ('${CLOSED}', '${TENANT}', '${TABLE}', '${STAFF}'),
-                ('${ORDER3}', '${TENANT}', '${TABLE}', '${STAFF}');`);
+                ('${ORDER3}', '${TENANT}', '${TABLE}', '${STAFF}'), ('${ORDER4}', '${TENANT}', '${TABLE}', '${STAFF}'), ('${ORDER5}', '${TENANT}', '${TABLE}', '${STAFF}');`);
     // ORDER3 tem saldo folgado: dezenas de cobranças de teste ficam em andamento nela, reservando.
     // Saldo de R$ 50,00 na ORDER2 sem montar itens (os totais só mudam pelo recálculo do banco).
     sql(`BEGIN; SET LOCAL session_replication_role = replica;
          UPDATE orders SET total_amount = 50, remaining_balance = 50 WHERE id = '${ORDER2}';
-         UPDATE orders SET total_amount = 100000, remaining_balance = 100000 WHERE id = '${ORDER3}';
+         UPDATE orders SET total_amount = 100000, remaining_balance = 100000 WHERE id IN ('${ORDER3}', '${ORDER5}');
+         UPDATE orders SET total_amount = 50, remaining_balance = 50 WHERE id = '${ORDER4}';
          UPDATE orders SET total_amount = 50, remaining_balance = 50, status = 'CLOSED' WHERE id = '${CLOSED}';
          COMMIT;`);
   }, 120_000);
@@ -294,7 +303,8 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     it('conta inexistente, de outra loja ou fechada: recusa com código e não grava', () => {
       const missing = open('rpc-missing', '12345678-1234-4234-8234-123456789012', 100);
       expect(missing).toMatchObject({ ok: false, sqlstate: 'TF001' });
-      const other = psql(target!, `SELECT tchefood_open_terminal_charge('${OTHER}', 'rpc-other', '${ORDER2}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${OTHER_STAFF}');`, DB);
+      // Outra loja, com a maquininha e o operador DELA, pedindo a conta desta: a conta não é dela (TF001).
+      const other = psql(target!, `SELECT tchefood_open_terminal_charge('${OTHER}', 'rpc-other', '${ORDER2}', '${OTHER_TERMINAL}', '${OTHER_MP_ID}', 'CREDIT', 100, '${OTHER_STAFF}');`, DB);
       expect(other).toMatchObject({ ok: false, sqlstate: 'TF001' });
       expect(open('rpc-closed', CLOSED, 100)).toMatchObject({ ok: false, sqlstate: 'TF002' });
       expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key LIKE 'rpc-%'`)).toBe('0');
@@ -836,8 +846,6 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     }, 120_000);
 
     it('auditoria r3 P1-01: chave que já é de uma loja não é bloqueada nem lida por outra, mesmo com maquininha e operador da outra (TF005)', () => {
-      const OTHER_TERMINAL = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
-      sql(`INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${OTHER_TERMINAL}', '${OTHER}', 'Point da outra', 'OUTRA-POINT', 'MERCADO_PAGO');`);
       const before = sql(`SELECT id || '|' || tenant_id || '|' || status || '|' || cancel_requested_by FROM terminal_charges WHERE idempotency_key = 'blk-ok'`);
       const stolen = psql(target!, `SELECT tchefood_block_point_key('${OTHER}', 'blk-ok', '${ORDER3}', '${OTHER_TERMINAL}', 'OUTRA-POINT', 'CREDIT', 100, '${OTHER_STAFF}');`, DB);
       expect(stolen).toMatchObject({ ok: false, sqlstate: 'TF005' });
@@ -878,6 +886,255 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       }
       expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = 'blk-dev'`)).toBe('0');
     });
+  });
+
+  describe('auditoria r3, terceira revisão: loja, chave, reserva, gatilho e relógio', () => {
+    const openAs = (tenant: string, key: string, order: string, terminal: string, serial: string, cents: number, staff: string) =>
+      psql(target!, `SELECT tchefood_open_terminal_charge('${tenant}', '${key}', '${order}', '${terminal}', '${serial}', 'CREDIT', ${cents}, '${staff}');`, DB);
+    const open = (key: string, order: string, cents: number) => openAs(TENANT, key, order, TERMINAL, MP_ID, cents, STAFF);
+    const field = (key: string, expr: string) => sql(`SELECT ${expr} FROM terminal_charges WHERE idempotency_key = '${key}'`);
+    const idOf = (key: string) => `(SELECT id FROM terminal_charges WHERE idempotency_key = '${key}')`;
+    const set = (key: string, what: string) => psql(target!, `UPDATE terminal_charges SET ${what} WHERE idempotency_key = '${key}';`, DB);
+
+    it('auditoria r3, terceira revisão: chave que já é de OUTRA loja não abre cobrança, não devolve o id dela e não grava nada (TF005)', () => {
+      const theirs = psql(target!, `SELECT tchefood_block_point_key('${OTHER}', 't3-alheia', '${ORDER5}', '${OTHER_TERMINAL}', '${OTHER_MP_ID}', 'CREDIT', 100, '${OTHER_STAFF}');`, DB);
+      expect(theirs.ok, theirs.message ?? '').toBe(true);
+      const before = field('t3-alheia', `id || '|' || tenant_id || '|' || status || '|' || updated_at`);
+      const r = open('t3-alheia', ORDER5, 100);
+      expect(r).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(r.out).toBe('');
+      expect(r.out).not.toContain(theirs.out);
+      expect(field('t3-alheia', `id || '|' || tenant_id || '|' || status || '|' || updated_at`)).toBe(before);
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = 't3-alheia'`)).toBe('1');
+      // E a conta desta loja não ficou com nada reservado por causa da tentativa.
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE tenant_id = '${TENANT}' AND idempotency_key = 't3-alheia'`)).toBe('0');
+    });
+
+    it('auditoria r3, terceira revisão: maquininha de outra loja não abre cobrança nesta (TF005), nem a desta abre na outra', () => {
+      expect(openAs(TENANT, 't3-maq', ORDER5, OTHER_TERMINAL, OTHER_MP_ID, 100, STAFF)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(openAs(OTHER, 't3-maq', ORDER5, TERMINAL, MP_ID, 100, OTHER_STAFF)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(openAs(TENANT, 't3-maq', ORDER5, '12345678-1234-4234-8234-123456789012', MP_ID, 100, STAFF)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = 't3-maq'`)).toBe('0');
+    });
+
+    it('auditoria r3, terceira revisão: bloqueio (conta A) e criação (conta B) da mesma chave ao mesmo tempo, 6 rodadas: nenhum erro de chave duplicada, uma linha só', async () => {
+      // Contas diferentes = travas diferentes: as duas gravações chegam juntas no índice único da chave.
+      for (let round = 0; round < 6; round += 1) {
+        const key = `t3-duas-${round}`;
+        const out = await together(8, (i) => (i % 2
+          ? `SELECT tchefood_block_point_key('${TENANT}', '${key}', '${ORDER3}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${STAFF}');`
+          : `SELECT tchefood_open_terminal_charge('${TENANT}', '${key}', '${ORDER5}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${STAFF}');`));
+        expect(lastOverlap).toBe(8);
+        // together() derruba o teste se alguma sessão der erro (23505 incluído). Todas devolvem a MESMA linha.
+        expect(new Set(out).size, key).toBe(1);
+        expect(out[0]).toMatch(/^[0-9a-f-]{36}$/);
+        expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = '${key}'`)).toBe('1');
+        expect(['creating|' + ORDER5, 'cancelled|' + ORDER3]).toContain(field(key, `status || '|' || order_id`));
+      }
+    }, 90_000);
+
+    it('auditoria r3, terceira revisão: cobrança na maquininha (at_terminal) reserva o saldo; aprovada COM pagamento gravado deixa de reservar', () => {
+      // ORDER4 tem R$ 50,00. 30,00 esperando o cartão na maquininha: 20,01 não cabe, 20,00 cabe.
+      expect(open('t3-res-a', ORDER4, 3000).ok).toBe(true);
+      sql(`UPDATE terminal_charges SET status = 'at_terminal', external_order_id = 'ORDT3A' WHERE idempotency_key = 't3-res-a';`);
+      expect(open('t3-res-b', ORDER4, 2001)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      const b = open('t3-res-b', ORDER4, 2000);
+      expect(b.ok, b.message ?? '').toBe(true);
+      // A de 30,00 expira na maquininha (libera) e a de 20,00 é aprovada, ainda sem pagamento gravado: reserva 20,00.
+      sql(`UPDATE terminal_charges SET status = 'expired' WHERE idempotency_key = 't3-res-a';
+           UPDATE terminal_charges SET status = 'approved', external_order_id = 'ORDT3B', external_payment_id = '880022', paid_amount_cents = 2000, card_brand = 'VISA', authorization_code = 'T3B'
+            WHERE idempotency_key = 't3-res-b';`);
+      expect(open('t3-res-c', ORDER4, 3001)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      // O pagamento aprovado da mesma chave entra. Sem itens na conta, o recálculo do banco zera os totais; o
+      // saldo é remontado (dono do banco, sem gatilhos) em R$ 30,00 = 50,00 menos os 20,00 pagos.
+      const paid = pay('t3-res-b', { order_id: ORDER4, amount: 20, nsu: '880022', authorization_code: 'T3B' });
+      expect(paid.ok, paid.message ?? '').toBe(true);
+      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE orders SET total_amount = 50, remaining_balance = 30 WHERE id = '${ORDER4}'; COMMIT;`);
+      // Se a aprovada ainda reservasse, só caberiam 10,00. Cabem os 30,00 inteiros, e nem 1 centavo a mais.
+      expect(open('t3-res-c', ORDER4, 3001)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      const c = open('t3-res-c', ORDER4, 3000);
+      expect(c.ok, c.message ?? '').toBe(true);
+    });
+
+    it.each(['cancelled', 'expired', 'refunded', 'rejected', 'approved'])('auditoria r3, terceira revisão: cobrança "%s" é final: nenhum campo muda mais', (status) => {
+      const receipt: Record<string, string | number | null> = status === 'approved' ? {} : { external_payment_id: null, paid_amount_cents: null, card_brand: null, authorization_code: null };
+      const key = charge({ status, ...receipt });
+      for (const what of [`status = 'at_terminal'`, `status = 'manual_review'`, `status = 'creating'`, `raw_status = 'x'`, `external_order_id = 'OUTRA'`, `updated_at = NOW()`]) {
+        const r = set(key, what);
+        expect(r.ok, `${status}: ${what}`).toBe(false);
+        expect(r.message, `${status}: ${what}`).toContain('não muda mais');
+      }
+      expect(field(key, 'status')).toBe(status);
+    });
+
+    it('auditoria r3, terceira revisão: chave, loja, maquininha e operador da cobrança não mudam (cobrança ainda em andamento)', () => {
+      const key = 't3-ident';
+      expect(open(key, ORDER5, 100).ok).toBe(true);
+      const before = field(key, `idempotency_key || '|' || tenant_id || '|' || terminal_id || '|' || provider || '|' || created_by`);
+      for (const what of [`idempotency_key = 't3-ident-x'`, `tenant_id = '${OTHER}'`, `terminal_id = '${STONE_TERMINAL}'`, `created_by = '${MANAGER}'`, `created_by = NULL`]) {
+        const r = set(key, what);
+        expect(r.ok, what).toBe(false);
+        expect(r.message, what).toContain('não mudam');
+      }
+      // "provider" só aceita um valor (regra da tabela), então a troca já morre antes do gatilho; aqui fica a prova de que não muda.
+      expect(set(key, `provider = 'outro'`).ok).toBe(false);
+      expect(field(key, `idempotency_key || '|' || tenant_id || '|' || terminal_id || '|' || provider || '|' || created_by`)).toBe(before);
+      // Operador gravado como NULL (linha antiga) também não ganha operador depois.
+      const anon = charge({ status: 'pending', created_by: null, external_payment_id: null, paid_amount_cents: null, card_brand: null, authorization_code: null });
+      expect(set(anon, `created_by = '${STAFF}'`).message).toContain('não mudam');
+    });
+
+    it('auditoria r3, terceira revisão: virar "approved" por UPDATE exige o comprovante inteiro; campo vazio ou só com espaços não conta', () => {
+      const key = charge({ status: 'at_terminal', external_payment_id: null, paid_amount_cents: null, card_brand: null, authorization_code: null });
+      const full = { external_payment_id: `'990011'`, paid_amount_cents: '1000', card_brand: `'VISA'`, authorization_code: `'T3OK'` };
+      const approve = (over: Record<string, string>) => {
+        const v = { ...full, ...over };
+        return set(key, `status = 'approved', ${Object.entries(v).map(([k, x]) => `${k} = ${x}`).join(', ')}`);
+      };
+      const overs: Record<string, string>[] = [
+        { external_payment_id: 'NULL' }, { external_payment_id: `''` }, { external_payment_id: `'   '` },
+        { authorization_code: 'NULL' }, { authorization_code: `''` }, { authorization_code: `'  '` },
+        { card_brand: 'NULL' }, { card_brand: `''` }, { card_brand: `' '` },
+        { paid_amount_cents: 'NULL' }, { paid_amount_cents: '999' },
+      ];
+      for (const over of overs) {
+        const r = approve(over);
+        expect(r.ok, JSON.stringify(over)).toBe(false);
+        expect(r.message, JSON.stringify(over)).toContain('comprovante completo');
+      }
+      expect(field(key, 'status')).toBe('at_terminal');
+      // Na criação da linha vale o mesmo.
+      expect(() => charge({ external_payment_id: '' })).toThrow(/comprovante completo/);
+      expect(() => charge({ authorization_code: ' ' })).toThrow(/comprovante completo/);
+      // Com tudo, aprova.
+      const ok = approve({});
+      expect(ok.ok, ok.message ?? '').toBe(true);
+      expect(field(key, 'status')).toBe('approved');
+    });
+
+    it('auditoria r3, terceira revisão: motivo e hora do encerramento andam juntos (um sem o outro é recusado pela tabela)', () => {
+      const key = 't3-par';
+      expect(open(key, ORDER5, 100).ok).toBe(true);
+      for (const what of [`cancel_reason = 'timeout'`, `cancel_requested_at = NOW()`]) {
+        const r = set(key, what);
+        expect(r.ok, what).toBe(false);
+        expect(r.message, what).toContain('terminal_charges_cancel_pair_check');
+      }
+      expect(field(key, 'cancel_reason IS NULL AND cancel_requested_at IS NULL')).toBe('t');
+      // Na criação da linha também.
+      expect(() => charge({ status: 'pending', cancel_reason: 'timeout', external_payment_id: null, paid_amount_cents: null, card_brand: null, authorization_code: null }))
+        .toThrow(/terminal_charges_cancel_pair_check/);
+      // Os dois juntos entram; depois, tirar só um deles não passa (gatilho ou regra da tabela).
+      expect(set(key, `cancel_reason = 'timeout', cancel_requested_at = NOW()`).ok).toBe(true);
+      expect(set(key, `cancel_reason = NULL`).ok).toBe(false);
+      expect(set(key, `cancel_requested_at = NULL`).ok).toBe(false);
+      expect(set(key, `cancel_reason = NULL, cancel_requested_at = NULL`).ok).toBe(false);
+      expect(field(key, `cancel_reason || '|' || (cancel_requested_at IS NOT NULL)`)).toBe('timeout|true');
+    });
+
+    it('auditoria r3, terceira revisão: o aparelho não grava registro da Point em audit_logs (encerramento autorizado nem bloqueio de chave)', () => {
+      const insert = (action: string, tenant = TENANT, staff = STAFF) =>
+        asDevice(`INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata) VALUES ('${tenant}', '${staff}', '${action}', 'forjado pelo aparelho', '{"idempotency_key":"t3-forjada"}')`, tenant);
+      for (const action of ['POINT_CHARGE_CANCELED', 'POINT_KEY_BLOCKED']) {
+        const r = insert(action);
+        expect(r.ok, action).toBe(false);
+        expect(r.message, action).toContain('registro da Point só é gravado pelo servidor');
+        const anon = psql(target!, `BEGIN; SET LOCAL ROLE anon; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);
+          INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason) VALUES ('${TENANT}', '${STAFF}', '${action}', 'forjado'); COMMIT;`, DB);
+        expect(anon.ok, `anon ${action}`).toBe(false);
+      }
+      expect(sql(`SELECT count(*) FROM audit_logs WHERE metadata->>'idempotency_key' = 't3-forjada'`)).toBe('0');
+      // Um registro comum do aparelho continua entrando, e não vira registro da Point depois.
+      const plain = insert('T3_REGISTRO_COMUM');
+      expect(plain.ok, plain.message ?? '').toBe(true);
+      const turn = asDevice(`UPDATE audit_logs SET action_type = 'POINT_CHARGE_CANCELED' WHERE action_type = 'T3_REGISTRO_COMUM'`);
+      expect(turn.ok).toBe(false);
+      expect(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'T3_REGISTRO_COMUM'`)).toBe('1');
+      // As funções do servidor seguem gravando os dois tipos (provado nos testes do bloqueio e do PIN).
+    });
+
+    it('auditoria r3, terceira revisão: a barreira que ESPEROU a trava da linha decide com a hora de depois da espera: posse vencida no meio = não manda', async () => {
+      const key = 't3-relogio-posse';
+      expect(open(key, ORDER5, 100).ok).toBe(true);
+      // Posse de 2 s. Uma sessão segura a linha; a barreira entra ANTES de a posse vencer e fica parada na trava.
+      expect(psql(target!, `SELECT tchefood_claim_point_dispatch('${TENANT}', ${idOf(key)}, 2000);`, DB).out).toBe('1');
+      const before = waiting();
+      const holder = session();
+      holder.send(`BEGIN; SELECT id FROM terminal_charges WHERE idempotency_key = '${key}' FOR UPDATE; SELECT 'held';`);
+      await until('trava da linha', () => holder.output().includes('held'));
+      const barrier = session();
+      barrier.end(`SELECT tchefood_begin_point_dispatch('${TENANT}', ${idOf(key)}, 1, 30000);`);
+      await until('barreira esperando a linha', () => waiting() === before + 1);
+      // Prova de que ela começou com a posse ainda em vigor (com NOW(), a hora do começo, ela passaria).
+      expect(field(key, 'dispatch_lease_until > clock_timestamp()')).toBe('t');
+      await until('posse vencida', () => field(key, 'dispatch_lease_until <= clock_timestamp()') === 't', 5_000);
+      expect(waiting()).toBe(before + 1);
+      holder.end('COMMIT;');
+      await holder.done;
+      expect((await barrier.done).split('\n').pop()).toBe('0');
+      expect(field(key, `(dispatched_at IS NULL) || '|' || dispatch_attempts`)).toBe('true|1');
+    }, 30_000);
+
+    it('auditoria r3, terceira revisão: posse pedida por quem ESPEROU a trava mais que o prazo dela nunca libera envio vencida (a barreira confere a hora de agora)', async () => {
+      const key = 't3-relogio-claim';
+      expect(open(key, ORDER5, 100).ok).toBe(true);
+      const before = waiting();
+      const holder = session();
+      holder.send(`BEGIN; SELECT id FROM terminal_charges WHERE idempotency_key = '${key}' FOR UPDATE; SELECT 'held';`);
+      await until('trava da linha', () => holder.output().includes('held'));
+      const claimer = session();
+      claimer.end(`SELECT tchefood_claim_point_dispatch('${TENANT}', ${idOf(key)}, 1000);`);
+      await until('posse esperando a linha', () => waiting() === before + 1);
+      await pause(1_200); // mais que a posse de 1 s
+      holder.end('COMMIT;');
+      await holder.done;
+      expect((await claimer.done).split('\n').pop()).toBe('1');
+      // O prazo da posse pode ter sido calculado antes da espera (a linha só estava travada, não mudou). O que
+      // não pode é envio sair com posse vencida: a barreira passa se, e só se, a posse ainda vale agora.
+      const valid = field(key, `dispatch_lease_until > clock_timestamp() + INTERVAL '300 milliseconds'`) === 't';
+      const expired = field(key, 'dispatch_lease_until <= clock_timestamp()') === 't';
+      expect(valid || expired, 'posse na beirada do prazo: rode de novo').toBe(true);
+      const barrier = psql(target!, `SELECT tchefood_begin_point_dispatch('${TENANT}', ${idOf(key)}, 1, 30000);`, DB);
+      expect(barrier.out).toBe(valid ? '1' : '0');
+      expect(field(key, '(dispatched_at IS NOT NULL)::text')).toBe(valid ? 'true' : 'false');
+    }, 30_000);
+
+    it('auditoria r3, terceira revisão: o encerramento por prazo que ESPEROU a trava decide com a hora de depois da espera (prazo vencido no meio = grava)', async () => {
+      const key = 't3-relogio-prazo';
+      expect(open(key, ORDER5, 100).ok).toBe(true);
+      // Faltam 2 s para o prazo de 1 min.
+      backdate(key, '58 seconds');
+      const before = waiting();
+      const holder = session();
+      holder.send(`BEGIN; SELECT id FROM terminal_charges WHERE idempotency_key = '${key}' FOR UPDATE; SELECT 'held';`);
+      await until('trava da linha', () => holder.output().includes('held'));
+      const timeout = session();
+      timeout.end(`SELECT tchefood_request_point_timeout('${TENANT}', ${idOf(key)}, 60000);`);
+      await until('encerramento esperando a linha', () => waiting() === before + 1);
+      // Começou antes do prazo (com NOW() responderia 0, "cedo demais").
+      expect(field(key, `created_at + INTERVAL '60 seconds' > clock_timestamp()`)).toBe('t');
+      await until('prazo vencido', () => field(key, `created_at + INTERVAL '60 seconds' <= clock_timestamp()`) === 't', 6_000);
+      holder.end('COMMIT;');
+      await holder.done;
+      expect((await timeout.done).split('\n').pop()).toBe('1');
+      // A hora gravada é a de depois da espera: nunca antes do prazo.
+      expect(field(key, `cancel_reason || '|' || (cancel_requested_at >= created_at + INTERVAL '60 seconds')`)).toBe('timeout|true');
+    }, 30_000);
+
+    it('auditoria r3, terceira revisão: a hora do encerramento com PIN é a de quando gravou, nunca anterior ao envio que passou na frente', async () => {
+      const key = 't3-relogio-pin';
+      expect(open(key, ORDER5, 100).ok).toBe(true);
+      expect(psql(target!, `SELECT tchefood_claim_point_dispatch('${TENANT}', ${idOf(key)}, 30000);`, DB).out).toBe('1');
+      // Na trava da linha: primeiro a barreira, depois o PIN do gerente. A barreira passa (1) e o encerramento grava depois.
+      const out = await contend(`SELECT id FROM terminal_charges WHERE idempotency_key = '${key}' FOR UPDATE`, [
+        `SELECT tchefood_begin_point_dispatch('${TENANT}', ${idOf(key)}, 1, 30000);`,
+        `SELECT (tchefood_authorize_point_cancel('${TENANT}', '${key}', '${STAFF}', '${MANAGER_PIN}', 'cliente desistiu') IS NOT NULL)::text;`,
+      ]);
+      expect(lastOverlap).toBe(2);
+      expect(out).toEqual(['1', 'true']);
+      // Com NOW() (hora do começo da transação, antes da espera) o encerramento ficaria gravado ANTES do envio.
+      expect(field(key, 'cancel_requested_at >= dispatched_at')).toBe('t');
+    }, 30_000);
   });
 
   describe('auditoria r2 P1-01: encerrar pelo operador só com PIN de gerente conferido no banco', () => {
@@ -979,6 +1236,29 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         expect(sql(`SELECT count(*) FROM audit_logs WHERE metadata->>'idempotency_key' = '${key}'`)).toBe('0');
         expect(sql(`SELECT cancel_reason IS NULL AND cancel_audit_id IS NULL FROM terminal_charges WHERE idempotency_key = '${key}'`)).toBe('t');
       }
+    });
+
+    it('auditoria r3, terceira revisão: PIN de quem não é gerente, de gerente inativo e de gerente de outra loja não autoriza nada', () => {
+      expect(open('pin-roles').ok).toBe(true);
+      // Cada tentativa grava uma falha, e 3 em 60 s bloqueiam a loja. Para este teste e o seguinte (o do bloqueio)
+      // partirem do zero, as falhas são apagadas pelo dono do banco, sem gatilhos, antes e depois.
+      const clear = () => sql(`BEGIN; SET LOCAL session_replication_role = replica; DELETE FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'; COMMIT;`);
+      clear();
+      // 5162 = caixa ativo desta loja; 3197 = gerente desta loja que saiu; 9753 = gerente ativo da outra loja.
+      for (const pin of ['5162', '3197', '9753']) {
+        const r = authorize('pin-roles', pin);
+        expect(r.ok, r.message ?? '').toBe(true);
+        expect(r.out, pin).toBe('');
+      }
+      // As três foram recusadas pelo PIN (não pelo bloqueio, que só entra na quarta).
+      expect(audits('MANAGER_PIN_FAILED', 'pin-roles')).toBe('3');
+      expect(audits('MANAGER_PIN_LOCKOUT', 'pin-roles')).toBe('0');
+      expect(audits('POINT_CHARGE_CANCELED', 'pin-roles')).toBe('0');
+      expect(sql(`SELECT cancel_reason IS NULL AND cancel_authorized_by IS NULL AND cancel_audit_id IS NULL FROM terminal_charges WHERE idempotency_key = 'pin-roles'`)).toBe('t');
+      clear();
+      // Sem as falhas, o PIN do gerente ativo desta loja autoriza a mesma cobrança.
+      expect(authorize('pin-roles', MANAGER_PIN).out).toMatch(/^[0-9a-f-]{36}$/);
+      expect(sql(`SELECT cancel_authorized_by FROM terminal_charges WHERE idempotency_key = 'pin-roles'`)).toBe(MANAGER);
     });
 
     // Por último: 3 PINs errados bloqueiam a loja por 60 s.

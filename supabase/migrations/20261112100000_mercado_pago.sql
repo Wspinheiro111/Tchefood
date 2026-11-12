@@ -103,6 +103,9 @@ ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS cancel_authorized_by UUID 
 ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS cancel_audit_id UUID REFERENCES audit_logs(id);
 ALTER TABLE terminal_charges DROP CONSTRAINT IF EXISTS terminal_charges_cancel_reason_check;
 ALTER TABLE terminal_charges ADD CONSTRAINT terminal_charges_cancel_reason_check CHECK (cancel_reason IN ('timeout', 'operator', 'void'));
+-- Motivo e hora do encerramento andam juntos: não existe um sem o outro.
+ALTER TABLE terminal_charges DROP CONSTRAINT IF EXISTS terminal_charges_cancel_pair_check;
+ALTER TABLE terminal_charges ADD CONSTRAINT terminal_charges_cancel_pair_check CHECK ((cancel_reason IS NULL) = (cancel_requested_at IS NULL));
 CREATE INDEX IF NOT EXISTS idx_terminal_charges_order ON terminal_charges(tenant_id, order_id);
 ALTER TABLE terminal_charges ENABLE ROW LEVEL SECURITY;
 
@@ -136,8 +139,9 @@ BEGIN
     END IF;
     IF TG_OP = 'UPDATE' AND (NEW.idempotency_key <> OLD.idempotency_key OR NEW.tenant_id <> OLD.tenant_id OR NEW.order_id <> OLD.order_id
        OR NEW.terminal_id <> OLD.terminal_id OR NEW.method <> OLD.method OR NEW.amount_cents <> OLD.amount_cents
-       OR NEW.external_terminal_id <> OLD.external_terminal_id) THEN
-        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: conta, maquininha, forma e valor da cobrança não mudam.';
+       OR NEW.external_terminal_id <> OLD.external_terminal_id OR NEW.provider <> OLD.provider
+       OR NEW.created_by IS DISTINCT FROM OLD.created_by) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: conta, maquininha, forma, valor e operador da cobrança não mudam.';
     END IF;
     -- A hora gravada da cobrança é a base do prazo de espera: não muda.
     IF TG_OP = 'UPDATE' AND NEW.created_at IS DISTINCT FROM OLD.created_at THEN
@@ -152,7 +156,7 @@ BEGIN
         IF NEW.cancel_requested_at IS NULL OR NEW.cancel_reason IS NULL THEN
             RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o encerramento da cobrança % já foi registrado.', OLD.idempotency_key;
         END IF;
-        IF NOT (OLD.cancel_reason = 'timeout' AND NEW.cancel_reason = 'operator')
+        IF NOT (OLD.cancel_reason IS NOT DISTINCT FROM 'timeout' AND NEW.cancel_reason IS NOT DISTINCT FROM 'operator')
            AND (NEW.cancel_requested_at IS DISTINCT FROM OLD.cancel_requested_at OR NEW.cancel_reason IS DISTINCT FROM OLD.cancel_reason
                 OR NEW.cancel_requested_by IS DISTINCT FROM OLD.cancel_requested_by OR NEW.cancel_authorized_by IS DISTINCT FROM OLD.cancel_authorized_by
                 OR NEW.cancel_audit_id IS DISTINCT FROM OLD.cancel_audit_id) THEN
@@ -179,7 +183,8 @@ BEGIN
     IF NEW.cancel_reason = 'operator' AND (NEW.cancel_authorized_by IS NULL OR NEW.cancel_audit_id IS NULL OR NEW.cancel_requested_by IS NULL) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: encerramento pelo operador sem autorização de gerente.';
     END IF;
-    IF NEW.status = 'approved' AND (NEW.external_payment_id IS NULL OR NEW.authorization_code IS NULL OR NEW.card_brand IS NULL
+    IF NEW.status = 'approved' AND (NULLIF(btrim(NEW.external_payment_id), '') IS NULL OR NULLIF(btrim(NEW.authorization_code), '') IS NULL
+       OR NULLIF(btrim(NEW.card_brand), '') IS NULL
        OR NEW.paid_amount_cents IS DISTINCT FROM NEW.amount_cents) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: aprovado sem comprovante completo (pagamento, autorização, bandeira e valor pago).';
     END IF;
@@ -187,8 +192,8 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS trg_terminal_charges_final ON terminal_charges;
-CREATE TRIGGER trg_terminal_charges_final BEFORE INSERT OR UPDATE ON terminal_charges
+-- CREATE OR REPLACE: reaplicar o arquivo não deixa a tabela um instante sem o gatilho.
+CREATE OR REPLACE TRIGGER trg_terminal_charges_final BEFORE INSERT OR UPDATE ON terminal_charges
     FOR EACH ROW EXECUTE FUNCTION tchefood_terminal_charge_guard();
 
 -- -----------------------------------------------------------------------------
@@ -214,7 +219,11 @@ BEGIN
     IF p_created_by IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_created_by AND u.tenant_id = p_tenant AND u.active) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
     END IF;
-    SELECT id INTO v_id FROM terminal_charges WHERE idempotency_key = p_key;
+    -- A maquininha precisa ser desta loja.
+    IF NOT EXISTS (SELECT 1 FROM pos_terminals t WHERE t.id = p_terminal AND t.tenant_id = p_tenant) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: maquininha não encontrada nesta loja.' USING ERRCODE = 'TF005';
+    END IF;
+    SELECT id INTO v_id FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant;
     IF FOUND THEN
         RETURN v_id; -- reenvio: o chamador confere se é o mesmo pedido
     END IF;
@@ -223,7 +232,7 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a conta ainda não está no servidor. Aguarde a sincronização e cobre de novo.' USING ERRCODE = 'TF001';
     END IF;
     -- Dois envios da mesma chave: o segundo espera a conta e, ao entrar, a cobrança já existe.
-    SELECT id INTO v_id FROM terminal_charges WHERE idempotency_key = p_key;
+    SELECT id INTO v_id FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant;
     IF FOUND THEN
         RETURN v_id;
     END IF;
@@ -243,7 +252,16 @@ BEGIN
     END IF;
     INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status, created_by)
     VALUES (p_tenant, p_key, p_order, p_terminal, 'mercado_pago_point', p_external_terminal, p_method, p_amount_cents, 'creating', p_created_by)
+    ON CONFLICT (idempotency_key) DO NOTHING
     RETURNING id INTO v_id;
+    IF v_id IS NULL THEN
+        -- A chave foi gravada no meio (bloqueio preventivo com outra conta, ou outra loja): devolve a desta
+        -- loja para o chamador conferir; de outra loja, não devolve nada.
+        SELECT id INTO v_id FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant;
+        IF v_id IS NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_COBRANCA: chave de cobrança indisponível.' USING ERRCODE = 'TF005';
+        END IF;
+    END IF;
     RETURN v_id;
 END;
 $$;
@@ -324,7 +342,7 @@ BEGIN
             jsonb_build_object('idempotency_key', p_key, 'charge_status', v_charge.status, 'manager_name', v_manager.name, 'server_verified', true))
     RETURNING id INTO v_id;
     UPDATE terminal_charges
-       SET cancel_reason = 'operator', cancel_requested_by = p_performed_by, cancel_requested_at = NOW(),
+       SET cancel_reason = 'operator', cancel_requested_by = p_performed_by, cancel_requested_at = clock_timestamp(),
            cancel_authorized_by = v_manager.id, cancel_audit_id = v_id, updated_at = NOW()
      WHERE id = v_charge.id;
     GET DIAGNOSTICS v_rows = ROW_COUNT;
@@ -354,19 +372,23 @@ CREATE OR REPLACE FUNCTION tchefood_claim_point_dispatch(p_tenant UUID, p_id UUI
 RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
-    v_attempt INT;
+    v_charge terminal_charges%ROWTYPE;
 BEGIN
     IF p_lease_ms IS NULL OR p_lease_ms < 1000 OR p_lease_ms > 600000 THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: prazo de posse inválido.';
     END IF;
+    -- Trava a linha primeiro: a conferência e o prazo da posse usam a hora de depois da espera.
+    SELECT * INTO v_charge FROM terminal_charges WHERE id = p_id AND tenant_id = p_tenant FOR UPDATE;
+    IF NOT FOUND OR v_charge.status <> 'creating' OR v_charge.external_order_id IS NOT NULL OR v_charge.cancel_requested_at IS NOT NULL
+       OR (v_charge.dispatch_lease_until IS NOT NULL AND v_charge.dispatch_lease_until > clock_timestamp())
+       OR v_charge.dispatch_attempts >= 8 THEN
+        RETURN 0;
+    END IF;
     UPDATE terminal_charges
        SET dispatch_lease_until = clock_timestamp() + make_interval(secs => p_lease_ms / 1000.0),
            dispatch_attempts = dispatch_attempts + 1, updated_at = clock_timestamp()
-     WHERE id = p_id AND tenant_id = p_tenant AND status = 'creating' AND external_order_id IS NULL
-       AND cancel_requested_at IS NULL AND (dispatch_lease_until IS NULL OR dispatch_lease_until <= clock_timestamp())
-       AND dispatch_attempts < 8
-    RETURNING dispatch_attempts INTO v_attempt;
-    RETURN COALESCE(v_attempt, 0);
+     WHERE id = v_charge.id;
+    RETURN v_charge.dispatch_attempts + 1;
 END;
 $$;
 
@@ -484,6 +506,20 @@ BEGIN
 END;
 $$;
 
+-- Os registros da Point em audit_logs (encerramento autorizado e bloqueio de chave) só são gravados pelas
+-- funções acima. O aparelho (anon/authenticated) não consegue forjar um.
+CREATE OR REPLACE FUNCTION tchefood_guard_point_audit()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.action_type IN ('POINT_CHARGE_CANCELED', 'POINT_KEY_BLOCKED') AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: registro da Point só é gravado pelo servidor.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE TRIGGER trg_audit_logs_point BEFORE INSERT OR UPDATE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION tchefood_guard_point_audit();
+
 DO $$
 DECLARE
     v_fn TEXT;
@@ -544,6 +580,6 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS trg_payments_mercado_pago ON payments;
-CREATE TRIGGER trg_payments_mercado_pago BEFORE INSERT OR UPDATE ON payments
+-- CREATE OR REPLACE: reaplicar o arquivo não deixa a tabela um instante sem o gatilho.
+CREATE OR REPLACE TRIGGER trg_payments_mercado_pago BEFORE INSERT OR UPDATE ON payments
     FOR EACH ROW EXECUTE FUNCTION tchefood_mercado_pago_payment_guard();

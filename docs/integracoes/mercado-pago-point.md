@@ -50,9 +50,10 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   3. A ordem devolvida é **ligada à cobrança assim que chega**, em qualquer estado não final (inclusive revisão
      manual), e só depois o resultado é conferido. Com o encerramento já pedido, ela é cancelada no Mercado Pago
      na mesma hora e vale o que ele responder.
-  Sem resposta do Mercado Pago (queda, prazo), a posse fica até vencer e só então a próxima consulta repete com a
-  **mesma chave** (o Mercado Pago devolve a ordem original). Se ele respondeu sem resultado (erro 5xx), a posse é
-  devolvida e a repetição vem na consulta seguinte. Recusa do pedido só vira "nada foi cobrado" no **primeiro**
+  Sem resultado do Mercado Pago (queda, prazo, erro 5xx, 408, 429, resposta ilegível), a posse **nunca é devolvida
+  antes da hora**: fica até vencer e só então a próxima consulta repete com a **mesma chave** (o Mercado Pago
+  devolve a ordem original). Se a resposta da barreira demorar mais de 10 s para chegar, o envio não sai (a
+  chamada poderia passar do fim da posse). Recusa do pedido só vira "nada foi cobrado" no **primeiro**
   envio; numa repetição (ou com conflito de idempotência) o envio anterior pode ter criado a ordem, e a cobrança
   segue como resultado desconhecido.
 - **Envio sem resposta nunca vira recusa por tempo nem por PIN.** Encerramento pedido com a ordem ainda desconhecida:
@@ -61,6 +62,13 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   pode ter sido paga: confira no app do Mercado Pago. Uma resposta atrasada ainda liga a ordem à cobrança em
   revisão manual. A liberação conferida pelo gerente (com prova do Mercado Pago) fica para a tela de conciliação,
   fora deste PR.
+- **Duas ordens para a mesma chave** (o Mercado Pago não deveria devolver): a segunda é cancelada no Mercado Pago
+  na hora e a cobrança fica em revisão manual (`ORDER_ID_CHANGED`, com o número da segunda anotado) até alguém
+  conferir; consulta nenhuma desfaz essa revisão.
+- **Cobrança largada pelo aparelho** (app fechado no meio, pedido de encerramento que não chegou): ao abrir outra
+  cobrança na mesma conta, o servidor encerra por prazo as antigas que já passaram dos 2 min (relógio do banco),
+  com as mesmas regras: cancelada só com a confirmação do Mercado Pago; envio sem resposta vai para revisão manual
+  e segue reservando.
 - Chave que **nunca foi gravada** (a criação se perdeu no caminho) não tem o que cancelar: o servidor grava o
   **bloqueio preventivo** da chave (`tchefood_block_point_key`), exige operador da equipe ativa e registra
   `POINT_KEY_BLOCKED` em `audit_logs`. Pedido "pelo operador" (com PIN) sem cobrança gravada é recusado. O app, ao

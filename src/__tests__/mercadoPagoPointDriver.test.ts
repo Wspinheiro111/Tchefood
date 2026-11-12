@@ -186,7 +186,42 @@ describe('MercadoPagoPointDriver', () => {
       now: () => clock,
       operator: async () => STAFF,
     });
-    expect(await err.charge(REQ)).toMatchObject({ status: 'DECLINED', reason: 'HTTP 400' });
+    // 400 com corpo que não é da função (sem "error"): pode ter vindo de um intermediário, não prova nada.
+    expect(await err.charge(REQ)).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT' });
+  });
+
+  it.each([
+    [408, { error: 'timeout', message: 'gateway timeout' }],
+    [425, { error: 'too_early', message: 'too early' }],
+    [429, { error: 'rate_limited', message: 'calma' }],
+    [400, '<html><body>Bad Request</body></html>'],
+    [400, { message: 'sem o campo error' }],
+    [403, { error: 42, message: 'error não é texto' }],
+    [404, 'not found'],
+  ] as const)('auditoria r3, terceira revisão: criação respondida com %s que não prova nada não vira recusa; quem decide é o encerramento no servidor', async (status, body) => {
+    const odd = { status, body };
+    // Só a criação recebe a resposta estranha; a cobrança existe e é aprovada depois.
+    const paid = harness((action, n) => (action === 'create' ? odd : n < 2 ? pending : { status: 200, body: APPROVED }));
+    expect((await paid.driver.charge(REQ)).status).toBe('APPROVED');
+    expect(paid.counts.create).toBe(3); // tratada como resultado desconhecido: repete com a mesma chave
+    expect(new Set(paid.calls.filter((c) => c.body.action === 'create').map((c) => c.body.idempotency_key))).toEqual(new Set([REQ.idempotency_key]));
+    // Tudo responde assim: nunca "nada foi cobrado"; passa pelo encerramento no servidor e termina em revisão manual.
+    const all = harness(() => odd);
+    const r = await all.driver.charge(REQ);
+    expect(r).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT' });
+    expect(all.counts.cancel).toBeGreaterThan(0);
+  });
+
+  it('auditoria r3, terceira revisão: recusa de verdade da função ({error, message}) na primeira criação segue sendo recusa', async () => {
+    const { driver, counts } = harness(() => ({ status: 409, body: { error: 'over_balance', message: 'passa do saldo' } }));
+    expect(await driver.charge(REQ)).toMatchObject({ status: 'DECLINED', reason: 'passa do saldo' });
+    expect(counts).toEqual({ create: 1 });
+  });
+
+  it('auditoria r3, terceira revisão: consulta respondida com 404 que não é da função não dispara o bloqueio nem recusa', async () => {
+    const { driver, counts } = harness((action, n) => (action === 'create' ? pending : action === 'status' ? (n < 3 ? { status: 404, body: 'not found' } : { status: 200, body: APPROVED }) : pending));
+    expect((await driver.charge(REQ)).status).toBe('APPROVED');
+    expect(counts.cancel).toBeUndefined();
   });
 
   it('erro 500 ou rede na consulta nunca vira recusa', async () => {
