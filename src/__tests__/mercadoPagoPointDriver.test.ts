@@ -99,7 +99,7 @@ describe('MercadoPagoPointDriver', () => {
     expect(creates).toHaveLength(3);
     expect(new Set(creates.map((c) => c.body.idempotency_key))).toEqual(new Set([REQ.idempotency_key]));
     expect(calls.find((c) => c.body.action === 'cancel')!.body).toEqual({
-      action: 'cancel', terminal_id: TERMINAL.id, idempotency_key: REQ.idempotency_key, order_id: REQ.order_id, amount_cents: 2450, method: 'CREDIT', reason: 'timeout', staff_id: STAFF,
+      action: 'cancel', terminal_id: TERMINAL.id, idempotency_key: REQ.idempotency_key, order_id: REQ.order_id, amount_cents: 2450, method: 'CREDIT', reason: 'timeout',
     });
   });
 
@@ -127,17 +127,43 @@ describe('MercadoPagoPointDriver', () => {
     expect(counts.create).toBe(2);
   });
 
-  it('sem operador logado não encerra: segue até a revisão manual', async () => {
-    const { driver, counts } = harness((action) => (action === 'create' ? 'network' : notFound), { operator: null });
-    expect(await driver.charge(REQ)).toMatchObject({ status: 'MANUAL_REVIEW' });
-    expect(counts.cancel).toBeUndefined();
+  it('auditoria r2 P2-02: sem operador identificado não cobra (nada vai ao servidor)', async () => {
+    const { driver, calls } = harness(() => pending, { operator: null });
+    expect(await driver.charge(REQ)).toMatchObject({ status: 'DECLINED', reason: 'Entre com o seu PIN para cobrar na Point Smart.' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('auditoria r2 P2-01: sincronização antes de cobrar que nunca termina estoura o prazo e não cobra', async () => {
+    let clock = 0;
+    const calls: string[] = [];
+    const driver = new MercadoPagoPointDriver('TEF_POS_WIRELESS', TERMINAL, {
+      config: async () => CFG,
+      fetch: async (url) => { calls.push(url); return { status: 200, text: async () => JSON.stringify(pending.body) }; },
+      sleep: async (ms) => { clock += ms; },
+      now: () => clock,
+      timer: async () => undefined,
+      operator: async () => STAFF,
+      beforeCreate: () => new Promise(() => undefined),
+    });
+    expect(await driver.charge(REQ)).toMatchObject({ status: 'DECLINED', reason: 'Não consegui sincronizar a conta com a nuvem. Nada foi cobrado; tente de novo.' });
+    expect(calls).toHaveLength(0);
+    const failing = new MercadoPagoPointDriver('TEF_POS_WIRELESS', TERMINAL, {
+      config: async () => CFG,
+      fetch: async (url) => { calls.push(url); return { status: 200, text: async () => '{}' }; },
+      sleep: async () => undefined,
+      now: () => 0,
+      operator: async () => STAFF,
+      beforeCreate: async () => { throw new Error('offline'); },
+    });
+    expect((await failing.charge(REQ)).status).toBe('DECLINED');
+    expect(calls).toHaveLength(0);
   });
 
   it('auditoria r1 P2-02: chamada que nunca responde estoura o prazo e o fluxo termina em revisão manual', async () => {
     const { driver, counts } = harness(() => 'hang', { timer: async () => undefined });
     expect(await driver.charge(REQ)).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT' });
     expect(counts.create).toBe(3);
-    expect(counts.cancel).toBe(1);
+    expect(counts.cancel).toBeGreaterThanOrEqual(1);
   });
 
   it('auditoria r1 P2-04: corpo null, [], número ou ilegível não lança e não vira recusa', async () => {
@@ -158,6 +184,7 @@ describe('MercadoPagoPointDriver', () => {
       fetch: async () => ({ status: 400, text: async () => 'null' }),
       sleep: async (ms) => { clock += ms; },
       now: () => clock,
+      operator: async () => STAFF,
     });
     expect(await err.charge(REQ)).toMatchObject({ status: 'DECLINED', reason: 'HTTP 400' });
   });
@@ -181,17 +208,44 @@ describe('MercadoPagoPointDriver', () => {
     const { driver, counts } = harness(() => pending);
     const r = await driver.charge(REQ);
     expect(r).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT', acquirer: 'MERCADO_PAGO' });
-    expect(counts.cancel).toBe(1);
+    // Repete o encerramento a cada volta (o servidor pode recusar por "cedo demais" e aceitar depois).
+    expect(counts.cancel).toBeGreaterThanOrEqual(POINT_CANCEL_WAIT_MS / 2_000 - 1);
     expect(counts.status).toBeGreaterThanOrEqual((POINT_WAIT_MS + POINT_CANCEL_WAIT_MS) / 2_000 - 2);
   });
 
-  it('abort pede o cancelamento já na próxima volta', async () => {
+  it('auditoria r2 P1-01: encerrar antes do prazo leva o PIN do gerente e o motivo ao servidor', async () => {
+    const h = harness((action) => (action === 'cancel' ? { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } } : pending));
+    const p = h.driver.charge(REQ);
+    h.driver.abort(REQ.request_id, { manager_pin: '9999', reason: 'cliente desistiu' });
+    expect((await p).status).toBe('DECLINED');
+    expect(h.counts.cancel).toBe(1);
+    expect(h.calls.find((c) => c.body.action === 'cancel')!.body).toMatchObject({ reason: 'operator', staff_id: STAFF, manager_pin: '9999', reason_text: 'cliente desistiu' });
+  });
+
+  it('auditoria r2 P1-01: sem autorização do gerente o encerramento antecipado não acontece (segue até o prazo)', async () => {
     const h = harness((action) => (action === 'cancel' ? { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } } : pending));
     const p = h.driver.charge(REQ);
     h.driver.abort(REQ.request_id);
+    await p;
+    const cancel = h.calls.find((c) => c.body.action === 'cancel')!;
+    expect(cancel.body.reason).toBe('timeout');
+    expect(h.counts.status).toBeGreaterThanOrEqual(POINT_WAIT_MS / 2_000 - 2);
+  });
+
+  it('auditoria r2 P1-01: PIN recusado (403) desfaz o pedido e a cobrança segue até o prazo', async () => {
+    const h = harness((action, n) => (action === 'cancel' ? (n === 1 ? { status: 403, body: { error: 'manager_denied', message: 'PIN errado' } } : { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } }) : pending));
+    const p = h.driver.charge(REQ);
+    h.driver.abort(REQ.request_id, { manager_pin: '0000', reason: 'cliente desistiu' });
     expect((await p).status).toBe('DECLINED');
-    expect(h.counts.cancel).toBe(1);
-    expect(h.calls.find((c) => c.body.action === 'cancel')!.body).toMatchObject({ reason: 'operator', staff_id: STAFF });
+    const cancels = h.calls.filter((c) => c.body.action === 'cancel').map((c) => c.body.reason);
+    expect(cancels).toEqual(['operator', 'timeout']);
+    expect(h.counts.status).toBeGreaterThanOrEqual(POINT_WAIT_MS / 2_000 - 2);
+  });
+
+  it('encerramento por prazo cedo demais no servidor (409) segue consultando e tenta de novo', async () => {
+    const { driver, counts } = harness((action, n) => (action === 'cancel' ? (n < 3 ? { status: 409, body: { error: 'too_early', message: 'cedo' } } : { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } }) : pending));
+    expect((await driver.charge(REQ)).status).toBe('DECLINED');
+    expect(counts.cancel).toBe(3);
   });
 
   it('cancelar depois de pago devolve a aprovação', async () => {

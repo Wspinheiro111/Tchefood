@@ -22,13 +22,23 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   (crédito à vista ou débito), autorização e bandeira (Visa, Master ou Elo). Parcelas = 1 e bandeira vêm do
   próprio pagamento (ausentes não contam). Qualquer diferença vira revisão manual. O banco confere de novo ao
   gravar o pagamento, inclusive bandeira e CNPJ do Mercado Pago (10.573.521/0001-91).
-- Cobrança nova só para conta **aberta no servidor** e dentro do saldo dele, menos as outras cobranças da mesma
-  conta em andamento (`tchefood_open_terminal_charge`, com a conta travada). Antes de cobrar o app sobe a fila;
-  conta que ainda não subiu é recusada antes de chegar à maquininha ("aguarde a sincronização").
+- Cobrança nova só para conta **aberta no servidor**, com **operador identificado** (da equipe ativa da loja, conferido
+  no banco) e dentro do saldo dele, menos as outras cobranças da mesma conta que ainda não terminaram
+  (`tchefood_open_terminal_charge`, com a conta travada). Reservam: criando, na fila, na maquininha e em **revisão
+  manual**, sem limite de tempo, e aprovadas ainda sem pagamento gravado. Só liberam com o fim comprovado no Mercado
+  Pago (recusada, cancelada, expirada, estornada) ou com o encerramento autorizado por gerente. Antes de cobrar o
+  app sobe a fila (com prazo de 15 s); conta que ainda não subiu é recusada antes de chegar à maquininha.
 - Sem cartão em 2 minutos (contados desde o primeiro envio) o app **encerra a tentativa**: pede à maquininha que
-  pare de esperar o cartão. Não é estorno: cobrança já paga continua paga e volta como aprovada. Fica gravado na
-  cobrança quem encerrou (operador da equipe ativa), o motivo (`timeout` ou `operator`) e a hora. Só vira
-  "recusado" quando o Mercado Pago confirma cancelada; senão vira revisão manual.
+  pare de esperar o cartão. Não é estorno: cobrança já paga continua paga e volta como aprovada. O servidor só
+  aceita o encerramento por prazo depois de 90 s da cobrança gravada (relógio do servidor) e repete o pedido até lá.
+  Só vira "recusado" quando o Mercado Pago confirma cancelada; senão vira revisão manual.
+- Encerrar **antes do prazo** a pedido do operador exige **PIN de gerente** e motivo (5+ letras), conferidos no banco
+  (`tchefood_authorize_point_cancel`, mesmas regras de `tchefood_authorize_manager`: 3 PINs errados em 60 s
+  bloqueiam). Fica um registro `POINT_CHARGE_CANCELED` em `audit_logs` e a cobrança guarda operador, gerente e
+  registro; o banco recusa encerramento "pelo operador" sem gerente. O pedido também confere conta, valor e forma.
+  Cobrança que foi à nuvem e nunca ganhou ordem só é liberada assim, depois de 2 min do envio (`manager_released`).
+- Consulta e encerramento **nunca** mandam cobrança nova à maquininha: só a criação manda, uma vez por chave
+  (`dispatched_at` gravado antes do envio; reenvio só com a mesma chave e sem pedido de encerramento).
 - Criação sem resposta (queda, prazo de 15 s por chamada estourado, erro 5xx): nem "cobrança não encontrada" nem
   outra recusa provam que nada foi cobrado, porque a primeira criação pode estar a caminho. Quem decide é o
   encerramento no servidor: sem cobrança gravada, ele grava o bloqueio da chave (`voided_before_send`) e a criação

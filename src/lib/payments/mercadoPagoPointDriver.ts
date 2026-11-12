@@ -27,6 +27,7 @@ import {
   guardApproved,
   type ChargeRequest,
   type IPaymentTerminalDriver,
+  type ManagerAbort,
   type TerminalResult,
 } from './drivers';
 
@@ -108,7 +109,8 @@ function parseReply(text: string): Reply | null {
 
 export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
   readonly acquirer = 'MERCADO_PAGO' as const;
-  private readonly aborted = new Set<string>();
+  /** Pedidos de encerramento do operador, com a autorização do gerente (sem ela, o servidor recusa). */
+  private readonly aborted = new Map<string, ManagerAbort>();
   private readonly printer: MockTerminalDriver;
 
   constructor(
@@ -212,17 +214,26 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     const key = req.idempotency_key;
     const amountCents = Math.round(req.amount * 100);
     const operator = await (this.deps.operator?.() ?? Promise.resolve(null)).catch(() => null);
+    // Sem operador identificado não cobra (o servidor também recusa quem não é da equipe ativa da loja).
+    if (!operator) return this.declined('Entre com o seu PIN para cobrar na Point Smart.');
     const charge = { terminal_id: this.terminal.id, idempotency_key: key, order_id: req.order_id, amount_cents: amountCents, method: req.method };
     // O prazo conta desde o primeiro envio: criação pendurada também consome o tempo de espera.
     const started = this.deps.now();
-    await this.deps.beforeCreate?.().catch(() => undefined);
+    // Sobe a fila antes (o servidor só cobra conta que já está nele). Com prazo: pendurada ou com erro, não
+    // cobra (nada foi mandado). O servidor confere de novo que a conta está lá.
+    if (this.deps.beforeCreate) {
+      const before = this.deps.beforeCreate().then(() => 'ok' as const, () => 'failed' as const);
+      const timer = this.deps.timer;
+      const result = timer ? await Promise.race([before, timer(POINT_REQUEST_TIMEOUT_MS).then(() => 'timeout' as const)]) : await before;
+      if (result !== 'ok') return this.declined('Não consegui sincronizar a conta com a nuvem. Nada foi cobrado; tente de novo.');
+    }
 
     // 1) Criação. Resultado desconhecido: repete com a mesma chave (o servidor não cria outra).
     let uncertain = false;
     let sent = false;
     for (let attempt = 0; attempt < 3 && !sent; attempt += 1) {
       if (this.deps.now() - started >= POINT_WAIT_MS) break;
-      const out = await this.call({ action: 'create', ...charge, ...(operator ? { staff_id: operator } : {}) });
+      const out = await this.call({ action: 'create', ...charge, staff_id: operator });
       if (out.kind === 'reply') {
         sent = true;
         const final = this.toResult(out.reply, req);
@@ -241,17 +252,27 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
 
     // 2) Espera o cartão. Encerrar no servidor é a única prova de "nada foi cobrado": sem cobrança gravada,
     //    ele grava o bloqueio da chave e uma criação atrasada não chega mais à Point.
+    //    Por prazo, o servidor confere a hora gravada (cedo demais = recusa e segue consultando). Pelo
+    //    operador, vai junto a autorização do gerente. Repete a cada volta até o fim.
     let cancelAt: number | null = null;
-    const close = async (reason: 'timeout' | 'operator'): Promise<TerminalResult | null> => {
-      if (!operator) return null;
-      const out = await this.call({ action: 'cancel', ...charge, reason, staff_id: operator });
+    const close = async (): Promise<TerminalResult | null> => {
+      const manager = this.aborted.get(req.request_id);
+      const body = manager
+        ? { action: 'cancel', ...charge, reason: 'operator', staff_id: operator, manager_pin: manager.manager_pin, reason_text: manager.reason }
+        : { action: 'cancel', ...charge, reason: 'timeout' };
+      const out = await this.call(body);
+      if (out.kind === 'rejected' && manager && out.httpStatus === 403) {
+        // PIN recusado: o pedido do operador cai; a cobrança segue até o prazo.
+        this.aborted.delete(req.request_id);
+        if (this.deps.now() - started < POINT_WAIT_MS) cancelAt = null;
+      }
       return out.kind === 'reply' ? this.toResult(out.reply, req) : null;
     };
     for (;;) {
       const now = this.deps.now();
-      if (cancelAt === null && (this.aborted.has(req.request_id) || now - started >= POINT_WAIT_MS)) {
-        cancelAt = now;
-        const final = await close(this.aborted.has(req.request_id) ? 'operator' : 'timeout');
+      if (cancelAt === null && (this.aborted.has(req.request_id) || now - started >= POINT_WAIT_MS)) cancelAt = now;
+      if (cancelAt !== null) {
+        const final = await close();
         if (final) return final;
       }
       if (cancelAt !== null && this.deps.now() - cancelAt >= POINT_CANCEL_WAIT_MS) {
@@ -266,7 +287,7 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
         if (out.httpStatus === 404) {
           // Não gravada AGORA não prova nada (a criação pode estar a caminho): encerra no servidor, que decide.
           if (cancelAt === null) cancelAt = this.deps.now();
-          const final = await close('timeout');
+          const final = await close();
           if (final) return final;
           continue;
         }
@@ -279,8 +300,11 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     return this.printer.print(lines);
   }
 
-  /** Pede o cancelamento: a cobrança em andamento cancela na maquininha e espera a confirmação. */
-  abort(requestId: string): void {
-    this.aborted.add(requestId);
+  /**
+   * Encerrar antes do prazo, a pedido do operador: exige o PIN do gerente e o motivo (conferidos no banco).
+   * Sem autorização não faz nada: a cobrança segue até o prazo, quando o servidor encerra sozinho.
+   */
+  abort(requestId: string, auth?: ManagerAbort): void {
+    if (auth) this.aborted.set(requestId, auth);
   }
 }

@@ -12,13 +12,20 @@ export interface SupabaseLike {
 }
 
 export const CHARGE_COLUMNS =
-  'id, tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status, external_order_id, external_payment_id, raw_status, raw_status_detail, paid_amount_cents, card_brand, authorization_code, last_four, created_by, cancel_reason, cancel_requested_by, cancel_requested_at';
+  'id, tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status, external_order_id, external_payment_id, raw_status, raw_status_detail, paid_amount_cents, card_brand, authorization_code, last_four, created_by, dispatched_at, cancel_reason, cancel_requested_by, cancel_requested_at, cancel_authorized_by, cancel_audit_id, created_at';
 
 /** Estados de que uma cobrança não sai mais (o banco também recusa, gatilho trg_terminal_charges_final). */
 const FINAL_LIST = '(approved,rejected,cancelled,expired,refunded)';
 
 /** Códigos de tchefood_open_terminal_charge (db/schema_mercado_pago.sql). */
-const REFUSALS: Record<string, ChargeRefusedError['code']> = { TF001: 'order_not_found', TF002: 'order_closed', TF003: 'over_balance' };
+const REFUSALS: Record<string, ChargeRefusedError['code']> = {
+  TF001: 'order_not_found', TF002: 'order_closed', TF003: 'over_balance', TF004: 'invalid_staff', TF005: 'not_found', TF006: 'invalid_reason',
+};
+
+function refusal(error: { message: string; code?: string } | null): ChargeRefusedError | null {
+  const code = error?.code ? REFUSALS[error.code] : undefined;
+  return code ? new ChargeRefusedError(code, (error?.message ?? '').replace(/^TCHEFOOD_COBRANCA:\s*/, '')) : null;
+}
 
 function check(result: { data: Query; error: { message: string; code?: string } | null }, what: string): Query {
   if (result.error) throw new Error(`Falha ao ${what}: ${result.error.message}`);
@@ -53,8 +60,8 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
         p_amount_cents: row.amount_cents,
         p_created_by: row.created_by,
       });
-      const refusal = res.error?.code ? REFUSALS[res.error.code] : undefined;
-      if (refusal) throw new ChargeRefusedError(refusal, (res.error?.message ?? '').replace(/^TCHEFOOD_COBRANCA:\s*/, ''));
+      const refused = refusal(res.error);
+      if (refused) throw refused;
       check(res, 'gravar a cobrança');
       const inserted = await this.findByKey(row.idempotency_key);
       if (!inserted) throw new Error('Falha ao gravar a cobrança.');
@@ -92,6 +99,60 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
       const current = await this.findByKey(row.idempotency_key);
       if (!current) throw new Error('Cobrança não encontrada para atualizar.');
       return current;
+    },
+    async claimDispatch(row: TerminalChargeRow): Promise<TerminalChargeRow | null> {
+      // Um UPDATE só: dois pedidos juntos ou um encerramento no meio não mandam a ordem duas vezes.
+      return normalize(check(
+        await db
+          .from('terminal_charges')
+          .update({ dispatched_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .eq('id', row.id)
+          .eq('tenant_id', tenantId)
+          .eq('status', 'creating')
+          .is('dispatched_at', null)
+          .is('cancel_requested_at', null)
+          .select(CHARGE_COLUMNS)
+          .maybeSingle(),
+        'marcar o envio',
+      ));
+    },
+    async voidUndispatched(row: TerminalChargeRow): Promise<TerminalChargeRow> {
+      const updated = normalize(check(
+        await db
+          .from('terminal_charges')
+          .update({ status: 'cancelled', raw_status: 'voided_before_send', updated_at: new Date().toISOString() })
+          .eq('id', row.id)
+          .eq('tenant_id', tenantId)
+          .eq('status', 'creating')
+          .is('dispatched_at', null)
+          .select(CHARGE_COLUMNS)
+          .maybeSingle(),
+        'encerrar a cobrança',
+      ));
+      if (updated) return updated;
+      const current = await this.findByKey(row.idempotency_key);
+      if (!current) throw new Error('Cobrança não encontrada para encerrar.');
+      return current;
+    },
+    async listOpenForOrder(orderId: string): Promise<TerminalChargeRow[]> {
+      const rows = check(
+        await db.from('terminal_charges').select(CHARGE_COLUMNS).eq('tenant_id', tenantId).eq('order_id', orderId).not('status', 'in', FINAL_LIST),
+        'ler as cobranças da conta',
+      ) as Record<string, unknown>[] | null;
+      return (rows ?? []).map((r) => normalize(r)!);
+    },
+    async authorizeCancel(input): Promise<string | null> {
+      const res = await db.rpc('tchefood_authorize_point_cancel', {
+        p_tenant: tenantId,
+        p_key: input.idempotency_key,
+        p_performed_by: input.performed_by,
+        p_manager_pin: input.manager_pin,
+        p_reason: input.reason,
+      });
+      const refused = refusal(res.error);
+      if (refused) throw refused;
+      const id = check(res, 'conferir o PIN do gerente');
+      return typeof id === 'string' && id ? id : null;
     },
   };
 }

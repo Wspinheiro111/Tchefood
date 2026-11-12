@@ -7,8 +7,11 @@
 //   { "action": "create", "terminal_id": "<uuid>", "idempotency_key": "...", "order_id": "<uuid>",
 //     "amount_cents": 2450, "method": "CREDIT" | "DEBIT", "staff_id": "<uuid>" }
 //   { "action": "status", "idempotency_key": "..." }
-//   { "action": "cancel", "idempotency_key": "...", "reason": "timeout" | "operator", "staff_id": "<uuid>",
-//     "terminal_id", "order_id", "amount_cents", "method" }   (encerra a tentativa; não estorna)
+//   { "action": "cancel", "idempotency_key": "...", "terminal_id", "order_id", "amount_cents", "method",
+//     "reason": "timeout" }                                    (prazo vencido: o servidor confere pela hora gravada)
+//   { ..., "reason": "operator", "staff_id": "<uuid>", "manager_pin": "1234", "reason_text": "..." }
+//                                                             (pedido do operador: PIN de gerente conferido no banco)
+//   O encerramento não estorna nada: cobrança paga continua paga.
 //   Cancel sem cobrança gravada grava o bloqueio da chave: a criação atrasada não chega mais à Point.
 //
 // Resposta: { status: "PENDING" | "APPROVED" | "DECLINED" | "MANUAL_REVIEW", ... } (ver charge.ts).
@@ -72,7 +75,7 @@ Deno.serve(async (req: Request) => {
   };
   if (action === 'cancel') {
     try {
-      validateCancel(body as { reason: unknown; staff_id: unknown });
+      validateCancel(body as { reason: unknown });
     } catch (error) {
       if (error instanceof ChargeInputError) return json({ error: error.code, message: error.message }, error.httpStatus);
       throw error;
@@ -101,13 +104,6 @@ Deno.serve(async (req: Request) => {
   const accessToken = secret.data?.access_token as string | undefined;
   if (!accessToken) return json({ error: 'not_configured', message: 'Mercado Pago sem Access Token nesta loja.' }, 412);
 
-  // Quem encerra precisa ser da equipe ativa desta loja (fica gravado na cobrança).
-  if (action === 'cancel') {
-    const staff = await admin.from('staff_users').select('id').eq('id', body.staff_id).eq('tenant_id', tenantId).eq('active', true).maybeSingle();
-    if (staff.error) return json({ error: 'internal', message: 'Falha ao conferir o operador.' }, 500);
-    if (!staff.data) return json({ error: 'invalid_staff', message: 'Operador não é da equipe ativa desta loja.' }, 403);
-  }
-
   const ctx: ChargeContext = {
     store: supabaseChargeStore(admin, tenantId),
     provider: new MercadoPagoPointProvider({ accessToken, fetchImpl: (input, init) => fetch(input, init) }),
@@ -117,7 +113,7 @@ Deno.serve(async (req: Request) => {
     if (action === 'create') return json(await startCharge(ctx, terminal!, body), 200);
     const row = await ctx.store.findByKey(key);
     if (action === 'cancel') {
-      const input = body as { idempotency_key: unknown; order_id: unknown; amount_cents: unknown; method: unknown; reason: unknown; staff_id: unknown };
+      const input = body as { idempotency_key: unknown; order_id: unknown; amount_cents: unknown; method: unknown; reason: unknown; staff_id?: unknown; manager_pin?: unknown; reason_text?: unknown };
       if (row) return json(await cancelCharge(ctx, row, input), 200);
       if (!terminal) {
         const refused = await loadTerminal();

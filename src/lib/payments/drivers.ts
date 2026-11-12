@@ -31,6 +31,12 @@ export const ACQUIRER_CNPJ: Record<'STONE' | 'PAGBANK' | 'MERCADO_PAGO', string>
 
 export type CardBrand = 'VISA' | 'MASTERCARD' | 'ELO' | 'PIX';
 
+/** Autorização do gerente para encerrar uma cobrança antes do prazo (conferida no servidor). */
+export interface ManagerAbort {
+  manager_pin: string;
+  reason: string;
+}
+
 export interface ChargeRequest {
   request_id: string;
   idempotency_key: string;
@@ -87,8 +93,8 @@ export interface IPaymentTerminalDriver {
   charge(req: ChargeRequest): Promise<TerminalResult>;
   /** Imprime texto puro na bobina térmica de 58mm (32 colunas). */
   print(lines: string[]): Promise<void>;
-  /** Cancela uma cobrança pendente no terminal. */
-  abort(requestId: string): void;
+  /** Cancela uma cobrança pendente no terminal (Mercado Pago: só com a autorização do gerente). */
+  abort(requestId: string, auth?: ManagerAbort): void;
 }
 
 // ---------------------------------------------------------------------------
