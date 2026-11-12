@@ -39,10 +39,14 @@ nunca ficarem visíveis a uma página de terceiros.
 debug em `apk/`. A pasta `apk/` só guarda os APKs da última execução: ela é um link para a versão atual
 (em `.apk-releases/`), trocado de uma vez, então quem lê `apk/` vê sempre o conjunto anterior inteiro ou o novo
 inteiro, mesmo se o script for morto no meio; se o build falhar, fica como estava. A versão anterior fica guardada
-até a publicação seguinte (`.apk-anterior`), para um download que já tinha começado terminar inteiro. Só roda um
-build por vez no mesmo repositório (trava do sistema operacional em `.apk-build.flock`, presa ao próprio script e
-solta sozinha se ele morrer; npm, Gradle e SDK rodam sem ela, então um daemon que sobrevive ao build não a segura):
-uma segunda execução simultânea para com aviso e não altera nada. Precisa de `perl` (já vem no Linux e no Mac).
+até a publicação seguinte (`.apk-anterior`), para um download que já tinha começado terminar inteiro; ela só muda
+depois que a troca de `apk/` deu certo (enquanto isso a versão que sai fica em `.apk-pendente`, e a execução
+seguinte conclui esse passo se o script morrer no meio). Só roda um build por vez no mesmo repositório (trava do
+sistema operacional em `.apk-build.flock`): uma segunda execução simultânea para com aviso e não altera nada. npm,
+Gradle, downloads e SDK rodam sob um supervisor que segura a trava enquanto o comando existir e, se o script for
+interrompido ou morto (até com `kill -9` só no bash), encerra o comando e os filhos dele antes de soltá-la; o
+próprio comando roda sem a trava, então um daemon que sobrevive ao build não a segura. Precisa de `perl` e `ps`
+(já vêm no Linux e no Mac).
 
 ```bash
 bash scripts/build-apk.sh            # pagbank e tablet

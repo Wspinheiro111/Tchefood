@@ -12,3 +12,4 @@ android/local.properties
 /.apk-build.flock
 /.apk-link.*
 /.apk-anterior
+/.apk-pendente

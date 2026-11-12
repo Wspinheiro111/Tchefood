@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -26,8 +26,11 @@ function executavel(caminho: string, conteudo: string) {
 //   FAKE_BUILD  texto gravado em cada APK, para distinguir um build do outro
 //   FAKE_FUNDO  arquivo onde grava o pid de um processo deixado em segundo plano (fora do grupo, vivo 30 s,
 //               herdando todo descritor aberto que o Gradle recebeu), como um daemon que sobrevive ao build
+//   FAKE_PID    arquivo onde grava o próprio pid
+//   FAKE_DEPOIS segundos que espera (depois da pausa) antes de gravar FAKE_ESCRITA, como um Gradle ainda escrevendo
 const GRADLE_FALSO = `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "Gradle 8.7"; exit 0; fi
+[ -n "$FAKE_PID" ] && echo $$ > "$FAKE_PID"
 for v in $FAKE_GERAR; do
   d="android/app/build/outputs/apk/$v/debug"
   mkdir -p "$d"
@@ -40,6 +43,10 @@ fi
 if [ -n "$FAKE_MARCA" ]; then
   : > "$FAKE_MARCA"
   while [ -e "$FAKE_PAUSA" ]; do sleep 0.1; done
+fi
+if [ -n "$FAKE_DEPOIS" ]; then
+  sleep "$FAKE_DEPOIS"
+  : > "$FAKE_ESCRITA"
 fi
 [ "$FAKE_FALHAR" = "1" ] && exit 1
 exit 0
@@ -65,14 +72,19 @@ case "$ultimo" in
 esac
 `;
 
-// perl falso: repassa tudo ao perl de verdade, exceto a renomeação que publica o novo apk/ (o script usa
-// rename($ARGV[0], ...)), onde pode falhar (FAKE_RENAME_FALHAR) ou parar logo antes (FAKE_TROCA_MARCA/PAUSA).
+// perl falso: repassa tudo ao perl de verdade, exceto as renomeações da publicação (o script usa
+// rename($ARGV[0], ...)), onde pode falhar (FAKE_RENAME_FALHAR: todas; FAKE_RENAME_APK_FALHAR: só a que troca apk/)
+// ou parar logo antes (FAKE_TROCA_MARCA/PAUSA; com FAKE_TROCA_ALVO, só na renomeação para esse nome).
 function perlFalso(real: string) {
   return `#!/bin/sh
 case "$*" in
   *'rename($ARGV[0]'*)
+    for destino; do :; done
     if [ -n "$FAKE_RENAME_FALHAR" ]; then exit 5; fi
-    if [ -n "$FAKE_TROCA_MARCA" ]; then : > "$FAKE_TROCA_MARCA"; while [ -e "$FAKE_TROCA_PAUSA" ]; do sleep 0.1; done; fi ;;
+    case "$destino" in */apk) [ -n "$FAKE_RENAME_APK_FALHAR" ] && exit 5 ;; esac
+    if [ -n "$FAKE_TROCA_MARCA" ] && { [ -z "$FAKE_TROCA_ALVO" ] || [ "\${destino##*/}" = "$FAKE_TROCA_ALVO" ]; }; then
+      : > "$FAKE_TROCA_MARCA"; while [ -e "$FAKE_TROCA_PAUSA" ]; do sleep 0.1; done
+    fi ;;
 esac
 exec ${real} "$@"
 `;
@@ -107,6 +119,7 @@ type Opcoes = {
   pausa?: string; marca?: string; trocaPausa?: string; trocaMarca?: string;
   lockPausa?: string; lockMarca?: string; legadoPausa?: string; legadoMarca?: string;
   fundo?: string; extra?: Record<string, string>;
+  pid?: string; depois?: number; escrita?: string; renameApkFalhar?: boolean; trocaAlvo?: string;
 };
 
 function ambiente(raiz: string, o: Opcoes) {
@@ -131,6 +144,11 @@ function ambiente(raiz: string, o: Opcoes) {
     FAKE_PAUSA: o.pausa ?? '',
     FAKE_MARCA: o.marca ?? '',
     FAKE_FUNDO: o.fundo ?? '',
+    FAKE_PID: o.pid ?? '',
+    FAKE_DEPOIS: o.depois === undefined ? '' : String(o.depois),
+    FAKE_ESCRITA: o.escrita ?? '',
+    FAKE_RENAME_APK_FALHAR: o.renameApkFalhar ? '1' : '',
+    FAKE_TROCA_ALVO: o.trocaAlvo ?? '',
     ...(o.extra ?? {}),
   };
 }
@@ -147,7 +165,47 @@ function rodarEmSegundoPlano(raiz: string, variante: string, o: Opcoes) {
   filho.stderr?.on('data', (d) => { saida += String(d); });
   let terminou = false;
   const fim = new Promise<number | null>((ok) => filho.on('close', (c) => { terminou = true; ok(c); }));
-  return { filho, fim, saida: () => saida, terminou: () => terminou };
+  // 'exit' = o bash principal saiu (o 'close' ainda espera quem herdou a saída dele)
+  const saiu = new Promise<{ codigo: number | null; sinal: NodeJS.Signals | null }>((ok) =>
+    filho.on('exit', (codigo, sinal) => ok({ codigo, sinal })));
+  return { filho, fim, saiu, saida: () => saida, terminou: () => terminou };
+}
+
+// Processos que têm aberto o arquivo da trava (Linux: /proc/<pid>/fd); fora do Linux devolve null.
+function donosDaTrava(raiz: string): number[] | null {
+  if (process.platform !== 'linux') return null;
+  const alvo = join(raiz, '.apk-build.flock');
+  const donos: number[] = [];
+  for (const p of readdirSync('/proc')) {
+    if (!/^\d+$/.test(p)) continue;
+    let fds: string[] = [];
+    try { fds = readdirSync(`/proc/${p}/fd`); } catch { continue; }
+    for (const fd of fds) {
+      try { if (readlinkSync(`/proc/${p}/fd/${fd}`) === alvo) { donos.push(Number(p)); break; } } catch { /* saiu */ }
+    }
+  }
+  return donos;
+}
+
+function pidDe(arquivo: string) {
+  return existsSync(arquivo) ? Number(readFileSync(arquivo, 'utf8')) : 0;
+}
+
+// Leitor que resolve um caminho (cd -P: fica com a pasta da versão aberta) e só lê os APKs quando liberado.
+function abrirLeitor(raiz: string, caminho: string) {
+  const pausa = join(raiz, `pausa-leitor-${Math.random().toString(36).slice(2)}`);
+  const marca = `${pausa}.aberto`;
+  writeFileSync(pausa, '');
+  const leitor = spawn('bash', ['-c', `cd -P ${caminho} && : > "${marca}" && while [ -e "${pausa}" ]; do sleep 0.05; done; ` +
+    'cat tchefood-pagbank-debug.apk; echo; cat tchefood-tablet-debug.apk'], { cwd: raiz });
+  let lido = '';
+  leitor.stdout.on('data', (d) => { lido += String(d); });
+  leitor.stderr.on('data', (d) => { lido += String(d); });
+  const fim = new Promise<number | null>((ok) => leitor.on('close', (c) => ok(c)));
+  return {
+    aberto: () => esperar(() => existsSync(marca)),
+    ler: async () => { rmSync(pausa, { force: true }); const c = await fim; return { codigo: c, lido }; },
+  };
 }
 
 async function esperar(cond: () => boolean, ms = 10000) {
@@ -375,6 +433,53 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       expect(lido).toBe('A-pagbank\nA-tablet');
     }, 30000);
 
+    it('a troca de apk/ falha depois de B publicado: a referência a A continua e uma execução que falha no Gradle não apaga A', async () => {
+      const raiz = criarRepo();
+      expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'A' }).codigo).toBe(0);
+      const leitor = abrirLeitor(raiz, 'apk');
+      await leitor.aberto();
+      expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' }).codigo).toBe(0);
+      // C falha só na renomeação que troca apk/
+      const c = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'C', renameApkFalhar: true });
+      expect(c.codigo).not.toBe(0);
+      expect(c.saida).toContain('não consegui publicar o novo apk/');
+      // D falha no Gradle (e passa pela limpeza do início)
+      expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'D', falhar: true }).codigo).not.toBe(0);
+      expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
+      expect(await leitor.ler()).toEqual({ codigo: 0, lido: 'A-pagbank\nA-tablet' });
+      expect(existsSync(join(raiz, '.apk-pendente'))).toBe(false);
+    }, 30000);
+
+    for (const alvo of ['.apk-pendente', 'apk', '.apk-anterior']) {
+      it(`SIGKILL antes da renomeação para ${alvo}: quem lia a versão que saía termina de ler, e a seguinte se recupera`, async () => {
+        const raiz = criarRepo();
+        expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'A' }).codigo).toBe(0);
+        expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' }).codigo).toBe(0);
+        const leitor = abrirLeitor(raiz, 'apk');
+        await leitor.aberto();
+        const trocaPausa = join(raiz, 'pausa-troca');
+        const trocaMarca = join(raiz, 'na-troca');
+        writeFileSync(trocaPausa, '');
+        const c = rodarEmSegundoPlano(raiz, 'all', { gerar: 'pagbank tablet', build: 'C', trocaPausa, trocaMarca, trocaAlvo: alvo });
+        await esperar(() => existsSync(trocaMarca) || c.terminou());
+        expect(c.terminou()).toBe(false);
+        process.kill(-(c.filho.pid as number), 'SIGKILL');
+        await c.fim;
+        // apk/ é sempre um conjunto inteiro: B (antes da troca) ou C (depois)
+        const B = { 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' };
+        const C = { 'tchefood-pagbank-debug.apk': 'C-pagbank', 'tchefood-tablet-debug.apk': 'C-tablet' };
+        expect([B, C]).toContainEqual(apks(raiz));
+        // D falha no Gradle: a limpeza do início não pode apagar a versão B que o leitor tem aberta
+        expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'D', falhar: true }).codigo).not.toBe(0);
+        expect([B, C]).toContainEqual(apks(raiz));
+        expect(await leitor.ler()).toEqual({ codigo: 0, lido: 'B-pagbank\nB-tablet' });
+        expect(existsSync(join(raiz, '.apk-pendente'))).toBe(false);
+        expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'E' }).codigo).toBe(0);
+        expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'E-pagbank', 'tchefood-tablet-debug.apk': 'E-tablet' });
+        expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(2);
+      }, 30000);
+    }
+
     it('apk/ pasta de verdade, de uma versão antiga do script, é migrada para o formato novo', () => {
       const raiz = criarRepo();
       mkdirSync(join(raiz, 'apk'));
@@ -530,6 +635,93 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
         expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
       } finally {
         matarFundo(fundo);
+      }
+    }, 30000);
+
+    it('kill -9 só no bash principal com o Gradle parado: o Gradle é encerrado, ninguém fica com a trava e B roda', async () => {
+      const raiz = criarRepo();
+      const pausa = join(raiz, 'pausa');
+      const marca = join(raiz, 'gradle-rodando');
+      const pid = join(raiz, 'pid-gradle');
+      writeFileSync(pausa, '');
+      const a = rodarEmSegundoPlano(raiz, 'all', { gerar: 'pagbank tablet', build: 'A', pausa, marca, pid });
+      try {
+        await esperar(() => existsSync(marca));
+        const gradle = pidDe(pid);
+        expect(gradle).toBeGreaterThan(0);
+        const durante = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
+        expect(durante.saida).toContain('outra execução');
+        // só o PID do bash, não o grupo
+        process.kill(a.filho.pid as number, 'SIGKILL');
+        await a.saiu;
+        // o Gradle de A (parado, que nunca terminaria sozinho) é encerrado, e nenhum processo de A segura a trava
+        await esperar(() => !vivo(gradle), 15000);
+        const donos = donosDaTrava(raiz);
+        if (donos) await esperar(() => (donosDaTrava(raiz) ?? []).length === 0, 5000);
+        const r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
+        expect(r.codigo).toBe(0);
+        expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
+      } finally {
+        rmSync(pausa, { force: true });
+        const g = pidDe(pid);
+        if (g > 0 && vivo(g)) process.kill(g, 'SIGKILL');
+      }
+    }, 30000);
+
+    it('kill -9 só no bash principal com um Gradle que terminaria sozinho: B nunca roda junto com ele', async () => {
+      const raiz = criarRepo();
+      const marca = join(raiz, 'gradle-rodando');
+      const pid = join(raiz, 'pid-gradle');
+      const escrita = join(raiz, 'gradle-escreveu');
+      const a = rodarEmSegundoPlano(raiz, 'all', { gerar: 'pagbank tablet', build: 'A', marca, pid, depois: 2, escrita });
+      try {
+        await esperar(() => existsSync(marca));
+        const gradle = pidDe(pid);
+        process.kill(a.filho.pid as number, 'SIGKILL');
+        await a.saiu;
+        // B tenta até conseguir; quando consegue, o Gradle de A já não existe
+        let r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
+        const limite = Date.now() + 15000;
+        while (r.codigo !== 0 && r.saida.includes('outra execução') && Date.now() < limite) {
+          await new Promise((ok) => setTimeout(ok, 100));
+          r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B', pid: join(raiz, 'pid-b') });
+        }
+        expect(r.codigo).toBe(0);
+        expect(vivo(gradle)).toBe(false);
+        expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
+        // e nada de A escreve depois de B
+        await new Promise((ok) => setTimeout(ok, 2500));
+        expect(existsSync(escrita)).toBe(false);
+      } finally {
+        const g = pidDe(pid);
+        if (g > 0 && vivo(g)) process.kill(g, 'SIGKILL');
+      }
+    }, 40000);
+
+    it('SIGTERM só no bash principal: o Gradle é encerrado antes de a trava sair e não escreve depois que B começa', async () => {
+      const raiz = criarRepo();
+      const marca = join(raiz, 'gradle-rodando');
+      const pid = join(raiz, 'pid-gradle');
+      const escrita = join(raiz, 'gradle-escreveu');
+      const a = rodarEmSegundoPlano(raiz, 'all', { gerar: 'pagbank tablet', build: 'A', marca, pid, depois: 2, escrita });
+      try {
+        await esperar(() => existsSync(marca));
+        const gradle = pidDe(pid);
+        process.kill(a.filho.pid as number, 'SIGTERM');
+        const { codigo } = await a.saiu;
+        expect(codigo).not.toBe(0);
+        // quando o bash de A sai, o Gradle dele já foi encerrado
+        expect(vivo(gradle)).toBe(false);
+        // B começa logo depois e não é bloqueado
+        const r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
+        expect(r.codigo).toBe(0);
+        expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
+        // o Gradle de A teria escrito 2 s depois da marca: não escreveu
+        await new Promise((ok) => setTimeout(ok, 2500));
+        expect(existsSync(escrita)).toBe(false);
+      } finally {
+        const g = pidDe(pid);
+        if (g > 0 && vivo(g)) process.kill(g, 'SIGKILL');
       }
     }, 30000);
 

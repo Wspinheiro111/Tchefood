@@ -59,23 +59,101 @@ case "$codigo_trava" in
   *) falha "não consegui pegar a trava $raiz/.apk-build.flock" ;;
 esac
 
-# Programas externos que podem deixar processos vivos (npm, Gradle, SDK, downloads) rodam sem o descritor 9:
-# um daemon que sobreviva ao build nunca fica segurando a trava.
+# Comandos rápidos de consulta (java -version, node -v, gradle --version, licenças do SDK) rodam sem o descritor 9.
 sem_trava() { "$@" 9>&-; }
+
+# Comandos longos que escrevem no projeto ou no cache (downloads, unzip, sdkmanager, npm, Gradle) rodam sob um
+# supervisor (perl), iniciado direto por este bash, sem subshell no meio:
+#  - o supervisor fica com o descritor 9, então a trava continua presa enquanto o comando existir, mesmo se este
+#    bash morrer com kill -9: outra execução nunca roda ao mesmo tempo que um Gradle ou npm que ainda escreve;
+#  - o comando roda sem o descritor 9 (um daemon que sobreviva ao build não segura a trava) e no mesmo grupo de
+#    processos deste bash (Ctrl-C ou um kill no grupo inteiro também o alcançam);
+#  - se este bash receber TERM/INT/HUP, ou morrer (o pai do supervisor muda), o supervisor encerra o comando e
+#    todos os descendentes dele (TERM e, 10 s depois, KILL), espera e só então sai, soltando a trava.
+supervisor_pl='
+use strict; use warnings; use POSIX ();
+my $pai = getppid();
+my $pid = fork();
+defined $pid or exit 125;
+if ($pid == 0) {
+  POSIX::close(9);
+  exec { $ARGV[0] } @ARGV;
+  print STDERR "ERRO: nao consegui executar $ARGV[0]: $!\n";
+  POSIX::_exit(127);
+}
+my $parar = 0;
+$SIG{$_} = sub { $parar = 1 } for qw(TERM INT HUP);
+sub dorme { select(undef, undef, undef, $_[0]) }
+sub descendentes {
+  my %filhos;
+  open(my $ps, "-|", "ps", "-A", "-o", "pid=", "-o", "ppid=") or return ();
+  while (<$ps>) { my ($p, $pp) = split; push @{ $filhos{$pp} }, $p if defined $pp }
+  close($ps);
+  my @fila = ($pid); my @todos;
+  while (@fila) { for my $f (@{ $filhos{ shift @fila } || [] }) { push @todos, $f; push @fila, $f } }
+  return @todos;
+}
+my $st;
+while (1) {
+  if (waitpid($pid, POSIX::WNOHANG()) == $pid) { $st = $?; last }
+  last if $parar || getppid() != $pai;
+  dorme(0.05);
+}
+exit(($st & 127) ? 128 + ($st & 127) : $st >> 8) if defined $st;
+my %alvos = map { $_ => 1 } descendentes();
+kill("TERM", $pid, keys %alvos);
+for (1 .. 200) {
+  $alvos{$_} = 1 for descendentes();
+  if (!defined $st && waitpid($pid, POSIX::WNOHANG()) == $pid) { $st = $? }
+  delete $alvos{$_} for grep { !kill(0, $_) } keys %alvos;
+  last if defined $st && !%alvos;
+  dorme(0.05);
+}
+$alvos{$_} = 1 for descendentes();
+kill("KILL", (defined $st ? () : $pid), keys %alvos);
+waitpid($pid, 0) unless defined $st;
+exit(143);
+'
+pid_filho=""
+supervisionado() {
+  local codigo=0
+  # Em segundo plano só para este bash poder atender TERM/INT/HUP na hora (o `wait` é interrompido pelo sinal).
+  perl -e "$supervisor_pl" "$@" &
+  pid_filho=$!
+  wait "$pid_filho" || codigo=$?
+  pid_filho=""
+  return "$codigo"
+}
+
+# Publicação interrompida (kill -9) depois de .apk-pendente: se apk/ já aponta para a versão nova, a que saiu
+# (guardada em .apk-pendente) vira a anterior, como a publicação teria feito; se apk/ ainda aponta para ela, nada
+# mudou e o registro pendente só sai. Assim a versão que acabou de sair de apk/ nunca é apagada como sobra.
+resolver_pendente() {
+  [ -L "$raiz/.apk-pendente" ] || return 0
+  local pendente atual=""
+  pendente="$(basename "$(readlink "$raiz/.apk-pendente")")"
+  if [ -L "$raiz/apk" ]; then atual="$(basename "$(readlink "$raiz/apk")")"; fi
+  if [ "$pendente" != "$atual" ] && [ -d "$raiz/.apk-releases/$pendente" ]; then
+    perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$raiz/.apk-pendente" "$raiz/.apk-anterior"
+  else
+    rm -f "$raiz/.apk-pendente"
+  fi
+}
 
 staging=""
 link_novo=""
 link_ant=""
-pid_gradle=""
 
 limpar() {
   local codigo=$?
   trap - EXIT
-  # interrompido (Ctrl-C, kill) no meio da compilação: o Gradle não continua sozinho depois que a trava sai
-  if [ -n "$pid_gradle" ]; then kill "$pid_gradle" 2>/dev/null || true; wait "$pid_gradle" 2>/dev/null || true; fi
+  # interrompido (Ctrl-C, kill) no meio de um comando longo: o supervisor encerra o grupo do comando e só sai
+  # depois disso; a trava só é solta quando nenhum processo desta execução sobrou
+  if [ -n "$pid_filho" ]; then kill "$pid_filho" 2>/dev/null || true; wait "$pid_filho" 2>/dev/null || true; fi
   if [ -n "$link_novo" ]; then rm -f "$link_novo"; fi
   if [ -n "$link_ant" ]; then rm -f "$link_ant"; fi
   if [ -n "$staging" ]; then rm -rf "$staging"; fi
+  resolver_pendente || true
   exit "$codigo"
 }
 trap limpar EXIT
@@ -93,15 +171,17 @@ if [ ! -e "$raiz/apk" ] && [ ! -L "$raiz/apk" ]; then
     ln -s ".apk-releases/$(basename "$r")" "$raiz/apk" && break
   done
 fi
-# Mantém a versão atual e a anterior; apaga o resto (pastas de builds que morreram antes de publicar).
+resolver_pendente || falha "não consegui concluir a publicação interrompida (.apk-pendente)"
+# Mantém a versão atual e a anterior (e a pendente, se houver); apaga o resto (builds que morreram antes de publicar).
 manter_so_atual_e_anterior() {
-  local atual="" anterior="" r n
+  local atual="" anterior="" pendente="" r n
   if [ -L "$raiz/apk" ]; then atual="$(basename "$(readlink "$raiz/apk")")"; fi
   if [ -L "$raiz/.apk-anterior" ]; then anterior="$(basename "$(readlink "$raiz/.apk-anterior")")"; fi
+  if [ -L "$raiz/.apk-pendente" ]; then pendente="$(basename "$(readlink "$raiz/.apk-pendente")")"; fi
   for r in "$raiz"/.apk-releases/*; do
     [ -e "$r" ] || continue
     n="$(basename "$r")"
-    [ "$n" = "$atual" ] || [ "$n" = "$anterior" ] || rm -rf "$r"
+    [ "$n" = "$atual" ] || [ "$n" = "$anterior" ] || [ "$n" = "$pendente" ] || rm -rf "$r"
   done
 }
 manter_so_atual_e_anterior
@@ -130,7 +210,7 @@ fi
 
 baixar() { # url destino
   echo "-> baixando $1"
-  sem_trava curl -fL --retry 3 --retry-delay 2 -o "$2.part" "$1" || falha "falha ao baixar $1"
+  supervisionado curl -fL --retry 3 --retry-delay 2 -o "$2.part" "$1" || falha "falha ao baixar $1"
   mv "$2.part" "$2"
 }
 
@@ -154,7 +234,7 @@ if [ ! -x "$sdkmanager" ]; then
   zip="$CACHE/cmdline-tools-$so.zip"
   baixar "https://dl.google.com/android/repository/commandlinetools-$so-${CMDLINE_TOOLS_VERSION}_latest.zip" "$zip"
   rm -rf "$CACHE/cmdline-tools-extract"
-  sem_trava unzip -q "$zip" -d "$CACHE/cmdline-tools-extract"
+  supervisionado unzip -q "$zip" -d "$CACHE/cmdline-tools-extract"
   mkdir -p "$ANDROID_HOME/cmdline-tools"
   rm -rf "$ANDROID_HOME/cmdline-tools/latest"
   mv "$CACHE/cmdline-tools-extract/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
@@ -167,7 +247,7 @@ if [ ! -d "$ANDROID_HOME/platforms/$PLATFORM" ] || [ ! -d "$ANDROID_HOME/build-t
   set +o pipefail
   sem_trava yes | sem_trava "$sdkmanager" --licenses >/dev/null
   set -o pipefail
-  sem_trava "$sdkmanager" "platforms;$PLATFORM" "build-tools;$BUILD_TOOLS" "platform-tools"
+  supervisionado "$sdkmanager" "platforms;$PLATFORM" "build-tools;$BUILD_TOOLS" "platform-tools"
 fi
 
 # --- Gradle ----------------------------------------------------------------------------------
@@ -178,7 +258,7 @@ else
   if [ ! -x "$gradle_dir/bin/gradle" ]; then
     zip="$CACHE/gradle-$GRADLE_VERSION-bin.zip"
     baixar "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" "$zip"
-    sem_trava unzip -q "$zip" -d "$CACHE"
+    supervisionado unzip -q "$zip" -d "$CACHE"
     rm -f "$zip"
   fi
   gradle_cmd="$gradle_dir/bin/gradle"
@@ -187,8 +267,8 @@ fi
 # --- Sistema web (vai embutido no APK) -------------------------------------------------------
 if [ -z "${TCHEFOOD_APP_URL:-}" ]; then
   echo "-> gerando o sistema web (npm ci && npm run build)"
-  sem_trava npm ci
-  sem_trava npm run build
+  supervisionado npm ci
+  supervisionado npm run build
   [ -f dist/index.html ] || falha "o build web não gerou dist/index.html"
 fi
 
@@ -205,12 +285,8 @@ for v in "${variantes[@]}"; do
 done
 
 echo "-> compilando: ${tarefas[*]}"
-# Em segundo plano só para guardar o pid: se este script for interrompido, `limpar` encerra o Gradle.
-sem_trava "$gradle_cmd" -p android --no-daemon ${gradle_props[@]+"${gradle_props[@]}"} "${tarefas[@]}" &
-pid_gradle=$!
 codigo_gradle=0
-wait "$pid_gradle" || codigo_gradle=$?
-pid_gradle=""
+supervisionado "$gradle_cmd" -p android --no-daemon ${gradle_props[@]+"${gradle_props[@]}"} "${tarefas[@]}" || codigo_gradle=$?
 [ "$codigo_gradle" -eq 0 ] || falha "o Gradle falhou (código $codigo_gradle); apk/ ficou como estava"
 
 # Cada variante pedida precisa ter exatamente um APK, não vazio, antes de qualquer coisa ir para apk/.
@@ -242,13 +318,17 @@ if [ -d "$raiz/apk" ] && [ ! -L "$raiz/apk" ]; then
 fi
 antes=""
 if [ -L "$raiz/apk" ]; then antes="$(basename "$(readlink "$raiz/apk")")"; fi
-# A versão que sai de apk/ vira a "anterior" ANTES da troca: quem já abriu apk/ (um download em andamento)
-# continua lendo a pasta dela até a próxima publicação, que é quando ela sai.
+# Ordem da publicação, para nenhuma versão que alguém possa estar lendo perder a referência:
+#  1. a versão que vai sair de apk/ ganha um registro próprio, .apk-pendente (.apk-anterior não muda ainda);
+#  2. apk/ troca para a versão nova;
+#  3. só depois da troca, .apk-pendente vira .apk-anterior (uma renomeação), e a anterior antiga sai.
+# Se a troca falhar, .apk-anterior continua como estava; se o processo morrer entre as etapas, a próxima execução
+# conclui ou desfaz o passo pendente antes de limpar (resolver_pendente, acima).
 if [ -n "$antes" ]; then
   link_ant="$raiz/.apk-link.ant.$$"
   ln -s ".apk-releases/$antes" "$link_ant" || falha "não consegui preparar o link da versão anterior; nada foi alterado"
-  perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$link_ant" "$raiz/.apk-anterior" \
-    || falha "não consegui guardar a versão anterior; nada foi alterado"
+  perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$link_ant" "$raiz/.apk-pendente" \
+    || falha "não consegui guardar a versão atual antes da troca; nada foi alterado"
   link_ant=""
 fi
 link_novo="$raiz/.apk-link.$$"
@@ -257,6 +337,10 @@ perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$link_novo" "$raiz/apk" \
   || falha "não consegui publicar o novo apk/; o conjunto anterior foi mantido"
 link_novo=""
 staging=""
+if [ -n "$antes" ]; then
+  perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$raiz/.apk-pendente" "$raiz/.apk-anterior" \
+    || falha "apk/ já tem a versão nova, mas não consegui registrar a anterior; a próxima execução conclui isso"
+fi
 # Ficam a versão nova e a anterior; as mais velhas saem.
 manter_so_atual_e_anterior
 for v in "${variantes[@]}"; do
