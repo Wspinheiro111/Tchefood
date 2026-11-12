@@ -1,5 +1,5 @@
 import iconUrl from '../assets/brand/icon.png';
-import logoUrl from '../assets/brand/logo.png';
+import logoUrl from '../assets/brand/logo.webp';
 
 /**
  * Logo oficial do Tchê Food.
@@ -10,7 +10,7 @@ export default function Logo({ compacto = false }: { compacto?: boolean }) {
   if (compacto) {
     return (
       <span className="inline-flex items-center gap-2">
-        <img src={iconUrl} alt="" aria-hidden className="h-9 w-9 object-contain" />
+        <img src={iconUrl} alt="" aria-hidden width={36} height={35} className="h-9 w-9 object-contain" />
         <span className="font-display text-lg font-extrabold">
           <span className="text-verde">Tchê</span>
           <span className="text-brasa">Food</span>
@@ -20,7 +20,14 @@ export default function Logo({ compacto = false }: { compacto?: boolean }) {
   }
   return (
     <span className="inline-flex flex-col items-start">
-      <img src={logoUrl} alt="Tchê Food — Sistema para restaurantes e delivery" className="h-10 w-auto object-contain sm:h-11" />
+      <img
+        src={logoUrl}
+        alt="Tchê Food — Sistema para restaurantes e delivery"
+        width={360}
+        height={89}
+        decoding="async"
+        className="h-10 w-auto object-contain sm:h-11"
+      />
       <span className="sr-only">um produto W9 Sistemas</span>
     </span>
   );

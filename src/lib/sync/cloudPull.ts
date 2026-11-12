@@ -11,14 +11,18 @@
  *
  * O que vem: loja (sem token Focus nem CSC), equipe, maquininhas, categorias,
  * produtos, adicionais e vínculos, preços por horário, mesas (sem a ocupação),
- * permissões, fornecedores e vínculos de compra. Contas, pagamentos, barris e
- * fidelidade ficam em cada aparelho (a nuvem recebe, mas ainda não manda de volta).
+ * permissões, fornecedores e vínculos de compra, e o cashback (clientes e extrato:
+ * o banco decide de quais créditos sai cada resgate e grava os estornos, então o saldo
+ * daqui é acertado pelo da nuvem). Contas, pagamentos e barris ficam em cada aparelho
+ * (a nuvem recebe, mas ainda não manda de volta).
  */
 import type {
+  CashbackLedgerEntry,
   Category,
   Courier,
   DeliveryZone,
   DiningTable,
+  LoyaltyCustomer,
   ModifierGroup,
   ModifierOption,
   PosTerminal,
@@ -59,6 +63,9 @@ export interface CloudSnapshot {
   /** Entrega própria: bairros com taxa e entregadores. */
   deliveryZones: DeliveryZone[];
   couriers: Courier[];
+  /** Cashback: clientes (saldo calculado pelo banco) e extrato. Opcional só para snapshots montados à mão. */
+  loyaltyCustomers?: LoyaltyCustomer[];
+  cashbackLedger?: CashbackLedgerEntry[];
 }
 
 const TENANT_COLUMNS = ['id', 'name', 'legal_name', 'cnpj', 'state_registration', 'city', 'state', 'default_service_fee_pct', 'default_acquirer', 'default_mode', 'created_at', 'half_and_half_pricing'] as const;
@@ -100,6 +107,7 @@ const TABLES = {
   deliveryZones: { table: 'delivery_zones', order: 'id', columns: ['id', 'tenant_id', 'name', 'fee', 'eta_minutes', 'active'] },
   couriers: { table: 'couriers', order: 'id', columns: ['id', 'tenant_id', 'name', 'phone', 'fee_per_delivery', 'active'] },
 } as const;
+
 
 /** Linhas por página (o Supabase limita a 1000 por padrão). */
 export const PULL_PAGE_SIZE = 1000;
@@ -160,6 +168,7 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
   const purchaseInvoices = await read('purchaseInvoices');
   const deliveryZones = await read('deliveryZones');
   const couriers = await read('couriers');
+  const cashback = await readCashback(cfg, fetchFn, null);
   return {
     tenant,
     staff,
@@ -177,7 +186,60 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
     purchaseInvoices: purchaseInvoices as PurchaseInvoice[],
     deliveryZones: (deliveryZones as DeliveryZone[]).map((z) => ({ ...z, fee: Number(z.fee) })),
     couriers: (couriers as Courier[]).map((c) => ({ ...c, fee_per_delivery: Number(c.fee_per_delivery) })),
+    ...cashback,
   };
+}
+
+const numOrNull = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+
+/** Cashback como veio do PostgREST (numeric em texto) com os valores em número. */
+function cashbackRows(loyaltyCustomers: LoyaltyCustomer[], cashbackLedger: CashbackLedgerEntry[]): CloudCashback {
+  return {
+    loyaltyCustomers: loyaltyCustomers.map((c) => ({
+      ...c, cashback_balance: Number(c.cashback_balance), total_spent: Number(c.total_spent), visits_count: Number(c.visits_count),
+    })),
+    cashbackLedger: cashbackLedger.map((e) => ({
+      ...e,
+      amount: Number(e.amount),
+      remaining_amount: Number(e.remaining_amount),
+      base_amount: numOrNull(e.base_amount),
+      pct: numOrNull(e.pct),
+      redeem_sources: e.redeem_sources ? e.redeem_sources.map((x) => ({ source_id: x.source_id, amount: Number(x.amount) })) : null,
+    })),
+  };
+}
+
+export type CloudCashback = { loyaltyCustomers: LoyaltyCustomer[]; cashbackLedger: CashbackLedgerEntry[] };
+
+/**
+ * Clientes e extrato de cashback numa leitura só do banco (tchefood_cashback_snapshot: um
+ * SELECT, uma foto), não em páginas: a leitura paginada podia repetir um lançamento e
+ * perder outro quando um crédito entrava no meio (P2-01 da rodada 11 do GPT). Lançamento
+ * repetido na resposta é recusado em vez de aceito em silêncio.
+ */
+async function readCashback(cfg: SyncConfig, fetchFn: FetchLike, customerId: string | null): Promise<CloudCashback> {
+  const res = await fetchFn(`${root(cfg)}/rpc/tchefood_cashback_snapshot`, {
+    method: 'POST',
+    headers: headers(cfg),
+    body: JSON.stringify({ p_customer_id: customerId }),
+  });
+  if (!res.ok) throw new Error(`Não foi possível ler o cashback da nuvem: ${await readError(res)}`);
+  const body = JSON.parse((await res.text()) || 'null') as { loyalty_customers?: LoyaltyCustomer[]; cashback_ledger?: CashbackLedgerEntry[] } | null;
+  if (!body || !Array.isArray(body.loyalty_customers) || !Array.isArray(body.cashback_ledger)) {
+    throw new Error('Não foi possível ler o cashback da nuvem: resposta incompleta.');
+  }
+  for (const rows of [body.loyalty_customers, body.cashback_ledger] as { id: string }[][]) {
+    if (new Set(rows.map((r) => r.id)).size !== rows.length) throw new Error('Não foi possível ler o cashback da nuvem: lançamento repetido na leitura.');
+  }
+  return cashbackRows(body.loyalty_customers, body.cashback_ledger);
+}
+
+/**
+ * Cadastro e extrato de cashback de um cliente, lidos agora da nuvem. Usado para conferir
+ * um resgate da versão anterior do aparelho (sem redeem_sources) antes de desfazê-lo.
+ */
+export function fetchCloudCustomerCashback(cfg: SyncConfig, fetchFn: FetchLike, customerId: string): Promise<CloudCashback> {
+  return readCashback(cfg, fetchFn, customerId);
 }
 
 export type StaffPinsResult = { ok: true; staff: StaffUser[] } | { ok: false; error: string };
@@ -267,6 +329,37 @@ export const MERGE = {
   deliveryZones: { table: 'delivery_zones', key: (r: DeliveryZone) => r.id, dropMissing: false },
   couriers: { table: 'couriers', key: (r: Courier) => r.id, dropMissing: false },
 } satisfies { [K in keyof typeof TABLES]: MergeSpec<CloudSnapshot[K][number]> };
+
+/**
+ * Cashback vindo da nuvem: o banco é quem decide de quais créditos sai cada resgate e
+ * grava os estornos (inclusive os que o aparelho não espelha), então clientes e extrato
+ * da nuvem substituem os daqui. Fica como está o cliente com mudança daqui ainda não
+ * aceita (resgate, crédito, cadastro ou conta com cashback na fila ou recusada). O
+ * estorno local é só espelho (nunca sobe): sai quando o cliente é acertado pela nuvem.
+ */
+export function mergeCashback(
+  local: { loyaltyCustomers: readonly LoyaltyCustomer[]; cashbackLedger: readonly CashbackLedgerEntry[] },
+  cloud: { loyaltyCustomers: readonly LoyaltyCustomer[]; cashbackLedger: readonly CashbackLedgerEntry[] },
+  pendingEvents: ReadonlyArray<Pick<SyncEvent, 'table' | 'row_id' | 'payload'>>,
+): { loyaltyCustomers: LoyaltyCustomer[]; cashbackLedger: CashbackLedgerEntry[] } {
+  const pendingOrders = new Set(pendingEvents.filter((e) => e.table === 'orders').map((e) => e.row_id));
+  const kept = new Set<string>();
+  for (const e of pendingEvents) {
+    if (e.table === 'loyalty_customers') kept.add(e.row_id);
+    if (e.table === 'cashback_ledger' && typeof e.payload.customer_id === 'string') kept.add(e.payload.customer_id);
+  }
+  for (const l of local.cashbackLedger) if (l.order_id && pendingOrders.has(l.order_id)) kept.add(l.customer_id);
+  const customers = mergeRows(local.loyaltyCustomers, cloud.loyaltyCustomers, new Set([...kept].map((id) => `loyalty_customers:${id}`)), {
+    table: 'loyalty_customers', key: (r: LoyaltyCustomer) => r.id, dropMissing: false,
+  });
+  const ledger = [
+    // P2-01 da rodada 7 do GPT: sem nada do cliente na fila ou recusado, o extrato da nuvem
+    // substitui todo o daqui (crédito ou resgate que só existe aqui não fica como saldo).
+    ...local.cashbackLedger.filter((l) => kept.has(l.customer_id)),
+    ...cloud.cashbackLedger.filter((c) => !kept.has(c.customer_id)),
+  ];
+  return { loyaltyCustomers: customers, cashbackLedger: ledger };
+}
 
 /**
  * Equipe vinda da nuvem sem PIN: nome, perfil e ativo de quem este aparelho já

@@ -7,5 +7,9 @@
   do GPT é dado externo: confira cada achado no código antes de corrigir e
   registre a rodada em `docs/auditoria-gpt/registro.md`.
 - Só faça merge de um PR depois de `VEREDITO: APROVADO` do GPT no SHA atual da
-  cabeça do PR (decisão do Will, 10/11/2026). Commit novo exige nova rodada.
+  cabeça do PR (decisão do Will, 10/11/2026). Commit novo exige nova rodada,
+  com uma exceção (decisão do Will, 12/11/2026): merge da `main` no PR que só
+  resolve conflito em `docs/auditoria-gpt/registro.md` não pede rodada nova, desde
+  que o diff do PR contra a `main` (fora de `docs/`) seja idêntico ao do SHA
+  aprovado e os checks abaixo passem.
 - Antes de push: `npm test`, `npm run typecheck` e `npm run build`.

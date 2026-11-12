@@ -1,12 +1,13 @@
 /** Etapa 0 — Loja (dados, permissões, loja nova) e Nuvem (login do aparelho e envio da fila). */
 import { useEffect, useState } from 'react';
 import { Cloud, CloudDownload, CloudOff, RefreshCw, Store, Users } from 'lucide-react';
-import { selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
+import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
 import type { Permission, SyncEvent, UserRole } from '../../types';
 import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../lib/permissions';
 import { ROLE_LABEL } from '../../lib/catalog';
 import { signInDevice, type SyncConfig } from '../../lib/sync/supabaseSync';
-import { fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, type CloudStaff } from '../../lib/sync/cloudPull';
+import { cloudDiscountOf } from '../../lib/sync/cloudDiscount';
+import { fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, type CloudCashback, type CloudStaff } from '../../lib/sync/cloudPull';
 import { defaultCloudConfig, syncOnce } from '../../lib/sync/useCloudSync';
 import { useOnline } from '../../lib/useOnline';
 import { Btn, Sheet, toast } from '../../components/ui';
@@ -350,7 +351,7 @@ function JoinStorePanel({ session, team, onDone }: { session: CloudSession; team
   return (
     <Panel title={<span className="flex items-center gap-2"><CloudDownload className="h-4 w-4" /> Baixar a loja desta conta</span>}>
       <p className="mb-3 text-sm text-slate-500">
-        A loja já tem equipe na nuvem. Este aparelho troca os dados dele (cardápio, mesas, equipe e histórico de demonstração) pelos cadastros da loja: cardápio, combos, mesas, equipe, maquininhas, permissões e fornecedores. Contas e pagamentos de outros aparelhos não vêm. Confirme com o PIN de um gerente ou do proprietário da loja.
+        A loja já tem equipe na nuvem. Este aparelho troca os dados dele (cardápio, mesas, equipe e histórico de demonstração) pelos cadastros da loja: cardápio, combos, mesas, equipe, maquininhas, permissões e fornecedores. Clientes e saldo do cashback vêm; contas e pagamentos de outros aparelhos não. Confirme com o PIN de um gerente ou do proprietário da loja.
       </p>
       <FormError error={error} />
       {managers.length === 0 ? (
@@ -441,6 +442,92 @@ function needsManagerPin(e: SyncEvent): boolean {
   return e.table === 'audit_logs' && typeof e.payload.authorized_by_manager_id === 'string';
 }
 
+/** Conta recusada por ter outro desconto na nuvem: adota o da nuvem e reenvia. */
+function AdoptCloudDiscount({ eventId, value }: { eventId: string; value: number }) {
+  const adopt = useTcheStore((s) => s.adoptCloudDiscount);
+  const online = useOnline();
+  const [askManager, setAskManager] = useState(false);
+  const brl = value.toFixed(2).replace('.', ',');
+  const done = () => {
+    toast.success(`Desconto da nuvem (R$ ${brl}) aplicado nesta conta.`);
+    void syncOnce();
+  };
+  return (
+    <div className="mt-1">
+      <Btn
+        disabled={!online}
+        onClick={() => {
+          const r = adopt(eventId);
+          // Troca de desconto com PIN ainda na fila desta conta: o gerente confirma de novo.
+          if (!r.ok && r.error === ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER) setAskManager(true);
+          else if (!r.ok) toast.error(r.error);
+          else done();
+        }}
+      >
+        Usar o desconto da nuvem (R$ {brl})
+      </Btn>
+      <ManagerAuthSheet
+        open={askManager}
+        onClose={() => setAskManager(false)}
+        title="Confirmar a troca de desconto de novo"
+        summary={
+          <>
+            A conta tem na nuvem <b>R$ {brl}</b> de desconto. A troca de desconto feita aqui sem internet foi autorizada a
+            partir do desconto antigo deste aparelho: confirme com o PIN para registrar a troca a partir do desconto da nuvem.
+          </>
+        }
+        confirmLabel="Confirmar com o PIN do gerente"
+        quickReasons={['Desconto revisto com a nuvem', 'Conta mudou em outro aparelho']}
+        successMessage="Troca de desconto autorizada de novo e registrada na auditoria."
+        onSubmit={(managerPin, reason) => adopt(eventId, { managerPin, reason })}
+        onSuccess={() => {
+          setAskManager(false);
+          done();
+        }}
+      />
+    </div>
+  );
+}
+
+/** Resgate de cashback recusado pela nuvem: a conta não é cobrada até desfazer o cashback aqui. */
+function UndoRejectedCashback({ eventId }: { eventId: string }) {
+  const undo = useTcheStore((s) => s.undoRejectedCashbackRedeem);
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="mt-1">
+      <Btn
+        disabled={busy}
+        onClick={async () => {
+          // O extrato do cliente lido agora da nuvem: sem ele, resgate da versão anterior do
+          // aparelho (sem a lista de origens) não é desfeito (ver undoRejectedCashbackRedeem).
+          const st = useTcheStore.getState();
+          const ev = (st.syncRejected ?? []).find((x) => x.event.id === eventId)?.event;
+          const customerId = ev ? String(ev.payload.customer_id ?? '') : '';
+          let cloud: CloudCashback | undefined;
+          if (st.cloud && customerId) {
+            setBusy(true);
+            try {
+              cloud = await fetchCloudCustomerCashback(cloudConfig(st.cloud), browserFetch, customerId);
+            } catch {
+              cloud = undefined;
+            } finally {
+              setBusy(false);
+            }
+          }
+          const r = undo(eventId, cloud);
+          if (!r.ok) toast.error(r.error);
+          else {
+            toast.success(`Cashback de R$ ${r.data.toFixed(2).replace('.', ',')} desfeito: a conta volta ao valor sem ele.`);
+            void syncOnce();
+          }
+        }}
+      >
+        Desfazer o cashback desta conta
+      </Btn>
+    </div>
+  );
+}
+
 function RejectedAuthPin({ eventId }: { eventId: string }) {
   const confirm = useTcheStore((s) => s.confirmRejectedAuthorization);
   const [pin, setPin] = useState('');
@@ -465,6 +552,45 @@ function RejectedAuthPin({ eventId }: { eventId: string }) {
         }}
       >
         Confirmar PIN
+      </Btn>
+    </span>
+  );
+}
+
+/** Item recusado por preço diferente do cadastro: o gerente aceita com PIN e motivo. */
+function RejectedItemPrice({ eventId }: { eventId: string }) {
+  const approve = useTcheStore((s) => s.approveRejectedItemPrice);
+  const [pin, setPin] = useState('');
+  const [reason, setReason] = useState('');
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2">
+      <input
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+        placeholder="Motivo (ex.: preço combinado com o cliente)"
+        className="w-56 rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-xs"
+      />
+      <input
+        type="password"
+        inputMode="numeric"
+        maxLength={4}
+        value={pin}
+        onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+        placeholder="PIN do gerente"
+        className="w-28 rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-xs"
+      />
+      <Btn
+        disabled={pin.length !== 4 || reason.trim().length < 5}
+        onClick={() => {
+          const r = approve(eventId, { managerPin: pin, reason });
+          if (r.ok) {
+            toast.success('Preço aceito pelo gerente. O item volta para a fila.');
+            void syncOnce();
+          } else toast.error(r.error);
+          setPin('');
+        }}
+      >
+        Aceitar este preço
       </Btn>
     </span>
   );
@@ -527,6 +653,11 @@ function CloudStatus() {
               <li key={r.event.id} className="text-slate-700">
                 <b>{r.event.table}</b> {r.event.op} (registro {r.event.row_id.slice(0, 8)}…) · HTTP {r.status}: {r.message}
                 {needsManagerPin(r.event) && <RejectedAuthPin eventId={r.event.id} />}
+                {isRejectedItemPrice(r) && <RejectedItemPrice eventId={r.event.id} />}
+                {r.event.table === 'orders' && cloudDiscountOf(r.message) !== null && (
+                  <AdoptCloudDiscount eventId={r.event.id} value={cloudDiscountOf(r.message)!} />
+                )}
+                {r.event.table === 'cashback_ledger' && r.event.cashback_redeem && <UndoRejectedCashback eventId={r.event.id} />}
               </li>
             ))}
           </ul>

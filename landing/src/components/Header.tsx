@@ -4,7 +4,7 @@ import Logo from './Logo';
 import { linkWhatsApp } from '../lib/config';
 
 const LINKS = [
-  { href: '#beneficios', label: 'Benefícios' },
+  { href: '#funcionalidades', label: 'Funcionalidades' },
   { href: '#calculadora', label: 'Calculadora' },
   { href: '#comparativo', label: 'Comparativo' },
   { href: '#planos', label: 'Planos' },
@@ -32,14 +32,14 @@ export default function Header() {
         <a href="#topo" aria-label="Tchê Food, início">
           <Logo />
         </a>
-        <nav className="hidden items-center gap-7 text-sm text-slate-700 md:flex">
+        <nav aria-label="Principal" className="hidden items-center gap-6 text-sm text-slate-700 lg:flex">
           {LINKS.map((l) => (
             <a key={l.href} href={l.href} className="transition hover:text-slate-900">
               {l.label}
             </a>
           ))}
         </nav>
-        <div className="hidden md:block">
+        <div className="hidden lg:block">
           <a
             className="btn-primario py-2 text-sm"
             href={linkWhatsApp('Olá! Quero agendar uma demonstração do Tchê Food.')}
@@ -50,7 +50,7 @@ export default function Header() {
           </a>
         </div>
         <button
-          className="grid h-10 w-10 place-items-center rounded-lg border border-borda md:hidden"
+          className="grid h-10 w-10 place-items-center rounded-lg border border-borda lg:hidden"
           onClick={() => setAberto((v) => !v)}
           aria-expanded={aberto}
           aria-label={aberto ? 'Fechar menu' : 'Abrir menu'}
@@ -59,7 +59,7 @@ export default function Header() {
         </button>
       </div>
       {aberto && (
-        <nav className="container-lp flex flex-col gap-1 border-t border-borda bg-fundo pb-4 pt-2 md:hidden">
+        <nav aria-label="Principal no celular" className="container-lp flex flex-col gap-1 border-t border-borda bg-fundo pb-4 pt-2 lg:hidden">
           {LINKS.map((l) => (
             <a
               key={l.href}

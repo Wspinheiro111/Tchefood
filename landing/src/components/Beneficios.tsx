@@ -1,4 +1,4 @@
-import { BellRing, Flame, QrCode, ReceiptText, Smartphone, SplitSquareHorizontal, WifiOff, ShieldCheck } from 'lucide-react';
+import { Bike, Flame, MonitorSmartphone, QrCode, ShieldCheck, Smartphone, SplitSquareHorizontal, WifiOff } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
 interface Beneficio {
@@ -15,23 +15,13 @@ const BENEFICIOS: Beneficio[] = [
   },
   {
     icone: SplitSquareHorizontal,
-    titulo: 'Rachadinha na maquininha',
-    texto: 'A conta vai da mesa para a Stone ou PagBank já dividida por pessoa, por item ou em partes iguais.',
+    titulo: 'Rachadinha em segundos',
+    texto: 'Divide a conta por pessoa, por item consumido ou em partes iguais, com os 10% proporcionais de cada um.',
   },
   {
-    icone: ReceiptText,
-    titulo: 'NFC-e automática',
-    texto: 'Pagou, emitiu. A nota sai com os dados da transação vinculados, como a SEFAZ-RS exige.',
-  },
-  {
-    icone: ShieldCheck,
-    titulo: 'Cancelamento com PIN de gerente',
-    texto: 'Item cancelado depois de enviado à cozinha só sai com autorização, e fica registrado com quem cancelou.',
-  },
-  {
-    icone: BellRing,
-    titulo: 'Alerta no seu WhatsApp',
-    texto: 'Você fica sabendo de cada cancelamento e estorno no celular, mesmo longe do restaurante.',
+    icone: MonitorSmartphone,
+    titulo: 'PDV, totem e painel de senhas',
+    texto: 'Caixa rápido no teclado, totem para o cliente pedir sozinho e a TV chamando a senha quando o pedido fica pronto.',
   },
   {
     icone: Flame,
@@ -40,8 +30,18 @@ const BENEFICIOS: Beneficio[] = [
   },
   {
     icone: QrCode,
-    titulo: 'Cardápio QR Code incluso',
-    texto: 'O cliente vê o cardápio com fotos e chama o garçom pela mesa, sem custo adicional.',
+    titulo: 'Cardápio QR Code e 3D',
+    texto: 'O cliente pede pelo celular na mesa e pode ver o prato em realidade aumentada, sem instalar app.',
+  },
+  {
+    icone: Bike,
+    titulo: 'Delivery próprio',
+    texto: 'Taxa por bairro, entregador, rota no Google Maps e acerto do dinheiro com o entregador no fim do dia.',
+  },
+  {
+    icone: ShieldCheck,
+    titulo: 'Antifraude e caixa às cegas',
+    texto: 'Cancelamento e desconto só com PIN de gerente, tudo registrado. O caixa fecha sem ver o valor esperado.',
   },
   {
     icone: WifiOff,
@@ -56,7 +56,7 @@ export default function Beneficios() {
       <div className="container-lp">
         <div className="max-w-2xl">
           <p className="eyebrow">O que muda no seu salão</p>
-          <h2 className="mt-3 text-3xl font-bold sm:text-4xl">Tudo que o salão precisa, na maquininha que já está na mesa.</h2>
+          <h2 className="mt-3 text-3xl font-bold sm:text-4xl">Do salão ao delivery, tudo num sistema só.</h2>
         </div>
         <div className="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {BENEFICIOS.map(({ icone: Icone, titulo, texto }) => (

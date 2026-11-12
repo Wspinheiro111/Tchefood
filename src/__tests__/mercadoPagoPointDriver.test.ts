@@ -231,11 +231,12 @@ describe('Mercado Pago no resto do app', () => {
   });
 
   it('conciliação: Mercado Pago tem linha própria só quando houve venda na Point', () => {
-    const base = { id: 'p', order_id: 'o', tenant_id: 't', waiter_id: 'w', terminal_id: null, tip_amount: 0, status: 'APPROVED', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: null, created_at: '' };
+    const base = { id: 'p', order_id: 'o', tenant_id: 't', waiter_id: 'w', terminal_id: null, tip_amount: 0, status: 'APPROVED', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: null, created_at: '2026-11-12T15:00:00.000Z' };
+    const period = { start: new Date('2026-11-12T09:00:00.000Z'), end: new Date('2026-11-13T09:00:00.000Z') };
     const stone = { ...base, amount: 10, method: 'CREDIT', acquirer: 'STONE' } as unknown as Payment;
-    expect(reconciliation([stone]).map((r) => r.acquirer)).toEqual(['STONE', 'PAGBANK', 'CASH_DESK']);
+    expect(reconciliation([stone], period).map((r) => r.acquirer)).toEqual(['STONE', 'PAGBANK', 'CASH_DESK']);
     const mp = { ...base, amount: 24.5, method: 'DEBIT', acquirer: 'MERCADO_PAGO' } as unknown as Payment;
-    const rows = reconciliation([stone, mp]);
+    const rows = reconciliation([stone, mp], period);
     expect(rows.map((r) => r.acquirer)).toEqual(['STONE', 'PAGBANK', 'MERCADO_PAGO', 'CASH_DESK']);
     expect(rows[2]).toMatchObject({ total: 24.5, count: 1, cnpj: '10573521000191' });
     expect(rows[3]!.total).toBe(0);
