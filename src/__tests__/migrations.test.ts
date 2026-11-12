@@ -71,6 +71,9 @@ describe('supabase/migrations', () => {
     expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_cashback_conciliacao.sql'));
     const definesAuthorize = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes('CREATE OR REPLACE FUNCTION tchefood_authorize_manager('));
     expect(definesAuthorize.at(-1)).toBe(files[idx('schema_pin_gerente_trava.sql')]);
+    // A conciliação do cashback também é refeita (mesma ordem de travas e mesmo relógio da janela).
+    const definesReconcile = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes('CREATE OR REPLACE FUNCTION tchefood_reconcile_cashback('));
+    expect(definesReconcile.at(-1)).toBe(files[idx('schema_pin_gerente_trava.sql')]);
   });
 
   it('permissões padrão do banco iguais às do app (src/lib/permissions.ts)', async () => {
