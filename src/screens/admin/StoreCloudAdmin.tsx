@@ -7,7 +7,8 @@ import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../li
 import { ROLE_LABEL } from '../../lib/catalog';
 import { signInDevice, type SyncConfig } from '../../lib/sync/supabaseSync';
 import { cloudDiscountOf } from '../../lib/sync/cloudDiscount';
-import { fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, type CloudCashback, type CloudStaff } from '../../lib/sync/cloudPull';
+import { fetchCashbackPending, fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, reconcileCashback, type CashbackPending, type CloudCashback, type CloudStaff } from '../../lib/sync/cloudPull';
+import { formatBRL } from '../../lib/money';
 import { defaultCloudConfig, syncOnce } from '../../lib/sync/useCloudSync';
 import { useOnline } from '../../lib/useOnline';
 import { Btn, Sheet, toast } from '../../components/ui';
@@ -528,6 +529,138 @@ function UndoRejectedCashback({ eventId }: { eventId: string }) {
   );
 }
 
+/**
+ * Cashback para conciliar (decisão do Will, 12/11/2026): devoluções retidas (HOLD) e baixas
+ * sem resgate, lidas agora da nuvem. O gerente confere com o cliente e decide cada uma com
+ * PIN e motivo; a regra roda no servidor (tchefood_reconcile_cashback).
+ */
+function CashbackReconcilePanel() {
+  const cloud = useTcheStore((s) => s.cloud)!;
+  const online = useOnline();
+  const [pending, setPending] = useState<CashbackPending | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = async () => {
+    setBusy(true);
+    try {
+      setPending(await fetchCashbackPending(cloudConfig(cloud), browserFetch));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const total = pending ? pending.holds.length + pending.orphans.length : 0;
+  return (
+    <div className="mb-3 rounded-xl border border-slate-200 p-3 text-sm">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="font-bold">Cashback para conciliar</div>
+        <Btn disabled={busy || !online} onClick={() => void load()}>
+          <RefreshCw className={`h-4 w-4 ${busy ? 'animate-spin' : ''}`} /> {pending ? 'Ler de novo' : 'Ler pendências'}
+        </Btn>
+      </div>
+      <p className="mb-2 text-xs text-slate-600">
+        Devolução retida: parte de um cashback devolvido sem origem comprovada, fora do saldo do cliente. Baixa sem resgate: crédito baixado por um aparelho da versão anterior sem o registro do resgate. Confira com o cliente. Liberar devolve o valor como crédito novo, que vale 30 dias a partir de agora. Descartar não devolve.
+      </p>
+      {pending && total === 0 && <p className="text-xs text-slate-500">Nada para conciliar.</p>}
+      {pending && (
+        <ul className="space-y-2">
+          {pending.holds.map((h) => (
+            <ReconcileRow
+              key={`h-${h.id}`}
+              kind="HOLD"
+              customerId={h.customer_id}
+              holdId={h.id}
+              amount={h.amount}
+              title={`Devolução retida · ${h.customer_name ?? 'Sem nome'} (${h.phone})`}
+              detail={`${new Date(h.created_at).toLocaleString('pt-BR')}${h.order_id ? ` · conta ${h.order_id.slice(0, 8)}…` : ''}`}
+              onDone={() => void load()}
+            />
+          ))}
+          {pending.orphans.map((o) => (
+            <ReconcileRow
+              key={`o-${o.customer_id}`}
+              kind="ORPHAN"
+              customerId={o.customer_id}
+              holdId={null}
+              amount={o.amount}
+              title={`Baixa sem resgate · ${o.customer_name ?? 'Sem nome'} (${o.phone})`}
+              detail={o.pending_legacy_redeems > 0 ? `${o.pending_legacy_redeems} resgate(s) da versão anterior sem registro: depois da conciliação eles não entram mais (desfaça o cashback dessas contas em recusados).` : 'Nenhum resgate pendente.'}
+              onDone={() => void load()}
+            />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ReconcileRow(props: {
+  kind: 'HOLD' | 'ORPHAN';
+  customerId: string;
+  holdId: string | null;
+  amount: number;
+  title: string;
+  detail: string;
+  onDone: () => void;
+}) {
+  const cloud = useTcheStore((s) => s.cloud)!;
+  const userId = useTcheStore((s) => s.currentUserId);
+  // Um id por pendência: o reenvio depois de resposta perdida não repete a decisão.
+  const [requestId] = useState(() => crypto.randomUUID());
+  const [reason, setReason] = useState('');
+  const [pin, setPin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const decide = async (decision: 'RELEASE' | 'DISCARD') => {
+    if (!userId) return toast.error('Entre com o seu PIN antes de conciliar.');
+    if (reason.trim().length < 5) return toast.error('Escreva o motivo (mínimo 5 caracteres).');
+    if (pin.length !== 4) return toast.error('Digite o PIN do gerente.');
+    setBusy(true);
+    try {
+      const r = await reconcileCashback(cloudConfig(cloud), browserFetch, {
+        requestId, kind: props.kind, customerId: props.customerId, holdId: props.holdId, decision, amount: props.amount,
+        managerPin: pin, performedBy: userId, reason: reason.trim(),
+      });
+      setPin('');
+      if (!r.ok) return toast.error(r.error);
+      toast.success(decision === 'RELEASE' ? `${formatBRL(r.amount)} liberados ao cliente.` : `${formatBRL(r.amount)} conciliados sem devolver.`);
+      await syncOnce(undefined, { forcePull: true });
+      props.onDone();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <li className="rounded-lg border border-slate-200 p-2">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="font-semibold">{props.title}</div>
+          <div className="text-xs text-slate-500">{props.detail}</div>
+        </div>
+        <div className="font-black tabular-nums text-brasa">{formatBRL(props.amount)}</div>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <input
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Motivo (ex.: conferido com o cliente)"
+          className="w-56 rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-xs"
+        />
+        <input
+          type="password"
+          inputMode="numeric"
+          maxLength={4}
+          value={pin}
+          onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+          placeholder="PIN do gerente"
+          className="w-28 rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-xs"
+        />
+        <Btn disabled={busy} onClick={() => void decide('RELEASE')}>Liberar ao cliente</Btn>
+        <Btn variant="danger" disabled={busy} onClick={() => void decide('DISCARD')}>Descartar</Btn>
+      </div>
+    </li>
+  );
+}
+
 function RejectedAuthPin({ eventId }: { eventId: string }) {
   const confirm = useTcheStore((s) => s.confirmRejectedAuthorization);
   const [pin, setPin] = useState('');
@@ -642,6 +775,7 @@ function CloudStatus() {
         <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm text-brasa">Leitura da nuvem: {pull.last_error}</div>
       )}
       <RefreshStaffPanel />
+      <CashbackReconcilePanel />
       {rejected.length > 0 && (
         <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm">
           <div className="mb-2 font-bold text-brasa">{rejected.length} evento(s) recusado(s) pela nuvem</div>

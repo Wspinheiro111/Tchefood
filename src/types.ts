@@ -548,7 +548,11 @@ export interface LoyaltyCustomer {
 
 /** REFUND: cashback devolvido ao cliente quando um cancelamento deixa o desconto abaixo do resgate (crédito como o EARN). */
 /** HOLD: parte de um resgate que saiu da conta sem origem comprovada, retida para conciliação (sem saldo nem validade). */
-export type CashbackEntryType = 'EARN' | 'REDEEM' | 'EXPIRE' | 'REFUND' | 'HOLD';
+/**
+ * SETTLE: baixa sem resgate conciliada pelo gerente (débito explicado, sem saldo nem validade).
+ * Gravado só pelo banco (tchefood_reconcile_cashback); a liberação ao cliente é um REFUND sem conta.
+ */
+export type CashbackEntryType = 'EARN' | 'REDEEM' | 'EXPIRE' | 'REFUND' | 'HOLD' | 'SETTLE';
 
 export interface CashbackLedgerEntry {
   id: UUID;

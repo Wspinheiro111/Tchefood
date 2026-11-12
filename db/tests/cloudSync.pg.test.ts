@@ -14,10 +14,10 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, migratePersisted, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
-import { availableCashback } from '../../src/lib/loyalty';
+import { availableCashback, cashbackOrphanCents } from '../../src/lib/loyalty';
 import type { CashbackLedgerEntry } from '../../src/types';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
-import { fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins } from '../../src/lib/sync/cloudPull';
+import { fetchCashbackPending, fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, reconcileCashback } from '../../src/lib/sync/cloudPull';
 import { syncOnce } from '../../src/lib/sync/useCloudSync';
 import { useArStore } from '../../src/store/useArStore';
 import { sampleNfeXml } from '../../src/data/sampleNfe';
@@ -1602,6 +1602,117 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(remainingOf(e.earns[0]!)).toBe(5);
     expect(sql(`SELECT discount_amount FROM orders WHERE id = '${b!.id}'`)).toBe('0.00');
     closeCashbackOrders([a!.id, b!.id, a1!.id, a2!.id]);
+    setCashbackClock(null);
+  });
+
+  it('conciliação do cashback pelo gerente: baixa sem resgate e devolução retida, com PIN e motivo, só pelo servidor', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-12T20:00:00-03:00') });
+    setCashbackClock('2026-11-12T20:00:00-03:00');
+    const cfg = { url: 'http://cloud.test', anonKey: 'anon', accessToken: 'token' };
+    const fetchFn = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' });
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    const reason = 'Conferido com o cliente';
+    const decide = (input: { kind: 'HOLD' | 'ORPHAN'; customerId: string; holdId: string | null; decision: 'RELEASE' | 'DISCARD'; amount: number; requestId?: string; managerPin?: string }) =>
+      reconcileCashback(cfg, fetchFn, { requestId: crypto.randomUUID(), managerPin: MANAGER_PIN, performedBy: cashier, reason, ...input });
+    const balanceOf = (id: string) => Number(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${id}'`));
+    const [a1, a2, a3] = await cashbackOrders(3, 92);
+    for (const o of [a1, a2, a3]) expect(o!.cap).toBeGreaterThanOrEqual(5);
+
+    // Caso ambíguo da versão anterior: R$ 5 baixados para resgates de R$ 4 e R$ 3. Parado até o gerente conciliar.
+    const d = cashbackCustomer('5553988110092', [{ amount: 10, expires: '2026-11-20' }, { amount: 10, expires: '2026-12-31' }]);
+    const audit1 = legacyAudit(a1!.id, d.id, 4);
+    const audit2 = legacyAudit(a2!.id, d.id, 3);
+    debit(d.earns[0]!, 5);
+    expect((await cashbackRpc(a1!.id, d.id, 4, { p_legacy_predebited: true, p_audit_id: audit1 })).body).toContain('ambíguo');
+    let pending = await fetchCashbackPending(cfg, fetchFn);
+    expect(pending.orphans.find((o) => o.customer_id === d.id)).toMatchObject({ amount: 5, pending_legacy_redeems: 2 });
+
+    // O aparelho não grava a conciliação por fora: nem o SETTLE, nem o registro, nem a tabela.
+    expect((await raw('POST', 'cashback_ledger', { id: crypto.randomUUID(), tenant_id: TENANT, customer_id: d.id, entry_type: 'SETTLE', amount: 5, remaining_amount: 0 })).status).toBe(400);
+    expect((await raw('POST', 'audit_logs', { tenant_id: TENANT, performed_by_user_id: cashier, action_type: 'CASHBACK_RECONCILED', amount_impact: 0, reason, metadata: { customer_id: d.id } })).status).toBe(400);
+    expect((await raw('GET', 'cashback_reconciliations?select=id', undefined)).status).toBe(403);
+    expect((await raw('POST', 'cashback_reconciliations', { id: crypto.randomUUID(), tenant_id: TENANT, customer_id: d.id })).status).toBe(403);
+    // PIN errado: nada muda, a tentativa fica registrada. Valor diferente do da tela: recusa. Motivo curto: recusa.
+    expect(await decide({ kind: 'ORPHAN', customerId: d.id, holdId: null, decision: 'DISCARD', amount: 5, managerPin: '0000' })).toEqual({ ok: false, error: 'PIN de gerente incorreto.' });
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'MANAGER_PIN_FAILED' AND metadata->>'attempted_action' = 'CASHBACK_RECONCILED'`)).not.toBe('0');
+    // A tentativa conta no bloqueio de 3 erros em 60 s: tira da janela para não bloquear os testes seguintes.
+    sql(`SET session_replication_role = replica; UPDATE audit_logs SET created_at = created_at - INTERVAL '2 minutes' WHERE action_type = 'MANAGER_PIN_FAILED' AND metadata->>'attempted_action' = 'CASHBACK_RECONCILED';`);
+    const stale = await decide({ kind: 'ORPHAN', customerId: d.id, holdId: null, decision: 'DISCARD', amount: 4 });
+    expect(stale.ok).toBe(false);
+    if (!stale.ok) expect(stale.error).toContain('mudou (agora R$ 5.00)');
+    const short = await reconcileCashback(cfg, fetchFn, { requestId: crypto.randomUUID(), kind: 'ORPHAN', customerId: d.id, holdId: null, decision: 'DISCARD', amount: 5, managerPin: MANAGER_PIN, performedBy: cashier, reason: 'ok' });
+    expect(short.ok).toBe(false);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE customer_id = '${d.id}' AND entry_type = 'SETTLE'`)).toBe('0');
+
+    // Descartar: a baixa fica explicada (SETTLE), o saldo não muda e os dois resgates pendentes não entram mais.
+    const discardId = crypto.randomUUID();
+    expect(await decide({ requestId: discardId, kind: 'ORPHAN', customerId: d.id, holdId: null, decision: 'DISCARD', amount: 5 })).toEqual({ ok: true, amount: 5, repeated: false });
+    expect(await decide({ requestId: discardId, kind: 'ORPHAN', customerId: d.id, holdId: null, decision: 'DISCARD', amount: 5 })).toEqual({ ok: true, amount: 5, repeated: true });
+    // O mesmo id com outra decisão (resposta perdida e o gerente mudou de ideia): recusa.
+    expect((await decide({ requestId: discardId, kind: 'ORPHAN', customerId: d.id, holdId: null, decision: 'RELEASE', amount: 5 })).ok).toBe(false);
+    expect(sql(`SELECT count(*) || ' ' || sum(amount) FROM cashback_ledger WHERE customer_id = '${d.id}' AND entry_type = 'SETTLE'`)).toBe('1 5.00');
+    expect(balanceOf(d.id)).toBe(15);
+    expect(sql(`SELECT a.authorized_by_manager_id IS NOT NULL AND a.metadata->'settled_audit_ids' @> '["${audit1}", "${audit2}"]'::jsonb
+                  FROM audit_logs a WHERE a.action_type = 'CASHBACK_RECONCILED' AND a.metadata->>'customer_id' = '${d.id}'`)).toBe('t');
+    pending = await fetchCashbackPending(cfg, fetchFn);
+    expect(pending.orphans.some((o) => o.customer_id === d.id)).toBe(false);
+    for (const [o, audit, v] of [[a1!, audit1, 4], [a2!, audit2, 3]] as const) {
+      const r = await cashbackRpc(o.id, d.id, v, { p_legacy_predebited: true, p_audit_id: audit });
+      expect(r.status).toBe(400);
+      expect(r.body).toContain('já foi conciliado');
+    }
+    // Resgate novo da versão anterior depois da conciliação: a baixa antiga já está explicada,
+    // então ele baixa do saldo (não conta os R$ 5 conciliados como já baixados para ele).
+    const audit3 = legacyAudit(a3!.id, d.id, 3);
+    const late = await cashbackRpc(a3!.id, d.id, 3, { p_legacy_predebited: true, p_audit_id: audit3 });
+    expect(late.status, late.body).toBe(200);
+    expect(balanceOf(d.id)).toBe(12);
+    // O aparelho vê a baixa conciliada: nada sem resgate no extrato da nuvem.
+    const cloudD = await fetchCloudCustomerCashback(cfg, fetchFn, d.id);
+    expect(cashbackOrphanCents(cloudD.cashbackLedger, d.id)).toBe(0);
+    expect(cloudD.cashbackLedger.filter((e) => e.entry_type === 'SETTLE').map((e) => e.amount)).toEqual([5]);
+
+    // Liberar a baixa sem resgate: SETTLE e crédito novo de R$ 3, que vale 30 dias a partir de agora.
+    const e = cashbackCustomer('5553988110093', [{ amount: 10, expires: '2026-12-31' }]);
+    debit(e.earns[0]!, 3);
+    sql(`SELECT tchefood_refresh_cashback_balance('${e.id}')`);
+    expect(balanceOf(e.id)).toBe(7);
+    expect(await decide({ kind: 'ORPHAN', customerId: e.id, holdId: null, decision: 'RELEASE', amount: 3 })).toEqual({ ok: true, amount: 3, repeated: false });
+    expect(sql(`SELECT amount || ' ' || remaining_amount || ' ' || (order_id IS NULL) || ' ' || to_char(valid_from AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD HH24:MI') || ' ' || to_char(expires_at AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD HH24:MI')
+                  FROM cashback_ledger WHERE customer_id = '${e.id}' AND entry_type = 'REFUND'`)).toBe('3.00 3.00 true 2026-11-12 20:00 2026-12-12 20:00');
+    expect(balanceOf(e.id)).toBe(10);
+
+    // Devolução retida (HOLD): liberar vira crédito; a mesma retenção não concilia de novo nem por outro cliente.
+    const hold1 = crypto.randomUUID();
+    const hold2 = crypto.randomUUID();
+    sql(`INSERT INTO cashback_ledger (id, tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, created_by_user_id)
+         VALUES ('${hold1}', '${TENANT}', '${e.id}', '${a1!.id}', 'HOLD', 2.5, 0, '${cashier}'), ('${hold2}', '${TENANT}', '${e.id}', '${a2!.id}', 'HOLD', 1.5, 0, '${cashier}');`);
+    pending = await fetchCashbackPending(cfg, fetchFn);
+    expect(pending.holds.filter((h) => h.customer_id === e.id).map((h) => [h.id, h.amount]).sort()).toEqual([[hold1, 2.5], [hold2, 1.5]].sort());
+    expect((await decide({ kind: 'HOLD', customerId: d.id, holdId: hold1, decision: 'RELEASE', amount: 2.5 })).ok).toBe(false);
+    expect((await decide({ kind: 'ORPHAN', customerId: e.id, holdId: hold1, decision: 'RELEASE', amount: 2.5 })).ok).toBe(false);
+    expect(await decide({ kind: 'HOLD', customerId: e.id, holdId: hold1, decision: 'RELEASE', amount: 2.5 })).toEqual({ ok: true, amount: 2.5, repeated: false });
+    expect(balanceOf(e.id)).toBe(12.5);
+    const again = await decide({ kind: 'HOLD', customerId: e.id, holdId: hold1, decision: 'DISCARD', amount: 2.5 });
+    expect(again.ok).toBe(false);
+    if (!again.ok) expect(again.error).toContain('já foi conciliada');
+    // Descartar a outra: sem crédito; nada mais pendente para este cliente.
+    expect(await decide({ kind: 'HOLD', customerId: e.id, holdId: hold2, decision: 'DISCARD', amount: 1.5 })).toEqual({ ok: true, amount: 1.5, repeated: false });
+    expect(balanceOf(e.id)).toBe(12.5);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE customer_id = '${e.id}' AND entry_type = 'REFUND'`)).toBe('2');
+    pending = await fetchCashbackPending(cfg, fetchFn);
+    expect(pending.holds.some((h) => h.customer_id === e.id) || pending.orphans.some((o) => o.customer_id === e.id)).toBe(false);
+    expect(sql(`SELECT count(*) FROM cashback_reconciliations WHERE customer_id IN ('${d.id}', '${e.id}')`)).toBe('4');
+    // Cliente de outra loja não aparece nem concilia com o token desta.
+    const OTHER = '55555555-5555-4555-8555-555555555555';
+    sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${OTHER}', 'Outra', 'Outra Ltda', '11222333000262') ON CONFLICT DO NOTHING;`);
+    const f = cashbackCustomer('5553988110094', [{ amount: 10, expires: '2026-12-31' }], OTHER);
+    debit(f.earns[0]!, 2);
+    pending = await fetchCashbackPending(cfg, fetchFn);
+    expect(pending.orphans.some((o) => o.customer_id === f.id)).toBe(false);
+    expect((await decide({ kind: 'ORPHAN', customerId: f.id, holdId: null, decision: 'RELEASE', amount: 2 })).ok).toBe(false);
+    expect(sql(`SELECT count(*) FROM cashback_ledger WHERE customer_id = '${f.id}'`)).toBe('1');
+    closeCashbackOrders([a1!.id, a2!.id, a3!.id]);
     setCashbackClock(null);
   });
 

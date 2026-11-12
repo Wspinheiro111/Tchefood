@@ -242,6 +242,55 @@ export function fetchCloudCustomerCashback(cfg: SyncConfig, fetchFn: FetchLike, 
   return readCashback(cfg, fetchFn, customerId);
 }
 
+export type CashbackPendingHold = { id: string; customer_id: string; customer_name: string | null; phone: string; order_id: string | null; amount: number; created_at: string };
+export type CashbackPendingOrphan = { customer_id: string; customer_name: string | null; phone: string; amount: number; pending_legacy_redeems: number };
+export type CashbackPending = { holds: CashbackPendingHold[]; orphans: CashbackPendingOrphan[] };
+
+/** Cashback que o gerente precisa conciliar: devoluções retidas (HOLD) e baixas sem resgate, lidas agora da nuvem. */
+export async function fetchCashbackPending(cfg: SyncConfig, fetchFn: FetchLike): Promise<CashbackPending> {
+  const res = await fetchFn(`${root(cfg)}/rpc/tchefood_cashback_reconciliation_pending`, { method: 'POST', headers: headers(cfg), body: '{}' });
+  if (!res.ok) throw new Error(`Não foi possível ler o cashback a conciliar: ${await readError(res)}`);
+  const body = JSON.parse((await res.text()) || 'null') as { holds?: CashbackPendingHold[]; orphans?: CashbackPendingOrphan[] } | null;
+  if (!body || !Array.isArray(body.holds) || !Array.isArray(body.orphans)) throw new Error('Não foi possível ler o cashback a conciliar: resposta incompleta.');
+  return {
+    holds: body.holds.map((h) => ({ ...h, amount: Number(h.amount) })),
+    orphans: body.orphans.map((o) => ({ ...o, amount: Number(o.amount), pending_legacy_redeems: Number(o.pending_legacy_redeems) })),
+  };
+}
+
+export type CashbackReconcileInput = {
+  /** Id da decisão, gerado uma vez por decisão: o reenvio com o mesmo id não repete nada. */
+  requestId: string;
+  kind: 'HOLD' | 'ORPHAN';
+  customerId: string;
+  holdId: string | null;
+  decision: 'RELEASE' | 'DISCARD';
+  /** O valor que a tela mostrou; se a pendência mudou, o servidor recusa. */
+  amount: number;
+  managerPin: string;
+  performedBy: string;
+  reason: string;
+};
+export type CashbackReconcileResult = { ok: true; amount: number; repeated: boolean } | { ok: false; error: string };
+
+/** Decisão do gerente sobre uma pendência de cashback. A regra (PIN, valor, crédito, auditoria) roda no servidor. */
+export async function reconcileCashback(cfg: SyncConfig, fetchFn: FetchLike, input: CashbackReconcileInput): Promise<CashbackReconcileResult> {
+  const res = await fetchFn(`${root(cfg)}/rpc/tchefood_reconcile_cashback`, {
+    method: 'POST',
+    headers: headers(cfg),
+    body: JSON.stringify({
+      p_request_id: input.requestId, p_kind: input.kind, p_customer_id: input.customerId, p_hold_id: input.holdId,
+      p_decision: input.decision, p_amount: input.amount, p_manager_pin: input.managerPin, p_performed_by: input.performedBy, p_reason: input.reason,
+    }),
+  });
+  if (!res.ok) return { ok: false, error: `A nuvem recusou: ${await readError(res)}` };
+  const body = JSON.parse((await res.text()) || 'null') as { status?: string; amount?: number | string; repeated?: boolean } | null;
+  if (body?.status === 'PIN_FAILED') return { ok: false, error: 'PIN de gerente incorreto.' };
+  if (body?.status === 'PIN_LOCKED') return { ok: false, error: 'PIN bloqueado por excesso de tentativas. Aguarde um minuto.' };
+  if (body?.status !== 'OK') return { ok: false, error: 'A nuvem não confirmou a conciliação.' };
+  return { ok: true, amount: Number(body.amount), repeated: !!body.repeated };
+}
+
 export type StaffPinsResult = { ok: true; staff: StaffUser[] } | { ok: false; error: string };
 
 /** Equipe com os PINs: o servidor confere o PIN do gerente/proprietário (com o bloqueio de 3 erros). */

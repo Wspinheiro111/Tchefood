@@ -161,4 +161,14 @@ describe('cashback vindo da nuvem', () => {
     expect(cashbackOrphanCents([earn, refund, redeem], 'c')).toBe(0);
     expect(cashbackOrphanCents([earn, refund], 'outro')).toBe(0);
   });
+
+  it('baixa conciliada pelo gerente (SETTLE) explica o débito, como tchefood_cashback_orphan', () => {
+    const earn = entry({ id: 'E', amount: 10, remaining_amount: 5, valid_from: '2026-11-01T03:00:00.000Z', expires_at: '2026-12-01T03:00:00.000Z' });
+    expect(cashbackOrphanCents([earn], 'c')).toBe(500);
+    const settle = entry({ id: 'S', entry_type: 'SETTLE', amount: 5 });
+    expect(cashbackOrphanCents([earn, settle], 'c')).toBe(0);
+    // Liberada ao cliente: o crédito novo (REFUND sem conta) intacto não cria baixa.
+    const released = entry({ id: 'L', entry_type: 'REFUND', amount: 5, remaining_amount: 5, valid_from: '2026-11-12T23:00:00.000Z', expires_at: '2026-12-12T23:00:00.000Z' });
+    expect(cashbackOrphanCents([earn, settle, released], 'c')).toBe(0);
+  });
 });

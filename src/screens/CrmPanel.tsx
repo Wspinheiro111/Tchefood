@@ -16,7 +16,7 @@ import {
 import { Badge } from '../components/ui';
 import { WinbackPanel } from './WinbackPanel';
 
-const ENTRY_LABEL = { EARN: 'Crédito', REDEEM: 'Resgate', EXPIRE: 'Vencido', REFUND: 'Devolvido', HOLD: 'A devolver (retido para conciliação)' } as const;
+const ENTRY_LABEL = { EARN: 'Crédito', REDEEM: 'Resgate', EXPIRE: 'Vencido', REFUND: 'Devolvido', HOLD: 'A devolver (retido para conciliação)', SETTLE: 'Baixa conciliada' } as const;
 
 /** Retaguarda · CRM: clientes do programa, saldo de cashback e extrato. */
 export function CrmPanel() {
@@ -42,7 +42,7 @@ export function CrmPanel() {
 
   const earned = ledger.filter((e) => e.entry_type === 'EARN').reduce((a, e) => a + e.amount, 0);
   // Resgatado líquido: o que voltou ao cliente num cancelamento (REFUND) não foi usado.
-  const redeemed = ledger.reduce((a, e) => a + (e.entry_type === 'REDEEM' ? e.amount : e.entry_type === 'REFUND' ? -e.amount : 0), 0);
+  const redeemed = ledger.reduce((a, e) => a + (e.entry_type === 'REDEEM' || e.entry_type === 'SETTLE' ? e.amount : e.entry_type === 'REFUND' ? -e.amount : 0), 0);
   const outstanding = rows.reduce((a, r) => a + r.balance, 0);
 
   return (
