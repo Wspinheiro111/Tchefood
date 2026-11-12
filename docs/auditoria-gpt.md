@@ -25,7 +25,13 @@ Will cola no GPT e traz a resposta de volta.
    rodada anterior. Repete até APROVADO.
 7. **Merge.** Decisão do Will (10/11/2026): o PR **só é mergeado depois do
    `VEREDITO: APROVADO`** do GPT no SHA da cabeça do PR. REPROVADO ou commit
-   novo depois da aprovação exige nova rodada. P3 de um PR aprovado vira PR de
+   novo depois da aprovação exige nova rodada. Exceção (decisão do Will,
+   12/11/2026): como cada PR acrescenta a própria linha no registro, um merge
+   da `main` no PR que só resolve conflito em `docs/auditoria-gpt/registro.md`
+   não pede rodada nova, se o diff do PR contra a `main` (fora de `docs/`) for
+   idêntico ao do SHA aprovado e `npm test`, `npm run typecheck` e
+   `npm run build` passarem (e os testes do Postgres, se o PR mexe em SQL).
+   Qualquer outra mudança exige nova rodada. P3 de um PR aprovado vira PR de
    seguimento. PRs mergeados antes desta regra (#21 a #31) são auditados
    depois, e os achados confirmados viram PRs de seguimento.
 8. **Registro.** Cada rodada entra em `docs/auditoria-gpt/registro.md`
