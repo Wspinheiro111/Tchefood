@@ -22,7 +22,9 @@ const APPROVED = {
 
 type Answer = { status: number; body: unknown } | 'network';
 
-function harness(answer: (action: string, n: number) => Answer, opts: { config?: PointDriverDeps['config'] } = {}) {
+const STAFF = '44444444-4444-4444-8444-444444444444';
+
+function harness(answer: (action: string, n: number) => Answer | 'hang', opts: { config?: PointDriverDeps['config']; operator?: string | null; timer?: PointDriverDeps['timer'] } = {}) {
   let clock = 0;
   const calls: { url: string; headers: Record<string, string>; body: Record<string, unknown> }[] = [];
   const counts: Record<string, number> = {};
@@ -34,6 +36,7 @@ function harness(answer: (action: string, n: number) => Answer, opts: { config?:
       const action = String(body.action);
       counts[action] = (counts[action] ?? 0) + 1;
       const a = answer(action, counts[action]!);
+      if (a === 'hang') return new Promise(() => undefined);
       if (a === 'network') throw new Error('offline');
       return { status: a.status, text: async () => JSON.stringify(a.body) };
     },
@@ -41,6 +44,9 @@ function harness(answer: (action: string, n: number) => Answer, opts: { config?:
       clock += ms;
     },
     now: () => clock,
+    // Por padrão o prazo de cada chamada nunca estoura (o teste de chamada pendurada troca).
+    timer: opts.timer ?? (() => new Promise(() => undefined)),
+    operator: async () => (opts.operator === undefined ? STAFF : opts.operator),
   };
   return { driver: new MercadoPagoPointDriver('TEF_POS_WIRELESS', TERMINAL, deps), calls, counts };
 }
@@ -58,7 +64,7 @@ describe('MercadoPagoPointDriver', () => {
     expect(calls[0]).toEqual({
       url: 'https://proj.supabase.co/functions/v1/point-charge',
       headers: { apikey: 'anon', Authorization: 'Bearer jwt', 'Content-Type': 'application/json' },
-      body: { action: 'create', terminal_id: TERMINAL.id, idempotency_key: REQ.idempotency_key, order_id: REQ.order_id, amount_cents: 2450, method: 'CREDIT' },
+      body: { action: 'create', terminal_id: TERMINAL.id, idempotency_key: REQ.idempotency_key, order_id: REQ.order_id, amount_cents: 2450, method: 'CREDIT', staff_id: STAFF },
     });
     expect(calls.slice(1).every((c) => c.body.action === 'status' && c.body.idempotency_key === REQ.idempotency_key)).toBe(true);
   });
@@ -82,13 +88,78 @@ describe('MercadoPagoPointDriver', () => {
     expect(counts.status).toBeUndefined();
   });
 
-  it('queda na criação repete com a mesma chave; consulta 404 prova que nada foi enviado', async () => {
-    const { driver, calls } = harness((action) => (action === 'create' ? 'network' : { status: 404, body: { error: 'not_found', message: 'Cobrança não encontrada nesta loja.' } }));
+  const notFound = { status: 404, body: { error: 'not_found', message: 'Cobrança não encontrada nesta loja.' } };
+  const voided = { status: 200, body: { status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'A cobrança não chegou à maquininha (nada foi cobrado).' } };
+
+  it('queda na criação repete com a mesma chave; 404 na consulta só vira recusa quando o encerramento no servidor bloqueia a chave', async () => {
+    const { driver, calls } = harness((action) => (action === 'create' ? 'network' : action === 'cancel' ? voided : notFound));
     const r = await driver.charge(REQ);
-    expect(r.status).toBe('DECLINED');
+    expect(r).toMatchObject({ status: 'DECLINED', reason: 'A cobrança não chegou à maquininha (nada foi cobrado).' });
     const creates = calls.filter((c) => c.body.action === 'create');
     expect(creates).toHaveLength(3);
     expect(new Set(creates.map((c) => c.body.idempotency_key))).toEqual(new Set([REQ.idempotency_key]));
+    expect(calls.find((c) => c.body.action === 'cancel')!.body).toEqual({
+      action: 'cancel', terminal_id: TERMINAL.id, idempotency_key: REQ.idempotency_key, order_id: REQ.order_id, amount_cents: 2450, method: 'CREDIT', reason: 'timeout', staff_id: STAFF,
+    });
+  });
+
+  it('auditoria r1 P0-01: criação a caminho, consulta 404 e a criação chega depois: não recusa, acompanha a cobrança que ficou', async () => {
+    // A primeira criação "cai" (resposta perdida) mas chega ao servidor depois; 404 nas primeiras consultas.
+    const { driver } = harness((action, n) => {
+      if (action === 'create') return 'network';
+      if (action === 'status') return n < 2 ? notFound : n < 4 ? pending : { status: 200, body: APPROVED };
+      return pending; // encerramento: a cobrança já existe e está na maquininha
+    });
+    expect((await driver.charge(REQ)).status).toBe('APPROVED');
+  });
+
+  it('auditoria r1 P0-01: depois de criação incerta, 404 sem encerramento confirmado nunca vira recusa', async () => {
+    const { driver } = harness((action) => (action === 'create' ? 'network' : action === 'cancel' ? 'network' : notFound));
+    expect(await driver.charge(REQ)).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT' });
+  });
+
+  it('auditoria r1 P0-01: recusa 4xx depois de criação incerta não vira recusa', async () => {
+    const { driver, counts } = harness((action, n) => {
+      if (action === 'create') return n === 1 ? 'network' : { status: 409, body: { error: 'order_not_found', message: 'a conta ainda não está no servidor' } };
+      return action === 'cancel' ? pending : n < 3 ? pending : { status: 200, body: APPROVED };
+    });
+    expect((await driver.charge(REQ)).status).toBe('APPROVED');
+    expect(counts.create).toBe(2);
+  });
+
+  it('sem operador logado não encerra: segue até a revisão manual', async () => {
+    const { driver, counts } = harness((action) => (action === 'create' ? 'network' : notFound), { operator: null });
+    expect(await driver.charge(REQ)).toMatchObject({ status: 'MANUAL_REVIEW' });
+    expect(counts.cancel).toBeUndefined();
+  });
+
+  it('auditoria r1 P2-02: chamada que nunca responde estoura o prazo e o fluxo termina em revisão manual', async () => {
+    const { driver, counts } = harness(() => 'hang', { timer: async () => undefined });
+    expect(await driver.charge(REQ)).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT' });
+    expect(counts.create).toBe(3);
+    expect(counts.cancel).toBe(1);
+  });
+
+  it('auditoria r1 P2-04: corpo null, [], número ou ilegível não lança e não vira recusa', async () => {
+    for (const text of ['null', '[]', '42', '{', '"x"']) {
+      let clock = 0;
+      const driver = new MercadoPagoPointDriver('TEF_POS_WIRELESS', TERMINAL, {
+        config: async () => CFG,
+        fetch: async () => ({ status: 200, text: async () => text }),
+        sleep: async (ms) => { clock += ms; },
+        now: () => clock,
+        operator: async () => STAFF,
+      });
+      expect((await driver.charge(REQ)).status).toBe('MANUAL_REVIEW');
+    }
+    let clock = 0;
+    const err = new MercadoPagoPointDriver('TEF_POS_WIRELESS', TERMINAL, {
+      config: async () => CFG,
+      fetch: async () => ({ status: 400, text: async () => 'null' }),
+      sleep: async (ms) => { clock += ms; },
+      now: () => clock,
+    });
+    expect(await err.charge(REQ)).toMatchObject({ status: 'DECLINED', reason: 'HTTP 400' });
   });
 
   it('erro 500 ou rede na consulta nunca vira recusa', async () => {
@@ -103,7 +174,7 @@ describe('MercadoPagoPointDriver', () => {
     const r = await driver.charge(REQ);
     expect(r).toMatchObject({ status: 'DECLINED', reason: 'Cobrança cancelada na maquininha (nada foi cobrado).' });
     expect(counts.cancel).toBe(1);
-    expect(counts.status).toBeGreaterThanOrEqual(POINT_WAIT_MS / 2_000 - 1);
+    expect(counts.status).toBeGreaterThanOrEqual(POINT_WAIT_MS / 2_000 - 2);
   });
 
   it('cancelamento sem confirmação vira revisão manual depois do prazo', async () => {
@@ -111,7 +182,7 @@ describe('MercadoPagoPointDriver', () => {
     const r = await driver.charge(REQ);
     expect(r).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT', acquirer: 'MERCADO_PAGO' });
     expect(counts.cancel).toBe(1);
-    expect(counts.status).toBeGreaterThanOrEqual((POINT_WAIT_MS + POINT_CANCEL_WAIT_MS) / 2_000 - 1);
+    expect(counts.status).toBeGreaterThanOrEqual((POINT_WAIT_MS + POINT_CANCEL_WAIT_MS) / 2_000 - 2);
   });
 
   it('abort pede o cancelamento já na próxima volta', async () => {
@@ -120,6 +191,7 @@ describe('MercadoPagoPointDriver', () => {
     h.driver.abort(REQ.request_id);
     expect((await p).status).toBe('DECLINED');
     expect(h.counts.cancel).toBe(1);
+    expect(h.calls.find((c) => c.body.action === 'cancel')!.body).toMatchObject({ reason: 'operator', staff_id: STAFF });
   });
 
   it('cancelar depois de pago devolve a aprovação', async () => {

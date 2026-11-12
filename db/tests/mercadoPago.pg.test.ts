@@ -21,6 +21,8 @@ const ORDER = '44444444-4444-4444-8444-444444444444';
 const TERMINAL = '55555555-5555-4555-8555-555555555555';
 const STONE_TERMINAL = '66666666-6666-4666-8666-666666666666';
 const MP_ID = 'NEWLAND_N950__N950NCB801293324';
+const ORDER2 = '77777777-7777-4777-8777-777777777777';
+const CLOSED = '88888888-8888-4888-8888-888888888888';
 
 function applySchema(t: PgTarget, db: string): void {
   createSupabaseLikeDb(t, db);
@@ -75,7 +77,13 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
          INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${TERMINAL}', '${TENANT}', 'Point Smart', '${MP_ID}', 'MERCADO_PAGO'),
                 ('${STONE_TERMINAL}', '${TENANT}', 'Stone 01', 'STONE-01', 'STONE');
          INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER}', '${TENANT}', '${TABLE}', '${STAFF}');
-         INSERT INTO payment_provider_secrets (tenant_id, provider, access_token) VALUES ('${TENANT}', 'mercado_pago_point', 'APP_USR-segredo');`);
+         INSERT INTO payment_provider_secrets (tenant_id, provider, access_token) VALUES ('${TENANT}', 'mercado_pago_point', 'APP_USR-segredo');
+         INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER2}', '${TENANT}', '${TABLE}', '${STAFF}'), ('${CLOSED}', '${TENANT}', '${TABLE}', '${STAFF}');`);
+    // Saldo de R$ 50,00 na ORDER2 sem montar itens (os totais só mudam pelo recálculo do banco).
+    sql(`BEGIN; SET LOCAL session_replication_role = replica;
+         UPDATE orders SET total_amount = 50, remaining_balance = 50 WHERE id = '${ORDER2}';
+         UPDATE orders SET total_amount = 50, remaining_balance = 50, status = 'CLOSED' WHERE id = '${CLOSED}';
+         COMMIT;`);
   }, 120_000);
 
   it('o aparelho não lê nem grava o token do Mercado Pago', () => {
@@ -129,9 +137,96 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     expect(r.message).toContain('não confere');
   });
 
-  it('cobrança aprovada com valor pago diferente não libera o pagamento', () => {
-    const key = charge({ paid_amount_cents: 900 });
-    expect(pay(key).ok).toBe(false);
+  it('cobrança aprovada com valor pago diferente nem é gravada (aprovado exige comprovante completo)', () => {
+    expect(() => charge({ paid_amount_cents: 900 })).toThrow(/comprovante completo/);
+    expect(() => charge({ authorization_code: null })).toThrow(/comprovante completo/);
+    expect(() => charge({ card_brand: null })).toThrow(/comprovante completo/);
+  });
+
+  it.each([
+    ['bandeira', { card_brand: 'MASTERCARD' }],
+    ['CNPJ da credenciadora', { acquirer_cnpj: '16501555000157' }],
+    ['sem CNPJ', { acquirer_cnpj: null }],
+  ])('auditoria r1 P2-03: pagamento com %s diferente da cobrança aprovada é recusado', (_label, over) => {
+    const key = charge(); // VISA
+    const r = pay(key, over);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain('não confere');
+  });
+
+  it('auditoria r1 P0-02: cobrança aprovada não é rebaixada nem perde o comprovante', () => {
+    const key = charge();
+    for (const set of [`status = 'at_terminal'`, `status = 'manual_review'`, `authorization_code = NULL`, `external_payment_id = '1'`, `card_brand = 'ELO'`]) {
+      const r = psql(target!, `UPDATE terminal_charges SET ${set} WHERE idempotency_key = '${key}';`, DB);
+      expect(r.ok, set).toBe(false);
+      expect(r.message).toContain('não muda mais');
+    }
+    expect(sql(`SELECT status || '|' || authorization_code FROM terminal_charges WHERE idempotency_key = '${key}'`)).toBe(`approved|AUT${key.split('-')[1]}`);
+    // Também recusado, cancelado e expirado são finais.
+    const rej = charge({ status: 'rejected', external_payment_id: null, paid_amount_cents: null, card_brand: null, authorization_code: null });
+    expect(psql(target!, `UPDATE terminal_charges SET status = 'approved' WHERE idempotency_key = '${rej}';`, DB).ok).toBe(false);
+  });
+
+  it('auditoria r1 P0-02: gravação condicionada ao estado lido não sobrescreve quem passou na frente', () => {
+    const key = charge({ status: 'at_terminal', external_payment_id: null, paid_amount_cents: null, card_brand: null, authorization_code: null });
+    // Primeira consulta aprova (leu at_terminal):
+    expect(sql(`UPDATE terminal_charges SET status = 'approved', external_payment_id = '555', paid_amount_cents = 1000, card_brand = 'VISA', authorization_code = 'OK1'
+                WHERE idempotency_key = '${key}' AND status = 'at_terminal' AND status NOT IN ('approved','rejected','cancelled','expired','refunded') RETURNING id;`)).not.toBe('');
+    // Segunda, atrasada, também leu at_terminal: não acha a linha e não grava nada.
+    expect(sql(`UPDATE terminal_charges SET status = 'at_terminal' WHERE idempotency_key = '${key}' AND status = 'at_terminal' RETURNING id;`)).toBe('');
+    expect(sql(`SELECT status FROM terminal_charges WHERE idempotency_key = '${key}'`)).toBe('approved');
+  });
+
+  it('conta, maquininha, forma e valor da cobrança não mudam', () => {
+    const key = charge({ status: 'pending', external_payment_id: null, paid_amount_cents: null, card_brand: null, authorization_code: null });
+    for (const set of [`amount_cents = 1`, `method = 'DEBIT'`, `order_id = '${ORDER2}'`, `external_terminal_id = 'X'`]) {
+      expect(psql(target!, `UPDATE terminal_charges SET ${set} WHERE idempotency_key = '${key}';`, DB).ok, set).toBe(false);
+    }
+  });
+
+  describe('auditoria r1 P1-02: abrir cobrança só para conta aberta e dentro do saldo', () => {
+    const open = (key: string, order: string, cents: number) =>
+      psql(target!, `SELECT tchefood_open_terminal_charge('${TENANT}', '${key}', '${order}', '${TERMINAL}', '${MP_ID}', 'CREDIT', ${cents}, '${STAFF}');`, DB);
+
+    it('conta inexistente, de outra loja ou fechada: recusa com código e não grava', () => {
+      const missing = open('rpc-missing', '12345678-1234-4234-8234-123456789012', 100);
+      expect(missing).toMatchObject({ ok: false, sqlstate: 'TF001' });
+      const other = psql(target!, `SELECT tchefood_open_terminal_charge('${OTHER}', 'rpc-other', '${ORDER2}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, NULL);`, DB);
+      expect(other).toMatchObject({ ok: false, sqlstate: 'TF001' });
+      expect(open('rpc-closed', CLOSED, 100)).toMatchObject({ ok: false, sqlstate: 'TF002' });
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key LIKE 'rpc-%'`)).toBe('0');
+    });
+
+    it('dentro do saldo grava "creating"; a cobrança em andamento reserva o valor; reenvio da chave devolve a mesma', () => {
+      const a = open('rpc-a', ORDER2, 3000);
+      expect(a.ok, a.message ?? '').toBe(true);
+      expect(sql(`SELECT status || '|' || amount_cents FROM terminal_charges WHERE idempotency_key = 'rpc-a'`)).toBe('creating|3000');
+      expect(open('rpc-a', ORDER2, 3000).out).toBe(a.out);
+      // Saldo 50,00 com 30,00 em andamento: 20,01 não cabe, 20,00 cabe.
+      const over = open('rpc-b', ORDER2, 2001);
+      expect(over).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      expect(over.message).toContain('passa do saldo');
+      expect(open('rpc-c', ORDER2, 2000).ok).toBe(true);
+      expect(open('rpc-d', ORDER2, 1)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+    });
+
+    it('aprovada sem pagamento gravado reserva; revisão manual e encerrada não reservam', () => {
+      sql(`UPDATE terminal_charges SET status = 'manual_review' WHERE idempotency_key = 'rpc-a';
+           UPDATE terminal_charges SET status = 'cancelled' WHERE idempotency_key = 'rpc-c';`);
+      expect(open('rpc-e', ORDER2, 5000).ok).toBe(true);
+      sql(`UPDATE terminal_charges SET status = 'approved', external_payment_id = '9', paid_amount_cents = 5000, card_brand = 'VISA', authorization_code = 'Z' WHERE idempotency_key = 'rpc-e';`);
+      expect(open('rpc-f', ORDER2, 1)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+    });
+
+    it('o aparelho não chama a função (só a Edge Function, com a service role)', () => {
+      const r = asDevice(`SELECT tchefood_open_terminal_charge('${TENANT}', 'rpc-dev', '${ORDER2}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 1, NULL)`);
+      expect(r.ok).toBe(false);
+      expect(r.sqlstate).toBe('42501');
+      const anon = psql(target!, `BEGIN; SET LOCAL ROLE anon; SELECT tchefood_open_terminal_charge('${TENANT}', 'rpc-anon', '${ORDER2}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 1, NULL); COMMIT;`, DB);
+      expect(anon.sqlstate).toBe('42501');
+      const svc = psql(target!, `BEGIN; SET LOCAL ROLE service_role; SELECT tchefood_open_terminal_charge('${TENANT}', 'rpc-svc', '${CLOSED}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 1, NULL); COMMIT;`, DB);
+      expect(svc.sqlstate).toBe('TF002'); // executa (e recusa pela conta fechada)
+    });
   });
 
   it('pagamento igual à cobrança aprovada entra, e a mesma cobrança não paga duas vezes', () => {

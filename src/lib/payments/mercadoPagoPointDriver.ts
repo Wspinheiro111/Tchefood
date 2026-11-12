@@ -11,8 +11,12 @@
  *    autorização e bandeira). O banco ainda confere de novo ao gravar o pagamento.
  *  - Sem resposta final no prazo, pede o cancelamento na maquininha e só devolve
  *    recusa quando o servidor confirma cancelada; senão vira revisão manual.
- *  - Falha de rede nunca vira recusa: a cobrança pode ter chegado à maquininha.
- *    Só "cobrança não encontrada" no servidor prova que nada foi enviado.
+ *  - Falha de rede, prazo estourado ou erro do servidor nunca viram recusa: a cobrança
+ *    pode ter chegado à maquininha. Depois de uma criação incerta, nem 404 nem outra
+ *    recusa provam nada (a primeira criação pode estar a caminho): a recusa só vem do
+ *    encerramento no servidor, que grava o bloqueio da chave antes de responder.
+ *  - Cada chamada tem prazo próprio (POINT_REQUEST_TIMEOUT_MS) e o fluxo inteiro tem
+ *    prazo contado desde o primeiro envio.
  *  - Pix pela Point ainda não: a cobrança nem começa.
  */
 import type { OperationMode, PosTerminal } from '../../types';
@@ -26,7 +30,7 @@ import {
   type TerminalResult,
 } from './drivers';
 
-export type PointFetch = (url: string, init: { method: string; headers: Record<string, string>; body: string }) => Promise<{ status: number; text(): Promise<string> }>;
+export type PointFetch = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }) => Promise<{ status: number; text(): Promise<string> }>;
 
 export interface PointDriverDeps {
   /** Sessão da nuvem com token válido; null = loja não conectada. */
@@ -34,6 +38,12 @@ export interface PointDriverDeps {
   fetch: PointFetch;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  /** Resolve depois de ms: prazo de cada chamada (sem ele, a chamada não tem limite próprio). */
+  timer?: (ms: number) => Promise<void>;
+  /** Quem está no caixa (fica gravado no encerramento da tentativa). */
+  operator?: () => Promise<string | null>;
+  /** Sobe a fila antes de cobrar: o servidor só cobra conta que já está nele. */
+  beforeCreate?: () => Promise<void>;
 }
 
 /** Tempo esperando o cartão antes de pedir o cancelamento na maquininha. */
@@ -41,6 +51,8 @@ export const POINT_WAIT_MS = 120_000;
 /** Depois do pedido de cancelamento, quanto tempo esperar a confirmação. */
 export const POINT_CANCEL_WAIT_MS = 30_000;
 export const POINT_POLL_MS = 2_000;
+/** Prazo de cada chamada à função point-charge. */
+export const POINT_REQUEST_TIMEOUT_MS = 15_000;
 
 type Reply =
   | { status: 'PENDING' }
@@ -55,13 +67,18 @@ type CallOutcome =
 
 const BRANDS = new Set(['VISA', 'MASTERCARD', 'ELO']);
 
-function parseReply(text: string): Reply | null {
-  let body: Record<string, unknown>;
+function parseObject(text: string): Record<string, unknown> | null {
   try {
-    body = JSON.parse(text) as Record<string, unknown>;
+    const parsed: unknown = JSON.parse(text);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
   } catch {
     return null;
   }
+}
+
+function parseReply(text: string): Reply | null {
+  const body = parseObject(text);
+  if (!body) return null;
   switch (body.status) {
     case 'PENDING':
       return { status: 'PENDING' };
@@ -120,13 +137,29 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     if (!cfg) return { kind: 'unknown' };
     let res: { status: number; text(): Promise<string> };
     let text: string;
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
     try {
-      res = await this.deps.fetch(`${cfg.url.replace(/\/+$/, '')}/functions/v1/point-charge`, {
-        method: 'POST',
-        headers: { apikey: cfg.anonKey, Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      text = await res.text();
+      const request = (async () => {
+        const r = await this.deps.fetch(`${cfg.url.replace(/\/+$/, '')}/functions/v1/point-charge`, {
+          method: 'POST',
+          headers: { apikey: cfg.anonKey, Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          ...(controller ? { signal: controller.signal } : {}),
+        });
+        return { r, t: await r.text() };
+      })();
+      const timer = this.deps.timer;
+      const out = timer
+        ? await Promise.race([request, timer(POINT_REQUEST_TIMEOUT_MS).then(() => null)])
+        : await request;
+      if (!out) {
+        // Prazo estourado: resultado desconhecido (a cobrança pode ter chegado).
+        controller?.abort();
+        request.catch(() => undefined);
+        return { kind: 'unknown' };
+      }
+      res = out.r;
+      text = out.t;
     } catch {
       return { kind: 'unknown' };
     }
@@ -136,13 +169,9 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     }
     let error = 'http';
     let message = `HTTP ${res.status}`;
-    try {
-      const b = JSON.parse(text) as { error?: unknown; message?: unknown };
-      if (typeof b.error === 'string') error = b.error;
-      if (typeof b.message === 'string') message = b.message;
-    } catch {
-      // corpo ilegível
-    }
+    const b = parseObject(text);
+    if (b && typeof b.error === 'string') error = b.error;
+    if (b && typeof b.message === 'string') message = b.message;
     // 5xx, 401 (sessão vencida no meio) e afins não provam nada sobre a maquininha.
     if (res.status >= 500 || res.status === 401) return { kind: 'unknown' };
     return { kind: 'rejected', httpStatus: res.status, error, message };
@@ -174,46 +203,58 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
   }
 
   async charge(req: ChargeRequest): Promise<TerminalResult> {
+    // Antes de qualquer espera: um abort logo depois de chamar charge() não pode se perder.
+    this.aborted.delete(req.request_id);
     if (req.method !== 'CREDIT' && req.method !== 'DEBIT') return this.declined('Pela Point Smart esta versão cobra só crédito à vista e débito. Use outra forma para Pix.');
     if (!this.terminal) return this.declined('Selecione a maquininha Point Smart.');
     const cfg = await this.deps.config().catch(() => null);
     if (!cfg) return this.declined('Conecte a loja à nuvem para cobrar na Point Smart.');
     const key = req.idempotency_key;
     const amountCents = Math.round(req.amount * 100);
-    this.aborted.delete(req.request_id);
+    const operator = await (this.deps.operator?.() ?? Promise.resolve(null)).catch(() => null);
+    const charge = { terminal_id: this.terminal.id, idempotency_key: key, order_id: req.order_id, amount_cents: amountCents, method: req.method };
+    // O prazo conta desde o primeiro envio: criação pendurada também consome o tempo de espera.
+    const started = this.deps.now();
+    await this.deps.beforeCreate?.().catch(() => undefined);
 
-    // 1) Criação. Rede caiu: repete com a mesma chave (o servidor não cria outra).
+    // 1) Criação. Resultado desconhecido: repete com a mesma chave (o servidor não cria outra).
+    let uncertain = false;
     let sent = false;
     for (let attempt = 0; attempt < 3 && !sent; attempt += 1) {
-      const out = await this.call({ action: 'create', terminal_id: this.terminal.id, idempotency_key: key, order_id: req.order_id, amount_cents: amountCents, method: req.method });
+      if (this.deps.now() - started >= POINT_WAIT_MS) break;
+      const out = await this.call({ action: 'create', ...charge, ...(operator ? { staff_id: operator } : {}) });
       if (out.kind === 'reply') {
         sent = true;
         const final = this.toResult(out.reply, req);
         if (final) return final;
       } else if (out.kind === 'rejected') {
-        // O servidor recusou antes de mandar à maquininha (validação, sem token, maquininha de outra loja).
-        return this.declined(out.message);
+        // Recusa antes da maquininha (validação, sem token, conta fora do servidor). Só prova algo se
+        // nenhuma criação anterior ficou sem resposta: senão ela pode estar a caminho e quem decide é o
+        // encerramento no servidor (abaixo).
+        if (!uncertain) return this.declined(out.message);
+        break;
       } else {
+        uncertain = true;
         await this.deps.sleep(POINT_POLL_MS);
       }
     }
 
-    // 2) Espera o cartão. Sem saber se a criação chegou, a consulta diz (404 = nunca chegou).
-    const started = this.deps.now();
+    // 2) Espera o cartão. Encerrar no servidor é a única prova de "nada foi cobrado": sem cobrança gravada,
+    //    ele grava o bloqueio da chave e uma criação atrasada não chega mais à Point.
     let cancelAt: number | null = null;
+    const close = async (reason: 'timeout' | 'operator'): Promise<TerminalResult | null> => {
+      if (!operator) return null;
+      const out = await this.call({ action: 'cancel', ...charge, reason, staff_id: operator });
+      return out.kind === 'reply' ? this.toResult(out.reply, req) : null;
+    };
     for (;;) {
       const now = this.deps.now();
       if (cancelAt === null && (this.aborted.has(req.request_id) || now - started >= POINT_WAIT_MS)) {
         cancelAt = now;
-        const out = await this.call({ action: 'cancel', idempotency_key: key });
-        if (out.kind === 'reply') {
-          const final = this.toResult(out.reply, req);
-          if (final) return final;
-        } else if (out.kind === 'rejected' && out.httpStatus === 404) {
-          return this.declined('A cobrança não chegou ao servidor (nada foi cobrado).');
-        }
+        const final = await close(this.aborted.has(req.request_id) ? 'operator' : 'timeout');
+        if (final) return final;
       }
-      if (cancelAt !== null && now - cancelAt >= POINT_CANCEL_WAIT_MS) {
+      if (cancelAt !== null && this.deps.now() - cancelAt >= POINT_CANCEL_WAIT_MS) {
         return this.review('A maquininha não confirmou o pagamento nem o cancelamento. Confira no app do Mercado Pago antes de cobrar de novo.', 'POINT_TIMEOUT');
       }
       await this.deps.sleep(POINT_POLL_MS);
@@ -222,7 +263,13 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
         const final = this.toResult(out.reply, req);
         if (final) return final;
       } else if (out.kind === 'rejected') {
-        if (out.httpStatus === 404) return this.declined('A cobrança não chegou ao servidor (nada foi cobrado).');
+        if (out.httpStatus === 404) {
+          // Não gravada AGORA não prova nada (a criação pode estar a caminho): encerra no servidor, que decide.
+          if (cancelAt === null) cancelAt = this.deps.now();
+          const final = await close('timeout');
+          if (final) return final;
+          continue;
+        }
         return this.review(`Falha ao consultar a cobrança: ${out.message}. Confira no app do Mercado Pago.`, 'POINT_STATUS_REJECTED');
       }
     }

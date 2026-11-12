@@ -502,6 +502,10 @@ export function createDriver(params: { terminal: PosTerminal | null; chassis: Ch
       fetch: (url, init) => fetch(url, init),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
       now: () => Date.now(),
+      timer: (ms) => new Promise((r) => setTimeout(r, ms)),
+      operator: async () => (await import('../../store/useTcheStore')).useTcheStore.getState().currentUserId,
+      // A conta precisa estar no servidor (ele confere conta aberta e saldo antes de cobrar).
+      beforeCreate: async () => (await import('../sync/useCloudSync')).syncOnce(),
     });
   }
   return new MockTerminalDriver(params.chassis, params.mode, params.terminal);

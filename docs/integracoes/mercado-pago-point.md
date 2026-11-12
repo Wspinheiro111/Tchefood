@@ -19,10 +19,22 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
 - **NSU** = ID do pagamento no Mercado Pago (o "ID da operação" do comprovante). **Autorização**, bandeira e
   final do cartão vêm de `GET /v1/payments/{id}`. Nada é gerado pelo app.
 - Aprovado só quando ordem e pagamento confirmam referência, maquininha, valor cobrado, valor pago, forma
-  (crédito à vista ou débito), autorização e bandeira (Visa, Master ou Elo). Qualquer diferença vira revisão
-  manual.
-- Sem cartão em 2 minutos o app pede o cancelamento na maquininha. Só vira "recusado" quando o Mercado Pago
-  confirma cancelada; senão vira revisão manual.
+  (crédito à vista ou débito), autorização e bandeira (Visa, Master ou Elo). Parcelas = 1 e bandeira vêm do
+  próprio pagamento (ausentes não contam). Qualquer diferença vira revisão manual. O banco confere de novo ao
+  gravar o pagamento, inclusive bandeira e CNPJ do Mercado Pago (10.573.521/0001-91).
+- Cobrança nova só para conta **aberta no servidor** e dentro do saldo dele, menos as outras cobranças da mesma
+  conta em andamento (`tchefood_open_terminal_charge`, com a conta travada). Antes de cobrar o app sobe a fila;
+  conta que ainda não subiu é recusada antes de chegar à maquininha ("aguarde a sincronização").
+- Sem cartão em 2 minutos (contados desde o primeiro envio) o app **encerra a tentativa**: pede à maquininha que
+  pare de esperar o cartão. Não é estorno: cobrança já paga continua paga e volta como aprovada. Fica gravado na
+  cobrança quem encerrou (operador da equipe ativa), o motivo (`timeout` ou `operator`) e a hora. Só vira
+  "recusado" quando o Mercado Pago confirma cancelada; senão vira revisão manual.
+- Criação sem resposta (queda, prazo de 15 s por chamada estourado, erro 5xx): nem "cobrança não encontrada" nem
+  outra recusa provam que nada foi cobrado, porque a primeira criação pode estar a caminho. Quem decide é o
+  encerramento no servidor: sem cobrança gravada, ele grava o bloqueio da chave (`voided_before_send`) e a criação
+  atrasada encontra a cobrança encerrada e não vai à Point.
+- Cobrança em estado final (aprovada, recusada, cancelada, expirada, estornada) não muda mais: cada gravação só vale
+  se o estado ainda for o lido, e o banco recusa mudar uma cobrança final.
 - Cobrança incerta do Mercado Pago **não** entra pelo comprovante digitado: o banco recusaria. Confira no app
   do Mercado Pago; se foi cobrado, estorne lá e cobre de novo.
 
