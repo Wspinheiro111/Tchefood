@@ -1990,6 +1990,57 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     });
   });
 
+  it('extrato com mais de 1.000 lançamentos e crédito novo no meio da leitura: leitura consistente, sem repetir nem perder (P2-01 da rodada 11)', async () => {
+    // Critério do GPT: 1.001 créditos de R$ 1,00; um crédito de R$ 100,00 entra no banco logo
+    // depois da primeira requisição de cashback (na leitura em páginas, entre a página 1 e a
+    // 2, com um id que ordena antes de todos). A leitura tem de ser a foto de antes ou a de
+    // depois, inteira: nada repetido, nada faltando.
+    const cust = cashbackCustomer('5553988119095', []);
+    sql(`SET session_replication_role = replica;
+         INSERT INTO cashback_ledger (tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+         SELECT '${TENANT}', '${cust.id}', 'EARN', 1, 1, '2026-11-01', '2026-12-31' FROM generate_series(1, 1001);`);
+    const ids = () => sql(`SELECT string_agg(id::text, ',' ORDER BY id) FROM cashback_ledger WHERE customer_id = '${cust.id}'`).split(',');
+    const before = ids();
+    expect(before).toHaveLength(1001);
+    const cloud = st().cloud!;
+    const cfg = { url: cloud.url, anonKey: cloud.anon_key, accessToken: cloud.access_token };
+    const base = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' });
+    let n = 0;
+    const late = (id: string): typeof base => async (url, init) => {
+      const res = await base(url, init);
+      if (/cashback/.test(url) && ++n === 1) {
+        sql(`SET session_replication_role = replica;
+             INSERT INTO cashback_ledger (id, tenant_id, customer_id, entry_type, amount, remaining_amount, valid_from, expires_at)
+             VALUES ('${id}', '${TENANT}', '${cust.id}', 'EARN', 100, 100, '2026-11-01', '2026-12-31');`);
+      }
+      return res;
+    };
+    const check = (rows: CashbackLedgerEntry[], after: string[]) => {
+      const got = rows.filter((e) => e.customer_id === cust.id).map((e) => e.id);
+      expect(new Set(got).size, 'lançamento repetido').toBe(got.length);
+      const sorted = [...got].sort();
+      expect([JSON.stringify(before), JSON.stringify(after)]).toContain(JSON.stringify(sorted));
+      const total = rows.filter((e) => e.customer_id === cust.id).reduce((a, e) => a + Math.round(e.amount * 100), 0);
+      expect([100100, 110100]).toContain(total);
+    };
+    // Conferência do desfazer (um cliente).
+    const one = await fetchCloudCustomerCashback(cfg, late('00000000-0000-4000-8000-000000000001'), cust.id);
+    check(one.cashbackLedger, ids());
+    expect(one.loyaltyCustomers.map((c) => c.id)).toEqual([cust.id]);
+    // Leitura da nuvem do aparelho (a loja toda).
+    const beforeAll = ids();
+    n = 0;
+    const snap = await fetchCloudSnapshot(cfg, TENANT, late('00000000-0000-4000-8000-000000000002'));
+    const afterAll = ids();
+    const got = snap.cashbackLedger.filter((e) => e.customer_id === cust.id).map((e) => e.id).sort();
+    expect(new Set(snap.cashbackLedger.map((e) => e.id)).size).toBe(snap.cashbackLedger.length);
+    expect([JSON.stringify(beforeAll), JSON.stringify(afterAll)]).toContain(JSON.stringify(got));
+    // Só a loja do token.
+    expect(snap.cashbackLedger.every((e) => e.tenant_id === TENANT)).toBe(true);
+    expect(snap.loyaltyCustomers.every((c) => c.tenant_id === TENANT)).toBe(true);
+    sql(`SET session_replication_role = replica; DELETE FROM cashback_ledger WHERE customer_id = '${cust.id}'; DELETE FROM loyalty_customers WHERE id = '${cust.id}';`);
+  });
+
   it('balcão (Ficha Rápida) com fichas e retirada', async () => {
     login(CASHIER_PIN);
     const order = ok(st().createCounterSale([{ product_id: productId, quantity: 2, modifiers: [], meat_doneness: null }]));

@@ -108,22 +108,6 @@ const TABLES = {
   couriers: { table: 'couriers', order: 'id', columns: ['id', 'tenant_id', 'name', 'phone', 'fee_per_delivery', 'active'] },
 } as const;
 
-/** Cashback: lido à parte (não passa pelo mergeRows; ver mergeCashback). */
-const CASHBACK_TABLES = {
-  loyaltyCustomers: {
-    table: 'loyalty_customers',
-    order: 'id',
-    columns: ['id', 'tenant_id', 'name', 'phone_whatsapp', 'cpf', 'whatsapp_opt_in', 'opt_in_at', 'cashback_balance', 'total_spent', 'visits_count', 'last_visit_at', 'created_at'],
-  },
-  cashbackLedger: {
-    table: 'cashback_ledger',
-    order: 'id',
-    columns: [
-      'id', 'tenant_id', 'customer_id', 'order_id', 'entry_type', 'amount', 'remaining_amount', 'base_amount', 'pct', 'valid_from', 'expires_at',
-      'created_by_user_id', 'created_at', 'redeem_sources', 'refund_of_id',
-    ],
-  },
-} as const;
 
 /** Linhas por página (o Supabase limita a 1000 por padrão). */
 export const PULL_PAGE_SIZE = 1000;
@@ -146,10 +130,10 @@ async function readError(res: { status: number; text: () => Promise<string> }): 
   }
 }
 
-async function getAll<T>(cfg: SyncConfig, fetchFn: FetchLike, table: string, columns: readonly string[], order: string, filter = ''): Promise<T[]> {
+async function getAll<T>(cfg: SyncConfig, fetchFn: FetchLike, table: string, columns: readonly string[], order: string): Promise<T[]> {
   const out: T[] = [];
   for (let offset = 0; ; offset += PULL_PAGE_SIZE) {
-    const q = `select=${columns.join(',')}${filter ? `&${filter}` : ''}&order=${order}&limit=${PULL_PAGE_SIZE}&offset=${offset}`;
+    const q = `select=${columns.join(',')}&order=${order}&limit=${PULL_PAGE_SIZE}&offset=${offset}`;
     const res = await fetchFn(`${root(cfg)}/${table}?${q}`, { method: 'GET', headers: headers(cfg) });
     if (!res.ok) throw new Error(`Não foi possível ler ${table} da nuvem: ${await readError(res)}`);
     const page = JSON.parse(await res.text()) as T[];
@@ -184,8 +168,7 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
   const purchaseInvoices = await read('purchaseInvoices');
   const deliveryZones = await read('deliveryZones');
   const couriers = await read('couriers');
-  const loyaltyCustomers = await getAll<LoyaltyCustomer>(cfg, fetchFn, CASHBACK_TABLES.loyaltyCustomers.table, CASHBACK_TABLES.loyaltyCustomers.columns, 'id');
-  const cashbackLedger = await getAll<CashbackLedgerEntry>(cfg, fetchFn, CASHBACK_TABLES.cashbackLedger.table, CASHBACK_TABLES.cashbackLedger.columns, 'id');
+  const cashback = await readCashback(cfg, fetchFn, null);
   return {
     tenant,
     staff,
@@ -203,7 +186,7 @@ export async function fetchCloudSnapshot(cfg: SyncConfig, tenantId: string, fetc
     purchaseInvoices: purchaseInvoices as PurchaseInvoice[],
     deliveryZones: (deliveryZones as DeliveryZone[]).map((z) => ({ ...z, fee: Number(z.fee) })),
     couriers: (couriers as Courier[]).map((c) => ({ ...c, fee_per_delivery: Number(c.fee_per_delivery) })),
-    ...cashbackRows(loyaltyCustomers, cashbackLedger),
+    ...cashback,
   };
 }
 
@@ -229,14 +212,34 @@ function cashbackRows(loyaltyCustomers: LoyaltyCustomer[], cashbackLedger: Cashb
 export type CloudCashback = { loyaltyCustomers: LoyaltyCustomer[]; cashbackLedger: CashbackLedgerEntry[] };
 
 /**
+ * Clientes e extrato de cashback numa leitura só do banco (tchefood_cashback_snapshot: um
+ * SELECT, uma foto), não em páginas: a leitura paginada podia repetir um lançamento e
+ * perder outro quando um crédito entrava no meio (P2-01 da rodada 11 do GPT). Lançamento
+ * repetido na resposta é recusado em vez de aceito em silêncio.
+ */
+async function readCashback(cfg: SyncConfig, fetchFn: FetchLike, customerId: string | null): Promise<CloudCashback> {
+  const res = await fetchFn(`${root(cfg)}/rpc/tchefood_cashback_snapshot`, {
+    method: 'POST',
+    headers: headers(cfg),
+    body: JSON.stringify({ p_customer_id: customerId }),
+  });
+  if (!res.ok) throw new Error(`Não foi possível ler o cashback da nuvem: ${await readError(res)}`);
+  const body = JSON.parse((await res.text()) || 'null') as { loyalty_customers?: LoyaltyCustomer[]; cashback_ledger?: CashbackLedgerEntry[] } | null;
+  if (!body || !Array.isArray(body.loyalty_customers) || !Array.isArray(body.cashback_ledger)) {
+    throw new Error('Não foi possível ler o cashback da nuvem: resposta incompleta.');
+  }
+  for (const rows of [body.loyalty_customers, body.cashback_ledger] as { id: string }[][]) {
+    if (new Set(rows.map((r) => r.id)).size !== rows.length) throw new Error('Não foi possível ler o cashback da nuvem: lançamento repetido na leitura.');
+  }
+  return cashbackRows(body.loyalty_customers, body.cashback_ledger);
+}
+
+/**
  * Cadastro e extrato de cashback de um cliente, lidos agora da nuvem. Usado para conferir
  * um resgate da versão anterior do aparelho (sem redeem_sources) antes de desfazê-lo.
  */
-export async function fetchCloudCustomerCashback(cfg: SyncConfig, fetchFn: FetchLike, customerId: string): Promise<CloudCashback> {
-  const id = encodeURIComponent(customerId);
-  const customers = await getAll<LoyaltyCustomer>(cfg, fetchFn, CASHBACK_TABLES.loyaltyCustomers.table, CASHBACK_TABLES.loyaltyCustomers.columns, 'id', `id=eq.${id}`);
-  const ledger = await getAll<CashbackLedgerEntry>(cfg, fetchFn, CASHBACK_TABLES.cashbackLedger.table, CASHBACK_TABLES.cashbackLedger.columns, 'id', `customer_id=eq.${id}`);
-  return cashbackRows(customers, ledger);
+export function fetchCloudCustomerCashback(cfg: SyncConfig, fetchFn: FetchLike, customerId: string): Promise<CloudCashback> {
+  return readCashback(cfg, fetchFn, customerId);
 }
 
 export type StaffPinsResult = { ok: true; staff: StaffUser[] } | { ok: false; error: string };

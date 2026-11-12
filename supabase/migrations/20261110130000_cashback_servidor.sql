@@ -875,6 +875,30 @@ BEGIN
     END IF;
 END $$;
 
+-- Leitura do cashback pelo aparelho (P2-01 da rodada 11 do GPT): clientes e extrato num
+-- único SELECT, então numa única foto do banco. A leitura em páginas (limit/offset, uma
+-- requisição por página) podia repetir um lançamento e perder outro quando um crédito
+-- entrava no meio, e o aparelho trocava o extrato dele por essa leitura. Roda com o papel
+-- de quem chama (a RLS da loja vale) e só devolve a loja do token. p_customer_id
+-- restringe a um cliente (conferência do desfazer de resgate da versão anterior).
+CREATE OR REPLACE FUNCTION tchefood_cashback_snapshot(p_customer_id UUID DEFAULT NULL)
+RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = public AS $$
+    WITH c AS (
+        SELECT id, tenant_id, name, phone_whatsapp, cpf, whatsapp_opt_in, opt_in_at, cashback_balance, total_spent,
+               visits_count, last_visit_at, created_at
+          FROM loyalty_customers
+         WHERE tenant_id = tchefood_tenant() AND (p_customer_id IS NULL OR id = p_customer_id)
+    ), l AS (
+        SELECT id, tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, base_amount, pct, valid_from,
+               expires_at, created_by_user_id, created_at, redeem_sources, refund_of_id
+          FROM cashback_ledger
+         WHERE tenant_id = tchefood_tenant() AND (p_customer_id IS NULL OR customer_id = p_customer_id)
+    )
+    SELECT jsonb_build_object(
+        'loyalty_customers', COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY c.id) FROM c), '[]'::jsonb),
+        'cashback_ledger', COALESCE((SELECT jsonb_agg(to_jsonb(l) ORDER BY l.id) FROM l), '[]'::jsonb));
+$$;
+
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
@@ -886,5 +910,7 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_loyalty_balance_from_ledger() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_orders_cashback_refund() FROM PUBLIC, anon, authenticated;
         REVOKE DELETE ON cashback_ledger FROM anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_cashback_snapshot(UUID) FROM PUBLIC, anon;
+        GRANT EXECUTE ON FUNCTION tchefood_cashback_snapshot(UUID) TO authenticated;
     END IF;
 END $$;
