@@ -271,7 +271,11 @@ export type CashbackReconcileInput = {
   performedBy: string;
   reason: string;
 };
-export type CashbackReconcileResult = { ok: true; amount: number; repeated: boolean } | { ok: false; error: string };
+export type CashbackReconcileResult =
+  | { ok: true; amount: number; repeated: boolean }
+  /** O id já tem outra decisão gravada (decisão, valor, motivo, operador ou gerente diferente): nada foi gravado agora. */
+  | { ok: false; conflict: { decision: 'RELEASE' | 'DISCARD'; amount: number; reason: string } }
+  | { ok: false; error: string };
 
 /** Decisão do gerente sobre uma pendência de cashback. A regra (PIN, valor, crédito, auditoria) roda no servidor. */
 export async function reconcileCashback(cfg: SyncConfig, fetchFn: FetchLike, input: CashbackReconcileInput): Promise<CashbackReconcileResult> {
@@ -284,7 +288,12 @@ export async function reconcileCashback(cfg: SyncConfig, fetchFn: FetchLike, inp
     }),
   });
   if (!res.ok) return { ok: false, error: `A nuvem recusou: ${await readError(res)}` };
-  const body = JSON.parse((await res.text()) || 'null') as { status?: string; amount?: number | string; repeated?: boolean } | null;
+  const body = JSON.parse((await res.text()) || 'null') as
+    | { status?: string; amount?: number | string; repeated?: boolean; decision?: 'RELEASE' | 'DISCARD'; reason?: string }
+    | null;
+  if (body?.status === 'CONFLICT' && body.decision) {
+    return { ok: false, conflict: { decision: body.decision, amount: Number(body.amount), reason: String(body.reason ?? '') } };
+  }
   if (body?.status === 'PIN_FAILED') return { ok: false, error: 'PIN de gerente incorreto.' };
   if (body?.status === 'PIN_LOCKED') return { ok: false, error: 'PIN bloqueado por excesso de tentativas. Aguarde um minuto.' };
   if (body?.status !== 'OK') return { ok: false, error: 'A nuvem não confirmou a conciliação.' };

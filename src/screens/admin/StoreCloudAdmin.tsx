@@ -9,6 +9,7 @@ import { signInDevice, type SyncConfig } from '../../lib/sync/supabaseSync';
 import { cloudDiscountOf } from '../../lib/sync/cloudDiscount';
 import { fetchCashbackPending, fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, reconcileCashback, type CashbackPending, type CloudCashback, type CloudStaff } from '../../lib/sync/cloudPull';
 import { formatBRL } from '../../lib/money';
+import { formatBrasiliaDateTime, runReconcileDecision } from '../../lib/cashbackReconcile';
 import { defaultCloudConfig, syncOnce } from '../../lib/sync/useCloudSync';
 import { useOnline } from '../../lib/useOnline';
 import { Btn, Sheet, toast } from '../../components/ui';
@@ -572,7 +573,7 @@ function CashbackReconcilePanel() {
               holdId={h.id}
               amount={h.amount}
               title={`Devolução retida · ${h.customer_name ?? 'Sem nome'} (${h.phone})`}
-              detail={`${new Date(h.created_at).toLocaleString('pt-BR')}${h.order_id ? ` · conta ${h.order_id.slice(0, 8)}…` : ''}`}
+              detail={`${formatBrasiliaDateTime(h.created_at)}${h.order_id ? ` · conta ${h.order_id.slice(0, 8)}…` : ''}`}
               onDone={() => void load()}
             />
           ))}
@@ -605,8 +606,9 @@ function ReconcileRow(props: {
 }) {
   const cloud = useTcheStore((s) => s.cloud)!;
   const userId = useTcheStore((s) => s.currentUserId);
-  // Um id por pendência: o reenvio depois de resposta perdida não repete a decisão.
-  const [requestId] = useState(() => crypto.randomUUID());
+  // Um id por decisão (reconcileOutcome): fica enquanto a resposta é incerta, para o reenvio
+  // não repetir nada, e muda depois de cada decisão confirmada pela nuvem.
+  const [requestId, setRequestId] = useState<string>(() => crypto.randomUUID());
   const [reason, setReason] = useState('');
   const [pin, setPin] = useState('');
   const [busy, setBusy] = useState(false);
@@ -616,15 +618,21 @@ function ReconcileRow(props: {
     if (pin.length !== 4) return toast.error('Digite o PIN do gerente.');
     setBusy(true);
     try {
-      const r = await reconcileCashback(cloudConfig(cloud), browserFetch, {
-        requestId, kind: props.kind, customerId: props.customerId, holdId: props.holdId, decision, amount: props.amount,
-        managerPin: pin, performedBy: userId, reason: reason.trim(),
-      });
+      const managerPin = pin;
       setPin('');
-      if (!r.ok) return toast.error(r.error);
-      toast.success(decision === 'RELEASE' ? `${formatBRL(r.amount)} liberados ao cliente.` : `${formatBRL(r.amount)} conciliados sem devolver.`);
-      await syncOnce(undefined, { forcePull: true });
-      props.onDone();
+      const r = await runReconcileDecision({
+        decision,
+        currentId: requestId,
+        newId: () => crypto.randomUUID(),
+        send: (id) => reconcileCashback(cloudConfig(cloud), browserFetch, {
+          requestId: id, kind: props.kind, customerId: props.customerId, holdId: props.holdId, decision, amount: props.amount,
+          managerPin, performedBy: userId, reason: reason.trim(),
+        }),
+        reload: () => syncOnce(undefined, { forcePull: true }),
+        notify: (tone, message) => (tone === 'success' ? toast.success(message) : toast.error(message)),
+      });
+      setRequestId(r.nextRequestId);
+      if (r.done) props.onDone();
     } finally {
       setBusy(false);
     }

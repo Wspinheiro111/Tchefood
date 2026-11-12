@@ -76,6 +76,16 @@ RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS
                     WHERE r.tenant_id = p_tenant AND p_audit_id = ANY (r.settled_audit_ids));
 $$;
 
+-- Conta com resgate da versão anterior já conciliado pelo gerente (P0-02 da segunda
+-- auditoria da rodada 1 do GPT no PR #48): o estado fica no banco (a conciliação guarda
+-- os registros, e cada registro a sua conta), não no id que o aparelho manda.
+CREATE OR REPLACE FUNCTION tchefood_cashback_order_settled(p_tenant UUID, p_order_id UUID)
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+    SELECT EXISTS (SELECT 1 FROM cashback_reconciliations r
+                     JOIN audit_logs a ON a.id = ANY (r.settled_audit_ids)
+                    WHERE r.tenant_id = p_tenant AND a.tenant_id = p_tenant AND a.order_id = p_order_id);
+$$;
+
 -- Baixa sem resgate do cliente: crédito baixado (EARN/REFUND, amount - remaining) que
 -- nenhum REDEEM nem SETTLE explica. Só desta loja.
 CREATE OR REPLACE FUNCTION tchefood_cashback_orphan(p_tenant UUID, p_customer_id UUID)
@@ -164,6 +174,10 @@ BEGIN
     -- confirmada ou devolvida em Nuvem › Cashback para conciliar): não entra mais.
     IF tchefood_cashback_audit_settled(v_tenant, p_audit_id) THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: este resgate da versão anterior já foi conciliado pelo gerente. Desfaça o cashback desta conta.';
+    END IF;
+    -- A mesma conta com ids novos também não: a conciliação já decidiu o cashback dela.
+    IF tchefood_cashback_order_settled(v_tenant, p_order_id) THEN
+        RAISE EXCEPTION 'TCHEFOOD_CASHBACK: esta conta tem resgate da versão anterior já conciliado pelo gerente; cashback novo nela não entra. Desfaça o cashback desta conta.';
     END IF;
     IF NOT tchefood_is_cashback_day(v_at) THEN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: cashback só pode ser usado de terça a quinta.';
@@ -348,6 +362,10 @@ BEGIN
     END IF;
 
     -- PIN do gerente, com o mesmo bloqueio de tchefood_authorize_manager (3 erros em 60 s).
+    -- P0-01 da rodada 1 do GPT: tentativas simultâneas contavam as falhas antes de qualquer
+    -- uma gravar a sua e todas testavam o PIN. A trava da loja (até o fim da transação)
+    -- enfileira as tentativas: cada uma conta as falhas já gravadas pelas anteriores.
+    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || v_tenant::text));
     SELECT count(*) INTO v_failures FROM audit_logs a
      WHERE a.tenant_id = v_tenant AND a.action_type = 'MANAGER_PIN_FAILED'
        AND a.created_at >= NOW() - INTERVAL '60 seconds';
@@ -373,12 +391,19 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_CASHBACK: cliente inválido.';
     END IF;
 
-    -- Reenvio: a mesma decisão já está gravada.
+    -- Reenvio: a mesma decisão já está gravada. P2-02 da segunda auditoria da rodada 1:
+    -- motivo, operador e gerente também precisam ser os mesmos; outro pedido com este id
+    -- não grava nada e devolve CONFLICT com o que está gravado (a tela mostra e lê de novo).
     SELECT * INTO v_existing FROM cashback_reconciliations WHERE id = p_request_id;
     IF FOUND THEN
-        IF v_existing.tenant_id <> v_tenant OR v_existing.kind <> p_kind OR v_existing.customer_id <> p_customer_id
-           OR v_existing.hold_id IS DISTINCT FROM p_hold_id OR v_existing.decision <> p_decision OR v_existing.amount <> p_amount THEN
+        IF v_existing.tenant_id <> v_tenant THEN
             RAISE EXCEPTION 'TCHEFOOD_CASHBACK: já existe outra conciliação com este id.';
+        END IF;
+        IF v_existing.kind <> p_kind OR v_existing.customer_id <> p_customer_id
+           OR v_existing.hold_id IS DISTINCT FROM p_hold_id OR v_existing.decision <> p_decision OR v_existing.amount <> p_amount
+           OR v_existing.reason <> trim(p_reason) OR v_existing.performed_by <> p_performed_by OR v_existing.manager_id <> v_manager.id THEN
+            RETURN jsonb_build_object('status', 'CONFLICT', 'reconciliation_id', v_existing.id, 'decision', v_existing.decision,
+                                      'amount', v_existing.amount, 'reason', v_existing.reason);
         END IF;
         RETURN jsonb_build_object('status', 'OK', 'reconciliation_id', v_existing.id, 'amount', v_existing.amount,
                                   'credit_id', v_existing.credit_id, 'repeated', TRUE);
@@ -462,6 +487,7 @@ DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
         REVOKE ALL ON FUNCTION tchefood_cashback_audit_settled(UUID, UUID) FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_cashback_order_settled(UUID, UUID) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_cashback_orphan(UUID, UUID) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_cashback_pending_legacy(UUID, UUID) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_cashback_reconciliation_pending() FROM PUBLIC, anon;
