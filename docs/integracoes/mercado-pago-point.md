@@ -26,8 +26,12 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   no banco) e dentro do saldo dele, menos as outras cobranças da mesma conta que ainda não terminaram
   (`tchefood_open_terminal_charge`, com a conta travada). Reservam: criando, na fila, na maquininha e em **revisão
   manual**, sem limite de tempo, e aprovadas ainda sem pagamento gravado. Só liberam com o fim comprovado no Mercado
-  Pago (recusada, cancelada, expirada, estornada). PIN de gerente e tempo passado não liberam. Antes de cobrar o
-  app sobe a fila (com prazo de 15 s); conta que ainda não subiu é recusada antes de chegar à maquininha.
+  Pago (recusada, cancelada, expirada, estornada). PIN de gerente e tempo passado não liberam.
+- **A conta cobrada é a que o servidor conhece** (auditoria r4): antes de cobrar, o app espera a sincronização que
+  estiver em andamento (nunca toma "já está sincronizando" por sucesso), sobe a fila e só segue quando nenhum
+  evento da conta (a própria conta, itens, pagamentos, cashback) ficou na fila nem foi recusado pela nuvem
+  (`ensureOrderSynced`, com prazo de 15 s). O saldo da conta no aparelho vai junto (`expected_balance_cents`) e
+  o banco recusa abrir a cobrança se o saldo dele for outro (`TF008`). Nada é mandado à maquininha nesses casos.
 - A mesma reserva vale para **qualquer outro pagamento** da conta: dinheiro, Pix, outra maquininha ou outra cobrança
   (`db/schema_point_reserva.sql`, gatilho em `payments` com a conta travada). Pagamento aprovado só entra até o saldo
   menos a reserva das outras cobranças; o pagamento da própria cobrança aprovada consome a reserva dela. O caixa lê a
@@ -52,6 +56,10 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   2. `tchefood_begin_point_dispatch` é a barreira **imediatamente antes** da chamada: confere de uma vez só que a
      posse ainda é a de quem chama, que não venceu e que não há pedido de encerramento; marca o primeiro envio e
      renova a posse. Não passou, não manda.
+  **Só o pedido de criação (`create`) manda a ordem pela primeira vez.** A consulta (`status`) só repete, com a
+  mesma chave, um envio que comprovadamente já saiu (`dispatched_at` gravado), para recuperar a ordem; a barreira
+  do banco confere isso de novo (`p_allow_first` falso nunca marca o primeiro envio). Cobrança gravada e largada
+  antes do primeiro envio fica parada até o encerramento por prazo, que a encerra com prova (nada foi cobrado).
   3. A ordem devolvida é **ligada à cobrança assim que chega**, em qualquer estado não final (inclusive revisão
      manual), e só depois o resultado é conferido. Com o encerramento já pedido, ela é cancelada no Mercado Pago
      na mesma hora e vale o que ele responder.
@@ -79,6 +87,9 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   `POINT_KEY_BLOCKED` em `audit_logs`. Pedido "pelo operador" (com PIN) sem cobrança gravada é recusado. O app, ao
   receber essa recusa, pede o bloqueio na mesma volta e guarda a autorização do gerente: se a criação gravar
   primeiro, ela vai de novo e encerra a cobrança que ficou.
+- O prazo de 15 s de cada chamada conta também a obtenção da sessão (renovação do token). Sessão que não chega
+  antes do primeiro envio = recusa local, nada foi mandado; depois de um envio incerto, a cobrança segue o caminho
+  de sempre e termina no limite de 3 min 30 s em revisão manual se a nuvem não responder.
 - Criação sem resposta (queda, prazo de 15 s por chamada estourado, erro 5xx): nem "cobrança não encontrada" nem
   outra recusa provam que nada foi cobrado, porque a primeira criação pode estar a caminho. Quem decide é o
   encerramento no servidor: sem cobrança gravada, ele grava o bloqueio preventivo da chave (`voided_before_send`) e a criação

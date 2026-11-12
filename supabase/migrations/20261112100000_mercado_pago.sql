@@ -19,6 +19,9 @@
 --  4. Cobrança nova só para conta aberta da loja e dentro do saldo do servidor,
 --     com a conta travada (tchefood_open_terminal_charge, só a service role).
 --     Toda cobrança ainda não encerrada (inclusive revisão manual) reserva o valor.
+--     O aparelho manda o saldo que mostrou (p_expected_balance_cents, obrigatório):
+--     saldo da nuvem diferente = TF008 e nada é cobrado (sincronizar e cobrar de novo).
+--     Reenvio da mesma chave devolve a cobrança já gravada, mesmo que o saldo tenha mudado.
 --  6. Encerrar a pedido do operador exige PIN de gerente conferido no banco
 --     (tchefood_authorize_point_cancel), com registro em audit_logs.
 --  5. Cobrança em estado final não muda mais (resposta atrasada não rebaixa
@@ -26,7 +29,8 @@
 --  7. Um pedido por vez fala com o Mercado Pago (posse do envio com prazo,
 --     tchefood_claim_point_dispatch, e barreira imediatamente antes da chamada,
 --     tchefood_begin_point_dispatch); depois do pedido de encerramento ninguém
---     ganha a posse nem passa da barreira.
+--     ganha a posse nem passa da barreira. Só a criação pode fazer o PRIMEIRO
+--     envio (p_allow_first); uma consulta de estado só repete envio que já saiu.
 --  9. Envio sem resposta nunca vira recusa por tempo nem por PIN: vai para
 --     revisão manual (tchefood_settle_point_dispatch) e segue reservando o saldo.
 --  8. Chave nunca gravada só é bloqueada por operador ativo da loja, com
@@ -200,13 +204,21 @@ CREATE OR REPLACE TRIGGER trg_terminal_charges_final BEFORE INSERT OR UPDATE ON 
 -- 2c. Abrir cobrança: conta aberta da loja, dentro do saldo, com a conta travada
 -- -----------------------------------------------------------------------------
 -- Reserva = toda outra cobrança desta conta que não terminou (criando, na fila, na maquininha ou
--- em revisão manual, sem limite de tempo) e as aprovadas que ainda não viraram pagamento aprovado.
+-- em revisão manual, sem limite de tempo) e as aprovadas que ainda não viraram pagamento aprovado
+-- do Mercado Pago com a chave delas (dinheiro ou outra maquininha com a mesma chave não libera nada).
 -- Só libera com o fim comprovado no Mercado Pago: recusada, cancelada, expirada ou estornada. PIN de
 -- gerente e tempo passado não liberam cobrança de resultado desconhecido (ela fica em revisão manual).
 -- Vale para qualquer aparelho da loja.
+-- Auditoria r4 P1-01: o saldo da conta é conferido aqui, no servidor. p_expected_balance_cents é o saldo
+-- que o aparelho mostrou ao operador (obrigatório). Com a conta travada, saldo da nuvem diferente =
+-- TF008 e nada é gravado: o operador sincroniza e cobra de novo. O reenvio da MESMA chave devolve a
+-- cobrança já gravada sem conferir o saldo de novo (o saldo pode ter mudado de verdade depois da
+-- criação, inclusive pelo pagamento desta mesma cobrança).
+-- A assinatura antiga (sem o saldo) sai: ninguém abre cobrança sem mandar o saldo.
+DROP FUNCTION IF EXISTS tchefood_open_terminal_charge(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID);
 CREATE OR REPLACE FUNCTION tchefood_open_terminal_charge(
     p_tenant UUID, p_key VARCHAR, p_order UUID, p_terminal UUID, p_external_terminal VARCHAR,
-    p_method VARCHAR, p_amount_cents BIGINT, p_created_by UUID)
+    p_method VARCHAR, p_amount_cents BIGINT, p_created_by UUID, p_expected_balance_cents BIGINT)
 RETURNS UUID
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
@@ -215,6 +227,10 @@ DECLARE
     v_reserved BIGINT;
     v_balance BIGINT;
 BEGIN
+    -- Sem o saldo que o aparelho mostrou não há o que conferir: recusa antes de qualquer coisa.
+    IF p_expected_balance_cents IS NULL OR p_expected_balance_cents < 0 THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o aparelho não mandou o saldo da conta. Nada foi cobrado: sincronize e cobre de novo.' USING ERRCODE = 'TF008';
+    END IF;
     -- Quem cobra precisa ser da equipe ativa desta loja (sem operador identificado, não cobra).
     IF p_created_by IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_created_by AND u.tenant_id = p_tenant AND u.active) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
@@ -239,12 +255,19 @@ BEGIN
     IF v_order.status NOT IN ('OPEN', 'PAYING') THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a conta já está %.', CASE v_order.status WHEN 'CLOSED' THEN 'fechada' ELSE 'cancelada' END USING ERRCODE = 'TF002';
     END IF;
+    -- Saldo conferido com a conta travada: o que o operador viu é o que está na nuvem agora.
+    v_balance := round(v_order.remaining_balance * 100)::BIGINT;
+    IF v_balance <> p_expected_balance_cents THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a conta na nuvem tem saldo de R$ %, diferente do R$ % mostrado no aparelho. Nada foi cobrado: sincronize e cobre de novo.',
+            to_char(v_balance / 100.0, 'FM999999990.00'), to_char(p_expected_balance_cents / 100.0, 'FM999999990.00')
+            USING ERRCODE = 'TF008';
+    END IF;
     SELECT COALESCE(SUM(c.amount_cents), 0) INTO v_reserved FROM terminal_charges c
      WHERE c.tenant_id = p_tenant AND c.order_id = p_order
        AND (c.status IN ('creating', 'pending', 'at_terminal', 'manual_review')
             OR (c.status = 'approved' AND NOT EXISTS (
-                SELECT 1 FROM payments p WHERE p.tenant_id = p_tenant AND p.idempotency_key = c.idempotency_key AND p.status = 'APPROVED')));
-    v_balance := round(v_order.remaining_balance * 100)::BIGINT;
+                SELECT 1 FROM payments p WHERE p.tenant_id = p_tenant AND p.idempotency_key = c.idempotency_key AND p.status = 'APPROVED'
+                  AND p.acquirer::text = 'MERCADO_PAGO')));
     IF p_amount_cents > v_balance - v_reserved THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: R$ % passa do saldo da conta no servidor (R$ % livre).',
             to_char(p_amount_cents / 100.0, 'FM999999990.00'), to_char(GREATEST(v_balance - v_reserved, 0) / 100.0, 'FM999999990.00')
@@ -266,17 +289,17 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION tchefood_open_terminal_charge(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tchefood_open_terminal_charge(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID, BIGINT) FROM PUBLIC;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
-        REVOKE ALL ON FUNCTION tchefood_open_terminal_charge(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID) FROM anon;
+        REVOKE ALL ON FUNCTION tchefood_open_terminal_charge(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID, BIGINT) FROM anon;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
-        REVOKE ALL ON FUNCTION tchefood_open_terminal_charge(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID) FROM authenticated;
+        REVOKE ALL ON FUNCTION tchefood_open_terminal_charge(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID, BIGINT) FROM authenticated;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
-        GRANT EXECUTE ON FUNCTION tchefood_open_terminal_charge(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID) TO service_role;
+        GRANT EXECUTE ON FUNCTION tchefood_open_terminal_charge(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID, BIGINT) TO service_role;
     END IF;
 END $$;
 
@@ -366,6 +389,10 @@ $$;
 --      a posse ainda for a do chamador, estiver em vigor e não houver pedido de encerramento; marca o
 --      primeiro envio (dispatched_at) e renova a posse a partir de agora. Devolve 1 (primeiro envio: nada
 --      saiu antes), 2 (repetição) ou 0 (não mande).
+--      Auditoria r4 P1-02: p_allow_first (obrigatório) diz se o chamador pode fazer o PRIMEIRO envio. Só a
+--      criação da cobrança pode (true); a consulta de estado manda false e, com nada enviado ainda
+--      (dispatched_at NULL), recebe 0 sem nada mudar (nem hora do envio, nem posse). Repetição de um envio
+--      que já saiu continua valendo para os dois.
 --   3. tchefood_settle_point_dispatch: encerramento pedido, envio já saiu, posse vencida e nenhuma ordem:
 --      resultado desconhecido vira revisão manual (segue reservando o saldo). Nunca vira recusa.
 CREATE OR REPLACE FUNCTION tchefood_claim_point_dispatch(p_tenant UUID, p_id UUID, p_lease_ms INT)
@@ -392,7 +419,9 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION tchefood_begin_point_dispatch(p_tenant UUID, p_id UUID, p_attempt INT, p_lease_ms INT)
+-- A assinatura antiga (sem p_allow_first) sai: nenhum chamador marca o primeiro envio sem dizer que pode.
+DROP FUNCTION IF EXISTS tchefood_begin_point_dispatch(UUID, UUID, INT, INT);
+CREATE OR REPLACE FUNCTION tchefood_begin_point_dispatch(p_tenant UUID, p_id UUID, p_attempt INT, p_lease_ms INT, p_allow_first BOOLEAN)
 RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
@@ -401,9 +430,16 @@ BEGIN
     IF p_lease_ms IS NULL OR p_lease_ms < 1000 OR p_lease_ms > 600000 THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: prazo de posse inválido.';
     END IF;
+    IF p_allow_first IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a barreira do envio precisa saber se pode fazer o primeiro envio.';
+    END IF;
     SELECT * INTO v_charge FROM terminal_charges WHERE id = p_id AND tenant_id = p_tenant FOR UPDATE;
     IF NOT FOUND OR v_charge.status <> 'creating' OR v_charge.external_order_id IS NOT NULL OR v_charge.cancel_requested_at IS NOT NULL
        OR v_charge.dispatch_attempts IS DISTINCT FROM p_attempt OR v_charge.dispatch_lease_until IS NULL OR v_charge.dispatch_lease_until <= clock_timestamp() THEN
+        RETURN 0;
+    END IF;
+    -- Consulta de estado nunca começa o primeiro envio: sem nada enviado, não manda e não grava nada.
+    IF v_charge.dispatched_at IS NULL AND NOT p_allow_first THEN
         RETURN 0;
     END IF;
     UPDATE terminal_charges
@@ -527,7 +563,7 @@ BEGIN
     FOREACH v_fn IN ARRAY ARRAY[
         'tchefood_authorize_point_cancel(UUID, VARCHAR, UUID, VARCHAR, TEXT)',
         'tchefood_claim_point_dispatch(UUID, UUID, INT)',
-        'tchefood_begin_point_dispatch(UUID, UUID, INT, INT)',
+        'tchefood_begin_point_dispatch(UUID, UUID, INT, INT, BOOLEAN)',
         'tchefood_settle_point_dispatch(UUID, UUID)',
         'tchefood_request_point_timeout(UUID, UUID, INT)',
         'tchefood_block_point_key(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID)'] LOOP

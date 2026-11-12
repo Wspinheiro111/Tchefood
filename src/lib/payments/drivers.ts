@@ -511,8 +511,9 @@ export function createDriver(params: { terminal: PosTerminal | null; chassis: Ch
       now: () => (typeof performance !== 'undefined' ? performance.now() : Date.now()),
       timer: (ms) => new Promise((r) => setTimeout(r, ms)),
       operator: async () => (await import('../../store/useTcheStore')).useTcheStore.getState().currentUserId,
-      // A conta precisa estar no servidor (ele confere conta aberta e saldo antes de cobrar).
-      beforeCreate: async () => (await import('../sync/useCloudSync')).syncOnce(),
+      // A conta precisa estar no servidor como aqui: espera a sincronização em andamento, sobe a fila e só
+      // libera sem nenhum evento da conta pendente ou recusado. O saldo daqui vai para o servidor conferir.
+      prepareOrder: async (orderId) => (await import('../sync/useCloudSync')).ensureOrderSynced(orderId),
     });
   }
   return new MockTerminalDriver(params.chassis, params.mode, params.terminal);

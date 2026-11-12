@@ -13,6 +13,8 @@ const ROW: TerminalChargeRow = {
 /** Query builder falso: grava a cadeia de filtros e responde o que o teste mandar. */
 function fakeDb(answers: { update?: unknown; select?: unknown; rpc?: { data: unknown; error: { message: string; code?: string } | null } }) {
   const chains: string[][] = [];
+  /** Argumentos de cada chamada de função do banco, na ordem. */
+  const rpcArgs: Record<string, unknown>[] = [];
   const db: SupabaseLike = {
     from(table: string) {
       const chain: string[] = [`from:${table}`];
@@ -35,10 +37,11 @@ function fakeDb(answers: { update?: unknown; select?: unknown; rpc?: { data: unk
     },
     async rpc(fn: string, args: Record<string, unknown>) {
       chains.push([`rpc:${fn}`, JSON.stringify(Object.keys(args).sort())]);
+      rpcArgs.push(args);
       return answers.rpc ?? { data: 'id', error: null };
     },
   };
-  return { db, chains };
+  return { db, chains, rpcArgs };
 }
 
 describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
@@ -58,20 +61,23 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
   });
 
   it('insert abre a cobrança pela função do banco com a conta travada', async () => {
-    const { db, chains } = fakeDb({ select: ROW });
+    const { db, chains, rpcArgs } = fakeDb({ select: ROW });
     const { id: _id, created_at: _c, ...fresh } = { ...ROW, status: 'creating' as const };
-    await supabaseChargeStore(db, TENANT).insert(fresh);
-    expect(chains[0]).toEqual(['rpc:tchefood_open_terminal_charge', JSON.stringify(['p_amount_cents', 'p_created_by', 'p_external_terminal', 'p_key', 'p_method', 'p_order', 'p_tenant', 'p_terminal'])]);
+    await supabaseChargeStore(db, TENANT).insert(fresh, 4321);
+    expect(chains[0]).toEqual(['rpc:tchefood_open_terminal_charge', JSON.stringify(['p_amount_cents', 'p_created_by', 'p_expected_balance_cents', 'p_external_terminal', 'p_key', 'p_method', 'p_order', 'p_tenant', 'p_terminal'])]);
+    // r4 P1-01: o saldo que o aparelho mostra vai para o banco conferir.
+    expect(rpcArgs[0]).toMatchObject({ p_tenant: TENANT, p_key: 'k1', p_amount_cents: 1000, p_expected_balance_cents: 4321 });
   });
 
   it.each([
     ['TF001', 'order_not_found'],
     ['TF002', 'order_closed'],
     ['TF003', 'over_balance'],
+    ['TF008', 'balance_mismatch'],
   ])('recusa do banco %s vira ChargeRefusedError(%s) sem o prefixo', async (code, mapped) => {
     const { db } = fakeDb({ rpc: { data: null, error: { code, message: 'TCHEFOOD_COBRANCA: explicação' } } });
     const { id: _id, created_at: _c, ...fresh } = ROW;
-    const err = await supabaseChargeStore(db, TENANT).insert(fresh).catch((e: unknown) => e);
+    const err = await supabaseChargeStore(db, TENANT).insert(fresh, 1000).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ChargeRefusedError);
     expect(err).toMatchObject({ code: mapped, message: 'explicação' });
   });
@@ -79,7 +85,7 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
   it('outro erro do banco não vira recusa', async () => {
     const { db } = fakeDb({ rpc: { data: null, error: { code: '57014', message: 'timeout' } } });
     const { id: _id, created_at: _c, ...fresh } = ROW;
-    await expect(supabaseChargeStore(db, TENANT).insert(fresh)).rejects.not.toBeInstanceOf(ChargeRefusedError);
+    await expect(supabaseChargeStore(db, TENANT).insert(fresh, 1000)).rejects.not.toBeInstanceOf(ChargeRefusedError);
   });
 
   it('r3 P1-02: a posse do envio é dada pela função do banco; 0 = não ganhou; ganhou = linha com o número da posse', async () => {
@@ -100,16 +106,22 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
 
   it('r3 2ª revisão: a barreira antes do envio é uma chamada só ao banco, com o número da posse; só 1 e 2 liberam', async () => {
     const first = fakeDb({ rpc: { data: 1, error: null } });
-    expect(await supabaseChargeStore(first.db, TENANT).beginDispatch({ ...ROW, status: 'creating', dispatch_attempts: 3 }, 30_000)).toBe(1);
-    expect(first.chains).toEqual([['rpc:tchefood_begin_point_dispatch', JSON.stringify(['p_attempt', 'p_id', 'p_lease_ms', 'p_tenant'])]]);
-    expect(await supabaseChargeStore(fakeDb({ rpc: { data: 2, error: null } }).db, TENANT).beginDispatch(ROW, 30_000)).toBe(2);
-    expect(await supabaseChargeStore(fakeDb({ rpc: { data: '2', error: null } }).db, TENANT).beginDispatch(ROW, 30_000)).toBe(2);
+    expect(await supabaseChargeStore(first.db, TENANT).beginDispatch({ ...ROW, status: 'creating', dispatch_attempts: 3 }, 30_000, true)).toBe(1);
+    expect(first.chains).toEqual([['rpc:tchefood_begin_point_dispatch', JSON.stringify(['p_allow_first', 'p_attempt', 'p_id', 'p_lease_ms', 'p_tenant'])]]);
+    expect(first.rpcArgs[0]).toEqual({ p_tenant: TENANT, p_id: 'r1', p_attempt: 3, p_lease_ms: 30_000, p_allow_first: true });
+    // r4 P1-02: a consulta pede a barreira sem primeiro envio, e um 1 vindo do banco não libera.
+    const poll = fakeDb({ rpc: { data: 1, error: null } });
+    expect(await supabaseChargeStore(poll.db, TENANT).beginDispatch({ ...ROW, status: 'creating', dispatch_attempts: 3 }, 30_000, false)).toBe(0);
+    expect(poll.rpcArgs[0]).toMatchObject({ p_allow_first: false });
+    expect(await supabaseChargeStore(fakeDb({ rpc: { data: 2, error: null } }).db, TENANT).beginDispatch(ROW, 30_000, false)).toBe(2);
+    expect(await supabaseChargeStore(fakeDb({ rpc: { data: 2, error: null } }).db, TENANT).beginDispatch(ROW, 30_000, true)).toBe(2);
+    expect(await supabaseChargeStore(fakeDb({ rpc: { data: '2', error: null } }).db, TENANT).beginDispatch(ROW, 30_000, true)).toBe(2);
     for (const data of [0, null, 3, -1, 'x', false]) {
-      expect(await supabaseChargeStore(fakeDb({ rpc: { data, error: null } }).db, TENANT).beginDispatch(ROW, 30_000)).toBe(0);
+      expect(await supabaseChargeStore(fakeDb({ rpc: { data, error: null } }).db, TENANT).beginDispatch(ROW, 30_000, true)).toBe(0);
     }
     // Banco fora do ar não libera o envio: a chamada falha.
     const down = fakeDb({ rpc: { data: null, error: { message: 'timeout' } } });
-    await expect(supabaseChargeStore(down.db, TENANT).beginDispatch(ROW, 30_000)).rejects.toThrow('marcar o envio');
+    await expect(supabaseChargeStore(down.db, TENANT).beginDispatch(ROW, 30_000, true)).rejects.toThrow('marcar o envio');
   });
 
   it('r3 2ª revisão: a ordem é ligada sem condição de estado lido, só se ainda não há ordem e a cobrança não é final', async () => {
@@ -159,7 +171,7 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
     }
     // true não é 1: a barreira só libera o envio com os números 1 e 2.
     for (const data of [true, null, 3, 'x']) {
-      expect(await supabaseChargeStore(fakeDb({ rpc: { data, error: null } }).db, TENANT).beginDispatch({ ...ROW, status: 'creating', dispatch_attempts: 1 }, 30_000)).toBe(0);
+      expect(await supabaseChargeStore(fakeDb({ rpc: { data, error: null } }).db, TENANT).beginDispatch({ ...ROW, status: 'creating', dispatch_attempts: 1 }, 30_000, true)).toBe(0);
     }
     const gone = fakeDb({ rpc: { data: null, error: { code: 'TF005', message: 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' } } });
     await expect(supabaseChargeStore(gone.db, TENANT).requestTimeoutCancel(ROW, 120_000)).rejects.toMatchObject({ code: 'not_found' });

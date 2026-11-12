@@ -15,7 +15,10 @@
 //  - Estado final gravado (aprovado, recusado, cancelado, expirado) não é reconsultado nem rebaixado:
 //    cada gravação só vale se a cobrança ainda estiver no estado lido (ChargeStore.update), e o banco
 //    recusa mudar uma cobrança final (gatilho em db/schema_mercado_pago.sql).
-//  - Cobrança nova só para conta aberta no servidor e dentro do saldo (RPC tchefood_open_terminal_charge).
+//  - Cobrança nova só para conta aberta no servidor, dentro do saldo e com o saldo que o aparelho mostra
+//    igual ao do servidor (RPC tchefood_open_terminal_charge): o operador cobra a conta que o servidor conhece.
+//  - Só o pedido de criação (create) pode mandar a ordem pela primeira vez. A consulta (status) só repete,
+//    com a mesma chave, um envio que comprovadamente já saiu (dispatched_at gravado), para recuperar a ordem.
 //  - "Encerrar tentativa" (cancel) não estorna nada: só pede à maquininha que pare de esperar o cartão.
 //    Fica registrado quem pediu, por quê e quando. Antes do prazo, só com PIN de gerente conferido no banco.
 //  - Só vira recusa ("nada foi cobrado") com prova: o Mercado Pago disse recusada/cancelada/expirada, ou a
@@ -93,7 +96,7 @@ export type NewChargeRow = Omit<TerminalChargeRow, 'id' | 'created_at'>;
 export type ChargePatch = Partial<Pick<TerminalChargeRow,
   'status' | 'external_order_id' | 'external_payment_id' | 'raw_status' | 'raw_status_detail' | 'paid_amount_cents' | 'card_brand' | 'authorization_code' | 'last_four'>>;
 
-export type ChargeRefusal = 'order_not_found' | 'order_closed' | 'over_balance' | 'invalid_staff' | 'not_found' | 'invalid_reason' | 'not_applicable';
+export type ChargeRefusal = 'order_not_found' | 'order_closed' | 'over_balance' | 'invalid_staff' | 'not_found' | 'invalid_reason' | 'not_applicable' | 'balance_mismatch';
 
 /** Recusa do banco (conta inexistente, fechada, acima do saldo, operador fora da equipe). Nada foi gravado. */
 export class ChargeRefusedError extends Error {
@@ -107,10 +110,11 @@ export interface ChargeStore {
   findByKey(idempotencyKey: string): Promise<TerminalChargeRow | null>;
   /**
    * Abre a cobrança ("creating") com a conta travada no banco: só conta aberta da loja e valor dentro do
-   * saldo menos as outras cobranças em andamento. Chave já gravada: devolve a linha que ficou.
+   * saldo menos as outras cobranças em andamento, e com o saldo da conta no servidor igual a
+   * `expectedBalanceCents` (o que o aparelho mostra). Chave já gravada: devolve a linha que ficou.
    * Lança ChargeRefusedError quando o banco recusa.
    */
-  insert(row: NewChargeRow): Promise<TerminalChargeRow>;
+  insert(row: NewChargeRow, expectedBalanceCents: number): Promise<TerminalChargeRow>;
   /**
    * Bloqueio da chave sem cobrança (nunca vai à Point), pedido por `row.cancel_requested_by`, que o banco
    * confere ser da equipe ativa da loja (ChargeRefusedError se não for) e registra em audit_logs.
@@ -133,8 +137,9 @@ export interface ChargeStore {
    * Atômica no banco: só passa se a posse ainda for a de `row`, estiver em vigor, a cobrança seguir
    * "creating" sem ordem e sem pedido de encerramento. Marca o primeiro envio e renova a posse por `leaseMs`.
    * Devolve 1 (primeiro envio: nada saiu antes), 2 (repetição de um envio anterior) ou 0 (não mande).
+   * Com `allowFirst` false (consulta), nunca marca o primeiro envio: sem envio anterior devolve 0 sem mudar nada.
    */
-  beginDispatch(row: TerminalChargeRow, leaseMs: number): Promise<0 | 1 | 2>;
+  beginDispatch(row: TerminalChargeRow, leaseMs: number, allowFirst: boolean): Promise<0 | 1 | 2>;
   /**
    * Liga a ordem que o Mercado Pago devolveu à cobrança, em qualquer estado não final, se ela ainda não tem
    * ordem. Devolve a linha atual (com esta ordem, ou com o que já estava gravado).
@@ -206,10 +211,16 @@ export interface CreateInput {
   amount_cents: unknown;
   method: unknown;
   staff_id?: unknown;
+  /** Saldo da conta no aparelho, em centavos, depois da sincronização: o servidor confere que é o mesmo. */
+  expected_balance_cents?: unknown;
 }
 
 export type ChargeReply =
-  | { status: 'PENDING'; idempotency_key: string; detail: string }
+  /**
+   * awaiting_send: cobrança gravada de que nenhum envio saiu ainda (a criação parou antes da barreira). A
+   * consulta não manda: o aparelho repete o pedido de criação, com a mesma chave, se ainda estiver no prazo.
+   */
+  | { status: 'PENDING'; idempotency_key: string; detail: string; awaiting_send?: true }
   | {
       status: 'APPROVED';
       idempotency_key: string;
@@ -262,7 +273,16 @@ function expectedType(method: PointMethod): 'credit_card' | 'debit_card' {
   return method === 'CREDIT' ? 'credit_card' : 'debit_card';
 }
 
-export function validateCreate(input: CreateInput): { idempotency_key: string; order_id: string; amount_cents: number; method: PointMethod; staff_id: string | null } {
+/** Conta, chave, valor, forma e operador do pedido (criação e bloqueio da chave). */
+export function validateCharge(input: CreateInput): { idempotency_key: string; order_id: string; amount_cents: number; method: PointMethod; staff_id: string | null } {
+  const { expected_balance_cents: _b, ...req } = validateCreate({ ...input, expected_balance_cents: 0 });
+  return req;
+}
+
+/** Pedido de criação: tudo de validateCharge e mais o saldo da conta no aparelho (obrigatório). */
+export function validateCreate(input: CreateInput): {
+  idempotency_key: string; order_id: string; amount_cents: number; method: PointMethod; staff_id: string | null; expected_balance_cents: number;
+} {
   if (!validKey(input.idempotency_key)) throw new ChargeInputError('invalid_key', 'Chave da cobrança inválida (até 50 letras, números, - ou _).');
   if (typeof input.order_id !== 'string' || !UUID.test(input.order_id)) throw new ChargeInputError('invalid_order', 'Conta inválida.');
   const cents = input.amount_cents;
@@ -274,7 +294,15 @@ export function validateCreate(input: CreateInput): { idempotency_key: string; o
   }
   const staff = input.staff_id;
   if (staff !== undefined && staff !== null && (typeof staff !== 'string' || !UUID.test(staff))) throw new ChargeInputError('invalid_staff', 'Operador inválido.');
-  return { idempotency_key: input.idempotency_key, order_id: input.order_id, amount_cents: cents, method: input.method, staff_id: (staff as string | null | undefined) ?? null };
+  // Obrigatório: sem o saldo que o aparelho mostra, o servidor não tem como provar que é a mesma conta.
+  const balance = input.expected_balance_cents;
+  if (typeof balance !== 'number' || !Number.isSafeInteger(balance) || balance < 0) {
+    throw new ChargeInputError('invalid_balance', 'Saldo da conta não informado. Sincronize e tente de novo.');
+  }
+  return {
+    idempotency_key: input.idempotency_key, order_id: input.order_id, amount_cents: cents, method: input.method,
+    staff_id: (staff as string | null | undefined) ?? null, expected_balance_cents: balance,
+  };
 }
 
 function sameRequest(row: TerminalChargeRow, req: { order_id: string; amount_cents: number; method: PointMethod }, terminal: TerminalRecord): boolean {
@@ -309,6 +337,9 @@ export function replyFor(row: TerminalChargeRow): ChargeReply {
       }
       return { status: 'MANUAL_REVIEW', idempotency_key: key, code: row.raw_status_detail ?? 'MANUAL_REVIEW', reason: 'O Mercado Pago não confirmou a cobrança por completo. Confira no app do Mercado Pago antes de cobrar de novo.' };
     default:
+      if (row.status === 'creating' && !row.dispatched_at && !row.cancel_requested_at && !row.external_order_id) {
+        return { status: 'PENDING', idempotency_key: key, detail: 'Enviando para a maquininha.', awaiting_send: true };
+      }
       return { status: 'PENDING', idempotency_key: key, detail: row.status === 'at_terminal' ? 'Aguardando o cartão na maquininha.' : 'Enviando para a maquininha.' };
   }
 }
@@ -376,15 +407,20 @@ async function reread(ctx: ChargeContext, row: TerminalChargeRow): Promise<Termi
  * Recusa definitiva só vira "nada foi cobrado" no primeiro envio (a barreira diz se é). Numa repetição o
  * envio anterior pode ter criado a ordem: fica como resultado desconhecido.
  */
-async function sendCreate(ctx: ChargeContext, row: TerminalChargeRow): Promise<TerminalChargeRow> {
+async function sendCreate(ctx: ChargeContext, row: TerminalChargeRow, allowFirst: boolean): Promise<TerminalChargeRow> {
   if (row.status !== 'creating' || row.external_order_id) return row;
   if (row.cancel_requested_at) return closeUnsent(ctx, row);
+  // Consulta não inicia cobrança: sem envio anterior gravado, só o pedido de criação manda. A barreira do banco
+  // confere de novo (allowFirst false nunca marca o primeiro envio).
+  if (!allowFirst && !row.dispatched_at) return row;
   const claimed = await ctx.store.claimDispatch(row, DISPATCH_LEASE_MS);
   // Sem posse: envio em andamento em outra chamada, encerramento pedido, limite de envios ou estado mudou.
   if (!claimed) return closeUnsent(ctx, await reread(ctx, row));
   const asked = monotonic(ctx);
-  const begun = await ctx.store.beginDispatch(claimed, DISPATCH_LEASE_MS);
+  const begun = await ctx.store.beginDispatch(claimed, DISPATCH_LEASE_MS, allowFirst);
   if (begun === 0) return closeUnsent(ctx, await reread(ctx, row));
+  // Nunca acontece com o banco (allowFirst false não marca o primeiro envio); se acontecer, não manda.
+  if (begun === 1 && !allowFirst) return closeUnsent(ctx, await reread(ctx, row));
   // A barreira passou, mas a resposta dela demorou demais: a chamada poderia passar do fim da posse (e outra
   // consulta mandaria por cima, ou um encerramento já teria levado a cobrança à revisão manual). Não manda.
   // O envio fica marcado como iniciado, então a cobrança é tratada como resultado desconhecido, nunca recusa.
@@ -531,7 +567,8 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
   const existing = await ctx.store.findByKey(req.idempotency_key);
   if (existing) {
     if (!sameRequest(existing, req, terminal)) throw new ChargeInputError('idempotency_conflict', 'Esta chave já foi usada em outra cobrança.', 409);
-    return pollCharge(ctx, existing);
+    // Repetição do pedido de criação (resposta anterior perdida): este pode mandar o primeiro envio.
+    return replyFor(await resume(ctx, existing, true));
   }
   const fresh = {
     tenant_id: terminal.tenant_id,
@@ -572,15 +609,14 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
   }
   let inserted: TerminalChargeRow;
   try {
-    inserted = await ctx.store.insert(fresh);
+    inserted = await ctx.store.insert(fresh, req.expected_balance_cents);
   } catch (error) {
     if (error instanceof ChargeRefusedError) throw new ChargeInputError(error.code, error.message, 409);
     throw error;
   }
   // Corrida: outro envio com a mesma chave gravou primeiro.
   if (!sameRequest(inserted, req, terminal)) throw new ChargeInputError('idempotency_conflict', 'Esta chave já foi usada em outra cobrança.', 409);
-  if (inserted.status !== 'creating' || inserted.external_order_id) return pollCharge(ctx, inserted);
-  return replyFor(await sendCreate(ctx, inserted));
+  return replyFor(await resume(ctx, inserted, true));
 }
 
 async function settleSibling(ctx: ChargeContext, row: TerminalChargeRow): Promise<void> {
@@ -598,11 +634,19 @@ async function settleSibling(ctx: ChargeContext, row: TerminalChargeRow): Promis
   await refreshCharge(ctx, current);
 }
 
-/** Reconsulta a cobrança no Mercado Pago (estado final gravado não é reconsultado). */
+/**
+ * Consulta (action status): reconsulta a cobrança no Mercado Pago (estado final gravado não é reconsultado).
+ * Nunca inicia a cobrança: sem ordem ligada, só repete um envio que já saiu (para recuperar a ordem).
+ */
 export async function pollCharge(ctx: ChargeContext, row: TerminalChargeRow): Promise<ChargeReply> {
-  if (FINAL.has(row.status)) return replyFor(row);
-  if (!row.external_order_id) return replyFor(await sendCreate(ctx, row));
-  return replyFor(await refreshCharge(ctx, row));
+  return replyFor(await resume(ctx, row, false));
+}
+
+/** Segue a cobrança gravada. `allowFirst`: só o pedido de criação pode mandar a ordem pela primeira vez. */
+async function resume(ctx: ChargeContext, row: TerminalChargeRow, allowFirst: boolean): Promise<TerminalChargeRow> {
+  if (FINAL.has(row.status)) return row;
+  if (!row.external_order_id) return sendCreate(ctx, row, allowFirst);
+  return refreshCharge(ctx, row);
 }
 
 /** Só reconsulta a ordem que já existe no Mercado Pago; nunca manda ordem. */
@@ -709,7 +753,8 @@ export async function cancelCharge(ctx: ChargeContext, row: TerminalChargeRow, i
  * Se a criação gravou primeiro, valem as regras normais do encerramento (prazo no servidor ou PIN).
  */
 export async function voidCharge(ctx: ChargeContext, terminal: TerminalRecord, input: CreateInput & CancelInput): Promise<ChargeReply> {
-  const req = validateCreate(input);
+  // O encerramento não manda o saldo da conta (não abre cobrança): só a conta, a chave, o valor e a forma.
+  const req = validateCharge(input);
   const cancel = validateCancel(input);
   if (terminal.acquirer !== 'MERCADO_PAGO') throw new ChargeInputError('not_mercado_pago', 'Esta maquininha não é Mercado Pago Point.');
   const existing = await ctx.store.findByKey(req.idempotency_key);

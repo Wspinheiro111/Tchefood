@@ -19,7 +19,7 @@ const FINAL_LIST = '(approved,rejected,cancelled,expired,refunded)';
 
 /** Códigos das funções de db/schema_mercado_pago.sql. */
 const REFUSALS: Record<string, ChargeRefusedError['code']> = {
-  TF001: 'order_not_found', TF002: 'order_closed', TF003: 'over_balance', TF004: 'invalid_staff', TF005: 'not_found', TF006: 'invalid_reason', TF007: 'not_applicable',
+  TF001: 'order_not_found', TF002: 'order_closed', TF003: 'over_balance', TF004: 'invalid_staff', TF005: 'not_found', TF006: 'invalid_reason', TF007: 'not_applicable', TF008: 'balance_mismatch',
 };
 
 function refusal(error: { message: string; code?: string } | null): ChargeRefusedError | null {
@@ -47,9 +47,10 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
         'ler a cobrança',
       ));
     },
-    async insert(row: NewChargeRow): Promise<TerminalChargeRow> {
+    async insert(row: NewChargeRow, expectedBalanceCents: number): Promise<TerminalChargeRow> {
       if (row.tenant_id !== tenantId) throw new Error('Cobrança de outra loja.');
-      // A conta trava no banco: confere loja, conta aberta e saldo e grava a cobrança na mesma transação.
+      // A conta trava no banco: confere loja, conta aberta, saldo igual ao do aparelho e saldo livre e grava a
+      // cobrança na mesma transação.
       const res = await db.rpc('tchefood_open_terminal_charge', {
         p_tenant: tenantId,
         p_key: row.idempotency_key,
@@ -59,6 +60,7 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
         p_method: row.method,
         p_amount_cents: row.amount_cents,
         p_created_by: row.created_by,
+        p_expected_balance_cents: expectedBalanceCents,
       });
       const refused = refusal(res.error);
       if (refused) throw refused;
@@ -117,11 +119,15 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
       // A posse é a de número `attempt`. A barreira (beginDispatch) confere de novo no banco se ela ainda vale.
       return { ...row, dispatch_attempts: attempt };
     },
-    async beginDispatch(row: TerminalChargeRow, leaseMs: number): Promise<0 | 1 | 2> {
-      const res = await db.rpc('tchefood_begin_point_dispatch', { p_tenant: tenantId, p_id: row.id, p_attempt: row.dispatch_attempts, p_lease_ms: leaseMs });
+    async beginDispatch(row: TerminalChargeRow, leaseMs: number, allowFirst: boolean): Promise<0 | 1 | 2> {
+      const res = await db.rpc('tchefood_begin_point_dispatch', {
+        p_tenant: tenantId, p_id: row.id, p_attempt: row.dispatch_attempts, p_lease_ms: leaseMs, p_allow_first: allowFirst === true,
+      });
       const kind: unknown = check(res, 'marcar o envio');
-      // Só os números 1 e 2 liberam o envio; qualquer outra resposta é "não mande".
-      return kind === 1 || kind === '1' ? 1 : kind === 2 || kind === '2' ? 2 : 0;
+      // Só os números 1 e 2 liberam o envio; qualquer outra resposta é "não mande". Consulta (allowFirst false)
+      // nunca recebe 1 do banco; se receber, não manda.
+      if ((kind === 1 || kind === '1') && allowFirst === true) return 1;
+      return kind === 2 || kind === '2' ? 2 : 0;
     },
     async attachOrder(row: TerminalChargeRow, externalOrderId: string): Promise<TerminalChargeRow> {
       // Sem condição de estado lido: vale para "creating" e para revisão manual. Só não troca ordem já ligada

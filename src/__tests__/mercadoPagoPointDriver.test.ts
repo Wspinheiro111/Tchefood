@@ -24,7 +24,7 @@ type Answer = { status: number; body: unknown } | 'network';
 
 const STAFF = '44444444-4444-4444-8444-444444444444';
 
-function harness(answer: (action: string, n: number) => Answer | 'hang', opts: { config?: PointDriverDeps['config']; operator?: string | null; timer?: PointDriverDeps['timer'] } = {}) {
+function harness(answer: (action: string, n: number) => Answer | 'hang', opts: { config?: PointDriverDeps['config']; operator?: string | null; timer?: PointDriverDeps['timer']; prepareOrder?: PointDriverDeps['prepareOrder'] } = {}) {
   let clock = 0;
   const calls: { url: string; headers: Record<string, string>; body: Record<string, unknown> }[] = [];
   const counts: Record<string, number> = {};
@@ -47,6 +47,7 @@ function harness(answer: (action: string, n: number) => Answer | 'hang', opts: {
     // Por padrão o prazo de cada chamada nunca estoura (o teste de chamada pendurada troca).
     timer: opts.timer ?? (() => new Promise(() => undefined)),
     operator: async () => (opts.operator === undefined ? STAFF : opts.operator),
+    prepareOrder: opts.prepareOrder ?? (async () => ({ ok: true, balance_cents: 2450 })),
   };
   return { driver: new MercadoPagoPointDriver('TEF_POS_WIRELESS', TERMINAL, deps), calls, counts };
 }
@@ -64,7 +65,7 @@ describe('MercadoPagoPointDriver', () => {
     expect(calls[0]).toEqual({
       url: 'https://proj.supabase.co/functions/v1/point-charge',
       headers: { apikey: 'anon', Authorization: 'Bearer jwt', 'Content-Type': 'application/json' },
-      body: { action: 'create', terminal_id: TERMINAL.id, idempotency_key: REQ.idempotency_key, order_id: REQ.order_id, amount_cents: 2450, method: 'CREDIT', staff_id: STAFF },
+      body: { action: 'create', terminal_id: TERMINAL.id, idempotency_key: REQ.idempotency_key, order_id: REQ.order_id, amount_cents: 2450, method: 'CREDIT', staff_id: STAFF, expected_balance_cents: 2450 },
     });
     expect(calls.slice(1).every((c) => c.body.action === 'status' && c.body.idempotency_key === REQ.idempotency_key)).toBe(true);
   });
@@ -73,7 +74,7 @@ describe('MercadoPagoPointDriver', () => {
     const h = harness(() => pending);
     expect((await h.driver.charge({ ...REQ, method: 'PIX' })).status).toBe('DECLINED');
     expect(h.calls).toHaveLength(0);
-    const none = new MercadoPagoPointDriver('TEF_POS_WIRELESS', null, { config: async () => CFG, fetch: async () => { throw new Error('x'); }, sleep: async () => undefined, now: () => 0 });
+    const none = new MercadoPagoPointDriver('TEF_POS_WIRELESS', null, { config: async () => CFG, fetch: async () => { throw new Error('x'); }, sleep: async () => undefined, now: () => 0, prepareOrder: async () => ({ ok: true, balance_cents: 2450 }) });
     expect((await none.charge(REQ)).status).toBe('DECLINED');
     const offline = harness(() => pending, { config: async () => null });
     const r = await offline.driver.charge(REQ);
@@ -141,9 +142,9 @@ describe('MercadoPagoPointDriver', () => {
       fetch: async (url) => { calls.push(url); return { status: 200, text: async () => JSON.stringify(pending.body) }; },
       sleep: async (ms) => { clock += ms; },
       now: () => clock,
-      timer: async () => undefined,
+      timer: () => new Promise((r) => setTimeout(r, 0)),
       operator: async () => STAFF,
-      beforeCreate: () => new Promise(() => undefined),
+      prepareOrder: () => new Promise(() => undefined),
     });
     expect(await driver.charge(REQ)).toMatchObject({ status: 'DECLINED', reason: 'Não consegui sincronizar a conta com a nuvem. Nada foi cobrado; tente de novo.' });
     expect(calls).toHaveLength(0);
@@ -153,14 +154,14 @@ describe('MercadoPagoPointDriver', () => {
       sleep: async () => undefined,
       now: () => 0,
       operator: async () => STAFF,
-      beforeCreate: async () => { throw new Error('offline'); },
+      prepareOrder: async () => { throw new Error('offline'); },
     });
     expect((await failing.charge(REQ)).status).toBe('DECLINED');
     expect(calls).toHaveLength(0);
   });
 
   it('auditoria r1 P2-02: chamada que nunca responde estoura o prazo e o fluxo termina em revisão manual', async () => {
-    const { driver, counts } = harness(() => 'hang', { timer: async () => undefined });
+    const { driver, counts } = harness(() => 'hang', { timer: () => new Promise((r) => setTimeout(r, 0)) });
     expect(await driver.charge(REQ)).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT' });
     expect(counts.create).toBe(3);
     expect(counts.cancel).toBeGreaterThanOrEqual(1);
@@ -175,6 +176,7 @@ describe('MercadoPagoPointDriver', () => {
         sleep: async (ms) => { clock += ms; },
         now: () => clock,
         operator: async () => STAFF,
+        prepareOrder: async () => ({ ok: true, balance_cents: 2450 }),
       });
       expect((await driver.charge(REQ)).status).toBe('MANUAL_REVIEW');
     }
@@ -185,6 +187,7 @@ describe('MercadoPagoPointDriver', () => {
       sleep: async (ms) => { clock += ms; },
       now: () => clock,
       operator: async () => STAFF,
+      prepareOrder: async () => ({ ok: true, balance_cents: 2450 }),
     });
     // 400 com corpo que não é da função (sem "error"): pode ter vindo de um intermediário, não prova nada.
     expect(await err.charge(REQ)).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT' });
@@ -296,7 +299,7 @@ describe('MercadoPagoPointDriver', () => {
       now: () => clock,
       timer: () => new Promise(() => undefined),
       operator: async () => STAFF,
-      beforeCreate: async () => { clock += 14_000; }, // sincronização lenta, dentro do prazo dela
+      prepareOrder: async () => { clock += 14_000; return { ok: true, balance_cents: 2450 }; }, // sincronização lenta, dentro do prazo dela
     });
     expect((await driver.charge(REQ)).status).toBe('DECLINED');
     expect(createAt).toBe(14_000);
@@ -409,5 +412,85 @@ describe('Mercado Pago no resto do app', () => {
     expect(rows.map((r) => r.acquirer)).toEqual(['STONE', 'PAGBANK', 'MERCADO_PAGO', 'CASH_DESK']);
     expect(rows[2]).toMatchObject({ total: 24.5, count: 1, cnpj: '10573521000191' });
     expect(rows[3]!.total).toBe(0);
+  });
+});
+
+describe('MercadoPagoPointDriver: auditoria r4', () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  it('P1-01: a preparação da conta sem prova (pendente, recusada, resposta estranha) não cobra', async () => {
+    const answers: unknown[] = [
+      { ok: false, reason: 'Ainda há alterações desta conta esperando a nuvem. Nada foi cobrado; tente de novo.' },
+      undefined, null, {}, { ok: true }, { ok: 'true', balance_cents: 2450 }, { ok: true, balance_cents: -1 }, { ok: true, balance_cents: 24.5 }, { ok: true, balance_cents: '2450' },
+    ];
+    for (const answer of answers) {
+      const h = harness(() => pending, { prepareOrder: async () => answer as never });
+      const r = await h.driver.charge(REQ);
+      expect(r.status, JSON.stringify(answer)).toBe('DECLINED');
+      expect(h.calls, JSON.stringify(answer)).toHaveLength(0);
+    }
+    const h = harness(() => pending, { prepareOrder: async () => answers[0] as never });
+    expect(await h.driver.charge(REQ)).toMatchObject({ reason: 'Ainda há alterações desta conta esperando a nuvem. Nada foi cobrado; tente de novo.' });
+  });
+
+  it('P1-01: prepara a conta desta cobrança e manda o saldo dela para o servidor conferir', async () => {
+    const asked: string[] = [];
+    const h = harness((action) => (action === 'create' ? pending : { status: 200, body: APPROVED }), {
+      prepareOrder: async (orderId) => { asked.push(orderId); return { ok: true, balance_cents: 9000 }; },
+    });
+    expect((await h.driver.charge(REQ)).status).toBe('APPROVED');
+    expect(asked).toEqual([REQ.order_id]);
+    expect(h.calls[0]!.body).toMatchObject({ action: 'create', expected_balance_cents: 9000, amount_cents: 2450 });
+  });
+
+  it('P1-01: saldo diferente no servidor (409 balance_mismatch) recusa sem nada cobrado', async () => {
+    const h = harness(() => ({ status: 409, body: { error: 'balance_mismatch', message: 'O saldo desta conta na nuvem é outro. Nada foi cobrado.' } }));
+    expect(await h.driver.charge(REQ)).toMatchObject({ status: 'DECLINED', reason: 'O saldo desta conta na nuvem é outro. Nada foi cobrado.' });
+    expect(h.counts.create).toBe(1);
+    expect(h.counts.status ?? 0).toBe(0);
+  });
+
+  it('P1-02: a consulta avisa que nenhum envio saiu (awaiting_send): o driver repete o create com a mesma chave', async () => {
+    const awaiting = { status: 200, body: { status: 'PENDING', idempotency_key: REQ.idempotency_key, detail: '', awaiting_send: true } };
+    const h = harness((action, n) => (action === 'create' ? pending : n === 1 ? awaiting : { status: 200, body: APPROVED }));
+    expect((await h.driver.charge(REQ)).status).toBe('APPROVED');
+    const creates = h.calls.filter((c) => c.body.action === 'create');
+    expect(creates).toHaveLength(2);
+    expect(creates[1]!.body).toEqual(creates[0]!.body);
+  });
+
+  it('P1-02: sem awaiting_send a consulta nunca vira create', async () => {
+    const h = harness((action, n) => (action === 'create' ? pending : n < 5 ? pending : { status: 200, body: APPROVED }));
+    expect((await h.driver.charge(REQ)).status).toBe('APPROVED');
+    expect(h.counts.create).toBe(1);
+  });
+
+  it('P2-01: sessão que nunca chega (renovação do token pendurada) antes de cobrar: recusa no prazo, sem chamar nada', async () => {
+    const h = harness(() => pending, { config: () => new Promise(() => undefined), timer: () => tick() });
+    const r = await h.driver.charge(REQ);
+    expect(r).toMatchObject({ status: 'DECLINED' });
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('P2-01: sessão que deixa de chegar na hora da criação, sem envio anterior: recusa local (nada saiu)', async () => {
+    let n = 0;
+    const h = harness(() => pending, {
+      config: () => { n += 1; return n === 1 ? Promise.resolve(CFG) : new Promise(() => undefined); },
+      timer: () => tick(),
+    });
+    expect(await h.driver.charge(REQ)).toMatchObject({ status: 'DECLINED', reason: 'Não consegui falar com a nuvem. Nada foi cobrado; tente de novo.' });
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('P2-01: sessão pendurada depois de uma criação incerta: termina no prazo em revisão manual, nunca recusa nem lança', async () => {
+    let n = 0;
+    const h = harness((action) => (action === 'create' ? 'network' : pending), {
+      // 1ª: início da cobrança; 2ª: a criação (sai e cai na rede); daí em diante a renovação pendura.
+      config: () => { n += 1; return n <= 2 ? Promise.resolve(CFG) : new Promise(() => undefined); },
+      timer: () => tick(),
+    });
+    const r = await h.driver.charge(REQ);
+    expect(r).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT' });
+    expect(h.counts.create).toBe(1);
   });
 });

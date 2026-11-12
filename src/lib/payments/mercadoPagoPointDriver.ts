@@ -15,8 +15,12 @@
  *    pode ter chegado à maquininha. Depois de uma criação incerta, nem 404 nem outra
  *    recusa provam nada (a primeira criação pode estar a caminho): a recusa só vem do
  *    encerramento no servidor, que grava o bloqueio da chave antes de responder.
- *  - Cada chamada tem prazo próprio (POINT_REQUEST_TIMEOUT_MS) e o fluxo inteiro tem
- *    prazo contado desde o primeiro envio.
+ *  - Cada chamada tem prazo próprio (POINT_REQUEST_TIMEOUT_MS), que conta também a obtenção da
+ *    sessão (renovação do token), e o fluxo inteiro tem prazo contado desde o primeiro envio.
+ *    Sessão que não chega no prazo antes do primeiro envio = recusa local (nada saiu daqui);
+ *    depois de um envio incerto, segue o caminho de sempre (encerramento no servidor ou revisão manual).
+ *  - Antes de cobrar, prova que a conta no servidor é a deste aparelho (prepareOrder): nenhum evento
+ *    da conta na fila nem recusado, e o saldo daqui vai junto para o servidor conferir.
  *  - Pix pela Point ainda não: a cobrança nem começa.
  */
 import type { OperationMode, PosTerminal } from '../../types';
@@ -43,9 +47,14 @@ export interface PointDriverDeps {
   timer?: (ms: number) => Promise<void>;
   /** Quem está no caixa (fica gravado no encerramento da tentativa). */
   operator?: () => Promise<string | null>;
-  /** Sobe a fila antes de cobrar: o servidor só cobra conta que já está nele. */
-  beforeCreate?: () => Promise<void>;
+  /**
+   * Antes de cobrar: sobe a fila e prova que a conta está no servidor como aqui (useCloudSync.ensureOrderSynced).
+   * Só `{ ok: true, balance_cents }` libera a cobrança; o saldo vai para o servidor conferir.
+   */
+  prepareOrder: (orderId: string) => Promise<PrepareResult>;
 }
+
+export type PrepareResult = { ok: true; balance_cents: number } | { ok: false; reason: string };
 
 /** Tempo esperando o cartão antes de pedir o cancelamento na maquininha. */
 export const POINT_WAIT_MS = 120_000;
@@ -62,7 +71,8 @@ export const POINT_POLL_MS = 2_000;
 export const POINT_REQUEST_TIMEOUT_MS = 15_000;
 
 type Reply =
-  | { status: 'PENDING' }
+  /** awaiting: a cobrança está gravada e nenhum envio saiu ainda (a consulta não manda; o create manda). */
+  | { status: 'PENDING'; awaiting?: true }
   | { status: 'APPROVED'; nsu: string; authorization_code: string; card_brand: 'VISA' | 'MASTERCARD' | 'ELO'; last_four: string | null; terminal_serial: string; amount_cents: number; method: 'CREDIT' | 'DEBIT' }
   | { status: 'DECLINED'; reason: string }
   | { status: 'MANUAL_REVIEW'; reason: string; code: string };
@@ -70,7 +80,11 @@ type Reply =
 type CallOutcome =
   | { kind: 'reply'; reply: Reply }
   | { kind: 'rejected'; httpStatus: number; error: string; message: string }
-  | { kind: 'unknown' };
+  | { kind: 'unknown' }
+  /** Sem sessão da nuvem (ou ela não chegou no prazo): o pedido nem saiu daqui. */
+  | { kind: 'unsent' };
+
+const TIMEOUT = Symbol('timeout');
 
 const BRANDS = new Set(['VISA', 'MASTERCARD', 'ELO']);
 
@@ -88,7 +102,7 @@ function parseReply(text: string): Reply | null {
   if (!body) return null;
   switch (body.status) {
     case 'PENDING':
-      return { status: 'PENDING' };
+      return body.awaiting_send === true ? { status: 'PENDING', awaiting: true } : { status: 'PENDING' };
     case 'DECLINED':
       return { status: 'DECLINED', reason: typeof body.reason === 'string' ? body.reason : 'Transação recusada.' };
     case 'MANUAL_REVIEW':
@@ -140,9 +154,28 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     return { status: 'MANUAL_REVIEW', acquirer: 'MERCADO_PAGO', reason, failure_code: code, terminal_serial: this.serial(), terminal_id: this.terminal?.id ?? null };
   }
 
+  /** `promise` com o prazo `deadline` (sem timer, sem prazo próprio). Falha vira null. */
+  private async within<T>(promise: Promise<T>, deadline: Promise<typeof TIMEOUT> | null): Promise<T | null | typeof TIMEOUT> {
+    const safe = promise.catch(() => null);
+    return deadline ? Promise.race([safe, deadline]) : safe;
+  }
+
+  /** Sessão da nuvem com prazo: a renovação do token pendurada não segura a cobrança. */
+  private async session(deadline: Promise<typeof TIMEOUT> | null): Promise<SyncConfig | null> {
+    const cfg = await this.within(this.deps.config(), deadline);
+    return cfg === TIMEOUT ? null : cfg;
+  }
+
+  private deadline(): Promise<typeof TIMEOUT> | null {
+    const timer = this.deps.timer;
+    return timer ? timer(POINT_REQUEST_TIMEOUT_MS).then(() => TIMEOUT) : null;
+  }
+
   private async call(body: Record<string, unknown>): Promise<CallOutcome> {
-    const cfg = await this.deps.config().catch(() => null);
-    if (!cfg) return { kind: 'unknown' };
+    // Um prazo só para a sessão (renovação do token) e para a chamada.
+    const deadline = this.deadline();
+    const cfg = await this.session(deadline);
+    if (!cfg) return { kind: 'unsent' };
     let res: { status: number; text(): Promise<string> };
     let text: string;
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
@@ -156,11 +189,8 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
         });
         return { r, t: await r.text() };
       })();
-      const timer = this.deps.timer;
-      const out = timer
-        ? await Promise.race([request, timer(POINT_REQUEST_TIMEOUT_MS).then(() => null)])
-        : await request;
-      if (!out) {
+      const out = deadline ? await Promise.race([request, deadline]) : await request;
+      if (out === TIMEOUT) {
         // Prazo estourado: resultado desconhecido (a cobrança pode ter chegado).
         controller?.abort();
         request.catch(() => undefined);
@@ -217,22 +247,25 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     this.aborted.delete(req.request_id);
     if (req.method !== 'CREDIT' && req.method !== 'DEBIT') return this.declined('Pela Point Smart esta versão cobra só crédito à vista e débito. Use outra forma para Pix.');
     if (!this.terminal) return this.declined('Selecione a maquininha Point Smart.');
-    const cfg = await this.deps.config().catch(() => null);
-    if (!cfg) return this.declined('Conecte a loja à nuvem para cobrar na Point Smart.');
+    // Com prazo: renovação do token pendurada não deixa o operador esperando (nada foi mandado ainda).
+    const cfg = await this.session(this.deadline());
+    if (!cfg) return this.declined('Conecte a loja à nuvem para cobrar na Point Smart. Nada foi cobrado.');
     const key = req.idempotency_key;
     const amountCents = Math.round(req.amount * 100);
     const operator = await (this.deps.operator?.() ?? Promise.resolve(null)).catch(() => null);
     // Sem operador identificado não cobra (o servidor também recusa quem não é da equipe ativa da loja).
     if (!operator) return this.declined('Entre com o seu PIN para cobrar na Point Smart.');
     const charge = { terminal_id: this.terminal.id, idempotency_key: key, order_id: req.order_id, amount_cents: amountCents, method: req.method };
-    // Sobe a fila antes (o servidor só cobra conta que já está nele). Com prazo: pendurada ou com erro, não
-    // cobra (nada foi mandado). O servidor confere de novo que a conta está lá.
-    if (this.deps.beforeCreate) {
-      const before = this.deps.beforeCreate().then(() => 'ok' as const, () => 'failed' as const);
-      const timer = this.deps.timer;
-      const result = timer ? await Promise.race([before, timer(POINT_REQUEST_TIMEOUT_MS).then(() => 'timeout' as const)]) : await before;
-      if (result !== 'ok') return this.declined('Não consegui sincronizar a conta com a nuvem. Nada foi cobrado; tente de novo.');
-    }
+    // Prova antes que o servidor tem esta conta como aqui (fila da conta enviada e aceita, nada recusado). Com
+    // prazo: pendurada, com erro ou sem prova, não cobra (nada foi mandado). Só um ok explícito com saldo em
+    // centavos libera; o saldo vai junto e o servidor confere que é o dele.
+    const prepared = await this.within(this.deps.prepareOrder(req.order_id), this.deadline());
+    const SYNC_FAILED = 'Não consegui sincronizar a conta com a nuvem. Nada foi cobrado; tente de novo.';
+    if (prepared === null || prepared === TIMEOUT || typeof prepared !== 'object') return this.declined(SYNC_FAILED);
+    if (prepared.ok !== true) return this.declined(typeof prepared.reason === 'string' && prepared.reason ? prepared.reason : SYNC_FAILED);
+    const balance = prepared.balance_cents;
+    if (typeof balance !== 'number' || !Number.isSafeInteger(balance) || balance < 0) return this.declined(SYNC_FAILED);
+    const createBody = { action: 'create', ...charge, staff_id: operator, expected_balance_cents: balance };
 
     // O prazo do cartão conta a partir do primeiro envio (a sincronização acima tem o prazo dela e não
     // consome este): criação pendurada consome o tempo de espera.
@@ -242,7 +275,11 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     let sent = false;
     for (let attempt = 0; attempt < 3 && !sent; attempt += 1) {
       if (this.deps.now() - started >= POINT_WAIT_MS) break;
-      const out = await this.call({ action: 'create', ...charge, staff_id: operator });
+      const out = await this.call(createBody);
+      if (out.kind === 'unsent' && !uncertain) {
+        // A sessão não veio (ou não veio no prazo) e nenhuma criação saiu antes: nada foi mandado.
+        return this.declined('Não consegui falar com a nuvem. Nada foi cobrado; tente de novo.');
+      }
       if (out.kind === 'reply') {
         sent = true;
         const final = this.toResult(out.reply, req);
@@ -300,7 +337,14 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
       if (cancelAt !== null && this.deps.now() - cancelAt >= POINT_CANCEL_WAIT_MS) return stuck();
       if (this.deps.now() - started >= POINT_HARD_LIMIT_MS) return stuck();
       await this.deps.sleep(POINT_POLL_MS);
-      const out = await this.call({ action: 'status', idempotency_key: key });
+      let out = await this.call({ action: 'status', idempotency_key: key });
+      // A consulta nunca inicia o envio. Cobrança gravada sem nenhum envio (a criação parou antes de chegar à
+      // maquininha): ainda no prazo e sem encerramento pedido, repete o pedido de criação, com a mesma chave.
+      if (out.kind === 'reply' && out.reply.status === 'PENDING' && out.reply.awaiting && cancelAt === null && this.deps.now() - started < POINT_WAIT_MS) {
+        const again = await this.call(createBody);
+        // Recusa ou falha aqui não provam nada (houve criação antes): segue consultando.
+        if (again.kind === 'reply') out = again;
+      }
       if (out.kind === 'reply') {
         const final = this.toResult(out.reply, req);
         if (final) return final;
