@@ -82,27 +82,87 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
     await expect(supabaseChargeStore(db, TENANT).insert(fresh)).rejects.not.toBeInstanceOf(ChargeRefusedError);
   });
 
-  it('r3 P1-02: a posse do envio é dada pela função do banco; 0 ou posse que já não é a desta chamada = não ganhou', async () => {
+  it('r3 P1-02: a posse do envio é dada pela função do banco; 0 = não ganhou; ganhou = linha com o número da posse', async () => {
     const none = fakeDb({ rpc: { data: 0, error: null } });
     expect(await supabaseChargeStore(none.db, TENANT).claimDispatch({ ...ROW, status: 'creating' }, 30_000)).toBeNull();
     expect(none.chains).toEqual([['rpc:tchefood_claim_point_dispatch', JSON.stringify(['p_id', 'p_lease_ms', 'p_tenant'])]]);
-    const won = fakeDb({ rpc: { data: 2, error: null }, select: { ...ROW, status: 'creating', dispatch_attempts: 2 } });
-    expect(await supabaseChargeStore(won.db, TENANT).claimDispatch({ ...ROW, status: 'creating' }, 30_000)).toMatchObject({ dispatch_attempts: 2 });
-    const lost = fakeDb({ rpc: { data: 2, error: null }, select: { ...ROW, status: 'creating', dispatch_attempts: 3 } });
-    expect(await supabaseChargeStore(lost.db, TENANT).claimDispatch({ ...ROW, status: 'creating' }, 30_000)).toBeNull();
+    const won = fakeDb({ rpc: { data: 2, error: null } });
+    expect(await supabaseChargeStore(won.db, TENANT).claimDispatch({ ...ROW, status: 'creating', dispatch_attempts: 1 }, 30_000)).toMatchObject({ id: 'r1', dispatch_attempts: 2 });
+    // Só a função do banco: nenhuma leitura entre a posse e a barreira.
+    expect(won.chains).toHaveLength(1);
+    for (const data of [null, 'x', 1.5, -1]) {
+      const odd = fakeDb({ rpc: { data, error: null } });
+      expect(await supabaseChargeStore(odd.db, TENANT).claimDispatch({ ...ROW, status: 'creating' }, 30_000)).toBeNull();
+    }
+    const down = fakeDb({ rpc: { data: null, error: { message: 'timeout' } } });
+    await expect(supabaseChargeStore(down.db, TENANT).claimDispatch({ ...ROW, status: 'creating' }, 30_000)).rejects.toThrow('posse do envio');
   });
 
-  it('r3 P1-02/P1-03: devolver e abandonar a posse só valem para a posse desta chamada', async () => {
+  it('r3 2ª revisão: a barreira antes do envio é uma chamada só ao banco, com o número da posse; só 1 e 2 liberam', async () => {
+    const first = fakeDb({ rpc: { data: 1, error: null } });
+    expect(await supabaseChargeStore(first.db, TENANT).beginDispatch({ ...ROW, status: 'creating', dispatch_attempts: 3 }, 30_000)).toBe(1);
+    expect(first.chains).toEqual([['rpc:tchefood_begin_point_dispatch', JSON.stringify(['p_attempt', 'p_id', 'p_lease_ms', 'p_tenant'])]]);
+    expect(await supabaseChargeStore(fakeDb({ rpc: { data: 2, error: null } }).db, TENANT).beginDispatch(ROW, 30_000)).toBe(2);
+    expect(await supabaseChargeStore(fakeDb({ rpc: { data: '2', error: null } }).db, TENANT).beginDispatch(ROW, 30_000)).toBe(2);
+    for (const data of [0, null, 3, -1, 'x', false]) {
+      expect(await supabaseChargeStore(fakeDb({ rpc: { data, error: null } }).db, TENANT).beginDispatch(ROW, 30_000)).toBe(0);
+    }
+    // Banco fora do ar não libera o envio: a chamada falha.
+    const down = fakeDb({ rpc: { data: null, error: { message: 'timeout' } } });
+    await expect(supabaseChargeStore(down.db, TENANT).beginDispatch(ROW, 30_000)).rejects.toThrow('marcar o envio');
+  });
+
+  it('r3 2ª revisão: a ordem é ligada sem condição de estado lido, só se ainda não há ordem e a cobrança não é final', async () => {
+    const ok = fakeDb({ update: { ...ROW, status: 'manual_review', external_order_id: 'ORD9' } });
+    expect(await supabaseChargeStore(ok.db, TENANT).attachOrder({ ...ROW, status: 'creating', external_order_id: null }, 'ORD9')).toMatchObject({ status: 'manual_review', external_order_id: 'ORD9' });
+    expect(ok.chains[0]).toEqual(expect.arrayContaining([`update:${JSON.stringify(['external_order_id', 'updated_at'])}`, 'eq:id,r1', `eq:tenant_id,${TENANT}`, 'is:external_order_id,null', 'not:status,in,(approved,rejected,cancelled,expired,refunded)']));
+    expect(ok.chains[0]!.some((c) => c.startsWith('eq:status'))).toBe(false);
+    // Já tinha ordem (ou terminou): não grava e devolve o que está lá.
+    const kept = fakeDb({ update: null, select: { ...ROW, external_order_id: 'ORD' } });
+    expect((await supabaseChargeStore(kept.db, TENANT).attachOrder({ ...ROW, external_order_id: null }, 'ORD9')).external_order_id).toBe('ORD');
+    expect(kept.chains).toHaveLength(2);
+  });
+
+  it('r3 2ª revisão: recusa do primeiro envio e devolução da posse só valem para a posse desta chamada, em "creating" e sem ordem', async () => {
+    const rej = fakeDb({ update: { ...ROW, status: 'rejected', raw_status: 'create_failed:terminal_busy' } });
+    expect((await supabaseChargeStore(rej.db, TENANT).rejectFirstSend({ ...ROW, status: 'creating', dispatch_attempts: 1 }, 'terminal_busy')).status).toBe('rejected');
+    expect(rej.chains[0]).toEqual(expect.arrayContaining(['eq:id,r1', `eq:tenant_id,${TENANT}`, 'eq:status,creating', 'eq:dispatch_attempts,1', 'is:external_order_id,null']));
+    // Outra posse já foi dada: nada é gravado e volta a linha atual.
+    const lost = fakeDb({ update: null, select: { ...ROW, status: 'creating', dispatch_attempts: 2 } });
+    expect(await supabaseChargeStore(lost.db, TENANT).rejectFirstSend({ ...ROW, status: 'creating', dispatch_attempts: 1 }, 'terminal_busy')).toMatchObject({ status: 'creating', dispatch_attempts: 2 });
     const rel = fakeDb({ update: { id: 'r1' } });
     await supabaseChargeStore(rel.db, TENANT).releaseDispatch({ ...ROW, status: 'creating', dispatch_attempts: 2 });
-    expect(rel.chains[0]).toEqual(expect.arrayContaining(['eq:id,r1', `eq:tenant_id,${TENANT}`, 'eq:status,creating', 'eq:dispatch_attempts,2']));
-    const first = fakeDb({ update: { ...ROW, status: 'cancelled', raw_status: 'voided_before_send' } });
-    expect((await supabaseChargeStore(first.db, TENANT).abandonDispatch({ ...ROW, status: 'creating', dispatch_attempts: 1 })).status).toBe('cancelled');
-    expect(first.chains[0]).toEqual(expect.arrayContaining(['eq:status,creating', 'eq:dispatch_attempts,1', 'is:external_order_id,null']));
-    // Numa repetição o envio anterior é desconhecido: não encerra, só devolve a linha atual.
-    const retry = fakeDb({ select: { ...ROW, status: 'creating', dispatch_attempts: 2 } });
-    expect((await supabaseChargeStore(retry.db, TENANT).abandonDispatch({ ...ROW, status: 'creating', dispatch_attempts: 2 })).status).toBe('creating');
-    expect(retry.chains.every((c) => !c.some((x) => x.startsWith('update')))).toBe(true);
+    expect(rel.chains).toHaveLength(1);
+    expect(rel.chains[0]).toEqual(expect.arrayContaining([`update:${JSON.stringify(['dispatch_lease_until', 'updated_at'])}`, 'eq:id,r1', `eq:tenant_id,${TENANT}`, 'eq:status,creating', 'eq:dispatch_attempts,2', 'is:external_order_id,null']));
+  });
+
+  it('r3 2ª revisão: revisão manual do envio sem resposta e encerramento por prazo são decididos pelo banco', async () => {
+    const settle = fakeDb({ rpc: { data: true, error: null }, select: { ...ROW, status: 'manual_review', raw_status_detail: 'DISPATCH_UNKNOWN' } });
+    expect((await supabaseChargeStore(settle.db, TENANT).settleDispatch({ ...ROW, status: 'creating' })).status).toBe('manual_review');
+    expect(settle.chains[0]).toEqual(['rpc:tchefood_settle_point_dispatch', JSON.stringify(['p_id', 'p_tenant'])]);
+    // Fora das condições (false): devolve a linha como está, sem gravar nada por fora.
+    const not = fakeDb({ rpc: { data: false, error: null }, select: { ...ROW, status: 'creating' } });
+    expect((await supabaseChargeStore(not.db, TENANT).settleDispatch({ ...ROW, status: 'creating' })).status).toBe('creating');
+    expect(not.chains.every((c) => !c.some((x) => x.startsWith('update')))).toBe(true);
+
+    const early = fakeDb({ rpc: { data: 0, error: null } });
+    expect(await supabaseChargeStore(early.db, TENANT).requestTimeoutCancel(ROW, 120_000)).toBeNull();
+    expect(early.chains).toEqual([['rpc:tchefood_request_point_timeout', JSON.stringify(['p_id', 'p_tenant', 'p_wait_ms'])]]);
+    for (const data of [1, 2]) {
+      const ok = fakeDb({ rpc: { data, error: null }, select: { ...ROW, cancel_reason: 'timeout', cancel_requested_at: '2026-11-12T10:02:00Z' } });
+      expect(await supabaseChargeStore(ok.db, TENANT).requestTimeoutCancel(ROW, 120_000)).toMatchObject({ cancel_reason: 'timeout' });
+      expect(ok.chains.every((c) => !c.some((x) => x.startsWith('update')))).toBe(true);
+    }
+    // Resposta estranha do banco não vira "prazo vencido" nem "cedo demais": é erro.
+    for (const data of [null, 3, 'x']) {
+      await expect(supabaseChargeStore(fakeDb({ rpc: { data, error: null } }).db, TENANT).requestTimeoutCancel(ROW, 120_000)).rejects.toThrow('Resposta inesperada');
+    }
+    // true não é 1: a barreira só libera o envio com os números 1 e 2.
+    for (const data of [true, null, 3, 'x']) {
+      expect(await supabaseChargeStore(fakeDb({ rpc: { data, error: null } }).db, TENANT).beginDispatch({ ...ROW, status: 'creating', dispatch_attempts: 1 }, 30_000)).toBe(0);
+    }
+    const gone = fakeDb({ rpc: { data: null, error: { code: 'TF005', message: 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' } } });
+    await expect(supabaseChargeStore(gone.db, TENANT).requestTimeoutCancel(ROW, 120_000)).rejects.toMatchObject({ code: 'not_found' });
   });
 
   it('r3 P1-01: o bloqueio da chave passa pela função do banco (operador conferido, registro gravado)', async () => {

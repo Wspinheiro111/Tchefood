@@ -22,7 +22,12 @@
 //    ordem comprovadamente nunca saiu daqui. Envio sem resposta nunca vira recusa por tempo nem por PIN:
 //    fica em revisão manual, segurando o saldo da conta.
 //  - Um pedido por vez fala com o Mercado Pago: quem manda a ordem tem a posse do envio (com prazo, no
-//    banco). Consultas no meio só acompanham. Depois do pedido de encerramento ninguém mais manda.
+//    banco) e passa pela barreira do banco imediatamente antes da chamada. Consultas no meio só
+//    acompanham. Depois do pedido de encerramento ninguém mais manda.
+//  - A ordem que o Mercado Pago devolve é ligada à cobrança assim que chega, em qualquer estado não final:
+//    resposta válida não se perde por corrida com consulta, encerramento ou revisão manual.
+//  - Prazos (posse do envio, espera do cartão) são decididos pelo relógio do banco, nunca pelo do aparelho
+//    nem pelo desta função.
 //  - Chave sem cobrança gravada: não há o que cancelar. Grava-se o bloqueio da chave (status cancelled,
 //    raw_status voided_before_send), com operador ativo e registro, para que uma criação atrasada nunca
 //    chegue à Point.
@@ -67,11 +72,11 @@ export interface TerminalChargeRow {
   authorization_code: string | null;
   last_four: string | null;
   created_by: string | null;
-  /** Primeiro envio da ordem ao Mercado Pago. NULL = nunca saiu daqui. */
+  /** Início do primeiro envio da ordem ao Mercado Pago (barreira do banco). NULL = nenhum envio saiu daqui. */
   dispatched_at: string | null;
   /** Posse do envio em andamento (relógio do banco). Enquanto vale, só quem a tem fala com o Mercado Pago. */
   dispatch_lease_until: string | null;
-  /** Quantas posses foram dadas (1 = primeiro envio). */
+  /** Quantas posses foram dadas. */
   dispatch_attempts: number;
   cancel_reason: CancelReason | null;
   cancel_requested_by: string | null;
@@ -86,8 +91,7 @@ export type CancelReason = 'timeout' | 'operator' | 'void';
 
 export type NewChargeRow = Omit<TerminalChargeRow, 'id' | 'created_at'>;
 export type ChargePatch = Partial<Pick<TerminalChargeRow,
-  'status' | 'external_order_id' | 'external_payment_id' | 'raw_status' | 'raw_status_detail' | 'paid_amount_cents' | 'card_brand' | 'authorization_code' | 'last_four'
-  | 'cancel_reason' | 'cancel_requested_by' | 'cancel_requested_at'>>;
+  'status' | 'external_order_id' | 'external_payment_id' | 'raw_status' | 'raw_status_detail' | 'paid_amount_cents' | 'card_brand' | 'authorization_code' | 'last_four'>>;
 
 export type ChargeRefusal = 'order_not_found' | 'order_closed' | 'over_balance' | 'invalid_staff' | 'not_found' | 'invalid_reason' | 'not_applicable';
 
@@ -120,19 +124,42 @@ export interface ChargeStore {
   update(row: TerminalChargeRow, patch: ChargePatch): Promise<TerminalChargeRow>;
   /**
    * Pede a posse do envio por `leaseMs` (relógio do banco, um UPDATE só): só para cobrança "creating", sem
-   * ordem, sem pedido de encerramento e sem outra posse em vigor. Devolve a linha com a posse
-   * (dispatch_attempts = número desta posse; 1 = primeiro envio) ou null se não ganhou.
+   * ordem, sem pedido de encerramento, sem outra posse em vigor e dentro do limite de posses. Devolve a
+   * linha com a posse (dispatch_attempts = número desta posse) ou null se não ganhou. Ainda não marca envio.
    */
   claimDispatch(row: TerminalChargeRow, leaseMs: number): Promise<TerminalChargeRow | null>;
-  /** Devolve a posse (a chamada ao Mercado Pago terminou sem resultado): só se a posse ainda for a de `row`. */
-  releaseDispatch(row: TerminalChargeRow): Promise<void>;
   /**
-   * Quem ganhou a PRIMEIRA posse e não mandou nada encerra a cobrança ("voided_before_send"): só vale se a
-   * posse ainda for a de `row` e for a primeira (nenhum envio saiu). Devolve a linha atual.
+   * Barreira IMEDIATAMENTE antes da chamada ao Mercado Pago (nada mais pode ficar entre ela e a chamada).
+   * Atômica no banco: só passa se a posse ainda for a de `row`, estiver em vigor, a cobrança seguir
+   * "creating" sem ordem e sem pedido de encerramento. Marca o primeiro envio e renova a posse por `leaseMs`.
+   * Devolve 1 (primeiro envio: nada saiu antes), 2 (repetição de um envio anterior) ou 0 (não mande).
    */
-  abandonDispatch(row: TerminalChargeRow): Promise<TerminalChargeRow>;
-  /** Encerra a cobrança que nunca foi enviada (status creating, sem envio). Devolve a linha atual. */
+  beginDispatch(row: TerminalChargeRow, leaseMs: number): Promise<0 | 1 | 2>;
+  /**
+   * Liga a ordem que o Mercado Pago devolveu à cobrança, em qualquer estado não final, se ela ainda não tem
+   * ordem. Devolve a linha atual (com esta ordem, ou com o que já estava gravado).
+   */
+  attachOrder(row: TerminalChargeRow, externalOrderId: string): Promise<TerminalChargeRow>;
+  /**
+   * Recusa definitiva do PRIMEIRO envio (nada foi criado): só grava se a cobrança seguir "creating", sem
+   * ordem e com a posse de `row`. Devolve a linha atual.
+   */
+  rejectFirstSend(row: TerminalChargeRow, code: string): Promise<TerminalChargeRow>;
+  /** Devolve a posse (o Mercado Pago RESPONDEU sem resultado): só se a posse ainda for a de `row`. */
+  releaseDispatch(row: TerminalChargeRow): Promise<void>;
+  /** Encerra a cobrança de que nenhum envio saiu (status creating, dispatched_at nulo). Devolve a linha atual. */
   voidUndispatched(row: TerminalChargeRow): Promise<TerminalChargeRow>;
+  /**
+   * Envio que saiu e ficou sem resposta, com encerramento pedido e posse vencida pelo relógio do banco: vai
+   * para revisão manual (DISPATCH_UNKNOWN), segurando o saldo. Fora dessas condições não muda nada.
+   * Devolve a linha atual.
+   */
+  settleDispatch(row: TerminalChargeRow): Promise<TerminalChargeRow>;
+  /**
+   * Encerramento por prazo, decidido pelo relógio do banco contra a hora gravada da cobrança. Devolve null
+   * se ainda é cedo (nada gravado); senão a linha atual, com o pedido gravado (por esta ou outra chamada).
+   */
+  requestTimeoutCancel(row: TerminalChargeRow, waitMs: number): Promise<TerminalChargeRow | null>;
   /** Cobranças da conta ainda não encerradas (para reconsultar antes de abrir outra). */
   listOpenForOrder(orderId: string): Promise<TerminalChargeRow[]>;
   /**
@@ -298,7 +325,7 @@ function declineReason(row: TerminalChargeRow): string {
   return `Transação recusada${row.raw_status_detail ? ` (${row.raw_status_detail})` : ''}.`;
 }
 
-/** Erros da criação que provam que a ordem não existe no Mercado Pago (nada foi cobrado). */
+/** Erros da criação que provam que ESTE pedido não criou ordem no Mercado Pago. */
 function definiteCreateFailure(error: unknown): string | null {
   if (!(error instanceof PaymentTerminalProviderError) || error.outcomeUnknown) return null;
   if (error.code === 'idempotency_conflict') return null; // a chave já criou outra ordem: não é recusa
@@ -309,36 +336,40 @@ function definiteCreateFailure(error: unknown): string | null {
 export const DISPATCH_LEASE_MS = 30_000;
 
 /**
- * Manda (ou repete, com a mesma chave) a ordem ao Mercado Pago. Só para cobrança "creating", e só com a
- * posse do envio (ChargeStore.claimDispatch). Três situações:
- *  - ainda não enviada: sem posse dada; pedido de encerramento aqui encerra sem mandar nada;
- *  - envio em andamento: outra chamada tem a posse; esta só devolve o estado gravado, sem HTTP;
- *  - posse vencida sem ordem: resultado desconhecido; repete com a MESMA chave (o Mercado Pago devolve a
- *    ordem original), menos depois de pedido de encerramento (aí ninguém ganha a posse).
- * Com a posse na mão, confere de novo a cobrança imediatamente antes do envio; e depois da resposta
- * grava sobre o estado ATUAL (não o lido antes), encerrando no Mercado Pago se o encerramento foi pedido
- * enquanto a ordem estava a caminho.
+ * Cobrança "creating", sem ordem e com encerramento pedido: daqui não sai mais envio. Se nenhum envio saiu,
+ * encerra com prova ("voided_before_send"). Se saiu, o resultado é desconhecido: revisão manual assim que a
+ * posse vencer (relógio do banco); enquanto ela vale, quem a tem ainda pode gravar a ordem. Nunca recusa.
+ */
+async function closeUnsent(ctx: ChargeContext, row: TerminalChargeRow): Promise<TerminalChargeRow> {
+  if (row.status !== 'creating' || row.external_order_id || !row.cancel_requested_at) return row;
+  return row.dispatched_at ? ctx.store.settleDispatch(row) : ctx.store.voidUndispatched(row);
+}
+
+async function reread(ctx: ChargeContext, row: TerminalChargeRow): Promise<TerminalChargeRow> {
+  const fresh = await ctx.store.findByKey(row.idempotency_key);
+  if (!fresh) throw new Error('Cobrança sumiu durante o envio.');
+  return fresh;
+}
+
+/**
+ * Manda (ou repete, com a mesma chave) a ordem ao Mercado Pago. Só para cobrança "creating" sem ordem:
+ *  1. pede a posse do envio (claimDispatch): outra chamada com a posse em vigor = esta só acompanha;
+ *  2. passa pela barreira do banco (beginDispatch) e, sem nenhuma outra espera, chama o Mercado Pago. A
+ *     barreira confere de novo, numa operação só, posse, prazo e pedido de encerramento;
+ *  3. liga a ordem devolvida à cobrança (attachOrder) antes de qualquer outra coisa, e só então confere o
+ *     resultado. Encerramento pedido com a ordem a caminho: cancela no Mercado Pago e grava o que ele disser.
+ * Recusa definitiva só vira "nada foi cobrado" no primeiro envio (a barreira diz se é). Numa repetição o
+ * envio anterior pode ter criado a ordem: fica como resultado desconhecido.
  */
 async function sendCreate(ctx: ChargeContext, row: TerminalChargeRow): Promise<TerminalChargeRow> {
   if (row.status !== 'creating' || row.external_order_id) return row;
-  if (!row.dispatched_at && row.cancel_requested_at) return ctx.store.voidUndispatched(row);
+  if (row.cancel_requested_at) return closeUnsent(ctx, row);
   const claimed = await ctx.store.claimDispatch(row, DISPATCH_LEASE_MS);
-  if (!claimed) {
-    const fresh = await ctx.store.findByKey(row.idempotency_key);
-    if (!fresh) throw new Error('Cobrança sumiu durante o envio.');
-    if (fresh.status === 'creating' && !fresh.dispatched_at && fresh.cancel_requested_at) return ctx.store.voidUndispatched(fresh);
-    return fresh; // envio em andamento em outra chamada, encerramento pedido ou estado já mudou: só acompanha
-  }
-  const firstDispatch = claimed.dispatch_attempts === 1;
-  // Imediatamente antes do envio: a posse é desta chamada, mas o encerramento pode ter chegado depois dela.
-  const check = await ctx.store.findByKey(claimed.idempotency_key);
-  if (!check) throw new Error('Cobrança sumiu durante o envio.');
-  if (check.status !== 'creating' || check.external_order_id) return check;
-  if (check.cancel_requested_at) {
-    // Não manda. No primeiro envio nada saiu daqui: encerra com prova. Numa repetição, o envio anterior
-    // continua desconhecido: fica como está e o encerramento leva à revisão manual.
-    return firstDispatch ? ctx.store.abandonDispatch(claimed) : check;
-  }
+  // Sem posse: envio em andamento em outra chamada, encerramento pedido, limite de envios ou estado mudou.
+  if (!claimed) return closeUnsent(ctx, await reread(ctx, row));
+  const begun = await ctx.store.beginDispatch(claimed, DISPATCH_LEASE_MS);
+  if (begun === 0) return closeUnsent(ctx, await reread(ctx, row));
+  // Entre a barreira e esta chamada não há nenhuma outra espera.
   let order: PaymentTerminalChargeResult;
   try {
     order = await ctx.provider.createCharge({
@@ -352,23 +383,42 @@ async function sendCreate(ctx: ChargeContext, row: TerminalChargeRow): Promise<T
     });
   } catch (error) {
     const failure = definiteCreateFailure(error);
-    // Recusa definitiva só prova "nada foi criado" no primeiro envio: numa repetição, o envio anterior
-    // pode ter criado a ordem. Aí continua como resultado desconhecido.
-    if (failure && firstDispatch) return ctx.store.update(claimed, { status: 'rejected', raw_status: `create_failed:${failure}`, raw_status_detail: null });
-    if (error instanceof PaymentTerminalProviderError && error.code === 'idempotency_conflict') {
-      // Não é recusa nem aprovação. Uma resposta válida que ainda chegue grava por cima (ver abaixo).
-      return ctx.store.update(claimed, { status: 'manual_review', raw_status: 'create_conflict', raw_status_detail: 'IDEMPOTENCY_CONFLICT' });
-    }
-    // Resultado desconhecido (queda, timeout, 5xx, resposta ilegível): a chamada acabou, devolve a posse.
-    // Continua "creating" e a próxima consulta repete com a MESMA chave e o MESMO pedido.
-    await ctx.store.releaseDispatch(claimed).catch(() => undefined);
-    return (await ctx.store.findByKey(claimed.idempotency_key)) ?? claimed;
+    if (failure && begun === 1) return ctx.store.rejectFirstSend(claimed, failure);
+    // Daqui para baixo o resultado é desconhecido e a cobrança segue "creating":
+    //  - recusa definitiva numa repetição, ou conflito de idempotência: o envio anterior pode ter criado a
+    //    ordem. Não devolve a posse: a próxima tentativa só depois do prazo dela;
+    //  - o Mercado Pago respondeu sem resultado (5xx, resposta ilegível): a chamada acabou, devolve a posse
+    //    e a próxima consulta repete com a MESMA chave e o MESMO pedido;
+    //  - sem resposta (queda, prazo estourado): o pedido pode ainda estar sendo processado lá. A posse fica
+    //    até vencer, para ninguém mandar outro por cima.
+    const answered = error instanceof PaymentTerminalProviderError && error.httpStatus !== null;
+    const conflict = error instanceof PaymentTerminalProviderError && error.code === 'idempotency_conflict';
+    if (answered && !failure && !conflict) await ctx.store.releaseDispatch(claimed).catch(() => undefined);
+    return closeUnsent(ctx, await reread(ctx, row));
   }
-  // A ordem existe. Grava sobre o estado de agora: se no meio a cobrança foi para revisão manual ou ganhou
-  // pedido de encerramento, a resposta válida não se perde.
-  const current = (await ctx.store.findByKey(claimed.idempotency_key)) ?? claimed;
-  if (FINAL.has(current.status)) return current;
-  if (current.external_order_id && current.external_order_id !== order.externalOrderId) return applyOrder(ctx, current, order);
+  // A ordem existe: liga à cobrança já, em qualquer estado não final (uma segunda tentativa cobre falha
+  // passageira do banco; se as duas falharem, a posse vence e a repetição com a mesma chave devolve a ordem).
+  let current: TerminalChargeRow;
+  try {
+    current = await ctx.store.attachOrder(claimed, order.externalOrderId);
+  } catch {
+    try {
+      current = await ctx.store.attachOrder(claimed, order.externalOrderId);
+    } catch (error) {
+      // O banco não gravou a ordem e ela está viva na maquininha, conhecida só aqui. Ordem sem registro não
+      // pode ser paga: pede o cancelamento no Mercado Pago. A repetição com a mesma chave devolve esta mesma
+      // ordem, cancelada (nada foi cobrado) ou, se o cartão passou antes, paga (aí a cobrança é aprovada).
+      await ctx.provider.cancelCharge(order.externalOrderId, { idempotencyKey: `${claimed.idempotency_key}-cancel` }).catch(() => undefined);
+      throw error;
+    }
+  }
+  if (FINAL.has(current.status)) {
+    if (current.status !== 'approved' && current.external_order_id !== order.externalOrderId) {
+      // A cobrança terminou sem esta ordem: ela não pode ficar esperando cartão na maquininha.
+      await ctx.provider.cancelCharge(order.externalOrderId, { idempotencyKey: `${claimed.idempotency_key}-cancel` }).catch(() => undefined);
+    }
+    return current;
+  }
   const applied = await applyOrder(ctx, current, order);
   if (applied.cancel_requested_at && !FINAL.has(applied.status) && applied.external_order_id) {
     // Encerramento pedido com a ordem a caminho: pede à maquininha que pare e grava o que o Mercado Pago disser.
@@ -524,7 +574,7 @@ async function refreshCharge(ctx: ChargeContext, row: TerminalChargeRow): Promis
 
 /**
  * Prazo de espera do cartão, igual ao do app (POINT_WAIT_MS): encerrar por "timeout", sem gerente, só depois
- * dele, contado pelo servidor desde a hora gravada da cobrança.
+ * dele, contado pelo relógio do banco desde a hora gravada da cobrança.
  */
 export const SERVER_TIMEOUT_MS = 120_000;
 
@@ -567,11 +617,11 @@ function matchesRow(row: TerminalChargeRow, input: CancelInput): boolean {
  * recusa: enquanto o envio pode estar a caminho, espera; depois vai para revisão manual e segue segurando
  * o saldo, com ou sem PIN de gerente.
  */
-export async function cancelCharge(ctx: ChargeContext, row: TerminalChargeRow, input: CancelInput, nowMs = Date.now()): Promise<ChargeReply> {
+export async function cancelCharge(ctx: ChargeContext, row: TerminalChargeRow, input: CancelInput): Promise<ChargeReply> {
   const req = validateCancel(input);
   if (!matchesRow(row, input)) throw new ChargeInputError('idempotency_conflict', 'O encerramento não confere com a cobrança (conta, valor ou forma).', 409);
   if (FINAL.has(row.status)) return replyFor(row);
-  let current = row;
+  let current: TerminalChargeRow;
   if (req.reason === 'operator') {
     let audit: string | null;
     try {
@@ -587,28 +637,16 @@ export async function cancelCharge(ctx: ChargeContext, row: TerminalChargeRow, i
     if (!audit) throw new ChargeInputError('manager_denied', 'PIN de gerente incorreto ou bloqueado. Nada foi cancelado.', 403);
     current = (await ctx.store.findByKey(row.idempotency_key)) ?? row;
   } else {
-    const created = Date.parse(row.created_at);
-    if (!Number.isFinite(created) || nowMs - created < SERVER_TIMEOUT_MS) {
-      throw new ChargeInputError('too_early', 'A cobrança ainda está no prazo de espera do cartão.', 409);
-    }
-    if (!current.cancel_requested_at) {
-      current = await ctx.store.update(current, { cancel_reason: 'timeout', cancel_requested_by: null, cancel_requested_at: new Date(nowMs).toISOString() });
-    }
+    const requested = await ctx.store.requestTimeoutCancel(row, SERVER_TIMEOUT_MS);
+    if (!requested) throw new ChargeInputError('too_early', 'A cobrança ainda está no prazo de espera do cartão.', 409);
+    current = requested;
   }
   if (FINAL.has(current.status)) return replyFor(current);
   // O pedido de encerramento só conta gravado: sem ele a posse do envio ainda pode ser dada.
   if (!current.cancel_requested_at) return replyFor(current);
-  if (!current.external_order_id) {
-    if (current.status !== 'creating') return replyFor(current); // já em revisão manual sem ordem: continua
-    if (!current.dispatched_at) return replyFor(await ctx.store.voidUndispatched(current));
-    // Enviada, sem ordem conhecida. Não repete a criação (o pedido de encerramento barra novas posses).
-    const lease = current.dispatch_lease_until ? Date.parse(current.dispatch_lease_until) : NaN;
-    // Envio em andamento: quem tem a posse grava a ordem e a encerra no Mercado Pago. Só espera.
-    if (Number.isFinite(lease) && nowMs < lease) return replyFor(current);
-    // Posse vencida e nenhuma ordem: resultado desconhecido. Pode ter sido criada e paga. Revisão manual,
-    // sem liberar o saldo; uma resposta atrasada ou a conferência no Mercado Pago ainda podem resolver.
-    return replyFor(await ctx.store.update(current, { status: 'manual_review', raw_status: 'dispatch_unknown', raw_status_detail: 'DISPATCH_UNKNOWN' }));
-  }
+  // Sem ordem conhecida: não repete a criação. Nenhum envio saiu = encerra com prova; envio sem resposta =
+  // espera a posse vencer e vai para revisão manual, sem liberar o saldo (com ou sem PIN de gerente).
+  if (!current.external_order_id) return replyFor(await closeUnsent(ctx, current));
   try {
     await ctx.provider.cancelCharge(current.external_order_id, { idempotencyKey: `${current.idempotency_key}-cancel` });
   } catch {
@@ -625,14 +663,14 @@ export async function cancelCharge(ctx: ChargeContext, row: TerminalChargeRow, i
  *  - o bloqueio exige operador da equipe ativa da loja (conferido no banco) e fica em audit_logs.
  * Se a criação gravou primeiro, valem as regras normais do encerramento (prazo no servidor ou PIN).
  */
-export async function voidCharge(ctx: ChargeContext, terminal: TerminalRecord, input: CreateInput & CancelInput, nowMs = Date.now()): Promise<ChargeReply> {
+export async function voidCharge(ctx: ChargeContext, terminal: TerminalRecord, input: CreateInput & CancelInput): Promise<ChargeReply> {
   const req = validateCreate(input);
   const cancel = validateCancel(input);
   if (terminal.acquirer !== 'MERCADO_PAGO') throw new ChargeInputError('not_mercado_pago', 'Esta maquininha não é Mercado Pago Point.');
   const existing = await ctx.store.findByKey(req.idempotency_key);
   if (existing) {
     if (!sameRequest(existing, req, terminal)) throw new ChargeInputError('idempotency_conflict', 'Esta chave já foi usada em outra cobrança.', 409);
-    return cancelCharge(ctx, existing, input, nowMs);
+    return cancelCharge(ctx, existing, input);
   }
   if (cancel.reason === 'operator') {
     throw new ChargeInputError('not_found', 'Cobrança ainda não gravada nesta loja: não há o que encerrar. Nada foi cancelado.', 404);
@@ -664,7 +702,7 @@ export async function voidCharge(ctx: ChargeContext, terminal: TerminalRecord, i
       dispatch_attempts: 0,
       cancel_reason: 'void',
       cancel_requested_by: req.staff_id,
-      cancel_requested_at: new Date(nowMs).toISOString(),
+      cancel_requested_at: null, // a hora é a do banco, gravada pela função do bloqueio
       cancel_authorized_by: null,
       cancel_audit_id: null,
     });
@@ -675,5 +713,5 @@ export async function voidCharge(ctx: ChargeContext, terminal: TerminalRecord, i
   if (!sameRequest(row, req, terminal)) throw new ChargeInputError('idempotency_conflict', 'Esta chave já foi usada em outra cobrança.', 409);
   if (row.status === 'cancelled' && row.raw_status === 'voided_before_send') return replyFor(row);
   // A criação gravou primeiro: encerramento normal da cobrança que ficou.
-  return cancelCharge(ctx, row, input, nowMs);
+  return cancelCharge(ctx, row, input);
 }

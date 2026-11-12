@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MercadoPagoPointDriver, POINT_CANCEL_WAIT_MS, POINT_WAIT_MS, type PointDriverDeps } from '../lib/payments/mercadoPagoPointDriver';
+import { MercadoPagoPointDriver, POINT_CANCEL_WAIT_MS, POINT_HARD_LIMIT_MS, POINT_WAIT_MS, type PointDriverDeps } from '../lib/payments/mercadoPagoPointDriver';
 import { createDriver, type ChargeRequest } from '../lib/payments/drivers';
 import { holdAcquirer } from '../lib/payments/reviewHolds';
 import { reconciliation } from '../lib/reports';
@@ -270,7 +270,7 @@ describe('MercadoPagoPointDriver', () => {
     expect(cancelAt[0]! - createAt).toBeLessThan(POINT_WAIT_MS + 2 * 2_000);
   });
 
-  it('auditoria r3 P1-01: pedido do operador sem cobrança gravada (404) cai; segue o bloqueio preventivo com o operador', async () => {
+  it('auditoria r3 P1-01: pedido do operador sem cobrança gravada (404): na mesma volta pede o bloqueio preventivo com o operador', async () => {
     const h = harness((action, n) => {
       if (action === 'create') return 'network';
       if (action === 'status') return { status: 404, body: { error: 'not_found', message: 'não encontrada' } };
@@ -289,6 +289,43 @@ describe('MercadoPagoPointDriver', () => {
     const { driver, counts } = harness((action, n) => (action === 'cancel' ? (n < 3 ? { status: 409, body: { error: 'too_early', message: 'cedo' } } : { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } }) : pending));
     expect((await driver.charge(REQ)).status).toBe('DECLINED');
     expect(counts.cancel).toBe(3);
+  });
+
+  it('auditoria r3, segunda revisão: PIN certo com cobrança ainda não gravada (404) não perde o pedido do gerente', async () => {
+    // 1º encerramento (gerente): 404, não gravada. Bloqueio na mesma volta: 409, a criação gravou no meio.
+    // Volta seguinte: a autorização do gerente vai de novo e agora encerra.
+    const answers: Answer[] = [
+      { status: 404, body: { error: 'not_found', message: 'não gravada' } },
+      { status: 409, body: { error: 'too_early', message: 'cedo' } },
+      { status: 200, body: { status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'Cobrança cancelada na maquininha (nada foi cobrado).' } },
+    ];
+    const h = harness((action, n) => (action === 'create' ? 'network' : action === 'status' ? pending : answers[n - 1]!));
+    const p = h.driver.charge(REQ);
+    h.driver.abort(REQ.request_id, { manager_pin: '9999', reason: 'cliente desistiu' });
+    expect((await p).status).toBe('DECLINED');
+    const cancels = h.calls.filter((c) => c.body.action === 'cancel').map((c) => c.body);
+    expect(cancels.map((c) => c.reason)).toEqual(['operator', 'timeout', 'operator']);
+    expect(cancels[2]).toMatchObject({ manager_pin: '9999', reason_text: 'cliente desistiu', staff_id: STAFF });
+  });
+
+  it('auditoria r3, segunda revisão: servidor ainda no prazo dele ("cedo demais") por mais de 30 s não vira revisão manual', async () => {
+    // A cobrança foi gravada no servidor 40 s depois do primeiro envio do app: o prazo dele vence 40 s depois.
+    const early = Math.ceil(40_000 / 2_000);
+    const { driver, counts } = harness((action, n) => (action === 'cancel'
+      ? (n <= early ? { status: 409, body: { error: 'too_early', message: 'cedo' } } : { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } })
+      : pending));
+    const r = await driver.charge(REQ);
+    expect(r.status).toBe('DECLINED');
+    expect(counts.cancel).toBe(early + 1);
+  });
+
+  it('auditoria r3, segunda revisão: "cedo demais" sem fim para no limite duro, em revisão manual (nunca recusa)', async () => {
+    const h = harness((action) => (action === 'cancel' ? { status: 409, body: { error: 'too_early', message: 'cedo' } } : pending));
+    const r = await h.driver.charge(REQ);
+    expect(r).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'POINT_TIMEOUT' });
+    // Limite: POINT_HARD_LIMIT_MS desde o primeiro envio, uma volta de consulta a cada 2 s.
+    expect(h.counts.cancel).toBeGreaterThan((POINT_HARD_LIMIT_MS - POINT_WAIT_MS) / 2_000 - 2);
+    expect(h.counts.cancel).toBeLessThan((POINT_HARD_LIMIT_MS - POINT_WAIT_MS) / 2_000 + 3);
   });
 
   it('cancelar depois de pago devolve a aprovação', async () => {

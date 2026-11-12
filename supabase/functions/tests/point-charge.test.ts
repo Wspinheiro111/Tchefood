@@ -31,79 +31,171 @@ const FINAL_STATES = new Set(['approved', 'rejected', 'cancelled', 'expired', 'r
 
 const MANAGER_PIN = '9999';
 
-/** Mesmo contrato do banco: cópias (como o PostgREST), gravação só se o estado lido não mudou, posse do envio com prazo. */
+type StoreMethod = 'findByKey' | 'claimDispatch' | 'beginDispatch' | 'attachOrder' | 'rejectFirstSend' | 'releaseDispatch' | 'voidUndispatched' | 'settleDispatch' | 'requestTimeoutCancel' | 'update';
+
+/**
+ * Mesmo contrato do banco (db/schema_mercado_pago.sql): cópias (como o PostgREST), gravação só se o estado
+ * lido não mudou, as mesmas condições das funções de posse/barreira/revisão/prazo e as recusas do gatilho
+ * (aqui viram exceção, como no banco). `nowMs` é o relógio do banco.
+ */
 class MemoryStore implements ChargeStore {
   rows: TerminalChargeRow[] = [];
   refuse: ChargeRefusedError | null = null;
   audits: { key: string; action: string; performed_by: string; reason: string }[] = [];
-  /** Idade das cobranças novas (o encerramento por prazo confere a hora gravada). */
+  /** Idade das cobranças novas (o encerramento por prazo confere a hora gravada contra `nowMs`). */
   createdAgoMs = 10 * 60_000;
-  /** Relógio do "banco" para a posse do envio (os testes adiantam). */
+  /** Relógio do "banco" (os testes adiantam). */
   nowMs = Date.now();
-  /** Chamado logo depois de dar a posse (para simular o que acontece entre a posse e o envio). */
+  /** Chamado logo depois de dar a posse (o que acontece entre a posse e a barreira). */
   afterClaim: ((row: TerminalChargeRow) => void | Promise<void>) | null = null;
+  /** Chamado logo depois da barreira passar (o que acontece entre a barreira e a chamada ao Mercado Pago). */
+  afterBegin: ((row: TerminalChargeRow, kind: 1 | 2) => void | Promise<void>) | null = null;
+  /** Quantas vezes cada método foi chamado. */
+  count: Partial<Record<StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel', number>> = {};
+  private failures: Partial<Record<StoreMethod, number>> = {};
+  /** Faz a próxima chamada (ou as próximas `times`) do método falhar, como uma queda do banco. */
+  failOnce(method: StoreMethod, times = 1) {
+    this.failures[method] = times;
+  }
+  private enter(method: StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel') {
+    this.count[method] = (this.count[method] ?? 0) + 1;
+    const left = this.failures[method as StoreMethod] ?? 0;
+    if (left > 0) {
+      this.failures[method as StoreMethod] = left - 1;
+      throw new Error(`banco fora do ar (${method})`);
+    }
+  }
+  private iso(ms = this.nowMs) {
+    return new Date(ms).toISOString();
+  }
   private add(row: NewChargeRow): TerminalChargeRow {
-    const r = { ...row, id: `row-${this.rows.length + 1}`, created_at: new Date(Date.now() - this.createdAgoMs).toISOString() };
+    const r = { ...row, id: `row-${this.rows.length + 1}`, created_at: this.iso(this.nowMs - this.createdAgoMs) };
     this.rows.push(r);
     return { ...r };
   }
   private get(id: string) {
     return this.rows.find((x) => x.id === id)!;
   }
+  private leased(r: TerminalChargeRow) {
+    return r.dispatch_lease_until !== null && Date.parse(r.dispatch_lease_until) > this.nowMs;
+  }
+  /** Gatilho tchefood_terminal_charge_guard: grava `next` por cima de `r` ou lança, como o banco. */
+  write(r: TerminalChargeRow, patch: Partial<TerminalChargeRow>) {
+    const next = { ...r, ...patch };
+    const raise = (m: string) => {
+      throw new Error(`TCHEFOOD_COBRANCA: ${m}`);
+    };
+    if (FINAL_STATES.has(r.status)) raise('a cobrança já terminou e não muda mais.');
+    if (next.created_at !== r.created_at) raise('a hora da cobrança não muda.');
+    if (r.dispatched_at !== null && next.dispatched_at !== r.dispatched_at) raise('a cobrança já foi mandada ao Mercado Pago.');
+    if (r.cancel_requested_at !== null) {
+      if (next.cancel_requested_at === null || next.cancel_reason === null) raise('o encerramento já foi registrado.');
+      const upgrade = r.cancel_reason === 'timeout' && next.cancel_reason === 'operator';
+      if (!upgrade && (next.cancel_requested_at !== r.cancel_requested_at || next.cancel_reason !== r.cancel_reason || next.cancel_requested_by !== r.cancel_requested_by
+        || next.cancel_authorized_by !== r.cancel_authorized_by || next.cancel_audit_id !== r.cancel_audit_id)) raise('o encerramento já foi registrado.');
+      if (r.dispatched_at === null && next.dispatched_at !== null) raise('foi encerrada antes de ir à maquininha.');
+      const grew = next.dispatch_lease_until !== null && (r.dispatch_lease_until === null || Date.parse(next.dispatch_lease_until) > Date.parse(r.dispatch_lease_until));
+      if (next.dispatch_attempts > r.dispatch_attempts || grew) raise('tem encerramento pedido e não é mais enviada.');
+    }
+    if (next.dispatch_attempts < r.dispatch_attempts) raise('a contagem de envios não volta.');
+    if (r.external_order_id !== null && next.external_order_id !== r.external_order_id) raise('já tem ordem no Mercado Pago.');
+    if (next.cancel_reason === 'operator' && (!next.cancel_authorized_by || !next.cancel_audit_id || !next.cancel_requested_by)) raise('encerramento pelo operador sem autorização de gerente.');
+    if (next.status === 'approved' && (!next.external_payment_id || !next.authorization_code || !next.card_brand || next.paid_amount_cents !== next.amount_cents)) raise('aprovação sem comprovante completo.');
+    Object.assign(r, patch);
+  }
   async findByKey(k: string) {
+    this.enter('findByKey');
     const r = this.rows.find((x) => x.idempotency_key === k);
     return r ? { ...r } : null;
   }
   async insert(row: NewChargeRow) {
-    const existing = await this.findByKey(row.idempotency_key);
-    if (existing) return existing;
+    this.enter('insert');
+    const existing = this.rows.find((x) => x.idempotency_key === row.idempotency_key);
+    if (existing) return { ...existing };
     if (this.refuse) throw this.refuse;
     return this.add(row);
   }
   async insertVoid(row: NewChargeRow) {
+    this.enter('insertVoid');
     if (row.cancel_requested_by !== STAFF) throw new ChargeRefusedError('invalid_staff', 'operador não é da equipe ativa desta loja.');
-    const existing = await this.findByKey(row.idempotency_key);
-    if (existing) return existing;
+    const existing = this.rows.find((x) => x.idempotency_key === row.idempotency_key);
+    if (existing) return { ...existing };
     this.audits.push({ key: row.idempotency_key, action: 'POINT_KEY_BLOCKED', performed_by: row.cancel_requested_by, reason: 'bloqueio' });
-    return this.add(row);
+    // Como a função do banco: a hora do bloqueio é a do banco, não a que o chamador mandou.
+    return this.add({ ...row, status: 'cancelled', raw_status: 'voided_before_send', cancel_reason: 'void', cancel_requested_at: this.iso() });
   }
   async update(row: TerminalChargeRow, patch: ChargePatch) {
+    this.enter('update');
     const r = this.get(row.id);
     if (r.status !== row.status || FINAL_STATES.has(r.status)) return { ...r };
-    Object.assign(r, patch);
+    this.write(r, patch);
     return { ...r };
   }
   async claimDispatch(row: TerminalChargeRow, leaseMs: number) {
+    this.enter('claimDispatch');
     const r = this.get(row.id);
-    const leased = r.dispatch_lease_until !== null && Date.parse(r.dispatch_lease_until) > this.nowMs;
-    if (r.status !== 'creating' || r.external_order_id || r.cancel_requested_at || leased) return null;
-    r.dispatched_at = r.dispatched_at ?? new Date(this.nowMs).toISOString();
-    r.dispatch_lease_until = new Date(this.nowMs + leaseMs).toISOString();
-    r.dispatch_attempts += 1;
-    const claimed = { ...r };
-    await this.afterClaim?.(claimed);
+    if (r.status !== 'creating' || r.external_order_id || r.cancel_requested_at || this.leased(r) || r.dispatch_attempts >= 8) return null;
+    this.write(r, { dispatch_lease_until: this.iso(this.nowMs + leaseMs), dispatch_attempts: r.dispatch_attempts + 1 });
+    const claimed = { ...row, dispatch_attempts: r.dispatch_attempts };
+    await this.afterClaim?.({ ...r });
     return claimed;
   }
-  async releaseDispatch(row: TerminalChargeRow) {
+  async beginDispatch(row: TerminalChargeRow, leaseMs: number): Promise<0 | 1 | 2> {
+    this.enter('beginDispatch');
     const r = this.get(row.id);
-    if (r.status === 'creating' && r.dispatch_attempts === row.dispatch_attempts) r.dispatch_lease_until = new Date(0).toISOString();
+    if (r.status !== 'creating' || r.external_order_id || r.cancel_requested_at || r.dispatch_attempts !== row.dispatch_attempts || !this.leased(r)) return 0;
+    const kind = r.dispatched_at === null ? 1 : 2;
+    this.write(r, { dispatched_at: r.dispatched_at ?? this.iso(), dispatch_lease_until: this.iso(this.nowMs + leaseMs) });
+    await this.afterBegin?.({ ...r }, kind);
+    return kind;
   }
-  async abandonDispatch(row: TerminalChargeRow) {
+  async attachOrder(row: TerminalChargeRow, externalOrderId: string) {
+    this.enter('attachOrder');
     const r = this.get(row.id);
-    if (row.dispatch_attempts === 1 && r.status === 'creating' && r.dispatch_attempts === 1 && !r.external_order_id) {
-      Object.assign(r, { status: 'cancelled', raw_status: 'voided_before_send' });
+    if (r.external_order_id === null && !FINAL_STATES.has(r.status)) this.write(r, { external_order_id: externalOrderId });
+    return { ...r };
+  }
+  async rejectFirstSend(row: TerminalChargeRow, code: string) {
+    this.enter('rejectFirstSend');
+    const r = this.get(row.id);
+    if (r.status === 'creating' && r.dispatch_attempts === row.dispatch_attempts && r.external_order_id === null) {
+      this.write(r, { status: 'rejected', raw_status: `create_failed:${code}`, raw_status_detail: null });
     }
     return { ...r };
   }
-  async voidUndispatched(row: TerminalChargeRow) {
+  async releaseDispatch(row: TerminalChargeRow) {
+    this.enter('releaseDispatch');
     const r = this.get(row.id);
-    if (r.status === 'creating' && !r.dispatched_at) Object.assign(r, { status: 'cancelled', raw_status: 'voided_before_send' });
+    if (r.status === 'creating' && r.dispatch_attempts === row.dispatch_attempts && r.external_order_id === null) this.write(r, { dispatch_lease_until: new Date(0).toISOString() });
+  }
+  async voidUndispatched(row: TerminalChargeRow) {
+    this.enter('voidUndispatched');
+    const r = this.get(row.id);
+    if (r.status === 'creating' && !r.dispatched_at) this.write(r, { status: 'cancelled', raw_status: 'voided_before_send' });
+    return { ...r };
+  }
+  async settleDispatch(row: TerminalChargeRow) {
+    this.enter('settleDispatch');
+    const r = this.get(row.id);
+    if (r.status === 'creating' && r.external_order_id === null && r.cancel_requested_at !== null && r.dispatched_at !== null && !this.leased(r)) {
+      this.write(r, { status: 'manual_review', raw_status: 'dispatch_unknown', raw_status_detail: 'DISPATCH_UNKNOWN' });
+    }
+    return { ...r };
+  }
+  async requestTimeoutCancel(row: TerminalChargeRow, waitMs: number) {
+    this.enter('requestTimeoutCancel');
+    if (waitMs < 60_000) throw new Error('TCHEFOOD_COBRANCA: prazo de espera inválido.');
+    const r = this.get(row.id);
+    if (FINAL_STATES.has(r.status) || r.cancel_requested_at !== null) return { ...r };
+    if (this.nowMs < Date.parse(r.created_at) + waitMs) return null;
+    this.write(r, { cancel_reason: 'timeout', cancel_requested_by: null, cancel_requested_at: this.iso() });
     return { ...r };
   }
   async listOpenForOrder(orderId: string) {
     return this.rows.filter((r) => r.order_id === orderId && !FINAL_STATES.has(r.status)).map((r) => ({ ...r }));
   }
   async authorizeCancel(input: { idempotency_key: string; performed_by: string; manager_pin: string; reason: string }) {
+    this.enter('authorizeCancel');
     const r = this.rows.find((x) => x.idempotency_key === input.idempotency_key)!;
     if (input.performed_by !== STAFF) throw new ChargeRefusedError('invalid_staff', 'operador não é da equipe ativa desta loja.');
     if (FINAL_STATES.has(r.status)) throw new ChargeRefusedError('not_applicable', 'a cobrança já terminou.');
@@ -114,7 +206,7 @@ class MemoryStore implements ChargeStore {
     }
     this.audits.push({ key: input.idempotency_key, action: 'POINT_CHARGE_CANCELED', performed_by: input.performed_by, reason: input.reason });
     const id = `audit-${this.audits.length}`;
-    Object.assign(r, { cancel_reason: 'operator', cancel_requested_by: input.performed_by, cancel_requested_at: new Date().toISOString(), cancel_authorized_by: 'manager', cancel_audit_id: id });
+    this.write(r, { cancel_reason: 'operator', cancel_requested_by: input.performed_by, cancel_requested_at: this.iso(), cancel_authorized_by: 'manager', cancel_audit_id: id });
     return id;
   }
 }
@@ -250,6 +342,11 @@ describe('point-charge: criação', () => {
     });
     expect((await startCharge(ctx, terminal, input())).status).toBe('PENDING');
     expect(store.rows[0]!.status).toBe('creating');
+    // Sem resposta do Mercado Pago: o pedido pode estar sendo processado lá. Ninguém manda outro por cima
+    // enquanto a posse do envio vale; vencida, a consulta repete com a MESMA chave.
+    expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+    expect(calls.create).toHaveLength(1);
+    store.nowMs += 31_000;
     expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
     expect(calls.create.map((c) => c.idempotencyKey)).toEqual([KEY, KEY]);
     expect(calls.create[0]).toEqual(calls.create[1]);
@@ -267,9 +364,14 @@ describe('point-charge: criação', () => {
     }
   });
 
-  it('conflito de chave no Mercado Pago não vira recusa: vai para revisão manual', async () => {
-    const { ctx } = setup({ create: async () => { throw new PaymentTerminalProviderError('idempotency_conflict', { httpStatus: 409 }); } });
-    expect((await startCharge(ctx, terminal, input())).status).toBe('MANUAL_REVIEW');
+  it('conflito de chave no Mercado Pago não vira recusa nem aprovação: resultado desconhecido, e o encerramento leva à revisão manual', async () => {
+    const { ctx, store, calls } = setup({ create: async () => { throw new PaymentTerminalProviderError('idempotency_conflict', { httpStatus: 409 }); } });
+    expect((await startCharge(ctx, terminal, input())).status).toBe('PENDING');
+    expect(store.rows[0]).toMatchObject({ status: 'creating', external_order_id: null });
+    expect(store.count.rejectFirstSend).toBeUndefined();
+    store.nowMs += 31_000;
+    expect(await cancelCharge(ctx, store.rows[0]!, CANCEL)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
+    expect(calls.create).toHaveLength(1);
   });
 });
 
@@ -481,12 +583,16 @@ describe('point-charge: encerrar tentativa (auditoria r1 P0-01 / r2 P1-01 e P1-0
     await expect(cancelCharge(ctx, store.rows[0]!, CANCEL)).rejects.toMatchObject({ code: 'too_early', httpStatus: 409 });
     expect(calls.cancel).toHaveLength(0);
     // r3 P1-01: o prazo do servidor é o mesmo do app (2 min). Aos 91 s ainda é cedo.
+    // O relógio é o do banco (store.nowMs), contra a hora gravada da cobrança.
     const created = Date.parse(store.rows[0]!.created_at);
-    await expect(cancelCharge(ctx, store.rows[0]!, CANCEL, created + 91_000)).rejects.toMatchObject({ code: 'too_early', httpStatus: 409 });
-    await expect(cancelCharge(ctx, store.rows[0]!, CANCEL, created + 119_999)).rejects.toMatchObject({ code: 'too_early' });
+    store.nowMs = created + 91_000;
+    await expect(cancelCharge(ctx, store.rows[0]!, CANCEL)).rejects.toMatchObject({ code: 'too_early', httpStatus: 409 });
+    store.nowMs = created + 119_999;
+    await expect(cancelCharge(ctx, store.rows[0]!, CANCEL)).rejects.toMatchObject({ code: 'too_early' });
     expect(store.rows[0]!.cancel_requested_at).toBeNull();
     expect(calls.cancel).toHaveLength(0);
-    await cancelCharge(ctx, store.rows[0]!, { ...CANCEL, staff_id: STAFF } as never, created + 120_000);
+    store.nowMs = created + 120_000;
+    await cancelCharge(ctx, store.rows[0]!, { ...CANCEL, staff_id: STAFF } as never);
     expect(store.rows[0]).toMatchObject({ cancel_reason: 'timeout', cancel_requested_by: null });
     expect(calls.cancel).toHaveLength(1);
   });
@@ -539,7 +645,8 @@ describe('point-charge: encerrar tentativa (auditoria r1 P0-01 / r2 P1-01 e P1-0
     const creating = startCharge(ctx, terminal, input());
     await new Promise((r) => setTimeout(r, 0));
     expect(calls.create).toHaveLength(1); // envio em andamento
-    expect((await cancelCharge(ctx, store.rows[0]!, CANCEL, store.nowMs + 1_000)).status).toBe('PENDING'); // sem ordem ainda: não manda outra, não desiste
+    store.nowMs += 1_000;
+    expect((await cancelCharge(ctx, store.rows[0]!, CANCEL)).status).toBe('PENDING'); // sem ordem ainda: não manda outra, não desiste
     expect(store.rows[0]).toMatchObject({ status: 'creating', cancel_reason: 'timeout' });
     release(order());
     // Quem tinha a posse grava a ordem e, vendo o encerramento pedido, cancela no Mercado Pago na mesma chamada.
@@ -619,15 +726,16 @@ describe('point-charge: auditoria r3', () => {
       const { ctx, store, calls } = setup({ create: async () => unknown() });
       await startCharge(ctx, terminal, input());
       expect(store.rows[0]).toMatchObject({ status: 'creating', external_order_id: null });
-      const dispatched = Date.parse(store.rows[0]!.dispatched_at!);
-      const reply = await cancelCharge(ctx, store.rows[0]!, OPERATOR, dispatched + 121_000);
+      store.nowMs += 121_000;
+      const reply = await cancelCharge(ctx, store.rows[0]!, OPERATOR);
       expect(reply).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
       expect((reply as { reason: string }).reason).toContain('pode ter sido paga');
       expect(store.rows[0]).toMatchObject({ status: 'manual_review', raw_status: 'dispatch_unknown', cancel_reason: 'operator' });
       // Não é estado final: segue na lista das que reservam o saldo da conta.
       expect((await store.listOpenForOrder(ORDER)).map((r) => r.idempotency_key)).toEqual([KEY]);
       // Repetir o pedido, consultar e tentar de novo com a mesma chave: continua revisão manual, nada é mandado.
-      expect((await cancelCharge(ctx, store.rows[0]!, OPERATOR, dispatched + 600_000)).status).toBe('MANUAL_REVIEW');
+      store.nowMs += 600_000;
+      expect((await cancelCharge(ctx, store.rows[0]!, OPERATOR)).status).toBe('MANUAL_REVIEW');
       expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('MANUAL_REVIEW');
       expect((await startCharge(ctx, terminal, input())).status).toBe('MANUAL_REVIEW');
       expect(calls.create).toHaveLength(1);
@@ -638,7 +746,8 @@ describe('point-charge: auditoria r3', () => {
     it('por prazo é igual: sem ordem conhecida vai para revisão manual, não para recusa', async () => {
       const { ctx, store } = setup({ create: async () => unknown() });
       await startCharge(ctx, terminal, input());
-      const reply = await cancelCharge(ctx, store.rows[0]!, CANCEL, store.nowMs + 121_000);
+      store.nowMs += 121_000;
+      const reply = await cancelCharge(ctx, store.rows[0]!, CANCEL);
       expect(reply).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
       expect(store.rows[0]!.status).toBe('manual_review');
     });
@@ -649,7 +758,9 @@ describe('point-charge: auditoria r3', () => {
       const creating = startCharge(ctx, terminal, input());
       await new Promise((r) => setTimeout(r, 0));
       // A posse venceu sem resposta e o gerente pediu o encerramento: revisão manual.
-      expect((await cancelCharge(ctx, store.rows[0]!, OPERATOR, store.nowMs + 121_000)).status).toBe('MANUAL_REVIEW');
+      store.nowMs += 121_000;
+      expect(await cancelCharge(ctx, store.rows[0]!, OPERATOR)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
+      expect(store.rows[0]).toMatchObject({ status: 'manual_review', external_order_id: null });
       release(approvedOrder());
       expect((await creating).status).toBe('APPROVED');
       expect(store.rows[0]).toMatchObject({ status: 'approved', external_payment_id: '123456789', authorization_code: 'A1B2C3' });
@@ -718,9 +829,9 @@ describe('point-charge: auditoria r3', () => {
       expect(store.rows[0]).toMatchObject({ status: 'at_terminal', external_order_id: 'ORD01', dispatch_attempts: 2 });
     });
 
-    it('resultado desconhecido devolve a posse: a consulta seguinte já pode repetir', async () => {
+    it('o Mercado Pago respondeu sem resultado (5xx): devolve a posse e a consulta seguinte já pode repetir', async () => {
       let n = 0;
-      const { ctx, store, calls } = setup({ create: async () => { n += 1; if (n === 1) unknown(); return order(); } });
+      const { ctx, store, calls } = setup({ create: async () => { n += 1; if (n === 1) throw new PaymentTerminalProviderError('unavailable', { httpStatus: 502, outcomeUnknown: true }); return order(); } });
       await startCharge(ctx, terminal, input());
       expect(store.rows[0]).toMatchObject({ status: 'creating', dispatch_attempts: 1 });
       expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
@@ -728,7 +839,7 @@ describe('point-charge: auditoria r3', () => {
       expect(store.rows[0]!.external_order_id).toBe('ORD01');
     });
 
-    it('conflito de chave na repetição e depois a resposta válida da primeira: termina aprovada, não em revisão manual', async () => {
+    it('conflito de chave na repetição e depois a resposta válida da primeira: segue aguardando e termina aprovada, não em revisão manual', async () => {
       let release: (o: PaymentTerminalChargeResult) => void = () => undefined;
       let n = 0;
       const { ctx, store } = setup({
@@ -741,8 +852,8 @@ describe('point-charge: auditoria r3', () => {
       const first = startCharge(ctx, terminal, input());
       await new Promise((r) => setTimeout(r, 0));
       store.nowMs += 31_000; // a posse da primeira venceu com ela ainda pendurada
-      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('MANUAL_REVIEW');
-      expect(store.rows[0]).toMatchObject({ status: 'manual_review', raw_status: 'create_conflict' });
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+      expect(store.rows[0]).toMatchObject({ status: 'creating', dispatch_attempts: 2, external_order_id: null });
       release(approvedOrder());
       expect((await first).status).toBe('APPROVED');
       expect(store.rows[0]).toMatchObject({ status: 'approved', external_order_id: 'ORD01' });
@@ -754,9 +865,10 @@ describe('point-charge: auditoria r3', () => {
       const { ctx, store, calls } = setup();
       store.afterClaim = (claimed) => {
         // Outra requisição registra o encerramento (por prazo) neste intervalo.
-        Object.assign(store.rows.find((r) => r.id === claimed.id)!, { cancel_reason: 'timeout', cancel_requested_at: new Date().toISOString() });
+        store.write(store.rows.find((r) => r.id === claimed.id)!, { cancel_reason: 'timeout', cancel_requested_at: new Date(store.nowMs).toISOString() });
       };
       const reply = await startCharge(ctx, terminal, input());
+      expect(store.count.beginDispatch).toBe(1); // a barreira foi consultada e barrou
       expect(calls.create).toHaveLength(0);
       expect(reply).toMatchObject({ status: 'DECLINED', reason: 'A cobrança não chegou à maquininha (nada foi cobrado).' });
       expect(store.rows[0]).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send', external_order_id: null });
@@ -771,8 +883,10 @@ describe('point-charge: auditoria r3', () => {
         await during;
       };
       const reply = await startCharge(ctx, terminal, input());
-      // O encerramento viu o envio em andamento e esperou; quem tinha a posse não mandou nada.
-      expect(await during).toMatchObject({ status: 'PENDING' });
+      // Havia posse dada, mas nenhum envio tinha passado da barreira: o encerramento encerra com prova, e
+      // quem tinha a posse é barrado e não manda nada.
+      expect(await during).toMatchObject({ status: 'DECLINED', reason: 'A cobrança não chegou à maquininha (nada foi cobrado).' });
+      expect(store.rows[0]!.dispatched_at).toBeNull();
       expect(calls.create).toHaveLength(0);
       expect(calls.cancel).toHaveLength(0);
       expect(reply.status).toBe('DECLINED');
@@ -785,24 +899,26 @@ describe('point-charge: auditoria r3', () => {
       await new Promise((r) => setTimeout(r, 0));
       store.nowMs += 31_000;
       store.afterClaim = (claimed) => {
-        Object.assign(store.rows.find((r) => r.id === claimed.id)!, { cancel_reason: 'timeout', cancel_requested_at: new Date().toISOString() });
+        store.write(store.rows.find((r) => r.id === claimed.id)!, { cancel_reason: 'timeout', cancel_requested_at: new Date(store.nowMs).toISOString() });
       };
       expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
       expect(calls.create).toHaveLength(1);
       expect(store.rows[0]).toMatchObject({ status: 'creating', dispatch_attempts: 2 });
       store.afterClaim = null;
       // Encerramento com a segunda posse vencida: revisão manual, nunca recusa.
-      expect((await cancelCharge(ctx, store.rows[0]!, CANCEL, store.nowMs + 31_000)).status).toBe('MANUAL_REVIEW');
+      store.nowMs += 31_000;
+      expect(await cancelCharge(ctx, store.rows[0]!, CANCEL)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
       expect(calls.create).toHaveLength(1);
     });
 
     it('depois do pedido de encerramento ninguém ganha a posse', async () => {
       const { ctx, store, calls } = setup({ create: async () => unknown() });
       await startCharge(ctx, terminal, input());
-      await cancelCharge(ctx, store.rows[0]!, CANCEL, store.nowMs);
+      expect((await cancelCharge(ctx, store.rows[0]!, CANCEL)).status).toBe('PENDING'); // a posse do envio ainda vale
       store.nowMs += 600_000;
       expect(await store.claimDispatch(store.rows[0]!, 30_000)).toBeNull();
-      await pollCharge(ctx, store.rows[0]!);
+      expect(await store.beginDispatch(store.rows[0]!, 30_000)).toBe(0);
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('MANUAL_REVIEW');
       expect(calls.create).toHaveLength(1);
     });
   });
@@ -827,6 +943,447 @@ describe('point-charge: auditoria r3', () => {
       expect((await cancelCharge(ctx, stale, OPERATOR)).status).toBe('APPROVED');
       expect(store.audits).toHaveLength(0);
       expect(store.rows[0]).toMatchObject({ status: 'approved', cancel_reason: null });
+    });
+  });
+});
+
+describe('point-charge: auditoria r3, segunda revisão', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const hang = <T,>() => new Promise<T>(() => undefined);
+  /** Sem resposta: queda ou prazo estourado (o pedido pode estar sendo processado no Mercado Pago). */
+  const netDown = () => new PaymentTerminalProviderError('timeout', { outcomeUnknown: true });
+  /** O Mercado Pago respondeu, sem resultado. */
+  const http5xx = () => new PaymentTerminalProviderError('unavailable', { httpStatus: 502, outcomeUnknown: true });
+  const busy = () => new PaymentTerminalProviderError('terminal_busy', { httpStatus: 409 });
+
+  describe('A. encerramento gravado entre a posse e a barreira', () => {
+    it.each([['por prazo', CANCEL], ['pelo gerente', OPERATOR]])('%s: nenhuma chamada de criação; a cobrança encerra como nunca enviada', async (_n, body) => {
+      const { ctx, store, calls } = setup();
+      let during: unknown;
+      store.afterClaim = async (claimed) => {
+        store.afterClaim = null;
+        during = await cancelCharge(ctx, claimed, body);
+      };
+      const reply = await startCharge(ctx, terminal, input());
+      expect(during).toMatchObject({ status: 'DECLINED', reason: 'A cobrança não chegou à maquininha (nada foi cobrado).' });
+      expect(reply).toMatchObject({ status: 'DECLINED', reason: 'A cobrança não chegou à maquininha (nada foi cobrado).' });
+      expect(store.count.beginDispatch).toBe(1);
+      expect(calls.create).toHaveLength(0);
+      expect(calls.cancel).toHaveLength(0);
+      expect(store.rows[0]).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send', dispatched_at: null, external_order_id: null });
+    });
+
+    it('a barreira é a última coisa antes da chamada: nenhuma leitura ou gravação no banco entre ela e o HTTP', async () => {
+      const { ctx, store, calls } = setup({
+        create: async () => {
+          seenAtCreate = { ...store.count };
+          return order();
+        },
+      });
+      let seenAtBegin: typeof store.count = {};
+      let seenAtCreate: typeof store.count = {};
+      store.afterBegin = () => { seenAtBegin = { ...store.count }; };
+      await startCharge(ctx, terminal, input());
+      expect(calls.create).toHaveLength(1);
+      expect(seenAtCreate).toEqual(seenAtBegin);
+    });
+  });
+
+  describe('B. encerramento gravado depois da barreira, com a ordem a caminho', () => {
+    it('a ordem que chega é ligada à cobrança, cancelada no Mercado Pago e o resultado vem da reconsulta', async () => {
+      let cancelled = false;
+      const { ctx, store, calls } = setup({
+        get: async () => (cancelled ? order({ status: 'cancelled', rawStatus: 'canceled' }) : order()),
+        cancel: async () => { cancelled = true; },
+      });
+      let during: unknown;
+      store.afterBegin = async (row) => {
+        store.afterBegin = null;
+        during = await cancelCharge(ctx, row, CANCEL);
+      };
+      const reply = await startCharge(ctx, terminal, input());
+      expect(during).toMatchObject({ status: 'PENDING' }); // envio em andamento: o encerramento só espera
+      expect(calls.create).toHaveLength(1);
+      expect(calls.cancel).toEqual([{ id: 'ORD01', key: `${KEY}-cancel` }]);
+      expect(calls.get).toEqual(['ORD01']);
+      expect(reply.status).toBe('DECLINED');
+      expect(store.rows[0]).toMatchObject({ status: 'cancelled', external_order_id: 'ORD01', cancel_reason: 'timeout' });
+    });
+
+    it('se o Mercado Pago diz que foi paga, fica aprovada (o encerramento não desfaz pagamento)', async () => {
+      const { ctx, store, calls } = setup({
+        get: async () => approvedOrder(),
+        cancel: async () => { throw new PaymentTerminalProviderError('not_cancellable', { httpStatus: 409 }); },
+      });
+      store.afterBegin = async (row) => {
+        store.afterBegin = null;
+        await cancelCharge(ctx, row, OPERATOR);
+      };
+      const reply = await startCharge(ctx, terminal, input());
+      expect(calls.cancel).toHaveLength(1);
+      expect(reply).toMatchObject({ status: 'APPROVED', nsu: '123456789' });
+      expect(store.rows[0]).toMatchObject({ status: 'approved', external_order_id: 'ORD01', cancel_reason: 'operator' });
+    });
+  });
+
+  describe('C. envio em andamento sem resposta e encerramento pedido', () => {
+    it.each([['por prazo', CANCEL, 'timeout'], ['pelo gerente (PIN certo)', OPERATOR, 'operator']])(
+      '%s: espera enquanto a posse vale; vencida, revisão manual (nunca recusa); a resposta atrasada ainda aprova',
+      async (_n, body, reason) => {
+        let release: (o: PaymentTerminalChargeResult) => void = () => undefined;
+        const { ctx, store, calls } = setup({ create: () => new Promise((resolve) => { release = resolve; }) });
+        const creating = startCharge(ctx, terminal, input());
+        await tick();
+        expect(calls.create).toHaveLength(1);
+        store.nowMs += 29_000;
+        expect((await cancelCharge(ctx, store.rows[0]!, body)).status).toBe('PENDING');
+        expect(store.rows[0]).toMatchObject({ status: 'creating', cancel_reason: reason });
+        expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+        store.nowMs += 2_000; // 31 s depois da barreira: posse vencida pelo relógio do banco
+        const settled = await cancelCharge(ctx, store.rows[0]!, body);
+        expect(settled).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
+        expect(store.rows[0]).toMatchObject({ status: 'manual_review', raw_status_detail: 'DISPATCH_UNKNOWN', external_order_id: null });
+        // Não é final: segue reservando o saldo da conta. E nada mais é mandado.
+        expect((await store.listOpenForOrder(ORDER)).map((r) => r.idempotency_key)).toEqual([KEY]);
+        expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('MANUAL_REVIEW');
+        expect(calls.create).toHaveLength(1);
+        // A resposta válida do primeiro envio chega depois: a ordem é ligada à cobrança em revisão manual.
+        release(approvedOrder());
+        expect((await creating).status).toBe('APPROVED');
+        expect(store.rows[0]).toMatchObject({ status: 'approved', external_order_id: 'ORD01', external_payment_id: '123456789', cancel_reason: reason });
+        expect(store.count.attachOrder).toBe(1);
+      },
+    );
+
+    it('resposta atrasada ainda "na maquininha": a ordem é ligada e cancelada no Mercado Pago, sem ficar esperando cartão', async () => {
+      let release: (o: PaymentTerminalChargeResult) => void = () => undefined;
+      let cancelled = false;
+      const { ctx, store, calls } = setup({
+        create: () => new Promise((resolve) => { release = resolve; }),
+        get: async () => (cancelled ? order({ status: 'cancelled', rawStatus: 'canceled' }) : order()),
+        cancel: async () => { cancelled = true; },
+      });
+      const creating = startCharge(ctx, terminal, input());
+      await tick();
+      store.nowMs += 31_000;
+      expect((await cancelCharge(ctx, store.rows[0]!, CANCEL)).status).toBe('MANUAL_REVIEW');
+      release(order());
+      expect((await creating).status).toBe('DECLINED');
+      expect(calls.cancel).toEqual([{ id: 'ORD01', key: `${KEY}-cancel` }]);
+      expect(store.rows[0]).toMatchObject({ status: 'cancelled', external_order_id: 'ORD01' });
+    });
+
+    it('consulta de status (sem novo pedido de encerramento) também leva à revisão manual, sem criar nada', async () => {
+      const { ctx, store, calls } = setup({ create: async () => { throw netDown(); } });
+      await startCharge(ctx, terminal, input());
+      expect((await cancelCharge(ctx, store.rows[0]!, CANCEL)).status).toBe('PENDING');
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+      store.nowMs += 31_000;
+      expect(await pollCharge(ctx, store.rows[0]!)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
+      expect(calls.create).toHaveLength(1);
+      expect(store.count.claimDispatch).toBe(1); // depois do pedido de encerramento nem se pede a posse
+    });
+  });
+
+  describe('D. consultas simultâneas e repetição', () => {
+    it('duas consultas ao mesmo tempo: exatamente uma criação; a outra só acompanha', async () => {
+      let n = 0;
+      const { ctx, store, calls } = setup({ create: async () => { n += 1; if (n === 1) throw http5xx(); await tick(); return order(); } });
+      await startCharge(ctx, terminal, input()); // respondeu 5xx: posse devolvida
+      const stale = { ...store.rows[0]! };
+      const replies = await Promise.all([pollCharge(ctx, { ...stale }), pollCharge(ctx, { ...stale }), startCharge(ctx, terminal, input())]);
+      expect(calls.create).toHaveLength(2);
+      expect(replies.map((r) => r.status)).toEqual(['PENDING', 'PENDING', 'PENDING']);
+      expect(store.rows[0]).toMatchObject({ status: 'at_terminal', external_order_id: 'ORD01', dispatch_attempts: 2 });
+    });
+
+    it('a repetição passa pela barreira como repetição (2) e manda o MESMO pedido com a MESMA chave', async () => {
+      let n = 0;
+      const kinds: number[] = [];
+      const { ctx, store, calls } = setup({ create: () => { n += 1; return n === 1 ? hang() : Promise.resolve(order()); } });
+      store.afterBegin = (_r, kind) => { kinds.push(kind); };
+      void startCharge(ctx, terminal, input());
+      await tick();
+      const firstDispatch = store.rows[0]!.dispatched_at;
+      store.nowMs += 31_000;
+      await pollCharge(ctx, store.rows[0]!);
+      expect(kinds).toEqual([1, 2]);
+      expect(calls.create[1]).toEqual(calls.create[0]);
+      expect(store.rows[0]!.dispatched_at).toBe(firstDispatch); // a hora do primeiro envio não muda
+    });
+
+    it('recusa "definitiva" na repetição: não vira recusa, não devolve a posse, e a consulta seguinte não manda nada', async () => {
+      let n = 0;
+      const { ctx, store, calls } = setup({ create: async () => { n += 1; if (n === 1) throw netDown(); throw busy(); } });
+      await startCharge(ctx, terminal, input());
+      store.nowMs += 31_000;
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+      expect(calls.create).toHaveLength(2);
+      expect(store.rows[0]).toMatchObject({ status: 'creating', dispatch_attempts: 2, raw_status: null });
+      expect(store.count.rejectFirstSend).toBeUndefined();
+      expect(store.count.releaseDispatch).toBeUndefined();
+      store.nowMs += 2_000;
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+      expect(calls.create).toHaveLength(2); // posse da repetição ainda em vigor: nenhum POST a cada consulta
+      store.nowMs += 29_000;
+      await pollCharge(ctx, store.rows[0]!);
+      expect(calls.create).toHaveLength(3);
+    });
+
+    it('recusa definitiva no PRIMEIRO envio: recusada com o motivo, sem nova tentativa', async () => {
+      const { ctx, store, calls } = setup({ create: async () => { throw busy(); } });
+      const reply = await startCharge(ctx, terminal, input());
+      expect(reply.status).toBe('DECLINED');
+      expect(store.rows[0]).toMatchObject({ status: 'rejected', raw_status: 'create_failed:terminal_busy', dispatch_attempts: 1 });
+      store.nowMs += 600_000;
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('DECLINED');
+      expect(calls.create).toHaveLength(1);
+    });
+
+    it('recusa definitiva do primeiro envio que perdeu a posse no meio não grava recusa', async () => {
+      // A chamada demorou mais que a posse e outra consulta já repetiu: a recusa deste pedido não prova mais nada.
+      let fail: (e: unknown) => void = () => undefined;
+      let n = 0;
+      const { ctx, store } = setup({ create: () => { n += 1; return n === 1 ? new Promise((_r, reject) => { fail = reject; }) : hang(); } });
+      const first = startCharge(ctx, terminal, input());
+      await tick();
+      store.nowMs += 31_000;
+      void pollCharge(ctx, store.rows[0]!); // repetição em andamento (posse 2)
+      await tick();
+      fail(busy());
+      expect((await first).status).toBe('PENDING');
+      expect(store.rows[0]).toMatchObject({ status: 'creating', dispatch_attempts: 2 });
+    });
+  });
+
+  describe('E. resultado desconhecido', () => {
+    it('sem resposta (queda/prazo): a posse fica; nenhuma chamada até ela vencer', async () => {
+      const { ctx, store, calls } = setup({ create: async () => { throw netDown(); } });
+      await startCharge(ctx, terminal, input());
+      expect(store.count.releaseDispatch).toBeUndefined();
+      for (const step of [1_000, 10_000, 18_000]) {
+        store.nowMs += step;
+        expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+        expect(calls.create).toHaveLength(1);
+      }
+      store.nowMs += 2_000; // 31 s
+      await pollCharge(ctx, store.rows[0]!);
+      expect(calls.create.map((c) => c.idempotencyKey)).toEqual([KEY, KEY]);
+    });
+
+    it('5xx (o Mercado Pago respondeu): a posse é devolvida e a consulta seguinte repete com a mesma chave', async () => {
+      const { ctx, store, calls } = setup({ create: async () => { throw http5xx(); } });
+      await startCharge(ctx, terminal, input());
+      expect(store.count.releaseDispatch).toBe(1);
+      expect(store.rows[0]).toMatchObject({ status: 'creating', dispatch_attempts: 1 });
+      await pollCharge(ctx, store.rows[0]!);
+      expect(calls.create.map((c) => c.idempotencyKey)).toEqual([KEY, KEY]);
+      expect(calls.create[1]).toEqual(calls.create[0]);
+    });
+
+    it('conflito de idempotência: segue "creating", sem revisão manual, sem recusa e sem devolver a posse', async () => {
+      const { ctx, store, calls } = setup({ create: async () => { throw new PaymentTerminalProviderError('idempotency_conflict', { httpStatus: 409 }); } });
+      expect((await startCharge(ctx, terminal, input())).status).toBe('PENDING');
+      expect(store.rows[0]).toMatchObject({ status: 'creating', raw_status: null, raw_status_detail: null });
+      expect(store.count.releaseDispatch).toBeUndefined();
+      expect(store.count.rejectFirstSend).toBeUndefined();
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+      expect(calls.create).toHaveLength(1);
+    });
+
+    it('erro que não é do provedor (exceção qualquer) também não vira recusa nem devolve a posse', async () => {
+      const { ctx, store, calls } = setup({ create: async () => { throw new TypeError('fetch failed'); } });
+      expect((await startCharge(ctx, terminal, input())).status).toBe('PENDING');
+      expect(store.rows[0]!.status).toBe('creating');
+      expect(store.count.releaseDispatch).toBeUndefined();
+      await pollCharge(ctx, store.rows[0]!);
+      expect(calls.create).toHaveLength(1);
+    });
+  });
+
+  describe('F. limite de envios', () => {
+    it('depois de 8 posses nada mais é mandado; o encerramento por prazo leva à revisão manual', async () => {
+      const { ctx, store, calls } = setup({ create: async () => { throw netDown(); } });
+      await startCharge(ctx, terminal, input());
+      for (let i = 0; i < 12; i += 1) {
+        store.nowMs += 31_000;
+        expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+      }
+      expect(calls.create).toHaveLength(8);
+      expect(new Set(calls.create.map((c) => c.idempotencyKey))).toEqual(new Set([KEY]));
+      expect(store.rows[0]).toMatchObject({ status: 'creating', dispatch_attempts: 8 });
+      store.nowMs += 31_000;
+      expect(await cancelCharge(ctx, store.rows[0]!, CANCEL)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
+      expect(calls.create).toHaveLength(8);
+    });
+  });
+
+  describe('G. falha do banco depois da resposta do Mercado Pago', () => {
+    it('ligar a ordem falha uma vez: tenta de novo e a ordem não se perde', async () => {
+      const { ctx, store, calls } = setup();
+      store.failOnce('attachOrder');
+      expect((await startCharge(ctx, terminal, input())).status).toBe('PENDING');
+      expect(store.count.attachOrder).toBe(2);
+      expect(store.rows[0]).toMatchObject({ status: 'at_terminal', external_order_id: 'ORD01' });
+      expect(calls.create).toHaveLength(1);
+    });
+
+    it('ligar a ordem falha duas vezes: erro interno, a posse fica e a repetição com a mesma chave recupera a ordem', async () => {
+      const { ctx, store, calls } = setup();
+      store.failOnce('attachOrder', 2);
+      await expect(startCharge(ctx, terminal, input())).rejects.toThrow('banco fora do ar');
+      expect(store.rows[0]).toMatchObject({ status: 'creating', external_order_id: null, dispatch_attempts: 1 });
+      // A ordem ficou viva na maquininha sem registro: o cancelamento foi pedido ao Mercado Pago.
+      expect(calls.cancel).toEqual([{ id: 'ORD01', key: `${KEY}-cancel` }]);
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+      expect(calls.create).toHaveLength(1); // posse em vigor
+      store.nowMs += 31_000;
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('PENDING');
+      expect(calls.create.map((c) => c.idempotencyKey)).toEqual([KEY, KEY]);
+      expect(store.rows[0]).toMatchObject({ status: 'at_terminal', external_order_id: 'ORD01' });
+    });
+
+    it('a barreira falha (banco fora): nenhuma chamada ao Mercado Pago', async () => {
+      const { ctx, store, calls } = setup();
+      store.failOnce('beginDispatch');
+      await expect(startCharge(ctx, terminal, input())).rejects.toThrow('banco fora do ar');
+      expect(calls.create).toHaveLength(0);
+      expect(store.rows[0]).toMatchObject({ status: 'creating', dispatched_at: null });
+    });
+
+    it('a ordem já ligada não é trocada por outra: ID diferente vira revisão manual', async () => {
+      let n = 0;
+      let release: (o: PaymentTerminalChargeResult) => void = () => undefined;
+      const { ctx, store } = setup({ create: () => { n += 1; return n === 1 ? new Promise((resolve) => { release = resolve; }) : Promise.resolve(order({ externalOrderId: 'ORD02' })); } });
+      const first = startCharge(ctx, terminal, input());
+      await tick();
+      store.nowMs += 31_000;
+      await pollCharge(ctx, store.rows[0]!); // a repetição ligou ORD02
+      expect(store.rows[0]!.external_order_id).toBe('ORD02');
+      release(order());
+      expect((await first).status).toBe('MANUAL_REVIEW');
+      expect(store.rows[0]).toMatchObject({ status: 'manual_review', external_order_id: 'ORD02', raw_status_detail: 'ORDER_ID_CHANGED' });
+    });
+  });
+
+  describe('H. encerramento por prazo pelo relógio do banco', () => {
+    it('cedo demais (409) até 120 s da hora gravada; nada é gravado nem pedido ao Mercado Pago', async () => {
+      const { ctx, store, calls } = setup();
+      store.createdAgoMs = 0;
+      await startCharge(ctx, terminal, input());
+      for (const at of [0, 60_000, 119_999]) {
+        store.nowMs = Date.parse(store.rows[0]!.created_at) + at;
+        await expect(cancelCharge(ctx, store.rows[0]!, CANCEL)).rejects.toMatchObject({ code: 'too_early', httpStatus: 409 });
+      }
+      expect(store.rows[0]).toMatchObject({ cancel_requested_at: null, cancel_reason: null });
+      expect(calls.cancel).toHaveLength(0);
+      store.nowMs += 1;
+      expect((await cancelCharge(ctx, store.rows[0]!, CANCEL)).status).toBe('PENDING');
+      expect(store.rows[0]!.cancel_requested_at).toBe(new Date(store.nowMs).toISOString());
+    });
+
+    it('dois encerramentos por prazo ao mesmo tempo: os dois respondem, um pedido só fica gravado', async () => {
+      let cancelled = false;
+      const { ctx, store, calls } = setup({
+        get: async () => (cancelled ? order({ status: 'cancelled', rawStatus: 'canceled' }) : order()),
+        cancel: async () => { await tick(); cancelled = true; },
+      });
+      await startCharge(ctx, terminal, input());
+      const stale = { ...store.rows[0]! };
+      const replies = await Promise.all([cancelCharge(ctx, { ...stale }, CANCEL), cancelCharge(ctx, { ...stale }, CANCEL)]);
+      expect(replies.map((r) => r.status)).toEqual(['DECLINED', 'DECLINED']);
+      expect(store.rows[0]).toMatchObject({ status: 'cancelled', cancel_reason: 'timeout' });
+      expect(calls.create).toHaveLength(1);
+    });
+
+    it('dois encerramentos ao mesmo tempo com o envio em andamento: os dois esperam, sem erro e sem criar', async () => {
+      const { ctx, store, calls } = setup({ create: () => hang() });
+      void startCharge(ctx, terminal, input());
+      await tick();
+      const stale = { ...store.rows[0]! };
+      const replies = await Promise.all([cancelCharge(ctx, { ...stale }, CANCEL), cancelCharge(ctx, { ...stale }, OPERATOR), cancelCharge(ctx, { ...stale }, CANCEL)]);
+      expect(replies.map((r) => r.status)).toEqual(['PENDING', 'PENDING', 'PENDING']);
+      expect(calls.create).toHaveLength(1);
+      expect(store.rows[0]).toMatchObject({ status: 'creating', cancel_reason: 'operator' });
+    });
+
+    it('encerrar nunca manda criação, em nenhum estado sem ordem', async () => {
+      const { ctx, store, calls } = setup({ create: async () => { throw http5xx(); } });
+      await startCharge(ctx, terminal, input()); // posse devolvida: uma consulta repetiria
+      store.nowMs += 600_000;
+      expect((await cancelCharge(ctx, store.rows[0]!, CANCEL)).status).toBe('MANUAL_REVIEW');
+      await cancelCharge(ctx, store.rows[0]!, OPERATOR);
+      await voidCharge(ctx, terminal, { ...input(), ...CANCEL });
+      expect(calls.create).toHaveLength(1);
+    });
+  });
+
+  describe('I. bloqueio preventivo: quem responde por ele', () => {
+    it('sem operador: 403 e a função do bloqueio nem é chamada', async () => {
+      const { ctx, store } = setup();
+      for (const staff of [undefined, null]) {
+        await expect(voidCharge(ctx, terminal, { ...input({ staff_id: staff }), ...CANCEL })).rejects.toMatchObject({ code: 'invalid_staff', httpStatus: 403 });
+      }
+      expect(store.count.insertVoid).toBeUndefined();
+      expect(store.rows).toHaveLength(0);
+      expect(store.audits).toHaveLength(0);
+    });
+
+    it('pedido "pelo operador" sem cobrança gravada: 404 e a função do bloqueio não é chamada', async () => {
+      const { ctx, store } = setup();
+      await expect(voidCharge(ctx, terminal, { ...input(), ...OPERATOR })).rejects.toMatchObject({ code: 'not_found', httpStatus: 404 });
+      expect(store.count.insertVoid).toBeUndefined();
+      expect(store.count.authorizeCancel).toBeUndefined();
+      expect(store.rows).toHaveLength(0);
+    });
+
+    it('com operador da loja: a função é chamada uma vez e grava o bloqueio com a hora do banco', async () => {
+      const { ctx, store } = setup();
+      await voidCharge(ctx, terminal, { ...input(), ...CANCEL });
+      expect(store.count.insertVoid).toBe(1);
+      expect(store.rows[0]).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send', cancel_reason: 'void', cancel_requested_at: new Date(store.nowMs).toISOString() });
+    });
+  });
+
+  describe('J. cobrança que terminou sem a ordem que chegou depois', () => {
+    it('a ordem atrasada é cancelada no Mercado Pago (não fica esperando cartão) e a cobrança não muda', async () => {
+      const { ctx, store, calls } = setup();
+      store.afterBegin = (row) => {
+        // Estado que as regras não deixam acontecer; se acontecer, a ordem não pode ficar solta na maquininha.
+        Object.assign(store.rows.find((r) => r.id === row.id)!, { status: 'cancelled', raw_status: 'voided_before_send' });
+      };
+      const reply = await startCharge(ctx, terminal, input());
+      expect(reply.status).toBe('DECLINED');
+      expect(calls.cancel).toEqual([{ id: 'ORD01', key: `${KEY}-cancel` }]);
+      expect(store.rows[0]).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send', external_order_id: null });
+      expect(calls.get).toHaveLength(0);
+    });
+
+    it('cobrança já aprovada com a mesma ordem: nada é cancelado', async () => {
+      const { ctx, store, calls } = setup({ create: async () => approvedOrder() });
+      store.afterBegin = (row) => {
+        Object.assign(store.rows.find((r) => r.id === row.id)!, { status: 'approved', external_order_id: 'ORD01', external_payment_id: '123456789', authorization_code: 'A1B2C3', card_brand: 'MASTERCARD', paid_amount_cents: 2450 });
+      };
+      expect((await startCharge(ctx, terminal, input())).status).toBe('APPROVED');
+      expect(calls.cancel).toHaveLength(0);
+    });
+  });
+
+  describe('o banco de mentira segue as regras do gatilho', () => {
+    it('recusa mudar cobrança final, trocar a ordem, apagar o encerramento e mandar depois dele', async () => {
+      const { ctx, store } = setup();
+      await startCharge(ctx, terminal, input());
+      const r = store.rows[0]!;
+      expect(() => store.write(r, { external_order_id: 'ORD02' })).toThrow('já tem ordem');
+      expect(() => store.write(r, { created_at: new Date(0).toISOString() })).toThrow('hora da cobrança');
+      expect(() => store.write(r, { dispatch_attempts: 0 })).toThrow('não volta');
+      await cancelCharge(ctx, r, CANCEL);
+      expect(() => store.write(r, { cancel_requested_at: null })).toThrow('já foi registrado');
+      expect(() => store.write(r, { cancel_reason: 'void' })).toThrow('já foi registrado');
+      expect(() => store.write(r, { dispatch_attempts: r.dispatch_attempts + 1 })).toThrow('não é mais enviada');
+      expect(() => store.write(r, { dispatch_lease_until: new Date(store.nowMs + 600_000).toISOString() })).toThrow('não é mais enviada');
+      Object.assign(r, { status: 'cancelled' });
+      expect(() => store.write(r, { raw_status: 'x' })).toThrow('não muda mais');
     });
   });
 });

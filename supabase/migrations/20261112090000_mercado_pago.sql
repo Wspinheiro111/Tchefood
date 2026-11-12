@@ -24,8 +24,11 @@
 --  5. Cobrança em estado final não muda mais (resposta atrasada não rebaixa
 --     aprovado) e aprovado exige comprovante completo.
 --  7. Um pedido por vez fala com o Mercado Pago (posse do envio com prazo,
---     tchefood_claim_point_dispatch); depois do pedido de encerramento ninguém
---     ganha a posse.
+--     tchefood_claim_point_dispatch, e barreira imediatamente antes da chamada,
+--     tchefood_begin_point_dispatch); depois do pedido de encerramento ninguém
+--     ganha a posse nem passa da barreira.
+--  9. Envio sem resposta nunca vira recusa por tempo nem por PIN: vai para
+--     revisão manual (tchefood_settle_point_dispatch) e segue reservando o saldo.
 --  8. Chave nunca gravada só é bloqueada por operador ativo da loja, com
 --     registro (tchefood_block_point_key). Não é cancelamento.
 -- =============================================================================
@@ -71,10 +74,11 @@ CREATE TABLE IF NOT EXISTS terminal_charges (
     authorization_code VARCHAR(50),
     last_four VARCHAR(4),
     created_by UUID REFERENCES staff_users(id),
-    -- Hora em que a ordem foi mandada ao Mercado Pago pela primeira vez. NULL = nunca saiu daqui.
+    -- Hora em que o primeiro envio ao Mercado Pago começou (tchefood_begin_point_dispatch, imediatamente antes
+    -- da chamada). NULL = nenhum envio saiu daqui, mesmo que alguém já tenha pedido a posse.
     dispatched_at TIMESTAMPTZ,
     -- Envio em andamento: só quem tem a posse (até dispatch_lease_until, relógio do banco) fala com o Mercado
-    -- Pago; os outros pedidos só acompanham. dispatch_attempts conta as posses dadas (1 = primeiro envio).
+    -- Pago; os outros pedidos só acompanham. dispatch_attempts conta as posses dadas.
     dispatch_lease_until TIMESTAMPTZ,
     dispatch_attempts INT NOT NULL DEFAULT 0 CHECK (dispatch_attempts >= 0),
     -- Encerramento da tentativa (não é estorno): por quê, quando e, a pedido do operador, quem pediu,
@@ -87,6 +91,18 @@ CREATE TABLE IF NOT EXISTS terminal_charges (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Banco que já rodou uma versão anterior deste arquivo (antes do merge): as colunas e a lista de motivos
+-- que vieram depois entram aqui, para os gatilhos e funções abaixo não ficarem sem elas.
+ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ;
+ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS dispatch_lease_until TIMESTAMPTZ;
+ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS dispatch_attempts INT NOT NULL DEFAULT 0 CHECK (dispatch_attempts >= 0);
+ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS cancel_reason VARCHAR(20);
+ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS cancel_requested_by UUID REFERENCES staff_users(id);
+ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ;
+ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS cancel_authorized_by UUID REFERENCES staff_users(id);
+ALTER TABLE terminal_charges ADD COLUMN IF NOT EXISTS cancel_audit_id UUID REFERENCES audit_logs(id);
+ALTER TABLE terminal_charges DROP CONSTRAINT IF EXISTS terminal_charges_cancel_reason_check;
+ALTER TABLE terminal_charges ADD CONSTRAINT terminal_charges_cancel_reason_check CHECK (cancel_reason IN ('timeout', 'operator', 'void'));
 CREATE INDEX IF NOT EXISTS idx_terminal_charges_order ON terminal_charges(tenant_id, order_id);
 ALTER TABLE terminal_charges ENABLE ROW LEVEL SECURITY;
 
@@ -123,26 +139,42 @@ BEGIN
        OR NEW.external_terminal_id <> OLD.external_terminal_id) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: conta, maquininha, forma e valor da cobrança não mudam.';
     END IF;
+    -- A hora gravada da cobrança é a base do prazo de espera: não muda.
+    IF TG_OP = 'UPDATE' AND NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a hora da cobrança % não muda.', OLD.idempotency_key;
+    END IF;
     IF TG_OP = 'UPDATE' AND OLD.dispatched_at IS NOT NULL AND NEW.dispatched_at IS DISTINCT FROM OLD.dispatched_at THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % já foi mandada ao Mercado Pago.', OLD.idempotency_key;
     END IF;
-    -- O encerramento registrado não muda; só "por prazo" pode virar "pelo operador, com gerente".
-    IF TG_OP = 'UPDATE' AND OLD.cancel_requested_at IS NOT NULL
-       AND NOT (OLD.cancel_reason = 'timeout' AND NEW.cancel_reason = 'operator')
-       AND (NEW.cancel_requested_at IS DISTINCT FROM OLD.cancel_requested_at
-       OR NEW.cancel_reason IS DISTINCT FROM OLD.cancel_reason OR NEW.cancel_requested_by IS DISTINCT FROM OLD.cancel_requested_by) THEN
-        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o encerramento da cobrança % já foi registrado.', OLD.idempotency_key;
+    -- O encerramento registrado não some nem muda (motivo, hora, quem pediu, gerente e registro); a única
+    -- troca aceita é "por prazo" virar "pelo operador, com gerente", uma vez.
+    IF TG_OP = 'UPDATE' AND OLD.cancel_requested_at IS NOT NULL THEN
+        IF NEW.cancel_requested_at IS NULL OR NEW.cancel_reason IS NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o encerramento da cobrança % já foi registrado.', OLD.idempotency_key;
+        END IF;
+        IF NOT (OLD.cancel_reason = 'timeout' AND NEW.cancel_reason = 'operator')
+           AND (NEW.cancel_requested_at IS DISTINCT FROM OLD.cancel_requested_at OR NEW.cancel_reason IS DISTINCT FROM OLD.cancel_reason
+                OR NEW.cancel_requested_by IS DISTINCT FROM OLD.cancel_requested_by OR NEW.cancel_authorized_by IS DISTINCT FROM OLD.cancel_authorized_by
+                OR NEW.cancel_audit_id IS DISTINCT FROM OLD.cancel_audit_id) THEN
+            RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o encerramento da cobrança % já foi registrado.', OLD.idempotency_key;
+        END IF;
     END IF;
-    -- Pedido de encerramento: nada mais sai daqui para a maquininha.
+    -- Pedido de encerramento: nada mais sai daqui para a maquininha. Nem primeiro envio, nem nova posse,
+    -- nem posse esticada.
     IF TG_OP = 'UPDATE' AND OLD.dispatched_at IS NULL AND NEW.dispatched_at IS NOT NULL AND OLD.cancel_requested_at IS NOT NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % foi encerrada antes de ir à maquininha.', OLD.idempotency_key;
     END IF;
-    -- Nem repetição: depois do pedido de encerramento ninguém ganha a posse do envio.
-    IF TG_OP = 'UPDATE' AND OLD.cancel_requested_at IS NOT NULL AND NEW.dispatch_attempts > OLD.dispatch_attempts THEN
+    IF TG_OP = 'UPDATE' AND OLD.cancel_requested_at IS NOT NULL
+       AND (NEW.dispatch_attempts > OLD.dispatch_attempts
+            OR (NEW.dispatch_lease_until IS NOT NULL AND (OLD.dispatch_lease_until IS NULL OR NEW.dispatch_lease_until > OLD.dispatch_lease_until))) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % tem encerramento pedido e não é mais enviada.', OLD.idempotency_key;
     END IF;
     IF TG_OP = 'UPDATE' AND NEW.dispatch_attempts < OLD.dispatch_attempts THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a contagem de envios da cobrança % não volta.', OLD.idempotency_key;
+    END IF;
+    -- A ordem do Mercado Pago ligada à cobrança não é trocada por outra.
+    IF TG_OP = 'UPDATE' AND OLD.external_order_id IS NOT NULL AND NEW.external_order_id IS DISTINCT FROM OLD.external_order_id THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % já tem ordem no Mercado Pago.', OLD.idempotency_key;
     END IF;
     IF NEW.cancel_reason = 'operator' AND (NEW.cancel_authorized_by IS NULL OR NEW.cancel_audit_id IS NULL OR NEW.cancel_requested_by IS NULL) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: encerramento pelo operador sem autorização de gerente.';
@@ -307,8 +339,17 @@ $$;
 -- -----------------------------------------------------------------------------
 -- 2e. Posse do envio: um pedido por vez fala com o Mercado Pago
 -- -----------------------------------------------------------------------------
--- Dá a posse (por p_lease_ms, relógio do banco) só para cobrança "creating", sem ordem, sem pedido de
--- encerramento e sem outra posse em vigor. Devolve o número da posse (1 = primeiro envio) ou 0.
+-- Três passos, todos com o relógio do banco e um UPDATE só cada (pedidos simultâneos não passam juntos):
+-- A hora é clock_timestamp() (a de agora), não NOW() (a do início da transação): quem esperou a trava da
+-- linha decide com a hora de depois da espera.
+--   1. tchefood_claim_point_dispatch: pede a posse. Só para cobrança "creating", sem ordem, sem pedido de
+--      encerramento, sem outra posse em vigor e até 8 posses. Devolve o número da posse ou 0.
+--   2. tchefood_begin_point_dispatch: a barreira IMEDIATAMENTE antes da chamada ao Mercado Pago. Só passa se
+--      a posse ainda for a do chamador, estiver em vigor e não houver pedido de encerramento; marca o
+--      primeiro envio (dispatched_at) e renova a posse a partir de agora. Devolve 1 (primeiro envio: nada
+--      saiu antes), 2 (repetição) ou 0 (não mande).
+--   3. tchefood_settle_point_dispatch: encerramento pedido, envio já saiu, posse vencida e nenhuma ordem:
+--      resultado desconhecido vira revisão manual (segue reservando o saldo). Nunca vira recusa.
 CREATE OR REPLACE FUNCTION tchefood_claim_point_dispatch(p_tenant UUID, p_id UUID, p_lease_ms INT)
 RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
@@ -319,13 +360,81 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: prazo de posse inválido.';
     END IF;
     UPDATE terminal_charges
-       SET dispatched_at = COALESCE(dispatched_at, NOW()),
-           dispatch_lease_until = NOW() + make_interval(secs => p_lease_ms / 1000.0),
-           dispatch_attempts = dispatch_attempts + 1, updated_at = NOW()
+       SET dispatch_lease_until = clock_timestamp() + make_interval(secs => p_lease_ms / 1000.0),
+           dispatch_attempts = dispatch_attempts + 1, updated_at = clock_timestamp()
      WHERE id = p_id AND tenant_id = p_tenant AND status = 'creating' AND external_order_id IS NULL
-       AND cancel_requested_at IS NULL AND (dispatch_lease_until IS NULL OR dispatch_lease_until <= NOW())
+       AND cancel_requested_at IS NULL AND (dispatch_lease_until IS NULL OR dispatch_lease_until <= clock_timestamp())
+       AND dispatch_attempts < 8
     RETURNING dispatch_attempts INTO v_attempt;
     RETURN COALESCE(v_attempt, 0);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION tchefood_begin_point_dispatch(p_tenant UUID, p_id UUID, p_attempt INT, p_lease_ms INT)
+RETURNS INT
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_charge terminal_charges%ROWTYPE;
+BEGIN
+    IF p_lease_ms IS NULL OR p_lease_ms < 1000 OR p_lease_ms > 600000 THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: prazo de posse inválido.';
+    END IF;
+    SELECT * INTO v_charge FROM terminal_charges WHERE id = p_id AND tenant_id = p_tenant FOR UPDATE;
+    IF NOT FOUND OR v_charge.status <> 'creating' OR v_charge.external_order_id IS NOT NULL OR v_charge.cancel_requested_at IS NOT NULL
+       OR v_charge.dispatch_attempts IS DISTINCT FROM p_attempt OR v_charge.dispatch_lease_until IS NULL OR v_charge.dispatch_lease_until <= clock_timestamp() THEN
+        RETURN 0;
+    END IF;
+    UPDATE terminal_charges
+       SET dispatched_at = COALESCE(dispatched_at, clock_timestamp()),
+           dispatch_lease_until = clock_timestamp() + make_interval(secs => p_lease_ms / 1000.0), updated_at = clock_timestamp()
+     WHERE id = v_charge.id;
+    RETURN CASE WHEN v_charge.dispatched_at IS NULL THEN 1 ELSE 2 END;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION tchefood_settle_point_dispatch(p_tenant UUID, p_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_rows INT;
+BEGIN
+    UPDATE terminal_charges
+       SET status = 'manual_review', raw_status = 'dispatch_unknown', raw_status_detail = 'DISPATCH_UNKNOWN', updated_at = clock_timestamp()
+     WHERE id = p_id AND tenant_id = p_tenant AND status = 'creating' AND external_order_id IS NULL
+       AND cancel_requested_at IS NOT NULL AND dispatched_at IS NOT NULL
+       AND (dispatch_lease_until IS NULL OR dispatch_lease_until <= clock_timestamp());
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    RETURN v_rows = 1;
+END;
+$$;
+
+-- Encerramento por prazo: quem decide é o relógio do banco, contra a hora gravada da cobrança (também do
+-- banco). Um UPDATE só, com a linha travada: dois pedidos juntos gravam um encerramento.
+-- Devolve 0 (cedo demais, nada gravado), 1 (pedido gravado agora) ou 2 (já havia pedido, ou a cobrança
+-- já terminou: nada a gravar).
+CREATE OR REPLACE FUNCTION tchefood_request_point_timeout(p_tenant UUID, p_id UUID, p_wait_ms INT)
+RETURNS INT
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_charge terminal_charges%ROWTYPE;
+BEGIN
+    IF p_wait_ms IS NULL OR p_wait_ms < 60000 OR p_wait_ms > 3600000 THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: prazo de espera inválido.';
+    END IF;
+    SELECT * INTO v_charge FROM terminal_charges WHERE id = p_id AND tenant_id = p_tenant FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
+    END IF;
+    IF v_charge.status IN ('approved', 'rejected', 'cancelled', 'expired', 'refunded') OR v_charge.cancel_requested_at IS NOT NULL THEN
+        RETURN 2;
+    END IF;
+    IF clock_timestamp() < v_charge.created_at + make_interval(secs => p_wait_ms / 1000.0) THEN
+        RETURN 0;
+    END IF;
+    UPDATE terminal_charges
+       SET cancel_reason = 'timeout', cancel_requested_by = NULL, cancel_requested_at = clock_timestamp(), updated_at = clock_timestamp()
+     WHERE id = v_charge.id;
+    RETURN 1;
 END;
 $$;
 
@@ -382,6 +491,9 @@ BEGIN
     FOREACH v_fn IN ARRAY ARRAY[
         'tchefood_authorize_point_cancel(UUID, VARCHAR, UUID, VARCHAR, TEXT)',
         'tchefood_claim_point_dispatch(UUID, UUID, INT)',
+        'tchefood_begin_point_dispatch(UUID, UUID, INT, INT)',
+        'tchefood_settle_point_dispatch(UUID, UUID)',
+        'tchefood_request_point_timeout(UUID, UUID, INT)',
         'tchefood_block_point_key(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID)'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN

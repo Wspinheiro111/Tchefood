@@ -8,7 +8,7 @@
 //     "amount_cents": 2450, "method": "CREDIT" | "DEBIT", "staff_id": "<uuid>" }
 //   { "action": "status", "idempotency_key": "..." }
 //   { "action": "cancel", "idempotency_key": "...", "terminal_id", "order_id", "amount_cents", "method",
-//     "reason": "timeout", "staff_id": "<uuid>" }              (prazo vencido: o servidor confere 2 min pela hora gravada)
+//     "reason": "timeout", "staff_id": "<uuid>" }              (prazo vencido: o banco confere 2 min pela hora gravada)
 //   { ..., "reason": "operator", "staff_id": "<uuid>", "manager_pin": "1234", "reason_text": "..." }
 //                                                             (pedido do operador: PIN de gerente conferido no banco)
 //   O encerramento não estorna nada: cobrança paga continua paga.

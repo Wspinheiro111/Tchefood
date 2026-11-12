@@ -51,6 +51,12 @@ export interface PointDriverDeps {
 export const POINT_WAIT_MS = 120_000;
 /** Depois do pedido de cancelamento, quanto tempo esperar a confirmação. */
 export const POINT_CANCEL_WAIT_MS = 30_000;
+/**
+ * Limite duro do fluxo, contado do primeiro envio. O servidor conta o prazo do cartão pela hora em que ELE
+ * gravou a cobrança (depois do primeiro envio do app): enquanto responde "cedo demais", o app segue
+ * consultando e pedindo o encerramento, mas não além deste limite.
+ */
+export const POINT_HARD_LIMIT_MS = POINT_WAIT_MS + 90_000;
 export const POINT_POLL_MS = 2_000;
 /** Prazo de cada chamada à função point-charge. */
 export const POINT_REQUEST_TIMEOUT_MS = 15_000;
@@ -253,25 +259,35 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
 
     // 2) Espera o cartão. Encerrar no servidor é a única prova de "nada foi cobrado": sem cobrança gravada,
     //    ele grava o bloqueio da chave e uma criação atrasada não chega mais à Point.
-    //    Por prazo, o servidor confere a hora gravada (cedo demais = recusa e segue consultando). Pelo
+    //    Por prazo, o servidor confere a hora gravada (cedo demais = segue consultando e pedindo). Pelo
     //    operador, vai junto a autorização do gerente (repetir é seguro: o servidor reaproveita a primeira
     //    autorização, sem novo registro). Repete a cada volta até o fim.
     let cancelAt: number | null = null;
+    const timeoutBody = { action: 'cancel', ...charge, reason: 'timeout', staff_id: operator };
     const close = async (): Promise<TerminalResult | null> => {
       const manager = this.aborted.get(req.request_id);
-      const body = manager
+      let out = await this.call(manager
         ? { action: 'cancel', ...charge, reason: 'operator', staff_id: operator, manager_pin: manager.manager_pin, reason_text: manager.reason }
         // staff_id: quem responde pelo bloqueio preventivo quando a cobrança nem chegou a ser gravada.
-        : { action: 'cancel', ...charge, reason: 'timeout', staff_id: operator };
-      const out = await this.call(body);
-      if (out.kind === 'rejected' && manager && (out.httpStatus === 403 || out.httpStatus === 404)) {
-        // 403: PIN recusado. 404: a cobrança não está gravada, não há o que o gerente encerrar.
-        // O pedido do operador cai e a cobrança segue as regras do prazo.
+        : timeoutBody);
+      if (out.kind === 'rejected' && manager && out.httpStatus === 403) {
+        // PIN recusado: o pedido do operador cai e a cobrança segue as regras do prazo.
         this.aborted.delete(req.request_id);
-        if (out.httpStatus === 403 && this.deps.now() - started < POINT_WAIT_MS) cancelAt = null;
+        if (this.deps.now() - started < POINT_WAIT_MS) cancelAt = null;
+        return null;
       }
+      if (out.kind === 'rejected' && manager && out.httpStatus === 404) {
+        // A cobrança não está gravada: não há o que o gerente encerrar, mas a criação pode estar a caminho.
+        // Pede já o bloqueio da chave. O pedido do gerente fica guardado: se a criação gravar primeiro, a
+        // próxima volta manda a autorização de novo, agora com cobrança para encerrar.
+        out = await this.call(timeoutBody);
+      }
+      // "Cedo demais": o prazo do servidor ainda não venceu. A espera pela confirmação recomeça daqui.
+      if (out.kind === 'rejected' && out.error === 'too_early' && cancelAt !== null) cancelAt = this.deps.now();
       return out.kind === 'reply' ? this.toResult(out.reply, req) : null;
     };
+    const stuck = (): TerminalResult =>
+      this.review('A maquininha não confirmou o pagamento nem o cancelamento. Confira no app do Mercado Pago antes de cobrar de novo.', 'POINT_TIMEOUT');
     for (;;) {
       const now = this.deps.now();
       if (cancelAt === null && (this.aborted.has(req.request_id) || now - started >= POINT_WAIT_MS)) cancelAt = now;
@@ -279,9 +295,8 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
         const final = await close();
         if (final) return final;
       }
-      if (cancelAt !== null && this.deps.now() - cancelAt >= POINT_CANCEL_WAIT_MS) {
-        return this.review('A maquininha não confirmou o pagamento nem o cancelamento. Confira no app do Mercado Pago antes de cobrar de novo.', 'POINT_TIMEOUT');
-      }
+      if (cancelAt !== null && this.deps.now() - cancelAt >= POINT_CANCEL_WAIT_MS) return stuck();
+      if (this.deps.now() - started >= POINT_HARD_LIMIT_MS) return stuck();
       await this.deps.sleep(POINT_POLL_MS);
       const out = await this.call({ action: 'status', idempotency_key: key });
       if (out.kind === 'reply') {

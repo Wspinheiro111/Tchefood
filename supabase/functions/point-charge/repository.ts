@@ -112,12 +112,55 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
       // Um UPDATE só, com o relógio do banco: dois pedidos juntos não ganham a posse, e pedido de
       // encerramento gravado antes barra a posse.
       const res = await db.rpc('tchefood_claim_point_dispatch', { p_tenant: tenantId, p_id: row.id, p_lease_ms: leaseMs });
-      const attempt = Number(check(res, 'marcar o envio') ?? 0);
+      const attempt = Number(check(res, 'pedir a posse do envio') ?? 0);
       if (!Number.isInteger(attempt) || attempt < 1) return null;
-      const claimed = await this.findByKey(row.idempotency_key);
-      // A posse é a de número `attempt`: se a linha já mostra outra, esta chamada não a tem mais.
-      if (!claimed || claimed.dispatch_attempts !== attempt) return null;
-      return claimed;
+      // A posse é a de número `attempt`. A barreira (beginDispatch) confere de novo no banco se ela ainda vale.
+      return { ...row, dispatch_attempts: attempt };
+    },
+    async beginDispatch(row: TerminalChargeRow, leaseMs: number): Promise<0 | 1 | 2> {
+      const res = await db.rpc('tchefood_begin_point_dispatch', { p_tenant: tenantId, p_id: row.id, p_attempt: row.dispatch_attempts, p_lease_ms: leaseMs });
+      const kind: unknown = check(res, 'marcar o envio');
+      // Só os números 1 e 2 liberam o envio; qualquer outra resposta é "não mande".
+      return kind === 1 || kind === '1' ? 1 : kind === 2 || kind === '2' ? 2 : 0;
+    },
+    async attachOrder(row: TerminalChargeRow, externalOrderId: string): Promise<TerminalChargeRow> {
+      // Sem condição de estado lido: vale para "creating" e para revisão manual. Só não troca ordem já ligada
+      // nem mexe em cobrança final (o gatilho do banco recusa as duas coisas também).
+      const updated = normalize(check(
+        await db
+          .from('terminal_charges')
+          .update({ external_order_id: externalOrderId, updated_at: new Date().toISOString() })
+          .eq('id', row.id)
+          .eq('tenant_id', tenantId)
+          .is('external_order_id', null)
+          .not('status', 'in', FINAL_LIST)
+          .select(CHARGE_COLUMNS)
+          .maybeSingle(),
+        'ligar a ordem à cobrança',
+      ));
+      if (updated) return updated;
+      const current = await this.findByKey(row.idempotency_key);
+      if (!current) throw new Error('Cobrança não encontrada para ligar a ordem.');
+      return current;
+    },
+    async rejectFirstSend(row: TerminalChargeRow, code: string): Promise<TerminalChargeRow> {
+      const updated = normalize(check(
+        await db
+          .from('terminal_charges')
+          .update({ status: 'rejected', raw_status: `create_failed:${code}`, raw_status_detail: null, updated_at: new Date().toISOString() })
+          .eq('id', row.id)
+          .eq('tenant_id', tenantId)
+          .eq('status', 'creating')
+          .eq('dispatch_attempts', row.dispatch_attempts)
+          .is('external_order_id', null)
+          .select(CHARGE_COLUMNS)
+          .maybeSingle(),
+        'gravar a recusa do envio',
+      ));
+      if (updated) return updated;
+      const current = await this.findByKey(row.idempotency_key);
+      if (!current) throw new Error('Cobrança não encontrada para gravar a recusa.');
+      return current;
     },
     async releaseDispatch(row: TerminalChargeRow): Promise<void> {
       check(
@@ -128,29 +171,25 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
           .eq('tenant_id', tenantId)
           .eq('status', 'creating')
           .eq('dispatch_attempts', row.dispatch_attempts)
+          .is('external_order_id', null)
           .select('id')
           .maybeSingle(),
         'devolver a posse do envio',
       );
     },
-    async abandonDispatch(row: TerminalChargeRow): Promise<TerminalChargeRow> {
-      // Só a primeira posse, ainda em vigor para esta chamada e sem ordem: nada saiu daqui.
-      if (row.dispatch_attempts === 1) {
-        const updated = normalize(check(
-          await db
-            .from('terminal_charges')
-            .update({ status: 'cancelled', raw_status: 'voided_before_send', updated_at: new Date().toISOString() })
-            .eq('id', row.id)
-            .eq('tenant_id', tenantId)
-            .eq('status', 'creating')
-            .eq('dispatch_attempts', 1)
-            .is('external_order_id', null)
-            .select(CHARGE_COLUMNS)
-            .maybeSingle(),
-          'encerrar a cobrança não enviada',
-        ));
-        if (updated) return updated;
-      }
+    async settleDispatch(row: TerminalChargeRow): Promise<TerminalChargeRow> {
+      check(await db.rpc('tchefood_settle_point_dispatch', { p_tenant: tenantId, p_id: row.id }), 'levar o envio sem resposta à revisão manual');
+      const current = await this.findByKey(row.idempotency_key);
+      if (!current) throw new Error('Cobrança não encontrada para revisar.');
+      return current;
+    },
+    async requestTimeoutCancel(row: TerminalChargeRow, waitMs: number): Promise<TerminalChargeRow | null> {
+      const res = await db.rpc('tchefood_request_point_timeout', { p_tenant: tenantId, p_id: row.id, p_wait_ms: waitMs });
+      const refused = refusal(res.error);
+      if (refused) throw refused;
+      const kind: unknown = check(res, 'registrar o encerramento por prazo');
+      if (kind === 0 || kind === '0') return null; // ainda é cedo
+      if (kind !== 1 && kind !== 2 && kind !== '1' && kind !== '2') throw new Error('Resposta inesperada ao registrar o encerramento por prazo.');
       const current = await this.findByKey(row.idempotency_key);
       if (!current) throw new Error('Cobrança não encontrada para encerrar.');
       return current;
