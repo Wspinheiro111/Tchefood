@@ -2497,6 +2497,51 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     forgetPinFailures();
   });
 
+  it('PIN do gerente nas autorizações: 20 tentativas erradas simultâneas, só 3 conferem o PIN e a conciliação espera pela mesma trava (corrida do bloqueio em tchefood_authorize_manager)', async () => {
+    vi.useRealTimers();
+    forgetPinFailures();
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    const psqlArgs = ['-h', target!.host, '-p', target!.port, '-U', target!.user, '-d', DB, '-X', '-q', '-t', '-A', '-v', 'ON_ERROR_STOP=1'];
+    const run = (body: string) => new Promise<string>((resolve, reject) => {
+      const p = spawn('psql', psqlArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+      let out = '';
+      let err = '';
+      p.stdout.on('data', (c) => { out += c; });
+      p.stderr.on('data', (c) => { err += c; });
+      p.on('exit', (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(err))));
+      const claims = JSON.stringify({ role: 'authenticated', tenant_id: TENANT, sub: 'device' });
+      p.stdin.end(`BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '${claims}', true) \\g /dev/null
+        ${body} COMMIT;`);
+    });
+    // Troca de barril (sem comanda), cada tentativa com o seu client_audit_id: a trava do reenvio
+    // não junta tentativas diferentes, só a trava da loja enfileira a contagem.
+    const authorize = () => run(`SELECT COALESCE(tchefood_authorize_manager(NULL, 'KEG_CHANGED', '0000', '${cashier}', 'Tentativa concorrente', 0,
+        jsonb_build_object('client_audit_id', '${crypto.randomUUID()}'))::text, 'NULL');`);
+    const reconcile = () => run(`SELECT tchefood_reconcile_cashback('${crypto.randomUUID()}', 'ORPHAN', '${crypto.randomUUID()}', NULL, 'DISCARD', 5, '0000', '${cashier}', 'Tentativa concorrente')->>'status';`);
+    const pinRows = (type: string) => sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = '${type}' AND created_at >= NOW() - INTERVAL '60 seconds'`);
+    // Segura a gravação no audit_logs: sem a trava da loja, as 20 contariam 0 falhas antes de qualquer uma gravar.
+    const holder = spawn('psql', psqlArgs, { stdio: ['pipe', 'ignore', 'ignore'] });
+    const held = new Promise((r) => holder.on('exit', r));
+    holder.stdin.end('BEGIN; LOCK TABLE audit_logs IN SHARE MODE; SELECT pg_sleep(2); COMMIT;');
+    await new Promise((r) => setTimeout(r, 300));
+    const results = await Promise.all(Array.from({ length: 20 }, () => authorize()));
+    await held;
+    expect(results).toEqual(Array(20).fill('NULL'));
+    expect(pinRows('MANAGER_PIN_FAILED')).toBe('3');
+    expect(pinRows('MANAGER_PIN_LOCKOUT')).toBe('17');
+    // Mesma chave nas duas funções: 10 autorizações e 10 conciliações juntas somam 3 conferências.
+    forgetPinFailures();
+    const holder2 = spawn('psql', psqlArgs, { stdio: ['pipe', 'ignore', 'ignore'] });
+    const held2 = new Promise((r) => holder2.on('exit', r));
+    holder2.stdin.end('BEGIN; LOCK TABLE audit_logs IN SHARE MODE; SELECT pg_sleep(2); COMMIT;');
+    await new Promise((r) => setTimeout(r, 300));
+    await Promise.all(Array.from({ length: 20 }, (_, i) => (i % 2 ? reconcile() : authorize())));
+    await held2;
+    expect(pinRows('MANAGER_PIN_FAILED')).toBe('3');
+    expect(pinRows('MANAGER_PIN_LOCKOUT')).toBe('17');
+    forgetPinFailures();
+  });
+
   it('troca de barril com PIN de gerente: histórico, audit_log e barril novo pela função do servidor', async () => {
     forgetPinFailures();
     const tapId = crypto.randomUUID();
