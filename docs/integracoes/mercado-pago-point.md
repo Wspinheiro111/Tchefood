@@ -26,22 +26,36 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   no banco) e dentro do saldo dele, menos as outras cobranças da mesma conta que ainda não terminaram
   (`tchefood_open_terminal_charge`, com a conta travada). Reservam: criando, na fila, na maquininha e em **revisão
   manual**, sem limite de tempo, e aprovadas ainda sem pagamento gravado. Só liberam com o fim comprovado no Mercado
-  Pago (recusada, cancelada, expirada, estornada) ou com o encerramento autorizado por gerente. Antes de cobrar o
+  Pago (recusada, cancelada, expirada, estornada). PIN de gerente e tempo passado não liberam. Antes de cobrar o
   app sobe a fila (com prazo de 15 s); conta que ainda não subiu é recusada antes de chegar à maquininha.
 - Sem cartão em 2 minutos (contados desde o primeiro envio) o app **encerra a tentativa**: pede à maquininha que
   pare de esperar o cartão. Não é estorno: cobrança já paga continua paga e volta como aprovada. O servidor só
-  aceita o encerramento por prazo depois de 90 s da cobrança gravada (relógio do servidor) e repete o pedido até lá.
+  aceita o encerramento por prazo depois dos mesmos 2 min, contados da cobrança gravada (relógio do servidor); o app
+  repete o pedido até lá.
   Só vira "recusado" quando o Mercado Pago confirma cancelada; senão vira revisão manual.
 - Encerrar **antes do prazo** a pedido do operador exige **PIN de gerente** e motivo (5+ letras), conferidos no banco
   (`tchefood_authorize_point_cancel`, mesmas regras de `tchefood_authorize_manager`: 3 PINs errados em 60 s
   bloqueiam). Fica um registro `POINT_CHARGE_CANCELED` em `audit_logs` e a cobrança guarda operador, gerente e
   registro; o banco recusa encerramento "pelo operador" sem gerente. O pedido também confere conta, valor e forma.
-  Cobrança que foi à nuvem e nunca ganhou ordem só é liberada assim, depois de 2 min do envio (`manager_released`).
-- Consulta e encerramento **nunca** mandam cobrança nova à maquininha: só a criação manda, uma vez por chave
-  (`dispatched_at` gravado antes do envio; reenvio só com a mesma chave e sem pedido de encerramento).
+  Repetir o mesmo pedido reaproveita a primeira autorização (um registro só); cobrança que já terminou não gera
+  registro de encerramento.
+- **Um pedido por vez fala com o Mercado Pago.** Quem manda a ordem pega a posse do envio no banco
+  (`tchefood_claim_point_dispatch`, 30 s, maior que o prazo de 15 s da chamada). Consultas no meio só acompanham.
+  Posse vencida sem resposta: a próxima consulta repete com a **mesma chave** (o Mercado Pago devolve a ordem
+  original). Depois do pedido de encerramento ninguém ganha a posse, e quem já a tinha confere a cobrança de novo
+  imediatamente antes de mandar. Se a ordem chegar com o encerramento já pedido, ela é cancelada no Mercado Pago na
+  mesma hora.
+- **Envio sem resposta nunca vira recusa por tempo nem por PIN.** Encerramento pedido com a ordem ainda desconhecida:
+  enquanto a posse vale, espera; depois a cobrança vai para **revisão manual** (`DISPATCH_UNKNOWN`) e segue
+  segurando o saldo. Ela pode ter sido paga: confira no app do Mercado Pago. Uma resposta atrasada ainda grava por
+  cima da revisão manual. A liberação conferida pelo gerente (com prova do Mercado Pago) fica para a tela de
+  conciliação, fora deste PR.
+- Chave que **nunca foi gravada** (a criação se perdeu no caminho) não tem o que cancelar: o servidor grava o
+  **bloqueio preventivo** da chave (`tchefood_block_point_key`), exige operador da equipe ativa e registra
+  `POINT_KEY_BLOCKED` em `audit_logs`. Pedido "pelo operador" (com PIN) sem cobrança gravada é recusado.
 - Criação sem resposta (queda, prazo de 15 s por chamada estourado, erro 5xx): nem "cobrança não encontrada" nem
   outra recusa provam que nada foi cobrado, porque a primeira criação pode estar a caminho. Quem decide é o
-  encerramento no servidor: sem cobrança gravada, ele grava o bloqueio da chave (`voided_before_send`) e a criação
+  encerramento no servidor: sem cobrança gravada, ele grava o bloqueio preventivo da chave (`voided_before_send`) e a criação
   atrasada encontra a cobrança encerrada e não vai à Point.
 - Cobrança em estado final (aprovada, recusada, cancelada, expirada, estornada) não muda mais: cada gravação só vale
   se o estado ainda for o lido, e o banco recusa mudar uma cobrança final.

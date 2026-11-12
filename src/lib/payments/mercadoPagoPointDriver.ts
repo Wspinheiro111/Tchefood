@@ -217,8 +217,6 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     // Sem operador identificado não cobra (o servidor também recusa quem não é da equipe ativa da loja).
     if (!operator) return this.declined('Entre com o seu PIN para cobrar na Point Smart.');
     const charge = { terminal_id: this.terminal.id, idempotency_key: key, order_id: req.order_id, amount_cents: amountCents, method: req.method };
-    // O prazo conta desde o primeiro envio: criação pendurada também consome o tempo de espera.
-    const started = this.deps.now();
     // Sobe a fila antes (o servidor só cobra conta que já está nele). Com prazo: pendurada ou com erro, não
     // cobra (nada foi mandado). O servidor confere de novo que a conta está lá.
     if (this.deps.beforeCreate) {
@@ -228,6 +226,9 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
       if (result !== 'ok') return this.declined('Não consegui sincronizar a conta com a nuvem. Nada foi cobrado; tente de novo.');
     }
 
+    // O prazo do cartão conta a partir do primeiro envio (a sincronização acima tem o prazo dela e não
+    // consome este): criação pendurada consome o tempo de espera.
+    const started = this.deps.now();
     // 1) Criação. Resultado desconhecido: repete com a mesma chave (o servidor não cria outra).
     let uncertain = false;
     let sent = false;
@@ -253,18 +254,21 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     // 2) Espera o cartão. Encerrar no servidor é a única prova de "nada foi cobrado": sem cobrança gravada,
     //    ele grava o bloqueio da chave e uma criação atrasada não chega mais à Point.
     //    Por prazo, o servidor confere a hora gravada (cedo demais = recusa e segue consultando). Pelo
-    //    operador, vai junto a autorização do gerente. Repete a cada volta até o fim.
+    //    operador, vai junto a autorização do gerente (repetir é seguro: o servidor reaproveita a primeira
+    //    autorização, sem novo registro). Repete a cada volta até o fim.
     let cancelAt: number | null = null;
     const close = async (): Promise<TerminalResult | null> => {
       const manager = this.aborted.get(req.request_id);
       const body = manager
         ? { action: 'cancel', ...charge, reason: 'operator', staff_id: operator, manager_pin: manager.manager_pin, reason_text: manager.reason }
-        : { action: 'cancel', ...charge, reason: 'timeout' };
+        // staff_id: quem responde pelo bloqueio preventivo quando a cobrança nem chegou a ser gravada.
+        : { action: 'cancel', ...charge, reason: 'timeout', staff_id: operator };
       const out = await this.call(body);
-      if (out.kind === 'rejected' && manager && out.httpStatus === 403) {
-        // PIN recusado: o pedido do operador cai; a cobrança segue até o prazo.
+      if (out.kind === 'rejected' && manager && (out.httpStatus === 403 || out.httpStatus === 404)) {
+        // 403: PIN recusado. 404: a cobrança não está gravada, não há o que o gerente encerrar.
+        // O pedido do operador cai e a cobrança segue as regras do prazo.
         this.aborted.delete(req.request_id);
-        if (this.deps.now() - started < POINT_WAIT_MS) cancelAt = null;
+        if (out.httpStatus === 403 && this.deps.now() - started < POINT_WAIT_MS) cancelAt = null;
       }
       return out.kind === 'reply' ? this.toResult(out.reply, req) : null;
     };

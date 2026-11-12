@@ -22,6 +22,11 @@
 --     (tchefood_authorize_point_cancel), com registro em audit_logs.
 --  5. Cobrança em estado final não muda mais (resposta atrasada não rebaixa
 --     aprovado) e aprovado exige comprovante completo.
+--  7. Um pedido por vez fala com o Mercado Pago (posse do envio com prazo,
+--     tchefood_claim_point_dispatch); depois do pedido de encerramento ninguém
+--     ganha a posse.
+--  8. Chave nunca gravada só é bloqueada por operador ativo da loja, com
+--     registro (tchefood_block_point_key). Não é cancelamento.
 -- =============================================================================
 
 ALTER TYPE acquirer_type ADD VALUE IF NOT EXISTS 'MERCADO_PAGO';
@@ -67,6 +72,10 @@ CREATE TABLE IF NOT EXISTS terminal_charges (
     created_by UUID REFERENCES staff_users(id),
     -- Hora em que a ordem foi mandada ao Mercado Pago pela primeira vez. NULL = nunca saiu daqui.
     dispatched_at TIMESTAMPTZ,
+    -- Envio em andamento: só quem tem a posse (até dispatch_lease_until, relógio do banco) fala com o Mercado
+    -- Pago; os outros pedidos só acompanham. dispatch_attempts conta as posses dadas (1 = primeiro envio).
+    dispatch_lease_until TIMESTAMPTZ,
+    dispatch_attempts INT NOT NULL DEFAULT 0 CHECK (dispatch_attempts >= 0),
     -- Encerramento da tentativa (não é estorno): por quê, quando e, a pedido do operador, quem pediu,
     -- o gerente que autorizou e o registro em audit_logs. "timeout" e "void" são decididos pelo servidor.
     cancel_reason VARCHAR(20) CHECK (cancel_reason IN ('timeout', 'operator', 'void')),
@@ -127,6 +136,13 @@ BEGIN
     IF TG_OP = 'UPDATE' AND OLD.dispatched_at IS NULL AND NEW.dispatched_at IS NOT NULL AND OLD.cancel_requested_at IS NOT NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % foi encerrada antes de ir à maquininha.', OLD.idempotency_key;
     END IF;
+    -- Nem repetição: depois do pedido de encerramento ninguém ganha a posse do envio.
+    IF TG_OP = 'UPDATE' AND OLD.cancel_requested_at IS NOT NULL AND NEW.dispatch_attempts > OLD.dispatch_attempts THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % tem encerramento pedido e não é mais enviada.', OLD.idempotency_key;
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.dispatch_attempts < OLD.dispatch_attempts THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a contagem de envios da cobrança % não volta.', OLD.idempotency_key;
+    END IF;
     IF NEW.cancel_reason = 'operator' AND (NEW.cancel_authorized_by IS NULL OR NEW.cancel_audit_id IS NULL OR NEW.cancel_requested_by IS NULL) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: encerramento pelo operador sem autorização de gerente.';
     END IF;
@@ -147,8 +163,9 @@ CREATE TRIGGER trg_terminal_charges_final BEFORE INSERT OR UPDATE ON terminal_ch
 -- -----------------------------------------------------------------------------
 -- Reserva = toda outra cobrança desta conta que não terminou (criando, na fila, na maquininha ou
 -- em revisão manual, sem limite de tempo) e as aprovadas que ainda não viraram pagamento aprovado.
--- Só libera com o fim comprovado: recusada, cancelada, expirada ou estornada no Mercado Pago, ou
--- encerramento autorizado por gerente (audit_logs). Vale para qualquer aparelho da loja.
+-- Só libera com o fim comprovado no Mercado Pago: recusada, cancelada, expirada ou estornada. PIN de
+-- gerente e tempo passado não liberam cobrança de resultado desconhecido (ela fica em revisão manual).
+-- Vale para qualquer aparelho da loja.
 CREATE OR REPLACE FUNCTION tchefood_open_terminal_charge(
     p_tenant UUID, p_key VARCHAR, p_order UUID, p_terminal UUID, p_external_terminal VARCHAR,
     p_method VARCHAR, p_amount_cents BIGINT, p_created_by UUID)
@@ -218,7 +235,11 @@ END $$;
 -- Chamada pela Edge Function (service role) antes de qualquer pedido ao Mercado Pago. Mesmas
 -- regras de tchefood_authorize_manager: gerente ou dono ativo da loja, motivo com 5+ letras,
 -- 3 PINs errados em 60 s bloqueiam (com a loja travada: tentativas simultâneas não passam juntas).
--- Devolve o id do audit_log, ou NULL quando o PIN falha ou está bloqueado (a falha fica registrada).
+-- A cobrança fica travada (FOR UPDATE) da leitura à gravação, então o resultado é um destes:
+--   * autorização aplicada: grava UM audit_log POINT_CHARGE_CANCELED e marca a cobrança; devolve o id;
+--   * já autorizada: devolve o id do audit_log da primeira autorização, sem conferir PIN nem gravar outro;
+--   * não se aplica (cobrança em estado final): TF007, sem audit_log;
+--   * PIN errado ou bloqueado: NULL (a falha fica em audit_logs).
 CREATE OR REPLACE FUNCTION tchefood_authorize_point_cancel(
     p_tenant UUID, p_key VARCHAR, p_performed_by UUID, p_manager_pin VARCHAR, p_reason TEXT)
 RETURNS UUID
@@ -229,8 +250,9 @@ DECLARE
     v_order UUID;
     v_failures INT;
     v_id UUID;
+    v_rows INT;
 BEGIN
-    SELECT * INTO v_charge FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant;
+    SELECT * INTO v_charge FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
     END IF;
@@ -239,6 +261,12 @@ BEGIN
     END IF;
     IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: motivo obrigatório (mínimo 5 caracteres).' USING ERRCODE = 'TF006';
+    END IF;
+    IF v_charge.status IN ('approved', 'rejected', 'cancelled', 'expired', 'refunded') THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança já está "%"; não há o que encerrar.', v_charge.status USING ERRCODE = 'TF007';
+    END IF;
+    IF v_charge.cancel_reason = 'operator' AND v_charge.cancel_audit_id IS NOT NULL THEN
+        RETURN v_charge.cancel_audit_id; -- mesma intenção, repetida: vale a primeira autorização
     END IF;
     SELECT o.id INTO v_order FROM orders o WHERE o.id = v_charge.order_id AND o.tenant_id = p_tenant;
     PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || p_tenant::text));
@@ -265,24 +293,106 @@ BEGIN
     UPDATE terminal_charges
        SET cancel_reason = 'operator', cancel_requested_by = p_performed_by, cancel_requested_at = NOW(),
            cancel_authorized_by = v_manager.id, cancel_audit_id = v_id, updated_at = NOW()
-     WHERE id = v_charge.id AND (cancel_requested_at IS NULL OR cancel_reason = 'timeout')
-       AND status NOT IN ('approved', 'rejected', 'cancelled', 'expired', 'refunded');
+     WHERE id = v_charge.id;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    IF v_rows <> 1 THEN
+        -- Desfaz o audit_log junto: não fica registro de encerramento que não marcou a cobrança.
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o encerramento não foi gravado na cobrança.' USING ERRCODE = 'TF007';
+    END IF;
     RETURN v_id;
 END;
 $$;
 
-REVOKE ALL ON FUNCTION tchefood_authorize_point_cancel(UUID, VARCHAR, UUID, VARCHAR, TEXT) FROM PUBLIC;
-DO $$
+-- -----------------------------------------------------------------------------
+-- 2e. Posse do envio: um pedido por vez fala com o Mercado Pago
+-- -----------------------------------------------------------------------------
+-- Dá a posse (por p_lease_ms, relógio do banco) só para cobrança "creating", sem ordem, sem pedido de
+-- encerramento e sem outra posse em vigor. Devolve o número da posse (1 = primeiro envio) ou 0.
+CREATE OR REPLACE FUNCTION tchefood_claim_point_dispatch(p_tenant UUID, p_id UUID, p_lease_ms INT)
+RETURNS INT
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_attempt INT;
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
-        REVOKE ALL ON FUNCTION tchefood_authorize_point_cancel(UUID, VARCHAR, UUID, VARCHAR, TEXT) FROM anon;
+    IF p_lease_ms IS NULL OR p_lease_ms < 1000 OR p_lease_ms > 600000 THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: prazo de posse inválido.';
     END IF;
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
-        REVOKE ALL ON FUNCTION tchefood_authorize_point_cancel(UUID, VARCHAR, UUID, VARCHAR, TEXT) FROM authenticated;
+    UPDATE terminal_charges
+       SET dispatched_at = COALESCE(dispatched_at, NOW()),
+           dispatch_lease_until = NOW() + make_interval(secs => p_lease_ms / 1000.0),
+           dispatch_attempts = dispatch_attempts + 1, updated_at = NOW()
+     WHERE id = p_id AND tenant_id = p_tenant AND status = 'creating' AND external_order_id IS NULL
+       AND cancel_requested_at IS NULL AND (dispatch_lease_until IS NULL OR dispatch_lease_until <= NOW())
+    RETURNING dispatch_attempts INTO v_attempt;
+    RETURN COALESCE(v_attempt, 0);
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- 2f. Bloqueio preventivo da chave que nunca foi gravada (não é cancelamento)
+-- -----------------------------------------------------------------------------
+-- Depois de uma criação sem resposta, o aparelho precisa de prova de que nada vai à maquininha. Sem
+-- cobrança gravada não há o que cancelar nem prazo a conferir: grava-se o bloqueio da chave, e uma criação
+-- atrasada com a mesma chave encontra a cobrança encerrada. Exige operador da equipe ativa da loja e deixa
+-- registro em audit_logs (POINT_KEY_BLOCKED). Chave já gravada: devolve a cobrança que ficou, sem mexer.
+CREATE OR REPLACE FUNCTION tchefood_block_point_key(
+    p_tenant UUID, p_key VARCHAR, p_order UUID, p_terminal UUID, p_external_terminal VARCHAR,
+    p_method VARCHAR, p_amount_cents BIGINT, p_requested_by UUID)
+RETURNS UUID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_id UUID;
+    v_order UUID;
+BEGIN
+    IF p_requested_by IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_requested_by AND u.tenant_id = p_tenant AND u.active) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
     END IF;
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
-        GRANT EXECUTE ON FUNCTION tchefood_authorize_point_cancel(UUID, VARCHAR, UUID, VARCHAR, TEXT) TO service_role;
+    IF NOT EXISTS (SELECT 1 FROM pos_terminals t WHERE t.id = p_terminal AND t.tenant_id = p_tenant) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: maquininha não encontrada nesta loja.' USING ERRCODE = 'TF005';
     END IF;
+    -- Mesma ordem de travas de tchefood_open_terminal_charge (conta, depois a chave): a criação e o bloqueio
+    -- da mesma chave ao mesmo tempo esperam um pelo outro, sem travamento mútuo. A conta pode ainda não ter subido.
+    SELECT o.id INTO v_order FROM orders o WHERE o.id = p_order AND o.tenant_id = p_tenant FOR UPDATE;
+    INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents,
+                                  status, raw_status, cancel_reason, cancel_requested_by, cancel_requested_at)
+    VALUES (p_tenant, p_key, p_order, p_terminal, 'mercado_pago_point', p_external_terminal, p_method, p_amount_cents,
+            'cancelled', 'voided_before_send', 'void', p_requested_by, NOW())
+    ON CONFLICT (idempotency_key) DO NOTHING
+    RETURNING id INTO v_id;
+    IF v_id IS NULL THEN
+        -- A criação gravou primeiro (ou a chave já estava bloqueada): devolve a que ficou, só desta loja.
+        SELECT id INTO v_id FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant;
+        IF v_id IS NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
+        END IF;
+        RETURN v_id;
+    END IF;
+    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, amount_impact, reason, metadata)
+    VALUES (p_tenant, v_order, p_requested_by, 'POINT_KEY_BLOCKED', 0, 'Chave bloqueada antes do envio à maquininha (nada foi cobrado)',
+            jsonb_build_object('idempotency_key', p_key, 'amount_cents', p_amount_cents, 'method', p_method));
+    RETURN v_id;
+END;
+$$;
+
+DO $$
+DECLARE
+    v_fn TEXT;
+BEGIN
+    FOREACH v_fn IN ARRAY ARRAY[
+        'tchefood_authorize_point_cancel(UUID, VARCHAR, UUID, VARCHAR, TEXT)',
+        'tchefood_claim_point_dispatch(UUID, UUID, INT)',
+        'tchefood_block_point_key(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID)'] LOOP
+        EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION %s FROM anon', v_fn);
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION %s FROM authenticated', v_fn);
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+            EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role', v_fn);
+        END IF;
+    END LOOP;
 END $$;
 
 -- -----------------------------------------------------------------------------

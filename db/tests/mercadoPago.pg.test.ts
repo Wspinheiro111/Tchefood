@@ -5,6 +5,7 @@
  *
  * Só roda com TCHEFOOD_PG=host:porta:usuario (ex.: /var/tmp/tfpg:5499:postgres).
  */
+import { execFile } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
@@ -45,6 +46,24 @@ function sql(q: string): string {
 /** Roda como o aparelho (papel authenticated com o tenant no JWT). */
 function asDevice(q: string, tenant = TENANT) {
   return psql(target!, `BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${tenant}"}', true); ${q}; COMMIT;`, DB);
+}
+
+/**
+ * Roda `q` em `count` sessões ao mesmo tempo de verdade: todas esperam uma trava que outra sessão segura
+ * e partem juntas quando ela solta. Devolve a saída de cada uma.
+ */
+async function together(count: number, q: string | ((i: number) => string)): Promise<string[]> {
+  const run = (text: string) => new Promise<string>((resolve, reject) => {
+    const child = execFile('psql', ['-h', target!.host, '-p', target!.port, '-U', target!.user, '-d', DB, '-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1'],
+      (error, stdout, stderr) => (error ? reject(new Error(stderr || error.message)) : resolve(stdout.trim())));
+    child.stdin!.end(text);
+  });
+  const gate = 424242;
+  const holder = run(`SELECT pg_advisory_lock(${gate}); SELECT pg_sleep(1.5);`);
+  await new Promise((r) => setTimeout(r, 400));
+  const runs = Array.from({ length: count }, (_, i) => run(`SELECT pg_advisory_lock_shared(${gate}); ${typeof q === 'function' ? q(i) : q}`));
+  await holder;
+  return (await Promise.all(runs)).map((out) => out.split('\n').pop() ?? '');
 }
 
 let n = 0;
@@ -256,6 +275,161 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     });
   });
 
+  // Antes do bloco do PIN: o último teste dele bloqueia o PIN da loja por 60 s.
+  describe('auditoria r3 P1-02/P1-03: posse do envio (um pedido por vez fala com o Mercado Pago)', () => {
+    const open = (key: string) =>
+      psql(target!, `SELECT tchefood_open_terminal_charge('${TENANT}', '${key}', '${ORDER3}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${STAFF}');`, DB);
+    const claim = (key: string, tenant = TENANT, lease = 30000) =>
+      psql(target!, `SELECT tchefood_claim_point_dispatch('${tenant}', (SELECT id FROM terminal_charges WHERE idempotency_key = '${key}'), ${lease});`, DB);
+    const field = (key: string, expr: string) => sql(`SELECT ${expr} FROM terminal_charges WHERE idempotency_key = '${key}'`);
+
+    it('primeira posse marca o envio; com a posse em vigor ninguém mais ganha; vencida, a repetição ganha a de número 2', () => {
+      expect(open('lease-a').ok).toBe(true);
+      expect(claim('lease-a').out).toBe('1');
+      expect(field('lease-a', `(dispatched_at IS NOT NULL) || '|' || (dispatch_lease_until > NOW() + INTERVAL '25 seconds') || '|' || (dispatch_lease_until <= NOW() + INTERVAL '31 seconds')`)).toBe('true|true|true');
+      const first = field('lease-a', 'dispatched_at');
+      expect(claim('lease-a').out).toBe('0');
+      expect(claim('lease-a').out).toBe('0');
+      expect(field('lease-a', 'dispatch_attempts')).toBe('1');
+      sql(`UPDATE terminal_charges SET dispatch_lease_until = NOW() - INTERVAL '1 second' WHERE idempotency_key = 'lease-a';`);
+      expect(claim('lease-a').out).toBe('2');
+      expect(field('lease-a', 'dispatched_at')).toBe(first); // a hora do primeiro envio não muda
+      expect(claim('lease-a').out).toBe('0');
+    });
+
+    it('oito pedidos ao mesmo tempo: só um ganha a posse', async () => {
+      expect(open('lease-race').ok).toBe(true);
+      const out = await together(8, `SELECT tchefood_claim_point_dispatch('${TENANT}', (SELECT id FROM terminal_charges WHERE idempotency_key = 'lease-race'), 30000);`);
+      expect(out.sort()).toEqual(['0', '0', '0', '0', '0', '0', '0', '1']);
+      expect(field('lease-race', 'dispatch_attempts')).toBe('1');
+    }, 30_000);
+
+    it('pedido de encerramento gravado: ninguém ganha a posse, nem com a anterior vencida, nem forçando no banco', () => {
+      expect(open('lease-cancel').ok).toBe(true);
+      expect(claim('lease-cancel').out).toBe('1');
+      sql(`UPDATE terminal_charges SET dispatch_lease_until = NOW() - INTERVAL '1 second', cancel_reason = 'timeout', cancel_requested_at = NOW() WHERE idempotency_key = 'lease-cancel';`);
+      expect(claim('lease-cancel').out).toBe('0');
+      const forced = psql(target!, `UPDATE terminal_charges SET dispatch_attempts = dispatch_attempts + 1 WHERE idempotency_key = 'lease-cancel';`, DB);
+      expect(forced.ok).toBe(false);
+      expect(forced.message).toContain('não é mais enviada');
+      // Nunca enviada com encerramento pedido: também não.
+      expect(open('lease-never').ok).toBe(true);
+      sql(`UPDATE terminal_charges SET cancel_reason = 'timeout', cancel_requested_at = NOW() WHERE idempotency_key = 'lease-never';`);
+      expect(claim('lease-never').out).toBe('0');
+      expect(field('lease-never', 'dispatched_at IS NULL')).toBe('t');
+    });
+
+    it('sem posse para cobrança com ordem, fora de "creating", de outra loja ou com prazo inválido; a contagem não volta', () => {
+      expect(open('lease-order').ok).toBe(true);
+      sql(`UPDATE terminal_charges SET external_order_id = 'ORDX' WHERE idempotency_key = 'lease-order';`);
+      expect(claim('lease-order').out).toBe('0');
+      expect(open('lease-review').ok).toBe(true);
+      sql(`UPDATE terminal_charges SET status = 'manual_review' WHERE idempotency_key = 'lease-review';`);
+      expect(claim('lease-review').out).toBe('0');
+      expect(open('lease-other').ok).toBe(true);
+      expect(claim('lease-other', OTHER).out).toBe('0');
+      expect(claim('lease-other', TENANT, 10).ok).toBe(false);
+      expect(claim('lease-other').out).toBe('1');
+      const back = psql(target!, `UPDATE terminal_charges SET dispatch_attempts = 0 WHERE idempotency_key = 'lease-other';`, DB);
+      expect(back.ok).toBe(false);
+      expect(back.message).toContain('não volta');
+    });
+
+    it('o aparelho não chama a função', () => {
+      for (const role of ['authenticated', 'anon']) {
+        const r = psql(target!, `BEGIN; SET LOCAL ROLE ${role}; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);
+          SELECT tchefood_claim_point_dispatch('${TENANT}', gen_random_uuid(), 30000); COMMIT;`, DB);
+        expect(r.sqlstate, role).toBe('42501');
+      }
+      const svc = psql(target!, `BEGIN; SET LOCAL ROLE service_role; SELECT tchefood_claim_point_dispatch('${TENANT}', gen_random_uuid(), 30000); COMMIT;`, DB);
+      expect(svc.ok, svc.message ?? '').toBe(true);
+    });
+
+    it('auditoria r3 P0-01: enviada sem resposta, com encerramento do gerente, em revisão manual: segue reservando o saldo', () => {
+      const ORDER4 = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+      sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER4}', '${TENANT}', '${TABLE}', '${STAFF}');
+           BEGIN; SET LOCAL session_replication_role = replica; UPDATE orders SET total_amount = 100, remaining_balance = 100 WHERE id = '${ORDER4}'; COMMIT;`);
+      const open4 = (key: string, cents: number) =>
+        psql(target!, `SELECT tchefood_open_terminal_charge('${TENANT}', '${key}', '${ORDER4}', '${TERMINAL}', '${MP_ID}', 'CREDIT', ${cents}, '${STAFF}');`, DB);
+      expect(open4('unk-a', 10000).ok).toBe(true);
+      expect(claim('unk-a').out).toBe('1');
+      const auth = psql(target!, `SELECT tchefood_authorize_point_cancel('${TENANT}', 'unk-a', '${STAFF}', '${MANAGER_PIN}', 'cliente desistiu');`, DB);
+      expect(auth.ok, auth.message ?? '').toBe(true);
+      expect(auth.out).toMatch(/^[0-9a-f-]{36}$/);
+      // O que a função grava quando a posse vence sem ordem (charge.ts cancelCharge):
+      sql(`UPDATE terminal_charges SET status = 'manual_review', raw_status = 'dispatch_unknown', raw_status_detail = 'DISPATCH_UNKNOWN' WHERE idempotency_key = 'unk-a';`);
+      // PIN do gerente e tempo passado não liberam: a segunda cobrança da conta é recusada.
+      sql(`UPDATE terminal_charges SET created_at = NOW() - INTERVAL '2 days', dispatch_lease_until = NOW() - INTERVAL '2 days' WHERE idempotency_key = 'unk-a';`);
+      expect(open4('unk-b', 1)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      // A resposta atrasada ainda grava a aprovação por cima da revisão manual.
+      const late = psql(target!, `UPDATE terminal_charges SET status = 'approved', external_order_id = 'ORD-LATE', external_payment_id = '4242', paid_amount_cents = 10000, card_brand = 'VISA', authorization_code = 'LATE1'
+                                  WHERE idempotency_key = 'unk-a' AND status = 'manual_review';`, DB);
+      expect(late.ok, late.message ?? '').toBe(true);
+      expect(field('unk-a', 'status')).toBe('approved');
+    });
+  });
+
+  describe('auditoria r3 P1-01: bloqueio preventivo da chave nunca gravada', () => {
+    const block = (key: string, who: string, tenant = TENANT, terminal = TERMINAL) =>
+      psql(target!, `SELECT tchefood_block_point_key('${tenant}', '${key}', '${ORDER3}', '${terminal}', '${MP_ID}', 'CREDIT', 100, ${who});`, DB);
+    const audits = (key: string) => sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'POINT_KEY_BLOCKED' AND metadata->>'idempotency_key' = '${key}'`);
+
+    it.each([
+      ['sem operador', 'NULL'],
+      ['operador inativo', `'${INACTIVE}'`],
+      ['operador de outra loja', `'${OTHER_STAFF}'`],
+    ])('%s não bloqueia (TF004) e nada é gravado', (_label, who) => {
+      expect(block('blk-who', who)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = 'blk-who'`)).toBe('0');
+      expect(audits('blk-who')).toBe('0');
+    });
+
+    it('operador ativo: grava a chave encerrada (nunca enviada), com quem pediu e um registro; repetir não grava outro', () => {
+      const r = block('blk-ok', `'${STAFF}'`);
+      expect(r.ok, r.message ?? '').toBe(true);
+      expect(sql(`SELECT status || '|' || raw_status || '|' || cancel_reason || '|' || cancel_requested_by || '|' || (dispatched_at IS NULL) || '|' || (created_by IS NULL) FROM terminal_charges WHERE idempotency_key = 'blk-ok'`))
+        .toBe(`cancelled|voided_before_send|void|${STAFF}|true|true`);
+      expect(sql(`SELECT performed_by_user_id || '|' || (authorized_by_manager_id IS NULL) FROM audit_logs WHERE action_type = 'POINT_KEY_BLOCKED' AND metadata->>'idempotency_key' = 'blk-ok'`)).toBe(`${STAFF}|true`);
+      expect(block('blk-ok', `'${STAFF}'`).out).toBe(r.out);
+      expect(audits('blk-ok')).toBe('1');
+      // A criação atrasada com a mesma chave encontra a cobrança encerrada: a função de abrir devolve a mesma linha.
+      const late = psql(target!, `SELECT tchefood_open_terminal_charge('${TENANT}', 'blk-ok', '${ORDER3}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${STAFF}');`, DB);
+      expect(late.out).toBe(r.out);
+      expect(sql(`SELECT status FROM terminal_charges WHERE idempotency_key = 'blk-ok'`)).toBe('cancelled');
+      // E nunca ganha a posse do envio.
+      expect(psql(target!, `SELECT tchefood_claim_point_dispatch('${TENANT}', '${r.out}', 30000);`, DB).out).toBe('0');
+    });
+
+    it('a criação gravou primeiro: o bloqueio não mexe na cobrança nem registra nada', () => {
+      const created = psql(target!, `SELECT tchefood_open_terminal_charge('${TENANT}', 'blk-late', '${ORDER3}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${STAFF}');`, DB);
+      expect(created.ok).toBe(true);
+      expect(block('blk-late', `'${STAFF}'`).out).toBe(created.out);
+      expect(sql(`SELECT status || '|' || (cancel_reason IS NULL) FROM terminal_charges WHERE idempotency_key = 'blk-late'`)).toBe('creating|true');
+      expect(audits('blk-late')).toBe('0');
+    });
+
+    it('criação e bloqueio ao mesmo tempo: fica uma linha só, e ou é a cobrança ou é o bloqueio', async () => {
+      const q = (i: number) => (i % 2
+        ? `SELECT tchefood_block_point_key('${TENANT}', 'blk-race', '${ORDER3}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${STAFF}');`
+        : `SELECT tchefood_open_terminal_charge('${TENANT}', 'blk-race', '${ORDER3}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${STAFF}');`);
+      const out = await together(8, q);
+      expect(new Set(out).size).toBe(1);
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = 'blk-race'`)).toBe('1');
+      const status = sql(`SELECT status FROM terminal_charges WHERE idempotency_key = 'blk-race'`);
+      expect(audits('blk-race')).toBe(status === 'cancelled' ? '1' : '0');
+    }, 30_000);
+
+    it('chave de outra loja, maquininha de outra loja e papéis do aparelho', () => {
+      expect(block('blk-ok', `'${OTHER_STAFF}'`, OTHER)).toMatchObject({ ok: false, sqlstate: 'TF005' }); // maquininha não é da outra loja
+      for (const role of ['authenticated', 'anon']) {
+        const r = psql(target!, `BEGIN; SET LOCAL ROLE ${role}; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);
+          SELECT tchefood_block_point_key('${TENANT}', 'blk-dev', '${ORDER3}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${STAFF}'); COMMIT;`, DB);
+        expect(r.sqlstate, role).toBe('42501');
+      }
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = 'blk-dev'`)).toBe('0');
+    });
+  });
+
   describe('auditoria r2 P1-01: encerrar pelo operador só com PIN de gerente conferido no banco', () => {
     const open = (key: string) =>
       psql(target!, `SELECT tchefood_open_terminal_charge('${TENANT}', '${key}', '${ORDER3}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 100, '${STAFF}');`, DB);
@@ -316,6 +490,43 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         const r = psql(target!, `BEGIN; SET LOCAL ROLE ${role}; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);
           SELECT tchefood_authorize_point_cancel('${TENANT}', 'pin-ok', '${STAFF}', '${MANAGER_PIN}', 'cliente desistiu'); COMMIT;`, DB);
         expect(r.sqlstate, role).toBe('42501');
+      }
+    });
+
+    it('auditoria r3 P2-01: o mesmo pedido autorizado dez vezes deixa UM registro e devolve sempre o mesmo', () => {
+      expect(open('pin-ten').ok).toBe(true);
+      const ids = new Set<string>();
+      for (let i = 0; i < 10; i += 1) {
+        // Da segunda em diante nem o PIN é conferido de novo (PIN errado não vira falha nem outro registro).
+        const r = authorize('pin-ten', i === 0 ? MANAGER_PIN : i % 2 ? '0000' : MANAGER_PIN);
+        expect(r.ok, r.message ?? '').toBe(true);
+        ids.add(r.out);
+      }
+      expect(ids.size).toBe(1);
+      expect(audits('POINT_CHARGE_CANCELED', 'pin-ten')).toBe('1');
+      expect(audits('MANAGER_PIN_FAILED', 'pin-ten')).toBe('0');
+      expect(sql(`SELECT cancel_audit_id FROM terminal_charges WHERE idempotency_key = 'pin-ten'`)).toBe([...ids][0]);
+    });
+
+    it('auditoria r3 P2-01: oito autorizações ao mesmo tempo gravam um registro só', async () => {
+      expect(open('pin-race').ok).toBe(true);
+      const out = await together(8, `SELECT tchefood_authorize_point_cancel('${TENANT}', 'pin-race', '${STAFF}', '${MANAGER_PIN}', 'cliente desistiu');`);
+      expect(new Set(out).size).toBe(1);
+      expect(out[0]).toMatch(/^[0-9a-f-]{36}$/);
+      expect(audits('POINT_CHARGE_CANCELED', 'pin-race')).toBe('1');
+    }, 30_000);
+
+    it('auditoria r3 P2-01: cobrança que já terminou não ganha registro de encerramento (TF007)', () => {
+      for (const [key, set] of [
+        ['pin-paid', `status = 'approved', external_payment_id = '77', paid_amount_cents = 100, card_brand = 'VISA', authorization_code = 'OK7'`],
+        ['pin-gone', `status = 'expired'`],
+      ] as const) {
+        expect(open(key).ok).toBe(true);
+        sql(`UPDATE terminal_charges SET ${set} WHERE idempotency_key = '${key}';`);
+        expect(authorize(key, MANAGER_PIN)).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        expect(authorize(key, '0000')).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        expect(sql(`SELECT count(*) FROM audit_logs WHERE metadata->>'idempotency_key' = '${key}'`)).toBe('0');
+        expect(sql(`SELECT cancel_reason IS NULL AND cancel_audit_id IS NULL FROM terminal_charges WHERE idempotency_key = '${key}'`)).toBe('t');
       }
     });
 

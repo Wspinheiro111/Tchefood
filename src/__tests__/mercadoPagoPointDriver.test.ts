@@ -99,7 +99,7 @@ describe('MercadoPagoPointDriver', () => {
     expect(creates).toHaveLength(3);
     expect(new Set(creates.map((c) => c.body.idempotency_key))).toEqual(new Set([REQ.idempotency_key]));
     expect(calls.find((c) => c.body.action === 'cancel')!.body).toEqual({
-      action: 'cancel', terminal_id: TERMINAL.id, idempotency_key: REQ.idempotency_key, order_id: REQ.order_id, amount_cents: 2450, method: 'CREDIT', reason: 'timeout',
+      action: 'cancel', terminal_id: TERMINAL.id, idempotency_key: REQ.idempotency_key, order_id: REQ.order_id, amount_cents: 2450, method: 'CREDIT', reason: 'timeout', staff_id: STAFF,
     });
   });
 
@@ -240,6 +240,49 @@ describe('MercadoPagoPointDriver', () => {
     const cancels = h.calls.filter((c) => c.body.action === 'cancel').map((c) => c.body.reason);
     expect(cancels).toEqual(['operator', 'timeout']);
     expect(h.counts.status).toBeGreaterThanOrEqual(POINT_WAIT_MS / 2_000 - 2);
+  });
+
+  it('auditoria r3 P2-02: o prazo do cartão conta do primeiro envio, não da sincronização', async () => {
+    let clock = 0;
+    const cancelAt: number[] = [];
+    let createAt = -1;
+    const driver = new MercadoPagoPointDriver('TEF_POS_WIRELESS', TERMINAL, {
+      config: async () => CFG,
+      fetch: async (_url, init) => {
+        const body = JSON.parse(init.body) as Record<string, unknown>;
+        if (body.action === 'create' && createAt < 0) createAt = clock;
+        if (body.action === 'cancel') {
+          cancelAt.push(clock);
+          return { status: 200, text: async () => JSON.stringify({ status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'cancelada' }) };
+        }
+        return { status: 200, text: async () => JSON.stringify(pending.body) };
+      },
+      sleep: async (ms) => { clock += ms; },
+      now: () => clock,
+      timer: () => new Promise(() => undefined),
+      operator: async () => STAFF,
+      beforeCreate: async () => { clock += 14_000; }, // sincronização lenta, dentro do prazo dela
+    });
+    expect((await driver.charge(REQ)).status).toBe('DECLINED');
+    expect(createAt).toBe(14_000);
+    // A Point teve os 2 minutos inteiros desde o envio (antes: o pedido saía aos 120 s do início, 106 s de espera).
+    expect(cancelAt[0]! - createAt).toBeGreaterThanOrEqual(POINT_WAIT_MS);
+    expect(cancelAt[0]! - createAt).toBeLessThan(POINT_WAIT_MS + 2 * 2_000);
+  });
+
+  it('auditoria r3 P1-01: pedido do operador sem cobrança gravada (404) cai; segue o bloqueio preventivo com o operador', async () => {
+    const h = harness((action, n) => {
+      if (action === 'create') return 'network';
+      if (action === 'status') return { status: 404, body: { error: 'not_found', message: 'não encontrada' } };
+      return n === 1 ? { status: 404, body: { error: 'not_found', message: 'não gravada' } } : { status: 200, body: { status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'A cobrança não chegou à maquininha (nada foi cobrado).' } };
+    });
+    const p = h.driver.charge(REQ);
+    h.driver.abort(REQ.request_id, { manager_pin: '9999', reason: 'cliente desistiu' });
+    expect((await p).status).toBe('DECLINED');
+    const cancels = h.calls.filter((c) => c.body.action === 'cancel').map((c) => c.body);
+    expect(cancels.map((c) => c.reason)).toEqual(['operator', 'timeout']);
+    expect(cancels[1]).toMatchObject({ staff_id: STAFF });
+    expect(cancels[1]).not.toHaveProperty('manager_pin');
   });
 
   it('encerramento por prazo cedo demais no servidor (409) segue consultando e tenta de novo', async () => {

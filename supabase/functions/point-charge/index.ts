@@ -8,11 +8,12 @@
 //     "amount_cents": 2450, "method": "CREDIT" | "DEBIT", "staff_id": "<uuid>" }
 //   { "action": "status", "idempotency_key": "..." }
 //   { "action": "cancel", "idempotency_key": "...", "terminal_id", "order_id", "amount_cents", "method",
-//     "reason": "timeout" }                                    (prazo vencido: o servidor confere pela hora gravada)
+//     "reason": "timeout", "staff_id": "<uuid>" }              (prazo vencido: o servidor confere 2 min pela hora gravada)
 //   { ..., "reason": "operator", "staff_id": "<uuid>", "manager_pin": "1234", "reason_text": "..." }
 //                                                             (pedido do operador: PIN de gerente conferido no banco)
 //   O encerramento não estorna nada: cobrança paga continua paga.
-//   Cancel sem cobrança gravada grava o bloqueio da chave: a criação atrasada não chega mais à Point.
+//   Cancel sem cobrança gravada não cancela nada: com "timeout" grava o bloqueio preventivo da chave (operador
+//   ativo da loja, com registro), e a criação atrasada não chega mais à Point; com "operator" é recusado (404).
 //
 // Resposta: { status: "PENDING" | "APPROVED" | "DECLINED" | "MANUAL_REVIEW", ... } (ver charge.ts).
 // O token do Mercado Pago fica em payment_provider_secrets e só a service role lê; o aparelho nunca o vê.
