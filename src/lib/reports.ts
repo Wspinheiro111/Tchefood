@@ -25,13 +25,110 @@ export function shiftStart(now: Date = new Date(), cutoffHour = SHIFT_CUTOFF_HOU
   return start;
 }
 
+/** Fuso da loja: o turno vira às 05:00 de Brasília, não do relógio do aparelho. */
+export const SHIFT_TIME_ZONE = 'America/Sao_Paulo';
+
+/** Período de relatório [start, end): `start` entra, `end` fica de fora. */
+export interface ShiftPeriod {
+  start: Date;
+  end: Date;
+}
+
+const SHIFT_CLOCK = new Intl.DateTimeFormat('en-US', {
+  timeZone: SHIFT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+});
+
+/** Relógio de parede de Brasília no instante `ms`, como se fosse UTC (para calcular a diferença de fuso). */
+function wallClockAsUtc(ms: number): number {
+  const p = Object.fromEntries(SHIFT_CLOCK.formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), Number(p.hour), Number(p.minute), Number(p.second));
+}
+
+/** Instante em que o relógio de Brasília marca `y-m-d hh:00`. */
+function brasiliaInstant(y: number, m: number, d: number, hour: number): number {
+  const guess = Date.UTC(y, m, d, hour);
+  let at = guess - (wallClockAsUtc(guess) - guess);
+  at = guess - (wallClockAsUtc(at) - at);
+  return at;
+}
+
+/**
+ * Início do turno corrente no horário de Brasília (America/Sao_Paulo): hoje às
+ * 05:00, ou ontem às 05:00 se ainda é madrugada. Não depende do fuso do aparelho.
+ */
+export function shiftStartBrasilia(now: Date = new Date(), cutoffHour = SHIFT_CUTOFF_HOUR): Date {
+  const p = Object.fromEntries(SHIFT_CLOCK.formatToParts(now).map((x) => [x.type, x.value]));
+  const y = Number(p.year);
+  const m = Number(p.month) - 1;
+  const d = Number(p.day);
+  const today = brasiliaInstant(y, m, d, cutoffHour);
+  if (now.getTime() >= today) return new Date(today);
+  return new Date(brasiliaInstant(y, m, d - 1, cutoffHour));
+}
+
+/** Início do turno seguinte ao que começou em `start` (05:00 do dia seguinte em Brasília). */
+export function nextShiftStart(start: Date, cutoffHour = SHIFT_CUTOFF_HOUR): Date {
+  return shiftStartBrasilia(new Date(start.getTime() + 36 * 3600_000), cutoffHour);
+}
+
+/**
+ * Período do turno corrente: de `start` até agora (inclusive), nunca além do
+ * início do turno seguinte. Registro com data no futuro não entra.
+ */
+export function currentShiftPeriod(start: Date = shiftStartBrasilia(), now: Date = new Date()): ShiftPeriod {
+  return { start, end: new Date(Math.min(nextShiftStart(start).getTime(), now.getTime() + 1)) };
+}
+
+/**
+ * Instante ISO 8601 com fuso explícito (Z ou ±hh:mm), validado no calendário:
+ * 31/11, 30/02, 25h etc. são recusados em vez de normalizados. Sem fuso também é
+ * recusado, porque seria lido no fuso do aparelho. Devolve ms ou null.
+ */
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|([+-])(\d{2}):?(\d{2}))$/;
+export function parseIsoInstant(iso: unknown): number | null {
+  if (typeof iso !== 'string') return null;
+  const m = ISO_INSTANT.exec(iso);
+  if (!m) return null;
+  const [y, mo, d, h, mi] = [m[1], m[2], m[3], m[4], m[5]].map(Number) as [number, number, number, number, number];
+  const sec = m[6] === undefined ? 0 : Number(m[6]);
+  const ms = m[7] === undefined ? 0 : Number(m[7].slice(0, 3).padEnd(3, '0'));
+  if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || sec > 59) return null;
+  const daysInMonth = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  if (d > daysInMonth) return null;
+  let offsetMin = 0;
+  if (m[8] !== 'Z') {
+    const oh = Number(m[10]);
+    const om = Number(m[11]);
+    if (oh > 23 || om > 59) return null;
+    offsetMin = (m[9] === '-' ? -1 : 1) * (oh * 60 + om);
+  }
+  const t = Date.UTC(y, mo - 1, d, h, mi, sec, ms) - offsetMin * 60_000;
+  return Number.isFinite(t) ? t : null;
+}
+
+/** true se a data é válida e cai em [start, end). Data inválida, impossível, sem fuso, vazia ou null fica de fora. */
+export function inShiftPeriod(iso: string | null | undefined, period: ShiftPeriod): boolean {
+  const t = parseIsoInstant(iso);
+  return t !== null && t >= period.start.getTime() && t < period.end.getTime();
+}
+
+/** Legenda "dd/mm, hh:mm" do início do turno, sempre no horário de Brasília. */
+export function formatShiftStart(start: Date): string {
+  return start.toLocaleString('pt-BR', { timeZone: SHIFT_TIME_ZONE, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
 /**
  * KPIs do turno: faturamento, contas fechadas, ticket médio e 10% contam só o
- * que aconteceu desde `since`; o saldo em aberto no salão é sempre o atual.
+ * que aconteceu no turno; o saldo em aberto no salão é sempre o atual. Com um
+ * `ShiftPeriod`, usa o mesmo filtro [início, fim) da conciliação e do rateio;
+ * com um `Date`, conta desde ele (comportamento anterior).
  */
-export function shiftKpis(orders: readonly Order[], payments: readonly Payment[], since: Date = shiftStart()): ShiftKpis {
-  const from = since.getTime();
-  const inShift = (iso: string | null) => iso !== null && new Date(iso).getTime() >= from;
+export function shiftKpis(orders: readonly Order[], payments: readonly Payment[], since: Date | ShiftPeriod = shiftStart()): ShiftKpis {
+  const inShift =
+    since instanceof Date
+      ? (iso: string | null) => iso !== null && new Date(iso).getTime() >= since.getTime()
+      : (iso: string | null) => inShiftPeriod(iso, since);
   const approved = payments.filter((p) => p.status === 'APPROVED' && inShift(p.created_at));
   const grossCents = approved.reduce((a, p) => a + toCents(p.amount), 0);
   const closed = orders.filter((o) => o.status === 'CLOSED' && inShift(o.closed_at));
@@ -60,7 +157,8 @@ export interface ReconRow {
   count: number;
 }
 
-export function reconciliation(payments: readonly Payment[]): ReconRow[] {
+/** Conciliação por adquirente: só pagamentos aprovados dentro do período do turno [start, end). */
+export function reconciliation(payments: readonly Payment[], period: ShiftPeriod = currentShiftPeriod()): ReconRow[] {
   const rows: Record<ReconKey, ReconRow> = {
     STONE: { acquirer: 'STONE', cnpj: '16501555000157', byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
     PAGBANK: { acquirer: 'PAGBANK', cnpj: '08561701000101', byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
@@ -72,7 +170,7 @@ export function reconciliation(payments: readonly Payment[]): ReconRow[] {
     CASH_DESK: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 },
   };
   for (const p of payments) {
-    if (p.status !== 'APPROVED') continue;
+    if (p.status !== 'APPROVED' || !inShiftPeriod(p.created_at, period)) continue;
     const key: ReconKey = p.acquirer === 'STONE' || p.acquirer === 'PAGBANK' ? p.acquirer : 'CASH_DESK';
     cents[key][p.method] += toCents(p.amount);
     rows[key].count += 1;
@@ -100,14 +198,15 @@ export interface WaiterRow {
  * cobrada é distribuída entre os garçons proporcionalmente ao valor que cada
  * um lançou (maiores restos → Σ comissões == Σ taxas, sem perder centavo).
  */
-export function waiterSplit(orders: readonly Order[], items: readonly OrderItem[], staff: readonly StaffUser[]): WaiterRow[] {
+export function waiterSplit(orders: readonly Order[], items: readonly OrderItem[], staff: readonly StaffUser[], period: ShiftPeriod = currentShiftPeriod()): WaiterRow[] {
   const sales = new Map<string, { cents: number; qty: number; commission: number }>();
   const bump = (id: string) => {
     if (!sales.has(id)) sales.set(id, { cents: 0, qty: 0, commission: 0 });
     return sales.get(id)!;
   };
   for (const o of orders) {
-    if (o.status !== 'CLOSED') continue;
+    // Só contas fechadas dentro do turno [start, end) entram no rateio.
+    if (o.status !== 'CLOSED' || o.closed_at === null || !inShiftPeriod(o.closed_at, period)) continue;
     const valid = items.filter((i) => i.order_id === o.id && i.status !== 'CANCELED');
     const perWaiter = new Map<string, number>();
     for (const i of valid) {

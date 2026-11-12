@@ -476,6 +476,27 @@ END $$;
 -- de novo. O aparelho não grava a coluna (o gatilho mantém a do banco).
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_auth_seq BIGINT NOT NULL DEFAULT 0;
 
+-- A autorização de troca do desconto que vale para OLD → NEW: a última DISCOUNT_APPLIED da
+-- conta (pela sequência do servidor), de gerente ativo, conferindo com o valor do banco e o
+-- novo, ainda não usada nesta conta (mais nova que o marcador) e mais nova que o último
+-- resgate ou estorno do cashback da conta (autorização de antes do estorno não vale depois
+-- dele). Devolve a sequência dela, ou NULL.
+CREATE OR REPLACE FUNCTION tchefood_discount_auth_seq(p_tenant UUID, p_order UUID, p_before NUMERIC, p_after NUMERIC, p_used BIGINT)
+RETURNS BIGINT LANGUAGE sql STABLE SET search_path = public AS $$
+    SELECT CASE WHEN (a.metadata->>'discount_before')::NUMERIC = p_before
+                 AND (a.metadata->>'discount_after')::NUMERIC = p_after
+                 AND m.role IN ('MANAGER', 'OWNER') AND m.active
+                 AND a.server_seq > COALESCE(p_used, 0)
+                 AND a.server_seq > COALESCE((SELECT max(c.server_seq) FROM audit_logs c
+                                               WHERE c.tenant_id = p_tenant AND c.order_id = p_order
+                                                 AND c.action_type IN ('CASHBACK_REDEEMED', 'CASHBACK_REFUNDED', 'CASHBACK_REFUND_HELD')), 0)
+                THEN a.server_seq END
+      FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id AND m.tenant_id = a.tenant_id
+     WHERE a.order_id = p_order AND a.tenant_id = p_tenant AND a.action_type = 'DISCOUNT_APPLIED'
+     ORDER BY a.server_seq DESC
+     LIMIT 1;
+$$;
+
 CREATE OR REPLACE FUNCTION tchefood_orders_keep_discount()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
@@ -505,19 +526,8 @@ BEGIN
     -- conferindo com o valor do banco e o novo, ainda não usada nesta conta e mais nova que o
     -- último resgate ou estorno do cashback da conta (autorização de antes do estorno não
     -- vale depois dele).
-    SELECT (a.metadata->>'discount_before')::NUMERIC = OLD.discount_amount
-       AND (a.metadata->>'discount_after')::NUMERIC = NEW.discount_amount
-       AND m.role IN ('MANAGER', 'OWNER') AND m.active
-       AND a.server_seq > OLD.discount_auth_seq
-       AND a.server_seq > COALESCE((SELECT max(c.server_seq) FROM audit_logs c
-                                     WHERE c.tenant_id = NEW.tenant_id AND c.order_id = NEW.id
-                                       AND c.action_type IN ('CASHBACK_REDEEMED', 'CASHBACK_REFUNDED', 'CASHBACK_REFUND_HELD')), 0),
-           a.server_seq
-      INTO v_ok, v_auth_seq
-      FROM audit_logs a LEFT JOIN staff_users m ON m.id = a.authorized_by_manager_id AND m.tenant_id = a.tenant_id
-     WHERE a.order_id = NEW.id AND a.tenant_id = NEW.tenant_id AND a.action_type = 'DISCOUNT_APPLIED'
-     ORDER BY a.server_seq DESC
-     LIMIT 1;
+    v_auth_seq := tchefood_discount_auth_seq(NEW.tenant_id, NEW.id, OLD.discount_amount, NEW.discount_amount, OLD.discount_auth_seq);
+    v_ok := v_auth_seq IS NOT NULL;
     IF NEW.discount_amount > OLD.discount_amount THEN
         -- Aumento em conta com cashback: o desconto do cashback só entra pela função do
         -- resgate. Sem esta trava, depois de um estorno o aparelho subia o desconto de volta
@@ -539,8 +549,10 @@ BEGIN
             RAISE EXCEPTION 'TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ % e este aparelho mandou R$ % (outro aparelho ou o cashback mudou a conta). Use o desconto da nuvem antes de cobrar.',
                 to_char(OLD.discount_amount, 'FM999999990.00'), to_char(NEW.discount_amount, 'FM999999990.00');
         END IF;
-        -- Sem cashback, o aumento é conferido por tchefood_require_order_audit (PIN de gerente).
-        IF COALESCE(v_ok, false) THEN NEW.discount_auth_seq := v_auth_seq; END IF;
+        -- O aumento é conferido, e a autorização marcada como usada, por
+        -- tchefood_require_order_audit (schema_desconto_uso_unico.sql, gatilho adiado): ela lê
+        -- o marcador da tabela no fim da transação. Marcar aqui faria a conferência adiada
+        -- ver a própria autorização como já usada e recusar o desconto legítimo.
         RETURN NEW;
     END IF;
     -- Redução que só limita o desconto ao bruto que a conta terá com esta mesma atualização
@@ -560,13 +572,40 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_DESCONTO: o desconto desta conta na nuvem é R$ % e este aparelho mandou R$ % (outro aparelho ou o cashback mudou a conta). Use o desconto da nuvem antes de cobrar.',
             to_char(OLD.discount_amount, 'FM999999990.00'), to_char(NEW.discount_amount, 'FM999999990.00');
     END IF;
-    NEW.discount_auth_seq := v_auth_seq;
+    -- A autorização da troca é marcada como usada depois da gravação
+    -- (tchefood_orders_discount_auth_used): aqui o gatilho de schema_desconto_uso_unico.sql,
+    -- que roda depois deste, devolveria o marcador ao do banco quando o aparelho manda a
+    -- coluna junto, e a mesma autorização voltaria a valer.
     RETURN NEW;
 END;
 $$;
 DROP TRIGGER IF EXISTS trg_orders_00_keep_discount ON orders;
 CREATE TRIGGER trg_orders_00_keep_discount BEFORE UPDATE OF discount_amount, discount_auth_seq ON orders
     FOR EACH ROW EXECUTE FUNCTION tchefood_orders_keep_discount();
+
+-- Redução autorizada do desconto (troca do manual por um menor): marca a autorização como
+-- usada, já com a linha gravada. O UPDATE roda um nível de gatilho abaixo, onde o aparelho
+-- não é barrado ao gravar o marcador. Roda antes do estorno do cashback (ordem dos nomes),
+-- com o extrato de auditoria igual ao que a conferência acima viu.
+CREATE OR REPLACE FUNCTION tchefood_orders_discount_auth_used()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    v_seq BIGINT;
+BEGIN
+    IF pg_trigger_depth() > 1 OR current_user NOT IN ('anon', 'authenticated') THEN
+        RETURN NULL;
+    END IF;
+    v_seq := tchefood_discount_auth_seq(NEW.tenant_id, NEW.id, OLD.discount_amount, NEW.discount_amount, OLD.discount_auth_seq);
+    IF v_seq IS NOT NULL THEN
+        UPDATE orders SET discount_auth_seq = v_seq WHERE id = NEW.id AND tenant_id = NEW.tenant_id;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_orders_00_discount_auth_used ON orders;
+CREATE TRIGGER trg_orders_00_discount_auth_used AFTER UPDATE OF discount_amount ON orders
+    FOR EACH ROW WHEN (NEW.discount_amount < OLD.discount_amount)
+    EXECUTE FUNCTION tchefood_orders_discount_auth_used();
 
 -- Estorno do cashback (decisão do Will, 10/11/2026: "devolva"). Quando o cancelamento de
 -- item deixa o desconto da conta abaixo do cashback que ela consumiu, a diferença volta
