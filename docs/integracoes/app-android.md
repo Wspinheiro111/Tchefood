@@ -32,16 +32,47 @@ nunca ficarem visíveis a uma página de terceiros.
 
 ## Gerar o APK
 
-Pelo GitHub: a action **APK Android** roda em todo PR que mexe no app e deixa os dois APKs (debug) em
-*Artifacts* (`tchefood-apk`). Também dá para rodar à mão em Actions → APK Android → Run workflow.
+### 1. Script (sem GitHub Actions, sem custo)
 
-Na máquina (Android Studio ou SDK + Gradle 8.7, Java 17):
+`scripts/build-apk.sh` faz tudo: confere Java 17 a 21 e Node, baixa o SDK Android e o Gradle 8.7 se faltarem
+(em `~/.cache/tchefood-android`, fora do projeto), roda `npm ci && npm run build`, compila e deixa os APKs
+debug em `apk/`. A pasta `apk/` só guarda os APKs da última execução: ela é um link para a versão atual
+(em `.apk-releases/`), trocado de uma vez, então quem lê `apk/` vê sempre o conjunto anterior inteiro ou o novo
+inteiro, mesmo se o script for morto no meio; se o build falhar, fica como estava. A versão anterior fica guardada
+até a publicação seguinte (`.apk-anterior`), para um download que já tinha começado terminar inteiro; ela só muda
+depois que a troca de `apk/` deu certo (enquanto isso a versão que sai fica em `.apk-pendente`, e a execução
+seguinte conclui esse passo se o script morrer no meio). Só roda um build por vez no mesmo repositório (trava do
+sistema operacional em `.apk-build.flock`): uma segunda execução simultânea para com aviso e não altera nada. npm,
+Gradle, downloads e SDK rodam sob um supervisor que segura a trava enquanto o comando existir e, se o script for
+interrompido ou morto (até com `kill -9` só no bash), encerra o comando e os filhos dele antes de soltá-la; o
+próprio comando roda sem a trava, então um daemon que sobrevive ao build não a segura. Precisa de `perl` e `ps`
+(já vêm no Linux e no Mac).
 
 ```bash
-npm ci && npm run build
-gradle -p android assemblePagbankDebug   # ou assembleTabletDebug
-# APK em android/app/build/outputs/apk/<variante>/debug/
+bash scripts/build-apk.sh            # pagbank e tablet
+bash scripts/build-apk.sh pagbank    # só a Moderninha Smart
 ```
+
+**Google Cloud Shell** (grátis, só precisa de conta Google; abre em shell.cloud.google.com):
+
+```bash
+git clone https://github.com/Wspinheiro111/Tchefood && cd Tchefood
+bash scripts/build-apk.sh pagbank
+cloudshell download apk/tchefood-pagbank-debug.apk
+```
+
+Também serve em Linux, no Mac e no WSL do Windows. O script aceita as licenças do SDK do Google
+(`sdkmanager --licenses`) em seu nome: leia-as antes se for usar numa máquina de terceiros.
+
+### 2. Android Studio
+
+`npm ci && npm run build` na raiz e abrir a pasta `android/`; em Build, *Build APK(s)* na variante desejada.
+
+### 3. GitHub Actions
+
+A action **APK Android** roda em todo PR que mexe no app e deixa os dois APKs (debug) em *Artifacts*
+(`tchefood-apk`); também dá para rodar à mão em Actions → APK Android → Run workflow. Só funciona com a
+cobrança da conta GitHub em dia.
 
 Instalar na maquininha para teste: ativar instalação de fontes desconhecidas (ou `adb install`). Publicar na loja
 PagBank exige cadastro de desenvolvedor PagBank e APK de release assinado (ainda não configurado).

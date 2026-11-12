@@ -147,7 +147,7 @@ export function postgrestFetch(t: PgTarget, db: string, claims: Record<string, u
       const fn = path.slice(4);
       const sig = psql(
         t,
-        `SELECT array_to_string(p.proargnames, ',') || '|' || array_to_string(ARRAY(SELECT format_type(x, NULL) FROM unnest(p.proargtypes) x), ',')
+        `SELECT COALESCE(array_to_string(p.proargnames, ','), '') || '|' || array_to_string(ARRAY(SELECT format_type(x, NULL) FROM unnest(p.proargtypes) x), ',')
            FROM pg_proc p WHERE p.proname = ${lit(fn)} AND p.pronamespace = 'public'::regnamespace;`,
         db,
       );
