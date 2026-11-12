@@ -18,6 +18,7 @@ import type {
   AuditActionType,
   AuditLog,
   CashbackLedgerEntry,
+  CashbackRedeemSource,
   CashMovement,
   CashSession,
   Courier,
@@ -61,6 +62,7 @@ import type {
   RejectedSyncEvent,
 } from '../types';
 import { applyOrderTotals, computeItemTotal, formatBRL, halfAndHalfPrice, round2, round3, toCents } from '../lib/money';
+import { cloudDiscountOf } from '../lib/sync/cloudDiscount';
 import {
   effectivePrice,
   validateCategory,
@@ -90,7 +92,7 @@ import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
 import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
 import { comboChildrenOf, comboComponents, comboNeedsDoneness, expandComboItem } from '../lib/combos';
-import { adaptTable, MERGE, mergeRows, mergeStaffWithoutPins, mergeStaffWithPins, pendingRowKeys, type CloudSnapshot } from '../lib/sync/cloudPull';
+import { adaptTable, MERGE, mergeCashback, mergeRows, mergeStaffWithoutPins, mergeStaffWithPins, pendingRowKeys, type CloudCashback, type CloudSnapshot } from '../lib/sync/cloudPull';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
 import { computeNetWeight } from '../lib/scale';
@@ -105,7 +107,12 @@ import {
   cashbackEarnAmount,
   cashbackUsable,
   cashbackValidity,
+  cashbackFifoSources,
+  cashbackOrphanCents,
   consumeCashbackFifo,
+  planCashbackRefund,
+  cashbackRefundCents,
+  isCashbackRefund,
   isCashbackDay,
   normalizeWhatsapp,
 } from '../lib/loyalty';
@@ -130,6 +137,10 @@ export const RECEIPT_CARD_BRANDS: ReadonlyArray<string> = ['VISA', 'MASTERCARD',
 
 /** Início da mensagem do Cardápio QR quando o preço do carrinho ficou diferente do atual. */
 export const QR_PRICE_CHANGED = 'Preço atualizado:';
+
+/** adoptCloudDiscount sem PIN, com troca de desconto autorizada na fila da conta. */
+export const ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER =
+  'Esta conta tem troca de desconto com PIN de gerente ainda na fila. Com o desconto da nuvem, a troca muda de valor: o gerente confirma de novo com o PIN.';
 
 const MANAGER_ROLES: ReadonlyArray<StaffUser['role']> = ['MANAGER', 'OWNER'];
 
@@ -510,6 +521,22 @@ interface Actions {
    * presa ao id e ao preço do item) sobe antes do item, que volta para a frente da fila.
    */
   approveRejectedItemPrice: (eventId: UUID, auth: ManagerAuthInput) => ActionResult<AuditLog>;
+  /**
+   * Conta recusada pela nuvem porque o desconto dela lá é outro (outro aparelho ou o
+   * cashback mudou a conta): adota o desconto da nuvem neste aparelho e reenvia a conta.
+   * Com troca de desconto autorizada ainda na fila desta conta, o gerente confirma de novo
+   * com o PIN (auth): a autorização da fila descreve a troca a partir do desconto velho.
+   */
+  adoptCloudDiscount: (eventId: UUID, auth?: ManagerAuthInput) => ActionResult<number>;
+  /**
+   * Resgate de cashback recusado pela nuvem (o banco não concedeu o crédito): desfaz aqui o
+   * resgate, a baixa dos créditos e o desconto da conta, e refaz as versões seguintes da conta
+   * na fila sem o cashback. Até isso, a conta não é cobrada nem encerrada. Resgate da
+   * versão anterior do aparelho (sem redeem_sources): não se sabe de quais créditos saiu;
+   * só desfaz com o extrato do cliente lido agora da nuvem (cloud), e só se ele não tiver
+   * crédito baixado sem resgate (P0-01 da rodada 10 do GPT).
+   */
+  undoRejectedCashbackRedeem: (eventId: UUID, cloud?: CloudCashback) => ActionResult<number>;
 
   // Caixa
   /** Abre o caixa com o fundo de troco. Um caixa aberto por loja. */
@@ -886,6 +913,160 @@ export const useTcheStore = create<TcheState>()(
         get().pendingCharges.find((c) => c.order_id === orderId && Date.now() - c.started_at < PENDING_CHARGE_TTL_MS) ?? null;
 
       const CHARGE_LOCK_ERROR = 'Há uma cobrança em andamento na maquininha para esta mesa. Aguarde a resposta.';
+
+      /**
+       * Espelho local do estorno de cashback (tchefood_orders_cashback_refund): quando um
+       * ajuste deixa o desconto da conta abaixo do cashback usado, a diferença volta ao
+       * cliente, cada parte com a validade do crédito de onde saiu (decisão do Will,
+       * 10/11/2026: o cashback vale 30 dias de quando foi gerado, com ou sem cancelamento).
+       * Não sobe: o banco grava o dele ao receber o ajuste, e a leitura da nuvem acerta.
+       */
+      // O estorno leva a operação que o provocou (P2-01 da rodada 5 do GPT): o cancelamento
+      // do item ou a retirada dos 10%, com o operador e o gerente dela, como o banco grava.
+      const cashbackRefundMirror = (
+        order: Order, discountAfter: number, ts: string, cause: AuditLog,
+      ): { refunds: CashbackLedgerEntry[]; refundLogs: AuditLog[] } => {
+        const ledger = get().cashbackLedger;
+        const redeem = ledger.find((e) => e.order_id === order.id && e.entry_type === 'REDEEM');
+        if (!redeem) return { refunds: [], refundLogs: [] };
+        // Cashback ainda aplicado: resgatado − devolvido ou retido. O desconto manual da conta
+        // fica e o cashback absorve a queda do desconto (P0-02 da rodada 8 do GPT).
+        const applied = toCents(redeem.amount) - ledger
+          .filter((e) => e.order_id === order.id && isCashbackRefund(e))
+          .reduce((sum, e) => sum + toCents(e.amount), 0);
+        const refundCents = cashbackRefundCents(applied, toCents(order.discount_amount), toCents(discountAfter));
+        if (refundCents <= 0) return { refunds: [], refundLogs: [] };
+        return buildRefundMirror(ledger, redeem, order, order.discount_amount, discountAfter, refundCents, ts, cause);
+      };
+
+      /** Lançamentos REFUND e CASHBACK_REFUNDED do espelho de um estorno de refundCents. */
+      const buildRefundMirror = (
+        ledger: readonly CashbackLedgerEntry[], redeem: CashbackLedgerEntry, order: Order,
+        discountBefore: number, discountAfter: number, refundCents: number, ts: string, cause: AuditLog,
+      ): { refunds: CashbackLedgerEntry[]; refundLogs: AuditLog[] } => {
+        const userId = cause.performed_by_user_id;
+        const feeRemoved = cause.action_type === 'SERVICE_FEE_REMOVED';
+        // Parte sem origem comprovada (P0-03 da rodada 8 do GPT): HOLD, sem saldo nem
+        // validade, para conciliação; não entra no saldo do cliente.
+        const parts = planCashbackRefund(ledger, redeem, fromCentsLocal(refundCents));
+        const refunds: CashbackLedgerEntry[] = parts.map((part) => ({
+          id: uuid(),
+          tenant_id: order.tenant_id,
+          customer_id: redeem.customer_id,
+          order_id: order.id,
+          entry_type: part.hold ? 'HOLD' : 'REFUND',
+          amount: part.amount,
+          remaining_amount: part.hold ? 0 : part.amount,
+          base_amount: null,
+          pct: null,
+          valid_from: part.valid_from,
+          expires_at: part.expires_at,
+          created_by_user_id: userId,
+          created_at: ts,
+          refund_of_id: part.refund_of_id,
+        }));
+        const refundLogs: AuditLog[] = refunds.map((refund, i) => ({
+          ...buildAudit({
+            order_id: order.id,
+            performed_by_user_id: userId,
+            authorized_by_manager_id: cause.authorized_by_manager_id,
+            action_type: refund.entry_type === 'HOLD' ? 'CASHBACK_REFUND_HELD' : 'CASHBACK_REFUNDED',
+            amount_impact: refund.amount,
+            reason: refund.entry_type === 'HOLD'
+              ? 'Cashback a devolver retido para conciliação: o crédito de onde saiu não está comprovado (resgate da versão anterior do aparelho). Não volta ao saldo até o gerente conferir com o cliente.'
+              : feeRemoved
+                ? 'Cashback devolvido ao cliente (retirada dos 10% deixou o desconto abaixo do cashback usado)'
+                : 'Cashback devolvido ao cliente (cancelamento de item deixou o desconto abaixo do cashback usado)',
+            metadata: {
+              table: tableLabel(order.table_id),
+              customer_id: refund.customer_id,
+              amount: refund.amount,
+              redeem_id: redeem.id,
+              refund_id: refund.id,
+              refund_of_id: refund.refund_of_id ?? null,
+              expires_at: refund.expires_at,
+              already_expired: refund.expires_at ? new Date(refund.expires_at) <= new Date(ts) : null,
+              ...(refund.entry_type === 'HOLD'
+                ? { hold_id: refund.id, reconciliation: 'PENDING', reported_source_ids: parts[i]!.hold ? parts[i]!.reported_source_ids : [] }
+                : {}),
+              discount_before: discountBefore,
+              discount_after: discountAfter,
+              cause: cause.action_type,
+              cause_audit_id: cause.id,
+              item_cancel_audit_id: feeRemoved ? null : cause.id,
+              canceled_item_id: feeRemoved ? null : (cause.metadata?.item_id ?? null),
+              service_fee_audit_id: feeRemoved ? cause.id : null,
+            },
+          }),
+          whatsapp_alert_sent: false,
+        }));
+        return { refunds, refundLogs };
+      };
+
+      /** Estado com o espelho do estorno aplicado (extrato, saldo do cliente e audit_logs). */
+      const withCashbackRefund = (
+        s: { cashbackLedger: CashbackLedgerEntry[]; loyaltyCustomers: LoyaltyCustomer[] },
+        auditLogs: AuditLog[],
+        mirror: { refunds: CashbackLedgerEntry[]; refundLogs: AuditLog[] },
+        ts: string,
+        newEvents: SyncEvent[],
+      ) => {
+        if (!mirror.refunds.length) return {};
+        // O evento que faz o banco gravar o estorno: a atualização da conta desta operação.
+        const orderId = mirror.refunds[0]!.order_id;
+        const sourceEvent = [...newEvents].reverse().find((e) => e.table === 'orders' && e.row_id === orderId);
+        const refunds = mirror.refunds.map((r) => (sourceEvent ? { ...r, source_event_id: sourceEvent.id } : r));
+        const cashbackLedger = [...s.cashbackLedger, ...refunds];
+        const customerId = mirror.refunds[0]!.customer_id;
+        return {
+          cashbackLedger,
+          loyaltyCustomers: s.loyaltyCustomers.map((c) => (c.id === customerId ? { ...c, cashback_balance: balanceCashback(cashbackLedger, c.id, new Date(ts)) } : c)),
+          auditLogs: [...[...mirror.refundLogs].reverse(), ...auditLogs],
+        };
+      };
+
+      /**
+       * De quais eventos da fila um resgate depende: os que fazem o banco gravar os estornos
+       * feitos aqui (em outra conta) de onde ele sai. Estorno já lido da nuvem, ou cujo evento
+       * já subiu, não segura nada (P2-01 da rodada 6 do GPT).
+       */
+      const refundDependencies = (
+        ledger: readonly CashbackLedgerEntry[],
+        sources: readonly CashbackRedeemSource[],
+        orderId: UUID,
+        queue: readonly SyncEvent[],
+      ): UUID[] => {
+        const waiting = new Set([...queue, ...(get().syncRejected ?? []).map((r) => r.event)].map((e) => e.id));
+        return [
+          ...new Set(
+            sources
+              .map((src) => ledger.find((e) => e.id === src.source_id))
+              .filter((e): e is CashbackLedgerEntry => e?.entry_type === 'REFUND' && e.order_id !== orderId && !!e.source_event_id)
+              .map((e) => e.source_event_id!)
+              .filter((id) => waiting.has(id)),
+          ),
+        ];
+      };
+
+      /** A nuvem recusou a conta por ter outro desconto lá (outro aparelho ou o cashback). */
+      const cloudDiscountConflict = (orderId: UUID): boolean =>
+        (get().syncRejected ?? []).some((r) => r.event.table === 'orders' && r.event.row_id === orderId && cloudDiscountOf(r.message) !== null);
+      /**
+       * P0-01 da rodada 7 do GPT: o resgate de cashback desta conta foi recusado pela nuvem
+       * (fora de terça a quinta pelo relógio do servidor, saldo, regra). O desconto do
+       * cashback está na conta deste aparelho, mas o banco não o concedeu.
+       */
+      const rejectedCashbackRedeem = (orderId: UUID): boolean =>
+        (get().syncRejected ?? []).some(
+          (r) => r.event.table === 'cashback_ledger' && r.event.op === 'INSERT' && !!r.event.cashback_redeem && r.event.payload.order_id === orderId,
+        );
+      /** Motivo para não cobrar nem encerrar a conta enquanto a nuvem não conferir o desconto. */
+      const chargeBlock = (orderId: UUID): string | null =>
+        cloudDiscountConflict(orderId) ? CLOUD_DISCOUNT_CONFLICT : rejectedCashbackRedeem(orderId) ? REJECTED_CASHBACK_REDEEM : null;
+      const CLOUD_DISCOUNT_NEEDS_MANAGER = ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER;
+      const CLOUD_DISCOUNT_CONFLICT = 'A nuvem tem outro desconto para esta conta (outro aparelho ou o cashback mudou). Em Retaguarda › Nuvem, use o desconto da nuvem antes de cobrar.';
+      const REJECTED_CASHBACK_REDEEM =
+        'A nuvem recusou o cashback desta conta: o desconto dele não vale. Em Retaguarda › Nuvem › recusados, desfaça o cashback (ou reenvie, se a recusa foi resolvida) antes de cobrar.';
 
       /**
        * Encerra a conta quando o saldo chega a zero com algo já pago: CLOSED,
@@ -1447,6 +1628,10 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
             return fail('Cancelamento deixaria a conta abaixo do valor já pago. Estorne um pagamento primeiro.');
           }
+          // Conta com cashback: se o cancelamento deixa o desconto abaixo do cashback usado,
+          // a diferença volta para o cliente (REFUND). Quem grava na nuvem é o banco, no
+          // cancelamento do item (tchefood_orders_cashback_refund), pela mesma conta; aqui
+          // fica o espelho local, que não sobe.
           const trayBlock = blocksSettleWithTray(simulated);
           if (trayBlock) return fail(trayBlock);
 
@@ -1502,6 +1687,8 @@ export const useTcheStore = create<TcheState>()(
             });
           });
 
+          const { refunds, refundLogs } = cashbackRefundMirror(order, simulated.discount_amount, ts, log);
+
           set((s) => {
             const orderItems = s.orderItems.map((i) => canceledById.get(i.id) ?? i);
             const current = s.orders.find((o) => o.id === order.id)!;
@@ -1512,8 +1699,10 @@ export const useTcheStore = create<TcheState>()(
               if (before) kegTaps = applyKegCancel(kegTaps, s.kegTapProducts, before);
             }
             const patch = commitAdjustment(s, recalculated, orderItems, [...canceledById.values()], [log, ...partLogs], auth.managerPin);
+            // Estorno: só local (o banco grava o dele ao receber o cancelamento).
             return {
               ...patch,
+              ...withCashbackRefund(s, patch.auditLogs!, { refunds, refundLogs }, ts, patch.outbox!.slice(s.outbox.length)),
               kegTaps,
               outbox: [...patch.outbox!, ...changedTaps(s.kegTaps, kegTaps).map((k) => syncEvent('keg_taps', 'UPDATE', k))],
             };
@@ -1551,10 +1740,15 @@ export const useTcheStore = create<TcheState>()(
               manager_name: authRes.data.name,
             },
           });
+          // Sem os 10%, o desconto pode ficar limitado ao novo bruto e abaixo do cashback
+          // usado: o banco devolve a diferença; aqui fica o mesmo espelho do cancelamento.
+          const ts = nowISO();
+          const mirror = cashbackRefundMirror(order, simulated.discount_amount, ts, log);
           set((s) => {
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, charge_service_fee: false }, s.orderItems, s.payments);
-            return commitAdjustment(s, recalculated, s.orderItems, [], log, auth.managerPin);
+            const patch = commitAdjustment(s, recalculated, s.orderItems, [], log, auth.managerPin);
+            return { ...patch, ...withCashbackRefund(s, patch.auditLogs!, mirror, ts, patch.outbox!.slice(s.outbox.length)) };
           });
           return { ok: true, data: log };
         },
@@ -1595,6 +1789,10 @@ export const useTcheStore = create<TcheState>()(
           const discount = round2(amount);
           if (!(discount > 0)) return fail('Informe um desconto maior que zero.');
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          // Com o conflito pendente, a autorização nova descreveria a troca a partir do
+          // desconto velho deste aparelho e não bateria com a nuvem depois de adotar o dela.
+          const block = chargeBlock(orderId);
+          if (block) return fail(block);
           // O desconto manual substitui o valor; com cashback já abatido ele apagaria o resgate.
           if (get().cashbackLedger.some((e) => e.order_id === orderId && e.entry_type === 'REDEEM')) {
             return fail('Esta conta já usou cashback. Desconto manual não pode ser combinado.');
@@ -1637,6 +1835,8 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(orderId);
           if (!res.ok) return res;
           const order = res.data;
+          const block = chargeBlock(orderId);
+          if (block) return fail(block);
           if (get().tray.some((t) => t.order_id === orderId)) {
             return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
           }
@@ -1658,11 +1858,18 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(input.orderId);
           if (!res.ok) return res;
           const order = res.data;
+          // A resposta de uma cobrança da maquininha já em andamento continua sendo registrada.
+          // "Em andamento" é a trava ativa com o mesmo request_id (fromLockedCharge), não a
+          // simples presença de um charge_request_id: id arbitrário ou de cobrança já encerrada
+          // (trava expirada ou liberada) passa pela mesma recusa e, se a maquininha aprovou,
+          // a tela manda para a conferência pelo comprovante (REGISTER_FAILED).
+          const lock = activeCharge(order.id);
+          const fromLockedCharge = Boolean(lock && input.charge_request_id && lock.request_id === input.charge_request_id);
+          const block = input.status === 'APPROVED' && !fromLockedCharge ? chargeBlock(order.id) : null;
+          if (block) return fail(block);
           if (input.status === 'APPROVED' && get().tray.some((t) => t.order_id === order.id)) {
             return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
           }
-          const lock = activeCharge(order.id);
-          const fromLockedCharge = Boolean(lock && input.charge_request_id && lock.request_id === input.charge_request_id);
           if (lock && !fromLockedCharge) return fail(CHARGE_LOCK_ERROR);
           // A maquininha já cobrou: o pagamento pertence a quem iniciou a cobrança,
           // mesmo que a sessão tenha mudado nesse meio-tempo.
@@ -1757,6 +1964,10 @@ export const useTcheStore = create<TcheState>()(
           const res = findEditableOrder(orderId);
           if (!res.ok) return res;
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          // Desconto diferente na nuvem: nenhuma cobrança nova na maquininha com o valor
+          // antigo. A resposta de uma cobrança já em andamento continua sendo registrada.
+          const block = chargeBlock(orderId);
+          if (block) return fail(block);
           if (get().tray.some((t) => t.order_id === orderId)) return fail('Há itens na bandeja não enviados. Envie ou remova antes de cobrar.');
           const value = round2(amount);
           if (!(value > 0) || toCents(value) > toCents(res.data.remaining_balance)) return fail('Valor maior que o saldo restante da mesa.');
@@ -1777,6 +1988,9 @@ export const useTcheStore = create<TcheState>()(
           const order = res.data;
           if (toCents(order.remaining_balance) !== 0 || toCents(order.paid_amount) !== 0) return fail('Só contas zeradas e sem pagamento podem ser encerradas assim.');
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          // Conta zerada pelo desconto deste aparelho que a nuvem não conferiu: não encerra.
+          const block = chargeBlock(orderId);
+          if (block) return fail(block);
           if (get().tray.some((t) => t.order_id === orderId)) return fail('Há itens na bandeja não enviados. Envie ou remova antes de encerrar.');
           const ts = nowISO();
           const hasItems = get().orderItems.some((i) => i.order_id === orderId && i.status !== 'CANCELED');
@@ -2738,6 +2952,7 @@ export const useTcheStore = create<TcheState>()(
           if (!res.ok) return res;
           const order = res.data;
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (cloudDiscountConflict(orderId)) return fail(CLOUD_DISCOUNT_CONFLICT);
           const now = new Date();
           if (!isCashbackDay(now)) return fail(`Cashback só pode ser usado de ${CASHBACK_DAYS_LABEL}.`);
           if (get().cashbackLedger.some((e) => e.order_id === orderId && e.entry_type === 'REDEEM')) return fail('Esta conta já usou cashback.');
@@ -2767,11 +2982,17 @@ export const useTcheStore = create<TcheState>()(
           };
           let ledger: CashbackLedgerEntry[];
           try {
+            // De onde saiu o resgate: o estorno de um cancelamento vence junto com o crédito.
+            entry.redeem_sources = cashbackFifoSources(get().cashbackLedger, customer.id, amount, now);
             ledger = [...consumeCashbackFifo(get().cashbackLedger, customer.id, amount, now), entry];
           } catch (e) {
             return fail((e as Error).message);
           }
           const updatedCustomer: LoyaltyCustomer = { ...customer, cashback_balance: balanceCashback(ledger, customer.id, now) };
+          // P1-02 da rodada 5 do GPT: crédito que é estorno de outra comanda (cancelamento ou
+          // retirada dos 10% feitos aqui): o resgate só sobe depois do evento que faz o banco
+          // gravar aquele estorno. Se ele for recusado, o estorno não existe na nuvem.
+          const refundDeps = refundDependencies(get().cashbackLedger, entry.redeem_sources ?? [], orderId, get().outbox);
           const log: AuditLog = {
             ...buildAudit({
               order_id: orderId,
@@ -2796,11 +3017,12 @@ export const useTcheStore = create<TcheState>()(
           set((s) => {
             const current = s.orders.find((o) => o.id === orderId)!;
             const recalculated = applyOrderTotals({ ...current, discount_amount: round2(current.discount_amount + amount) }, s.orderItems, s.payments);
-            const changedLedger = ledger.filter((e, i) => e !== s.cashbackLedger[i] && e.entry_type === 'EARN');
             const patch = commitAdjustment(s, recalculated, s.orderItems, [], log, null);
-            // Ordem no servidor: audit_log e extrato (REDEEM) antes do desconto da comanda,
-            // porque a trava do desconto confere os dois.
-            const [auditEvent, ...orderEvents] = patch.outbox!.slice(s.outbox.length);
+            // O resgate sobe por tchefood_register_cashback_redeem, que confere a regra no
+            // banco, baixa os créditos e grava o audit_log e o desconto da comanda. Por isso
+            // o audit_log e a baixa dos créditos não sobem sozinhos, e o resgate vai antes da
+            // atualização da comanda (que então já encontra o desconto gravado).
+            const [, ...orderEvents] = patch.outbox!.slice(s.outbox.length);
             return {
               ...patch,
               auditLogs: patch.auditLogs,
@@ -2808,11 +3030,12 @@ export const useTcheStore = create<TcheState>()(
               loyaltyCustomers: s.loyaltyCustomers.map((c) => (c.id === customer.id ? updatedCustomer : c)),
               outbox: [
                 ...s.outbox,
-                auditEvent!,
-                // O consumo dos créditos só sobe junto com a comanda do resgate: se a
-                // autorização ou o desconto dela for recusado, o extrato fica esperando.
-                ...changedLedger.map((e) => ({ ...syncEvent('cashback_ledger', 'UPDATE', e), depends_on_order_id: orderId })),
-                { ...syncEvent('cashback_ledger', 'INSERT', entry), depends_on_order_id: orderId },
+                {
+                  ...syncEvent('cashback_ledger', 'INSERT', entry),
+                  depends_on_order_id: orderId,
+                  ...(refundDeps.length ? { depends_on_event_ids: refundDeps } : {}),
+                  cashback_redeem: { audit_id: log.id },
+                },
                 ...orderEvents,
                 { ...syncEvent('loyalty_customers', 'UPDATE', updatedCustomer), depends_on_order_id: orderId },
               ],
@@ -3462,8 +3685,8 @@ export const useTcheStore = create<TcheState>()(
             kegTapProducts: [],
             kegHistory: [],
             eventTickets: [],
-            loyaltyCustomers: [],
-            cashbackLedger: [],
+            loyaltyCustomers: [...(snapshot.loyaltyCustomers ?? [])],
+            cashbackLedger: [...(snapshot.cashbackLedger ?? [])],
             tray: [],
             pendingCharges: [],
             outbox: extraTables.map((t) => syncEvent('dining_tables', 'INSERT', t)),
@@ -3505,6 +3728,10 @@ export const useTcheStore = create<TcheState>()(
             purchaseInvoices: mergeRows(state.purchaseInvoices, snapshot.purchaseInvoices, pending, MERGE.purchaseInvoices),
             deliveryZones: mergeRows(state.deliveryZones, snapshot.deliveryZones, pending, MERGE.deliveryZones),
             couriers: mergeRows(state.couriers, snapshot.couriers, pending, MERGE.couriers),
+            ...(snapshot.loyaltyCustomers && snapshot.cashbackLedger
+              ? mergeCashback(state, { loyaltyCustomers: snapshot.loyaltyCustomers, cashbackLedger: snapshot.cashbackLedger },
+                [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)])
+              : {}),
             // Desativado em outro aparelho: sai da sessão aqui também.
             currentUserId: currentStillActive ? state.currentUserId : null,
             pullStatus: { last_pull_at: nowISO(), last_error: null, cloud_staff_unknown: team.unknown },
@@ -3628,6 +3855,451 @@ export const useTcheStore = create<TcheState>()(
             outbox: [managerAuthEvent(log, auth.managerPin), ev, ...s.outbox],
           }));
           return { ok: true, data: log };
+        },
+
+        adoptCloudDiscount: (eventId, auth) => {
+          const rejected = (get().syncRejected ?? []).find((r) => r.event.id === eventId);
+          if (!rejected || rejected.event.table !== 'orders') return fail('Conta recusada não encontrada.');
+          const cloud = cloudDiscountOf(rejected.message);
+          if (cloud === null) return fail('Esta recusa não é de desconto diferente na nuvem.');
+          const orderId = rejected.event.row_id;
+          const order = get().orders.find((o) => o.id === orderId);
+          if (!order) return fail('Conta não encontrada neste aparelho.');
+          // Cobrança começada antes da recusa: o saldo não muda até a resposta da maquininha
+          // ser registrada (senão o pagamento aprovado passaria do saldo novo).
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          // A conta recusada leva o desconto da nuvem. As mudanças seguintes dela (que
+          // esperavam a recusa) são refeitas em ordem, como o banco as aplica, a partir do
+          // desconto já refeito da anterior: quando o aparelho limitou o desconto ao bruto
+          // (cancelamento, tirar os 10%), o banco limita o dele ao mesmo bruto, sem levar a
+          // diferença do aparelho (com nuvem 5 e aparelho 7, cancelar até bruto 6 fica 5 no
+          // banco, não 4); outra mudança leva a mesma diferença, limitada ao bruto.
+          let prevOwn = toCents(Number(rejected.event.payload.discount_amount ?? order.discount_amount));
+          let prevNew = toCents(cloud);
+          const rebase = (own: number, gross: number | null): number => {
+            const clamped = gross !== null && own < prevOwn && own === gross;
+            let cents = clamped ? Math.min(prevNew, gross) : Math.max(prevNew + own - prevOwn, 0);
+            if (gross !== null) cents = Math.min(cents, gross);
+            prevOwn = own;
+            prevNew = cents;
+            return cents;
+          };
+          // P1-01 da rodada 5 do GPT: troca de desconto autorizada que ficou na fila atrás da
+          // recusa. A autorização dela descreve a troca a partir do desconto velho deste
+          // aparelho; mudar os valores dela em silêncio reusaria o PIN do gerente para outra
+          // troca. O gerente confirma de novo com o PIN: cada troca da fila vira uma
+          // autorização nova, do desconto refeito até o valor que o gerente digitou (o desconto
+          // manual é o valor final, não uma diferença). A autorização original fica no
+          // histórico deste aparelho, e a nova aponta para ela (replaces_audit_id).
+          const queuedAuths = get().outbox.filter(
+            (e) => e.table === 'audit_logs' && e.payload.order_id === orderId && e.payload.action_type === 'DISCOUNT_APPLIED',
+          );
+          let manager: StaffUser | null = null;
+          if (queuedAuths.length > 0) {
+            if (!auth) return fail(CLOUD_DISCOUNT_NEEDS_MANAGER);
+            const authRes = authorizeManager(auth, { orderId, action: 'DISCOUNT_APPLIED' });
+            if (!authRes.ok) return authRes;
+            manager = authRes.data;
+          }
+          const user = currentUser();
+          if (manager && !user) return fail('Sessão expirada. Faça login novamente.');
+          const reauthorized: AuditLog[] = [];
+          let manualTarget: number | null = null;
+          // Achado do Codex em f793339: resgate de cashback na fila atrás da recusa. O banco
+          // calcula o valor com a conta dele (teto de 50% do total com o desconto da nuvem) e
+          // recusa outro valor; o resgate é refeito com a conta refeita até ali, e a baixa dos
+          // créditos deste aparelho acompanha. As versões seguintes da conta levam o valor novo.
+          const rejectedPayload = rejected.event.payload as Partial<Order>;
+          const own0 = toCents(Number(rejectedPayload.discount_amount ?? order.discount_amount));
+          let lastTotal: number | null =
+            typeof rejectedPayload.total_amount === 'number' ? toCents(rejectedPayload.total_amount) + own0 - toCents(cloud) : null;
+          let lastRemaining: number | null =
+            typeof rejectedPayload.remaining_balance === 'number' ? toCents(rejectedPayload.remaining_balance) + own0 - toCents(cloud) : null;
+          let ledger = get().cashbackLedger;
+          const redeemFixes: { auditId: UUID; amount: number; before: number }[] = [];
+          let redeemError: string | null = null;
+          const now = new Date();
+          // P1-01 da rodada 6 do GPT: os estornos feitos aqui nesta conta (espelho) foram
+          // calculados com o resgate e o desconto antigos. São refeitos em ordem, como o banco
+          // vai gravá-los: em cada versão da conta, o que o desconto refeito ficar abaixo do
+          // cashback ainda usado volta ao cliente. Estorno já aceito pela nuvem fica como está.
+          const queueIds = new Set(get().outbox.map((e) => e.id));
+          const localRedeem = get().cashbackLedger.find((e) => e.order_id === orderId && e.entry_type === 'REDEEM');
+          // P1-01 da rodada 7 do GPT: o resgate está na fila (ou recusado) pelo registro que o
+          // evento leva (row_id), não pelo id do evento. Enquanto ele não sobe, o banco não tem o
+          // resgate: os estornos só contam a partir do ponto da fila em que ele entra.
+          const redeemQueued =
+            !!localRedeem &&
+            [...get().outbox, ...(get().syncRejected ?? []).map((r) => r.event)].some(
+              (e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.entry_type === 'REDEEM' && e.row_id === localRedeem.id,
+            );
+          const refundGroups = new Map<UUID, CashbackLedgerEntry[]>();
+          for (const r of get().cashbackLedger) {
+            if (r.order_id !== orderId || !isCashbackRefund(r) || !r.source_event_id || !queueIds.has(r.source_event_id)) continue;
+            refundGroups.set(r.source_event_id, [...(refundGroups.get(r.source_event_id) ?? []), r]);
+          }
+          const rebuiltRefundIds = new Set<UUID>();
+          const rebuiltLogs: AuditLog[] = [];
+          let net: number | null =
+            localRedeem && !redeemQueued
+              ? toCents(localRedeem.amount) -
+                get().cashbackLedger
+                  .filter((r) => r.order_id === orderId && isCashbackRefund(r) && !(r.source_event_id && refundGroups.has(r.source_event_id)))
+                  .reduce((sum, r) => sum + toCents(r.amount), 0)
+              : null;
+          let lastCause: AuditLog | null = null;
+          const outbox = get().outbox.flatMap((e): SyncEvent[] => {
+            if (e.table === 'audit_logs' && e.payload.order_id === orderId && ['ITEM_CANCELED', 'SERVICE_FEE_REMOVED'].includes(String(e.payload.action_type))) {
+              lastCause = e.payload as unknown as AuditLog;
+            }
+            if (e.table === 'cashback_ledger' && e.op === 'INSERT' && e.cashback_redeem && !e.cashback_redeem.legacy_predebited && e.payload.order_id === orderId) {
+              const entry = (ledger.find((x) => x.id === e.row_id) ?? e.payload) as CashbackLedgerEntry;
+              const old = toCents(Number(entry.amount));
+              if (lastTotal === null || lastRemaining === null) {
+                redeemError = 'Esta conta tem resgate de cashback na fila e a conta recusada não traz o total. Chame o suporte.';
+                return [e];
+              }
+              const sources = entry.redeem_sources ?? [];
+              const reverted = ledger
+                .filter((x) => x.id !== entry.id)
+                .map((x) => {
+                  const back = sources.filter((src) => src.source_id === x.id).reduce((sum, src) => sum + toCents(src.amount), 0);
+                  return back ? { ...x, remaining_amount: (toCents(x.remaining_amount) + back) / 100 } : x;
+                });
+              const amount = cashbackUsable(availableCashback(reverted, entry.customer_id, now), {
+                total_amount: lastTotal / 100,
+                remaining_balance: lastRemaining / 100,
+              });
+              const cents = toCents(amount);
+              if (cents <= 0) {
+                redeemError = 'Com o desconto da nuvem esta conta não tem mais espaço para o cashback resgatado aqui. O desconto da nuvem não é adotado: chame o gerente para conferir a conta com o cliente.';
+                return [e];
+              }
+              let fixed: CashbackLedgerEntry;
+              try {
+                fixed = { ...entry, amount, redeem_sources: cashbackFifoSources(reverted, entry.customer_id, amount, now) };
+                ledger = [...consumeCashbackFifo(reverted, entry.customer_id, amount, now), fixed];
+              } catch (err) {
+                redeemError = (err as Error).message;
+                return [e];
+              }
+              if (cents !== old) redeemFixes.push({ auditId: e.cashback_redeem.audit_id, amount: cents, before: prevNew });
+              net = cents;
+              // A versão seguinte da conta leva o resgate antigo no desconto: vale o novo.
+              prevOwn += old - cents;
+              // P1-02 da rodada 6 do GPT: com a origem refeita (um crédito pode ter vencido e
+              // o resgate passar a sair de um estorno de outra conta), a espera da fila também.
+              const { depends_on_event_ids: _oldDeps, ...rest } = e;
+              void _oldDeps;
+              const deps = refundDependencies(ledger, fixed.redeem_sources ?? [], orderId, get().outbox);
+              return [{ ...rest, ...(deps.length ? { depends_on_event_ids: deps } : {}), payload: { ...e.payload, amount, redeem_sources: fixed.redeem_sources } }];
+            }
+            if (manager && queuedAuths.includes(e)) {
+              const original = e.payload as unknown as AuditLog;
+              const after = toCents(Number(original.metadata?.discount_after));
+              manualTarget = after;
+              // A nuvem já tem esse desconto: não há troca a autorizar.
+              if (after === prevNew) return [];
+              const log = buildAudit({
+                order_id: orderId,
+                performed_by_user_id: user!.id,
+                authorized_by_manager_id: manager.id,
+                action_type: 'DISCOUNT_APPLIED',
+                amount_impact: (prevNew - after) / 100,
+                reason: auth!.reason.trim(),
+                metadata: {
+                  ...(original.metadata ?? {}),
+                  discount_before: prevNew / 100,
+                  discount_after: after / 100,
+                  replaces_audit_id: original.id,
+                  original_discount_before: original.metadata?.discount_before ?? null,
+                  original_discount_after: original.metadata?.discount_after ?? null,
+                  waiter_name: user!.name,
+                  manager_name: manager.name,
+                },
+              });
+              reauthorized.push(log);
+              return [managerAuthEvent(log, auth!.managerPin)];
+            }
+            if (e.table !== 'orders' || e.row_id !== orderId || typeof e.payload.discount_amount !== 'number') return [e];
+            const p = e.payload as Partial<Order>;
+            const gross =
+              typeof p.subtotal_items === 'number' && typeof p.service_fee_amount === 'number'
+                ? toCents(p.subtotal_items) + toCents(p.service_fee_amount)
+                : null;
+            const own = toCents(p.discount_amount!);
+            const before = prevNew;
+            let cents: number;
+            if (manualTarget !== null && own === manualTarget) {
+              // A versão da conta que leva o desconto que o gerente digitou: vale o valor dele.
+              cents = gross !== null ? Math.min(own, gross) : own;
+              prevOwn = own;
+              prevNew = cents;
+              manualTarget = null;
+            } else {
+              cents = rebase(own, gross);
+            }
+            if (typeof p.total_amount === 'number') lastTotal = toCents(p.total_amount) + own - cents;
+            if (typeof p.remaining_balance === 'number') lastRemaining = toCents(p.remaining_balance) + own - cents;
+            if (net !== null) {
+              const refundCents = cashbackRefundCents(net, before, cents);
+              const group = refundGroups.get(e.id) ?? [];
+              const oldCents = group.reduce((sum, r) => sum + toCents(r.amount), 0);
+              const oldLogs = get().auditLogs.filter((l) => (l.action_type === 'CASHBACK_REFUNDED' || l.action_type === 'CASHBACK_REFUND_HELD') && group.some((r) => r.id === l.metadata?.refund_id));
+              if (group.length && refundCents !== oldCents && group.some((r) => r.entry_type === 'REFUND' && toCents(r.remaining_amount) < toCents(r.amount))) {
+                redeemError = 'O cashback devolvido nesta conta já foi usado em outro resgate neste aparelho, e com o desconto da nuvem a devolução muda de valor. O desconto da nuvem não é adotado: chame o gerente para conferir com o cliente.';
+              } else if (group.length && refundCents === oldCents) {
+                // Mesmo valor: o espelho fica como está.
+              } else if (group.length || refundCents > 0) {
+                const causeId = oldLogs[0]?.metadata?.cause_audit_id;
+                const cause = get().auditLogs.find((l) => l.id === causeId) ?? lastCause;
+                ledger = ledger.filter((r) => !group.some((g) => g.id === r.id));
+                for (const r of group) rebuiltRefundIds.add(r.id);
+                const redeem = ledger.find((r) => r.order_id === orderId && r.entry_type === 'REDEEM');
+                if (refundCents > 0 && cause && redeem) {
+                  const ts = group[0]?.created_at ?? cause.created_at;
+                  const mirror = buildRefundMirror(ledger, redeem, order, before / 100, cents / 100, refundCents, ts, cause);
+                  ledger = [...ledger, ...mirror.refunds.map((r) => ({ ...r, source_event_id: e.id }))];
+                  rebuiltLogs.push(
+                    ...mirror.refundLogs.map((l) => ({
+                      ...l,
+                      metadata: { ...(l.metadata ?? {}), amount_before_cloud_discount: group.length ? oldCents / 100 : null, replaces_refund_ids: group.map((r) => r.id) },
+                    })),
+                  );
+                }
+              }
+              net -= refundCents;
+            }
+            if (e.table === 'orders') lastCause = null;
+            return [{ ...e, payload: { ...e.payload, discount_amount: cents / 100 } }];
+          });
+          if (redeemError) return fail(redeemError);
+          const localCents = rebase(toCents(order.discount_amount), toCents(order.subtotal_items) + toCents(order.service_fee_amount));
+          const recalculated = applyOrderTotals({ ...order, discount_amount: localCents / 100 }, get().orderItems, get().payments);
+          if (toCents(recalculated.total_amount) < toCents(order.paid_amount)) {
+            return fail('Com o desconto da nuvem a conta fica abaixo do já pago neste aparelho. Chame o gerente para conferir os pagamentos.');
+          }
+          // Conta fechada aqui sem internet com o desconto deste aparelho: com o desconto menor
+          // da nuvem ficaria fechada com saldo (não dá para cobrar a diferença, e o banco não
+          // aceita fechar com saldo). Não adota: o gerente confere com o cliente.
+          if (order.status === 'CLOSED' && toCents(recalculated.remaining_balance) > 0) {
+            return fail(
+              `Esta conta já foi fechada neste aparelho com o desconto daqui. Com o desconto da nuvem ficariam faltando ${formatBRL(recalculated.remaining_balance)}, que não foram cobrados. O desconto da nuvem não é adotado: a conta segue nos recusados para o gerente conferir com o cliente.`,
+            );
+          }
+          set((s) => ({
+            orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
+            outbox: [{ ...rejected.event, payload: { ...rejected.event.payload, discount_amount: cloud } }, ...outbox],
+            syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
+            ...(reauthorized.length || redeemFixes.length || rebuiltRefundIds.size || rebuiltLogs.length
+              ? {
+                  auditLogs: [
+                    ...[...reauthorized].reverse(),
+                    ...[...rebuiltLogs].reverse(),
+                    ...s.auditLogs.filter((l) => !((l.action_type === 'CASHBACK_REFUNDED' || l.action_type === 'CASHBACK_REFUND_HELD') && rebuiltRefundIds.has(String(l.metadata?.refund_id)))).map((l) => {
+                      const fix = redeemFixes.find((f) => f.auditId === l.id);
+                      if (!fix) return l;
+                      return {
+                        ...l,
+                        amount_impact: -fix.amount / 100,
+                        metadata: {
+                          ...(l.metadata ?? {}),
+                          amount: fix.amount / 100,
+                          discount_before: fix.before / 100,
+                          discount_after: (fix.before + fix.amount) / 100,
+                          amount_before_cloud_discount: l.metadata?.amount ?? null,
+                        },
+                      };
+                    }),
+                  ],
+                }
+              : {}),
+            ...(localRedeem
+              ? {
+                  cashbackLedger: ledger,
+                  loyaltyCustomers: s.loyaltyCustomers.map((c) =>
+                    ledger.some((x) => x.customer_id === c.id && x.order_id === orderId && x.entry_type === 'REDEEM')
+                      ? { ...c, cashback_balance: balanceCashback(ledger, c.id, now) }
+                      : c,
+                  ),
+                }
+              : {}),
+          }));
+          return { ok: true, data: cloud };
+        },
+
+        undoRejectedCashbackRedeem: (eventId, cloud) => {
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const rejected = (get().syncRejected ?? []).find((r) => r.event.id === eventId);
+          if (!rejected || rejected.event.table !== 'cashback_ledger' || !rejected.event.cashback_redeem) return fail('Resgate de cashback recusado não encontrado.');
+          const orderId = String(rejected.event.payload.order_id);
+          const order = get().orders.find((o) => o.id === orderId);
+          if (!order) return fail('Conta não encontrada neste aparelho.');
+          // Cobrança começada antes da recusa: o saldo não muda até a resposta da maquininha.
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          const redeem = get().cashbackLedger.find((e) => e.id === rejected.event.row_id && e.entry_type === 'REDEEM');
+          const redeemLog = get().auditLogs.find((l) => l.id === rejected.event.cashback_redeem!.audit_id);
+          const amount = toCents(Number(redeem?.amount ?? rejected.event.payload.amount));
+          const before = redeemLog ? Number(redeemLog.metadata?.discount_before) : NaN;
+          if (!Number.isFinite(before)) return fail('O registro do resgate não traz o desconto de antes. Chame o suporte.');
+          // Estornos feitos aqui nesta conta (cancelamento, tirar os 10%) saíram deste resgate,
+          // que o banco não concedeu: somem junto. Se já foram usados em outro resgate, não dá.
+          const refunds = get().cashbackLedger.filter((e) => e.order_id === orderId && isCashbackRefund(e));
+          if (refunds.some((r) => r.entry_type === 'REFUND' && toCents(r.remaining_amount) < toCents(r.amount))) {
+            return fail('O cashback devolvido nesta conta já foi usado em outro resgate neste aparelho. Desfaça aquele resgate primeiro ou chame o gerente para conferir com o cliente.');
+          }
+          // A conta e as versões dela na fila voltam ao desconto sem o cashback, em ordem, como
+          // o banco as aplica (o mesmo cálculo de "usar o desconto da nuvem"): quando o aparelho
+          // limitou o desconto ao bruto, fica o desconto anterior limitado ao mesmo bruto.
+          let prevOwn = toCents(before) + amount;
+          let prevNew = toCents(before);
+          const rebase = (own: number, gross: number | null): number => {
+            const clamped = gross !== null && own < prevOwn && own === gross;
+            let cents = clamped ? Math.min(prevNew, gross) : Math.max(prevNew + own - prevOwn, 0);
+            if (gross !== null) cents = Math.min(cents, gross);
+            prevOwn = own;
+            prevNew = cents;
+            return cents;
+          };
+          const outbox = get().outbox.map((e): SyncEvent => {
+            if (e.table !== 'orders' || e.row_id !== orderId || typeof e.payload.discount_amount !== 'number') return e;
+            const p = e.payload as Partial<Order>;
+            const gross =
+              typeof p.subtotal_items === 'number' && typeof p.service_fee_amount === 'number' ? toCents(p.subtotal_items) + toCents(p.service_fee_amount) : null;
+            const own = toCents(p.discount_amount!);
+            const cents = rebase(own, gross);
+            return {
+              ...e,
+              payload: {
+                ...e.payload,
+                discount_amount: cents / 100,
+                ...(typeof p.total_amount === 'number' ? { total_amount: (toCents(p.total_amount) + own - cents) / 100 } : {}),
+                ...(typeof p.remaining_balance === 'number' ? { remaining_balance: (toCents(p.remaining_balance) + own - cents) / 100 } : {}),
+              },
+            };
+          });
+          const localCents = rebase(toCents(order.discount_amount), toCents(order.subtotal_items) + toCents(order.service_fee_amount));
+          const recalculated = applyOrderTotals({ ...order, discount_amount: localCents / 100 }, get().orderItems, get().payments);
+          if (order.status === 'CLOSED' && toCents(recalculated.remaining_balance) > 0) {
+            return fail(
+              `Esta conta já foi fechada neste aparelho com o cashback. Sem ele ficariam faltando ${formatBRL(recalculated.remaining_balance)}, que não foram cobrados. A conta segue nos recusados para o gerente conferir com o cliente.`,
+            );
+          }
+          const refundIds = new Set(refunds.map((r) => r.id));
+          const customerId = redeem?.customer_id ?? String(rejected.event.payload.customer_id);
+          const ts = nowISO();
+          const rest = get().cashbackLedger.filter((e) => e.id !== redeem?.id && !refundIds.has(e.id));
+          const sources = redeem?.redeem_sources ?? null;
+          const proven = sources !== null && sources.length > 0 && sources.every((src) => src.source_id !== null)
+            && sources.reduce((sum, src) => sum + toCents(src.amount), 0) === amount
+            && sources.every((src) => rest.some((e) => e.id === src.source_id && e.customer_id === customerId));
+          let ledger: CashbackLedgerEntry[];
+          let reconciled: Record<string, unknown> = {};
+          if (proven) {
+            // Resgate desta versão: os créditos voltam ao que eram antes dele, pela lista de origens.
+            ledger = rest.map((x) => {
+              const back = sources.filter((src) => src.source_id === x.id).reduce((sum, src) => sum + toCents(src.amount), 0);
+              return back ? { ...x, remaining_amount: (toCents(x.remaining_amount) + back) / 100 } : x;
+            });
+          } else {
+            // Resgate da versão anterior (P0-01 da rodada 10 do GPT): sem a lista de origens,
+            // somar o valor de volta a um crédito qualquer inventa saldo, e deixar como está
+            // perde o que foi baixado. O extrato do cliente vem da nuvem, lido agora.
+            if (!cloud) {
+              return fail('Este resgate é da versão anterior do aparelho e não diz de quais créditos saiu. Para desfazer, o aparelho confere o extrato do cliente na nuvem: conecte à internet e toque de novo.');
+            }
+            const cloudLedger = cloud.cashbackLedger.filter((e) => e.customer_id === customerId && e.tenant_id === order.tenant_id);
+            if (!cloud.loyaltyCustomers.some((c) => c.id === customerId && c.tenant_id === order.tenant_id)) {
+              return fail('O cliente deste resgate não foi encontrado na nuvem. Nada foi alterado; chame o gerente para conferir com o cliente.');
+            }
+            if (cloudLedger.some((e) => e.entry_type === 'REDEEM' && e.order_id === orderId)) {
+              return fail('A nuvem já tem um resgate para esta conta. Nada foi alterado; toque em Sincronizar agora e confira a conta.');
+            }
+            // Baixa que subiu da versão anterior sem o resgate: não há como provar a qual
+            // resgate pertence. Nada muda aqui; o recusado fica para o gerente conciliar.
+            const orphan = cashbackOrphanCents(cloudLedger, customerId);
+            if (orphan > 0) {
+              return fail(
+                `Na nuvem, ${formatBRL(orphan / 100)} do cashback deste cliente já foram baixados sem resgate (versão anterior do aparelho). Não dá para desfazer sem conferir de qual resgate é: nada foi alterado e a conta segue nos recusados para o gerente conciliar com o cliente.`,
+              );
+            }
+            // Outros resgates do mesmo cliente ainda recusados aqui continuam aplicados neste
+            // aparelho: saem de novo do extrato da nuvem (pela lista de origens ou, sem ela,
+            // do mais antigo para o mais novo). Qualquer outro lançamento do extrato do cliente
+            // ainda não aceito pela nuvem: espera (o extrato da nuvem ainda não o tem).
+            const otherRejected = (get().syncRejected ?? []).filter(
+              (r) => r.event.id !== eventId && r.event.table === 'cashback_ledger' && r.event.cashback_redeem && r.event.payload.customer_id === customerId,
+            );
+            const heldOrders = new Set([orderId, ...otherRejected.map((r) => String(r.event.payload.order_id))]);
+            const unsettled = [...get().outbox, ...(get().syncRejected ?? []).map((r) => r.event)].some(
+              (e) =>
+                e.id !== eventId &&
+                !otherRejected.some((r) => r.event.id === e.id) &&
+                !(e.depends_on_order_id && heldOrders.has(e.depends_on_order_id)) &&
+                // Só o extrato conta: o cadastro do cliente (loyalty_customers) não muda saldo,
+                // que o banco calcula pelo extrato.
+                e.table === 'cashback_ledger' && e.payload.customer_id === customerId,
+            );
+            if (unsettled) {
+              return fail('Há outra operação de cashback deste cliente esperando a nuvem. Nada foi alterado; toque em Sincronizar agora e tente de novo.');
+            }
+            let fromCloud: CashbackLedgerEntry[] = cloudLedger;
+            for (const r of otherRejected) {
+              const other = get().cashbackLedger.find((e) => e.id === r.event.row_id && e.entry_type === 'REDEEM');
+              const v = toCents(Number(other?.amount ?? r.event.payload.amount));
+              const otherSources = other?.redeem_sources ?? null;
+              try {
+                if (otherSources && otherSources.length > 0 && otherSources.every((src) => src.source_id !== null)) {
+                  fromCloud = fromCloud.map((x) => {
+                    const out = otherSources.filter((src) => src.source_id === x.id).reduce((sum, src) => sum + toCents(src.amount), 0);
+                    if (out > toCents(x.remaining_amount)) throw new Error('crédito');
+                    return out ? { ...x, remaining_amount: (toCents(x.remaining_amount) - out) / 100 } : x;
+                  });
+                  if (otherSources.some((src) => !fromCloud.some((x) => x.id === src.source_id))) throw new Error('crédito');
+                } else {
+                  fromCloud = consumeCashbackFifo(fromCloud, customerId, v / 100, new Date(other?.created_at ?? ts));
+                }
+              } catch {
+                return fail('Outro resgate recusado deste cliente não fecha com o extrato da nuvem. Nada foi alterado; chame o gerente para conciliar com o cliente.');
+              }
+              if (other) fromCloud = [...fromCloud, other];
+            }
+            // Reaplicados acima (os resgates e os estornos locais das outras contas recusadas
+            // saem da troca e voltam pelo que foi reaplicado).
+            const localOthers = rest.filter((e) => e.customer_id !== customerId);
+            const keptOtherRows = rest.filter(
+              (e) => e.customer_id === customerId && e.order_id !== null && heldOrders.has(e.order_id) && e.entry_type !== 'REDEEM',
+            );
+            ledger = [...localOthers, ...fromCloud, ...keptOtherRows];
+            reconciled = {
+              legacy_redeem: true,
+              reconciled_with_cloud_at: ts,
+              cloud_orphan_cents: orphan,
+              local_balance_before: balanceCashback(get().cashbackLedger, customerId, new Date(ts)),
+            };
+          }
+          set((s) => ({
+            orders: s.orders.map((o) => (o.id === orderId ? recalculated : o)),
+            outbox,
+            syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
+            cashbackLedger: ledger,
+            loyaltyCustomers: s.loyaltyCustomers.map((c) => (c.id === customerId ? { ...c, cashback_balance: balanceCashback(ledger, c.id, new Date(ts)) } : c)),
+            // O registro do resgate fica no histórico deste aparelho, sem valor e marcado como
+            // recusado pela nuvem; os estornos que saíram dele somem com eles.
+            auditLogs: s.auditLogs
+              .filter((l) => !((l.action_type === 'CASHBACK_REFUNDED' || l.action_type === 'CASHBACK_REFUND_HELD') && refundIds.has(String(l.metadata?.refund_id))))
+              .map((l) =>
+                l.id === redeemLog!.id
+                  ? {
+                      ...l,
+                      amount_impact: 0,
+                      metadata: { ...(l.metadata ?? {}), rejected_by_cloud: rejected.message, undone_at: ts, undone_by_user_id: user.id, ...reconciled },
+                    }
+                  : l,
+              ),
+          }));
+          return { ok: true, data: amount / 100 };
         },
 
         openCashSession: (openingFloat) => {
@@ -4076,8 +4748,8 @@ export const useTcheStore = create<TcheState>()(
       // v4 = totem / pedido com senha; v5 = compras por XML (estoque, código de barras);
       // v6 = combos; v7 = nuvem → aparelho (pullStatus);
       // v8 = caixa (abertura, sangria, suprimento, fechamento); v9 = preço conferido pelo servidor;
-      // v10 = entrega própria; v11 = avaliações dos clientes.
-      version: 11,
+      // v10 = entrega própria; v11 = avaliações dos clientes; v12 = resgate de cashback pela função do servidor.
+      version: 12,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
       storage: createJSONStorage(() => idbStorage),
       partialize: (s) => {
@@ -4208,7 +4880,49 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
   if (version < 11) {
     if (!Array.isArray(out.reviews)) out.reviews = [];
   }
+  if (version < 12) {
+    const auditLogs = Array.isArray(out.auditLogs) ? (out.auditLogs as AuditLog[]) : [];
+    const outbox = Array.isArray(out.outbox) ? (out.outbox as SyncEvent[]) : [];
+    const rejected = Array.isArray(out.syncRejected) ? (out.syncRejected as RejectedSyncEvent[]) : [];
+    const queued = migrateCashbackRedeemQueue([...rejected.map((r) => r.event), ...outbox], auditLogs);
+    const rejectedIds = new Set(rejected.map((r) => r.event.id));
+    out.syncRejected = rejected.flatMap((r) => {
+      const ev = queued.find((e) => e.id === r.event.id);
+      return ev ? [{ ...r, event: ev }] : [];
+    });
+    out.outbox = queued.filter((e) => !rejectedIds.has(e.id));
+  }
   return out;
+}
+
+/**
+ * Fila gravada antes da v12: o resgate de cashback subia em três partes (audit_log
+ * CASHBACK_REDEEMED, baixa dos créditos por UPDATE e o REDEEM). Agora sobe numa chamada
+ * (tchefood_register_cashback_redeem), que faz as três no banco. O REDEEM ganha o id do
+ * audit_log do resgate; o audit_log e as baixas ainda na fila saem dela (o banco recusaria
+ * a baixa direta). Se o audit_log já tinha subido, a função usa o que está gravado; se
+ * parte das baixas já tinha subido, a função só conta esse crédito como já baixado com a
+ * prova na nuvem (o audit_log deste resgate, desta conta, cliente e valor) e sem dúvida de
+ * a qual resgate ele pertence; senão recusa e o gerente concilia (legacy_predebited).
+ */
+export function migrateCashbackRedeemQueue(events: SyncEvent[], auditLogs: AuditLog[]): SyncEvent[] {
+  const redeems = events.filter((e) => e.table === 'cashback_ledger' && e.op === 'INSERT' && e.payload.entry_type === 'REDEEM' && !e.cashback_redeem);
+  if (!redeems.length) return events;
+  const orderIds = new Set(redeems.map((e) => String(e.payload.order_id)));
+  const auditFor = (orderId: string) =>
+    events.find((e) => e.table === 'audit_logs' && e.op === 'INSERT' && e.payload.action_type === 'CASHBACK_REDEEMED' && e.payload.order_id === orderId)?.row_id ??
+    auditLogs.find((l) => l.action_type === 'CASHBACK_REDEEMED' && l.order_id === orderId)?.id;
+  return events.flatMap((e) => {
+    if (e.table === 'cashback_ledger' && e.op === 'UPDATE' && e.depends_on_order_id && orderIds.has(e.depends_on_order_id)) return [];
+    if (e.table === 'audit_logs' && e.op === 'INSERT' && e.payload.action_type === 'CASHBACK_REDEEMED' && orderIds.has(String(e.payload.order_id))) return [];
+    if (redeems.includes(e)) {
+      const audit = auditFor(String(e.payload.order_id));
+      // As baixas dos créditos subiam ANTES do resgate: se parte delas já subiu, o
+      // servidor encontra essa baixa sem resgate do cliente e não a consome de novo.
+      return [audit ? { ...e, cashback_redeem: { audit_id: audit, legacy_predebited: true } } : e];
+    }
+    return [e];
+  });
 }
 
 /** Mesa técnica da venda de balcão (Ficha Rápida) de uma loja. */

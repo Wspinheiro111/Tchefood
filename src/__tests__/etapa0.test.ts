@@ -560,6 +560,23 @@ describe('sincronização com o Supabase', () => {
     expect(res.rejected[0]!.message).toMatch(/não confirmou o PIN/);
   });
 
+  it('quem depende de um evento mais adiante na fila espera por ele', async () => {
+    const calls: string[] = [];
+    const fetchFn: FetchLike = async (url) => {
+      calls.push(url);
+      return { ok: true, status: 201, text: async () => '' };
+    };
+    // O dependente vem primeiro na ordem do servidor (cashback antes de pedido não importa:
+    // a dependência é explícita pelo id do evento).
+    const dep = ev({ id: 'dep', table: 'audit_logs', row_id: 'L1', payload: { id: 'L1' }, depends_on_event_ids: ['later'] });
+    const later = ev({ id: 'later', table: 'audit_logs', row_id: 'L2', payload: { id: 'L2' } });
+    const r = await flushOutbox([dep, later], cfg, fetchFn);
+    expect(r.sent).toEqual(['later']);
+    expect(calls).toHaveLength(1);
+    // Na rodada seguinte, já aceita a dependência, ele sobe.
+    expect((await flushOutbox([dep], cfg, fetchFn)).sent).toEqual(['dep']);
+  });
+
   it('evento recusado (4xx) não trava a fila: os próximos continuam subindo', async () => {
     const calls: string[] = [];
     const fetchFn: FetchLike = async (url) => {

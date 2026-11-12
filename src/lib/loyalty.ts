@@ -11,7 +11,7 @@
  *    vencem primeiro (FIFO).
  *  - WhatsApp só com opt-in registrado (LGPD / política do WhatsApp Business).
  */
-import type { CashbackLedgerEntry, LoyaltyCustomer, Order, UUID } from '../types';
+import type { CashbackLedgerEntry, CashbackRedeemSource, LoyaltyCustomer, Order, UUID } from '../types';
 import { formatBRL, fromCents, toCents } from './money';
 
 export const CASHBACK_PCT = 5;
@@ -76,10 +76,37 @@ export function cashbackValidity(earnedAt: Date): { valid_from: string; expires_
   return { valid_from: from.toISOString(), expires_at: until.toISOString() };
 }
 
+/** Lançamento que é crédito do cliente: o ganho (EARN) e a devolução de um resgate (REFUND). */
+export function isCashbackCredit(e: CashbackLedgerEntry): boolean {
+  return e.entry_type === 'EARN' || e.entry_type === 'REFUND';
+}
+
+/**
+ * Parte de um resgate que já saiu da conta: devolvida ao cliente (REFUND) ou retida para
+ * conciliação por não ter origem comprovada (HOLD, sem saldo e sem validade).
+ */
+export function isCashbackRefund(e: CashbackLedgerEntry): boolean {
+  return e.entry_type === 'REFUND' || e.entry_type === 'HOLD';
+}
+
+/**
+ * Quanto do cashback volta quando o desconto da conta cai (P0-02 da rodada 8 do GPT; mesma
+ * conta de tchefood_orders_cashback_refund). O desconto é o manual mais o cashback ainda
+ * aplicado; o desconto manual fica (até o novo desconto) e o cashback absorve a queda.
+ * Bruto 100, manual 10, resgate 45 (desconto 55), cancelamento deixa o bruto em 20:
+ * manual 10, cashback 10, volta 35. Tudo em centavos.
+ */
+export function cashbackRefundCents(appliedCents: number, discountBeforeCents: number, discountAfterCents: number): number {
+  const applied = Math.max(appliedCents, 0);
+  const manualBefore = Math.max(discountBeforeCents - applied, 0);
+  const manualAfter = Math.min(manualBefore, Math.max(discountAfterCents, 0));
+  return Math.max(applied - (discountAfterCents - manualAfter), 0);
+}
+
 function isUsableEarn(e: CashbackLedgerEntry, customerId: UUID, at: Date): boolean {
   return (
     e.customer_id === customerId &&
-    e.entry_type === 'EARN' &&
+    isCashbackCredit(e) &&
     e.remaining_amount > 0 &&
     e.valid_from !== null &&
     e.expires_at !== null &&
@@ -97,15 +124,115 @@ export function availableCashback(ledger: readonly CashbackLedgerEntry[], custom
 export function balanceCashback(ledger: readonly CashbackLedgerEntry[], customerId: UUID, at: Date): number {
   return fromCents(
     ledger
-      .filter((e) => e.customer_id === customerId && e.entry_type === 'EARN' && e.expires_at !== null && new Date(e.expires_at) > at)
+      .filter((e) => e.customer_id === customerId && isCashbackCredit(e) && e.expires_at !== null && new Date(e.expires_at) > at)
       .reduce((a, e) => a + toCents(e.remaining_amount), 0),
   );
+}
+
+/**
+ * Crédito do cliente baixado sem resgate que o explique: soma de (amount − remaining) dos
+ * EARN e REFUND menos a soma dos REDEEM. Mesma conta de v_orphan em
+ * tchefood_register_cashback_redeem (db/schema_cashback_servidor.sql). Na versão 11 do
+ * aparelho a baixa subia antes do resgate; se só ela chegou à nuvem, aparece aqui.
+ */
+export function cashbackOrphanCents(ledger: readonly CashbackLedgerEntry[], customerId: UUID): number {
+  const mine = ledger.filter((e) => e.customer_id === customerId);
+  const debited = mine.filter(isCashbackCredit).reduce((a, e) => a + toCents(e.amount) - toCents(e.remaining_amount), 0);
+  const redeemed = mine.filter((e) => e.entry_type === 'REDEEM').reduce((a, e) => a + toCents(e.amount), 0);
+  return Math.max(debited - redeemed, 0);
 }
 
 /** Quanto do cashback pode abater desta conta. */
 export function cashbackUsable(available: number, order: Pick<Order, 'total_amount' | 'remaining_balance'>): number {
   const capCents = Math.round((toCents(order.total_amount) * CASHBACK_MAX_USAGE_PCT) / 100);
   return fromCents(Math.max(Math.min(toCents(available), capCents, toCents(order.remaining_balance)), 0));
+}
+
+/**
+ * De quais créditos sai um resgate (FIFO: vence antes, sai antes), na ordem da baixa.
+ * O resgate guarda essa lista (redeem_sources) para o estorno herdar a validade.
+ */
+export function cashbackFifoSources(
+  ledger: readonly CashbackLedgerEntry[],
+  customerId: UUID,
+  amount: number,
+  at: Date,
+): CashbackRedeemSource[] {
+  let left = toCents(amount);
+  const usable = ledger
+    .filter((e) => isUsableEarn(e, customerId, at))
+    .sort((a, b) => (a.expires_at! < b.expires_at! ? -1 : a.expires_at! > b.expires_at! ? 1 : a.created_at < b.created_at ? -1 : 1));
+  const sources: CashbackRedeemSource[] = [];
+  for (const e of usable) {
+    if (left <= 0) break;
+    const t = Math.min(toCents(e.remaining_amount), left);
+    sources.push({ source_id: e.id, amount: fromCents(t) });
+    left -= t;
+  }
+  if (left > 0) throw new Error('Saldo de cashback insuficiente.');
+  return sources;
+}
+
+/**
+ * Uma parte do estorno: valor e a validade do crédito de onde saiu. Parte sem origem
+ * comprovada (hold) não tem validade: fica retida para conciliação, fora do saldo.
+ */
+export type CashbackRefundPart =
+  | { refund_of_id: UUID; amount: number; valid_from: string; expires_at: string; hold?: undefined }
+  | { refund_of_id: null; amount: number; valid_from: null; expires_at: null; hold: true; reported_source_ids: UUID[] };
+
+/**
+ * Como o estorno de um resgate volta ao cliente (decisão do Will, 10/11/2026: o cashback
+ * vale 30 dias de quando foi gerado, com ou sem cancelamento). Mesma regra de
+ * tchefood_orders_cashback_refund (db/schema_cashback_servidor.sql): cada parte volta com
+ * a validade do crédito de onde saiu, primeiro o que vence por último; parte de crédito
+ * vencido volta vencida. Parte sem origem comprovada (resgate da versão anterior com
+ * source_id nulo, ou crédito de origem que não está no extrato) não ganha validade de outro
+ * crédito nem prazo novo (P0-03 da rodada 8 do GPT): sai como hold, para conciliação.
+ */
+export function planCashbackRefund(
+  ledger: readonly CashbackLedgerEntry[],
+  redeem: CashbackLedgerEntry,
+  amount: number,
+): CashbackRefundPart[] {
+  const byId = new Map(ledger.map((e) => [e.id, e]));
+  // Origem comprovada: crédito desta loja, com validade. O resto (sem source_id, UUID que
+  // não está no extrato ou de outra loja: P2-01 da rodada 9 do GPT) é um único balde
+  // retido (HOLD) sem refund_of_id; o que o balde já reteve é a soma dos HOLD da conta.
+  const all = (redeem.redeem_sources ?? [{ source_id: null, amount: redeem.amount }]).map((src) => {
+    const credit = src.source_id ? byId.get(src.source_id) ?? null : null;
+    const proven = credit && credit.tenant_id === redeem.tenant_id && credit.valid_from && credit.expires_at ? credit : null;
+    return { src, credit: proven };
+  });
+  const proven = all
+    .filter((x): x is { src: (typeof all)[number]['src']; credit: CashbackLedgerEntry & { valid_from: string; expires_at: string } } => x.credit !== null)
+    .sort((a, b) => {
+      if (a.credit.expires_at === b.credit.expires_at) return b.credit.created_at < a.credit.created_at ? -1 : 1;
+      return a.credit.expires_at > b.credit.expires_at ? -1 : 1;
+    });
+  const unproven = all.filter((x) => x.credit === null);
+  const refunds = ledger.filter((e) => e.order_id === redeem.order_id && isCashbackRefund(e));
+  let left = toCents(amount);
+  const parts: CashbackRefundPart[] = [];
+  for (const { src, credit } of proven) {
+    if (left <= 0) break;
+    const back = refunds.filter((r) => r.entry_type === 'REFUND' && r.refund_of_id === credit.id).reduce((sum, r) => sum + toCents(r.amount), 0);
+    const take = Math.min(toCents(src.amount) - back, left);
+    if (take <= 0) continue;
+    parts.push({ refund_of_id: credit.id, amount: fromCents(take), valid_from: credit.valid_from, expires_at: credit.expires_at });
+    left -= take;
+  }
+  if (left > 0 && unproven.length > 0) {
+    const held = refunds.filter((r) => r.entry_type === 'HOLD').reduce((sum, r) => sum + toCents(r.amount), 0);
+    const take = Math.min(unproven.reduce((sum, x) => sum + toCents(x.src.amount), 0) - held, left);
+    if (take > 0) {
+      parts.push({
+        refund_of_id: null, amount: fromCents(take), valid_from: null, expires_at: null, hold: true,
+        reported_source_ids: unproven.flatMap((x) => (x.src.source_id ? [x.src.source_id] : [])),
+      });
+    }
+  }
+  return parts;
 }
 
 /** Consome créditos FIFO (vence antes, sai antes). Devolve o extrato atualizado. */
