@@ -127,18 +127,34 @@ export function jsonLd(): Record<string, unknown> {
   };
 }
 
-/** JSON pronto para ir dentro de <script type="application/ld+json">, sem permitir fechar a tag. */
-export function jsonLdSeguroParaHtml(): string {
-  return JSON.stringify(jsonLd()).replace(/</g, '\\u003c');
+/**
+ * Serializa um valor para dentro de <script type="application/ld+json">: "<" vira \u003c, então
+ * nenhum texto (nem "</script>") consegue fechar a tag. U+2028/U+2029 também saem escapados.
+ */
+export function jsonParaScript(valor: unknown): string {
+  return JSON.stringify(valor)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
-export function sitemapXml(dataModificacao: string): string {
+/** JSON-LD da página pronto para o <head>. */
+export function jsonLdSeguroParaHtml(): string {
+  return jsonParaScript(jsonLd());
+}
+
+/**
+ * sitemap.xml. `dataModificacao` (AAAA-MM-DD) é a data do último commit que mexeu na landing,
+ * não a data do build: sem ela (build fora do git), o <lastmod> fica de fora em vez de inventar.
+ */
+export function sitemapXml(dataModificacao?: string | null): string {
+  const lastmod = dataModificacao && /^\d{4}-\d{2}-\d{2}$/.test(dataModificacao) ? dataModificacao : null;
   return [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     '  <url>',
     `    <loc>${urlAbsoluta()}</loc>`,
-    `    <lastmod>${dataModificacao}</lastmod>`,
+    ...(lastmod ? [`    <lastmod>${lastmod}</lastmod>`] : []),
     '    <changefreq>weekly</changefreq>',
     '    <priority>1.0</priority>',
     '  </url>',
