@@ -427,6 +427,8 @@ export type AuditActionType =
   | 'MANAGER_PIN_LOCKOUT'
   | 'KEG_CHANGED'
   | 'CASHBACK_REDEEMED'
+  | 'CASHBACK_REFUNDED'
+  | 'CASHBACK_REFUND_HELD'
   | 'KIOSK_EXIT'
   | 'CHARGE_CONFIRMED_MANUALLY'
   // Etapa 0 — cadastros
@@ -544,7 +546,9 @@ export interface LoyaltyCustomer {
   created_at: ISODateTime;
 }
 
-export type CashbackEntryType = 'EARN' | 'REDEEM' | 'EXPIRE';
+/** REFUND: cashback devolvido ao cliente quando um cancelamento deixa o desconto abaixo do resgate (crédito como o EARN). */
+/** HOLD: parte de um resgate que saiu da conta sem origem comprovada, retida para conciliação (sem saldo nem validade). */
+export type CashbackEntryType = 'EARN' | 'REDEEM' | 'EXPIRE' | 'REFUND' | 'HOLD';
 
 export interface CashbackLedgerEntry {
   id: UUID;
@@ -560,6 +564,21 @@ export interface CashbackLedgerEntry {
   expires_at: ISODateTime | null;
   created_by_user_id: UUID | null;
   created_at: ISODateTime;
+  /** REDEEM: de quais créditos saiu (gravado pelo banco; source_id nulo = origem desconhecida). */
+  redeem_sources?: CashbackRedeemSource[] | null;
+  /** REFUND: de qual crédito é esta devolução (vence com ele). */
+  refund_of_id?: UUID | null;
+  /**
+   * Só no espelho do estorno feito neste aparelho (não existe no banco): o evento da fila
+   * (atualização da conta) que faz o banco gravar este estorno. Enquanto ele não subir, o
+   * crédito não existe na nuvem. O estorno lido da nuvem não tem este campo.
+   */
+  source_event_id?: UUID;
+}
+
+export interface CashbackRedeemSource {
+  source_id: UUID | null;
+  amount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +818,19 @@ export interface SyncEvent {
    */
   keg_change?: KegChangeSync;
   /**
+   * Só no resgate de cashback (cashback_ledger REDEEM): o id do audit_log do resgate.
+   * Sobe por tchefood_register_cashback_redeem(), que confere dia, saldo e teto,
+   * baixa os créditos e grava resgate, audit_log e desconto da comanda juntos.
+   */
+  cashback_redeem?: {
+    audit_id: UUID;
+    /**
+     * Fila convertida da versão anterior (antes da v12): os créditos podem já ter sido
+     * baixados na nuvem sem o resgate. O servidor mede essa baixa e não consome de novo.
+     */
+    legacy_predebited?: boolean;
+  };
+  /**
    * Item de chopp: a torneira de onde sai. Segura o item atrás de uma troca de barril
    * recusada da mesma torneira (recordKeys). Não vai para o banco.
    */
@@ -812,6 +844,14 @@ export interface SyncEvent {
    * comanda for recusado, a mesa fica segurada junto e não aparece livre na nuvem.
    */
   depends_on_order_id?: UUID;
+  /**
+   * Eventos da fila de que esta mudança depende: o resgate de cashback que usa o estorno
+   * gerado neste aparelho pelo cancelamento (ou retirada dos 10%) de outra comanda espera o
+   * evento que faz o banco gravar aquele estorno. Enquanto ele estiver na fila ou recusado, o
+   * resgate fica segurado (flushOutbox); só ele, não as operações seguintes daquela comanda.
+   * Não vai para o banco.
+   */
+  depends_on_event_ids?: UUID[];
 }
 
 export interface KegChangeSync {
