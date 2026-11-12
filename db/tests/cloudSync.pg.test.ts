@@ -2032,12 +2032,12 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     n = 0;
     const snap = await fetchCloudSnapshot(cfg, TENANT, late('00000000-0000-4000-8000-000000000002'));
     const afterAll = ids();
-    const got = snap.cashbackLedger.filter((e) => e.customer_id === cust.id).map((e) => e.id).sort();
-    expect(new Set(snap.cashbackLedger.map((e) => e.id)).size).toBe(snap.cashbackLedger.length);
+    const got = snap.cashbackLedger!.filter((e) => e.customer_id === cust.id).map((e) => e.id).sort();
+    expect(new Set(snap.cashbackLedger!.map((e) => e.id)).size).toBe(snap.cashbackLedger!.length);
     expect([JSON.stringify(beforeAll), JSON.stringify(afterAll)]).toContain(JSON.stringify(got));
     // Só a loja do token.
-    expect(snap.cashbackLedger.every((e) => e.tenant_id === TENANT)).toBe(true);
-    expect(snap.loyaltyCustomers.every((c) => c.tenant_id === TENANT)).toBe(true);
+    expect(snap.cashbackLedger!.every((e) => e.tenant_id === TENANT)).toBe(true);
+    expect(snap.loyaltyCustomers!.every((c) => c.tenant_id === TENANT)).toBe(true);
     sql(`SET session_replication_role = replica; DELETE FROM cashback_ledger WHERE customer_id = '${cust.id}'; DELETE FROM loyalty_customers WHERE id = '${cust.id}';`);
   });
 
@@ -2192,7 +2192,8 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await rpc('tchefood_start_store', { p_owner_id: owner.id, p_owner_name: owner.name, p_owner_pin: '0003', p_qr_user_id: null, p_reason: 'Tentar de novo' })).body).toBe('null');
     expect(attempts()).toBe(before + 3);
     // O PIN nunca vai para o audit_log.
-    expect(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND (metadata::text LIKE '%${CASHIER_PIN}%' OR metadata::text LIKE '%${MANAGER_PIN}%')`)).toBe('0');
+    // (O PIN como valor solto: dentro de um UUID aleatório, como 5867f1eb-…-88ec3525162c, não conta.)
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND (metadata::text ~ '(^|[^0-9a-f-])${CASHIER_PIN}([^0-9a-f-]|$)' OR metadata::text ~ '(^|[^0-9a-f-])${MANAGER_PIN}([^0-9a-f-]|$)')`)).toBe('0');
     // anon não chama as funções.
     expect(sql(`SELECT has_function_privilege('anon', 'tchefood_save_staff(uuid,text,user_role,varchar,boolean,uuid,varchar,varchar,text,timestamptz)', 'EXECUTE')`)).toBe('f');
     expect(sql(`SELECT has_function_privilege('authenticated', 'tchefood_check_pin(uuid,varchar[],user_role[],uuid,uuid,varchar,text)', 'EXECUTE')`)).toBe('f');
