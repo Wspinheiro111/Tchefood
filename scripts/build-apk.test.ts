@@ -89,6 +89,22 @@ esac
 exec ${real} "$@"
 `;
 }
+// sdkmanager falso: em --licenses grava o próprio pid (FAKE_SDK_PID), cria FAKE_SDK_MARCA e espera enquanto
+// FAKE_SDK_PAUSA existir; depois grava FAKE_SDK_ESCRITA (um sdkmanager que ainda mexe no SDK). Na instalação cria
+// as pastas da plataforma e do build-tools.
+const SDKMANAGER_FALSO = `#!/bin/sh
+if [ "$1" = "--licenses" ]; then
+  [ -n "$FAKE_SDK_PID" ] && echo $$ > "$FAKE_SDK_PID"
+  if [ -n "$FAKE_SDK_MARCA" ]; then
+    : > "$FAKE_SDK_MARCA"
+    while [ -e "$FAKE_SDK_PAUSA" ]; do sleep 0.1; done
+    : > "$FAKE_SDK_ESCRITA"
+  fi
+  exit 0
+fi
+mkdir -p "$ANDROID_HOME/platforms/android-34" "$ANDROID_HOME/build-tools/34.0.0"
+exit 0
+`;
 const PERL_REAL = spawnSync('sh', ['-c', 'command -v perl'], { encoding: 'utf8' }).stdout.trim();
 
 function criarRepo() {
@@ -100,7 +116,7 @@ function criarRepo() {
   writeFileSync(join(raiz, 'android', 'settings.gradle.kts'), '');
 
   const sdk = join(raiz, 'sdk');
-  executavel(join(sdk, 'cmdline-tools', 'latest', 'bin', 'sdkmanager'), '#!/bin/sh\nexit 0\n');
+  executavel(join(sdk, 'cmdline-tools', 'latest', 'bin', 'sdkmanager'), SDKMANAGER_FALSO);
   mkdirSync(join(sdk, 'platforms', 'android-34'), { recursive: true });
   mkdirSync(join(sdk, 'build-tools', '34.0.0'), { recursive: true });
 
@@ -120,6 +136,7 @@ type Opcoes = {
   lockPausa?: string; lockMarca?: string; legadoPausa?: string; legadoMarca?: string;
   fundo?: string; extra?: Record<string, string>;
   pid?: string; depois?: number; escrita?: string; renameApkFalhar?: boolean; trocaAlvo?: string;
+  sdkPid?: string; sdkMarca?: string; sdkPausa?: string; sdkEscrita?: string;
 };
 
 function ambiente(raiz: string, o: Opcoes) {
@@ -149,6 +166,10 @@ function ambiente(raiz: string, o: Opcoes) {
     FAKE_ESCRITA: o.escrita ?? '',
     FAKE_RENAME_APK_FALHAR: o.renameApkFalhar ? '1' : '',
     FAKE_TROCA_ALVO: o.trocaAlvo ?? '',
+    FAKE_SDK_PID: o.sdkPid ?? '',
+    FAKE_SDK_MARCA: o.sdkMarca ?? '',
+    FAKE_SDK_PAUSA: o.sdkPausa ?? '',
+    FAKE_SDK_ESCRITA: o.sdkEscrita ?? '',
     ...(o.extra ?? {}),
   };
 }
@@ -724,6 +745,46 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
         if (g > 0 && vivo(g)) process.kill(g, 'SIGKILL');
       }
     }, 30000);
+
+    for (const sinal of ['SIGKILL', 'SIGTERM'] as const) {
+      it(`${sinal} só no bash principal durante a aceitação das licenças do SDK: B não roda enquanto o sdkmanager de A existir`, async () => {
+        const raiz = criarRepo();
+        // SDK sem a plataforma: o script passa por sdkmanager --licenses e pela instalação
+        rmSync(join(raiz, 'sdk', 'platforms'), { recursive: true, force: true });
+        const sdkPid = join(raiz, 'pid-sdk');
+        const sdkMarca = join(raiz, 'sdk-licencas');
+        const sdkPausa = join(raiz, 'pausa-sdk');
+        const sdkEscrita = join(raiz, 'sdk-escreveu');
+        writeFileSync(sdkPausa, '');
+        const a = rodarEmSegundoPlano(raiz, 'all', { gerar: 'pagbank tablet', build: 'A', sdkPid, sdkMarca, sdkPausa, sdkEscrita });
+        try {
+          await esperar(() => existsSync(sdkMarca) || a.terminou());
+          expect(a.terminou()).toBe(false);
+          const sdk = pidDe(sdkPid);
+          expect(sdk).toBeGreaterThan(0);
+          process.kill(a.filho.pid as number, sinal);
+          await a.saiu;
+          // B tenta até conseguir; enquanto o sdkmanager de A existir, B tem de ser recusado
+          let r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
+          const limite = Date.now() + 15000;
+          while (r.codigo !== 0 && r.saida.includes('outra execução') && Date.now() < limite) {
+            await new Promise((ok) => setTimeout(ok, 100));
+            r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
+          }
+          expect(vivo(sdk)).toBe(false);
+          expect(r.codigo).toBe(0);
+          expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
+          // o sdkmanager de A foi encerrado parado: nunca chegou a escrever, nem depois de B
+          rmSync(sdkPausa, { force: true });
+          await new Promise((ok) => setTimeout(ok, 500));
+          expect(existsSync(sdkEscrita)).toBe(false);
+        } finally {
+          rmSync(sdkPausa, { force: true });
+          const g = pidDe(sdkPid);
+          if (g > 0 && vivo(g)) process.kill(g, 'SIGKILL');
+        }
+      }, 40000);
+    }
 
     it('variável TCHEFOOD_BUILD_LOCK_HELD definida por quem chama não pula a trava', async () => {
       const raiz = criarRepo();

@@ -59,10 +59,10 @@ case "$codigo_trava" in
   *) falha "não consegui pegar a trava $raiz/.apk-build.flock" ;;
 esac
 
-# Comandos rápidos de consulta (java -version, node -v, gradle --version, licenças do SDK) rodam sem o descritor 9.
+# Comandos rápidos de consulta (java -version, node -v, gradle --version) rodam sem o descritor 9.
 sem_trava() { "$@" 9>&-; }
 
-# Comandos longos que escrevem no projeto ou no cache (downloads, unzip, sdkmanager, npm, Gradle) rodam sob um
+# Comandos longos que escrevem no projeto ou no cache (downloads, unzip, sdkmanager e licenças, npm, Gradle) rodam sob um
 # supervisor (perl), iniciado direto por este bash, sem subshell no meio:
 #  - o supervisor fica com o descritor 9, então a trava continua presa enquanto o comando existir, mesmo se este
 #    bash morrer com kill -9: outra execução nunca roda ao mesmo tempo que um Gradle ou npm que ainda escreve;
@@ -147,7 +147,7 @@ link_ant=""
 limpar() {
   local codigo=$?
   trap - EXIT
-  # interrompido (Ctrl-C, kill) no meio de um comando longo: o supervisor encerra o grupo do comando e só sai
+  # interrompido (Ctrl-C, kill) no meio de um comando longo: o supervisor encerra o comando e os descendentes e só sai
   # depois disso; a trava só é solta quando nenhum processo desta execução sobrou
   if [ -n "$pid_filho" ]; then kill "$pid_filho" 2>/dev/null || true; wait "$pid_filho" 2>/dev/null || true; fi
   if [ -n "$link_novo" ]; then rm -f "$link_novo"; fi
@@ -243,10 +243,9 @@ fi
 
 if [ ! -d "$ANDROID_HOME/platforms/$PLATFORM" ] || [ ! -d "$ANDROID_HOME/build-tools/$BUILD_TOOLS" ]; then
   echo "-> instalando plataforma $PLATFORM e build-tools $BUILD_TOOLS (aceitando as licenças do Google)"
-  # `yes` fecha o pipe quando o sdkmanager termina; o SIGPIPE não é erro aqui.
-  set +o pipefail
-  sem_trava yes | sem_trava "$sdkmanager" --licenses >/dev/null
-  set -o pipefail
+  # As licenças também rodam sob o supervisor: o pipeline inteiro (sh, yes e sdkmanager) é descendente dele e sai
+  # junto se este bash for interrompido ou morrer. O status é o do sdkmanager (o SIGPIPE do `yes` não conta).
+  supervisionado sh -c 'yes | "$1" --licenses >/dev/null' sh "$sdkmanager"
   supervisionado "$sdkmanager" "platforms;$PLATFORM" "build-tools;$BUILD_TOOLS" "platform-tools"
 fi
 
