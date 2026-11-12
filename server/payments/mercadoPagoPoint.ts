@@ -11,7 +11,7 @@ import {
   type PaymentTerminalOperatingMode,
   type PaymentTerminalPaymentMethodType,
   type PaymentTerminalProvider,
-} from "../shared/paymentTerminal";
+} from "../shared/paymentTerminal.ts";
 
 const DEFAULT_BASE_URL = "https://api.mercadopago.com";
 const DEFAULT_TIMEOUT_MS = 15_000;

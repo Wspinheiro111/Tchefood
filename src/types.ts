@@ -23,7 +23,7 @@ export type ItemStatus = 'PENDING' | 'PREPARING' | 'READY' | 'DELIVERED' | 'CANC
 export type ProductionSector = 'KITCHEN' | 'BAR' | 'GRILL' | 'DESSERT' | 'NONE';
 export type PaymentMethod = 'CREDIT' | 'DEBIT' | 'PIX' | 'VOUCHER' | 'CASH';
 export type PaymentStatus = 'PENDING' | 'APPROVED' | 'DECLINED' | 'REFUNDED';
-export type AcquirerType = 'STONE' | 'PAGBANK' | 'MOCK' | 'CASH_DESK';
+export type AcquirerType = 'STONE' | 'PAGBANK' | 'MERCADO_PAGO' | 'MOCK' | 'CASH_DESK';
 export type OperationMode = 'SMARTPOS_EMBEDDED' | 'TEF_POS_WIRELESS';
 
 /** Valores aceitos em order_items.origin (VARCHAR(20)). */

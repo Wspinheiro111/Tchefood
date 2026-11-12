@@ -169,6 +169,13 @@ export interface PaymentOutcome {
  * aprovada. NSU e autorização são digitados do papel, nunca gerados. Forma e
  * adquirente vêm da trava; só são aceitos aqui quando a trava é antiga e não os tem.
  */
+/**
+ * Cobrança incerta da Point Smart não entra pelo comprovante: o banco só aceita a aprovação do
+ * Mercado Pago confirmada pelo servidor (db/schema_mercado_pago.sql).
+ */
+export const MERCADO_PAGO_MANUAL_ERROR =
+  'Cobrança do Mercado Pago não se registra pelo comprovante: o servidor só aceita a aprovação confirmada pelo Mercado Pago. Confira no app do Mercado Pago; se foi cobrado, estorne lá e cobre de novo.';
+
 export interface ReviewedChargeInput {
   orderId: UUID;
   nsu: string;
@@ -1789,6 +1796,7 @@ export const useTcheStore = create<TcheState>()(
           const method = hold.method ?? input.method;
           const acquirer = hold.acquirer ?? input.acquirer;
           if (method !== 'CREDIT' && method !== 'DEBIT' && method !== 'PIX') return fail('Informe a forma de pagamento que aparece no comprovante.');
+          if (acquirer === 'MERCADO_PAGO') return fail(MERCADO_PAGO_MANUAL_ERROR);
           if (acquirer !== 'STONE' && acquirer !== 'PAGBANK') return fail('Informe a maquininha (Stone ou PagBank) do comprovante.');
           if (input.card_brand !== null && !RECEIPT_CARD_BRANDS.includes(input.card_brand)) return fail('Bandeira do cartão inválida.');
           const proof = checkReceiptProof({ nsu: input.nsu, authorization_code: input.authorization_code });

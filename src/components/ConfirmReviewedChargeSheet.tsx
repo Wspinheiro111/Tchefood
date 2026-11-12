@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ReceiptText } from 'lucide-react';
 import { Btn, Sheet, toast } from './ui';
 import { PinPad } from './PinPad';
-import { MIN_REASON_LENGTH, RECEIPT_CARD_BRANDS, useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
+import { MERCADO_PAGO_MANUAL_ERROR, MIN_REASON_LENGTH, RECEIPT_CARD_BRANDS, useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
 import type { ReviewHold } from '../lib/payments/reviewHolds';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { formatBRL } from '../lib/money';
@@ -14,6 +14,11 @@ type Acquirer = 'STONE' | 'PAGBANK';
 const METHOD_LABEL: Record<Method, string> = { CREDIT: 'Crédito', DEBIT: 'Débito', PIX: 'Pix' };
 const ACQUIRER_LABEL: Record<Acquirer, string> = { STONE: 'Stone', PAGBANK: 'PagBank' };
 const DEFAULT_REASON = 'Maquininha aprovou, conferido no comprovante';
+
+/** Maquininha da trava que aceita registro pelo comprovante (Mercado Pago não aceita). */
+function receiptAcquirer(a: ReviewHold['acquirer']): Acquirer | null {
+  return a === 'STONE' || a === 'PAGBANK' ? a : null;
+}
 
 interface Props {
   open: boolean;
@@ -34,7 +39,7 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
   const [authCode, setAuthCode] = useState('');
   const [brand, setBrand] = useState<string | null>(null);
   const [method, setMethod] = useState<Method | null>(hold.method ?? null);
-  const [acquirer, setAcquirer] = useState<Acquirer | null>(hold.acquirer ?? null);
+  const [acquirer, setAcquirer] = useState<Acquirer | null>(receiptAcquirer(hold.acquirer));
   const [reason, setReason] = useState(DEFAULT_REASON);
   const [pin, setPin] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -45,7 +50,7 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
     setAuthCode('');
     setBrand(null);
     setMethod(hold.method ?? null);
-    setAcquirer(hold.acquirer ?? null);
+    setAcquirer(receiptAcquirer(hold.acquirer));
     setReason(DEFAULT_REASON);
     setPin('');
     setError(null);
@@ -77,6 +82,22 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
   };
 
   const field = 'min-h-touch-lg w-full rounded-xl border border-slate-300 bg-base px-3 text-2xl font-black tracking-widest outline-none focus:border-ouro';
+  if (hold.acquirer === 'MERCADO_PAGO') {
+    return (
+      <Sheet
+        open={open}
+        onClose={onClose}
+        title={<span className="flex items-center gap-2 text-brasa"><ReceiptText className="h-6 w-6" /> Cobrança do Mercado Pago</span>}
+        footer={<Btn block size="lg" variant="secondary" onClick={onClose}>Entendi</Btn>}
+      >
+        <div className="rounded-xl border border-ouro/50 bg-ouro/10 p-3 text-sm">
+          <div className="font-bold">{label} · {formatBRL(hold.amount)}{hold.method ? ` · ${METHOD_LABEL[hold.method]}` : ''} · Mercado Pago</div>
+          <p className="mt-1 text-slate-700">{MERCADO_PAGO_MANUAL_ERROR}</p>
+        </div>
+      </Sheet>
+    );
+  }
+
   const chip = (on: boolean) => `min-h-touch rounded-xl px-3 text-sm font-bold ${on ? 'bg-ouro text-slate-950' : 'bg-slate-200 text-slate-800'}`;
 
   return (

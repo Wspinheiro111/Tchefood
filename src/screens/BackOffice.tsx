@@ -156,8 +156,8 @@ function Dashboard() {
           <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Entradas por adquirente</div>
           {recon.map((r) => (
             <div key={r.acquirer} className="mb-2">
-              <div className="flex justify-between text-sm"><span>{r.acquirer === 'CASH_DESK' ? 'Dinheiro / Caixa' : r.acquirer === 'STONE' ? 'Stone' : 'PagBank'}</span><span className="tabular-nums">{formatBRL(r.total)}</span></div>
-              <div className="h-3 rounded-full bg-base"><div className={`h-3 rounded-full ${r.acquirer === 'STONE' ? 'bg-stone' : r.acquirer === 'PAGBANK' ? 'bg-pagbank' : 'bg-slate-400'}`} style={{ width: `${(r.total / max) * 100}%` }} /></div>
+              <div className="flex justify-between text-sm"><span>{r.acquirer === 'CASH_DESK' ? 'Dinheiro / Caixa' : r.acquirer === 'STONE' ? 'Stone' : r.acquirer === 'MERCADO_PAGO' ? 'Mercado Pago' : 'PagBank'}</span><span className="tabular-nums">{formatBRL(r.total)}</span></div>
+              <div className="h-3 rounded-full bg-base"><div className={`h-3 rounded-full ${r.acquirer === 'STONE' ? 'bg-stone' : r.acquirer === 'PAGBANK' ? 'bg-pagbank' : r.acquirer === 'MERCADO_PAGO' ? 'bg-sky-500' : 'bg-slate-400'}`} style={{ width: `${(r.total / max) * 100}%` }} /></div>
             </div>
           ))}
         </div>
@@ -184,7 +184,7 @@ function Reconciliation() {
             {rows.map((r) => (
               <tr key={r.acquirer} className="border-t border-slate-200">
                 <td className="p-3">
-                  <div className="font-bold">{r.acquirer === 'STONE' ? 'Stone' : r.acquirer === 'PAGBANK' ? 'PagBank' : 'Dinheiro / Caixa'}</div>
+                  <div className="font-bold">{r.acquirer === 'STONE' ? 'Stone' : r.acquirer === 'PAGBANK' ? 'PagBank' : r.acquirer === 'MERCADO_PAGO' ? 'Mercado Pago' : 'Dinheiro / Caixa'}</div>
                   <div className="text-xs text-slate-500">{r.cnpj ? `CNPJ ${r.cnpj.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5')}` : 'Gaveta do caixa'}</div>
                 </td>
                 {methods.map((m) => <td key={m} className="p-3 text-right tabular-nums">{formatBRL(r.byMethod[m])}</td>)}

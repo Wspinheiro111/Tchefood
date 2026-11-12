@@ -49,7 +49,7 @@ export function shiftKpis(orders: readonly Order[], payments: readonly Payment[]
   };
 }
 
-export type ReconKey = 'STONE' | 'PAGBANK' | 'CASH_DESK';
+export type ReconKey = 'STONE' | 'PAGBANK' | 'MERCADO_PAGO' | 'CASH_DESK';
 export type ReconMethod = 'CREDIT' | 'DEBIT' | 'PIX' | 'CASH' | 'VOUCHER';
 
 export interface ReconRow {
@@ -64,16 +64,18 @@ export function reconciliation(payments: readonly Payment[]): ReconRow[] {
   const rows: Record<ReconKey, ReconRow> = {
     STONE: { acquirer: 'STONE', cnpj: '16501555000157', byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
     PAGBANK: { acquirer: 'PAGBANK', cnpj: '08561701000101', byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
+    MERCADO_PAGO: { acquirer: 'MERCADO_PAGO', cnpj: '10573521000191', byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
     CASH_DESK: { acquirer: 'CASH_DESK', cnpj: null, byMethod: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 }, total: 0, count: 0 },
   };
   const cents: Record<ReconKey, Record<ReconMethod, number>> = {
     STONE: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 },
     PAGBANK: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 },
+    MERCADO_PAGO: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 },
     CASH_DESK: { CREDIT: 0, DEBIT: 0, PIX: 0, CASH: 0, VOUCHER: 0 },
   };
   for (const p of payments) {
     if (p.status !== 'APPROVED') continue;
-    const key: ReconKey = p.acquirer === 'STONE' || p.acquirer === 'PAGBANK' ? p.acquirer : 'CASH_DESK';
+    const key: ReconKey = p.acquirer === 'STONE' || p.acquirer === 'PAGBANK' || p.acquirer === 'MERCADO_PAGO' ? p.acquirer : 'CASH_DESK';
     cents[key][p.method] += toCents(p.amount);
     rows[key].count += 1;
   }
@@ -85,7 +87,8 @@ export function reconciliation(payments: readonly Payment[]): ReconRow[] {
     }
     rows[k].total = fromCents(total);
   }
-  return [rows.STONE, rows.PAGBANK, rows.CASH_DESK];
+  // Linha do Mercado Pago só quando houve venda na Point (lojas sem Point veem o mesmo de antes).
+  return rows.MERCADO_PAGO.count > 0 ? [rows.STONE, rows.PAGBANK, rows.MERCADO_PAGO, rows.CASH_DESK] : [rows.STONE, rows.PAGBANK, rows.CASH_DESK];
 }
 
 export interface WaiterRow {

@@ -3,7 +3,7 @@ import type { PaymentMethod } from '../types';
 import { round2, toCents } from './money';
 import { uuid } from './ids';
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest } from './payments/drivers';
-import { getReviewHold, setReviewHold } from './payments/reviewHolds';
+import { getReviewHold, setReviewHold, holdAcquirer } from './payments/reviewHolds';
 import { cardReceiptLines } from './receipts';
 import { formatPickupNumber, pickupReceipt } from './kiosk';
 import { routeDispatch, usePrintPreview } from '../services/printer/printerService';
@@ -67,7 +67,7 @@ export async function chargePickupOrder(params: {
     if (result.status === 'MANUAL_REVIEW') {
       setReviewHold({
         order_id: order.id, amount, reason: result.reason, code: result.failure_code, method: params.method,
-        acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
+        acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
       });
       return { status: 'MANUAL_REVIEW', reason: result.reason };
     }
@@ -84,7 +84,7 @@ export async function chargePickupOrder(params: {
       // A maquininha aprovou mas o registro falhou: trata como conferência manual, nunca cobra de novo.
       setReviewHold({
         order_id: order.id, amount, reason: `Aprovado na maquininha, mas não registrado: ${r.error}`, code: 'REGISTER_FAILED', method: params.method,
-        acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
+        acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
       });
       return { status: 'MANUAL_REVIEW', reason: r.error };
     }

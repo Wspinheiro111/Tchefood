@@ -103,3 +103,22 @@ export function defaultCloudConfig(): { url: string; anonKey: string } {
   const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {};
   return { url: env.VITE_SUPABASE_URL ?? '', anonKey: env.VITE_SUPABASE_ANON_KEY ?? '' };
 }
+
+/**
+ * Sessão da nuvem com token válido para chamar uma Edge Function agora (cobrança na
+ * Point Smart). Renova o token quando está para vencer. null = loja não conectada
+ * ou renovação recusada.
+ */
+export async function freshCloudConfig(fetchFn: FetchLike = browserFetch): Promise<SyncConfig | null> {
+  const session = useTcheStore.getState().cloud;
+  if (!session) return null;
+  if (!needsRefresh(session.expires_at)) return { url: session.url, anonKey: session.anon_key, accessToken: session.access_token };
+  try {
+    const t = await refreshDevice(session.url, session.anon_key, session.refresh_token, fetchFn);
+    const res = useTcheStore.getState().setCloudSession({ ...session, ...t });
+    if (!res.ok) return null;
+    return { url: session.url, anonKey: session.anon_key, accessToken: t.access_token };
+  } catch {
+    return null;
+  }
+}

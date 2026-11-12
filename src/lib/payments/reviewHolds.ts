@@ -16,13 +16,18 @@ export interface ReviewHold {
    * desta versão não têm esses campos e o gerente informa forma e adquirente.
    */
   method?: 'CREDIT' | 'DEBIT' | 'PIX';
-  acquirer?: 'STONE' | 'PAGBANK';
+  acquirer?: 'STONE' | 'PAGBANK' | 'MERCADO_PAGO';
   terminal_id?: string | null;
   terminal_serial?: string | null;
   /** Mesma chave da cobrança enviada à maquininha: o registro manual nunca duplica. */
   idempotency_key?: string;
   /** Mesa "por item consumido": itens que a cobrança incerta quitaria. */
   item_ids?: string[];
+}
+
+/** Adquirente gravado na trava: Mercado Pago e PagBank pelo nome; o resto como antes (Stone). */
+export function holdAcquirer(acquirer: string): 'STONE' | 'PAGBANK' | 'MERCADO_PAGO' {
+  return acquirer === 'PAGBANK' || acquirer === 'MERCADO_PAGO' ? acquirer : 'STONE';
 }
 
 const STORAGE_KEY = 'tchefood.paymentReviewHolds.v1';

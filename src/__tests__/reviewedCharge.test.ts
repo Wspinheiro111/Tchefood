@@ -176,3 +176,15 @@ describe('cobrança incerta aprovada na maquininha', () => {
     expect(order(created.data.id).status).toBe('CLOSED');
   });
 });
+
+describe('cobrança incerta da Point Smart (Mercado Pago)', () => {
+  it('não entra pelo comprovante digitado: o servidor só aceita a aprovação confirmada pelo Mercado Pago', async () => {
+    const { MERCADO_PAGO_MANUAL_ERROR } = await import('../store/useTcheStore');
+    const id = openTableWith(['101']);
+    holdFor(id, { acquirer: 'MERCADO_PAGO', terminal_serial: 'NEWLAND_N950__N950NCB801293324' });
+    const before = st().payments.length;
+    expect(st().confirmReviewedCharge({ orderId: id, ...RECEIPT }, MANAGER)).toEqual({ ok: false, error: MERCADO_PAGO_MANUAL_ERROR });
+    expect(st().payments.length).toBe(before);
+    expect(getReviewHold(id)).not.toBeNull();
+  });
+});

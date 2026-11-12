@@ -6,7 +6,7 @@ import { computeEqualShare, computeItemsShare, formatBRL, round2, toCents } from
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest, type IPaymentTerminalDriver } from '../lib/payments/drivers';
 import { cardReceiptLines, conferenceLines } from '../lib/receipts';
 import { uuid } from '../lib/ids';
-import { clearReviewHold, getReviewHold, setReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
+import { clearReviewHold, getReviewHold, setReviewHold, type ReviewHold, holdAcquirer } from '../lib/payments/reviewHolds';
 import { Btn, Stepper, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { ReviewCapture } from '../components/ReviewCapture';
@@ -119,7 +119,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         // Não registra pagamento nem recusa: o resultado é desconhecido e não pode ser repetido sozinho.
         setReviewHoldState(setReviewHold({
           order_id: orderId, amount, reason: result.reason, code: result.failure_code, method,
-          acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
+          acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
           idempotency_key, item_ids: itemIds,
         }));
         toast.alert(`⚠️ ${result.reason}`);
@@ -143,7 +143,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         // A maquininha aprovou mas o registro falhou: trava a conta (nunca cobra de novo) e o gerente registra pelo comprovante.
         setReviewHoldState(setReviewHold({
           order_id: orderId, amount, reason: `Aprovado na maquininha, mas não registrado: ${r.error}`, code: 'REGISTER_FAILED', method,
-          acquirer: result.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
+          acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
           idempotency_key, item_ids: itemIds,
         }));
         toast.alert(`⚠️ Aprovado na maquininha, mas não registrado: ${r.error}`);

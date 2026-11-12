@@ -124,7 +124,7 @@ function cardReceiptRaw(params: { tenant: Tenant; payment: Payment; tableLabel: 
   const p = params.payment;
   const methodLabel = p.method === 'CREDIT' ? 'CREDITO A VISTA' : p.method === 'DEBIT' ? 'DEBITO' : p.method === 'PIX' ? 'PIX' : p.method;
   return [
-    center(p.acquirer === 'PAGBANK' ? 'PAGBANK - MODERNINHA SMART' : 'STONE PAGAMENTOS'),
+    center(p.acquirer === 'PAGBANK' ? 'PAGBANK - MODERNINHA SMART' : p.acquirer === 'MERCADO_PAGO' ? 'MERCADO PAGO - POINT SMART' : 'STONE PAGAMENTOS'),
     center(`CNPJ ${formatCnpj(p.acquirer_cnpj ?? '')}`),
     LINE,
     center('VIA DO CLIENTE'),
