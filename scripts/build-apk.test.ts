@@ -24,6 +24,8 @@ function executavel(caminho: string, conteudo: string) {
 //   FAKE_VAZIO  variante cujo APK sai com 0 byte
 //   FAKE_FALHAR 1 = termina com erro depois de gerar os arquivos
 //   FAKE_BUILD  texto gravado em cada APK, para distinguir um build do outro
+//   FAKE_FUNDO  arquivo onde grava o pid de um processo deixado em segundo plano (fora do grupo, vivo 30 s,
+//               herdando todo descritor aberto que o Gradle recebeu), como um daemon que sobrevive ao build
 const GRADLE_FALSO = `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "Gradle 8.7"; exit 0; fi
 for v in $FAKE_GERAR; do
@@ -31,6 +33,10 @@ for v in $FAKE_GERAR; do
   mkdir -p "$d"
   if [ "$FAKE_VAZIO" = "$v" ]; then : > "$d/app-$v-debug.apk"; else printf '%s' "$FAKE_BUILD-$v" > "$d/app-$v-debug.apk"; fi
 done
+if [ -n "$FAKE_FUNDO" ]; then
+  perl -e 'setpgrp(0, 0); sleep 30' </dev/null >/dev/null 2>&1 &
+  echo $! > "$FAKE_FUNDO"
+fi
 if [ -n "$FAKE_MARCA" ]; then
   : > "$FAKE_MARCA"
   while [ -e "$FAKE_PAUSA" ]; do sleep 0.1; done
@@ -100,6 +106,7 @@ type Opcoes = {
   gerar: string; build?: string; vazio?: string; falhar?: boolean; renameFalhar?: boolean;
   pausa?: string; marca?: string; trocaPausa?: string; trocaMarca?: string;
   lockPausa?: string; lockMarca?: string; legadoPausa?: string; legadoMarca?: string;
+  fundo?: string; extra?: Record<string, string>;
 };
 
 function ambiente(raiz: string, o: Opcoes) {
@@ -123,6 +130,8 @@ function ambiente(raiz: string, o: Opcoes) {
     FAKE_LEGADO_MARCA: o.legadoMarca ?? '',
     FAKE_PAUSA: o.pausa ?? '',
     FAKE_MARCA: o.marca ?? '',
+    FAKE_FUNDO: o.fundo ?? '',
+    ...(o.extra ?? {}),
   };
 }
 
@@ -147,6 +156,16 @@ async function esperar(cond: () => boolean, ms = 10000) {
     if (Date.now() > limite) throw new Error('tempo esgotado esperando a condição');
     await new Promise((r) => setTimeout(r, 50));
   }
+}
+
+function vivo(pid: number) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function matarFundo(arquivo: string) {
+  if (!existsSync(arquivo)) return;
+  const pid = Number(readFileSync(arquivo, 'utf8'));
+  if (pid > 0 && vivo(pid)) process.kill(pid, 'SIGKILL');
 }
 
 function apks(raiz: string) {
@@ -275,6 +294,8 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(1);
       expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'C' }).codigo).toBe(0);
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'C-pagbank', 'tchefood-tablet-debug.apk': 'C-tablet' });
+      // ficam só a versão atual (C) e a anterior (A)
+      expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(2);
     });
 
     it('SIGKILL no meio da publicação: sem rodar o script de novo, apk/ continua inteiro no conjunto anterior', async () => {
@@ -299,7 +320,8 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       // e a execução seguinte funciona e limpa as sobras
       expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'C' }).codigo).toBe(0);
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'C-pagbank', 'tchefood-tablet-debug.apk': 'C-tablet' });
-      expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(1);
+      // a pasta do B morto sai; ficam C (atual) e A (anterior)
+      expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(2);
       expect(readdirSync(raiz).filter((n) => n.startsWith('.apk-link'))).toEqual([]);
     }, 30000);
 
@@ -329,13 +351,37 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'A12-pagbank', 'tchefood-tablet-debug.apk': 'A12-tablet' });
     }, 60000);
 
+    it('quem já abriu a versão anterior termina de ler os dois APKs dela depois da troca', async () => {
+      const raiz = criarRepo();
+      expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'A' }).codigo).toBe(0);
+      const pausa = join(raiz, 'pausa-leitor');
+      const marca = join(raiz, 'leitor-aberto');
+      writeFileSync(pausa, '');
+      // o leitor resolve apk/ (cd -P fica com a pasta da versão A aberta) e só lê os arquivos depois da troca
+      const leitor = spawn('bash', ['-c', `cd -P apk && : > "${marca}" && while [ -e "${pausa}" ]; do sleep 0.05; done; ` +
+        'cat tchefood-pagbank-debug.apk; echo; cat tchefood-tablet-debug.apk'], { cwd: raiz });
+      let lido = '';
+      leitor.stdout.on('data', (d) => { lido += String(d); });
+      leitor.stderr.on('data', (d) => { lido += String(d); });
+      const fimLeitor = new Promise<number | null>((ok) => leitor.on('close', (c) => ok(c)));
+      await esperar(() => existsSync(marca));
+
+      expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' }).codigo).toBe(0);
+      // quem chega agora por apk/ vê B inteiro
+      expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
+      rmSync(pausa);
+      expect(await fimLeitor).toBe(0);
+      // e o leitor que já estava na versão A lê o conjunto A inteiro, sem erro
+      expect(lido).toBe('A-pagbank\nA-tablet');
+    }, 30000);
+
     it('apk/ pasta de verdade, de uma versão antiga do script, é migrada para o formato novo', () => {
       const raiz = criarRepo();
       mkdirSync(join(raiz, 'apk'));
       writeFileSync(join(raiz, 'apk', 'tchefood-pagbank-debug.apk'), 'velho');
       expect(rodar(raiz, 'pagbank', { gerar: 'pagbank', build: 'N' }).codigo).toBe(0);
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'N-pagbank' });
-      expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(1);
+      expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(2);
     });
     it('SIGKILL na migração da pasta apk/ antiga: a execução seguinte devolve o conjunto antigo antes de limpar', async () => {
       const raiz = criarRepo();
@@ -353,7 +399,7 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'velho' });
       expect(rodar(raiz, 'pagbank', { gerar: 'pagbank', build: 'M' }).codigo).toBe(0);
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'M-pagbank' });
-      expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(1);
+      expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(2);
     }, 30000);
   });
 
@@ -445,6 +491,63 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       const r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
       expect(r.codigo).toBe(0);
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
+    }, 30000);
+
+    it('um processo deixado em segundo plano pelo Gradle não segura a trava depois do build', () => {
+      const raiz = criarRepo();
+      const fundo = join(raiz, 'pid-fundo');
+      try {
+        expect(rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'A', fundo }).codigo).toBe(0);
+        expect(vivo(Number(readFileSync(fundo, 'utf8')))).toBe(true);
+        const r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
+        expect(r.saida).not.toContain('outra execução');
+        expect(r.codigo).toBe(0);
+        expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
+      } finally {
+        matarFundo(fundo);
+      }
+    }, 30000);
+
+    it('A morto no meio do Gradle, com um processo dele ainda vivo: a trava fica livre para B', async () => {
+      const raiz = criarRepo();
+      const fundo = join(raiz, 'pid-fundo');
+      const pausa = join(raiz, 'pausa');
+      const marca = join(raiz, 'gradle-rodando');
+      writeFileSync(pausa, '');
+      try {
+        const a = rodarEmSegundoPlano(raiz, 'all', { gerar: 'pagbank tablet', build: 'A', pausa, marca, fundo });
+        await esperar(() => existsSync(marca));
+        // enquanto A compila, B é recusado
+        const durante = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
+        expect(durante.codigo).not.toBe(0);
+        expect(durante.saida).toContain('outra execução');
+        process.kill(-(a.filho.pid as number), 'SIGKILL');
+        await a.fim;
+        expect(vivo(Number(readFileSync(fundo, 'utf8')))).toBe(true);
+        rmSync(pausa);
+        const r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B' });
+        expect(r.codigo).toBe(0);
+        expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'B-pagbank', 'tchefood-tablet-debug.apk': 'B-tablet' });
+      } finally {
+        matarFundo(fundo);
+      }
+    }, 30000);
+
+    it('variável TCHEFOOD_BUILD_LOCK_HELD definida por quem chama não pula a trava', async () => {
+      const raiz = criarRepo();
+      const pausa = join(raiz, 'pausa');
+      const marca = join(raiz, 'gradle-rodando');
+      writeFileSync(pausa, '');
+      const a = rodarEmSegundoPlano(raiz, 'all', { gerar: 'pagbank tablet', build: 'A', pausa, marca });
+      await esperar(() => existsSync(marca));
+      const r = rodar(raiz, 'all', { gerar: 'pagbank tablet', build: 'B', extra: { TCHEFOOD_BUILD_LOCK_HELD: '1' } });
+      expect(r.codigo).not.toBe(0);
+      expect(r.saida).toContain('outra execução');
+      expect(readFileSync(join(raiz, 'android/app/build/outputs/apk/pagbank/debug/app-pagbank-debug.apk'), 'utf8')).toBe('A-pagbank');
+      expect(apks(raiz)).toEqual({});
+      rmSync(pausa);
+      expect(await a.fim).toBe(0);
+      expect(apks(raiz)).toEqual({ 'tchefood-pagbank-debug.apk': 'A-pagbank', 'tchefood-tablet-debug.apk': 'A-tablet' });
     }, 30000);
 
     it('a trava é solta quando o build falha', () => {

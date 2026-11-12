@@ -10,7 +10,8 @@
 # Faz, nessa ordem: confere Java e Node, baixa o SDK Android e o Gradle se faltarem
 # (em ~/.cache/tchefood-android, nunca dentro do projeto), roda `npm ci && npm run build`,
 # compila e deixa os APKs em ./apk/ (só os desta execução: os antigos saem, e se o build falhar a
-# pasta fica como estava; apk/ é um link para a versão atual, trocado de uma vez). O APK é debug: instala direto na maquininha ou no
+# pasta fica como estava; apk/ é um link para a versão atual, trocado de uma vez, e a versão anterior fica até a
+# publicação seguinte). O APK é debug: instala direto na maquininha ou no
 # tablet (fontes desconhecidas ou `adb install`). Release assinado e loja ficam fora daqui.
 set -euo pipefail
 
@@ -42,43 +43,47 @@ cd "$raiz"
 
 # --- Trava: uma execução por repositório --------------------------------------------------------------------
 # A limpeza, o Gradle e a publicação usam as mesmas pastas. A exclusão mútua é um flock do sistema operacional
-# num arquivo de trava: o próprio sistema solta a trava quando o processo morre (até com kill -9), então não há
-# "trava velha" para recuperar nem PID para conferir. O perl (presente no Linux e no macOS) pega o flock e roda
-# este mesmo script já com a trava na mão. O arquivo é .apk-build.flock (a pasta .apk-build.lock de uma versão
-# antiga do script, se sobrou, é ignorada: não serve de trava nem é removida).
-if [ -z "${TCHEFOOD_BUILD_LOCK_HELD:-}" ]; then
-  command -v perl >/dev/null 2>&1 || falha "perl não encontrado (usado para a trava de execução única)."
-  export TCHEFOOD_BUILD_LOCK_HELD=1
-  exec perl -e '
-    use Fcntl qw(:flock F_SETFD);
-    my $trava = shift @ARGV;
-    open(my $fh, ">>", $trava) or die "ERRO: não consegui abrir $trava: $!\n";
-    flock($fh, LOCK_EX | LOCK_NB) or do {
-      print STDERR "ERRO: outra execução do build-apk.sh está em andamento (trava $trava); nada foi alterado. Espere terminar e rode de novo.\n";
-      exit 1;
-    };
-    fcntl($fh, F_SETFD, 0);
-    exec @ARGV or die "ERRO: exec falhou: $!\n";
-  ' "$raiz/.apk-build.flock" bash "$raiz/scripts/$(basename "$0")" "$@"
-fi
-# A marca só vale para esta chamada: os processos filhos (npm, Gradle) não a herdam.
-unset TCHEFOOD_BUILD_LOCK_HELD
+# no arquivo .apk-build.flock, aberto no descritor 9 deste próprio processo: o perl (presente no Linux e no macOS)
+# só pede o flock sobre esse descritor e sai, e a trava fica com este bash até ele terminar. O sistema a solta
+# quando o processo morre (até com kill -9), então não há "trava velha" para recuperar nem PID para conferir, e
+# não existe nenhum caminho que entre no corpo do script sem passar por aqui (nada de variável que pule a trava).
+# A pasta .apk-build.lock de uma versão antiga do script, se sobrou, é ignorada.
+command -v perl >/dev/null 2>&1 || falha "perl não encontrado (usado para a trava de execução única)."
+exec 9>>"$raiz/.apk-build.flock" || falha "não consegui abrir a trava $raiz/.apk-build.flock"
+codigo_trava=0
+perl -e 'use Fcntl qw(:flock); open(my $fh, ">&=", 9) or exit 2; flock($fh, LOCK_EX | LOCK_NB) or exit 1; exit 0' \
+  || codigo_trava=$?
+case "$codigo_trava" in
+  0) ;;
+  1) falha "outra execução do build-apk.sh está em andamento (trava $raiz/.apk-build.flock); nada foi alterado. Espere terminar e rode de novo." ;;
+  *) falha "não consegui pegar a trava $raiz/.apk-build.flock" ;;
+esac
+
+# Programas externos que podem deixar processos vivos (npm, Gradle, SDK, downloads) rodam sem o descritor 9:
+# um daemon que sobreviva ao build nunca fica segurando a trava.
+sem_trava() { "$@" 9>&-; }
 
 staging=""
 link_novo=""
+link_ant=""
+pid_gradle=""
 
 limpar() {
   local codigo=$?
   trap - EXIT
+  # interrompido (Ctrl-C, kill) no meio da compilação: o Gradle não continua sozinho depois que a trava sai
+  if [ -n "$pid_gradle" ]; then kill "$pid_gradle" 2>/dev/null || true; wait "$pid_gradle" 2>/dev/null || true; fi
   if [ -n "$link_novo" ]; then rm -f "$link_novo"; fi
+  if [ -n "$link_ant" ]; then rm -f "$link_ant"; fi
   if [ -n "$staging" ]; then rm -rf "$staging"; fi
   exit "$codigo"
 }
 trap limpar EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 
-# Sobras de uma execução morta à força (kill -9): só o conjunto apontado por apk/ é guardado, o resto sai.
+# Sobras de uma execução morta à força (kill -9): só o conjunto atual (apk/) e o anterior (.apk-anterior) ficam.
 rm -f "$raiz"/.apk-link.*
 # Migração da pasta apk/ antiga interrompida entre as duas etapas (pasta já guardada, link ainda não criado):
 # devolve o conjunto guardado antes de qualquer limpeza, para ele não ser apagado como sobra.
@@ -88,21 +93,27 @@ if [ ! -e "$raiz/apk" ] && [ ! -L "$raiz/apk" ]; then
     ln -s ".apk-releases/$(basename "$r")" "$raiz/apk" && break
   done
 fi
-atual=""
-if [ -L "$raiz/apk" ]; then atual="$(basename "$(readlink "$raiz/apk")")"; fi
-for r in "$raiz"/.apk-releases/*; do
-  [ -e "$r" ] || continue
-  [ "$(basename "$r")" = "$atual" ] || rm -rf "$r"
-done
+# Mantém a versão atual e a anterior; apaga o resto (pastas de builds que morreram antes de publicar).
+manter_so_atual_e_anterior() {
+  local atual="" anterior="" r n
+  if [ -L "$raiz/apk" ]; then atual="$(basename "$(readlink "$raiz/apk")")"; fi
+  if [ -L "$raiz/.apk-anterior" ]; then anterior="$(basename "$(readlink "$raiz/.apk-anterior")")"; fi
+  for r in "$raiz"/.apk-releases/*; do
+    [ -e "$r" ] || continue
+    n="$(basename "$r")"
+    [ "$n" = "$atual" ] || [ "$n" = "$anterior" ] || rm -rf "$r"
+  done
+}
+manter_so_atual_e_anterior
 
 # --- Java 17 a 21 (o plugin Android 8.4 exige 17 ou mais; o Gradle 8.7 roda até o 21) ----------
 command -v java >/dev/null 2>&1 || falha "Java não encontrado. Instale o JDK 17 (Cloud Shell já traz)."
-java_major="$(java -version 2>&1 | sed -n 's/.*version "\([0-9]*\).*/\1/p' | head -1)"
+java_major="$(sem_trava java -version 2>&1 | sed -n 's/.*version "\([0-9]*\).*/\1/p' | head -1)"
 { [ -n "$java_major" ] && [ "$java_major" -ge 17 ] && [ "$java_major" -le 21 ]; } \
   || falha "precisa de Java 17 a 21; achei: ${java_major:-desconhecido}"
 
 command -v node >/dev/null 2>&1 || falha "Node não encontrado (precisa do Node 20 para gerar o sistema web)."
-node_major="$(node -v 2>/dev/null | sed -n 's/^v\([0-9]*\).*/\1/p')"
+node_major="$(sem_trava node -v 2>/dev/null | sed -n 's/^v\([0-9]*\).*/\1/p')"
 { [ -n "$node_major" ] && [ "$node_major" -ge 20 ]; } || falha "precisa do Node 20 ou mais; achei: ${node_major:-desconhecido}"
 command -v npm >/dev/null 2>&1 || falha "npm não encontrado."
 command -v curl >/dev/null 2>&1 || falha "curl não encontrado."
@@ -119,7 +130,7 @@ fi
 
 baixar() { # url destino
   echo "-> baixando $1"
-  curl -fL --retry 3 --retry-delay 2 -o "$2.part" "$1" || falha "falha ao baixar $1"
+  sem_trava curl -fL --retry 3 --retry-delay 2 -o "$2.part" "$1" || falha "falha ao baixar $1"
   mv "$2.part" "$2"
 }
 
@@ -143,7 +154,7 @@ if [ ! -x "$sdkmanager" ]; then
   zip="$CACHE/cmdline-tools-$so.zip"
   baixar "https://dl.google.com/android/repository/commandlinetools-$so-${CMDLINE_TOOLS_VERSION}_latest.zip" "$zip"
   rm -rf "$CACHE/cmdline-tools-extract"
-  unzip -q "$zip" -d "$CACHE/cmdline-tools-extract"
+  sem_trava unzip -q "$zip" -d "$CACHE/cmdline-tools-extract"
   mkdir -p "$ANDROID_HOME/cmdline-tools"
   rm -rf "$ANDROID_HOME/cmdline-tools/latest"
   mv "$CACHE/cmdline-tools-extract/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
@@ -154,20 +165,20 @@ if [ ! -d "$ANDROID_HOME/platforms/$PLATFORM" ] || [ ! -d "$ANDROID_HOME/build-t
   echo "-> instalando plataforma $PLATFORM e build-tools $BUILD_TOOLS (aceitando as licenças do Google)"
   # `yes` fecha o pipe quando o sdkmanager termina; o SIGPIPE não é erro aqui.
   set +o pipefail
-  yes | "$sdkmanager" --licenses >/dev/null
+  sem_trava yes | sem_trava "$sdkmanager" --licenses >/dev/null
   set -o pipefail
-  "$sdkmanager" "platforms;$PLATFORM" "build-tools;$BUILD_TOOLS" "platform-tools"
+  sem_trava "$sdkmanager" "platforms;$PLATFORM" "build-tools;$BUILD_TOOLS" "platform-tools"
 fi
 
 # --- Gradle ----------------------------------------------------------------------------------
-if command -v gradle >/dev/null 2>&1 && gradle --version 2>/dev/null | grep -qx "Gradle $GRADLE_VERSION"; then
+if command -v gradle >/dev/null 2>&1 && sem_trava gradle --version 2>/dev/null | grep -qx "Gradle $GRADLE_VERSION"; then
   gradle_cmd="gradle"
 else
   gradle_dir="$CACHE/gradle-$GRADLE_VERSION"
   if [ ! -x "$gradle_dir/bin/gradle" ]; then
     zip="$CACHE/gradle-$GRADLE_VERSION-bin.zip"
     baixar "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" "$zip"
-    unzip -q "$zip" -d "$CACHE"
+    sem_trava unzip -q "$zip" -d "$CACHE"
     rm -f "$zip"
   fi
   gradle_cmd="$gradle_dir/bin/gradle"
@@ -176,8 +187,8 @@ fi
 # --- Sistema web (vai embutido no APK) -------------------------------------------------------
 if [ -z "${TCHEFOOD_APP_URL:-}" ]; then
   echo "-> gerando o sistema web (npm ci && npm run build)"
-  npm ci
-  npm run build
+  sem_trava npm ci
+  sem_trava npm run build
   [ -f dist/index.html ] || falha "o build web não gerou dist/index.html"
 fi
 
@@ -194,7 +205,13 @@ for v in "${variantes[@]}"; do
 done
 
 echo "-> compilando: ${tarefas[*]}"
-"$gradle_cmd" -p android --no-daemon ${gradle_props[@]+"${gradle_props[@]}"} "${tarefas[@]}"
+# Em segundo plano só para guardar o pid: se este script for interrompido, `limpar` encerra o Gradle.
+sem_trava "$gradle_cmd" -p android --no-daemon ${gradle_props[@]+"${gradle_props[@]}"} "${tarefas[@]}" &
+pid_gradle=$!
+codigo_gradle=0
+wait "$pid_gradle" || codigo_gradle=$?
+pid_gradle=""
+[ "$codigo_gradle" -eq 0 ] || falha "o Gradle falhou (código $codigo_gradle); apk/ ficou como estava"
 
 # Cada variante pedida precisa ter exatamente um APK, não vazio, antes de qualquer coisa ir para apk/.
 # Os arquivos vão primeiro para uma pasta de versão nova em .apk-releases/, que ainda não aparece em apk/.
@@ -223,17 +240,25 @@ if [ -d "$raiz/apk" ] && [ ! -L "$raiz/apk" ]; then
   mv "$raiz/apk" "$raiz/.apk-releases/legado.$$" || falha "não consegui migrar o apk/ antigo; nada foi alterado"
   ln -s ".apk-releases/legado.$$" "$raiz/apk" || falha "não consegui migrar o apk/ antigo"
 fi
+antes=""
+if [ -L "$raiz/apk" ]; then antes="$(basename "$(readlink "$raiz/apk")")"; fi
+# A versão que sai de apk/ vira a "anterior" ANTES da troca: quem já abriu apk/ (um download em andamento)
+# continua lendo a pasta dela até a próxima publicação, que é quando ela sai.
+if [ -n "$antes" ]; then
+  link_ant="$raiz/.apk-link.ant.$$"
+  ln -s ".apk-releases/$antes" "$link_ant" || falha "não consegui preparar o link da versão anterior; nada foi alterado"
+  perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$link_ant" "$raiz/.apk-anterior" \
+    || falha "não consegui guardar a versão anterior; nada foi alterado"
+  link_ant=""
+fi
 link_novo="$raiz/.apk-link.$$"
 ln -s ".apk-releases/$nome" "$link_novo" || falha "não consegui preparar o link do novo apk/; o conjunto anterior foi mantido"
 perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$link_novo" "$raiz/apk" \
   || falha "não consegui publicar o novo apk/; o conjunto anterior foi mantido"
 link_novo=""
 staging=""
-# Só agora, com apk/ apontando para o conjunto novo, as versões antigas saem.
-for r in "$raiz"/.apk-releases/*; do
-  [ -e "$r" ] || continue
-  [ "$(basename "$r")" = "$nome" ] || rm -rf "$r"
-done
+# Ficam a versão nova e a anterior; as mais velhas saem.
+manter_so_atual_e_anterior
 for v in "${variantes[@]}"; do
   echo "OK: apk/tchefood-$v-debug.apk"
 done

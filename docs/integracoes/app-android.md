@@ -38,9 +38,11 @@ nunca ficarem visíveis a uma página de terceiros.
 (em `~/.cache/tchefood-android`, fora do projeto), roda `npm ci && npm run build`, compila e deixa os APKs
 debug em `apk/`. A pasta `apk/` só guarda os APKs da última execução: ela é um link para a versão atual
 (em `.apk-releases/`), trocado de uma vez, então quem lê `apk/` vê sempre o conjunto anterior inteiro ou o novo
-inteiro, mesmo se o script for morto no meio; se o build falhar, fica como estava. Só roda um build por vez no
-mesmo repositório (trava do sistema operacional em `.apk-build.flock`, solta sozinha se o processo morrer): uma
-segunda execução simultânea para com aviso e não altera nada. Precisa de `perl` (já vem no Linux e no Mac).
+inteiro, mesmo se o script for morto no meio; se o build falhar, fica como estava. A versão anterior fica guardada
+até a publicação seguinte (`.apk-anterior`), para um download que já tinha começado terminar inteiro. Só roda um
+build por vez no mesmo repositório (trava do sistema operacional em `.apk-build.flock`, presa ao próprio script e
+solta sozinha se ele morrer; npm, Gradle e SDK rodam sem ela, então um daemon que sobrevive ao build não a segura):
+uma segunda execução simultânea para com aviso e não altera nada. Precisa de `perl` (já vem no Linux e no Mac).
 
 ```bash
 bash scripts/build-apk.sh            # pagbank e tablet
