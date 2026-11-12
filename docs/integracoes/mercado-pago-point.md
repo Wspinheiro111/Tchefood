@@ -28,6 +28,11 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   manual**, sem limite de tempo, e aprovadas ainda sem pagamento gravado. Só liberam com o fim comprovado no Mercado
   Pago (recusada, cancelada, expirada, estornada). PIN de gerente e tempo passado não liberam. Antes de cobrar o
   app sobe a fila (com prazo de 15 s); conta que ainda não subiu é recusada antes de chegar à maquininha.
+- A mesma reserva vale para **qualquer outro pagamento** da conta: dinheiro, Pix, outra maquininha ou outra cobrança
+  (`db/schema_point_reserva.sql`, gatilho em `payments` com a conta travada). Pagamento aprovado só entra até o saldo
+  menos a reserva das outras cobranças; o pagamento da própria cobrança aprovada consome a reserva dela. O caixa lê a
+  reserva da conta a cada 5 s (`tchefood_point_reservation`) e mostra "Há uma cobrança na Point em andamento nesta
+  conta" com o valor livre; sem nuvem, vale a cobrança incerta da Point gravada no próprio aparelho.
 - Sem cartão em 2 minutos (contados desde o primeiro envio) o app **encerra a tentativa**: pede à maquininha que
   pare de esperar o cartão. Não é estorno: cobrança já paga continua paga e volta como aprovada. O servidor só
   aceita o encerramento por prazo depois dos mesmos 2 min, contados pelo **relógio do banco** desde a hora em que a

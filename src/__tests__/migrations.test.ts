@@ -26,7 +26,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_mercado_pago.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_mercado_pago.sql', 'schema_point_reserva.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -70,6 +70,8 @@ describe('supabase/migrations', () => {
     // A conciliação refaz o resgate (tchefood_register_cashback_redeem) e o guarda dos audit_logs do cashback no servidor.
     expect(idx('schema_cashback_conciliacao.sql')).toBeGreaterThan(idx('schema_cashback_servidor.sql'));
     expect(idx('schema_cashback_conciliacao.sql')).toBeGreaterThan(idx('schema_desconto_uso_unico.sql'));
+    // A reserva da Point lê terminal_charges e soma com a regra de tchefood_open_terminal_charge.
+    expect(idx('schema_point_reserva.sql')).toBeGreaterThan(idx('schema_mercado_pago.sql'));
   });
 
   it('permissões padrão do banco iguais às do app (src/lib/permissions.ts)', async () => {
