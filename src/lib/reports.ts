@@ -240,6 +240,8 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   MANAGER_PIN_LOCKOUT: 'PIN bloqueado (3 erros)',
   KEG_CHANGED: 'Troca de barril de chopp',
   CASHBACK_REDEEMED: 'Cashback resgatado',
+  CASHBACK_REFUNDED: 'Cashback devolvido ao cliente',
+  CASHBACK_REFUND_HELD: 'Cashback a devolver retido para conciliação (origem não comprovada)',
   KIOSK_EXIT: 'Totem fechado',
   CHARGE_CONFIRMED_MANUALLY: 'Cobrança incerta registrada pelo comprovante',
   PRODUCT_PRICE_CHANGED: 'Preço alterado no cadastro',
