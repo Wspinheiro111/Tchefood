@@ -12,6 +12,12 @@ import { NfceViewer } from './NfceViewer';
 import { ReviewCapture } from '../components/ReviewCapture';
 import { CashbackCapture, CashbackRedeem } from '../components/CashbackPanel';
 import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
+import { effectiveReservation, freeCents, pointReservationBlock, POINT_RESERVATION_NOTICE, type PointReservation } from '../lib/payments/pointReservation';
+import { fetchPointReservation } from '../lib/sync/cloudPull';
+import { freshCloudConfig } from '../lib/sync/useCloudSync';
+
+/** De quanto em quanto tempo o caixa relê a reserva da Point desta conta na nuvem. */
+const POINT_RESERVATION_POLL_MS = 5000;
 
 type SplitMode = 'EQUAL' | 'FREE' | 'ITEMS';
 type Method = 'CREDIT' | 'DEBIT' | 'PIX' | 'CASH';
@@ -52,6 +58,36 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     }
   }, [orderId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Cobrança da Point em andamento nesta conta (de qualquer aparelho): o servidor reserva o valor para
+  // qualquer forma de pagamento; o caixa lê a reserva para avisar e não aceitar o valor reservado.
+  const cloudConnected = useTcheStore((st) => st.cloud !== null);
+  const [cloudReservation, setCloudReservation] = useState<Omit<PointReservation, 'source'> | null>(null);
+  useEffect(() => {
+    if (!cloudConnected) {
+      setCloudReservation(null);
+      return;
+    }
+    let alive = true;
+    const read = async () => {
+      try {
+        const cfg = await freshCloudConfig();
+        if (!cfg) throw new Error('sem sessão');
+        const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
+        if (alive) setCloudReservation(r);
+      } catch {
+        // Sem leitura da nuvem: vale a cobrança incerta deste aparelho; o servidor confere de qualquer jeito.
+        if (alive) setCloudReservation(null);
+      }
+    };
+    void read();
+    const timer = setInterval(() => void read(), POINT_RESERVATION_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [orderId, cloudConnected, busy]);
+  const pointReservation = effectiveReservation(cloudReservation, reviewHold);
+
   if (closedOrderId) {
     const closedOrder = s.orders.find((o) => o.id === closedOrderId)!;
     return <ClosedView orderId={closedOrderId} label={table?.label ?? ''} total={closedOrder.total_amount} onDone={onClosed} />;
@@ -90,6 +126,8 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
 
   const charge = async () => {
     if (!amountValid || busy || trayPending) return;
+    const reserved = pointReservationBlock(amount, remaining, pointReservation);
+    if (reserved) return toast.error(reserved);
     const idempotency_key = uuid();
     const itemIds = mode === 'ITEMS' ? selected : [];
 
@@ -178,6 +216,17 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
           <div className="text-2xl font-black tabular-nums text-brasa">{formatBRL(remaining)}</div>
         </div>
       </div>
+
+      {pointReservation && (
+        <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
+          <div className="mb-1 font-black text-brasa">{POINT_RESERVATION_NOTICE}</div>
+          <p className="text-slate-800">
+            {formatBRL(pointReservation.reservedCents / 100)} reservado{pointReservation.openCharges > 1 ? ` em ${pointReservation.openCharges} cobranças` : ''}.
+            {' '}Livre para outro pagamento (dinheiro, Pix ou outra maquininha): <b>{formatBRL(freeCents(remaining, pointReservation) / 100)}</b>.
+            {pointReservation.manualReview ? ' Uma cobrança está em revisão: o valor só é liberado quando o gerente conferir no Mercado Pago.' : ' Aguarde a Point terminar.'}
+          </p>
+        </div>
+      )}
 
       {/* Rachadinha — 3 modos */}
       <div className="mb-3 grid grid-cols-3 gap-2">

@@ -440,3 +440,18 @@ export function mergeStaffWithoutPins(local: readonly StaffUser[], cloud: readon
 export function mergeStaffWithPins(local: readonly StaffUser[], cloud: readonly StaffUser[], pending: Set<RowKey>): StaffUser[] {
   return mergeRows(local, cloud, pending, { table: 'staff_users', key: (r) => r.id, dropMissing: false });
 }
+
+/** Reserva da Point Smart numa conta, lida agora da nuvem (tchefood_point_reservation, db/schema_point_reserva.sql). */
+export type CloudPointReservation = { reservedCents: number; openCharges: number; manualReview: boolean };
+
+export async function fetchPointReservation(cfg: SyncConfig, fetchFn: FetchLike, orderId: string): Promise<CloudPointReservation> {
+  const res = await fetchFn(`${root(cfg)}/rpc/tchefood_point_reservation`, { method: 'POST', headers: headers(cfg), body: JSON.stringify({ p_order: orderId }) });
+  if (!res.ok) throw new Error(`Não foi possível ler a cobrança da Point desta conta: ${await readError(res)}`);
+  const body = JSON.parse((await res.text()) || 'null') as { reserved_cents?: unknown; open_charges?: unknown; manual_review?: unknown } | null;
+  const reserved = Number(body?.reserved_cents);
+  const open = Number(body?.open_charges);
+  if (!body || !Number.isSafeInteger(reserved) || reserved < 0 || !Number.isSafeInteger(open) || open < 0) {
+    throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+  }
+  return { reservedCents: reserved, openCharges: open, manualReview: body.manual_review === true };
+}
