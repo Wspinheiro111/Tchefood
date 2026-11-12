@@ -6,3 +6,10 @@ android/.gradle
 android/build
 android/app/build
 android/local.properties
+/apk
+/.apk-releases
+/.apk-build.lock
+/.apk-build.flock
+/.apk-link.*
+/.apk-anterior
+/.apk-pendente

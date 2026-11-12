@@ -13,5 +13,5 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["node"]
   },
-  "include": ["server", "db/tests"]
+  "include": ["server", "db/tests", "scripts/build-apk.test.ts"]
 }
