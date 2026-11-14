@@ -2,12 +2,48 @@ import { describe, expect, it, vi } from "vitest";
 import { DeliveryInbox, InMemoryDeliveryRepository } from "../deliveryInbox";
 import { IfoodMerchantApi } from "./ifoodMerchantApi";
 import { IfoodSandbox } from "./ifoodSandbox";
-import { createIfoodApiHandler, IfoodPoller, SupabaseCallerAuthorizer, type ApiRequest, type TenantAuthorizer } from "./ifoodServer";
+import {
+  createIfoodApiHandler,
+  IfoodPoller,
+  SupabaseCallerAuthorizer,
+  SupabaseManagerApproval,
+  type ApiRequest,
+  type ManagerApproval,
+  type ManagerRequest,
+  type TenantAuthorizer,
+} from "./ifoodServer";
 
 const ITEMS = [{ name: "Xis Galpão", externalCode: "301", quantity: 1, unitPrice: 38 }];
 const NOW = new Date("2026-11-14T15:00:00.000Z");
+const MANAGER_PIN = "7391";
+const auth = (extra: Partial<{ managerPin: string; reason: string; requestId: string }> = {}) => ({
+  managerPin: MANAGER_PIN,
+  performedBy: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  reason: "Cliente ligou desistindo",
+  requestId: crypto.randomUUID(),
+  ...extra,
+});
+const ALLOW_ALL: ManagerApproval = { authorize: async () => ({ status: "OK", auditId: "a1" }), recordResult: async () => undefined };
+
+// Gerente falso: PIN certo = 7391; guarda as autorizações e os resultados.
+function fakeApproval() {
+  const authorized: ManagerRequest[] = [];
+  const results: Array<{ auditId: string; outcome: string; detail: string }> = [];
+  const approval: ManagerApproval = {
+    authorize: async (_token, request) => {
+      if (request.managerPin !== MANAGER_PIN) return { status: "PIN_FAILED", message: "PIN de gerente incorreto." };
+      authorized.push(request);
+      return { status: "OK", auditId: `audit-${authorized.length}` };
+    },
+    recordResult: async (auditId, outcome, detail) => {
+      results.push({ auditId, outcome, detail });
+    },
+  };
+  return { approval, authorized, results };
+}
 
 function setup(options: { merchants?: string[]; authorizer?: TenantAuthorizer } = {}) {
+  const manager = fakeApproval();
   const sandbox = new IfoodSandbox(undefined, undefined, () => NOW);
   const api = new IfoodMerchantApi({
     credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret },
@@ -23,10 +59,10 @@ function setup(options: { merchants?: string[]; authorizer?: TenantAuthorizer } 
     canAccessOrder: async (token) => token === "loja-a",
     canAccessMerchant: async (token) => token === "loja-a",
   };
-  const handle = createIfoodApiHandler({ inbox, api, authorizer, poller, now: () => NOW });
+  const handle = createIfoodApiHandler({ inbox, api, authorizer, approval: manager.approval, poller, now: () => NOW });
   const call = (method: string, path: string, body?: unknown, token = "loja-a") =>
     handle({ method, path, headers: { authorization: token ? `Bearer ${token}` : undefined }, body: body === undefined ? "" : JSON.stringify(body) } satisfies ApiRequest);
-  return { sandbox, api, inbox, poller, merchants, call };
+  return { sandbox, api, inbox, poller, merchants, call, manager };
 }
 
 describe("servidor do iFood: polling", () => {
@@ -125,10 +161,10 @@ describe("servidor do iFood: API do app", () => {
     await poller.runOnce();
     const reasons = await call("GET", `/ifood/orders/${id}/cancellation-reasons`);
     expect(reasons.status).toBe(200);
-    expect((await call("POST", `/ifood/orders/${id}/cancellation`, { code: "999", description: "Inventado" })).status).toBe(400);
+    expect((await call("POST", `/ifood/orders/${id}/cancellation`, { code: "999", description: "Inventado", authorization: auth() })).status).toBe(400);
     expect((await call("POST", `/ifood/orders/${id}/cancellation`, {})).status).toBe(400);
     expect(sandbox.lastEventCode(id)).toBe("PLC");
-    const ok = await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível" });
+    const ok = await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", authorization: auth() });
     expect(ok.status).toBe(200);
     expect(sandbox.lastEventCode(id)).toBe("CAN");
   });
@@ -139,9 +175,9 @@ describe("servidor do iFood: API do app", () => {
     await poller.runOnce();
     sandbox.openDispute(id);
     await poller.runOnce();
-    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "reject" })).status).toBe(400);
-    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "talvez" })).status).toBe(400);
-    const rejected = await call("POST", `/ifood/orders/${id}/dispute`, { kind: "reject", reason: "Pedido já saiu" });
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "reject", authorization: auth() })).status).toBe(400);
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "talvez", authorization: auth() })).status).toBe(400);
+    const rejected = await call("POST", `/ifood/orders/${id}/dispute`, { kind: "reject", reason: "Pedido já saiu", authorization: auth() });
     expect(rejected.status).toBe(200);
     expect(sandbox.eventHistory().at(-1)?.code).toBe("HSS");
   });
@@ -154,6 +190,7 @@ describe("servidor do iFood: API do app", () => {
       inbox: new DeliveryInbox({ adapters: [], repository: new InMemoryDeliveryRepository() }),
       api: {} as IfoodMerchantApi,
       authorizer: { canAccessOrder: async () => true, canAccessMerchant: async () => true },
+      approval: ALLOW_ALL,
     });
     const response = await handle({ method: "POST", path: `/ifood/orders/${id}/dispute`, headers: { authorization: "Bearer x" }, body: "{" });
     expect(response.status).toBe(400);
@@ -161,21 +198,23 @@ describe("servidor do iFood: API do app", () => {
 
   it("pausa a loja pelo relógio do servidor, com limite de duração, e retoma", async () => {
     const { sandbox, call } = setup();
-    expect((await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás", minutes: 0 })).status).toBe(400);
-    expect((await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás", minutes: 24 * 60 + 1 })).status).toBe(400);
-    expect((await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { minutes: 30 })).status).toBe(400);
-    const created = await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás", minutes: 30, start: "2020-01-01T00:00:00Z" });
+    const pauses = `/ifood/merchants/${sandbox.merchantId}/pauses`;
+    expect((await call("POST", pauses, { description: "Falta de gás", minutes: 0, authorization: auth() })).status).toBe(400);
+    expect((await call("POST", pauses, { description: "Falta de gás", minutes: 24 * 60 + 1, authorization: auth() })).status).toBe(400);
+    expect((await call("POST", pauses, { minutes: 30, authorization: auth() })).status).toBe(400);
+    const created = await call("POST", pauses, { description: "Falta de gás", minutes: 30, start: "2020-01-01T00:00:00Z", authorization: auth() });
     expect(created.status).toBe(201);
     expect(created.body).toMatchObject({ start: "2026-11-14T15:00:00.000Z", end: "2026-11-14T15:30:00.000Z" });
     expect(((await call("GET", `/ifood/merchants/${sandbox.merchantId}/status`)).body as { state: string }).state).toBe("closed");
     const pauseId = (created.body as { id: string }).id;
-    expect((await call("DELETE", `/ifood/merchants/${sandbox.merchantId}/pauses/${pauseId}`)).status).toBe(204);
+    expect((await call("DELETE", `/ifood/merchants/${sandbox.merchantId}/pauses/${pauseId}`)).status).toBe(400);
+    expect((await call("DELETE", `/ifood/merchants/${sandbox.merchantId}/pauses/${pauseId}`, { authorization: auth() })).status).toBe(204);
     expect(((await call("GET", `/ifood/merchants/${sandbox.merchantId}/status`)).body as { state: string }).state).toBe("open");
   });
 
   it("loja de outro tenant não pode ser pausada", async () => {
     const { sandbox, call } = setup();
-    const response = await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "x", minutes: 10 }, "loja-b");
+    const response = await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "x", minutes: 10, authorization: auth() }, "loja-b");
     expect(response.status).toBe(404);
     expect(sandbox.activeInterruptions()).toHaveLength(0);
   });
@@ -192,6 +231,7 @@ describe("servidor do iFood: API do app", () => {
       inbox: { performAction: async () => { throw new Error("senha do banco xyz"); } } as unknown as DeliveryInbox,
       api: {} as IfoodMerchantApi,
       authorizer: { canAccessOrder: async () => true, canAccessMerchant: async () => true },
+      approval: ALLOW_ALL,
       log,
     });
     const response = await handle({ method: "POST", path: `/ifood/orders/${id}/actions/confirm`, headers: { authorization: "Bearer x" }, body: "" });
@@ -205,6 +245,113 @@ describe("servidor do iFood: API do app", () => {
     const health = await call("GET", "/health", undefined, "");
     expect(health.status).toBe(200);
     expect(health.body).toMatchObject({ ok: true, poller: { merchants: 1 } });
+  });
+});
+
+describe("servidor do iFood: alçada de gerente", () => {
+  it("cancelar sem PIN, motivo ou id da tentativa: 400 sem chamar o iFood nem conferir PIN", async () => {
+    const { sandbox, poller, call, manager } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const path = `/ifood/orders/${id}/cancellation`;
+    const base = { code: "503", description: "Item indisponível" };
+    expect((await call("POST", path, base)).status).toBe(400);
+    expect((await call("POST", path, { ...base, authorization: auth({ reason: "ok" }) })).status).toBe(400);
+    expect((await call("POST", path, { ...base, authorization: auth({ requestId: "1" }) })).status).toBe(400);
+    expect((await call("POST", path, { ...base, authorization: { ...auth(), performedBy: "x" } })).status).toBe(400);
+    expect(manager.authorized).toHaveLength(0);
+    expect(sandbox.lastEventCode(id)).toBe("PLC");
+  });
+
+  it("PIN errado: 403, nada no iFood; PIN certo: cancela e grava o resultado", async () => {
+    const { sandbox, poller, call, manager } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const path = `/ifood/orders/${id}/cancellation`;
+    const base = { code: "503", description: "Item indisponível" };
+    const denied = await call("POST", path, { ...base, authorization: auth({ managerPin: "0000" }) });
+    expect(denied).toMatchObject({ status: 403, body: { code: "PIN_FAILED" } });
+    expect(sandbox.lastEventCode(id)).toBe("PLC");
+    expect(manager.results).toHaveLength(0);
+    const ok = await call("POST", path, { ...base, authorization: auth() });
+    expect(ok.status).toBe(200);
+    expect(manager.authorized[0]).toMatchObject({ action: "DELIVERY_CANCEL", externalOrderId: id, merchantExternalId: null });
+    expect(manager.results).toEqual([{ auditId: "audit-1", outcome: "sent", detail: "HTTP 200" }]);
+  });
+
+  it("negociação, pausa e retomada pedem PIN; outra loja: 404 antes do PIN", async () => {
+    const { sandbox, poller, call, manager } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    sandbox.openDispute(id);
+    await poller.runOnce();
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept" })).status).toBe(400);
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", authorization: auth() }, "loja-b")).status).toBe(404);
+    expect((await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Gás", minutes: 10, authorization: auth({ managerPin: "1111" }) })).status).toBe(403);
+    expect(sandbox.activeInterruptions()).toHaveLength(0);
+    expect(manager.authorized).toHaveLength(0);
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", authorization: auth() })).status).toBe(200);
+    expect(manager.authorized.map((request) => request.action)).toEqual(["DELIVERY_DISPUTE"]);
+  });
+
+  it("falha incerta do iFood fica registrada como incerta; recusa clara como falha", async () => {
+    const { sandbox, poller, call, manager } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    sandbox.failNext("/requestCancellation", 503);
+    const path = `/ifood/orders/${id}/cancellation`;
+    expect((await call("POST", path, { code: "503", description: "Item indisponível", authorization: auth() })).status).toBe(503);
+    expect(manager.results.at(-1)?.outcome).toBe("uncertain");
+    sandbox.failNext("/requestCancellation", 400);
+    expect((await call("POST", path, { code: "503", description: "Item indisponível", authorization: auth() })).status).toBe(400);
+    expect(manager.results.at(-1)?.outcome).toBe("failed");
+  });
+
+  it("autorização pelo Supabase: JWT do app no RPC, PIN errado e bloqueio viram 403, erro do banco 503", async () => {
+    const calls: Array<{ url: string; headers: Record<string, string>; body?: string }> = [];
+    let reply: { ok: boolean; status: number; text: string } = { ok: true, status: 200, text: '{"status":"OK","auditId":"x1"}' };
+    const fetchImpl = async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
+      calls.push({ url, headers: init.headers, body: init.body });
+      return { ok: reply.ok, status: reply.status, text: async () => reply.text };
+    };
+    const approval = new SupabaseManagerApproval({ url: "https://x.supabase.co", anonKey: "anon", serviceRoleKey: "service", fetchImpl });
+    const request: ManagerRequest = { action: "DELIVERY_PAUSE", externalOrderId: null, merchantExternalId: "m-1", ...auth() };
+    expect(await approval.authorize("jwt-da-loja", request)).toEqual({ status: "OK", auditId: "x1" });
+    expect(calls[0]!.url).toBe("https://x.supabase.co/rest/v1/rpc/tchefood_delivery_authorize");
+    expect(calls[0]!.headers.authorization).toBe("Bearer jwt-da-loja");
+    expect(JSON.parse(calls[0]!.body!)).toMatchObject({ p_action: "DELIVERY_PAUSE", p_merchant_external_id: "m-1", p_external_order_id: null });
+    reply = { ok: true, status: 200, text: '{"status":"PIN_LOCKED"}' };
+    expect((await approval.authorize("jwt", request)).status).toBe("PIN_LOCKED");
+    reply = { ok: false, status: 400, text: '{"message":"TCHEFOOD_ANTIFRAUDE: loja do app não pertence a esta loja."}' };
+    expect(await approval.authorize("jwt", request)).toEqual({ status: "DENIED", message: "loja do app não pertence a esta loja." });
+    reply = { ok: false, status: 500, text: "" };
+    await expect(approval.authorize("jwt", request)).rejects.toThrow(/HTTP 500/);
+    reply = { ok: true, status: 200, text: "" };
+    await approval.recordResult("x1", "sent", "HTTP 200");
+    expect(calls.at(-1)!.headers.authorization).toBe("Bearer service");
+  });
+
+  it("Supabase que não responde: a API responde 503 no prazo e não chama o iFood", async () => {
+    const sandbox = new IfoodSandbox(undefined, undefined, () => NOW);
+    const api = new IfoodMerchantApi({ credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret }, baseUrl: sandbox.baseUrl, fetchImpl: sandbox.fetch });
+    const inbox = new DeliveryInbox({ adapters: [api], repository: new InMemoryDeliveryRepository() });
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runChannel(api);
+    let aborted = false;
+    const hanging = (_url: string, init: { signal?: AbortSignal }) =>
+      new Promise<never>((_, reject) => init.signal?.addEventListener("abort", () => { aborted = true; reject(new Error("abort")); }));
+    const handle = createIfoodApiHandler({
+      inbox,
+      api,
+      authorizer: new SupabaseCallerAuthorizer({ url: "https://x.supabase.co", anonKey: "anon", fetchImpl: hanging, timeoutMs: 20 }),
+      approval: ALLOW_ALL,
+    });
+    const started = Date.now();
+    const response = await handle({ method: "POST", path: `/ifood/orders/${id}/actions/confirm`, headers: { authorization: "Bearer x" }, body: "" });
+    expect(response.status).toBe(503);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(aborted).toBe(true);
+    expect(sandbox.lastEventCode(id)).toBe("PLC");
   });
 });
 

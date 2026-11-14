@@ -4,7 +4,7 @@ import {
   type DeliveryDisputeDecision,
   type DeliveryOrderAction,
 } from "../marketplace";
-import type { RestFetch } from "../supabaseDeliveryRepository";
+import { DeliveryRepositoryError, fetchWithDeadline, type RestFetch } from "../supabaseDeliveryRepository";
 import { IFOOD_POLLING_INTERVAL_MS, IfoodMerchantApi } from "./ifoodMerchantApi";
 
 // Servidor do iFood: um processo só, sempre ligado.
@@ -13,6 +13,9 @@ import { IFOOD_POLLING_INTERVAL_MS, IfoodMerchantApi } from "./ifoodMerchantApi"
 //  - API para o app: ações do pedido (confirmar, preparar, pronto, despachar), cancelamento com motivo do iFood,
 //    resposta a negociação e pausa da loja. O app manda o JWT da sessão; o servidor só age em pedido/loja que o
 //    RLS do Supabase mostra para esse JWT (a mesma prova de loja da emissão de NFC-e).
+//  - Cancelar, responder negociação, pausar e retomar a loja exigem PIN de gerente e motivo, conferidos no banco
+//    (tchefood_delivery_authorize, com o mesmo bloqueio de 3 erros em 60 s do PIN de gerente) ANTES de chamar o
+//    iFood. A autorização e o resultado ficam em audit_logs.
 // Segredos (IFOOD_CLIENT_SECRET, SUPABASE_SERVICE_ROLE_KEY) ficam nas variáveis de ambiente deste processo.
 
 export type MerchantSource = { activeMerchants(): Promise<Array<{ merchantExternalId: string }>> };
@@ -81,6 +84,8 @@ export class IfoodPoller {
       if (report.received > 0 || report.error) {
         log(`[ifood] recebidos=${report.received} novos=${report.newOrders.length} ack=${report.acknowledged} adiados=${report.deferred}${report.error ? ` erro=${report.error}` : ""}`);
       }
+      // Evento sem pedido que não deu para ler: confirmado (senão volta para sempre), mas fica registrado aqui.
+      if (report.discarded.length > 0) log(`[ifood] eventos ilegíveis sem pedido confirmados: ${report.discarded.join(", ")}`);
       return report;
     } catch (error) {
       this.status.lastError = error instanceof Error ? error.message : String(error);
@@ -113,13 +118,18 @@ export interface TenantAuthorizer {
   canAccessMerchant(accessToken: string, merchantExternalId: string): Promise<boolean>;
 }
 
+// Prazo das consultas ao Supabase feitas durante uma requisição do app.
+const SUPABASE_TIMEOUT_MS = 8_000;
+
 export class SupabaseCallerAuthorizer implements TenantAuthorizer {
   private readonly base: string;
   private readonly fetchImpl: RestFetch;
+  private readonly timeoutMs: number;
 
-  constructor(private readonly options: { url: string; anonKey: string; fetchImpl?: RestFetch }) {
+  constructor(private readonly options: { url: string; anonKey: string; fetchImpl?: RestFetch; timeoutMs?: number }) {
     this.base = options.url.replace(/\/+$/, "");
     this.fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
+    this.timeoutMs = options.timeoutMs ?? SUPABASE_TIMEOUT_MS;
   }
 
   canAccessOrder(accessToken: string, externalOrderId: string): Promise<boolean> {
@@ -133,19 +143,133 @@ export class SupabaseCallerAuthorizer implements TenantAuthorizer {
     );
   }
 
+  // Sem resposta no prazo: lança (a API responde 503 sem chamar o iFood); nunca libera.
   private async visible(query: string, accessToken: string): Promise<boolean> {
-    const response = await this.fetchImpl(`${this.base}/rest/v1/${query}`, {
-      method: "GET",
-      headers: { apikey: this.options.anonKey, authorization: `Bearer ${accessToken}`, accept: "application/json" },
-    });
+    const response = await fetchWithDeadline(
+      this.fetchImpl,
+      `${this.base}/rest/v1/${query}`,
+      { method: "GET", headers: { apikey: this.options.anonKey, authorization: `Bearer ${accessToken}`, accept: "application/json" } },
+      this.timeoutMs,
+      "prova de loja",
+    );
     // JWT inválido/vencido: o PostgREST responde 401/403. Qualquer outra falha também não libera nada.
     if (!response.ok) return false;
     try {
-      const rows = JSON.parse(await response.text()) as unknown;
+      const rows = JSON.parse(response.text) as unknown;
       return Array.isArray(rows) && rows.length > 0;
     } catch {
       return false;
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Alçada de gerente: PIN, motivo e registro em audit_logs
+// ---------------------------------------------------------------------------
+
+export type ManagerAction = "DELIVERY_CANCEL" | "DELIVERY_DISPUTE" | "DELIVERY_PAUSE" | "DELIVERY_RESUME";
+
+export type ManagerRequest = {
+  action: ManagerAction;
+  externalOrderId: string | null;
+  merchantExternalId: string | null;
+  managerPin: string;
+  performedBy: string;
+  reason: string;
+  // Gerado pelo app por tentativa: o reenvio da mesma autorização não grava outra.
+  requestId: string;
+};
+
+export type ManagerDecision =
+  | { status: "OK"; auditId: string }
+  | { status: "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT" | "DENIED"; message: string };
+
+export type ManagerOutcome = "sent" | "failed" | "uncertain";
+
+export interface ManagerApproval {
+  authorize(accessToken: string, request: ManagerRequest): Promise<ManagerDecision>;
+  // Resultado da chamada ao iFood, gravado como outro registro em audit_logs (que é só de inserção).
+  recordResult(auditId: string, outcome: ManagerOutcome, detail: string): Promise<void>;
+}
+
+export class SupabaseManagerApproval implements ManagerApproval {
+  private readonly base: string;
+  private readonly fetchImpl: RestFetch;
+  private readonly timeoutMs: number;
+
+  constructor(private readonly options: { url: string; anonKey: string; serviceRoleKey: string; fetchImpl?: RestFetch; timeoutMs?: number }) {
+    this.base = options.url.replace(/\/+$/, "");
+    this.fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
+    this.timeoutMs = options.timeoutMs ?? SUPABASE_TIMEOUT_MS;
+  }
+
+  // Com o JWT do app: a loja da sessão é a do banco (tchefood_tenant), nunca uma informada pelo app.
+  async authorize(accessToken: string, request: ManagerRequest): Promise<ManagerDecision> {
+    const response = await fetchWithDeadline(
+      this.fetchImpl,
+      `${this.base}/rest/v1/rpc/tchefood_delivery_authorize`,
+      {
+        method: "POST",
+        headers: { apikey: this.options.anonKey, authorization: `Bearer ${accessToken}`, "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({
+          p_channel: "ifood",
+          p_action: request.action,
+          p_external_order_id: request.externalOrderId,
+          p_merchant_external_id: request.merchantExternalId,
+          p_manager_pin: request.managerPin,
+          p_performed_by: request.performedBy,
+          p_reason: request.reason,
+          p_request_id: request.requestId,
+        }),
+      },
+      this.timeoutMs,
+      "autorização de gerente",
+    );
+    if (!response.ok) {
+      if (response.status >= 500) throw new DeliveryRepositoryError(`Supabase recusou a autorização (HTTP ${response.status}).`, response.status);
+      return { status: "DENIED", message: postgrestMessage(response.text) ?? "Autorização recusada." };
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(response.text);
+    } catch {
+      throw new DeliveryRepositoryError("Resposta da autorização não é JSON.");
+    }
+    const record = body !== null && typeof body === "object" ? (body as Record<string, unknown>) : {};
+    if (record.status === "OK" && typeof record.auditId === "string") return { status: "OK", auditId: record.auditId };
+    if (record.status === "PIN_FAILED") return { status: "PIN_FAILED", message: "PIN de gerente incorreto." };
+    if (record.status === "PIN_LOCKED") return { status: "PIN_LOCKED", message: "PIN de gerente bloqueado por 1 minuto (3 erros)." };
+    if (record.status === "CONFLICT") return { status: "CONFLICT", message: "Esta autorização já foi usada para outra ação." };
+    throw new DeliveryRepositoryError("Resposta da autorização inválida.");
+  }
+
+  async recordResult(auditId: string, outcome: ManagerOutcome, detail: string): Promise<void> {
+    const response = await fetchWithDeadline(
+      this.fetchImpl,
+      `${this.base}/rest/v1/rpc/tchefood_delivery_audit_result`,
+      {
+        method: "POST",
+        headers: {
+          apikey: this.options.serviceRoleKey,
+          authorization: `Bearer ${this.options.serviceRoleKey}`,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({ p_audit_id: auditId, p_outcome: outcome, p_detail: detail.slice(0, 500) }),
+      },
+      this.timeoutMs,
+      "resultado da autorização",
+    );
+    if (!response.ok) throw new DeliveryRepositoryError(`Supabase recusou o resultado da autorização (HTTP ${response.status}).`, response.status);
+  }
+}
+
+function postgrestMessage(raw: string): string | null {
+  try {
+    const body = JSON.parse(raw) as { message?: unknown };
+    return typeof body.message === "string" ? body.message.replace(/^TCHEFOOD_[A-Z_]+:\s*/, "").slice(0, 200) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -170,6 +294,7 @@ export type IfoodApiOptions = {
   inbox: DeliveryInbox;
   api: IfoodMerchantApi;
   authorizer: TenantAuthorizer;
+  approval: ManagerApproval;
   poller?: IfoodPoller;
   now?: () => Date;
   log?: (line: string) => void;
@@ -177,6 +302,30 @@ export type IfoodApiOptions = {
 
 export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRequest) => Promise<ApiResponse> {
   const now = options.now ?? (() => new Date());
+  const log = options.log ?? (() => undefined);
+
+  // PIN de gerente conferido no banco antes de qualquer chamada ao iFood; o resultado da chamada também fica no
+  // audit_logs. Falha ao gravar o resultado não muda a resposta (a autorização já está gravada), mas vai para o log.
+  const withManager = async (token: string, request: ManagerRequest, run: () => Promise<ApiResponse>): Promise<ApiResponse> => {
+    const decision = await options.approval.authorize(token, request);
+    if (decision.status !== "OK") {
+      return { status: decision.status === "CONFLICT" ? 409 : 403, body: { error: decision.message, code: decision.status } };
+    }
+    const record = (outcome: ManagerOutcome, detail: string) =>
+      options.approval.recordResult(decision.auditId, outcome, detail).catch((error: unknown) => {
+        log(`[ifood] resultado da autorização ${decision.auditId} não gravado (${outcome}): ${error instanceof Error ? error.message : String(error)}`);
+      });
+    try {
+      const response = await run();
+      await record("sent", `HTTP ${response.status}`);
+      return response;
+    } catch (error) {
+      const definite = error instanceof DeliveryMarketplaceError && ["invalid_request", "not_found", "conflict", "auth_failed", "rate_limited"].includes(error.code);
+      await record(definite ? "failed" : "uncertain", error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  };
+
   return async (request) => {
     const path = request.path.split("?")[0] ?? "";
     try {
@@ -206,17 +355,27 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           const code = text(body.code, 32);
           const description = text(body.description, 250);
           if (!code || !description) return { status: 400, body: { error: "Escolha um motivo de cancelamento do iFood." } };
-          // O motivo tem que ser um dos que o iFood oferece agora para este pedido.
+          const manager = parseManager(body.authorization);
+          if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
+          // O motivo tem que ser um dos que o iFood oferece agora para este pedido (conferido antes do PIN).
           const reasons = await options.inbox.listCancellationReasons("ifood", orderId);
           const reason = reasons.find((candidate) => candidate.code === code);
           if (!reason) return { status: 400, body: { error: "Motivo não está entre os aceitos pelo iFood para este pedido." } };
-          const record = await options.inbox.requestCancellation("ifood", orderId, reason, text(body.details, 250) ?? undefined);
-          return { status: 200, body: publicRecord(record) };
+          return await withManager(token, { ...manager, action: "DELIVERY_CANCEL", externalOrderId: orderId, merchantExternalId: null }, async () => ({
+            status: 200,
+            body: publicRecord(await options.inbox.requestCancellation("ifood", orderId, reason, text(body.details, 250) ?? undefined)),
+          }));
         }
         if (request.method === "POST" && route === "dispute") {
-          const decision = parseDecision(parseBody(request.body));
+          const body = parseBody(request.body);
+          const decision = parseDecision(body);
           if (!decision) return { status: 400, body: { error: "Resposta da negociação inválida." } };
-          return { status: 200, body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision)) };
+          const manager = parseManager(body.authorization);
+          if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
+          return await withManager(token, { ...manager, action: "DELIVERY_DISPUTE", externalOrderId: orderId, merchantExternalId: null }, async () => ({
+            status: 200,
+            body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision)),
+          }));
         }
         return { status: 405, body: { error: "Método não permitido." } };
       }
@@ -239,14 +398,23 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes < 1 || minutes > MAX_PAUSE_MINUTES) {
             return { status: 400, body: { error: `Pausa de 1 a ${MAX_PAUSE_MINUTES} minutos.` } };
           }
-          // Início e fim pelo relógio do servidor, nunca pelo do aparelho.
-          const start = now();
-          const end = new Date(start.getTime() + minutes * 60_000);
-          return { status: 201, body: await options.api.pauseStore(merchantId, { description, start: start.toISOString(), end: end.toISOString() }) };
+          const manager = parseManager(body.authorization);
+          if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
+          return await withManager(token, { ...manager, action: "DELIVERY_PAUSE", externalOrderId: null, merchantExternalId: merchantId }, async () => {
+            // Início e fim pelo relógio do servidor, nunca pelo do aparelho (contados depois da autorização).
+            const start = now();
+            const end = new Date(start.getTime() + minutes * 60_000);
+            return { status: 201, body: await options.api.pauseStore(merchantId, { description, start: start.toISOString(), end: end.toISOString() }) };
+          });
         }
         if (request.method === "DELETE" && merchant[2] === "pauses" && merchant[3]) {
-          await options.api.resumeStore(merchantId, merchant[3]);
-          return { status: 204, body: null };
+          const pauseId = merchant[3];
+          const manager = parseManager(parseBody(request.body).authorization);
+          if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
+          return await withManager(token, { ...manager, action: "DELIVERY_RESUME", externalOrderId: null, merchantExternalId: merchantId }, async () => {
+            await options.api.resumeStore(merchantId, pauseId);
+            return { status: 204, body: null };
+          });
         }
         return { status: 405, body: { error: "Método não permitido." } };
       }
@@ -254,7 +422,7 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
       return { status: 404, body: { error: "Rota não encontrada." } };
     } catch (error) {
       const response = errorResponse(error);
-      if (response.status >= 500) (options.log ?? (() => undefined))(`[ifood] ${request.method} ${path}: ${error instanceof Error ? error.message : String(error)}`);
+      if (response.status >= 500) log(`[ifood] ${request.method} ${path}: ${error instanceof Error ? error.message : String(error)}`);
       return response;
     }
   };
@@ -279,6 +447,20 @@ function text(value: unknown, max: number): string | null {
   return trimmed ? trimmed.slice(0, max) : null;
 }
 
+const MANAGER_FIELDS_ERROR = "Ação de gerente: informe o PIN de gerente, o operador, o motivo (5 caracteres ou mais) e o id da tentativa.";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function parseManager(raw: unknown): Omit<ManagerRequest, "action" | "externalOrderId" | "merchantExternalId"> | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const body = raw as Record<string, unknown>;
+  const managerPin = typeof body.managerPin === "string" && /^\d{4,8}$/.test(body.managerPin) ? body.managerPin : null;
+  const performedBy = typeof body.performedBy === "string" && UUID_PATTERN.test(body.performedBy) ? body.performedBy : null;
+  const requestId = typeof body.requestId === "string" && UUID_PATTERN.test(body.requestId) ? body.requestId : null;
+  const reason = text(body.reason, 250);
+  if (!managerPin || !performedBy || !requestId || !reason || reason.length < 5) return null;
+  return { managerPin, performedBy, requestId, reason };
+}
+
 function parseDecision(body: Record<string, unknown>): DeliveryDisputeDecision | null {
   if (body.kind === "accept") return { kind: "accept" };
   if (body.kind === "reject") {
@@ -301,6 +483,8 @@ function publicRecord(record: DeliveryOrderRecord): Omit<DeliveryOrderRecord, "v
 function errorResponse(error: unknown): ApiResponse {
   if (error instanceof BadRequest) return { status: 400, body: { error: error.message } };
   if (error instanceof DeliveryConcurrencyError) return { status: 409, body: { error: error.message, code: "conflict" } };
+  // Supabase fora do ar ou lento: nada foi feito no iFood (a prova de loja e a autorização vêm antes).
+  if (error instanceof DeliveryRepositoryError) return { status: 503, body: { error: "Banco indisponível; tente de novo.", code: "unavailable" } };
   if (error instanceof DeliveryMarketplaceError) {
     const status = {
       invalid_request: 400,

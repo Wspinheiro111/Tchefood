@@ -446,8 +446,9 @@ export function parseIfoodEvent(raw: unknown): DeliveryEvent {
   };
 }
 
-// Versão do polling: evento com id mas incompleto vira "unknown" (sem pedido) para ser confirmado e ignorado;
-// evento sem id volta null (não há o que confirmar). Nunca lança.
+// Versão do polling: evento com id mas incompleto vira "unknown" com malformed = true, mantendo o pedido quando
+// ele veio (vai para o histórico do pedido e vira pendência); evento sem id volta null (não há o que confirmar).
+// Nunca lança.
 export function parseIfoodEventLenient(raw: unknown): DeliveryEvent | null {
   try {
     return parseIfoodEvent(raw);
@@ -455,15 +456,19 @@ export function parseIfoodEventLenient(raw: unknown): DeliveryEvent | null {
     const record = asRecord(raw);
     const id = optionalString(record?.id);
     if (!id) return null;
+    // O pedido do evento é mantido sempre que vier num formato aceitável: o evento vai para o histórico do pedido
+    // (e busca o detalhe, se o pedido for novo) em vez de ser confirmado e esquecido.
+    const orderId = optionalString(record?.orderId);
     return {
       channel: "ifood",
       externalEventId: id,
-      externalOrderId: "",
+      externalOrderId: orderId && ID_PATTERN.test(orderId) ? orderId : "",
       merchantExternalId: optionalString(record?.merchantId) ?? "",
       rawCode: optionalString(record?.code) ?? "?",
       signal: "unknown",
       createdAt: isoInstant(record?.createdAt),
       dispute: null,
+      malformed: true,
     };
   }
 }

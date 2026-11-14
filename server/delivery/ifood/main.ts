@@ -3,7 +3,15 @@ import { DeliveryInbox, InMemoryDeliveryRepository, type DeliveryRepository } fr
 import { SupabaseDeliveryRepository } from "../supabaseDeliveryRepository";
 import { IfoodMerchantApi } from "./ifoodMerchantApi";
 import { IfoodSandbox } from "./ifoodSandbox";
-import { createIfoodApiHandler, IfoodPoller, SupabaseCallerAuthorizer, type MerchantSource, type TenantAuthorizer } from "./ifoodServer";
+import {
+  createIfoodApiHandler,
+  IfoodPoller,
+  SupabaseCallerAuthorizer,
+  SupabaseManagerApproval,
+  type ManagerApproval,
+  type MerchantSource,
+  type TenantAuthorizer,
+} from "./ifoodServer";
 
 // Processo do servidor do iFood. Variáveis de ambiente:
 //   IFOOD_CLIENT_ID, IFOOD_CLIENT_SECRET   credenciais do app centralizado (Portal do Desenvolvedor iFood)
@@ -45,7 +53,7 @@ function readBody(request: IncomingMessage): Promise<string> {
   });
 }
 
-function build(): { api: IfoodMerchantApi; repository: DeliveryRepository; merchants: MerchantSource; authorizer: TenantAuthorizer } {
+function build(): { api: IfoodMerchantApi; repository: DeliveryRepository; merchants: MerchantSource; authorizer: TenantAuthorizer; approval: ManagerApproval } {
   if (process.env.IFOOD_SANDBOX === "1") {
     const sandbox = new IfoodSandbox();
     const api = new IfoodMerchantApi({
@@ -59,6 +67,8 @@ function build(): { api: IfoodMerchantApi; repository: DeliveryRepository; merch
       repository: new InMemoryDeliveryRepository(),
       merchants: { activeMerchants: async () => [{ merchantExternalId: sandbox.merchantId }] },
       authorizer: { canAccessOrder: async () => true, canAccessMerchant: async () => true },
+      // Simulador: qualquer PIN serve e nada é gravado (não há banco).
+      approval: { authorize: async () => ({ status: "OK", auditId: "simulador" }), recordResult: async () => undefined },
     };
   }
   const url = required("SUPABASE_URL");
@@ -67,15 +77,22 @@ function build(): { api: IfoodMerchantApi; repository: DeliveryRepository; merch
     credentials: { clientId: required("IFOOD_CLIENT_ID"), clientSecret: required("IFOOD_CLIENT_SECRET") },
     baseUrl: process.env.IFOOD_BASE_URL?.trim() || undefined,
   });
-  return { api, repository, merchants: repository, authorizer: new SupabaseCallerAuthorizer({ url, anonKey: required("SUPABASE_ANON_KEY") }) };
+  const anonKey = required("SUPABASE_ANON_KEY");
+  return {
+    api,
+    repository,
+    merchants: repository,
+    authorizer: new SupabaseCallerAuthorizer({ url, anonKey }),
+    approval: new SupabaseManagerApproval({ url, anonKey, serviceRoleKey: required("SUPABASE_SERVICE_ROLE_KEY") }),
+  };
 }
 
 function main(): void {
-  const { api, repository, merchants, authorizer } = build();
+  const { api, repository, merchants, authorizer, approval } = build();
   const log = (line: string) => console.log(`${new Date().toISOString()} ${line}`);
   const inbox = new DeliveryInbox({ adapters: [api], repository });
   const poller = new IfoodPoller({ api, inbox, merchants, log });
-  const handle = createIfoodApiHandler({ inbox, api, authorizer, poller, log });
+  const handle = createIfoodApiHandler({ inbox, api, authorizer, approval, poller, log });
   const origins = (process.env.CORS_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter(Boolean);
 
   const server = createServer(async (request, response) => {

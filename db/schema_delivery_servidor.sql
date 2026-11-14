@@ -175,6 +175,150 @@ BEGIN
     ON CONFLICT (channel, external_event_id) DO NOTHING;
 END $$;
 
+-- -----------------------------------------------------------------------------
+-- Alçada de gerente nas ações do iFood que mexem em dinheiro ou na loja
+-- (cancelar, responder negociação, pausar e retomar). O servidor chama esta função com o
+-- JWT do app ANTES de chamar o iFood: a loja é a da sessão (tchefood_tenant), o pedido ou o
+-- merchantId precisa ser dessa loja, o PIN é de gerente/dono ativo e conta no mesmo bloqueio
+-- de 3 erros em 60 s de tchefood_authorize_manager (mesma trava e mesmos registros
+-- MANAGER_PIN_FAILED / MANAGER_PIN_LOCKOUT). A autorização vira um audit_log com gerente.
+-- Devolve {"status": "OK", "auditId"} ou {"status": "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT"}.
+-- -----------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_audit_logs_delivery_request
+    ON audit_logs (tenant_id, (metadata->>'delivery_request_id')) WHERE metadata ? 'delivery_request_id';
+
+CREATE OR REPLACE FUNCTION tchefood_delivery_authorize(
+    p_channel delivery_channel,
+    p_action VARCHAR,
+    p_external_order_id VARCHAR,
+    p_merchant_external_id VARCHAR,
+    p_manager_pin VARCHAR,
+    p_performed_by UUID,
+    p_reason TEXT,
+    p_request_id UUID
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_manager staff_users%ROWTYPE;
+    v_existing audit_logs%ROWTYPE;
+    v_failures INT;
+    v_checked_at TIMESTAMPTZ;
+    v_id UUID;
+    v_order_action BOOLEAN := p_action IN ('DELIVERY_CANCEL', 'DELIVERY_DISPUTE');
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: sessão sem tenant.' USING ERRCODE = '42501';
+    END IF;
+    IF p_action IS NULL OR p_action NOT IN ('DELIVERY_CANCEL', 'DELIVERY_DISPUTE', 'DELIVERY_PAUSE', 'DELIVERY_RESUME') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: ação % não é de delivery.', p_action USING ERRCODE = '22023';
+    END IF;
+    IF p_request_id IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: falta o id da tentativa.' USING ERRCODE = '22023';
+    END IF;
+    IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: motivo obrigatório (mínimo 5 caracteres).' USING ERRCODE = '22023';
+    END IF;
+    IF v_order_action THEN
+        IF COALESCE(p_external_order_id, '') = '' OR p_merchant_external_id IS NOT NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % é de um pedido.', p_action USING ERRCODE = '22023';
+        END IF;
+        PERFORM 1 FROM delivery_orders o
+         WHERE o.channel = p_channel AND o.external_id = p_external_order_id AND o.tenant_id = v_tenant;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: pedido não pertence a esta loja.' USING ERRCODE = '42501';
+        END IF;
+    ELSE
+        IF COALESCE(p_merchant_external_id, '') = '' OR p_external_order_id IS NOT NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: % é da loja no app.', p_action USING ERRCODE = '22023';
+        END IF;
+        PERFORM 1 FROM delivery_integrations i
+         WHERE i.channel = p_channel AND i.merchant_external_id = p_merchant_external_id AND i.tenant_id = v_tenant AND i.active;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: loja do app não pertence a esta loja.' USING ERRCODE = '42501';
+        END IF;
+    END IF;
+
+    -- Mesma trava de tchefood_authorize_manager: as conferências de PIN da loja entram em fila.
+    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || v_tenant::text));
+
+    PERFORM 1 FROM staff_users u WHERE u.id = p_performed_by AND u.tenant_id = v_tenant AND u.active;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: operador inválido.' USING ERRCODE = '42501';
+    END IF;
+
+    v_checked_at := clock_timestamp();
+    SELECT count(*) INTO v_failures FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.action_type = 'MANAGER_PIN_FAILED'
+       AND a.created_at >= v_checked_at - INTERVAL '60 seconds' AND a.created_at <= v_checked_at;
+    IF v_failures >= 3 THEN
+        INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata, created_at)
+        VALUES (v_tenant, p_performed_by, 'MANAGER_PIN_LOCKOUT', 'PIN de gerente bloqueado por excesso de tentativas',
+                jsonb_build_object('attempted_action', p_action), v_checked_at);
+        RETURN jsonb_build_object('status', 'PIN_LOCKED');
+    END IF;
+
+    SELECT * INTO v_manager FROM staff_users m
+     WHERE m.tenant_id = v_tenant AND m.pin_code = p_manager_pin AND m.active AND m.role IN ('MANAGER', 'OWNER');
+    IF NOT FOUND THEN
+        INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata, created_at)
+        VALUES (v_tenant, p_performed_by, 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto',
+                jsonb_build_object('attempted_action', p_action), v_checked_at);
+        RETURN jsonb_build_object('status', 'PIN_FAILED');
+    END IF;
+
+    -- Reenvio da mesma tentativa (resposta perdida): devolve a autorização já gravada, se for a mesma ação,
+    -- no mesmo alvo, pelo mesmo gerente e operador. Diferente disso é conflito (nada é gravado).
+    SELECT * INTO v_existing FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.authorized_by_manager_id IS NOT NULL
+       AND a.metadata->>'delivery_request_id' = p_request_id::text
+       AND a.metadata ? 'delivery_request_id'
+     ORDER BY a.server_seq
+     LIMIT 1;
+    IF FOUND THEN
+        IF v_existing.action_type = p_action
+           AND v_existing.metadata->>'external_order_id' IS NOT DISTINCT FROM p_external_order_id
+           AND v_existing.metadata->>'merchant_external_id' IS NOT DISTINCT FROM p_merchant_external_id
+           AND v_existing.authorized_by_manager_id = v_manager.id
+           AND v_existing.performed_by_user_id = p_performed_by THEN
+            RETURN jsonb_build_object('status', 'OK', 'auditId', v_existing.id, 'repeated', TRUE);
+        END IF;
+        RETURN jsonb_build_object('status', 'CONFLICT');
+    END IF;
+
+    INSERT INTO audit_logs (tenant_id, performed_by_user_id, authorized_by_manager_id, action_type, reason, metadata, created_at)
+    VALUES (v_tenant, p_performed_by, v_manager.id, p_action, trim(p_reason),
+            jsonb_build_object('channel', p_channel, 'external_order_id', p_external_order_id,
+                               'merchant_external_id', p_merchant_external_id, 'delivery_request_id', p_request_id),
+            v_checked_at)
+    RETURNING id INTO v_id;
+    RETURN jsonb_build_object('status', 'OK', 'auditId', v_id);
+END $$;
+
+-- Resultado da chamada ao app para uma autorização acima (audit_logs é só de inserção: outro registro).
+-- Só o servidor grava (o servidor grava um resultado por chamada; não há conferência de repetido porque o app
+-- consegue inserir audit_logs sem gerente, e um registro forjado não pode impedir o verdadeiro).
+CREATE OR REPLACE FUNCTION tchefood_delivery_audit_result(p_audit_id UUID, p_outcome VARCHAR, p_detail TEXT)
+RETURNS VOID
+LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE
+    v_auth audit_logs%ROWTYPE;
+BEGIN
+    IF p_outcome IS NULL OR p_outcome NOT IN ('sent', 'failed', 'uncertain') THEN
+        RAISE EXCEPTION 'Resultado inválido.' USING ERRCODE = '22023';
+    END IF;
+    SELECT * INTO v_auth FROM audit_logs a
+     WHERE a.id = p_audit_id AND a.authorized_by_manager_id IS NOT NULL
+       AND a.action_type IN ('DELIVERY_CANCEL', 'DELIVERY_DISPUTE', 'DELIVERY_PAUSE', 'DELIVERY_RESUME')
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Autorização de delivery % não existe.', p_audit_id USING ERRCODE = 'P0002';
+    END IF;
+    INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata)
+    VALUES (v_auth.tenant_id, v_auth.performed_by_user_id, 'DELIVERY_RESULT', left(COALESCE(p_detail, p_outcome), 500),
+            v_auth.metadata || jsonb_build_object('authorization_id', p_audit_id, 'action', v_auth.action_type, 'outcome', p_outcome));
+END $$;
+
 -- Só o servidor (service_role) chama estas funções.
 DO $$
 DECLARE f TEXT;
@@ -187,8 +331,13 @@ BEGIN
         'tchefood_delivery_list_orders(delivery_channel, INTEGER)',
         'tchefood_delivery_has_event(delivery_channel, VARCHAR)',
         'tchefood_delivery_save_order(delivery_channel, INTEGER, JSONB)',
-        'tchefood_delivery_record_event(JSONB)'] LOOP
+        'tchefood_delivery_record_event(JSONB)',
+        'tchefood_delivery_audit_result(UUID, VARCHAR, TEXT)'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC, anon, authenticated', f);
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role', f);
     END LOOP;
 END $$;
+
+-- A autorização de gerente é chamada pelo app (papel authenticated), pelo servidor, com o JWT da sessão.
+REVOKE ALL ON FUNCTION tchefood_delivery_authorize(delivery_channel, VARCHAR, VARCHAR, VARCHAR, VARCHAR, UUID, TEXT, UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION tchefood_delivery_authorize(delivery_channel, VARCHAR, VARCHAR, VARCHAR, VARCHAR, UUID, TEXT, UUID) TO authenticated;

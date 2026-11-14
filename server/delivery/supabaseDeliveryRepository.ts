@@ -158,3 +158,35 @@ function toRecord(raw: unknown): DeliveryOrderRecord {
     version,
   };
 }
+
+// Chamada ao Supabase com prazo: estourado o prazo, a requisição é cancelada (abort) e a chamada falha com
+// DeliveryRepositoryError. Devolve status e corpo já lidos.
+export async function fetchWithDeadline(
+  fetchImpl: RestFetch,
+  url: string,
+  init: { method: string; headers: Record<string, string>; body?: string },
+  timeoutMs: number,
+  label: string,
+): Promise<{ ok: boolean; status: number; text: string }> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new DeliveryRepositoryError(`Supabase não respondeu (${label}).`));
+    }, timeoutMs);
+  });
+  const exchange = (async () => {
+    const response = await fetchImpl(url, { ...init, signal: controller.signal });
+    return { ok: response.ok, status: response.status, text: await response.text() };
+  })();
+  try {
+    return await Promise.race([exchange, deadline]);
+  } catch (error) {
+    if (error instanceof DeliveryRepositoryError) throw error;
+    throw new DeliveryRepositoryError(`Falha de rede no Supabase (${label}).`);
+  } finally {
+    clearTimeout(timer);
+    exchange.catch(() => undefined);
+  }
+}

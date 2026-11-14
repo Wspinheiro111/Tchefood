@@ -22,6 +22,11 @@ const DB = 'tchefood_delivery_repo_test';
 const ROOT = join(__dirname, '..', '..');
 const TENANT = '22222222-2222-4222-8222-222222222222';
 const OTHER = '33333333-3333-4333-8333-333333333333';
+const OTHER_MERCHANT = '88888888-8888-4888-8888-888888888888';
+const MANAGER = '44444444-4444-4444-8444-444444444444';
+const CASHIER = '55555555-5555-4555-8555-555555555555';
+const OTHER_MANAGER = '66666666-6666-4666-8666-666666666666';
+const OTHER_CASHIER = '77777777-7777-4777-8777-777777777777';
 const ITEMS = [{ name: 'Xis Galpão', externalCode: '301', quantity: 2, unitPrice: 38.5 }];
 
 function applySchema(t: PgTarget, db: string): void {
@@ -64,12 +69,18 @@ function setup() {
     sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES
            ('${TENANT}', 'Flip', 'Flip Ltda', '11222333000181'),
            ('${OTHER}', 'Outra', 'Outra Ltda', '11444777000161');
-         INSERT INTO delivery_integrations (tenant_id, channel, merchant_external_id) VALUES ('${TENANT}', 'ifood', '${merchantId}');`);
+         INSERT INTO delivery_integrations (tenant_id, channel, merchant_external_id) VALUES ('${TENANT}', 'ifood', '${merchantId}'),
+           ('${OTHER}', 'ifood', '${OTHER_MERCHANT}');
+         INSERT INTO staff_users (id, tenant_id, name, role, pin_code) VALUES
+           ('${MANAGER}', '${TENANT}', 'Gerente', 'MANAGER', '7391'),
+           ('${CASHIER}', '${TENANT}', 'Caixa', 'CASHIER', '5162'),
+           ('${OTHER_MANAGER}', '${OTHER}', 'Gerente da outra', 'MANAGER', '4826'),
+           ('${OTHER_CASHIER}', '${OTHER}', 'Caixa da outra', 'CASHIER', '6273');`);
   });
 
   it('polling grava pedido, eventos e versões; repetir o evento não duplica', async () => {
     const { sandbox, api, repository, inbox } = setup();
-    expect(await repository.activeMerchants()).toEqual([{ tenantId: TENANT, merchantExternalId: merchantId }]);
+    expect((await repository.activeMerchants()).filter((m) => m.tenantId === TENANT)).toEqual([{ tenantId: TENANT, merchantExternalId: merchantId }]);
     const id = sandbox.placeOrder({ items: ITEMS });
     const report = await inbox.runChannel(api);
     expect(report).toMatchObject({ received: 1, acknowledged: 1 });
@@ -158,5 +169,80 @@ function setup() {
       method: 'POST', headers: {}, body: JSON.stringify({ tenant_id: TENANT, channel: 'ifood', merchant_external_id: 'outro-merchant' }),
     });
     expect(integration.ok).toBe(false);
+  });
+
+  describe('alçada de gerente (tchefood_delivery_authorize)', () => {
+    async function authorize(tenant: string, args: Record<string, unknown>) {
+      const res = await appFetch(tenant)('http://cloud.test/rest/v1/rpc/tchefood_delivery_authorize', {
+        method: 'POST', headers: {},
+        body: JSON.stringify({
+          p_channel: 'ifood', p_action: 'DELIVERY_CANCEL', p_external_order_id: null, p_merchant_external_id: null,
+          p_manager_pin: '7391', p_performed_by: CASHIER, p_reason: 'Cliente desistiu', p_request_id: crypto.randomUUID(), ...args,
+        }),
+      });
+      const text = await res.text();
+      return { ok: res.ok, body: text ? (JSON.parse(text) as Record<string, unknown>) : null };
+    }
+
+    it('PIN de gerente certo grava a autorização; reenvio devolve a mesma; outro alvo com o mesmo id é conflito', async () => {
+      const { sandbox, api, inbox } = setup();
+      const id = sandbox.placeOrder({ items: ITEMS });
+      const other = sandbox.placeOrder({ items: ITEMS });
+      await inbox.runChannel(api);
+      const requestId = crypto.randomUUID();
+      const first = await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId });
+      expect(first.body).toMatchObject({ status: 'OK' });
+      const auditId = first.body!.auditId as string;
+      expect(sql(`SELECT action_type || '|' || authorized_by_manager_id || '|' || performed_by_user_id || '|' || (metadata->>'external_order_id') FROM audit_logs WHERE id = '${auditId}'`))
+        .toBe(`DELIVERY_CANCEL|${MANAGER}|${CASHIER}|${id}`);
+      const again = await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId });
+      expect(again.body).toMatchObject({ status: 'OK', auditId, repeated: true });
+      expect((await authorize(TENANT, { p_external_order_id: other, p_request_id: requestId })).body).toEqual({ status: 'CONFLICT' });
+      expect(sql(`SELECT count(*) FROM audit_logs WHERE metadata->>'delivery_request_id' = '${requestId}'`)).toBe('1');
+
+      // Resultado: só o servidor grava; o app não chama a função.
+      const denied = await appFetch(TENANT)('http://cloud.test/rest/v1/rpc/tchefood_delivery_audit_result', {
+        method: 'POST', headers: {}, body: JSON.stringify({ p_audit_id: auditId, p_outcome: 'sent', p_detail: 'x' }),
+      });
+      expect(denied.ok).toBe(false);
+      const recorded = await serviceFetch()('http://cloud.test/rest/v1/rpc/tchefood_delivery_audit_result', {
+        method: 'POST', headers: {}, body: JSON.stringify({ p_audit_id: auditId, p_outcome: 'sent', p_detail: 'HTTP 200' }),
+      });
+      expect(recorded.ok).toBe(true);
+      expect(sql(`SELECT metadata->>'outcome' || '|' || (metadata->>'action') FROM audit_logs WHERE action_type = 'DELIVERY_RESULT' AND metadata->>'authorization_id' = '${auditId}'`))
+        .toBe('sent|DELIVERY_CANCEL');
+    });
+
+    it('PIN de caixa, motivo curto, pedido de outra loja e loja do app de outra loja não autorizam', async () => {
+      const { sandbox, api, inbox } = setup();
+      const id = sandbox.placeOrder({ items: ITEMS });
+      await inbox.runChannel(api);
+      const before = sql(`SELECT count(*) FROM audit_logs WHERE authorized_by_manager_id IS NOT NULL AND action_type LIKE 'DELIVERY_%'`);
+      expect((await authorize(TENANT, { p_external_order_id: id, p_manager_pin: '5162' })).body).toEqual({ status: 'PIN_FAILED' });
+      expect((await authorize(TENANT, { p_external_order_id: id, p_reason: 'ok' })).ok).toBe(false);
+      // A outra loja, com o PIN do gerente dela, não age no pedido nem na loja do app desta.
+      expect((await authorize(OTHER, { p_external_order_id: id, p_manager_pin: '4826', p_performed_by: OTHER_CASHIER })).ok).toBe(false);
+      expect((await authorize(OTHER, { p_action: 'DELIVERY_PAUSE', p_merchant_external_id: merchantId, p_manager_pin: '4826', p_performed_by: OTHER_CASHIER })).ok).toBe(false);
+      // Operador de outra loja também não.
+      expect((await authorize(TENANT, { p_external_order_id: id, p_performed_by: OTHER_CASHIER })).ok).toBe(false);
+      // Ação de pedido sem pedido, ou de loja com pedido: recusada.
+      expect((await authorize(TENANT, { p_action: 'DELIVERY_PAUSE', p_external_order_id: id })).ok).toBe(false);
+      expect((await authorize(TENANT, { p_action: 'ITEM_CANCELED', p_external_order_id: id })).ok).toBe(false);
+      expect(sql(`SELECT count(*) FROM audit_logs WHERE authorized_by_manager_id IS NOT NULL AND action_type LIKE 'DELIVERY_%'`)).toBe(before);
+      expect(Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'`))).toBeGreaterThanOrEqual(1);
+      // Limpa as falhas desta loja para os próximos testes (audit_logs é só de inserção: trigger desligado só aqui).
+      sql(`ALTER TABLE audit_logs DISABLE TRIGGER trg_audit_logs_immutable; DELETE FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'; ALTER TABLE audit_logs ENABLE TRIGGER trg_audit_logs_immutable;`);
+    });
+
+    it('3 PINs errados em 60 s bloqueiam até o PIN certo (mesmo bloqueio do PIN de gerente)', async () => {
+      const pause = { p_action: 'DELIVERY_PAUSE', p_merchant_external_id: OTHER_MERCHANT, p_performed_by: OTHER_CASHIER };
+      for (let i = 0; i < 3; i += 1) expect((await authorize(OTHER, { ...pause, p_manager_pin: '0000' })).body).toEqual({ status: 'PIN_FAILED' });
+      expect((await authorize(OTHER, { ...pause, p_manager_pin: '4826' })).body).toEqual({ status: 'PIN_LOCKED' });
+      expect(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${OTHER}' AND action_type = 'MANAGER_PIN_LOCKOUT'`)).toBe('1');
+      // A outra loja segue conferindo o PIN normalmente.
+      expect((await authorize(TENANT, { p_action: 'DELIVERY_PAUSE', p_merchant_external_id: merchantId })).body).toMatchObject({ status: 'OK' });
+      // As falhas pelo PIN de delivery bloqueiam também tchefood_authorize_manager (mesma contagem).
+      expect(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${OTHER}' AND action_type = 'MANAGER_PIN_FAILED' AND created_at > NOW() - INTERVAL '60 seconds'`)).toBe('3');
+    });
   });
 });

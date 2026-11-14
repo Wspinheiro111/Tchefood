@@ -34,10 +34,22 @@ export type DeliveryOrderRecord = {
   updatedAt: string;
   // Negociação aberta pelo app esperando resposta da loja (null = nenhuma). respondedAt preenchido = a loja já
   // respondeu e aguarda o app fechar (evento "dispute_settled").
-  dispute: (DeliveryDispute & { openedAt: string; respondedAt: string | null }) | null;
+  dispute: (DeliveryDispute & { openedAt: string; respondedAt: string | null; response?: DeliveryDisputeResponse | null }) | null;
   // Versão da gravação (controle otimista): 0 = pedido ainda não gravado. Quem grava com versão velha recebe
   // DeliveryConcurrencyError e precisa reler; assim dois processos (polling e ação da tela) nunca se sobrescrevem.
   version: number;
+};
+
+// Resposta da loja a uma negociação, reservada ANTES da chamada ao app: só uma resposta por negociação chega ao
+// app, mesmo com dois pedidos ao mesmo tempo ou com o banco falhando depois que o app aceitou.
+//   sending   reservada, chamada em andamento (ou o processo caiu no meio: tratada como incerta)
+//   sent      o app aceitou a resposta; falta o evento que fecha a negociação
+//   uncertain a chamada falhou sem resposta clara (rede, 5xx): pode ter chegado; só o evento do app (ou o prazo)
+//             resolve, nunca uma nova tentativa
+export type DeliveryDisputeResponse = {
+  decision: DeliveryDisputeDecision;
+  state: "sending" | "sent" | "uncertain";
+  reservedAt: string;
 };
 
 export class DeliveryConcurrencyError extends Error {
@@ -100,6 +112,8 @@ export type DeliveryCycleReport = {
   newOrders: string[];
   // Eventos que ficaram sem ack e voltam no próximo ciclo.
   deferred: number;
+  // Eventos confirmados sem pedido que não deu para ler (ids, para o log do servidor investigar).
+  discarded: string[];
   error: string | null;
 };
 
@@ -111,6 +125,9 @@ export type DeliveryInboxOptions = {
   onOrderUpdated?: (record: DeliveryOrderRecord) => void | Promise<void>;
   now?: () => Date;
 };
+
+// Falhas em que o app com certeza não aplicou o pedido.
+const DEFINITE_FAILURES: readonly string[] = ["invalid_request", "not_found", "conflict", "auth_failed", "rate_limited"];
 
 export class DeliveryInbox {
   private readonly adapters = new Map<DeliveryChannelKey, DeliveryMarketplaceAdapter>();
@@ -139,6 +156,7 @@ export class DeliveryInbox {
       acknowledged: 0,
       newOrders: [],
       deferred: 0,
+      discarded: [],
       error: null,
     };
     if (this.running.has(adapter.channel)) return report;
@@ -155,6 +173,7 @@ export class DeliveryInbox {
       for (const event of ordered) {
         // Evento sem pedido (ou que não deu para ler): confirmado e ignorado, senão volta para sempre no polling.
         if (!event.externalOrderId) {
+          if (event.malformed) report.discarded.push(`${event.externalEventId} (${event.rawCode})`);
           toAck.push(event);
           continue;
         }
@@ -217,6 +236,9 @@ export class DeliveryInbox {
     if (["concluded", "cancelled"].includes(record.order.status)) {
       throw new DeliveryMarketplaceError(channel, "conflict", "Pedido já finalizado não pode ser cancelado.");
     }
+    if (record.cancellationPending) {
+      throw new DeliveryMarketplaceError(channel, "conflict", "O cancelamento já foi pedido; aguarde a resposta do app.");
+    }
     const cancellationSeenBefore = record.lastCancellationEventAt;
     await adapter.requestCancellation(externalOrderId, reason, details);
     // Relê o pedido depois da resposta: o polling pode ter gravado eventos (até o próprio cancelamento) enquanto
@@ -230,24 +252,58 @@ export class DeliveryInbox {
     });
   }
 
-  // Resposta da loja a uma negociação aberta pelo app (cliente pediu cancelamento, reembolso...).
+  // Resposta da loja a uma negociação aberta pelo app (cliente pediu cancelamento, reembolso...). A resposta é
+  // reservada no pedido (gravação com versão) antes de chamar o app: duas respostas ao mesmo tempo, ou uma nova
+  // tentativa depois de uma resposta incerta, não chegam ao app.
   async respondToDispute(channel: DeliveryChannelKey, externalOrderId: string, decision: DeliveryDisputeDecision): Promise<DeliveryOrderRecord> {
     const adapter = this.adapter(channel);
-    const record = await this.requireOrder(channel, externalOrderId);
-    const dispute = record.dispute;
-    if (!dispute) throw new DeliveryMarketplaceError(channel, "conflict", "Este pedido não tem negociação aberta.");
-    if (dispute.respondedAt) throw new DeliveryMarketplaceError(channel, "conflict", "A negociação já foi respondida; aguarde o app.");
-    if (dispute.expiresAt && Date.parse(dispute.expiresAt) <= this.now().getTime()) {
-      throw new DeliveryMarketplaceError(channel, "conflict", "O prazo da negociação acabou; o app aplica a decisão padrão.");
+    const reservedAt = this.now().toISOString();
+    let disputeId = "";
+    await this.updateOrder(channel, externalOrderId, (latest) => {
+      const dispute = latest.dispute;
+      if (!dispute) throw new DeliveryMarketplaceError(channel, "conflict", "Este pedido não tem negociação aberta.");
+      if (dispute.respondedAt || dispute.response) {
+        throw new DeliveryMarketplaceError(
+          channel,
+          "conflict",
+          dispute.response?.state === "sent" || dispute.respondedAt
+            ? "A negociação já foi respondida; aguarde o app."
+            : "Já existe uma resposta em andamento ou sem confirmação; aguarde o app fechar a negociação.",
+        );
+      }
+      if (dispute.expiresAt && Date.parse(dispute.expiresAt) <= this.now().getTime()) {
+        throw new DeliveryMarketplaceError(channel, "conflict", "O prazo da negociação acabou; o app aplica a decisão padrão.");
+      }
+      if (decision.kind === "alternative" && !dispute.alternatives.some((alternative) => alternative.id === decision.alternativeId)) {
+        throw new DeliveryMarketplaceError(channel, "invalid_request", "Proposta não pertence a esta negociação.");
+      }
+      disputeId = dispute.id;
+      dispute.response = { decision, state: "sending", reservedAt };
+      return true;
+    });
+    // Só mexe na reserva desta resposta: se o app fechou ou trocou a negociação no meio, o evento manda.
+    const ours = (latest: DeliveryOrderRecord) =>
+      latest.dispute && latest.dispute.id === disputeId && latest.dispute.response?.reservedAt === reservedAt ? latest.dispute : null;
+    try {
+      await adapter.respondToDispute(disputeId, decision);
+    } catch (error) {
+      // Recusa clara do app (4xx, limite de uso): nada foi aplicado e a reserva é desfeita. Qualquer outra falha
+      // (rede, 5xx, prazo) pode ter chegado: fica "incerta" e bloqueia novas tentativas.
+      const definite = error instanceof DeliveryMarketplaceError && DEFINITE_FAILURES.includes(error.code);
+      await this.updateOrder(channel, externalOrderId, (latest) => {
+        const dispute = ours(latest);
+        if (!dispute) return false;
+        if (definite) dispute.response = null;
+        else dispute.response = { ...dispute.response!, state: "uncertain" };
+        return true;
+      }).catch(() => undefined);
+      throw error;
     }
-    if (decision.kind === "alternative" && !dispute.alternatives.some((alternative) => alternative.id === decision.alternativeId)) {
-      throw new DeliveryMarketplaceError(channel, "invalid_request", "Proposta não pertence a esta negociação.");
-    }
-    await adapter.respondToDispute(dispute.id, decision);
     return this.updateOrder(channel, externalOrderId, (latest) => {
-      // Só marca a mesma negociação; se o app já fechou ou abriu outra durante a chamada, o evento manda.
-      if (!latest.dispute || latest.dispute.id !== dispute.id || latest.dispute.respondedAt) return false;
-      latest.dispute.respondedAt = this.now().toISOString();
+      const dispute = ours(latest);
+      if (!dispute) return false;
+      dispute.response = { ...dispute.response!, state: "sent" };
+      dispute.respondedAt = this.now().toISOString();
       return true;
     });
   }
@@ -394,7 +450,7 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
       }
       // Negociação repetida (mesmo id) não apaga a resposta já dada.
       if (record.dispute?.id === event.dispute.id) return;
-      record.dispute = { ...event.dispute, openedAt: event.createdAt, respondedAt: null };
+      record.dispute = { ...event.dispute, openedAt: event.createdAt, respondedAt: null, response: null };
       flag(
         record,
         `O cliente abriu uma negociação${event.dispute.action ? ` (${event.dispute.action})` : ""}: responda${event.dispute.expiresAt ? ` até ${event.dispute.expiresAt}` : " logo"}, senão o app decide sozinho.`,
@@ -405,6 +461,10 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
       return;
     case "unknown":
       // Códigos que não mexem no status (entregador chegando, troca de endereço...) ficam só no histórico.
+      // Evento que não deu para ler é diferente: pode ser um cancelamento ou uma negociação.
+      if (event.malformed) {
+        flag(record, `Chegou um evento do app que não deu para ler (código ${event.rawCode || "?"}): confira o pedido no Portal do Parceiro.`);
+      }
       return;
     default: {
       const before = record.order.status;

@@ -240,6 +240,9 @@ export type DeliveryEvent = {
   createdAt: string;
   // Negociação aberta pelo app (só nos eventos "dispute_opened").
   dispute: DeliveryDispute | null;
+  // Evento que não deu para ler inteiro (ex.: código ausente). Se tem pedido, entra no histórico do pedido e vira
+  // pendência para a loja conferir; nunca é descartado em silêncio.
+  malformed?: boolean;
 };
 
 // Negociação (iFood: plataforma de negociação / handshake). O cliente pede algo (cancelar, reembolso parcial...)

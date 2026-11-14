@@ -398,6 +398,109 @@ describe("caixa de entrada de delivery", () => {
     expect((await repository.getOrder("ifood", other))!.reviewReasons.join(" ")).toMatch(/cancelamento/);
   });
 
+  it("negociação: duas respostas ao mesmo tempo chegam ao iFood uma vez só", async () => {
+    const { sandbox, api, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id);
+    await inbox.runCycle();
+    const spy = vi.spyOn(api, "respondToDispute");
+    const results = await Promise.allSettled([
+      inbox.respondToDispute("ifood", id, { kind: "accept" }),
+      inbox.respondToDispute("ifood", id, { kind: "reject", reason: "Já saiu" }),
+    ]);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+  });
+
+  it("negociação: outro processo com a mesma leitura também não manda a segunda resposta (versão no banco)", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id);
+    await inbox.runCycle();
+    // Segundo processo: outra caixa de entrada no mesmo banco.
+    const other = new DeliveryInbox({ adapters: [api], repository });
+    const spy = vi.spyOn(api, "respondToDispute");
+    await inbox.respondToDispute("ifood", id, { kind: "accept" });
+    await expect(other.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("negociação: iFood aceitou e o banco falhou depois: nova tentativa é recusada sem chamar o iFood", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id);
+    await inbox.runCycle();
+    const spy = vi.spyOn(api, "respondToDispute");
+    const save = repository.saveOrder.bind(repository);
+    let calls = 0;
+    // A reserva grava; a marcação de "respondida" (depois do iFood) falha.
+    vi.spyOn(repository, "saveOrder").mockImplementation(async (record) => {
+      calls += 1;
+      if (calls >= 2) throw new Error("banco fora do ar");
+      return save(record);
+    });
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toThrow(/banco fora do ar/);
+    vi.mocked(repository.saveOrder).mockImplementation(save);
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect((await repository.getOrder("ifood", id))!.dispute?.response?.state).toBe("sending");
+    // O evento do app fecha a negociação e libera tudo.
+    await inbox.runCycle();
+    expect((await repository.getOrder("ifood", id))!.dispute).toBeNull();
+  });
+
+  it("negociação: falha incerta bloqueia nova tentativa; recusa clara libera", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id);
+    await inbox.runCycle();
+    sandbox.failNext("/disputes/", 400);
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "invalid_request" });
+    expect((await repository.getOrder("ifood", id))!.dispute?.response).toBeNull();
+    vi.spyOn(api, "respondToDispute").mockRejectedValueOnce(new TypeError("fetch failed"));
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toThrow(/fetch failed/);
+    expect((await repository.getOrder("ifood", id))!.dispute?.response?.state).toBe("uncertain");
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("evento ilegível com pedido não se perde: entra no histórico do pedido e vira pendência", async () => {
+    const { sandbox, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.pushRawEvent({ id: "ev-ruim", orderId: id, merchantId: sandbox.merchantId, createdAt: new Date(Date.now() + 1_000).toISOString() });
+    const [report] = await inbox.runCycle();
+    expect(report).toMatchObject({ acknowledged: 1, deferred: 0, discarded: [] });
+    expect(await repository.hasEvent("ifood", "ev-ruim")).toBe(true);
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record.needsReview).toBe(true);
+    expect(record.reviewReasons.join(" ")).toMatch(/não deu para ler/);
+  });
+
+  it("evento ilegível de pedido que o PDV não conhece: busca o pedido; se o detalhe falha, fica sem ack", async () => {
+    const { sandbox, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    // O PLC some (ack perdido no iFood) e chega só um evento ilegível do pedido.
+    sandbox.pushRawEvent({ id: "ev-ruim-2", orderId: id, merchantId: sandbox.merchantId, code: 42 });
+    sandbox.failNext(`/orders/${id}`, 503);
+    const [first] = await inbox.runCycle();
+    expect(first!.deferred).toBeGreaterThan(0);
+    expect(await repository.getOrder("ifood", id)).toBeNull();
+    await inbox.runCycle();
+    expect(await repository.getOrder("ifood", id)).not.toBeNull();
+    expect(await repository.hasEvent("ifood", "ev-ruim-2")).toBe(true);
+  });
+
+  it("evento ilegível sem pedido: confirmado e listado para o log", async () => {
+    const { sandbox, inbox } = setup();
+    sandbox.pushRawEvent({ id: "ev-sem-pedido", merchantId: sandbox.merchantId, code: "ZZZ" });
+    const [report] = await inbox.runCycle();
+    expect(report).toMatchObject({ acknowledged: 1, discarded: ["ev-sem-pedido (ZZZ)"] });
+  });
+
   it("negociação vencida ou proposta de outra negociação não chegam ao iFood", async () => {
     let clock = new Date("2026-11-14T15:00:00.000Z");
     const { sandbox, api, inbox } = setup({ now: () => clock });
