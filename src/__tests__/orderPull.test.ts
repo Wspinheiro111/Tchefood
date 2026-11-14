@@ -266,3 +266,16 @@ describe('moveRejectedOrderToTableOrder (mesa ocupada por outra conta)', () => {
     expect(st().tables.find((t) => t.id === free.id)!.current_order_id).toBe(O2);
   });
 });
+
+describe('onlyHeldLeft (contas descem com a fila só segurada atrás de recusa)', () => {
+  it('só eventos de registro recusado: segurados; um evento livre: não', async () => {
+    const { onlyHeldLeft } = await import('../lib/sync/supabaseSync');
+    const rejected = ev('orders', O1, {}, { op: 'INSERT' });
+    const child = ev('order_items', 'i1', { order_id: O1 }, { op: 'INSERT' });
+    const table = ev('dining_tables', T1, { current_order_id: O1 });
+    expect(onlyHeldLeft([child, table], [rejected])).toBe(true);
+    expect(onlyHeldLeft([child, ev('orders', O2)], [rejected])).toBe(false);
+    expect(onlyHeldLeft([child], [])).toBe(false);
+    expect(onlyHeldLeft([], [])).toBe(true);
+  });
+});

@@ -3678,8 +3678,12 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       // Os itens e a mesa de A esperam atrás da recusa: nada subiu para a conta de B.
       expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${x}'`)).toBe('1');
       expect(sql(`SELECT current_order_id FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(x);
-      // A leitura não apaga a conta de A (pendente) e traz a conta de B.
-      ok(await pullA());
+      // A rodada do laço continua lendo as contas com a fila só segurada atrás da recusa
+      // (Codex no PR #54): a conta de B chega, e a de A (pendente) não é apagada.
+      expect(st().outbox.length).toBeGreaterThan(0);
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null } });
+      await syncOnce(fetchA());
+      expect(st().pullStatus.last_orders_pull_at).not.toBeNull();
       expect(st().tables.find((t) => t.id === mesa.id)!.current_order_id).toBe(y.id);
       expect(st().orders.some((o) => o.id === x)).toBe(true);
       // O gerente passa os itens para a conta da mesa.
@@ -3694,6 +3698,42 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       ok(await pullA());
       expect(st().tables.find((t) => t.id === mesa.id)).toMatchObject({ status: 'OCCUPIED', current_order_id: x });
       expect(st().orders.find((o) => o.id === x)!.total_amount).toBe(after);
+    });
+
+    it('duas contas sobem antes da atualização da mesa de cada aparelho: a primeira já ocupa a mesa e a segunda é recusada (Codex no PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(47);
+      await expectSynced('mesa 47');
+      const newOrder = (id: string) => ({
+        id, tenant_id: TENANT, table_id: mesa.id, opened_by_user_id: cashierId(), status: 'OPEN', customer_count: 1, customer_cpf: null,
+        charge_service_fee: true, service_fee_pct: 10, discount_amount: 0, opened_at: new Date().toISOString(), closed_at: null,
+      });
+      const first = crypto.randomUUID();
+      const second = crypto.randomUUID();
+      expect((await rawB('POST', 'orders', newOrder(first))).status).toBeLessThan(300);
+      expect(sql(`SELECT status || ' ' || current_order_id FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(`OCCUPIED ${first}`);
+      expect((await rawB('POST', 'orders', newOrder(second))).body).toMatch(/TCHEFOOD_MESA_OCUPADA/);
+      expect(sql(`SELECT count(*) FROM orders WHERE id = '${second}'`)).toBe('0');
+      // A atualização da mesa do primeiro aparelho chega depois e só confirma; a do segundo não toma a mesa.
+      expect((await rawB('PATCH', `dining_tables?id=eq.${mesa.id}`, { status: 'OCCUPIED', current_order_id: first })).status).toBeLessThan(300);
+      expect((await rawB('PATCH', `dining_tables?id=eq.${mesa.id}`, { status: 'OCCUPIED', current_order_id: second })).status).toBeLessThan(300);
+      expect(sql(`SELECT current_order_id FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(first);
+      // Duas transações ao mesmo tempo: uma só conta entra.
+      const mesa2 = tableNo(48);
+      await expectSynced('mesa 48');
+      const a = crypto.randomUUID();
+      const b = crypto.randomUUID();
+      const both = await Promise.all([a, b].map((id) => rawB('POST', 'orders', { ...newOrder(id), table_id: mesa2.id })));
+      expect(both.filter((r) => r.status < 300)).toHaveLength(1);
+      expect(sql(`SELECT count(*) FROM orders WHERE id IN ('${a}', '${b}')`)).toBe('1');
+      expect(sql(`SELECT current_order_id FROM dining_tables WHERE id = '${mesa2.id}'`)).toBe(both[0]!.status < 300 ? a : b);
+      // Mesa técnica (balcão) continua aceitando várias contas.
+      const counter = st().tables.find((t) => t.kind === 'COUNTER')!;
+      for (const id of [crypto.randomUUID(), crypto.randomUUID()]) {
+        const r = await rawB('POST', 'orders', { ...newOrder(id), table_id: counter.id });
+        expect(r.status, r.body).toBeLessThan(300);
+      }
+      expect(sql(`SELECT current_order_id IS NULL FROM dining_tables WHERE id = '${counter.id}'`)).toBe('t');
     });
 
     it('evento velho de mesa não libera mesa com conta aberta nem a aponta para conta encerrada', async () => {

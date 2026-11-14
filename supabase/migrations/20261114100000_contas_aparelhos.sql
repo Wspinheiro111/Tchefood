@@ -14,7 +14,10 @@
 --     Roda com o papel de quem chama (a RLS da loja vale) e só devolve a loja do token.
 --  2. Duas contas na mesma mesa (dois aparelhos abriram a mesma mesa antes de um ver o
 --     outro): a segunda conta é recusada (TCHEFOOD_MESA_OCUPADA). O aparelho dela passa
---     os itens para a conta que ficou na mesa (Retaguarda › Nuvem › recusados).
+--     os itens para a conta que ficou na mesa (Retaguarda › Nuvem › recusados). A conta
+--     aceita já ocupa a mesa na mesma transação (a mesa fica travada até o fim dela):
+--     mesmo que as duas contas subam antes da atualização da mesa de cada aparelho, a
+--     segunda vê a primeira e é recusada.
 --  3. Mesa com conta aberta não é liberada nem apontada para outra conta por um evento
 --     velho da fila de outro aparelho: a ocupação fica como está e o resto da linha
 --     (cadastro) passa. Do mesmo jeito, uma mesa não volta a apontar para uma conta já
@@ -86,8 +89,10 @@ BEGIN
     IF EXISTS (SELECT 1 FROM orders WHERE id = NEW.id) THEN
         RETURN NEW;
     END IF;
+    -- A trava da mesa vale até o fim da transação: duas contas novas na mesma mesa passam
+    -- aqui uma de cada vez, e a segunda já vê a primeira ocupando a mesa (gatilho abaixo).
     SELECT * INTO v_table FROM dining_tables WHERE id = NEW.table_id FOR UPDATE;
-    IF NOT FOUND OR v_table.current_order_id IS NULL OR v_table.current_order_id = NEW.id THEN
+    IF NOT FOUND OR v_table.kind NOT IN ('TABLE', 'CARD') OR v_table.current_order_id IS NULL OR v_table.current_order_id = NEW.id THEN
         RETURN NEW;
     END IF;
     SELECT * INTO v_holder FROM orders WHERE id = v_table.current_order_id;
@@ -102,6 +107,24 @@ $$;
 DROP TRIGGER IF EXISTS trg_orders_table_free ON orders;
 CREATE TRIGGER trg_orders_table_free BEFORE INSERT ON orders
     FOR EACH ROW EXECUTE FUNCTION tchefood_order_table_free_guard();
+
+-- A conta aberta aceita ocupa a mesa (ou o cartão) na mesma transação. A atualização da
+-- mesa que o aparelho manda logo depois chega com a mesma conta e só confirma a situação.
+CREATE OR REPLACE FUNCTION tchefood_order_reserve_table()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.status IN ('OPEN', 'PAYING') THEN
+        UPDATE dining_tables t SET status = 'OCCUPIED', current_order_id = NEW.id, updated_at = NOW()
+         WHERE t.id = NEW.table_id AND t.tenant_id = NEW.tenant_id AND t.kind IN ('TABLE', 'CARD')
+           AND (t.current_order_id IS NULL
+                OR NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = t.current_order_id AND o.status IN ('OPEN', 'PAYING')));
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_orders_reserve_table ON orders;
+CREATE TRIGGER trg_orders_reserve_table AFTER INSERT ON orders
+    FOR EACH ROW EXECUTE FUNCTION tchefood_order_reserve_table();
 
 -- -----------------------------------------------------------------------------
 -- 3. Ocupação da mesa não volta atrás por evento velho
@@ -180,6 +203,7 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_pull_orders() FROM PUBLIC, anon;
         GRANT EXECUTE ON FUNCTION tchefood_pull_orders() TO authenticated;
         REVOKE ALL ON FUNCTION tchefood_order_table_free_guard() FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_order_reserve_table() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_table_occupancy_guard() FROM PUBLIC, anon, authenticated;
     END IF;
 END $$;

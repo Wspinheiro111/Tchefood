@@ -6,7 +6,7 @@
  */
 import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
-import { flushOutbox, needsRefresh, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
+import { flushOutbox, needsRefresh, onlyHeldLeft, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
 import { fetchCloudOrders, missingCatalog } from './orderPull';
 
@@ -124,7 +124,16 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
       st.setSyncError(`Servidor recusou um evento${more} (HTTP ${first.status}): ${first.message}`, null);
     }
     // Fila zerou nesta rodada: lê a nuvem agora, se estava na hora.
-    if (wantsPull && useTcheStore.getState().outbox.length === 0 && !result.retryLater) await pullOnce(cfg, fetchFn, due);
+    const after = useTcheStore.getState();
+    if (wantsPull && after.outbox.length === 0 && !result.retryLater) await pullOnce(cfg, fetchFn, due);
+    // Sobrou só o que está segurado atrás de um recusado: as contas continuam descendo (a
+    // junção deixa como está a conta com evento pendente). Sem isso, a conta que ficou na
+    // mesa nunca chegaria para resolver a recusa de mesa ocupada (Codex no PR #54) e nenhuma
+    // conta de outro aparelho desceria enquanto houvesse uma recusa.
+    else if (due.orders && !result.retryLater && after.outbox.length > 0
+      && onlyHeldLeft(after.outbox, (after.syncRejected ?? []).map((r) => r.event))) {
+      await pullOnce(cfg, fetchFn, { catalog: false, orders: true });
+    }
   } finally {
     running = false;
   }
