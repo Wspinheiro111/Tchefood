@@ -431,6 +431,20 @@ const STATUS_RANK: Readonly<Record<DeliveryOrderStatus, number>> = {
   cancelled: 6,
 };
 
+// Texto livre que vai ao app e fica gravado (autorização do gerente, resposta reservada): aparado, cortado e sem
+// espaço no fim depois do corte. O corte anda por caractere (code point), nunca no meio de um emoji: metade de um
+// par UTF-16 o jsonb do Postgres recusa. O limite conta unidades UTF-16 (String.length), como o sandbox confere o
+// limite de 250 do iFood: um emoji que não cabe inteiro sai todo. Aplicado ao próprio resultado devolve o mesmo
+// texto, então quem repete o corte antes de enviar manda exatamente o que foi gravado.
+export function clipDeliveryText(value: string, max: number): string {
+  let clipped = "";
+  for (const char of value.trim()) {
+    if (clipped.length + char.length > max) break;
+    clipped += char;
+  }
+  return clipped.trimEnd();
+}
+
 export function mergeDeliveryStatus(current: DeliveryOrderStatus, incoming: DeliveryOrderStatus): DeliveryOrderStatus {
   if (incoming === "unknown" || current === "cancelled") return current;
   return STATUS_RANK[incoming] > STATUS_RANK[current] ? incoming : current;

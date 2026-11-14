@@ -2,6 +2,7 @@ import {
   DELIVERY_CHANNEL_CATALOG,
   DeliveryMarketplaceError,
   allowedDeliveryActions,
+  clipDeliveryText,
   mergeDeliveryStatus,
   type DeliveryCancellationReason,
   type DeliveryChannelKey,
@@ -71,8 +72,10 @@ export type DeliveryDisputeResponse = {
 //  1. a conferência do gerente no Portal do Parceiro (confirmUncertainRetry), porque nada na API prova que a
 //     primeira chamada não foi aplicada: o detalhe do pedido do iFood (GET /orders/{id}) não traz status nem
 //     cancelamento em análise, e a doc não diz o que o iFood faz com um requestCancellation repetido;
-//  2. uma consulta ao detalhe do pedido no app: se ele já mostra o pedido cancelado, grava e não pede de novo; se a
-//     consulta falha, continua bloqueado.
+//  2. uma consulta ao detalhe do pedido no app: se a consulta falha, continua bloqueado; se ele mostra o pedido
+//     cancelado, grava e não pede de novo. Com o iFood esse segundo ramo nunca roda: mapIfoodOrder sempre devolve
+//     status "placed" (o detalhe não traz status). Ele fica para outro app que informe status no detalhe; no iFood a
+//     única proteção contra o pedido repetido é a conferência do gerente (item 1).
 // O pedido repetido fica marcado para conferência (UNCERTAIN_CANCELLATION_RETRIED).
 export type DeliveryCancellationRequest = {
   state: "sending" | "sent" | "uncertain";
@@ -887,7 +890,8 @@ function resolveDisputeDecision(
     const reason = decision.reason?.trim();
     if (!reason) throw invalid(`Escolha o motivo do aceite: ${reasons.join(", ")}.`);
     if (!reasons.includes(reason)) throw invalid("Motivo do aceite não está entre os aceitos pelo app para esta negociação.");
-    const detailReason = decision.detailReason?.trim().slice(0, 250);
+    // Mesmo corte do envio (clipDeliveryText): a resposta reservada e a autorização gravam o texto que vai ao app.
+    const detailReason = decision.detailReason === undefined ? undefined : clipDeliveryText(decision.detailReason, 250);
     return { kind: "accept", reason, ...(detailReason ? { detailReason } : {}) };
   }
   if (decision.kind === "reject") {
@@ -895,7 +899,9 @@ function resolveDisputeDecision(
     if (dispute.handshakeType === "DELAY") {
       throw new DeliveryMarketplaceError(channel, "conflict", "Negociação de atraso não pode ser recusada: aceite ou proponha um novo prazo.");
     }
-    return decision;
+    const reason = typeof decision.reason === "string" ? clipDeliveryText(decision.reason, 250) : "";
+    if (!reason) throw invalid("Informe o motivo da recusa.");
+    return { kind: "reject", reason };
   }
   const alternative = dispute.alternatives.find((candidate) => candidate.id === decision.alternativeId);
   if (!alternative) throw invalid("Proposta não pertence a esta negociação.");

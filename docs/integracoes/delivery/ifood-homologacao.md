@@ -46,7 +46,8 @@ evento do app chegar. A reserva de cancelamento sem confirmação (chamada em an
 `confirmUncertainRetry: true` (o gerente conferiu no Portal do Parceiro que o pedido não está cancelado nem com
 cancelamento em análise; a decisão fica em `audit_logs.metadata.details`). Sem ela: 409. Com ela, o servidor consulta o
 pedido no iFood (`GET /orders/{id}`): consulta falhou, 409 e segue bloqueado ("confira no Portal do Parceiro"); pedido já
-cancelado, grava e recusa; senão pede de novo uma vez e marca o pedido para conferência ("o pedido de cancelamento
+cancelado no detalhe, grava e recusa (com o iFood esse ramo nunca roda: o mapeamento do detalhe sempre devolve `placed`,
+então no iFood a única proteção contra o pedido repetido é o `confirmUncertainRetry` do gerente); senão pede de novo uma vez e marca o pedido para conferência ("o pedido de cancelamento
 anterior ficou sem confirmação e foi repetido"). Por que a conferência humana: a doc oficial não dá prova de que a
 primeira chamada não foi aplicada. O detalhe do pedido não tem status nem cancelamento em análise
 (https://developer.ifood.com.br/en-US/docs/guides/modules/order/details/; o mapeamento daqui sempre lê `placed`), então a
@@ -199,7 +200,12 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
 
 - `server/delivery/deliverySaleGuard.ts` diz se um pedido do app pode virar venda, produção (cozinha/KDS) ou NFC-e.
   `deliverySaleBlockers(registro)` devolve os motivos que impedem (lista vazia = pode): pedido de teste do app,
-  pedido gravado sem o detalhe (`detailPending`), pedido cancelado, cancelamento em análise no app.
+  pedido gravado sem o detalhe (`detailPending`), pedido cancelado, cancelamento em análise no app, cancelamento pedido
+  pela loja (`cancellationRequest` em qualquer estado: em andamento e sem confirmação podem já ter chegado ao iFood) e
+  negociação aberta (`dispute`: pode virar cancelamento ou mudar o valor). A negociação só vira aviso, em vez de
+  bloqueio, quando a recusa da loja foi confirmada pelo iFood (falta só o fechamento) ou quando é `AFTER_DELIVERY` de
+  pedido concluído (a comida foi entregue; muda o valor a receber, não se houve venda). Aceite ou proposta confirmados
+  e resposta dada por fora (Portal) continuam bloqueando.
   `needsReview` sozinho não bloqueia (junta avisos de naturezas diferentes; travar por ele pararia pedido bom): sai
   como aviso em `deliverySaleWarnings(registro)`, para a tela mostrar e pedir conferência. Ainda não está ligada em
   nada: a tela do item 5 chama a guarda antes de lançar a venda, mandar para a produção ou emitir a nota.

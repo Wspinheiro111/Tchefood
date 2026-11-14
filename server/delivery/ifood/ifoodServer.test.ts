@@ -571,6 +571,66 @@ describe("servidor do iFood: alçada de gerente", () => {
     expect(sent[1]!.reason).toBe("Item indisponível");
   });
 
+  // Rodada 3 do GPT: o texto era cortado em 250 unidades UTF-16 e aparado de novo antes de ir ao iFood, então o
+  // registro podia terminar em espaço (diferente do enviado) ou num emoji partido (surrogate solto, que o jsonb do
+  // Postgres recusa). O corte agora é por caractere (code point), sem passar de 250 unidades UTF-16 (o limite que o
+  // sandbox confere), e o espaço final sai depois do corte.
+  it("negociação e cancelamento: o texto gravado na autorização é exatamente o que o iFood recebe (corte por caractere)", async () => {
+    const manager = fakeApproval();
+    const sandbox = new IfoodSandbox(undefined, undefined, () => NOW);
+    const sent: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const fetchImpl: typeof sandbox.fetch = async (input, init = {}) => {
+      const path = String(input);
+      if (/\/(reject|accept|requestCancellation)$/.test(path)) sent.push({ path, body: JSON.parse(String(init.body)) as Record<string, unknown> });
+      return sandbox.fetch(input, init);
+    };
+    const api = new IfoodMerchantApi({ credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret }, baseUrl: sandbox.baseUrl, fetchImpl });
+    const inbox = new DeliveryInbox({ adapters: [api], repository: new InMemoryDeliveryRepository(), now: () => NOW });
+    const poller = new IfoodPoller({ api, inbox, merchants: { activeMerchants: async () => [{ merchantExternalId: sandbox.merchantId }] }, now: () => NOW.getTime() });
+    const handle = createIfoodApiHandler({ inbox, api, authorizer: { canAccessOrder: async () => true, canAccessMerchant: async () => true }, approval: manager.approval, now: () => NOW });
+    const call = (path: string, body: unknown) => handle({ method: "POST", path, headers: { authorization: "Bearer loja-a" }, body: JSON.stringify(body) });
+    const spaced = "a".repeat(249) + " b";
+    const emoji = "a".repeat(249) + "😀" + "resto"; // emoji nas unidades 250-251: não cabe, sai inteiro
+    const fits = "a".repeat(248) + "😀" + "resto"; // emoji nas unidades 249-250: cabe inteiro
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+    // Recusa: corte cai no espaço (249 "a" + " b") e corte depois de um emoji na posição 250.
+    for (const [reason, expected] of [[spaced, "a".repeat(249)], [emoji, "a".repeat(249)], [fits, "a".repeat(248) + "😀"]] as const) {
+      const id = sandbox.placeOrder({ items: ITEMS });
+      await poller.runOnce();
+      const disputeId = sandbox.openDispute(id);
+      await poller.runOnce();
+      expect((await call(`/ifood/orders/${id}/dispute`, { kind: "reject", reason, disputeId, authorization: auth() })).status).toBe(200);
+      const body = sent.at(-1)!.body;
+      expect(sent.at(-1)!.path).toMatch(/\/reject$/);
+      expect(body).toEqual({ reason: expected });
+      expect(manager.authorized.at(-1)?.details).toEqual({ disputeId, kind: "reject", reason: body.reason });
+      expect(loneSurrogate.test(JSON.stringify(manager.authorized.at(-1)?.details))).toBe(false);
+    }
+
+    // Aceite com texto adicional (detailReason): mesmo corte.
+    for (const [detailReason, expected] of [[spaced, "a".repeat(249)], [emoji, "a".repeat(249)], [fits, "a".repeat(248) + "😀"]] as const) {
+      const id = sandbox.placeOrder({ items: ITEMS });
+      await poller.runOnce();
+      const disputeId = sandbox.openDispute(id, { acceptCancellationReasons: ["HIGH_STORE_DEMAND"] });
+      await poller.runOnce();
+      const accepted = await call(`/ifood/orders/${id}/dispute`, { kind: "accept", reason: "HIGH_STORE_DEMAND", detailReason, disputeId, authorization: auth() });
+      expect(accepted.status).toBe(200);
+      const body = sent.at(-1)!.body;
+      expect(sent.at(-1)!.path).toMatch(/\/accept$/);
+      expect(body).toEqual({ reason: "HIGH_STORE_DEMAND", detailReason: expected });
+      expect(manager.authorized.at(-1)?.details).toEqual({ disputeId, kind: "accept", reason: "HIGH_STORE_DEMAND", detailReason: body.detailReason });
+    }
+
+    // Cancelamento com emoji na posição 250 do texto adicional (não cabe inteiro: sai).
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    expect((await call(`/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", details: emoji, authorization: auth() })).status).toBe(200);
+    const body = sent.at(-1)!.body;
+    expect(body).toEqual({ cancellationCode: "503", reason: "a".repeat(249) });
+    expect(manager.authorized.at(-1)?.details).toEqual({ code: "503", reason: body.reason });
+  });
+
   it("iFood aceitou e o banco falhou depois: resposta diz que foi enviado (não 'tente de novo') e o resultado fica como enviado", async () => {
     const { sandbox, poller, call, manager, inbox } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });

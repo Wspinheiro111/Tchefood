@@ -1,4 +1,5 @@
 import {
+  clipDeliveryText,
   DeliveryMarketplaceError,
   type DeliveryAddress,
   type DeliveryCancellationReason,
@@ -214,13 +215,13 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
     const id = this.safeId(disputeId, "negociação");
     if (decision.kind === "accept") {
       const reason = decision.reason?.trim();
-      const detailReason = decision.detailReason?.trim().slice(0, 250);
+      const detailReason = decision.detailReason === undefined ? undefined : clipDeliveryText(decision.detailReason, 250);
       const json = reason ? { reason, ...(detailReason ? { detailReason } : {}) } : undefined;
       await this.request("POST", IFOOD_PATHS.disputeAccept(id), json ? { json } : {});
     } else if (decision.kind === "reject") {
-      const reason = decision.reason.trim();
+      const reason = clipDeliveryText(decision.reason, 250);
       if (!reason) throw new DeliveryMarketplaceError("ifood", "invalid_request", "Informe o motivo da recusa.");
-      await this.request("POST", IFOOD_PATHS.disputeReject(id), { json: { reason: reason.slice(0, 250) } });
+      await this.request("POST", IFOOD_PATHS.disputeReject(id), { json: { reason } });
     } else {
       const alternativeId = this.safeId(decision.alternativeId, "proposta");
       await this.request("POST", IFOOD_PATHS.disputeAlternative(id, alternativeId), { json: ifoodAlternativeBody(decision) });
@@ -428,10 +429,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 // Texto do campo reason de requestCancellation: o texto adicional, se houver, senão a descrição do motivo do iFood;
-// aparado e limitado a 250 caracteres. Aplicado ao próprio resultado devolve o mesmo texto: o servidor grava este
+// aparado e limitado a 250 caracteres (clipDeliveryText: corte por caractere, sem espaço no fim). Aplicado ao próprio resultado devolve o mesmo texto: o servidor grava este
 // valor na autorização do gerente e o passa como details, e é ele que vai ao iFood.
 export function ifoodCancellationText(reason: DeliveryCancellationReason, details?: string): string {
-  return (details?.trim() || reason.description.trim()).slice(0, 250).trimEnd();
+  return clipDeliveryText(details?.trim() || reason.description, 250);
 }
 
 function optionalString(value: unknown): string | null {

@@ -1,5 +1,6 @@
 import { DEFINITE_FAILURES, DeliveryConcurrencyError, DeliveryInbox, DeliverySentNotSavedError, type DeliveryCycleReport, type DeliveryOrderRecord } from "../deliveryInbox";
 import {
+  clipDeliveryText,
   DeliveryMarketplaceError,
   type DeliveryDisputeDecision,
   type DeliveryOrderAction,
@@ -521,10 +522,12 @@ function parseBody(raw: string): Record<string, unknown> {
   throw new BadRequest("JSON inválido.");
 }
 
+// Texto do corpo: aparado e cortado como o que vai ao iFood (clipDeliveryText, por caractere e sem espaço no fim),
+// para que o registro do gerente leve exatamente o texto enviado.
 function text(value: unknown, max: number): string | null {
   if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed ? trimmed.slice(0, max) : null;
+  const clipped = clipDeliveryText(value, max);
+  return clipped || null;
 }
 
 const MANAGER_FIELDS_ERROR = "Ação de gerente: informe o PIN de gerente, o operador, o motivo (5 caracteres ou mais) e o id da tentativa.";
