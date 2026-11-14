@@ -31,6 +31,7 @@
 --  5. Item novo não entra em conta já encerrada em outro aparelho (TCHEFOOD_CONTA_ENCERRADA):
 --     o aparelho passa os itens para uma conta nova da mesa.
 --  6. Item pago não volta a "não pago" por uma atualização velha de outro aparelho.
+--  7. Item na cozinha não volta atrás (pronto/entregue) por uma atualização velha.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -263,6 +264,35 @@ DROP TRIGGER IF EXISTS trg_order_items_paid_stays ON order_items;
 CREATE TRIGGER trg_order_items_paid_stays BEFORE UPDATE OF is_paid ON order_items
     FOR EACH ROW EXECUTE FUNCTION tchefood_item_paid_stays();
 
+-- -----------------------------------------------------------------------------
+-- 7. Item na cozinha não volta atrás
+-- -----------------------------------------------------------------------------
+-- O pagamento (e outras atualizações) de um aparelho manda o item inteiro, com a situação
+-- da cópia dele. Se a cozinha de outro aparelho já marcou o item pronto ou entregue, a
+-- cópia velha (PENDING) devolveria o item à fila da cozinha (Codex no PR #54). O app só
+-- avança o item (PENDING → PREPARING → READY → DELIVERED), então a situação e a hora de
+-- pronto mais adiantadas ficam, e o resto da linha passa: a atualização não é recusada.
+-- Cancelamento (CANCELED) continua com as travas de schema.sql.
+CREATE OR REPLACE FUNCTION tchefood_item_progress_stays()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    v_old INT := array_position(ARRAY['PENDING', 'PREPARING', 'READY', 'DELIVERED'], OLD.status::text);
+    v_new INT := array_position(ARRAY['PENDING', 'PREPARING', 'READY', 'DELIVERED'], NEW.status::text);
+BEGIN
+    IF v_old IS NOT NULL AND v_new IS NOT NULL AND v_new < v_old THEN
+        RAISE NOTICE 'TCHEFOOD_ITEM_COZINHA: o item % já está % e não volta para % (atualização velha).', OLD.id, OLD.status, NEW.status;
+        NEW.status := OLD.status;
+    END IF;
+    IF OLD.prepared_at IS NOT NULL AND NEW.prepared_at IS NULL THEN
+        NEW.prepared_at := OLD.prepared_at;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_order_items_progress_stays ON order_items;
+CREATE TRIGGER trg_order_items_progress_stays BEFORE UPDATE OF status, prepared_at ON order_items
+    FOR EACH ROW EXECUTE FUNCTION tchefood_item_progress_stays();
+
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
@@ -274,5 +304,6 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_table_occupancy_guard() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_item_order_open_guard() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_item_paid_stays() FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_item_progress_stays() FROM PUBLIC, anon, authenticated;
     END IF;
 END $$;

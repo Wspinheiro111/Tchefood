@@ -4047,6 +4047,29 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().orderItems.find((i) => i.id === item.id)!.is_paid).toBe(true);
     });
 
+    it('pagamento em A com a cópia velha do item não devolve à cozinha o item que B já entregou (Codex no PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(52);
+      await expectSynced('mesa 52');
+      const order = ok(st().openTable(mesa.id, 1, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await expectSynced('conta 52');
+      const item = st().orderItems.find((i) => i.order_id === order.id)!;
+      expect(item.status).toBe('PENDING');
+      // A cozinha de B marca pronto e entregue; A ainda tem o item PENDING e recebe a conta.
+      const ready = await rawB('PATCH', `order_items?id=eq.${item.id}`, { status: 'READY', prepared_at: new Date().toISOString() });
+      expect(ready.status, ready.body).toBeLessThan(300);
+      expect((await rawB('PATCH', `order_items?id=eq.${item.id}`, { status: 'DELIVERED' })).status).toBeLessThan(300);
+      payCash(order.id);
+      await expectSynced('pagamento de A');
+      expect(sql(`SELECT status || ' ' || (prepared_at IS NOT NULL) || ' ' || is_paid FROM order_items WHERE id = '${item.id}'`)).toBe('DELIVERED true true');
+      expect(sql(`SELECT status FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED');
+      ok(await pullA());
+      expect(st().orderItems.find((i) => i.id === item.id)!.status).toBe('DELIVERED');
+    });
+
     it('a rodada de sincronização lê as contas a cada 10 s, com a fila vazia', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(46);
