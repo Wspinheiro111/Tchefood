@@ -4,6 +4,7 @@
  * troca de plano com o preço do plano, conta do aparelho, mês da cobrança, cancelar sem
  * clique duplo, nova loja com CNPJ alfanumérico e telefone, e o host da senha no login.
  */
+import { StrictMode } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AdminClient, Charge, Plan, StoreDetail as Detail, Subscription } from '../lib/api';
@@ -11,6 +12,7 @@ import StoreDetail from '../components/StoreDetail';
 import NewStoreForm from '../components/NewStoreForm';
 import Login from '../components/Login';
 import Overview from '../components/Overview';
+import App from '../App';
 
 afterEach(() => {
   cleanup();
@@ -189,5 +191,27 @@ describe('login e visão geral', () => {
     });
     render(<Overview client={fakeClient({ overview })} today="2026-11-14" irPara={() => {}} />);
     expect(await screen.findByText('3 com teste vencido · 1 terminam em até 7 dias')).toBeTruthy();
+  });
+});
+
+describe('painel com sessão guardada', () => {
+  it('no StrictMode (efeito refeito) o cliente continua valendo e a visão geral carrega', async () => {
+    sessionStorage.setItem('tchefood-admin-session', JSON.stringify({ accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() + 3_600_000, email: 'will@x.com' }));
+    localStorage.setItem('tchefood-admin-config', JSON.stringify({ url: 'https://p.supabase.co', anonKey: 'k' }));
+    const fetchMock = vi.fn(async (url: string) => {
+      const fn = String(url).split('/rpc/')[1];
+      const body = fn === 'tchefood_admin_me' ? { user_id: 'u', email: 'will@x.com', name: 'Will', today: '2026-11-14' }
+        : fn === 'tchefood_admin_overview' ? { today: '2026-11-14', stores: { trial: 0, active: 1, suspended: 0, cancelled: 0, without_subscription: 0 }, mrr: 199, open_amount: 0, open_count: 0, overdue_amount: 0, overdue_count: 0, received_this_month: 0, trials_ending_7d: 0, trials_expired: 0 }
+        : null;
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<StrictMode><App /></StrictMode>);
+    await waitFor(() => expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('tchefood_admin_overview'))).toBe(true));
+    expect(screen.queryByText(/Sessão encerrada/)).toBeNull();
+    expect(sessionStorage.getItem('tchefood-admin-session')).not.toBeNull();
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+    localStorage.clear();
   });
 });

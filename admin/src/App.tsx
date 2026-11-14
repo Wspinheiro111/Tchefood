@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { LogOut } from 'lucide-react';
 import iconUrl from './assets/icon.png';
 import type { AdminClient, AdminConfig, Me, Session } from './lib/api';
-import { loadConfig, loadSession, saveSession, sessionClient } from './lib/session';
+import { loadConfig, loadSession, saveSession, sessionClient, type SessionClient } from './lib/session';
 import Login from './components/Login';
 import Overview from './components/Overview';
 import Stores from './components/Stores';
@@ -17,8 +17,14 @@ export default function App() {
   const [session, setSession] = useState<Session | null>(loadSession);
 
   const client = useMemo(() => (session ? sessionClient(cfg, session, () => setSession(null)) : null), [cfg, session]);
-  // Cliente trocado ou descartado: a renovação que ainda estiver no ar não grava a sessão.
-  useEffect(() => () => client?.dispose(), [client]);
+  // Cliente trocado: o anterior é descartado (a renovação que ainda estiver no ar não grava a
+  // sessão). Descarta só na troca, não na limpeza do efeito: o StrictMode do React refaz o
+  // efeito com o mesmo cliente, que tem de continuar valendo.
+  const previous = useRef<SessionClient | null>(null);
+  useEffect(() => {
+    if (previous.current && previous.current !== client) previous.current.dispose();
+    previous.current = client;
+  }, [client]);
 
   if (!session || !client) {
     return (
