@@ -11,7 +11,7 @@
 --
 --  1. tchefood_pull_orders(): uma foto só (um SELECT) das contas em aberto, das
 --     encerradas nas últimas 24 h, das que o aparelho ainda tem em aberto (de qualquer
---     data), dos itens e pagamentos delas e da ocupação das mesas.
+--     data), dos itens, pagamentos e entregas próprias delas e da ocupação das mesas.
 --     Roda com o papel de quem chama (a RLS da loja vale) e só devolve a loja do token.
 --  2. Duas contas na mesma mesa (dois aparelhos abriram a mesma mesa antes de um ver o
 --     outro): a segunda conta é recusada (TCHEFOOD_MESA_OCUPADA). O aparelho dela passa
@@ -33,17 +33,23 @@
 --     o aparelho passa os itens para uma conta nova da mesa.
 --  6. Item pago não volta a "não pago" por uma atualização velha de outro aparelho.
 --  7. Item na cozinha não volta atrás (pronto/entregue) por uma atualização velha.
+--  8. Os 10% retirados com PIN de gerente em outro aparelho não voltam por uma cópia velha
+--     da conta: só a reativação registrada (SERVICE_FEE_RESTORED) traz a taxa de volta.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
 -- 1. Leitura das contas e da ocupação das mesas
 -- -----------------------------------------------------------------------------
--- As colunas são as dos tipos em src/types.ts (Order, OrderItem, Payment): nada além
+-- As colunas são as dos tipos em src/types.ts (Order, OrderItem, Payment, OwnDelivery): nada além
 -- delas desce, para o aparelho não reenviar numa atualização uma coluna que não conhece.
 --
 -- p_order_ids: contas que o aparelho tem em aberto. Elas descem como estão no banco mesmo
 -- encerradas há mais de 24 h: um aparelho que ficou mais de um dia sem internet recebe o
 -- fechamento feito em outro aparelho e libera a mesa (Codex no PR #54). Até 500 ids.
+--
+-- Entrega própria (own_deliveries) desce com a conta: a cozinha de outro aparelho só
+-- prepara antes do pagamento o pedido de entrega paga na entrega, e sabe disso pela
+-- entrega (Codex no PR #54).
 DROP FUNCTION IF EXISTS tchefood_pull_orders();
 CREATE OR REPLACE FUNCTION tchefood_pull_orders(p_order_ids JSONB DEFAULT '[]'::jsonb)
 RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = public AS $$
@@ -72,6 +78,12 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = public AS $
                pa.idempotency_key, pa.created_at
           FROM payments pa JOIN o ON o.id = pa.order_id
          WHERE pa.tenant_id = tchefood_tenant()
+    ), d AS (
+        SELECT od.id, od.tenant_id, od.order_id, od.customer_name, od.customer_phone, od.address, od.reference,
+               od.zone_id, od.zone_name, od.delivery_fee, od.pay_on_delivery, od.change_for, od.status, od.courier_id,
+               od.courier_fee, od.out_at, od.delivered_at, od.settlement_id, od.created_at
+          FROM own_deliveries od JOIN o ON o.id = od.order_id
+         WHERE od.tenant_id = tchefood_tenant()
     ), t AS (
         SELECT id, status, current_order_id, updated_at
           FROM dining_tables
@@ -83,6 +95,7 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = public AS $
         'orders', COALESCE((SELECT jsonb_agg(to_jsonb(o) ORDER BY o.opened_at, o.id) FROM o), '[]'::jsonb),
         'order_items', COALESCE((SELECT jsonb_agg(to_jsonb(i) ORDER BY i.created_at, i.id) FROM i), '[]'::jsonb),
         'payments', COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.created_at, p.id) FROM p), '[]'::jsonb),
+        'own_deliveries', COALESCE((SELECT jsonb_agg(to_jsonb(d) ORDER BY d.created_at, d.id) FROM d), '[]'::jsonb),
         'tables', COALESCE((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id) FROM t), '[]'::jsonb));
 $$;
 
@@ -294,6 +307,40 @@ DROP TRIGGER IF EXISTS trg_order_items_progress_stays ON order_items;
 CREATE TRIGGER trg_order_items_progress_stays BEFORE UPDATE OF status, prepared_at ON order_items
     FOR EACH ROW EXECUTE FUNCTION tchefood_item_progress_stays();
 
+-- -----------------------------------------------------------------------------
+-- 8. Os 10% retirados não voltam por uma cópia velha da conta
+-- -----------------------------------------------------------------------------
+-- A atualização da conta manda a linha inteira, com o charge_service_fee da cópia do
+-- aparelho. Se A tirou os 10% com PIN de gerente e B ainda tem a cópia de antes, uma
+-- mudança qualquer em B (pessoas na mesa, bandeja) devolveria a taxa e aumentaria a conta
+-- sem ninguém pedir (Codex no PR #54). A reativação do app sempre registra
+-- SERVICE_FEE_RESTORED antes da conta (restoreServiceFee), então a taxa só volta quando o
+-- último registro de 10% da conta (ordem de gravação no servidor, server_seq, como em
+-- tchefood_require_order_audit) é essa reativação. Senão a taxa fica como está e o resto
+-- da linha passa: a atualização não é recusada. O nome com 000 roda antes de
+-- trg_orders_00_keep_discount, que confere o desconto com a taxa que vai ficar.
+CREATE OR REPLACE FUNCTION tchefood_order_fee_stays()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_last TEXT;
+BEGIN
+    IF NOT OLD.charge_service_fee AND NEW.charge_service_fee THEN
+        SELECT a.action_type INTO v_last
+          FROM audit_logs a
+         WHERE a.order_id = NEW.id AND a.action_type IN ('SERVICE_FEE_REMOVED', 'SERVICE_FEE_RESTORED')
+         ORDER BY a.server_seq DESC
+         LIMIT 1;
+        IF v_last IS DISTINCT FROM 'SERVICE_FEE_RESTORED' THEN
+            RAISE NOTICE 'TCHEFOOD_TAXA: a conta % está sem os 10%% e continua sem (atualização velha, sem reativação registrada).', OLD.id;
+            NEW.charge_service_fee := FALSE;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_orders_000_fee_stays ON orders;
+CREATE TRIGGER trg_orders_000_fee_stays BEFORE UPDATE OF charge_service_fee ON orders
+    FOR EACH ROW EXECUTE FUNCTION tchefood_order_fee_stays();
+
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
@@ -306,5 +353,6 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_item_order_open_guard() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_item_paid_stays() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_item_progress_stays() FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_order_fee_stays() FROM PUBLIC, anon, authenticated;
     END IF;
 END $$;

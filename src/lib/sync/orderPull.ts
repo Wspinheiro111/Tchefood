@@ -14,8 +14,12 @@
  *  - a conta que a nuvem não mandou (encerrada há mais de 24 h: histórico deste aparelho;
  *    ou uma conta aberta que a nuvem não tem, que continua visível em vez de sumir);
  *  - a mesa com mudança daqui pendente, ou que mostra uma conta daqui ainda pendente.
+ *
+ * A entrega própria da conta desce junto (a cozinha de outro aparelho precisa saber que o
+ * pedido é pago na entrega para preparar antes do pagamento); a entrega com mudança daqui
+ * pendente fica como está.
  */
-import type { DiningTable, Order, OrderItem, Payment, SyncEvent, UUID } from '../../types';
+import type { DiningTable, Order, OrderItem, OwnDelivery, Payment, SyncEvent, UUID } from '../../types';
 import { recordKeys, type FetchLike, type SyncConfig } from './supabaseSync';
 
 /** Ocupação da mesa como está na nuvem (o cadastro da mesa vem pela leitura dos cadastros). */
@@ -28,9 +32,11 @@ export interface CloudOrders {
   orders: Order[];
   orderItems: OrderItem[];
   payments: Payment[];
+  ownDeliveries: OwnDelivery[];
   tables: CloudTableOccupancy[];
 }
 
+const DELIVERY_STATUSES: ReadonlyArray<OwnDelivery['status']> = ['PREPARING', 'READY', 'OUT', 'DELIVERED', 'CANCELED'];
 const ORDER_STATUSES: ReadonlyArray<Order['status']> = ['OPEN', 'PAYING', 'CLOSED', 'CANCELED'];
 const TABLE_STATUSES: ReadonlyArray<DiningTable['status']> = ['FREE', 'OCCUPIED', 'WAITING_BILL', 'PAYING', 'DIRTY'];
 
@@ -157,6 +163,32 @@ function toPayment(r: Row): Payment {
   };
 }
 
+function toDelivery(r: Row): OwnDelivery {
+  const status = r.status as OwnDelivery['status'];
+  if (!DELIVERY_STATUSES.includes(status)) bad('situação de entrega desconhecida');
+  return {
+    id: str(r.id, 'own_deliveries.id'),
+    tenant_id: str(r.tenant_id, 'own_deliveries.tenant_id'),
+    order_id: str(r.order_id, 'own_deliveries.order_id'),
+    customer_name: str(r.customer_name, 'own_deliveries.customer_name'),
+    customer_phone: str(r.customer_phone, 'own_deliveries.customer_phone'),
+    address: str(r.address, 'own_deliveries.address'),
+    reference: strOrNull(r.reference),
+    zone_id: str(r.zone_id, 'own_deliveries.zone_id'),
+    zone_name: str(r.zone_name, 'own_deliveries.zone_name'),
+    delivery_fee: num(r.delivery_fee, 'own_deliveries.delivery_fee'),
+    pay_on_delivery: r.pay_on_delivery === true,
+    change_for: numOrNull(r.change_for, 'own_deliveries.change_for'),
+    status,
+    courier_id: strOrNull(r.courier_id),
+    courier_fee: numOrNull(r.courier_fee, 'own_deliveries.courier_fee'),
+    out_at: isoOrNull(r.out_at, 'own_deliveries.out_at'),
+    delivered_at: isoOrNull(r.delivered_at, 'own_deliveries.delivered_at'),
+    settlement_id: strOrNull(r.settlement_id),
+    created_at: iso(r.created_at, 'own_deliveries.created_at'),
+  };
+}
+
 function toTable(r: Row): CloudTableOccupancy {
   const status = r.status as DiningTable['status'];
   if (!TABLE_STATUSES.includes(status)) bad('situação de mesa desconhecida');
@@ -174,24 +206,29 @@ function unique(rows: ReadonlyArray<{ id: string }>, what: string): void {
  */
 export function parseCloudOrders(body: unknown, tenantId: UUID): CloudOrders {
   const b = body as Record<string, unknown> | null;
-  if (!b || typeof b !== 'object' || !Array.isArray(b.orders) || !Array.isArray(b.order_items) || !Array.isArray(b.payments) || !Array.isArray(b.tables)) {
+  if (!b || typeof b !== 'object' || !Array.isArray(b.orders) || !Array.isArray(b.order_items) || !Array.isArray(b.payments) || !Array.isArray(b.own_deliveries) || !Array.isArray(b.tables)) {
     bad('resposta incompleta');
   }
   if (b.tenant_id !== tenantId) bad('a resposta não é da loja deste aparelho');
   const orders = (b.orders as Row[]).map(toOrder);
   const orderItems = (b.order_items as Row[]).map(toItem);
   const payments = (b.payments as Row[]).map(toPayment);
+  const ownDeliveries = (b.own_deliveries as Row[]).map(toDelivery);
   const tables = (b.tables as Row[]).map(toTable);
   unique(orders, 'conta');
   unique(orderItems, 'item');
   unique(payments, 'pagamento');
+  unique(ownDeliveries, 'entrega');
   unique(tables, 'mesa');
   const orderIds = new Set(orders.map((o) => o.id));
   if (orders.some((o) => o.tenant_id !== tenantId)) bad('conta de outra loja');
   if (payments.some((p) => p.tenant_id !== tenantId)) bad('pagamento de outra loja');
   if (orderItems.some((i) => !orderIds.has(i.order_id))) bad('item de uma conta que não veio');
   if (payments.some((p) => !orderIds.has(p.order_id))) bad('pagamento de uma conta que não veio');
-  return { tenant_id: tenantId, server_now: iso(b.server_now, 'server_now'), orders, orderItems, payments, tables };
+  if (ownDeliveries.some((d) => d.tenant_id !== tenantId)) bad('entrega de outra loja');
+  if (ownDeliveries.some((d) => !orderIds.has(d.order_id))) bad('entrega de uma conta que não veio');
+  if (new Set(ownDeliveries.map((d) => d.order_id)).size !== ownDeliveries.length) bad('duas entregas na mesma conta');
+  return { tenant_id: tenantId, server_now: iso(b.server_now, 'server_now'), orders, orderItems, payments, ownDeliveries, tables };
 }
 
 /**
@@ -259,6 +296,7 @@ export interface OrderMergeResult {
   orders: Order[];
   orderItems: OrderItem[];
   payments: Payment[];
+  ownDeliveries: OwnDelivery[];
   tables: DiningTable[];
   /** Contas trocadas pela versão da nuvem (para testes e diagnóstico). */
   replaced: number;
@@ -302,13 +340,42 @@ function mergeChildren<T extends { id: UUID; order_id: UUID }>(
 }
 
 /**
+ * Entregas próprias: a da nuvem vale, menos a com mudança daqui pendente (evento na fila ou
+ * recusado). A entrega que a nuvem não mandou fica (conta antiga, ou ainda não subiu).
+ */
+function mergeDeliveries(local: readonly OwnDelivery[], cloud: readonly OwnDelivery[], pending: PendingOrderKeys): OwnDelivery[] {
+  const fromCloud = new Map(cloud.filter((c) => !pending.rows.has(`own_deliveries:${c.id}`)).map((c) => [c.id, c]));
+  // Uma entrega por conta (order_id é UNIQUE no banco): uma linha daqui de outra id para a mesma
+  // conta não fica ao lado da da nuvem, menos se ela estiver pendente.
+  const cloudOrders = new Map(cloud.map((c) => [c.order_id, c.id]));
+  const out: OwnDelivery[] = [];
+  const seen = new Set<UUID>();
+  for (const l of local) {
+    seen.add(l.id);
+    const c = fromCloud.get(l.id);
+    if (c) out.push(c);
+    else if (pending.rows.has(`own_deliveries:${l.id}`)) out.push(l);
+    else if (cloudOrders.has(l.order_id) && cloudOrders.get(l.order_id) !== l.id) continue;
+    else out.push(l);
+  }
+  for (const c of fromCloud.values()) if (!seen.has(c.id)) out.push(c);
+  return out;
+}
+
+/**
  * Junta as contas da nuvem às do aparelho. Conta sem nada pendente aqui fica igual à da
  * nuvem (conta, itens e pagamentos); conta com algo pendente fica inteira como está aqui.
  * A ocupação da mesa vem da nuvem, menos quando a mesa (ou a conta que ela mostra aqui)
  * está pendente, ou quando ela mostra aqui uma conta aberta que a nuvem não mandou.
  */
 export function mergeCloudOrders(
-  local: { orders: readonly Order[]; orderItems: readonly OrderItem[]; payments: readonly Payment[]; tables: readonly DiningTable[] },
+  local: {
+    orders: readonly Order[];
+    orderItems: readonly OrderItem[];
+    payments: readonly Payment[];
+    ownDeliveries: readonly OwnDelivery[];
+    tables: readonly DiningTable[];
+  },
   cloud: CloudOrders,
   pending: PendingOrderKeys,
 ): OrderMergeResult {
@@ -321,6 +388,7 @@ export function mergeCloudOrders(
 
   const orderItems = mergeChildren(local.orderItems, cloud.orderItems, replaced, 'order_items', pending);
   const payments = mergeChildren(local.payments, cloud.payments, replaced, 'payments', pending);
+  const ownDeliveries = mergeDeliveries(local.ownDeliveries, cloud.ownDeliveries, pending);
 
   const occupancy = new Map(cloud.tables.map((t) => [t.id, t]));
   const tables = local.tables.map((t) => {
@@ -335,7 +403,7 @@ export function mergeCloudOrders(
     return { ...t, status: c.status, current_order_id: c.current_order_id, updated_at: c.updated_at };
   });
 
-  return { orders, orderItems, payments, tables, replaced: replaced.size };
+  return { orders, orderItems, payments, ownDeliveries, tables, replaced: replaced.size };
 }
 
 /** Produto ou mesa que as contas da nuvem usam e este aparelho ainda não tem (pede a leitura dos cadastros). */

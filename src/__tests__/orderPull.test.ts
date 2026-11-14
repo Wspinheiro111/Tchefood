@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { mergeCloudOrders, missingCatalog, parseCloudOrders, pendingOrderKeys, type CloudOrders } from '../lib/sync/orderPull';
 import { useTcheStore, type CloudSession } from '../store/useTcheStore';
-import type { DiningTable, Order, OrderItem, Payment, SyncEvent } from '../types';
+import type { DiningTable, Order, OrderItem, OwnDelivery, Payment, SyncEvent } from '../types';
 
 const st = () => useTcheStore.getState();
 const TEN = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -35,7 +35,12 @@ const table = (id: string, over: Partial<DiningTable> = {}): DiningTable => ({
   id, tenant_id: TEN, number: 1, label: 'Mesa 1', area: 'Salão', capacity: 4, status: 'FREE', qr_code_token: null, current_order_id: null,
   active: true, updated_at: NOW, kind: 'TABLE', ...over,
 });
-const cloud = (over: Partial<CloudOrders> = {}): CloudOrders => ({ tenant_id: TEN, server_now: NOW, orders: [], orderItems: [], payments: [], tables: [], ...over });
+const cloud = (over: Partial<CloudOrders> = {}): CloudOrders => ({ tenant_id: TEN, server_now: NOW, orders: [], orderItems: [], payments: [], ownDeliveries: [], tables: [], ...over });
+const delivery = (id: string, orderId: string, over: Partial<OwnDelivery> = {}): OwnDelivery => ({
+  id, tenant_id: TEN, order_id: orderId, customer_name: 'Ana', customer_phone: '55999999999', address: 'Rua A, 1', reference: null,
+  zone_id: 'z1', zone_name: 'Centro', delivery_fee: 5, pay_on_delivery: true, change_for: null, status: 'PREPARING', courier_id: null,
+  courier_fee: null, out_at: null, delivered_at: null, settlement_id: null, created_at: NOW, ...over,
+});
 const ev = (table: SyncEvent['table'], rowId: string, payload: Record<string, unknown> = {}, over: Partial<SyncEvent> = {}): SyncEvent => ({
   id: `e-${table}-${rowId}`, table, op: 'UPDATE', row_id: rowId, payload: { id: rowId, ...payload }, created_at: NOW, ...over,
 });
@@ -43,7 +48,7 @@ const none = pendingOrderKeys([]);
 
 describe('mergeCloudOrders', () => {
   it('conta sem nada pendente fica igual à da nuvem: totais, itens e pagamentos do banco', () => {
-    const local = { orders: [order(O1)], orderItems: [item('i1', O1)], payments: [], tables: [table(T1, { status: 'OCCUPIED', current_order_id: O1 })] };
+    const local = { orders: [order(O1)], orderItems: [item('i1', O1)], payments: [], ownDeliveries: [], tables: [table(T1, { status: 'OCCUPIED', current_order_id: O1 })] };
     const c = cloud({
       orders: [order(O1, { subtotal_items: 80, service_fee_amount: 8, total_amount: 88, paid_amount: 40, remaining_balance: 48, status: 'PAYING' })],
       orderItems: [item('i1', O1, { status: 'READY' }), item('i2', O1, { unit_price: 30, total_item_price: 30 })],
@@ -57,8 +62,17 @@ describe('mergeCloudOrders', () => {
     expect(r.tables[0]).toMatchObject({ status: 'PAYING', current_order_id: O1 });
   });
 
+  it('entrega da conta desce da nuvem; a com mudança daqui pendente fica como está', () => {
+    const local = { orders: [], orderItems: [], payments: [], ownDeliveries: [delivery('d2', O2, { status: 'OUT', courier_id: 'c1', courier_fee: 4, out_at: NOW })], tables: [] };
+    const c = cloud({ orders: [order(O1), order(O2, { table_id: T2 })], ownDeliveries: [delivery('d1', O1), delivery('d2', O2)] });
+    const fresh = mergeCloudOrders(local, c, none);
+    expect(fresh.ownDeliveries.map((d) => `${d.id}:${d.status}`).sort()).toEqual(['d1:PREPARING', 'd2:PREPARING']);
+    const held = mergeCloudOrders(local, c, pendingOrderKeys([ev('own_deliveries', 'd2', { order_id: O2 })]));
+    expect(held.ownDeliveries.map((d) => `${d.id}:${d.status}`).sort()).toEqual(['d1:PREPARING', 'd2:OUT']);
+  });
+
   it('item ou pagamento só deste aparelho numa conta sem nada pendente sai (o banco não o tem)', () => {
-    const local = { orders: [order(O1)], orderItems: [item('i1', O1), item('fantasma', O1)], payments: [payment('pgx', O1, 10)], tables: [] };
+    const local = { orders: [order(O1)], orderItems: [item('i1', O1), item('fantasma', O1)], payments: [payment('pgx', O1, 10)], ownDeliveries: [], tables: [] };
     const r = mergeCloudOrders(local, cloud({ orders: [order(O1)], orderItems: [item('i1', O1)] }), none);
     expect(r.orderItems.map((i) => i.id)).toEqual(['i1']);
     expect(r.payments).toEqual([]);
@@ -69,6 +83,7 @@ describe('mergeCloudOrders', () => {
       orders: [order(O1, { customer_count: 5 })],
       orderItems: [item('i1', O1)],
       payments: [payment('pg1', O1, 10)],
+      ownDeliveries: [],
       tables: [table(T1, { status: 'OCCUPIED', current_order_id: O1 })],
     };
     const c = cloud({ orders: [order(O1, { status: 'CLOSED', remaining_balance: 0 })], orderItems: [item('i9', O1)], tables: [{ id: T1, status: 'FREE', current_order_id: null, updated_at: NOW }] });
@@ -89,13 +104,13 @@ describe('mergeCloudOrders', () => {
   });
 
   it('cobrança em andamento na maquininha deste aparelho segura a conta', () => {
-    const local = { orders: [order(O1)], orderItems: [], payments: [], tables: [] };
+    const local = { orders: [order(O1)], orderItems: [], payments: [], ownDeliveries: [], tables: [] };
     const r = mergeCloudOrders(local, cloud({ orders: [order(O1, { status: 'CLOSED' })] }), pendingOrderKeys([], [O1]));
     expect(r.orders[0]!.status).toBe('OPEN');
   });
 
   it('mesa com mudança daqui pendente fica como está; sem pendência, a ocupação vem da nuvem', () => {
-    const local = { orders: [], orderItems: [], payments: [], tables: [table(T1, { status: 'WAITING_BILL', current_order_id: O2 }), table(T2)] };
+    const local = { orders: [], orderItems: [], payments: [], ownDeliveries: [], tables: [table(T1, { status: 'WAITING_BILL', current_order_id: O2 }), table(T2)] };
     const c = cloud({ orders: [order(O2, { table_id: T1 }), order(O1, { table_id: T2 })], tables: [{ id: T1, status: 'OCCUPIED', current_order_id: O2, updated_at: NOW }, { id: T2, status: 'OCCUPIED', current_order_id: O1, updated_at: NOW }] });
     const r = mergeCloudOrders(local, c, pendingOrderKeys([ev('dining_tables', T1, { current_order_id: O2 })]));
     expect(r.tables[0]).toMatchObject({ status: 'WAITING_BILL', current_order_id: O2 });
@@ -104,7 +119,7 @@ describe('mergeCloudOrders', () => {
   });
 
   it('conta aberta daqui que a nuvem não mandou continua no mapa (não some a conta)', () => {
-    const local = { orders: [order(O1)], orderItems: [item('i1', O1)], payments: [], tables: [table(T1, { status: 'OCCUPIED', current_order_id: O1 })] };
+    const local = { orders: [order(O1)], orderItems: [item('i1', O1)], payments: [], ownDeliveries: [], tables: [table(T1, { status: 'OCCUPIED', current_order_id: O1 })] };
     const r = mergeCloudOrders(local, cloud({ tables: [{ id: T1, status: 'FREE', current_order_id: null, updated_at: NOW }] }), none);
     expect(r.orders).toHaveLength(1);
     expect(r.orderItems).toHaveLength(1);
@@ -113,13 +128,13 @@ describe('mergeCloudOrders', () => {
 
   it('conta encerrada há mais de 24 h (fora da leitura) fica como histórico deste aparelho', () => {
     const old = order(O1, { status: 'CLOSED', closed_at: '2026-11-10T20:00:00.000Z', remaining_balance: 0, paid_amount: 55 });
-    const r = mergeCloudOrders({ orders: [old], orderItems: [item('i1', O1)], payments: [payment('pg1', O1, 55)], tables: [] }, cloud(), none);
+    const r = mergeCloudOrders({ orders: [old], orderItems: [item('i1', O1)], payments: [payment('pg1', O1, 55)], ownDeliveries: [], tables: [] }, cloud(), none);
     expect(r.orders).toEqual([old]);
     expect(r.payments).toHaveLength(1);
   });
 
   it('NFC-e: vale a do servidor quando ele tem uma; sem ela, fica a daqui', () => {
-    const local = { orders: [order(O1, { status: 'CLOSED', nfce_status: 'AUTORIZADA', nfce_key: 'K-LOCAL' })], orderItems: [], payments: [], tables: [] };
+    const local = { orders: [order(O1, { status: 'CLOSED', nfce_status: 'AUTORIZADA', nfce_key: 'K-LOCAL' })], orderItems: [], payments: [], ownDeliveries: [], tables: [] };
     expect(mergeCloudOrders(local, cloud({ orders: [order(O1, { status: 'CLOSED' })] }), none).orders[0]).toMatchObject({ nfce_status: 'AUTORIZADA', nfce_key: 'K-LOCAL' });
     expect(mergeCloudOrders(local, cloud({ orders: [order(O1, { status: 'CLOSED', nfce_status: 'AUTHORIZED', nfce_key: 'K-SEFAZ' })] }), none).orders[0])
       .toMatchObject({ nfce_status: 'AUTHORIZED', nfce_key: 'K-SEFAZ' });
@@ -127,7 +142,7 @@ describe('mergeCloudOrders', () => {
 
   it('conta nova de outro aparelho entra com itens e pagamentos', () => {
     const c = cloud({ orders: [order(O2, { table_id: T2 })], orderItems: [item('i5', O2)], payments: [payment('pg5', O2, 5)] });
-    const r = mergeCloudOrders({ orders: [order(O1)], orderItems: [], payments: [], tables: [] }, c, none);
+    const r = mergeCloudOrders({ orders: [order(O1)], orderItems: [], payments: [], ownDeliveries: [], tables: [] }, c, none);
     expect(r.orders.map((o) => o.id)).toEqual([O1, O2]);
     expect(r.orderItems.map((i) => i.id)).toEqual(['i5']);
     expect(r.payments.map((p) => p.id)).toEqual(['pg5']);
@@ -148,6 +163,7 @@ describe('parseCloudOrders', () => {
     orders: [{ ...order(O1), total_amount: '55.00', opened_at: '2026-11-14 19:00:00+00' }],
     order_items: [{ ...item('i1', O1), quantity: '1.000', half_product_ids: null }],
     payments: [{ ...payment('pg1', O1, 10), amount: '10.00' }],
+    own_deliveries: [{ ...delivery('d1', O1), delivery_fee: '5.00', change_for: null }],
     tables: [{ id: T1, status: 'OCCUPIED', current_order_id: O1, updated_at: '2026-11-14 19:00:00+00' }],
   });
 
@@ -156,6 +172,7 @@ describe('parseCloudOrders', () => {
     expect(r.orders[0]).toMatchObject({ total_amount: 55, opened_at: '2026-11-14T19:00:00.000Z' });
     expect(r.orderItems[0]).toMatchObject({ quantity: 1, half_product_ids: [] });
     expect(r.payments[0]!.amount).toBe(10);
+    expect(r.ownDeliveries[0]).toMatchObject({ order_id: O1, delivery_fee: 5, pay_on_delivery: true });
     expect(r.server_now).toBe('2026-11-14T20:00:00.123Z');
   });
 
@@ -169,6 +186,11 @@ describe('parseCloudOrders', () => {
       ['número inválido', (b) => ({ ...b, orders: [{ ...b.orders[0], remaining_balance: 'abc' }] })],
       ['situação desconhecida', (b) => ({ ...b, orders: [{ ...b.orders[0], status: 'REOPENED' }] })],
       ['resposta incompleta', (b) => ({ ...b, payments: undefined })],
+      ['sem entregas', (b) => ({ ...b, own_deliveries: undefined })],
+      ['entrega sem conta', (b) => ({ ...b, own_deliveries: [{ ...b.own_deliveries[0], order_id: O2 }] })],
+      ['entrega de outra loja', (b) => ({ ...b, own_deliveries: [{ ...b.own_deliveries[0], tenant_id: 'outra' }] })],
+      ['entrega com situação desconhecida', (b) => ({ ...b, own_deliveries: [{ ...b.own_deliveries[0], status: 'LOST' }] })],
+      ['duas entregas na conta', (b) => ({ ...b, own_deliveries: [b.own_deliveries[0], { ...b.own_deliveries[0], id: 'd2' }] })],
     ];
     for (const [name, f] of cases) expect(() => parseCloudOrders(f(body()), TEN), name).toThrow(/Não foi possível ler as contas da nuvem/);
   });

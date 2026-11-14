@@ -4070,6 +4070,49 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().orderItems.find((i) => i.id === item.id)!.status).toBe('DELIVERED');
     });
 
+    it('entrega paga na entrega desce com a conta: a cozinha de outro aparelho prepara antes do pagamento (Codex no PR #54)', async () => {
+      login(OWNER_PIN);
+      const zone = st().deliveryZones.find((z) => z.active) ?? ok(st().saveDeliveryZone({ name: 'Bairro 54', fee: 4, eta_minutes: 30, active: true }));
+      login(CASHIER_PIN);
+      const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
+      const delivery = { customerName: 'Rosa', phone: '53 97777-6666', address: 'Rua das Flores, 54', reference: '', zoneId: zone.id, changeFor: null, payOnDelivery: true };
+      const order = ok(st().createPickupOrder({ lines: [line], fulfillment: 'DELIVERY', customerName: 'Rosa', delivery }));
+      await expectSynced('pedido de entrega');
+      const d = st().ownDeliveries.find((x) => x.order_id === order.id)!;
+      // Outro aparelho (a cozinha) ainda não tem a conta nem a entrega.
+      useTcheStore.setState((s) => ({
+        orders: s.orders.filter((o) => o.id !== order.id),
+        orderItems: s.orderItems.filter((i) => i.order_id !== order.id),
+        ownDeliveries: s.ownDeliveries.filter((x) => x.order_id !== order.id),
+      }));
+      ok(await pullA());
+      expect(st().orders.find((o) => o.id === order.id)!.status).not.toBe('CLOSED');
+      expect(st().ownDeliveries.find((x) => x.order_id === order.id)).toMatchObject({ id: d.id, pay_on_delivery: true, status: 'PREPARING', delivery_fee: d.delivery_fee });
+    });
+
+    it('cópia velha da conta em B não devolve os 10% que A tirou com PIN de gerente (Codex no PR #54)', async () => {
+      forgetPinFailures();
+      login(CASHIER_PIN);
+      const mesa = tableNo(53);
+      await expectSynced('mesa 53');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await expectSynced('conta 53');
+      ok(st().removeServiceFee(order.id, MANAGER));
+      await expectSynced('10% retirados em A');
+      expect(sql(`SELECT charge_service_fee || ' ' || service_fee_amount FROM orders WHERE id = '${order.id}'`)).toBe('false 0.00');
+      // B ainda tem a conta com os 10% e muda só o número de pessoas: manda a linha inteira.
+      const stale = await rawB('PATCH', `orders?id=eq.${order.id}`, { customer_count: 3, charge_service_fee: true, service_fee_pct: 10 });
+      expect(stale.status, stale.body).toBeLessThan(300);
+      expect(sql(`SELECT charge_service_fee || ' ' || service_fee_amount || ' ' || customer_count FROM orders WHERE id = '${order.id}'`)).toBe('false 0.00 3');
+      // A reativação registrada continua trazendo a taxa de volta.
+      ok(st().restoreServiceFee(order.id));
+      await expectSynced('10% reativados em A');
+      expect(sql(`SELECT charge_service_fee || ' ' || (service_fee_amount > 0) FROM orders WHERE id = '${order.id}'`)).toBe('true true');
+    });
+
     it('a rodada de sincronização lê as contas a cada 10 s, com a fila vazia', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(46);

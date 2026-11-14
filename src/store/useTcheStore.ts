@@ -3775,6 +3775,7 @@ export const useTcheStore = create<TcheState>()(
             orders: merged.orders,
             orderItems: merged.orderItems,
             payments: merged.payments,
+            ownDeliveries: merged.ownDeliveries,
             tables: merged.tables,
             pullStatus: { ...(state.pullStatus ?? EMPTY_PULL_STATUS), last_orders_pull_at: nowISO() },
           });
