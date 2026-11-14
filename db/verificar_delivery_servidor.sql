@@ -6,7 +6,7 @@
 -- rode. Volta uma tabela "item | esperado | encontrado | ok":
 --   ok = 'sim'                  conferido
 --   ok = 'NÃO'                  algo diferente do esperado: não ligue o servidor do iFood antes de corrigir
---   ok = 'ainda não (opcional)' item de uma rodada que talvez ainda não tenha sido aplicada (detail_pending)
+--   ok = 'ainda não (opcional)' item de uma rodada que talvez ainda não tenha sido aplicada (hoje nenhum: as colunas do detalhe pendente são obrigatórias)
 -- As linhas com 'NÃO' saem primeiro.
 --
 -- Conferido em Postgres limpo por db/tests/verificarDeliveryServidor.pg.test.ts (mesmas migrations).
