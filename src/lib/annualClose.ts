@@ -12,8 +12,8 @@
  * Tudo em centavos.
  */
 import type { CashMovement, CashSession, CourierSettlement, Order, OwnDelivery, Payment, PaymentMethod, Product, PurchaseInvoice, PurchaseInvoiceItem, StaffUser, StockMovement, Supplier } from '../types';
-import { feeCents, ruleFor, type FeeRule } from './cardFees';
-import { fromCents, round3, toCents } from './money';
+import { feeCents, MAX_FEE_DAYS, ruleFor, type FeeRule } from './cardFees';
+import { fromCents, toCents } from './money';
 import type { MarketplaceSale } from './ownerDashboard';
 import { brasiliaInstant, parseIsoInstant, SHIFT_TIME_ZONE } from './reports';
 
@@ -189,7 +189,7 @@ export interface InventoryRow {
   name: string;
   ncm: string;
   unit: string;
-  /** Saldo do livro de estoque no fim do dia 31/12 (último movimento até lá). */
+  /** Entradas deste aparelho no livro de estoque até a posição (soma das quantidades). */
   quantity: number;
   /** Custo médio ponderado no fim do dia 31/12 (4 casas, do livro de estoque). */
   unitCost: number;
@@ -215,6 +215,21 @@ export interface InventoryReport {
   afterCutoff: number;
 }
 
+/**
+ * Só os registros da loja deste aparelho. Ligar o aparelho a outra loja (ou zerar) nem
+ * sempre apaga tudo o que era da anterior: o que tem tenant_id de outra loja fica fora
+ * e é contado para o aviso. Registro sem tenant_id (dado antigo) fica.
+ */
+export function ownStore<T extends { tenant_id?: string | null }>(rows: readonly T[], tenantId: string): { rows: T[]; other: number } {
+  const out: T[] = [];
+  let other = 0;
+  for (const r of rows) {
+    if (r.tenant_id && r.tenant_id !== tenantId) other += 1;
+    else out.push(r);
+  }
+  return { rows: out, other };
+}
+
 /** Movimentos de estoque que vieram de NF-e de homologação (teste): não são mercadoria real. */
 export function testInvoiceMovementIds(
   movements: readonly StockMovement[],
@@ -235,12 +250,11 @@ export function testInvoiceMovementIds(
 const qtyTimesCostCents = (qty: number, cost: number): number => Math.round((Math.round(qty * 1000) * Math.round(cost * 10_000)) / 100_000);
 
 /**
- * Posição do estoque no fim do ano: para cada produto, o último movimento do livro
- * (stock_movements, só INSERT) com data até 31/12 23:59:59 de Brasília. O app hoje só
- * registra ENTRADA por nota de compra (PURCHASE_IN): as vendas ainda não baixam o
- * estoque, então este saldo é o que entrou, não o que sobrou na prateleira.
- * Produto com entrada de NF-e de homologação tem saldo e custo médio refeitos só com
- * as entradas reais (como o livro só tem entradas, a média ponderada delas é exata).
+ * Posição do estoque no fim do ano: para cada produto, a soma das entradas DESTE
+ * aparelho no livro (stock_movements, só INSERT) até a posição, com o custo médio
+ * ponderado delas. O app hoje só registra ENTRADA por nota de compra (PURCHASE_IN): as
+ * vendas ainda não baixam o estoque, então este saldo é o que entrou, não o que sobrou
+ * na prateleira. Entradas de NF-e de homologação ficam fora.
  */
 export function inventoryAt(
   products: readonly Product[],
@@ -275,24 +289,20 @@ export function inventoryAt(
     list.sort((a, b) => a.t - b.t || a.idx - b.idx);
     const tests = list.filter((x) => testMovementIds.has(x.m.id)).length;
     testMovements += tests;
-    let qty: number;
-    let unitCost: number;
-    if (tests === 0) {
-      const lastMov = list[list.length - 1]!.m;
-      qty = round3(lastMov.balance_after);
-      unitCost = Math.round(lastMov.avg_cost_after * 10_000) / 10_000;
-    } else {
-      let milli = 0;
-      let costTimes = 0; // Σ quantidade(milésimos) × custo(décimos de milésimo)
-      for (const { m } of list) {
-        if (testMovementIds.has(m.id)) continue;
-        const q = Math.round(m.quantity * 1000);
-        milli += q;
-        costTimes += q * Math.round(m.unit_cost * 10_000);
-      }
-      qty = milli / 1000;
-      unitCost = milli > 0 ? Math.round(costTimes / milli) / 10_000 : 0;
+    // Saldo e custo médio refeitos só com as entradas DESTE aparelho (o livro só tem
+    // entradas, então a média ponderada é exata). O balance_after gravado parte do
+    // estoque do produto que veio da nuvem (o da loja toda): usá-lo faria a soma dos
+    // aparelhos contar o mesmo estoque duas vezes.
+    let milli = 0;
+    let costTimes = 0; // Σ quantidade(milésimos) × custo(décimos de milésimo)
+    for (const { m } of list) {
+      if (testMovementIds.has(m.id)) continue;
+      const q = Math.round(m.quantity * 1000);
+      milli += q;
+      costTimes += q * Math.round(m.unit_cost * 10_000);
     }
+    const qty = milli / 1000;
+    const unitCost = milli > 0 ? Math.round(costTimes / milli) / 10_000 : 0;
     if (qty === 0) continue;
     const prod = byId.get(productId);
     const totalCents = qtyTimesCostCents(qty, unitCost);
@@ -368,6 +378,11 @@ export interface RevenueReport {
   totalWithoutRule: number;
   /** Gorjetas passadas junto (não são faturamento da casa). */
   tips: number;
+  /**
+   * Taxa de serviço (10%) das comandas fechadas no período: está DENTRO do bruto (veio
+   * nos pagamentos). É gorjeta pela Lei 13.419/2017; o contador decide como tratar.
+   */
+  serviceFee: number;
   /** Bruto por mês (índice 0 = janeiro), por chave de linha. */
   monthly: Record<string, number[]>;
   monthlyTotal: number[];
@@ -402,6 +417,8 @@ export interface RevenueInput {
   cashSessions: readonly CashSession[];
   cashMovements: readonly CashMovement[];
   staff: readonly StaffUser[];
+  /** Comandas (para a taxa de serviço, que vem dentro dos pagamentos). */
+  orders?: ReadonlyArray<Pick<Order, 'status' | 'closed_at' | 'service_fee_amount'>>;
 }
 
 /**
@@ -535,6 +552,13 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod, now: Date = 
     outsideC += toCents(pay.amount);
     outsideN += 1;
   }
+  // Taxa de serviço pela data de fechamento da comanda (é quando ela foi paga por inteiro).
+  let serviceFeeC = 0;
+  for (const o of input.orders ?? []) {
+    if (o.status !== 'CLOSED' || !(o.service_fee_amount > 0)) continue;
+    const t = at(o.closed_at);
+    if (t !== null && t >= p.from && t < cutoff) serviceFeeC += toCents(o.service_fee_amount);
+  }
   let suppliesC = 0;
   let withdrawalsC = 0;
   for (const mv of input.cashMovements) {
@@ -553,6 +577,7 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod, now: Date = 
     totalNet: fromCents(grossC - feeC),
     totalWithoutRule: fromCents(sum((r) => r.noRule)),
     tips: fromCents(tipsC),
+    serviceFee: fromCents(serviceFeeC),
     monthly,
     monthlyTotal: monthlyTotalC.map(fromCents),
     closings,
@@ -637,6 +662,15 @@ export interface OpenPositionsInput {
  * Posição na virada do ano (ou agora, se o ano ainda não terminou): o que estava a
  * receber da maquininha e o que estava a pagar aos entregadores naquele instante.
  */
+/**
+ * Folga, em ms, depois da qual o repasse com certeza já caiu: prazo em dias corridos
+ * (dias úteis viram corridos com os fins de semana) mais 2 dias de margem.
+ */
+const maxSettlementMs = (rule: Pick<FeeRule, 'days' | 'businessDays'>): number =>
+  ((rule.businessDays ? Math.ceil((rule.days * 7) / 5) + 4 : rule.days) + 2) * DAY_MS;
+/** Nenhuma taxa cadastrável passa de D+MAX_FEE_DAYS (úteis): venda mais antiga que isso já caiu. */
+const ANY_RULE_SETTLED_MS = maxSettlementMs({ days: MAX_FEE_DAYS, businessDays: true });
+
 export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: Date = new Date()): OpenPositionsReport {
   const cutoff = positionCutoff(p, now);
   const card = new Map<string, { acquirer: string; method: PaymentMethod; gross: number; fee: number; count: number }>();
@@ -653,8 +687,9 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
     const rule = ruleFor(pay, input.feeRules);
     if (!rule) {
       // Simulador (MOCK) e caixa (CASH_DESK) não têm repasse. Venda de anos anteriores
-      // também conta: sem o prazo não dá para saber se caiu antes da posição.
-      if (pay.acquirer === 'STONE' || pay.acquirer === 'PAGBANK') {
+      // também conta: sem o prazo não dá para saber se caiu antes da posição. Só a mais
+      // antiga que o maior prazo cadastrável (D+MAX_FEE_DAYS úteis) com certeza já caiu.
+      if ((pay.acquirer === 'STONE' || pay.acquirer === 'PAGBANK') && cutoff - t <= ANY_RULE_SETTLED_MS) {
         // Mesmo critério do faturamento: valor da venda, sem a gorjeta.
         const c = toCents(pay.amount);
         noRuleC += c;
@@ -669,6 +704,8 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
     // Já recebido = o dia do repasse (de Brasília) terminou antes da posição. Com a
     // posição em 31/12, repasse em 01/01 ou depois estava a receber; com o ano em
     // andamento, repasse de hoje em diante ainda está a receber.
+    // Venda bem mais antiga que o prazo: já caiu (pula o cálculo do dia, que é caro).
+    if (cutoff - t > maxSettlementMs(rule)) continue;
     if (settlementDayBrasilia(t, rule) + DAY_MS <= cutoff) continue;
     const key = `${pay.acquirer}|${pay.method}`;
     const row = card.get(key) ?? { acquirer: pay.acquirer, method: pay.method, gross: 0, fee: 0, count: 0 };
@@ -787,6 +824,8 @@ export interface ExpensesReport {
   homologationInvoices: number;
   /** NF-e com data de emissão inválida, contadas pela data da importação. */
   invalidIssueDates: number;
+  /** NF-e repetidas (mesma chave de acesso) contadas uma vez só. */
+  duplicateInvoices: number;
   /** Sangrias do caixa no ano que não são acerto de entregador: sem categoria. */
   withdrawals: WithdrawalRow[];
   withdrawalsTotal: number;
@@ -828,7 +867,19 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
   let homologation = 0;
   let invalidDates = 0;
   let invalidIssueDates = 0;
+  let duplicateInvoices = 0;
+  const seenKeys = new Set<string>();
   for (const inv of input.purchaseInvoices) {
+    // A mesma NF-e (mesma chave) importada em dois aparelhos antes de sincronizar fica
+    // duas vezes aqui (a da nuvem e a recusada deste aparelho): conta uma vez só.
+    const key = (inv.access_key ?? '').trim();
+    if (key !== '') {
+      if (seenKeys.has(key)) {
+        duplicateInvoices += 1;
+        continue;
+      }
+      seenKeys.add(key);
+    }
     // Emissão (dhEmi ou dEmi); sem ela (ou com ela inválida), a data da importação.
     const issued = invoiceDate(inv.issued_at);
     const t = issued ?? at(inv.imported_at);
@@ -909,7 +960,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
     { key: 'OTHER', label: 'Outras despesas (luz, água, gás, internet, impostos)', amount: null, count: 0, source: 'NOT_TRACKED', note: NOT_TRACKED },
   ];
   const total = rows.reduce((a, r) => a + (r.amount === null ? 0 : toCents(r.amount)), 0);
-  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, invalidIssueDates, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates, cutoff, afterCutoff: late };
+  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, invalidIssueDates, duplicateInvoices, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates, cutoff, afterCutoff: late };
 }
 
 const fmt = (cents: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(fromCents(cents));

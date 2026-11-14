@@ -11,7 +11,7 @@ import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTche
 import { useOwnerSettings } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import type { MarketplaceSale } from '../lib/ownerDashboard';
-import { brasiliaDateTime, clockBeforeYear, defaultYear, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { brasiliaDateTime, brasiliaYear, clockBeforeYear, defaultYear, ownStore, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, REPORT_TITLE, revenueDoc, toCsv, toPrintableHtml, type AnnualReportKind, type ReportDoc } from '../lib/annualCloseExport';
 
 /**
@@ -19,10 +19,14 @@ import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel,
  * iFood está em homologação), então nenhum pedido de app entra no fechamento.
  */
 const NO_MARKETPLACE: MarketplaceSale[] = [];
-/** Agora, no minuto cheio (o corte bate com o hh:mm mostrado). */
+/**
+ * Agora, arredondado para o próximo minuto cheio: o corte bate com o hh:mm mostrado e
+ * o que foi lançado até o instante em que a tela abriu (ou foi atualizada) entra.
+ */
 const minuteNow = (): Date => {
   const t = Date.now();
-  return new Date(t - (((t % 60_000) + 60_000) % 60_000));
+  const rem = ((t % 60_000) + 60_000) % 60_000;
+  return new Date(rem === 0 ? t : t + (60_000 - rem));
 };
 /** Hora em que o arquivo foi gerado (pode ser depois do instante dos números, dito no período). */
 const generatedAtLabel = (): string => new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
@@ -65,20 +69,40 @@ export function AnnualClose() {
   const user = useTcheStore(selectCurrentUser);
   const tenant = useTcheStore((s) => s.tenant);
   const staff = useTcheStore((s) => s.staff);
-  const products = useTcheStore((s) => s.products);
-  const stockMovements = useTcheStore((s) => s.stockMovements);
-  const payments = useTcheStore((s) => s.payments);
-  const cashSessions = useTcheStore((s) => s.cashSessions);
-  const cashMovements = useTcheStore((s) => s.cashMovements);
-  const purchaseInvoices = useTcheStore((s) => s.purchaseInvoices);
+  const allProducts = useTcheStore((s) => s.products);
+  const allStockMovements = useTcheStore((s) => s.stockMovements);
+  const allPayments = useTcheStore((s) => s.payments);
+  const allCashSessions = useTcheStore((s) => s.cashSessions);
+  const allCashMovements = useTcheStore((s) => s.cashMovements);
+  const allPurchaseInvoices = useTcheStore((s) => s.purchaseInvoices);
   const suppliers = useTcheStore((s) => s.suppliers);
-  const ownDeliveries = useTcheStore((s) => s.ownDeliveries);
-  const courierSettlements = useTcheStore((s) => s.courierSettlements);
+  const allOwnDeliveries = useTcheStore((s) => s.ownDeliveries);
+  const allCourierSettlements = useTcheStore((s) => s.courierSettlements);
   const couriers = useTcheStore((s) => s.couriers);
-  const orders = useTcheStore((s) => s.orders);
+  const allOrders = useTcheStore((s) => s.orders);
   const purchaseInvoiceItems = useTcheStore((s) => s.purchaseInvoiceItems);
   const feeRules = useOwnerSettings((s) => s.feeRules);
   const appCommissionPct = useOwnerSettings((s) => s.appCommissionPct);
+  // Só a loja deste aparelho (o que sobrou de outra loja fica fora e é avisado).
+  const ownProducts = useMemo(() => ownStore(allProducts, tenant.id), [allProducts, tenant.id]);
+  const products = ownProducts.rows;
+  const ownStockMovements = useMemo(() => ownStore(allStockMovements, tenant.id), [allStockMovements, tenant.id]);
+  const stockMovements = ownStockMovements.rows;
+  const ownPayments = useMemo(() => ownStore(allPayments, tenant.id), [allPayments, tenant.id]);
+  const payments = ownPayments.rows;
+  const ownCashSessions = useMemo(() => ownStore(allCashSessions, tenant.id), [allCashSessions, tenant.id]);
+  const cashSessions = ownCashSessions.rows;
+  const ownCashMovements = useMemo(() => ownStore(allCashMovements, tenant.id), [allCashMovements, tenant.id]);
+  const cashMovements = ownCashMovements.rows;
+  const ownPurchaseInvoices = useMemo(() => ownStore(allPurchaseInvoices, tenant.id), [allPurchaseInvoices, tenant.id]);
+  const purchaseInvoices = ownPurchaseInvoices.rows;
+  const ownOwnDeliveries = useMemo(() => ownStore(allOwnDeliveries, tenant.id), [allOwnDeliveries, tenant.id]);
+  const ownDeliveries = ownOwnDeliveries.rows;
+  const ownCourierSettlements = useMemo(() => ownStore(allCourierSettlements, tenant.id), [allCourierSettlements, tenant.id]);
+  const courierSettlements = ownCourierSettlements.rows;
+  const ownOrders = useMemo(() => ownStore(allOrders, tenant.id), [allOrders, tenant.id]);
+  const orders = ownOrders.rows;
+  const otherStore = ownProducts.other + ownStockMovements.other + ownPayments.other + ownCashSessions.other + ownCashMovements.other + ownPurchaseInvoices.other + ownOwnDeliveries.other + ownCourierSettlements.other + ownOrders.other;
   const marketplace = NO_MARKETPLACE;
   const androidApp = inAndroidApp();
 
@@ -86,6 +110,9 @@ export function AnnualClose() {
   // exatamente o corte): os quatro relatórios, a lista de anos, o título e as notas usam o
   // mesmo instante. "Atualizar" e a troca de ano pegam um novo.
   const [now, setNow] = useState(minuteNow);
+  // A lista de anos só depende do ANO de agora (não refaz a cada Atualizar).
+  const nowYear = brasiliaYear(now.toISOString());
+  const yearAnchor = useMemo(() => new Date(Date.UTC(nowYear ?? 1970, 6, 1)), [nowYear]);
   const years = useMemo(
     () =>
       yearsWithData([
@@ -99,8 +126,8 @@ export function AnnualClose() {
         ...courierSettlements.map((s) => s.created_at),
         ...cashMovements.map((m) => m.created_at),
         ...ownDeliveries.map((d) => d.delivered_at ?? d.created_at),
-      ], now),
-    [payments, stockMovements, purchaseInvoices, cashSessions, courierSettlements, cashMovements, ownDeliveries, now],
+      ], yearAnchor),
+    [payments, stockMovements, purchaseInvoices, cashSessions, courierSettlements, cashMovements, ownDeliveries, yearAnchor],
   );
   const [picked, setPicked] = useState<number | null>(null);
   // Relógio do aparelho fora de 2000–2100 deixa a lista sem o ano corrente; sem nenhum ano, usa 2000.
@@ -116,8 +143,8 @@ export function AnnualClose() {
   const testMovements = useMemo(() => testInvoiceMovementIds(stockMovements, purchaseInvoiceItems, purchaseInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices]);
   const inventory = useMemo(() => inventoryAt(products, stockMovements, period, testMovements, now), [products, stockMovements, period, testMovements, now]);
   const revenue = useMemo(
-    () => revenueByMethod({ payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff }, period, now),
-    [payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff, period, now],
+    () => revenueByMethod({ payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff, orders }, period, now),
+    [payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff, orders, period, now],
   );
   const open = useMemo(
     () => openPositionsAt({ payments, feeRules, ownDeliveries, courierSettlements, couriers, orders }, period, now),
@@ -131,7 +158,14 @@ export function AnnualClose() {
   if (!isManagerRole(user?.role)) return <p className="p-6">Só o proprietário e o gerente veem o fechamento anual.</p>;
 
   const cutoffLabel = brasiliaDateTime(positionCutoff(period, now));
-  const partialNote = partial ? [`O ano de ${year} ainda não terminou: os números vão até ${cutoffLabel} (horário de Brasília), não até 31/12.`] : [];
+  const clockNote = `ATENÇÃO: o relógio deste aparelho estava em ${brasiliaDateTime(now.getTime())}, antes de ${year} começar, quando este relatório foi gerado. Os números são do ano inteiro, mas confira a data e a hora do aparelho.`;
+  const otherNote = `${otherStore} registro(s) de outra loja que ficaram neste aparelho (de antes de ligá-lo a esta loja) foram deixados de fora.`;
+  // Notas que vão em todos os relatórios exportados (as mesmas que a tela mostra no topo).
+  const partialNote = [
+    ...(partial ? [`O ano de ${year} ainda não terminou: os números vão até ${cutoffLabel} (horário de Brasília), não até 31/12.`] : []),
+    ...(clockWrong ? [clockNote] : []),
+    ...(otherStore > 0 ? [otherNote] : []),
+  ];
   // Registros do ano datados depois do corte (lançados depois de abrir a tela, ou relógio
   // errado): cada relatório conta as suas fontes, então a tela mostra por relatório.
   const late = (
@@ -265,6 +299,11 @@ export function AnnualClose() {
             Atenção: o relógio deste aparelho está em {brasiliaDateTime(now.getTime())}, antes de {year} começar. Os relatórios mostram o ano inteiro, mas acerte a data e a hora do aparelho antes de enviar ao contador.
           </p>
         )}
+        {otherStore > 0 && (
+          <p role="status" className="w-full rounded-xl bg-amarelo/15 p-3 text-sm">
+            {otherNote}
+          </p>
+        )}
         {invalid.length > 0 && (
           <p role="alert" className="w-full rounded-xl bg-rose-100 p-3 text-sm">
             Atenção: registros com data inválida ficaram fora dos relatórios ({invalid.map(([k, n]) => `${REPORT_TITLE[k]}: ${n}`).join('; ')}). Se forem deste ano, os totais estão menores: avise o suporte antes de enviar ao contador.
@@ -291,6 +330,7 @@ export function AnnualClose() {
           {line('Total vendido', formatBRL(revenue.totalGross))}
           {line('Líquido estimado (já descontadas as taxas cadastradas)', formatBRL(revenue.totalNet))}
           {line('Gorjetas (fora do total)', formatBRL(revenue.tips))}
+          {revenue.serviceFee > 0 && line('Taxa de serviço (10%) dentro do total', formatBRL(revenue.serviceFee), '(é gorjeta pela Lei 13.419/2017: veja com o contador)')}
           {revenue.totalWithoutRule > 0 && line('Recebido sem taxa cadastrada', formatBRL(revenue.totalWithoutRule), '(taxa não descontada)')}
           {revenue.simulatorCount > 0 && line('Simulador de maquininha (fora do total)', formatBRL(revenue.simulatorAmount))}
           {line('Fechamentos de caixa', String(revenue.closings.length), revenue.closings.length > 0 ? `diferença somada ${formatBRL(revenue.closingsDifference)}` : undefined)}
@@ -317,6 +357,7 @@ export function AnnualClose() {
           {expenses.rows.map((r) => line(r.label, r.amount === null ? 'não registrado' : formatBRL(r.amount), r.source === 'ESTIMATED' ? '(estimado)' : undefined))}
           {line('Total (só o registrado e o estimado)', formatBRL(expenses.total))}
           {expenses.withdrawals.length > 0 && line('Sangrias sem categoria (fora do total)', formatBRL(expenses.withdrawalsTotal))}
+          {expenses.duplicateInvoices > 0 && line('NF-e repetidas contadas uma vez', String(expenses.duplicateInvoices))}
           {expenses.invalidIssueDates > 0 && line('NF-e com data de emissão inválida', String(expenses.invalidIssueDates), '(contadas pela data da importação: confira o ano)')}
         </>,
       )}

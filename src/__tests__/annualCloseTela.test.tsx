@@ -102,7 +102,7 @@ describe('Fechamento anual (tela): corte único no ano em andamento (auditoria P
     act(() => {
       useTcheStore.setState({
         stockMovements: [
-          { id: 'm9', tenant_id: 't', product_id: 'p1', type: 'PURCHASE_IN', quantity: 1, unit_cost: 1, balance_after: 1, avg_cost_after: 1, purchase_invoice_item_id: null, performed_by_user_id: 'own', created_at: '2026-11-14T11:00:00-03:00' },
+          { id: 'm9', tenant_id: useTcheStore.getState().tenant.id, product_id: 'p1', type: 'PURCHASE_IN', quantity: 1, unit_cost: 1, balance_after: 1, avg_cost_after: 1, purchase_invoice_item_id: null, performed_by_user_id: 'own', created_at: '2026-11-14T11:00:00-03:00' },
         ],
       } as never);
     });
@@ -157,19 +157,19 @@ describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
     vi.setSystemTime(new Date('2026-11-14T10:00:30-03:00'));
     setup('own', [pay(30, '2026-11-14T09:00:00')]);
     render(<AnnualClose />);
-    // Corte no minuto cheio: 10:00:30 vira 10:00.
-    expect(screen.getByText(/os números vão até 14\/11\/2026 10:00 /)).toBeTruthy();
+    // Corte no próximo minuto cheio: 10:00:30 vira 10:01 (o que já foi lançado entra).
+    expect(screen.getByText(/os números vão até 14\/11\/2026 10:01 /)).toBeTruthy();
     vi.setSystemTime(new Date('2026-11-14T12:00:00-03:00'));
     act(() => {
       useTcheStore.setState({
         payments: [pay(30, '2026-11-14T09:00:00'), pay(70, '2026-11-14T11:00:00')],
-        stockMovements: [{ id: 'm11', tenant_id: 't', product_id: 'p1', type: 'PURCHASE_IN', quantity: 1, unit_cost: 1, balance_after: 1, avg_cost_after: 1, purchase_invoice_item_id: null, performed_by_user_id: 'own', created_at: '2026-11-14T11:00:00-03:00' }],
+        stockMovements: [{ id: 'm11', tenant_id: useTcheStore.getState().tenant.id, product_id: 'p1', type: 'PURCHASE_IN', quantity: 1, unit_cost: 1, balance_after: 1, avg_cost_after: 1, purchase_invoice_item_id: null, performed_by_user_id: 'own', created_at: '2026-11-14T11:00:00-03:00' }],
         cashMovements: [{ id: 'w11', type: 'WITHDRAWAL', amount: 5, reason: 'gelo', created_at: '2026-11-14T11:00:00-03:00' }],
       } as never);
     });
     expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(30));
     expect(screen.getByText('Itens com saldo').parentElement!.textContent).toContain('0');
-    expect(screen.getAllByText(/Posição em 14\/11\/2026 10:00 \(ano em andamento\)/)).toHaveLength(2);
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 10:01 \(ano em andamento\)/)).toHaveLength(2);
     const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
     expect(alert.textContent).toContain('Inventário de insumos e mercadorias: 1');
     expect(alert.textContent).toContain('Fechamento de caixa e formas de pagamento: 2');
@@ -195,5 +195,15 @@ describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
     expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(100));
     expect(screen.getAllByRole('alert').some((a) => a.textContent!.includes('antes de 2025 começar'))).toBe(true);
     expect(screen.queryByRole('button', { name: 'Atualizar os números até agora' })).toBeNull();
+  });
+});
+
+describe('Fechamento anual (tela): rodada interna 2', () => {
+  it('registros de outra loja ficam fora e a tela avisa', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    setup('own', [pay(30, '2025-05-01T12:00:00'), { ...pay(70, '2025-06-01T12:00:00'), tenant_id: 'outra-loja' } as Payment]);
+    render(<AnnualClose />);
+    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain('30,00');
+    expect(screen.getByText(/1 registro\(s\) de outra loja/)).toBeTruthy();
   });
 });

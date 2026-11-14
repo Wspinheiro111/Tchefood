@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clockBeforeYear, defaultYear, positionCutoff, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { clockBeforeYear, ownStore, defaultYear, positionCutoff, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { br, code, escapeHtml, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, revenueDoc, toCsv, toPrintableHtml, type ReportDoc } from '../lib/annualCloseExport';
 import type { FeeRule } from '../lib/cardFees';
 import type { CashMovement, CashSession, CourierSettlement, OwnDelivery, Payment, Product, PurchaseInvoice, StockMovement, Supplier } from '../types';
@@ -33,15 +33,16 @@ describe('ano do fechamento', () => {
 });
 
 describe('1. inventário em 31/12', () => {
-  it('usa o último movimento até o fim do dia 31/12 de Brasília', () => {
+  it('soma as entradas deste aparelho até o fim do dia 31/12 de Brasília', () => {
     const r = inventoryAt(
       [product({}), product({ id: 'p2', code: '002', name: 'Alcatra', ncm: '2013000', unit: 'KG', active: false })],
       [
-        mov({ balance_after: 10, avg_cost_after: 2.5, created_at: '2025-06-01T12:00:00-03:00' }),
-        mov({ balance_after: 22, avg_cost_after: 2.7273, created_at: '2025-12-31T23:59:00-03:00' }),
-        mov({ balance_after: 40, avg_cost_after: 3, created_at: '2026-01-01T00:00:00-03:00' }), // já é 2026
-        mov({ product_id: 'p2', balance_after: 3.5, avg_cost_after: 39.9, created_at: '2025-11-01T10:00:00-03:00' }),
-        mov({ product_id: 'p3', balance_after: 0, created_at: '2025-11-01T10:00:00-03:00' }),
+        // balance_after vem do estoque da nuvem (loja toda): não é usado.
+        mov({ quantity: 10, unit_cost: 2.5, balance_after: 110, avg_cost_after: 9, created_at: '2025-06-01T12:00:00-03:00' }),
+        mov({ quantity: 12, unit_cost: 2.9167, balance_after: 122, avg_cost_after: 9, created_at: '2025-12-31T23:59:00-03:00' }),
+        mov({ quantity: 18, unit_cost: 3, balance_after: 40, avg_cost_after: 3, created_at: '2026-01-01T00:00:00-03:00' }), // já é 2026
+        mov({ product_id: 'p2', quantity: 3.5, unit_cost: 39.9, balance_after: 3.5, avg_cost_after: 39.9, created_at: '2025-11-01T10:00:00-03:00' }),
+        mov({ product_id: 'p3', quantity: 0, balance_after: 0, created_at: '2025-11-01T10:00:00-03:00' }),
         mov({ created_at: 'sem-data' }),
       ],
       P,
@@ -168,7 +169,8 @@ describe('3. contas em aberto na virada', () => {
 
 describe('4. despesas por categoria', () => {
   it('compras pela NF-e de produção, entregadores pelos acertos e sangria do entregador não conta duas vezes', () => {
-    const inv = (i: Partial<PurchaseInvoice>): PurchaseInvoice => ({ id: Math.random().toString(), supplier_id: 's1', access_key: '4325'.padEnd(44, '0'), number: '123', series: '1', issued_at: '2025-04-10T10:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 1234.56, imported_at: '2025-04-11T10:00:00-03:00', ...i }) as PurchaseInvoice;
+    let seq = 0;
+    const inv = (i: Partial<PurchaseInvoice>): PurchaseInvoice => ({ id: Math.random().toString(), supplier_id: 's1', access_key: seq++ === 0 ? '4325'.padEnd(44, '0') : `4325${String(seq).padStart(40, '0')}`, number: '123', series: '1', issued_at: '2025-04-10T10:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 1234.56, imported_at: '2025-04-11T10:00:00-03:00', ...i }) as PurchaseInvoice;
     const revenue = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ amount: 100 })], feeRules: [rule({})] }, P);
     const r = expensesByCategory(
       {
@@ -209,7 +211,7 @@ describe('exportação', () => {
 
   it('número com vírgula, código com zero à esquerda e nome de arquivo sem acento', () => {
     expect([br(1234.5), br(-10), br(2.7273), br(3.5), br(0.125)]).toEqual(['1234,50', '-10,00', '2,7273', '3,50', '0,125']);
-    const csv = toCsv(inventoryDoc(inventoryAt([product({ ncm: '02013000', name: 'Picanha; "premium"' })], [mov({ balance_after: 2, avg_cost_after: 50 })], P), base));
+    const csv = toCsv(inventoryDoc(inventoryAt([product({ ncm: '02013000', name: 'Picanha; "premium"' })], [mov({ quantity: 2, unit_cost: 50, balance_after: 2, avg_cost_after: 50 })], P), base));
     expect(csv).toContain('="001";"Picanha; ""premium""";="02013000";UN;2,00;50,00;100,00;Ativo');
     expect(csv).toContain('Posição em 31/12/2025');
     expect(fileName('revenue', 2025, 'csv')).toBe('fechamento-2025-faturamento-caixa.csv');
@@ -297,7 +299,7 @@ describe('rodada 1 de revisão', () => {
       mov({ id: 'real', quantity: 10, unit_cost: 2, balance_after: 10, avg_cost_after: 2, purchase_invoice_item_id: 'i1' }),
       mov({ id: 'teste', quantity: 5, unit_cost: 8, balance_after: 15, avg_cost_after: 4, purchase_invoice_item_id: 'i2', created_at: '2025-07-01T12:00:00-03:00' }),
       mov({ id: 'real2', quantity: 10, unit_cost: 3, balance_after: 25, avg_cost_after: 3.6, purchase_invoice_item_id: 'i3', created_at: '2025-08-01T12:00:00-03:00' }),
-      mov({ id: 'centavo', product_id: 'p2', balance_after: 3, avg_cost_after: 1.005 }),
+      mov({ id: 'centavo', product_id: 'p2', quantity: 3, unit_cost: 1.005, balance_after: 3, avg_cost_after: 1.005 }),
     ];
     const ids = testInvoiceMovementIds(movs, [{ id: 'i1', invoice_id: 'nf1' }, { id: 'i2', invoice_id: 'nf2' }, { id: 'i3', invoice_id: 'nf1' }], [{ id: 'nf1', environment: 'PRODUCTION' }, { id: 'nf2', environment: 'HOMOLOGATION' }]);
     expect([...ids]).toEqual(['teste']);
@@ -339,7 +341,7 @@ describe('revisão do Codex', () => {
   it('NF-e com dEmi (só a data) conta no ano da emissão, não no da importação', () => {
     expect(invoiceDate('2025-12-31')).toBe(Date.parse('2025-12-31T12:00:00-03:00'));
     expect(invoiceDate('2025-02-30')).toBeNull();
-    const inv = { id: 'n', supplier_id: 's', access_key: '1', number: '1', series: '1', issued_at: '2025-12-31', environment: 'PRODUCTION', invoice_amount: 80, imported_at: '2026-01-03T10:00:00-03:00' } as PurchaseInvoice;
+    const inv = { id: 'n', supplier_id: 's', access_key: Math.random().toString(), number: '1', series: '1', issued_at: '2025-12-31', environment: 'PRODUCTION', invoice_amount: 80, imported_at: '2026-01-03T10:00:00-03:00' } as PurchaseInvoice;
     const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P) };
     expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).rows[0]!.amount).toBe(80);
     expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, yearPeriod(2026)).rows[0]!.amount).toBe(0);
@@ -393,7 +395,7 @@ describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
     ({ id: Math.random().toString(), status: 'CLOSED', opened_at: '2026-11-14T08:00:00-03:00', closed_at: at9, opened_by_user_id: null, closed_by_user_id: null, opening_float: 0, expected_cash: 0, counted_cash: 0, difference: 0, ...s }) as CashSession;
   const cashMov = (m: Partial<CashMovement>): CashMovement => ({ id: Math.random().toString(), type: 'SUPPLY', amount: 10, reason: 'troco', created_at: at9, ...m }) as CashMovement;
   const invoice = (i: Partial<PurchaseInvoice>): PurchaseInvoice =>
-    ({ id: Math.random().toString(), supplier_id: 's', access_key: '1', number: '1', series: '1', issued_at: at9, environment: 'PRODUCTION', invoice_amount: 80, imported_at: at9, ...i }) as PurchaseInvoice;
+    ({ id: Math.random().toString(), supplier_id: 's', access_key: Math.random().toString(), number: '1', series: '1', issued_at: at9, environment: 'PRODUCTION', invoice_amount: 80, imported_at: at9, ...i }) as PurchaseInvoice;
   const delivery = (x: Partial<OwnDelivery>): OwnDelivery =>
     ({ id: Math.random().toString(), order_id: 'o1', status: 'DELIVERED', courier_id: 'c1', courier_fee: 7, pay_on_delivery: false, delivered_at: at9, settlement_id: null, ...x }) as OwnDelivery;
 
@@ -405,7 +407,7 @@ describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
   });
 
   it('inventário: 09:00 entra, 11:00 fica fora e é contado; aviso no CSV', () => {
-    const r = inventoryAt([product({})], [mov({ balance_after: 5, avg_cost_after: 2, created_at: at9 }), mov({ balance_after: 50, avg_cost_after: 9, created_at: at11 })], P26, new Set(), NOW);
+    const r = inventoryAt([product({})], [mov({ quantity: 5, unit_cost: 2, balance_after: 5, avg_cost_after: 2, created_at: at9 }), mov({ quantity: 45, unit_cost: 9.78, balance_after: 50, avg_cost_after: 9, created_at: at11 })], P26, new Set(), NOW);
     expect(r.rows.map((x) => [x.quantity, x.unitCost])).toEqual([[5, 2]]);
     expect([r.cutoff, r.afterCutoff]).toEqual([NOW.getTime(), 1]);
     expect(toCsv(inventoryDoc(r, base))).toContain(AVISO(1));
@@ -473,7 +475,7 @@ describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
   it('ano encerrado: o corte é 01/01 seguinte; 31/12 23:59 entra e 01/01 00:00 fica fora sem aviso', () => {
     const last = '2025-12-31T23:59:00-03:00';
     const next = '2026-01-01T00:00:00-03:00';
-    const inv = inventoryAt([product({})], [mov({ balance_after: 2, created_at: last }), mov({ balance_after: 9, created_at: next })], P, new Set(), NOW);
+    const inv = inventoryAt([product({})], [mov({ quantity: 2, balance_after: 2, created_at: last }), mov({ quantity: 7, balance_after: 9, created_at: next })], P, new Set(), NOW);
     expect([inv.rows[0]!.quantity, inv.cutoff, inv.afterCutoff]).toEqual([2, P.to, 0]);
     const rev = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 1, created_at: last }), pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 2, created_at: next })] }, P, NOW);
     expect([rev.totalGross, rev.cutoff, rev.afterCutoff]).toEqual([1, P.to, 0]);
@@ -560,5 +562,49 @@ describe('rodada interna 1: corte, futuro e HTML', () => {
     const html = toPrintableHtml(openDoc(open, base));
     expect(html).toContain('SITUAÇÃO DE REPASSE DESCONHECIDA: 1 venda(s)');
     expect(html).toContain('1 registro(s) com data a partir de 14/11/2026 10:00');
+  });
+});
+
+describe('rodada interna 2: contador, dados e exportação', () => {
+  const base = { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+
+  it('inventário soma só as entradas deste aparelho (não o saldo da loja vindo da nuvem)', () => {
+    // Aparelho B: o produto já tinha 10 un. de outro aparelho; B importou 5 (balance_after 15).
+    const r = inventoryAt([product({})], [mov({ quantity: 5, unit_cost: 4, balance_after: 15, avg_cost_after: 3 })], P);
+    expect([r.rows[0]!.quantity, r.rows[0]!.unitCost, r.totalCost]).toEqual([5, 4, 20]);
+    expect(toCsv(inventoryDoc(r, base))).toContain('importadas NESTE aparelho');
+  });
+
+  it('registro de outra loja que sobrou no aparelho fica fora e é contado', () => {
+    const r = ownStore([{ tenant_id: 'a' }, { tenant_id: 'b' }, { tenant_id: undefined }, { tenant_id: null }], 'a');
+    expect([r.rows.length, r.other]).toEqual([3, 1]);
+  });
+
+  it('NF-e repetida (mesma chave) conta uma vez e é avisada', () => {
+    const inv = (id: string) => ({ id, supplier_id: 's1', access_key: '4325'.padEnd(44, '1'), number: '1', series: '1', issued_at: '2025-03-01T10:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 10, imported_at: '2025-03-01T10:00:00-03:00' }) as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv('nuvem'), inv('recusada')], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW) }, P, NOW);
+    expect([r.purchases.length, r.duplicateInvoices, r.rows.find((x) => x.key === 'PURCHASES')!.amount]).toEqual([1, 1, 10]);
+    expect(toCsv(expensesDoc(r, base))).toContain('1 NF-e repetida(s)');
+  });
+
+  it('taxa de serviço das comandas fechadas no ano aparece à parte (está dentro do bruto)', () => {
+    const r = revenueByMethod({ ...emptyRevenueInput, orders: [
+      { status: 'CLOSED', closed_at: '2025-05-01T22:00:00-03:00', service_fee_amount: 10 },
+      { status: 'CLOSED', closed_at: '2026-01-01T00:10:00-03:00', service_fee_amount: 7 },
+      { status: 'OPEN', closed_at: null, service_fee_amount: 5 },
+    ] }, P, NOW);
+    expect(r.serviceFee).toBe(10);
+    expect(toCsv(revenueDoc(r, base))).toContain('Taxa de serviço (10%) das comandas fechadas no período: R$ 10,00');
+  });
+
+  it('venda sem taxa mais antiga que o maior prazo cadastrável já caiu e fica fora do aviso', () => {
+    const r = openPositionsAt({ payments: [pay({ amount: 50, method: 'CREDIT', acquirer: 'STONE', created_at: '2021-03-01T12:00:00-03:00' }), pay({ amount: 20, method: 'CREDIT', acquirer: 'STONE', created_at: '2025-01-10T12:00:00-03:00' })], feeRules: [], ownDeliveries: [], courierSettlements: [], couriers: [], orders: [] }, P, NOW);
+    expect([r.cardWithoutRule, r.cardWithoutRuleCount]).toEqual([20, 1]);
+  });
+
+  it('CSV: texto com vírgula vai entre aspas (quem separar por vírgula não cria célula com fórmula)', () => {
+    const csv = toCsv({ ...base, title: 'T', notes: [], tables: [{ title: 't', head: ['a'], rows: [['ok,@SUM(1)']] }] });
+    expect(csv).toContain('"ok,@SUM(1)"');
   });
 });

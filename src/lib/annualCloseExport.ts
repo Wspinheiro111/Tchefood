@@ -56,7 +56,7 @@ export interface ReportDoc {
  * mas ainda não devolve; src/lib/sync/cloudPull.ts). Todo relatório diz isso.
  */
 export const DEVICE_ONLY =
-  'SOMENTE os registros gravados NESTE aparelho. Vendas, pagamentos, caixa e estoque de outro aparelho da loja não estão aqui (a nuvem ainda não devolve esses dados). Com mais de um aparelho, gere o relatório em cada um e some. EXCEÇÃO: as compras por NF-e vêm da nuvem e são as mesmas em todos os aparelhos ligados a ela; NÃO some as compras de aparelhos diferentes.';
+  'SOMENTE os registros gravados NESTE aparelho. Vendas, pagamentos, caixa e entradas de estoque de outro aparelho da loja não estão aqui (a nuvem ainda não devolve esses dados). Com mais de um aparelho, gere o relatório em cada um e some. EXCEÇÃO: as compras por NF-e vêm da nuvem e são as mesmas em todos os aparelhos ligados a ela; NÃO some as compras de aparelhos diferentes (nota que ainda não subiu para a nuvem, ou foi recusada por ela, só está no aparelho que a importou). Se este aparelho foi ligado a outra loja ou zerado no meio do ano, o que havia antes não está aqui.';
 
 /** Aviso de registros que ficaram de fora por data inválida (nunca somem calados). */
 const invalid = (n: number, what: string): string[] =>
@@ -94,10 +94,10 @@ export function inventoryDoc(r: InventoryReport, base: Omit<ReportDoc, 'title' |
     ...base,
     title: REPORT_TITLE.inventory,
     notes: [
-      'Saldo pelo livro de estoque do Tchê Food: hoje ele registra só as ENTRADAS por NF-e de compra. As vendas ainda não baixam o estoque, então o saldo não é o físico. Faça a contagem física em 31/12 e use este relatório como conferência.',
+      'Saldo = soma das ENTRADAS por NF-e de compra importadas NESTE aparelho até a posição (o livro de estoque do Tchê Food ainda só registra entradas). As vendas não baixam o estoque e o saldo informado direto no cadastro do produto (sem nota) não entra, então o saldo não é o físico. Faça a contagem física em 31/12 e use este relatório como conferência.',
       'Custo unitário = custo médio ponderado das compras (com frete, IPI, ICMS-ST etc. da nota).',
       'A entrada conta pela data em que a nota foi IMPORTADA no app (nota emitida em 30/12 e importada em 03/01 não está neste saldo, mas está nas compras do ano).',
-      ...(r.testMovements > 0 ? [`${r.testMovements} entrada(s) por NF-e de homologação (teste) ficaram de fora; o saldo e o custo desses produtos foram refeitos só com as notas reais.`] : []),
+      ...(r.testMovements > 0 ? [`${r.testMovements} entrada(s) por NF-e de homologação (teste) ficaram de fora do saldo e do custo.`] : []),
       ...(r.missingNcm > 0 ? [`${r.missingNcm} produto(s) com saldo estão sem NCM válido (8 dígitos) no cadastro.`] : []),
       ...invalid(r.invalidDates, 'movimento(s) de estoque'),
       ...afterCutoffNote(r.afterCutoff, r.cutoff),
@@ -120,7 +120,9 @@ export function revenueDoc(r: RevenueReport, base: Omit<ReportDoc, 'title' | 'ta
     notes: [
       'Pagamentos aprovados pela data do pagamento (recusados ficam fora). Dinheiro devolvido ao cliente por sangria NÃO abate daqui: está na lista de sangrias do relatório de despesas. Gorjeta não entra no faturamento.',
       'Entrega própria paga em dinheiro conta na data do acerto com o entregador (é quando o dinheiro entra no caixa).',
-      'Taxa = estimativa pela taxa da maquininha cadastrada em Taxas e recebíveis, sobre conta + gorjeta (como a maquininha cobra). Confira com os extratos.',
+      'Taxa = estimativa pela taxa da maquininha cadastrada em Taxas e recebíveis, sobre conta + gorjeta (como a maquininha cobra). Confira com os extratos. O Líquido não tem a gorjeta: o que a maquininha deposita é Líquido + gorjeta de cartão.',
+      ...(r.serviceFee > 0 ? [`Taxa de serviço (10%) das comandas fechadas no período: R$ ${br(r.serviceFee)}. Ela está DENTRO do Bruto (veio nos pagamentos); pela Lei 13.419/2017 é gorjeta. Decida com o contador se sai da receita.`] : []),
+      'Sangrias aqui = todas as retiradas do caixa, inclusive o pagamento de entregador pela gaveta (que no relatório de despesas está em Taxas de entrega, não em sangrias sem categoria).',
       'Estorno feito na maquininha NÃO chega ao Tchê Food: abata pelo extrato da adquirente.',
       ...(r.rows.some((x) => x.key === 'VOUCHER' && x.notTracked) ? ['Vale-refeição/alimentação: o app ainda não registra esta forma; o que foi passado como VR/VA na maquininha está dentro de crédito/débito (com a taxa de crédito/débito). Separe pelo extrato da adquirente.'] : []),
       ...(r.cashOutsideSessionsCount > 0 ? [`${r.cashOutsideSessionsCount} recebimento(s) em dinheiro (R$ ${br(r.cashOutsideSessions)}) foram feitos sem turno de caixa aberto: estão no Dinheiro, mas não aparecem nos fechamentos.`] : []),
@@ -186,14 +188,15 @@ export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 
       'Estorno feito na maquininha NÃO chega ao Tchê Food: venda estornada ainda aparece aqui como a receber. Confira com a agenda da adquirente.',
       'A RECEBER de entregador: dinheiro de entregas pagas na entrega feitas até a posição e ainda não acertadas. O valor usa o total ATUAL do pedido menos o que foi pago até a posição: se o pedido foi alterado depois (desconto, item cancelado), o valor daquela data pode ser outro.',
       ...noRuleNote(r),
-      'NÃO registrados no Tchê Food (informe pelo seu controle): contas a pagar de fornecedores (boletos/duplicatas), fiado e convênios de clientes, repasses pendentes dos apps de delivery.',
+      'NÃO registrados no Tchê Food (informe pelo seu controle): contas a pagar de fornecedores (boletos/duplicatas), fiado e convênios de clientes, repasses pendentes dos apps de delivery, gorjetas e taxa de serviço ainda devidas à equipe.',
+      'Bases: o A receber de maquininha é sobre conta + gorjeta (o que a maquininha repassa); a situação de repasse desconhecida é só o valor da conta, sem a gorjeta.',
       ...invalid(r.invalidDates, 'entrega(s)'),
       ...afterCutoffNote(r.afterCutoff, r.cutoff),
       ...extraNotes,
     ],
     tables: [
       {
-        title: 'A receber: repasses de cartão/Pix pendentes na virada do ano',
+        title: 'A receber: repasses de cartão/Pix pendentes na posição',
         head: ['Maquininha', 'Forma', 'Qtde', 'Valor passado (R$)', 'Taxa estimada (R$)', 'Líquido a receber (R$)'],
         rows: r.cardReceivables.map((x) => [x.acquirer, METHOD_LABEL[x.method], String(x.count), x.gross, x.fee, x.net]),
         foot: ['Total', '', String(r.cardReceivables.reduce((a, x) => a + x.count, 0)), null, null, r.cardReceivablesNet],
@@ -220,7 +223,11 @@ export function expensesDoc(r: ExpensesReport, base: Omit<ReportDoc, 'title' | '
     title: REPORT_TITLE.expenses,
     notes: [
       'Total = só o que o app registra ou estima. Folha, aluguel e outras despesas não são registradas no Tchê Food e ficam de fora.',
+      'Compras de insumos entram no custo da mercadoria (CMV = estoque inicial + compras − estoque final), não como despesa operacional: separe na DRE.',
+      'Taxas da maquininha e comissões dos apps são as MESMAS já abatidas no Líquido do relatório de faturamento: se lançar a receita pelo Líquido, não lance estas taxas de novo.',
+      'Regime de caixa: taxas de entrega contam na data do acerto com o entregador. O que estava a pagar aos entregadores em 31/12 está no relatório de contas em aberto e entra aqui no ano do acerto.',
       ...(r.homologationInvoices > 0 ? [`${r.homologationInvoices} NF-e de homologação (teste) no ano ficaram de fora.`] : []),
+      ...(r.duplicateInvoices > 0 ? [`${r.duplicateInvoices} NF-e repetida(s) neste aparelho (mesma chave de acesso, importada duas vezes) foram contadas uma vez só.`] : []),
       ...(r.invalidIssueDates > 0 ? [`${r.invalidIssueDates} NF-e com data de emissão inválida foram contadas pela data da importação: confira o ano dessas notas.`] : []),
       ...invalid(r.invalidDates, 'nota(s), acerto(s) ou sangria(s)'),
       ...afterCutoffNote(r.afterCutoff, r.cutoff),
@@ -274,7 +281,9 @@ function csvCell(c: Cell): string {
   // Planilha executa célula que começa com = + - @ (mesmo depois de espaço, tab ou aspas):
   // vira texto com apóstrofo na frente.
   if (/^[\s"']*[=+\-@]/.test(s)) s = `'${s}`;
-  return /[;"\t]/.test(s) || s !== s.trim() ? `"${s.replace(/"/g, '""')}"` : s;
+  // Entre aspas também com vírgula: quem abrir o CSV separando por vírgula não parte a
+  // célula (nem cria uma célula nova começando com = + - @).
+  return /[;,"\t]/.test(s) || s !== s.trim() ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 const line = (cells: Cell[]) => cells.map(csvCell).join(';');
