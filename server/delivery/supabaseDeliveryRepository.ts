@@ -104,7 +104,9 @@ export class SupabaseDeliveryRepository implements DeliveryRepository {
           "content-type": "application/json",
           accept: "application/json",
         },
-        body: JSON.stringify(args),
+        // O Postgres recusa o caractere NUL em texto e JSONB ("unsupported Unicode escape sequence"): um NUL vindo
+        // do app (observação, nome) deixaria o pedido sem gravar e o evento sem ack para sempre. Sai antes de gravar.
+        body: JSON.stringify(args, (_key, value: unknown) => (typeof value === "string" ? value.replace(/\u0000/g, "") : value)),
         // O signal libera a conexão quando o prazo vence. Não garante que nada foi gravado: se o Postgres já
         // recebeu a chamada, ele termina a transação mesmo com o abort. Isso é seguro porque toda gravação é
         // idempotente ou leva a versão lida (o evento tem id único; o pedido só grava com a versão esperada, e a

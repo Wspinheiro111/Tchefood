@@ -131,6 +131,17 @@ function setup() {
 
   it('merchantId com espaço ou caractere fora do padrão não entra em delivery_integrations', () => {
     expect(() => sql(`INSERT INTO delivery_integrations (tenant_id, channel, merchant_external_id) VALUES ('${TENANT}', 'ifood', 'abc ')`)).toThrow(/merchant_format/);
+    // Os outros apps têm formatos próprios: a regra é só do iFood.
+    sql(`INSERT INTO delivery_integrations (tenant_id, channel, merchant_external_id, active) VALUES ('${TENANT}', 'rappi', 'loja_1.rs', false)`);
+  });
+
+  it('caractere NUL num texto do pedido não impede gravar (o Postgres não aceita NUL)', async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: [{ ...ITEMS[0]!, observations: 'sem\u0000cebola' }] });
+    const report = await inbox.runChannel(api);
+    expect(report).toMatchObject({ acknowledged: 1, deferred: 0 });
+    const record = await repository.getOrder('ifood', id);
+    expect(record?.order.items[0]?.notes).toBe('semcebola');
   });
 
   it('pedido de loja não ligada é recusado e fica sem ack', async () => {
