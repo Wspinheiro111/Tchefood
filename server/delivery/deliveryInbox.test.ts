@@ -865,4 +865,18 @@ describe("caixa de entrada de delivery", () => {
     const record = (await repository.getOrder("ifood", id))!;
     expect(record).toMatchObject({ newOrderNotified: true, order: { status: "cancelled" } });
   });
+
+  it("clique duplo numa ação de status chama o app uma vez só", async () => {
+    const { sandbox, api, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const spy = vi.spyOn(api, "performAction");
+    const results = await Promise.allSettled([inbox.performAction("ifood", id, "confirm"), inbox.performAction("ifood", id, "confirm")]);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+    // Terminada a chamada, a trava sai (a próxima ação do pedido segue normal).
+    await inbox.runCycle();
+    await inbox.performAction("ifood", id, "start_preparation");
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
 });

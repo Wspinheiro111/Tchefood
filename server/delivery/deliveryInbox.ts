@@ -175,6 +175,9 @@ export class DeliveryInbox {
   // Falhas seguidas do detalhe de pedido novo (auth_failed/not_found), por pedido. Só em memória: reiniciar o
   // processo recomeça a conta, o que só atrasa (nunca perde) o registro mínimo.
   private readonly detailFailures = new Map<string, number>();
+  // Ação de status em andamento por pedido (clique duplo / dois toques no mesmo aparelho): a segunda é recusada
+  // sem chamar o app. Vale só neste processo; o app recusa a transição repetida de qualquer forma.
+  private readonly actionsInFlight = new Set<string>();
 
   constructor(private readonly options: DeliveryInboxOptions) {
     for (const adapter of options.adapters) {
@@ -255,7 +258,16 @@ export class DeliveryInbox {
     if (!allowedDeliveryActions(record.order, record.cancellationPending).includes(action)) {
       throw new DeliveryMarketplaceError(channel, "conflict", `Ação "${action}" não é permitida com o pedido em "${record.order.status}".`);
     }
-    await adapter.performAction(externalOrderId, action);
+    const key = `${channel}:${externalOrderId}`;
+    if (this.actionsInFlight.has(key)) {
+      throw new DeliveryMarketplaceError(channel, "conflict", "Já há uma ação em andamento para este pedido; aguarde.");
+    }
+    this.actionsInFlight.add(key);
+    try {
+      await adapter.performAction(externalOrderId, action);
+    } finally {
+      this.actionsInFlight.delete(key);
+    }
     // O status oficial chega pelo evento do app; nada é gravado aqui, para que a resposta da ação nunca
     // sobrescreva um evento processado pelo polling enquanto a chamada estava em andamento.
     return this.requireOrder(channel, externalOrderId);

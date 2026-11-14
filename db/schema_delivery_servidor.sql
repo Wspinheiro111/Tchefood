@@ -20,6 +20,11 @@ ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS dispute JSONB;
 ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS cancellation_request JSONB;
 ALTER TABLE delivery_orders DROP CONSTRAINT IF EXISTS delivery_orders_version_positive;
 ALTER TABLE delivery_orders ADD CONSTRAINT delivery_orders_version_positive CHECK (version >= 1);
+-- merchantId cadastrado à mão: só letras, números e hífen (o polling ignora, com aviso no log, um id fora disso;
+-- NOT VALID para não travar a migração se já houver linha errada — o servidor ignora essa loja até corrigir).
+ALTER TABLE delivery_integrations DROP CONSTRAINT IF EXISTS delivery_integrations_merchant_format;
+ALTER TABLE delivery_integrations ADD CONSTRAINT delivery_integrations_merchant_format
+    CHECK (merchant_external_id ~ '^[A-Za-z0-9-]{1,64}$') NOT VALID;
 
 -- O app só lê. (Os privilégios padrão do Supabase dão tudo para anon/authenticated.)
 DO $$

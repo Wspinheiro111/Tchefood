@@ -28,11 +28,18 @@ iFood ──polling 30 s──> servidor (Node, 1 instância) ──service_role
 Todas exigem `Authorization: Bearer <JWT da sessão do app>`, menos `/health`.
 
 Cancelar, responder negociação, pausar e retomar a loja são ações de gerente: o corpo leva também
-`authorization: {managerPin, performedBy, requestId, reason}` (PIN de gerente de 4 a 8 dígitos, UUID do operador,
+`authorization: {managerPin, performedBy, requestId, reason}` (PIN de gerente de 4 a 6 dígitos, UUID do operador,
 UUID gerado pelo app por tentativa e motivo com 5 caracteres ou mais). O servidor confere o PIN no banco
 (`tchefood_delivery_authorize`, com o mesmo bloqueio de 3 erros em 60 s do PIN de gerente) ANTES de chamar o
 iFood; a autorização e o resultado da chamada ficam em `audit_logs`. Campos faltando: 400. PIN errado ou
-bloqueado: 403 com `code` (`PIN_FAILED`, `PIN_LOCKED`, `DENIED`); mesmo `requestId` reaproveitado em outra ação, alvo ou pessoa: 409 (reenvio igual devolve a mesma autorização).
+bloqueado: 403 com `code` (`PIN_FAILED`, `PIN_LOCKED`, `DENIED`); mesmo `requestId` reaproveitado em outra ação, alvo, pessoa, motivo
+ou conteúdo (código do cancelamento, resposta da negociação, duração da pausa): 409 `CONFLICT`. Reenvio idêntico (resposta
+perdida, toque repetido): 409 `ALREADY_SUBMITTED`, sem chamar o iFood de novo; a tela relê o pedido/loja. O que o gerente
+aprovou fica em `audit_logs.metadata.details`.
+
+Se o iFood aceitou e o banco falhou logo depois (cancelamento e negociação): 503 com `code: "sent_not_saved"` e "Enviado ao
+iFood, mas não deu para gravar; confira o pedido antes de repetir." O pedido fica reservado (nova tentativa recusada) até o
+evento do app chegar, ou por 10 min sem evento nenhum.
 
 | Método e rota | O que faz |
 |---|---|
@@ -158,4 +165,8 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
   retomar exigem o PIN de gerente (ver "API do servidor"); a tela que pede o PIN entra com o item 5.
 - Não há bloqueio automático de consulta/atualização 8 h depois da entrega (o servidor só consulta o detalhe no
   primeiro evento do pedido).
+- Erro 5xx do iFood numa ação da tela volta para a tela (não há nova tentativa automática); no polling o próximo ciclo
+  já tenta de novo. A doc de boas práticas recomenda nova tentativa automática: avaliar na homologação.
+- Todas as lojas vão num único `x-polling-merchants`. A doc fala em usar o header a partir de 100 lojas e torná-lo
+  obrigatório acima de 500, sem dizer o teto por requisição; com muitas lojas pode ser preciso dividir em lotes.
 - Não foi testado contra o iFood de verdade: depende das credenciais de teste do Portal do Desenvolvedor.

@@ -500,7 +500,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 function parseManager(raw: unknown): Omit<ManagerRequest, "action" | "externalOrderId" | "merchantExternalId" | "details"> | null {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
   const body = raw as Record<string, unknown>;
-  const managerPin = typeof body.managerPin === "string" && /^\d{4,8}$/.test(body.managerPin) ? body.managerPin : null;
+  const managerPin = typeof body.managerPin === "string" && /^\d{4,6}$/.test(body.managerPin) ? body.managerPin : null;
   const performedBy = typeof body.performedBy === "string" && UUID_PATTERN.test(body.performedBy) ? body.performedBy : null;
   const requestId = typeof body.requestId === "string" && UUID_PATTERN.test(body.requestId) ? body.requestId : null;
   const reason = text(body.reason, 250);

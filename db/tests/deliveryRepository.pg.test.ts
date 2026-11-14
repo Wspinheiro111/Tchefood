@@ -129,6 +129,10 @@ function setup() {
     expect(sql(`SELECT tenant_id || '|' || total_amount FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${TENANT}|77.00`);
   });
 
+  it('merchantId com espaço ou caractere fora do padrão não entra em delivery_integrations', () => {
+    expect(() => sql(`INSERT INTO delivery_integrations (tenant_id, channel, merchant_external_id) VALUES ('${TENANT}', 'ifood', 'abc ')`)).toThrow(/merchant_format/);
+  });
+
   it('pedido de loja não ligada é recusado e fica sem ack', async () => {
     const sandbox = new IfoodSandbox(undefined, '99999999-9999-4999-8999-999999999999');
     const api = new IfoodMerchantApi({ credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret }, baseUrl: sandbox.baseUrl, fetchImpl: sandbox.fetch });
