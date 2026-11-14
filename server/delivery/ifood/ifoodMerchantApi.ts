@@ -239,7 +239,9 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
     return body.map(mapIfoodInterruption);
   }
 
-  async pauseStore(merchantExternalId: string, pause: { description: string; start: string; end: string }): Promise<DeliveryStorePause> {
+  // id: o id da interrupção, escolhido por quem cria. O servidor passa o id da tentativa, para que a mesma tentativa
+  // nunca crie duas pausas; sem id, um UUID novo.
+  async pauseStore(merchantExternalId: string, pause: { id?: string; description: string; start: string; end: string }): Promise<DeliveryStorePause> {
     const description = pause.description.trim();
     const start = Date.parse(pause.start);
     const end = Date.parse(pause.end);
@@ -247,8 +249,11 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
       throw new DeliveryMarketplaceError("ifood", "invalid_request", "Pausa com início/fim inválidos.");
     }
-    // O id da interrupção é escolhido por quem cria (a confirmar no portal); um UUID novo evita colisão.
-    const id = crypto.randomUUID();
+    // O id da interrupção é escolhido por quem cria (a confirmar no portal).
+    if (pause.id !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pause.id)) {
+      throw new DeliveryMarketplaceError("ifood", "invalid_request", "Id da pausa inválido.");
+    }
+    const id = pause.id ?? crypto.randomUUID();
     const json = { id, description: description.slice(0, 200), start: new Date(start).toISOString(), end: new Date(end).toISOString() };
     const body = await this.request("POST", IFOOD_PATHS.interruptions(this.safeId(merchantExternalId, "loja")), { json });
     return body === null ? json : mapIfoodInterruption(body);

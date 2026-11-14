@@ -22,7 +22,11 @@ import {
 
 export type DeliveryOrderRecord = {
   order: DeliveryOrder;
+  // O app está analisando um pedido de cancelamento (evento CAR): nada anda até a resposta.
   cancellationPending: boolean;
+  // Pedido de cancelamento da loja reservado antes da chamada ao app (null = nenhum). Não trava as outras ações
+  // (isso é cancellationPending); só impede um segundo pedido de cancelamento.
+  cancellationRequest: DeliveryCancellationRequest | null;
   // Precisa de olho humano: avisos do pedido, status desconhecido, ação recusada pelo app.
   needsReview: boolean;
   reviewReasons: string[];
@@ -52,6 +56,32 @@ export type DeliveryDisputeResponse = {
   state: "sending" | "sent" | "uncertain";
   reservedAt: string;
 };
+
+// Pedido de cancelamento da loja, reservado ANTES da chamada ao app (mesmo esquema da resposta de negociação):
+// dois aparelhos ao mesmo tempo, ou uma nova tentativa depois de o banco falhar com o app já tendo aceitado,
+// não mandam um segundo cancelamento.
+//   sending   reservado, chamada em andamento (ou o processo caiu no meio: tratado como incerto)
+//   sent      o app aceitou o pedido; falta o evento dele (CAR, CARF ou CAN), que zera a reserva
+//   uncertain a chamada falhou sem resposta clara (rede, 5xx): pode ter chegado
+// "sending" e "uncertain" expiram em CANCELLATION_RESERVATION_TTL_MS: o app manda o CAR em segundos, então
+// passado esse prazo sem nenhum evento de cancelamento o pedido quase certamente não chegou, e a loja pode
+// tentar de novo (senão a reserva travaria o cancelamento para sempre).
+export type DeliveryCancellationRequest = {
+  state: "sending" | "sent" | "uncertain";
+  reservedAt: string;
+  code?: string;
+};
+
+export const CANCELLATION_RESERVATION_TTL_MS = 10 * 60_000;
+
+// O app aceitou a chamada, mas a gravação do resultado no banco falhou depois. Não é "banco indisponível, tente
+// de novo": o pedido já foi enviado e a tela precisa conferir antes de repetir.
+export class DeliverySentNotSavedError extends Error {
+  constructor(readonly channel: DeliveryChannelKey, readonly externalOrderId: string, readonly cause: unknown) {
+    super(`Enviado ao app, mas não deu para gravar o resultado do pedido ${externalOrderId} (${describe(cause)}).`);
+    this.name = "DeliverySentNotSavedError";
+  }
+}
 
 export class DeliveryConcurrencyError extends Error {
   constructor(readonly channel: DeliveryChannelKey, readonly externalOrderId: string) {
@@ -235,6 +265,8 @@ export class DeliveryInbox {
     return this.adapter(channel).listCancellationReasons(externalOrderId);
   }
 
+  // Pedido de cancelamento da loja. Reservado no pedido (gravação com versão) antes de chamar o app: dois pedidos
+  // ao mesmo tempo, ou uma nova tentativa depois de uma resposta incerta, não chegam ao app.
   async requestCancellation(
     channel: DeliveryChannelKey,
     externalOrderId: string,
@@ -242,24 +274,54 @@ export class DeliveryInbox {
     details?: string,
   ): Promise<DeliveryOrderRecord> {
     const adapter = this.adapter(channel);
-    const record = await this.requireOrder(channel, externalOrderId);
-    if (["concluded", "cancelled"].includes(record.order.status)) {
-      throw new DeliveryMarketplaceError(channel, "conflict", "Pedido já finalizado não pode ser cancelado.");
-    }
-    if (record.cancellationPending) {
-      throw new DeliveryMarketplaceError(channel, "conflict", "O cancelamento já foi pedido; aguarde a resposta do app.");
-    }
-    const cancellationSeenBefore = record.lastCancellationEventAt;
-    await adapter.requestCancellation(externalOrderId, reason, details);
-    // Relê o pedido depois da resposta: o polling pode ter gravado eventos (até o próprio cancelamento) enquanto
-    // a chamada estava em andamento, e a foto lida antes não pode sobrescrever isso.
-    return this.updateOrder(channel, externalOrderId, (latest) => {
-      // Se o polling aplicou algum evento de cancelamento (recusa ou confirmação) durante a chamada, ele manda.
-      const cancellationAdvanced = latest.lastCancellationEventAt !== cancellationSeenBefore;
-      if (cancellationAdvanced || latest.order.status === "cancelled" || latest.order.status === "concluded") return false;
-      latest.cancellationPending = true;
+    const reservedAt = this.now().toISOString();
+    await this.updateOrder(channel, externalOrderId, (latest) => {
+      if (latest.order.status === "concluded" || latest.order.status === "cancelled") {
+        throw new DeliveryMarketplaceError(channel, "conflict", "Pedido já finalizado não pode ser cancelado.");
+      }
+      if (latest.cancellationPending) {
+        throw new DeliveryMarketplaceError(channel, "conflict", "O cancelamento já foi pedido; aguarde a resposta do app.");
+      }
+      const current = latest.cancellationRequest;
+      if (current) {
+        const expired = current.state !== "sent" && Date.parse(current.reservedAt) + CANCELLATION_RESERVATION_TTL_MS <= this.now().getTime();
+        if (!expired) {
+          throw new DeliveryMarketplaceError(
+            channel,
+            "conflict",
+            current.state === "sent"
+              ? "O cancelamento já foi pedido; aguarde a resposta do app."
+              : "Já existe um pedido de cancelamento em andamento ou sem confirmação; confira o pedido no app antes de repetir.",
+          );
+        }
+      }
+      latest.cancellationRequest = { state: "sending", reservedAt, code: reason.code };
       return true;
     });
+    // Só mexe na reserva deste pedido: se um evento de cancelamento (CAR, CARF, CAN) chegou no meio, ele manda.
+    const ours = (latest: DeliveryOrderRecord) => latest.cancellationRequest?.reservedAt === reservedAt;
+    try {
+      await adapter.requestCancellation(externalOrderId, reason, details);
+    } catch (error) {
+      // Recusa clara do app: nada foi aplicado e a reserva é desfeita. Qualquer outra falha pode ter chegado.
+      const definite = error instanceof DeliveryMarketplaceError && DEFINITE_FAILURES.includes(error.code);
+      await this.updateOrder(channel, externalOrderId, (latest) => {
+        if (!ours(latest)) return false;
+        latest.cancellationRequest = definite ? null : { ...latest.cancellationRequest!, state: "uncertain" };
+        return true;
+      }).catch(() => undefined);
+      throw error;
+    }
+    try {
+      return await this.updateOrder(channel, externalOrderId, (latest) => {
+        if (!ours(latest)) return false;
+        latest.cancellationRequest = { ...latest.cancellationRequest!, state: "sent" };
+        if (latest.order.status !== "cancelled" && latest.order.status !== "concluded") latest.cancellationPending = true;
+        return true;
+      });
+    } catch (error) {
+      throw new DeliverySentNotSavedError(channel, externalOrderId, error);
+    }
   }
 
   // Confere a resposta contra a negociação gravada sem gravar nada nem chamar o app (o servidor usa antes de pedir
@@ -315,13 +377,17 @@ export class DeliveryInbox {
       }).catch(() => undefined);
       throw error;
     }
-    return this.updateOrder(channel, externalOrderId, (latest) => {
-      const dispute = ours(latest);
-      if (!dispute) return false;
-      dispute.response = { ...dispute.response!, state: "sent" };
-      dispute.respondedAt = this.now().toISOString();
-      return true;
-    });
+    try {
+      return await this.updateOrder(channel, externalOrderId, (latest) => {
+        const dispute = ours(latest);
+        if (!dispute) return false;
+        dispute.response = { ...dispute.response!, state: "sent" };
+        dispute.respondedAt = this.now().toISOString();
+        return true;
+      });
+    } catch (error) {
+      throw new DeliverySentNotSavedError(channel, externalOrderId, error);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -403,6 +469,7 @@ export class DeliveryInbox {
       record = {
         order,
         cancellationPending: false,
+        cancellationRequest: null,
         needsReview: order.warnings.length > 0,
         reviewReasons: [...order.warnings],
         newOrderNotified: false,
@@ -477,6 +544,8 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
     // Evento de cancelamento atrasado (ex.: o pedido chegando depois da recusa) não reabre nada.
     if (record.lastCancellationEventAt !== null && event.createdAt < record.lastCancellationEventAt) return;
     record.lastCancellationEventAt = event.createdAt;
+    // O app respondeu (CAR = recebeu o pedido, CARF = recusou): a reserva do pedido da loja acabou.
+    record.cancellationRequest = null;
   }
   switch (event.signal) {
     case "cancellation_requested":
@@ -524,6 +593,7 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
       record.order.status = mergeDeliveryStatus(before, event.signal);
       if (record.order.status === "cancelled") {
         record.cancellationPending = false;
+        record.cancellationRequest = null;
         record.dispute = null;
         if (before !== "cancelled" && before !== "placed") {
           flag(record, "Pedido cancelado pelo app depois de aceito: confira se já foi preparado ou impresso.");

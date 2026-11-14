@@ -82,6 +82,15 @@ describe('supabase/migrations', () => {
     // anterior à última aplicada fica fora do `supabase db push` normal.
     expect(idx('schema_delivery_servidor.sql')).toBe(files.length - 1);
     expect(idx('schema_delivery_servidor.sql')).toBeGreaterThan(idx('schema_pin_gerente_trava.sql'));
+    // O delivery refaz o guarda dos audit_logs (versão da conciliação do cashback + o bloqueio de DELIVERY_*):
+    // é a última que o define e mantém todos os bloqueios anteriores.
+    const guardOf = (f: string) => /CREATE OR REPLACE FUNCTION tchefood_guard_audit_insert\(\)[\s\S]*?\n\$\$;/.exec(readFileSync(f, 'utf8'))?.[0] ?? '';
+    const definesGuard = files.filter((f) => guardOf(join(MIGRATIONS, f)) !== '');
+    expect(definesGuard.at(-1)).toBe(files[idx('schema_delivery_servidor.sql')]);
+    const previousGuard = guardOf(join(ROOT, 'db', 'schema_cashback_conciliacao.sql'));
+    for (const block of previousGuard.split('\n').filter((line) => line.trim().startsWith('IF ') || line.trim().startsWith('RAISE '))) {
+      expect(guardOf(join(ROOT, 'db', 'schema_delivery_servidor.sql')), block).toContain(block);
+    }
     expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_pin_equipe_trava.sql'));
     // A trava do PIN da equipe refaz tchefood_check_pin, tchefood_save_staff e tchefood_start_store
     // (versão de schema_equipe.sql) e usa a mesma chave da conciliação do cashback: é a última que as define.

@@ -15,12 +15,20 @@
 
 ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS dispute JSONB;
+-- Pedido de cancelamento da loja reservado antes da chamada ao app ({state, reservedAt, code}; ver
+-- DeliveryCancellationRequest em server/delivery/deliveryInbox.ts). NULL = nenhum.
+ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS cancellation_request JSONB;
 ALTER TABLE delivery_orders DROP CONSTRAINT IF EXISTS delivery_orders_version_positive;
 ALTER TABLE delivery_orders ADD CONSTRAINT delivery_orders_version_positive CHECK (version >= 1);
 
 -- O app só lê. (Os privilégios padrão do Supabase dão tudo para anon/authenticated.)
-REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON delivery_orders, delivery_events, delivery_integrations FROM anon, authenticated;
-REVOKE ALL ON delivery_orders, delivery_events, delivery_integrations FROM anon;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON delivery_orders, delivery_events, delivery_integrations FROM anon, authenticated;
+        REVOKE ALL ON delivery_orders, delivery_events, delivery_integrations FROM anon;
+    END IF;
+END $$;
 
 -- Loja do Tchê Food dona de um merchantId do app (só integração ativa).
 CREATE OR REPLACE FUNCTION tchefood_delivery_tenant(p_channel delivery_channel, p_merchant VARCHAR)
@@ -46,6 +54,7 @@ LANGUAGE sql STABLE SET search_path = public AS $$
     SELECT jsonb_build_object(
         'order', o.payload || jsonb_build_object('status', o.status::text),
         'cancellationPending', o.cancellation_pending,
+        'cancellationRequest', o.cancellation_request,
         'needsReview', o.needs_review,
         'reviewReasons', to_jsonb(o.review_reasons),
         'newOrderNotified', o.new_order_notified,
@@ -117,7 +126,7 @@ BEGIN
         END IF;
         INSERT INTO delivery_orders (tenant_id, channel, external_id, display_id, status, cancellation_pending, needs_review,
                                      review_reasons, new_order_notified, last_cancellation_event_at, total_amount, payload,
-                                     placed_at, last_event_at, updated_at, dispute, version)
+                                     placed_at, last_event_at, updated_at, dispute, cancellation_request, version)
         VALUES (v_tenant, p_channel, v_external, left(COALESCE(v_order->>'displayId', ''), 20),
                 (v_order->>'status')::delivery_order_status,
                 COALESCE((p_record->>'cancellationPending')::BOOLEAN, FALSE),
@@ -127,7 +136,7 @@ BEGIN
                 (p_record->>'lastCancellationEventAt')::TIMESTAMPTZ,
                 v_total / 100, v_order - 'status',
                 (v_order->>'createdAt')::TIMESTAMPTZ, (p_record->>'lastEventAt')::TIMESTAMPTZ, NOW(),
-                NULLIF(p_record->'dispute', 'null'::jsonb), 1)
+                NULLIF(p_record->'dispute', 'null'::jsonb), NULLIF(p_record->'cancellationRequest', 'null'::jsonb), 1)
         ON CONFLICT (channel, external_id) DO NOTHING
         RETURNING version INTO v_version;
         RETURN v_version;
@@ -143,6 +152,7 @@ BEGIN
            last_cancellation_event_at = (p_record->>'lastCancellationEventAt')::TIMESTAMPTZ,
            last_event_at = (p_record->>'lastEventAt')::TIMESTAMPTZ,
            dispute = NULLIF(p_record->'dispute', 'null'::jsonb),
+           cancellation_request = NULLIF(p_record->'cancellationRequest', 'null'::jsonb),
            updated_at = NOW(),
            version = version + 1
      WHERE channel = p_channel AND external_id = v_external AND version = p_expected_version
@@ -181,11 +191,17 @@ END $$;
 -- JWT do app ANTES de chamar o iFood: a loja é a da sessão (tchefood_tenant), o pedido ou o
 -- merchantId precisa ser dessa loja, o PIN é de gerente/dono ativo e conta no mesmo bloqueio
 -- de 3 erros em 60 s de tchefood_authorize_manager (mesma trava e mesmos registros
--- MANAGER_PIN_FAILED / MANAGER_PIN_LOCKOUT). A autorização vira um audit_log com gerente.
--- Devolve {"status": "OK", "auditId"} ou {"status": "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT"}.
+-- MANAGER_PIN_FAILED / MANAGER_PIN_LOCKOUT). A autorização vira um audit_log com gerente, com o
+-- que o gerente aprovou em metadata.details (p_details: cancelamento {code}, negociação
+-- {kind, alternativeId?}, pausa {minutes, description}, retomada {pauseId}).
+-- Devolve {"status": "OK", "auditId", "repeated"} ou {"status": "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT"}.
+-- repeated = TRUE: reenvio de uma tentativa já autorizada; o servidor NÃO chama o app de novo.
 -- -----------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_audit_logs_delivery_request
     ON audit_logs (tenant_id, (metadata->>'delivery_request_id')) WHERE metadata ? 'delivery_request_id';
+
+-- A assinatura ganhou p_details: a versão antiga (sem ele) sai antes, senão ficariam as duas.
+DROP FUNCTION IF EXISTS tchefood_delivery_authorize(delivery_channel, VARCHAR, VARCHAR, VARCHAR, VARCHAR, UUID, TEXT, UUID);
 
 CREATE OR REPLACE FUNCTION tchefood_delivery_authorize(
     p_channel delivery_channel,
@@ -195,9 +211,10 @@ CREATE OR REPLACE FUNCTION tchefood_delivery_authorize(
     p_manager_pin VARCHAR,
     p_performed_by UUID,
     p_reason TEXT,
-    p_request_id UUID
+    p_request_id UUID,
+    p_details JSONB
 ) RETURNS JSONB
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
     v_tenant UUID := tchefood_tenant();
     v_manager staff_users%ROWTYPE;
@@ -218,6 +235,17 @@ BEGIN
     END IF;
     IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
         RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: motivo obrigatório (mínimo 5 caracteres).' USING ERRCODE = '22023';
+    END IF;
+    IF p_details IS NULL OR jsonb_typeof(p_details) <> 'object' OR NOT COALESCE(CASE p_action
+           WHEN 'DELIVERY_CANCEL' THEN jsonb_typeof(p_details->'code') = 'string'
+           WHEN 'DELIVERY_DISPUTE' THEN p_details->>'kind' IN ('accept', 'reject', 'alternative')
+                AND (p_details->>'kind' <> 'alternative' OR jsonb_typeof(p_details->'alternativeId') = 'string')
+           WHEN 'DELIVERY_PAUSE' THEN jsonb_typeof(p_details->'minutes') = 'number'
+                AND jsonb_typeof(p_details->'description') = 'string'
+                AND (p_details->>'minutes')::NUMERIC BETWEEN 1 AND 1440
+           WHEN 'DELIVERY_RESUME' THEN jsonb_typeof(p_details->'pauseId') = 'string'
+       END, FALSE) THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: detalhes de % inválidos.', p_action USING ERRCODE = '22023';
     END IF;
     IF v_order_action THEN
         IF COALESCE(p_external_order_id, '') = '' OR p_merchant_external_id IS NOT NULL THEN
@@ -268,7 +296,8 @@ BEGIN
     END IF;
 
     -- Reenvio da mesma tentativa (resposta perdida): devolve a autorização já gravada, se for a mesma ação,
-    -- no mesmo alvo, pelo mesmo gerente e operador. Diferente disso é conflito (nada é gravado).
+    -- no mesmo alvo, pelo mesmo gerente e operador, com o mesmo motivo e os mesmos detalhes aprovados.
+    -- Diferente disso é conflito (nada é gravado).
     SELECT * INTO v_existing FROM audit_logs a
      WHERE a.tenant_id = v_tenant AND a.authorized_by_manager_id IS NOT NULL
        AND a.metadata->>'delivery_request_id' = p_request_id::text
@@ -280,7 +309,9 @@ BEGIN
            AND v_existing.metadata->>'external_order_id' IS NOT DISTINCT FROM p_external_order_id
            AND v_existing.metadata->>'merchant_external_id' IS NOT DISTINCT FROM p_merchant_external_id
            AND v_existing.authorized_by_manager_id = v_manager.id
-           AND v_existing.performed_by_user_id = p_performed_by THEN
+           AND v_existing.performed_by_user_id = p_performed_by
+           AND v_existing.reason = trim(p_reason)
+           AND v_existing.metadata->'details' IS NOT DISTINCT FROM p_details THEN
             RETURN jsonb_build_object('status', 'OK', 'auditId', v_existing.id, 'repeated', TRUE);
         END IF;
         RETURN jsonb_build_object('status', 'CONFLICT');
@@ -289,15 +320,15 @@ BEGIN
     INSERT INTO audit_logs (tenant_id, performed_by_user_id, authorized_by_manager_id, action_type, reason, metadata, created_at)
     VALUES (v_tenant, p_performed_by, v_manager.id, p_action, trim(p_reason),
             jsonb_build_object('channel', p_channel, 'external_order_id', p_external_order_id,
-                               'merchant_external_id', p_merchant_external_id, 'delivery_request_id', p_request_id),
+                               'merchant_external_id', p_merchant_external_id, 'delivery_request_id', p_request_id,
+                               'details', p_details),
             v_checked_at)
     RETURNING id INTO v_id;
-    RETURN jsonb_build_object('status', 'OK', 'auditId', v_id);
+    RETURN jsonb_build_object('status', 'OK', 'auditId', v_id, 'repeated', FALSE);
 END $$;
 
 -- Resultado da chamada ao app para uma autorização acima (audit_logs é só de inserção: outro registro).
--- Só o servidor grava (o servidor grava um resultado por chamada; não há conferência de repetido porque o app
--- consegue inserir audit_logs sem gerente, e um registro forjado não pode impedir o verdadeiro).
+-- Só o servidor grava, um resultado por chamada (o app não insere DELIVERY_*: tchefood_guard_audit_insert abaixo).
 CREATE OR REPLACE FUNCTION tchefood_delivery_audit_result(p_audit_id UUID, p_outcome VARCHAR, p_detail TEXT)
 RETURNS VOID
 LANGUAGE plpgsql SET search_path = public AS $$
@@ -319,10 +350,39 @@ BEGIN
             v_auth.metadata || jsonb_build_object('authorization_id', p_audit_id, 'action', v_auth.action_type, 'outcome', p_outcome));
 END $$;
 
+-- O aparelho não grava os registros de delivery direto: a autorização sai de tchefood_delivery_authorize e o
+-- resultado de tchefood_delivery_audit_result (servidor). Versão de schema_cashback_conciliacao.sql + o bloqueio
+-- de DELIVERY_*. As funções SECURITY DEFINER rodam como o dono e seguem gravando; o service_role também.
+CREATE OR REPLACE FUNCTION tchefood_guard_audit_insert()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.authorized_by_manager_id IS NOT NULL AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: autorização de gerente só pode ser registrada por tchefood_authorize_manager().';
+    END IF;
+    IF NEW.action_type = 'CASHBACK_REDEEMED' AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o registro do resgate só é gravado por tchefood_register_cashback_redeem.';
+    END IF;
+    IF NEW.action_type IN ('CASHBACK_REFUNDED', 'CASHBACK_REFUND_HELD') AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_CASHBACK: o estorno do cashback só é gravado pelo banco, no cancelamento do item.';
+    END IF;
+    IF NEW.action_type = 'CASHBACK_RECONCILED' AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_CASHBACK: a conciliação do cashback só é gravada por tchefood_reconcile_cashback.';
+    END IF;
+    IF NEW.action_type IN ('DELIVERY_RESULT', 'DELIVERY_CANCEL', 'DELIVERY_DISPUTE', 'DELIVERY_PAUSE', 'DELIVERY_RESUME')
+       AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: registros de delivery só são gravados pelo servidor do delivery.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
 -- Só o servidor (service_role) chama estas funções.
 DO $$
 DECLARE f TEXT;
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        RETURN;
+    END IF;
     FOREACH f IN ARRAY ARRAY[
         'tchefood_delivery_tenant(delivery_channel, VARCHAR)',
         'tchefood_delivery_active_merchants(delivery_channel)',
@@ -336,8 +396,7 @@ BEGIN
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC, anon, authenticated', f);
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role', f);
     END LOOP;
+    -- A autorização de gerente é chamada pelo app (papel authenticated), pelo servidor, com o JWT da sessão.
+    REVOKE ALL ON FUNCTION tchefood_delivery_authorize(delivery_channel, VARCHAR, VARCHAR, VARCHAR, VARCHAR, UUID, TEXT, UUID, JSONB) FROM PUBLIC, anon;
+    GRANT EXECUTE ON FUNCTION tchefood_delivery_authorize(delivery_channel, VARCHAR, VARCHAR, VARCHAR, VARCHAR, UUID, TEXT, UUID, JSONB) TO authenticated;
 END $$;
-
--- A autorização de gerente é chamada pelo app (papel authenticated), pelo servidor, com o JWT da sessão.
-REVOKE ALL ON FUNCTION tchefood_delivery_authorize(delivery_channel, VARCHAR, VARCHAR, VARCHAR, VARCHAR, UUID, TEXT, UUID) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION tchefood_delivery_authorize(delivery_channel, VARCHAR, VARCHAR, VARCHAR, VARCHAR, UUID, TEXT, UUID) TO authenticated;

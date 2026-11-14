@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DeliveryConcurrencyError,
   DeliveryInbox,
+  DeliverySentNotSavedError,
   InMemoryDeliveryRepository,
   ORDER_DETAIL_MAX_FAILURES,
   type DeliveryOrderRecord,
@@ -695,6 +696,103 @@ describe("caixa de entrada de delivery", () => {
     const result = await inbox.requestCancellation("ifood", id, reason);
     expect(result.cancellationPending).toBe(true);
     expect((await inbox.listOrders())[0].cancellationPending).toBe(true);
+  });
+
+  it("cancelamento: dois pedidos ao mesmo tempo chegam ao iFood uma vez só", async () => {
+    const { sandbox, api, inbox } = setup();
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    const spy = vi.spyOn(api, "requestCancellation");
+    const results = await Promise.allSettled([inbox.requestCancellation("ifood", id, reason), inbox.requestCancellation("ifood", id, reason)]);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+  });
+
+  it("cancelamento: outro processo com a mesma leitura também não manda o segundo (versão no banco)", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const other = new DeliveryInbox({ adapters: [api], repository });
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    const spy = vi.spyOn(api, "requestCancellation");
+    await inbox.requestCancellation("ifood", id, reason);
+    await expect(other.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "conflict" });
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancelamento: iFood aceitou e o banco falhou depois: erro próprio e nova tentativa recusada sem chamar o iFood", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    const spy = vi.spyOn(api, "requestCancellation");
+    const save = repository.saveOrder.bind(repository);
+    let calls = 0;
+    vi.spyOn(repository, "saveOrder").mockImplementation(async (record) => {
+      calls += 1;
+      if (calls >= 2) throw new Error("banco fora do ar");
+      return save(record);
+    });
+    const failure = await inbox.requestCancellation("ifood", id, reason).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DeliverySentNotSavedError);
+    vi.mocked(repository.saveOrder).mockImplementation(save);
+    expect((await repository.getOrder("ifood", id))!.cancellationRequest).toMatchObject({ state: "sending", code: reason.code });
+    await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "conflict" });
+    expect(spy).toHaveBeenCalledTimes(1);
+    // A reserva não trava o pedido: confirmar segue valendo enquanto o app não responde.
+    await inbox.performAction("ifood", id, "confirm");
+    // O evento do app (CAR) fecha a reserva; o pedido fica pendente de cancelamento.
+    await inbox.runCycle();
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record.cancellationRequest).toBeNull();
+    expect(record.cancellationPending).toBe(true);
+  });
+
+  it("cancelamento: falha incerta bloqueia nova tentativa por 10 min; recusa clara libera; recusa do app (CARF) limpa", async () => {
+    let now = new Date("2026-11-14T15:00:00.000Z");
+    const { sandbox, api, repository, inbox } = setup({ now: () => now });
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    sandbox.failNext("/requestCancellation", 400);
+    await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "invalid_request" });
+    expect((await repository.getOrder("ifood", id))!.cancellationRequest).toBeNull();
+    vi.spyOn(api, "requestCancellation").mockRejectedValueOnce(new TypeError("fetch failed"));
+    await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toThrow(/fetch failed/);
+    expect((await repository.getOrder("ifood", id))!.cancellationRequest?.state).toBe("uncertain");
+    await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "conflict" });
+    now = new Date(now.getTime() + 9 * 60_000);
+    await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "conflict" });
+    // Passado o prazo sem nenhum evento do app, a incerta expira e uma nova tentativa é aceita.
+    now = new Date(now.getTime() + 2 * 60_000);
+    const pending = await inbox.requestCancellation("ifood", id, reason);
+    expect(pending).toMatchObject({ cancellationPending: true, cancellationRequest: { state: "sent" } });
+    sandbox.decideCancellation(id, false);
+    await inbox.runCycle();
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record.cancellationRequest).toBeNull();
+    expect(record.cancellationPending).toBe(false);
+  });
+
+  it("negociação: iFood aceitou e o banco falhou depois: erro próprio (não 'banco indisponível')", async () => {
+    const { sandbox, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id);
+    await inbox.runCycle();
+    const save = repository.saveOrder.bind(repository);
+    let calls = 0;
+    vi.spyOn(repository, "saveOrder").mockImplementation(async (record) => {
+      calls += 1;
+      if (calls >= 2) throw new Error("banco fora do ar");
+      return save(record);
+    });
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toBeInstanceOf(DeliverySentNotSavedError);
   });
 
   it("detalhe ilegível (valor negativo, sem itens): pedido entra mínimo, para conferência, e o evento recebe ack", async () => {

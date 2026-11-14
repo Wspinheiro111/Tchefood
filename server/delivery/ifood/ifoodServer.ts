@@ -1,4 +1,4 @@
-import { DeliveryConcurrencyError, DeliveryInbox, type DeliveryCycleReport, type DeliveryOrderRecord } from "../deliveryInbox";
+import { DeliveryConcurrencyError, DeliveryInbox, DeliverySentNotSavedError, type DeliveryCycleReport, type DeliveryOrderRecord } from "../deliveryInbox";
 import {
   DeliveryMarketplaceError,
   type DeliveryDisputeDecision,
@@ -197,10 +197,15 @@ export type ManagerRequest = {
   reason: string;
   // Gerado pelo app por tentativa: o reenvio da mesma autorização não grava outra.
   requestId: string;
+  // O que o gerente aprovou, montado pelo servidor a partir do corpo já validado (gravado na autorização; o
+  // reenvio com outro conteúdo é conflito): cancelamento {code}, negociação {kind, alternativeId?}, pausa
+  // {minutes, description}, retomada {pauseId}.
+  details: Record<string, unknown>;
 };
 
 export type ManagerDecision =
-  | { status: "OK"; auditId: string }
+  // repeated: o banco já tinha esta tentativa (reenvio): a ação já foi mandada, ou está sendo, por outra requisição.
+  | { status: "OK"; auditId: string; repeated?: boolean }
   | { status: "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT" | "DENIED"; message: string };
 
 export type ManagerOutcome = "sent" | "failed" | "uncertain";
@@ -239,6 +244,7 @@ export class SupabaseManagerApproval implements ManagerApproval {
           p_performed_by: request.performedBy,
           p_reason: request.reason,
           p_request_id: request.requestId,
+          p_details: request.details,
         }),
       },
       this.timeoutMs,
@@ -255,7 +261,7 @@ export class SupabaseManagerApproval implements ManagerApproval {
       throw new DeliveryRepositoryError("Resposta da autorização não é JSON.");
     }
     const record = body !== null && typeof body === "object" ? (body as Record<string, unknown>) : {};
-    if (record.status === "OK" && typeof record.auditId === "string") return { status: "OK", auditId: record.auditId };
+    if (record.status === "OK" && typeof record.auditId === "string") return { status: "OK", auditId: record.auditId, repeated: record.repeated === true };
     if (record.status === "PIN_FAILED") return { status: "PIN_FAILED", message: "PIN de gerente incorreto." };
     if (record.status === "PIN_LOCKED") return { status: "PIN_LOCKED", message: "PIN de gerente bloqueado por 1 minuto (3 erros)." };
     if (record.status === "CONFLICT") return { status: "CONFLICT", message: "Esta autorização já foi usada para outra ação." };
@@ -330,6 +336,11 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
     if (decision.status !== "OK") {
       return { status: decision.status === "CONFLICT" ? 409 : 403, body: { error: decision.message, code: decision.status } };
     }
+    // Reenvio da mesma tentativa (resposta perdida, toque duplo): a primeira requisição já chamou (ou está chamando)
+    // o iFood. Chamar de novo mandaria um segundo cancelamento ou criaria outra pausa.
+    if (decision.repeated) {
+      return { status: 409, body: { error: "Esta tentativa já foi enviada ao iFood; confira o pedido ou a loja antes de repetir.", code: "ALREADY_SUBMITTED" } };
+    }
     const record = (outcome: ManagerOutcome, detail: string) =>
       options.approval.recordResult(decision.auditId, outcome, detail).catch((error: unknown) => {
         log(`[ifood] resultado da autorização ${decision.auditId} não gravado (${outcome}): ${error instanceof Error ? error.message : String(error)}`);
@@ -340,7 +351,9 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
       return response;
     } catch (error) {
       const definite = error instanceof DeliveryMarketplaceError && ["invalid_request", "not_found", "conflict", "auth_failed", "rate_limited"].includes(error.code);
-      await record(definite ? "failed" : "uncertain", error instanceof Error ? error.message : String(error));
+      // O iFood aceitou e só a gravação local falhou: para a auditoria, foi enviado.
+      const outcome: ManagerOutcome = error instanceof DeliverySentNotSavedError ? "sent" : definite ? "failed" : "uncertain";
+      await record(outcome, error instanceof Error ? error.message : String(error));
       throw error;
     }
   };
@@ -387,7 +400,8 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           const reasons = await options.inbox.listCancellationReasons("ifood", orderId);
           const reason = reasons.find((candidate) => candidate.code === code);
           if (!reason) return { status: 400, body: { error: "Motivo não está entre os aceitos pelo iFood para este pedido." } };
-          return await withManager(token, { ...manager, action: "DELIVERY_CANCEL", externalOrderId: orderId, merchantExternalId: null }, async () => ({
+          const cancel = { ...manager, action: "DELIVERY_CANCEL" as const, externalOrderId: orderId, merchantExternalId: null, details: { code: reason.code } };
+          return await withManager(token, cancel, async () => ({
             status: 200,
             body: publicRecord(await options.inbox.requestCancellation("ifood", orderId, reason, text(body.details, 250) ?? undefined)),
           }));
@@ -400,7 +414,9 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
           // Motivo do aceite, valor e prazo da proposta conferidos contra a negociação gravada antes do PIN.
           await options.inbox.checkDisputeDecision("ifood", orderId, decision);
-          return await withManager(token, { ...manager, action: "DELIVERY_DISPUTE", externalOrderId: orderId, merchantExternalId: null }, async () => ({
+          // O registro do gerente leva a resposta inteira (aceite com motivo, recusa, valor ou prazo da proposta).
+          const details = JSON.parse(JSON.stringify(decision)) as Record<string, unknown>;
+          return await withManager(token, { ...manager, action: "DELIVERY_DISPUTE", externalOrderId: orderId, merchantExternalId: null, details }, async () => ({
             status: 200,
             body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision)),
           }));
@@ -428,18 +444,21 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           }
           const manager = parseManager(body.authorization);
           if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
-          return await withManager(token, { ...manager, action: "DELIVERY_PAUSE", externalOrderId: null, merchantExternalId: merchantId }, async () => {
+          const pause = { ...manager, action: "DELIVERY_PAUSE" as const, externalOrderId: null, merchantExternalId: merchantId, details: { minutes, description } };
+          return await withManager(token, pause, async () => {
             // Início e fim pelo relógio do servidor, nunca pelo do aparelho (contados depois da autorização).
             const start = now();
             const end = new Date(start.getTime() + minutes * 60_000);
-            return { status: 201, body: await options.api.pauseStore(merchantId, { description, start: start.toISOString(), end: end.toISOString() }) };
+            // O id da interrupção é o id da tentativa: a mesma tentativa nunca cria duas pausas no iFood.
+            const created = await options.api.pauseStore(merchantId, { id: manager.requestId, description, start: start.toISOString(), end: end.toISOString() });
+            return { status: 201, body: created };
           });
         }
         if (request.method === "DELETE" && merchant[2] === "pauses" && merchant[3]) {
           const pauseId = merchant[3];
           const manager = parseManager(parseBody(request.body).authorization);
           if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
-          return await withManager(token, { ...manager, action: "DELIVERY_RESUME", externalOrderId: null, merchantExternalId: merchantId }, async () => {
+          return await withManager(token, { ...manager, action: "DELIVERY_RESUME", externalOrderId: null, merchantExternalId: merchantId, details: { pauseId } }, async () => {
             await options.api.resumeStore(merchantId, pauseId);
             return { status: 204, body: null };
           });
@@ -478,7 +497,7 @@ function text(value: unknown, max: number): string | null {
 const MANAGER_FIELDS_ERROR = "Ação de gerente: informe o PIN de gerente, o operador, o motivo (5 caracteres ou mais) e o id da tentativa.";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function parseManager(raw: unknown): Omit<ManagerRequest, "action" | "externalOrderId" | "merchantExternalId"> | null {
+function parseManager(raw: unknown): Omit<ManagerRequest, "action" | "externalOrderId" | "merchantExternalId" | "details"> | null {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
   const body = raw as Record<string, unknown>;
   const managerPin = typeof body.managerPin === "string" && /^\d{4,8}$/.test(body.managerPin) ? body.managerPin : null;
@@ -540,7 +559,11 @@ function publicRecord(record: DeliveryOrderRecord): Omit<DeliveryOrderRecord, "v
 function errorResponse(error: unknown): ApiResponse {
   if (error instanceof BadRequest) return { status: 400, body: { error: error.message } };
   if (error instanceof DeliveryConcurrencyError) return { status: 409, body: { error: error.message, code: "conflict" } };
-  // Supabase fora do ar ou lento: nada foi feito no iFood (a prova de loja e a autorização vêm antes).
+  // O iFood aceitou e a gravação no banco falhou depois: repetir às cegas mandaria a ação de novo.
+  if (error instanceof DeliverySentNotSavedError) {
+    return { status: 503, body: { error: "Enviado ao iFood, mas não deu para gravar; confira o pedido antes de repetir.", code: "sent_not_saved" } };
+  }
+  // Supabase fora do ar ou lento antes da chamada ao iFood (prova de loja, autorização, reserva): nada foi feito lá.
   if (error instanceof DeliveryRepositoryError) return { status: 503, body: { error: "Banco indisponível; tente de novo.", code: "unavailable" } };
   if (error instanceof DeliveryMarketplaceError) {
     const status = {

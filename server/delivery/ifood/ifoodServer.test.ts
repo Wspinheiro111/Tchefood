@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { DeliveryInbox, InMemoryDeliveryRepository } from "../deliveryInbox";
+import { DeliveryRepositoryError } from "../supabaseDeliveryRepository";
 import { IfoodMerchantApi } from "./ifoodMerchantApi";
 import { IfoodSandbox } from "./ifoodSandbox";
 import {
@@ -29,10 +30,15 @@ const ALLOW_ALL: ManagerApproval = { authorize: async () => ({ status: "OK", aud
 function fakeApproval() {
   const authorized: ManagerRequest[] = [];
   const results: Array<{ auditId: string; outcome: string; detail: string }> = [];
+  const byRequest = new Map<string, string>();
   const approval: ManagerApproval = {
     authorize: async (_token, request) => {
       if (request.managerPin !== MANAGER_PIN) return { status: "PIN_FAILED", message: "PIN de gerente incorreto." };
+      // Mesmo id da tentativa: devolve a autorização já gravada (como tchefood_delivery_authorize).
+      const existing = byRequest.get(request.requestId);
+      if (existing) return { status: "OK", auditId: existing, repeated: true };
       authorized.push(request);
+      byRequest.set(request.requestId, `audit-${authorized.length}`);
       return { status: "OK", auditId: `audit-${authorized.length}` };
     },
     recordResult: async (auditId, outcome, detail) => {
@@ -356,17 +362,81 @@ describe("servidor do iFood: alçada de gerente", () => {
     expect(manager.authorized.map((request) => request.action)).toEqual(["DELIVERY_DISPUTE"]);
   });
 
-  it("falha incerta do iFood fica registrada como incerta; recusa clara como falha", async () => {
+  it("falha incerta do iFood fica registrada como incerta e bloqueia nova tentativa; recusa clara como falha", async () => {
     const { sandbox, poller, call, manager } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
+    const other = sandbox.placeOrder({ items: ITEMS });
     await poller.runOnce();
     sandbox.failNext("/requestCancellation", 503);
     const path = `/ifood/orders/${id}/cancellation`;
     expect((await call("POST", path, { code: "503", description: "Item indisponível", authorization: auth() })).status).toBe(503);
     expect(manager.results.at(-1)?.outcome).toBe("uncertain");
+    // Pode ter chegado ao iFood: outra tentativa (outro PIN, outro aparelho) não manda um segundo cancelamento.
+    expect((await call("POST", path, { code: "503", description: "Item indisponível", authorization: auth() })).status).toBe(409);
+    expect(sandbox.lastEventCode(id)).toBe("PLC");
     sandbox.failNext("/requestCancellation", 400);
-    expect((await call("POST", path, { code: "503", description: "Item indisponível", authorization: auth() })).status).toBe(400);
+    expect((await call("POST", `/ifood/orders/${other}/cancellation`, { code: "503", description: "Item indisponível", authorization: auth() })).status).toBe(400);
     expect(manager.results.at(-1)?.outcome).toBe("failed");
+  });
+
+  it("reenvio com o mesmo id da tentativa não chama o iFood de novo (pausa não duplica)", async () => {
+    const { sandbox, poller, call, manager } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const pauses = `/ifood/merchants/${sandbox.merchantId}/pauses`;
+    const authorization = auth();
+    const created = await call("POST", pauses, { description: "Falta de gás", minutes: 30, authorization });
+    expect(created.status).toBe(201);
+    // O id da interrupção no iFood é o id da tentativa: um reenvio nunca cria outra.
+    expect((created.body as { id: string }).id).toBe(authorization.requestId);
+    const again = await call("POST", pauses, { description: "Falta de gás", minutes: 30, authorization });
+    expect(again).toMatchObject({ status: 409, body: { code: "ALREADY_SUBMITTED" } });
+    expect(sandbox.activeInterruptions()).toHaveLength(1);
+    const cancel = { code: "503", description: "Item indisponível", authorization: auth() };
+    sandbox.autoAcceptCancellation = false;
+    expect((await call("POST", `/ifood/orders/${id}/cancellation`, cancel)).status).toBe(200);
+    const spy = vi.spyOn(IfoodMerchantApi.prototype, "requestCancellation");
+    expect((await call("POST", `/ifood/orders/${id}/cancellation`, cancel)).body).toMatchObject({ code: "ALREADY_SUBMITTED" });
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+    // Reenvio não grava outro resultado.
+    expect(manager.results).toHaveLength(2);
+  });
+
+  it("a autorização leva o que o gerente aprovou (motivo do iFood, resposta, duração da pausa)", async () => {
+    const { sandbox, poller, call, manager } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    const other = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    sandbox.openDispute(other, { alternatives: ["REFUND"] });
+    await poller.runOnce();
+    await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", authorization: auth() });
+    await call("POST", `/ifood/orders/${other}/dispute`, { kind: "reject", reason: "Pedido já saiu", authorization: auth() });
+    const created = await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás", minutes: 30, authorization: auth() });
+    await call("DELETE", `/ifood/merchants/${sandbox.merchantId}/pauses/${(created.body as { id: string }).id}`, { authorization: auth() });
+    expect(manager.authorized.map((request) => request.details)).toEqual([
+      { code: "503" },
+      { kind: "reject", reason: "Pedido já saiu" },
+      { minutes: 30, description: "Falta de gás" },
+      { pauseId: (created.body as { id: string }).id },
+    ]);
+  });
+
+  it("iFood aceitou e o banco falhou depois: resposta diz que foi enviado (não 'tente de novo') e o resultado fica como enviado", async () => {
+    const { sandbox, poller, call, manager, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const repository = (inbox as unknown as { options: { repository: InMemoryDeliveryRepository } }).options.repository;
+    const save = repository.saveOrder.bind(repository);
+    let calls = 0;
+    vi.spyOn(repository, "saveOrder").mockImplementation(async (record) => {
+      calls += 1;
+      if (calls >= 2) throw new DeliveryRepositoryError("Supabase não respondeu (tchefood_delivery_save_order).");
+      return save(record);
+    });
+    const response = await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", authorization: auth() });
+    expect(response).toMatchObject({ status: 503, body: { code: "sent_not_saved", error: "Enviado ao iFood, mas não deu para gravar; confira o pedido antes de repetir." } });
+    expect(manager.results.at(-1)?.outcome).toBe("sent");
   });
 
   it("autorização pelo Supabase: JWT do app no RPC, PIN errado e bloqueio viram 403, erro do banco 503", async () => {
@@ -377,11 +447,13 @@ describe("servidor do iFood: alçada de gerente", () => {
       return { ok: reply.ok, status: reply.status, text: async () => reply.text };
     };
     const approval = new SupabaseManagerApproval({ url: "https://x.supabase.co", anonKey: "anon", serviceRoleKey: "service", fetchImpl });
-    const request: ManagerRequest = { action: "DELIVERY_PAUSE", externalOrderId: null, merchantExternalId: "m-1", ...auth() };
-    expect(await approval.authorize("jwt-da-loja", request)).toEqual({ status: "OK", auditId: "x1" });
+    const request: ManagerRequest = { action: "DELIVERY_PAUSE", externalOrderId: null, merchantExternalId: "m-1", details: { minutes: 10, description: "Gás" }, ...auth() };
+    expect(await approval.authorize("jwt-da-loja", request)).toEqual({ status: "OK", auditId: "x1", repeated: false });
     expect(calls[0]!.url).toBe("https://x.supabase.co/rest/v1/rpc/tchefood_delivery_authorize");
     expect(calls[0]!.headers.authorization).toBe("Bearer jwt-da-loja");
-    expect(JSON.parse(calls[0]!.body!)).toMatchObject({ p_action: "DELIVERY_PAUSE", p_merchant_external_id: "m-1", p_external_order_id: null });
+    expect(JSON.parse(calls[0]!.body!)).toMatchObject({ p_action: "DELIVERY_PAUSE", p_merchant_external_id: "m-1", p_external_order_id: null, p_details: { minutes: 10, description: "Gás" } });
+    reply = { ok: true, status: 200, text: '{"status":"OK","auditId":"x1","repeated":true}' };
+    expect(await approval.authorize("jwt", request)).toEqual({ status: "OK", auditId: "x1", repeated: true });
     reply = { ok: true, status: 200, text: '{"status":"PIN_LOCKED"}' };
     expect((await approval.authorize("jwt", request)).status).toBe("PIN_LOCKED");
     reply = { ok: false, status: 400, text: '{"message":"TCHEFOOD_ANTIFRAUDE: loja do app não pertence a esta loja."}' };

@@ -432,6 +432,7 @@ describe("iFood: conferência com a documentação oficial", () => {
     const api = makeApi(sandbox, { fetchImpl: spy as unknown as typeof fetch });
     await expect(api.pauseStore(sandbox.merchantId, { description: "x", start: "2026-11-14T15:00:00Z", end: "2026-11-14T14:00:00Z" })).rejects.toMatchObject({ code: "invalid_request" });
     await expect(api.pauseStore(sandbox.merchantId, { description: " ", start: "2026-11-14T15:00:00Z", end: "2026-11-14T16:00:00Z" })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(api.pauseStore(sandbox.merchantId, { id: "../x", description: "Gás", start: "2026-11-14T15:00:00Z", end: "2026-11-14T16:00:00Z" })).rejects.toMatchObject({ code: "invalid_request" });
     await expect(api.resumeStore("../x", "p")).rejects.toMatchObject({ code: "invalid_request" });
     expect(spy).not.toHaveBeenCalled();
   });

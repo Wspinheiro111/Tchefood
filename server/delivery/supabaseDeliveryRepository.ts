@@ -151,6 +151,7 @@ function toRecord(raw: unknown): DeliveryOrderRecord {
   return {
     order: row.order as DeliveryOrderRecord["order"],
     cancellationPending: row.cancellationPending === true,
+    cancellationRequest: cancellationRequest(row.cancellationRequest),
     needsReview: row.needsReview === true,
     reviewReasons: Array.isArray(row.reviewReasons) ? row.reviewReasons.filter((reason): reason is string => typeof reason === "string") : [],
     newOrderNotified: row.newOrderNotified === true,
@@ -160,6 +161,16 @@ function toRecord(raw: unknown): DeliveryOrderRecord {
     dispute: (row.dispute ?? null) as DeliveryOrderRecord["dispute"],
     version,
   };
+}
+
+// Reserva do pedido de cancelamento. Estado desconhecido vira "incerta" (bloqueia até expirar); sem horário legível
+// a reserva conta como já expirada, para não travar o cancelamento para sempre.
+function cancellationRequest(raw: unknown): DeliveryOrderRecord["cancellationRequest"] {
+  if (raw === null || raw === undefined) return null;
+  const value = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  const reservedAt = typeof value.reservedAt === "string" && Number.isFinite(Date.parse(value.reservedAt)) ? value.reservedAt : new Date(0).toISOString();
+  const state = value.state === "sending" || value.state === "sent" || value.state === "uncertain" ? value.state : "uncertain";
+  return { state, reservedAt, ...(typeof value.code === "string" ? { code: value.code } : {}) };
 }
 
 // Chamada ao Supabase com prazo: estourado o prazo, a requisição é cancelada (abort) e a chamada falha com

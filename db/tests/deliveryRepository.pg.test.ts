@@ -171,13 +171,59 @@ function setup() {
     expect(integration.ok).toBe(false);
   });
 
+  it('a reserva do pedido de cancelamento passa pelas funções de leitura e gravação', async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    sandbox.autoAcceptCancellation = false;
+    try {
+      const id = sandbox.placeOrder({ items: ITEMS });
+      await inbox.runChannel(api);
+      const [reason] = await inbox.listCancellationReasons('ifood', id);
+      const result = await inbox.requestCancellation('ifood', id, reason!);
+      expect(result.cancellationRequest).toMatchObject({ state: 'sent', code: reason!.code });
+      expect(sql(`SELECT cancellation_request->>'state' || '|' || cancellation_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe('sent|true');
+      expect((await repository.getOrder('ifood', id))!.cancellationRequest).toMatchObject({ state: 'sent', code: reason!.code });
+      expect((await repository.listOrders()).find((r) => r.order.externalId === id)!.cancellationRequest?.state).toBe('sent');
+      // Segunda tentativa (outro aparelho): recusada pela reserva gravada no banco, sem chamar o iFood.
+      await expect(inbox.requestCancellation('ifood', id, reason!)).rejects.toMatchObject({ code: 'conflict' });
+      // O evento do app (CAR) zera a reserva.
+      await inbox.runChannel(api);
+      expect(sql(`SELECT coalesce(cancellation_request::text, 'null') FROM delivery_orders WHERE external_id = '${id}'`)).toBe('null');
+    } finally {
+      sandbox.autoAcceptCancellation = true;
+    }
+  });
+
+  it('o app não grava registros de delivery em audit_logs; o servidor grava', async () => {
+    const base = { tenant_id: TENANT, performed_by_user_id: CASHIER, reason: 'forjado', metadata: { outcome: 'sent' } };
+    for (const action of ['DELIVERY_RESULT', 'DELIVERY_CANCEL', 'DELIVERY_DISPUTE', 'DELIVERY_PAUSE', 'DELIVERY_RESUME']) {
+      const res = await appFetch(TENANT)('http://cloud.test/rest/v1/audit_logs', { method: 'POST', headers: {}, body: JSON.stringify({ ...base, action_type: action }) });
+      expect(res.ok, action).toBe(false);
+    }
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE reason = 'forjado'`)).toBe('0');
+    // Os outros registros do aparelho seguem passando.
+    const normal = await appFetch(TENANT)('http://cloud.test/rest/v1/audit_logs', { method: 'POST', headers: {}, body: JSON.stringify({ ...base, reason: 'registro normal', action_type: 'DRAWER_OPENED' }) });
+    expect(normal.ok).toBe(true);
+    // O servidor (service_role) grava.
+    const server = await serviceFetch()('http://cloud.test/rest/v1/audit_logs', { method: 'POST', headers: {}, body: JSON.stringify({ ...base, reason: 'do servidor', action_type: 'DELIVERY_RESULT' }) });
+    expect(server.ok).toBe(true);
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE reason = 'do servidor' AND action_type = 'DELIVERY_RESULT'`)).toBe('1');
+  });
+
   describe('alçada de gerente (tchefood_delivery_authorize)', () => {
+    const DETAILS: Record<string, unknown> = {
+      DELIVERY_CANCEL: { code: '503' },
+      DELIVERY_DISPUTE: { kind: 'accept' },
+      DELIVERY_PAUSE: { minutes: 30, description: 'Falta de gás' },
+      DELIVERY_RESUME: { pauseId: 'p-1' },
+    };
     async function authorize(tenant: string, args: Record<string, unknown>) {
+      const action = (args.p_action as string | undefined) ?? 'DELIVERY_CANCEL';
       const res = await appFetch(tenant)('http://cloud.test/rest/v1/rpc/tchefood_delivery_authorize', {
         method: 'POST', headers: {},
         body: JSON.stringify({
           p_channel: 'ifood', p_action: 'DELIVERY_CANCEL', p_external_order_id: null, p_merchant_external_id: null,
-          p_manager_pin: '7391', p_performed_by: CASHIER, p_reason: 'Cliente desistiu', p_request_id: crypto.randomUUID(), ...args,
+          p_manager_pin: '7391', p_performed_by: CASHIER, p_reason: 'Cliente desistiu', p_request_id: crypto.randomUUID(),
+          p_details: DETAILS[action] ?? {}, ...args,
         }),
       });
       const text = await res.text();
@@ -198,7 +244,15 @@ function setup() {
       const again = await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId });
       expect(again.body).toMatchObject({ status: 'OK', auditId, repeated: true });
       expect((await authorize(TENANT, { p_external_order_id: other, p_request_id: requestId })).body).toEqual({ status: 'CONFLICT' });
+      // O que o gerente aprovou fica gravado; reenvio com outro motivo do iFood ou outro motivo escrito é conflito.
+      expect(sql(`SELECT metadata->'details'->>'code' FROM audit_logs WHERE id = '${auditId}'`)).toBe('503');
+      expect((await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId, p_details: { code: '501' } })).body).toEqual({ status: 'CONFLICT' });
+      expect((await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId, p_reason: 'Outro motivo qualquer' })).body).toEqual({ status: 'CONFLICT' });
       expect(sql(`SELECT count(*) FROM audit_logs WHERE metadata->>'delivery_request_id' = '${requestId}'`)).toBe('1');
+      // Sem o que foi aprovado (ou com formato errado para a ação), nada é autorizado.
+      expect((await authorize(TENANT, { p_external_order_id: id, p_details: null })).ok).toBe(false);
+      expect((await authorize(TENANT, { p_external_order_id: id, p_details: { kind: 'accept' } })).ok).toBe(false);
+      expect((await authorize(TENANT, { p_action: 'DELIVERY_PAUSE', p_merchant_external_id: merchantId, p_details: { minutes: 0, description: 'x' } })).ok).toBe(false);
 
       // Resultado: só o servidor grava; o app não chama a função.
       const denied = await appFetch(TENANT)('http://cloud.test/rest/v1/rpc/tchefood_delivery_audit_result', {
