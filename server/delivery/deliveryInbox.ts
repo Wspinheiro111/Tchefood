@@ -256,9 +256,10 @@ export const ACTION_RESEND_GUARD_MS = 60_000;
 // Falhas em que o app com certeza não aplicou o pedido.
 export const DEFINITE_FAILURES: readonly string[] = ["invalid_request", "not_found", "conflict", "auth_failed", "rate_limited"];
 
-// Detalhe do pedido que o app recusa entregar (403/404) em todo ciclo: depois de tantos ciclos seguidos o pedido
-// entra mesmo sem detalhe, para a loja ver e confirmar pelo portal antes que o app cancele por falta de confirmação.
-// Falhas temporárias (fora do ar, limite de uso, tempo esgotado) não contam: só adiam.
+// Detalhe do pedido que o app recusa entregar (auth_failed, not_found, invalid_request: 4xx menos 409/429): depois de
+// tantas recusas o pedido entra mesmo sem detalhe, para a loja ver e confirmar pelo portal antes que o app cancele por
+// falta de confirmação. Falhas temporárias (fora do ar, limite de uso, tempo esgotado) não contam nem zeram a conta:
+// só adiam. A conta é por pedido e só em memória (reiniciar o processo recomeça do zero).
 export const ORDER_DETAIL_MAX_FAILURES = 10;
 const PERSISTENT_DETAIL_FAILURES: readonly string[] = ["auth_failed", "not_found", "invalid_request"];
 
