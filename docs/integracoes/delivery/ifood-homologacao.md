@@ -49,7 +49,7 @@ evento do app chegar, ou por 10 min sem evento nenhum.
 | `POST /ifood/orders/:id/actions/:acao` | `confirm`, `start_preparation`, `ready_for_pickup`, `dispatch` |
 | `GET /ifood/orders/:id/cancellation-reasons` | Motivos que o iFood aceita agora para o pedido |
 | `POST /ifood/orders/:id/cancellation` | `{code, description, details?, authorization}`; o código precisa estar na lista atual |
-| `POST /ifood/orders/:id/dispute` | Resposta à negociação (corpo abaixo), mais `authorization` (PIN de gerente) |
+| `POST /ifood/orders/:id/dispute` | Resposta à negociação (corpo abaixo), mais `authorization` (PIN de gerente) e `disputeId` da negociação mostrada (recomendado; outra negociação dá 409). A resposta só vai para a negociação conferida antes do PIN |
 | `GET /ifood/merchants/:id/status` | Loja aberta/fechada no iFood |
 | `GET /ifood/merchants/:id/pauses` | Pausas ativas |
 | `POST /ifood/merchants/:id/pauses` | `{description, minutes, authorization}` (1 a 1440 min); início e fim pelo relógio do servidor |

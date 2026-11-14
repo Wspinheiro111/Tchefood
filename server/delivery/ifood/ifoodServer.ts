@@ -426,12 +426,17 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           const manager = parseManager(body.authorization);
           if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
           // Motivo do aceite, valor e prazo da proposta conferidos contra a negociação gravada antes do PIN.
-          const resolved = await options.inbox.checkDisputeDecision("ifood", orderId, decision);
-          // O registro do gerente leva a resposta como vai ao iFood (aceite com motivo, recusa, valor ou prazo da proposta).
-          const details = JSON.parse(JSON.stringify(resolved)) as Record<string, unknown>;
+          // A tela pode mandar o id da negociação que mostrou ao gerente; sem ele, vale a negociação conferida aqui.
+          if (body.disputeId !== undefined && !(typeof body.disputeId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(body.disputeId))) {
+            return { status: 400, body: { error: "Resposta da negociação inválida." } };
+          }
+          const checked = await options.inbox.checkDisputeDecision("ifood", orderId, decision, body.disputeId as string | undefined);
+          // O registro do gerente leva a negociação e a resposta como vai ao iFood (aceite com motivo, recusa, valor ou
+          // prazo da proposta); a resposta só vai para essa negociação.
+          const details = JSON.parse(JSON.stringify({ disputeId: checked.disputeId, ...checked.decision })) as Record<string, unknown>;
           return await withManager(token, { ...manager, action: "DELIVERY_DISPUTE", externalOrderId: orderId, merchantExternalId: null, details }, async () => ({
             status: 200,
-            body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision)),
+            body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision, checked.disputeId)),
           }));
         }
         return { status: 405, body: { error: "Método não permitido." } };

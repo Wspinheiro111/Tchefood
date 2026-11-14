@@ -427,6 +427,33 @@ describe("servidor do iFood: alçada de gerente", () => {
     spy.mockRestore();
   });
 
+  it("resposta da negociação vale só para a negociação conferida: outra aberta durante o PIN dá conflito", async () => {
+    const { sandbox, poller, call, manager, api } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const first = sandbox.openDispute(id);
+    await poller.runOnce();
+    // Enquanto o PIN é conferido, o app fecha a primeira negociação e abre outra (o polling grava as duas).
+    const authorize = manager.approval.authorize;
+    let second = "";
+    manager.approval.authorize = async (token, request) => {
+      sandbox.expireDispute(first);
+      second = sandbox.openDispute(id);
+      await poller.runOnce();
+      return authorize(token, request);
+    };
+    const spy = vi.spyOn(api, "respondToDispute");
+    const response = await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", authorization: auth() });
+    expect(response.status).toBe(409);
+    expect(spy).not.toHaveBeenCalled();
+    expect(manager.authorized.at(-1)?.details).toMatchObject({ disputeId: first, kind: "accept" });
+    manager.approval.authorize = authorize;
+    // A tela que mostra a negociação nova manda o id dela; um id velho é recusado antes do PIN.
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", disputeId: first, authorization: auth() })).status).toBe(409);
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", disputeId: second, authorization: auth() })).status).toBe(200);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
   it("a autorização leva o que o gerente aprovou (motivo do iFood, resposta, duração da pausa)", async () => {
     const { sandbox, poller, call, manager } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
@@ -440,7 +467,7 @@ describe("servidor do iFood: alçada de gerente", () => {
     await call("DELETE", `/ifood/merchants/${sandbox.merchantId}/pauses/${(created.body as { id: string }).id}`, { authorization: auth() });
     expect(manager.authorized.map((request) => request.details)).toEqual([
       { code: "503" },
-      { kind: "reject", reason: "Pedido já saiu" },
+      { disputeId: expect.any(String), kind: "reject", reason: "Pedido já saiu" },
       { minutes: 30, description: "Falta de gás" },
       { pauseId: (created.body as { id: string }).id },
     ]);
