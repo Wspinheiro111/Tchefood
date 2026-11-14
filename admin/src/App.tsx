@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { LogOut } from 'lucide-react';
 import iconUrl from './assets/icon.png';
 import type { AdminClient, AdminConfig, Me, Session } from './lib/api';
@@ -46,6 +46,21 @@ function Painel({ client, email, onLogout }: { client: AdminClient; email: strin
   const [aba, setAba] = useState<Aba>('visao');
   const [loja, setLoja] = useState<string | null>(null);
   const me = useLoad<Me>(() => client.me(), [client]);
+  // A data de hoje vem do servidor (fuso de São Paulo): relê a cada troca de tela, ao voltar
+  // para a aba e a cada 5 minutos, para o painel aberto de um dia para o outro não usar a de ontem.
+  const reloadMe = me.reload;
+  useEffect(() => {
+    reloadMe();
+  }, [aba, loja]);
+  useEffect(() => {
+    const onVisible = () => document.visibilityState === 'visible' && reloadMe();
+    const timer = window.setInterval(reloadMe, 5 * 60_000);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, []);
 
   const abrirLoja = (id: string) => {
     setLoja(id);
@@ -92,7 +107,7 @@ function Painel({ client, email, onLogout }: { client: AdminClient; email: strin
         </div>
       </header>
       <main className="mx-auto max-w-6xl space-y-4 px-4 py-6">
-        {me.error ? (
+        {me.error && !me.data ? (
           <Erro>{me.error} Esta conta não é da equipe do Tchê Food (ou o painel ainda não foi instalado no banco).</Erro>
         ) : !me.data ? (
           <p className="text-sm text-slate-500">Carregando…</p>
