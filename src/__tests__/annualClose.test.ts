@@ -380,3 +380,109 @@ describe('3b. venda na maquininha sem taxa cadastrada (situação de repasse des
     expect(toCsv(openDoc(open([]), base))).not.toContain('SITUAÇÃO DE REPASSE DESCONHECIDA');
   });
 });
+
+describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+  const P26 = yearPeriod(2026);
+  const at9 = '2026-11-14T09:00:00-03:00';
+  const at11 = '2026-11-14T11:00:00-03:00';
+  const base = { period: '', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g' };
+  const AVISO = (n: number) => `ATENÇÃO: ${n} registro(s) com data depois de 14/11/2026 10:00 (instante deste relatório) ficaram de fora`;
+  const session = (s: Partial<CashSession>): CashSession =>
+    ({ id: Math.random().toString(), status: 'CLOSED', opened_at: '2026-11-14T08:00:00-03:00', closed_at: at9, opened_by_user_id: null, closed_by_user_id: null, opening_float: 0, expected_cash: 0, counted_cash: 0, difference: 0, ...s }) as CashSession;
+  const cashMov = (m: Partial<CashMovement>): CashMovement => ({ id: Math.random().toString(), type: 'SUPPLY', amount: 10, reason: 'troco', created_at: at9, ...m }) as CashMovement;
+  const invoice = (i: Partial<PurchaseInvoice>): PurchaseInvoice =>
+    ({ id: Math.random().toString(), supplier_id: 's', access_key: '1', number: '1', series: '1', issued_at: at9, environment: 'PRODUCTION', invoice_amount: 80, imported_at: at9, ...i }) as PurchaseInvoice;
+  const delivery = (x: Partial<OwnDelivery>): OwnDelivery =>
+    ({ id: Math.random().toString(), order_id: 'o1', status: 'DELIVERED', courier_id: 'c1', courier_fee: 7, pay_on_delivery: false, delivered_at: at9, settlement_id: null, ...x }) as OwnDelivery;
+
+  it('periodLabel mostra a hora do corte no ano em andamento e 31/12 no ano encerrado', () => {
+    expect(periodLabel('inventory', P26, NOW)).toBe('Posição em 14/11/2026 10:00 (ano em andamento)');
+    expect(periodLabel('revenue', P26, NOW)).toBe('01/01/2026 a 14/11/2026 10:00 (ano em andamento)');
+    expect(periodLabel('inventory', P, NOW)).toBe('Posição em 31/12/2025');
+    expect(periodLabel('expenses', P, NOW)).toBe('01/01/2025 a 31/12/2025');
+  });
+
+  it('inventário: 09:00 entra, 11:00 fica fora e é contado; aviso no CSV', () => {
+    const r = inventoryAt([product({})], [mov({ balance_after: 5, avg_cost_after: 2, created_at: at9 }), mov({ balance_after: 50, avg_cost_after: 9, created_at: at11 })], P26, new Set(), NOW);
+    expect(r.rows.map((x) => [x.quantity, x.unitCost])).toEqual([[5, 2]]);
+    expect([r.cutoff, r.afterCutoff]).toEqual([NOW.getTime(), 1]);
+    expect(toCsv(inventoryDoc(r, base))).toContain(AVISO(1));
+  });
+
+  it('faturamento: pagamentos, turnos e movimentos de caixa depois do corte ficam fora e são contados', () => {
+    const r = revenueByMethod(
+      {
+        ...emptyRevenueInput,
+        payments: [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 30, created_at: at9 }), pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 70, created_at: at11 })],
+        cashSessions: [session({}), session({ closed_at: at11 }), session({ status: 'OPEN', opened_at: at11, closed_at: null })],
+        cashMovements: [cashMov({}), cashMov({ created_at: at11, amount: 99 })],
+      },
+      P26,
+      NOW,
+    );
+    expect(r.totalGross).toBe(30);
+    expect(r.closings).toHaveLength(1);
+    expect(r.openSessions).toBe(0);
+    expect(r.supplies).toBe(10);
+    expect(r.afterCutoff).toBe(4); // pagamento, turno fechado, turno aberto, suprimento
+    expect(toCsv(revenueDoc(r, base))).toContain(AVISO(4));
+  });
+
+  it('contas em aberto: pagamento, entrega e acerto depois do corte são contados', () => {
+    const r = openPositionsAt(
+      {
+        payments: [pay({ created_at: at9 }), pay({ created_at: at11 })],
+        feeRules: [rule({ days: 30 })],
+        ownDeliveries: [delivery({ settlement_id: 's1' }), delivery({ delivered_at: at11 })],
+        courierSettlements: [{ id: 's1', created_at: at11 } as CourierSettlement],
+        couriers: [{ id: 'c1', name: 'Beto' }],
+        orders: [],
+      },
+      P26,
+      NOW,
+    );
+    expect(r.cardReceivables.map((x) => x.count)).toEqual([1]);
+    // A entrega das 09:00 continua devida: o acerto das 11:00 é depois da posição.
+    expect(r.courierPayables).toEqual([{ courier: 'Beto', deliveries: 1, amount: 7 }]);
+    expect(r.afterCutoff).toBe(3);
+    expect(toCsv(openDoc(r, base))).toContain(AVISO(3));
+  });
+
+  it('despesas: NF-e, acerto e sangria depois do corte ficam fora e são contados', () => {
+    const r = expensesByCategory(
+      {
+        purchaseInvoices: [invoice({}), invoice({ issued_at: at11, invoice_amount: 500 })],
+        suppliers: [],
+        courierSettlements: [{ id: 'a', created_at: at9, courier_fees: 5, cash_movement_id: null } as CourierSettlement, { id: 'b', created_at: at11, courier_fees: 50, cash_movement_id: null } as CourierSettlement],
+        cashMovements: [cashMov({ type: 'WITHDRAWAL', amount: 3 }), cashMov({ type: 'WITHDRAWAL', amount: 30, created_at: at11 })],
+        revenue: revenueByMethod(emptyRevenueInput, P26, NOW),
+      },
+      P26,
+      NOW,
+    );
+    expect(r.rows.find((x) => x.key === 'PURCHASES')!.amount).toBe(80);
+    expect(r.rows.find((x) => x.key === 'DELIVERY')!.amount).toBe(5);
+    expect(r.withdrawalsTotal).toBe(3);
+    expect(r.afterCutoff).toBe(3);
+    expect(toCsv(expensesDoc(r, base))).toContain(AVISO(3));
+  });
+
+  it('ano encerrado: o corte é 01/01 seguinte; 31/12 23:59 entra e 01/01 00:00 fica fora sem aviso', () => {
+    const last = '2025-12-31T23:59:00-03:00';
+    const next = '2026-01-01T00:00:00-03:00';
+    const inv = inventoryAt([product({})], [mov({ balance_after: 2, created_at: last }), mov({ balance_after: 9, created_at: next })], P, new Set(), NOW);
+    expect([inv.rows[0]!.quantity, inv.cutoff, inv.afterCutoff]).toEqual([2, P.to, 0]);
+    const rev = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 1, created_at: last }), pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 2, created_at: next })] }, P, NOW);
+    expect([rev.totalGross, rev.cutoff, rev.afterCutoff]).toEqual([1, P.to, 0]);
+    const open = openPositionsAt(
+      { payments: [], feeRules: [], ownDeliveries: [delivery({ delivered_at: last }), delivery({ delivered_at: next })], courierSettlements: [], couriers: [{ id: 'c1', name: 'Beto' }], orders: [] },
+      P,
+      NOW,
+    );
+    expect([open.courierPayablesTotal, open.afterCutoff]).toEqual([7, 0]);
+    const exp = expensesByCategory({ purchaseInvoices: [invoice({ issued_at: last }), invoice({ issued_at: next })], suppliers: [], courierSettlements: [], cashMovements: [], revenue: rev }, P, NOW);
+    expect([exp.rows[0]!.amount, exp.cutoff, exp.afterCutoff]).toEqual([80, P.to, 0]);
+    for (const doc of [inventoryDoc(inv, base), revenueDoc(rev, base), openDoc(open, base), expensesDoc(exp, base)]) expect(toCsv(doc)).not.toContain('instante deste relatório');
+  });
+});

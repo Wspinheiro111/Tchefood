@@ -5,13 +5,13 @@
  * "não registrado", e o que é estimativa vem marcado.
  */
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { FileSpreadsheet, Printer } from 'lucide-react';
+import { FileSpreadsheet, Printer, RefreshCw } from 'lucide-react';
 import { Btn, toast } from '../components/ui';
 import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { useOwnerSettings } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import type { MarketplaceSale } from '../lib/ownerDashboard';
-import { defaultYear, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { brasiliaDateTime, defaultYear, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, REPORT_TITLE, revenueDoc, toCsv, toPrintableHtml, type AnnualReportKind, type ReportDoc } from '../lib/annualCloseExport';
 
 /**
@@ -92,7 +92,8 @@ export function AnnualClose() {
     [payments, stockMovements, purchaseInvoices, cashSessions, courierSettlements, cashMovements, ownDeliveries],
   );
   const [picked, setPicked] = useState<number | null>(null);
-  // "Agora" fixo enquanto a tela está aberta: os números, o título e as notas usam o mesmo instante.
+  // "Agora" fixo enquanto a tela está aberta: os quatro relatórios, o título e as notas usam o
+  // mesmo instante (o corte). "Atualizar" e a troca de ano pegam um novo.
   const [now, setNow] = useState(() => new Date());
   // Relógio do aparelho fora de 2000–2100 deixa a lista sem o ano corrente; sem nenhum ano, usa 2000.
   const year = picked !== null && validYear(picked) && years.includes(picked) ? picked : defaultYear(years, now) ?? 2000;
@@ -104,20 +105,34 @@ export function AnnualClose() {
   const partial = yearInProgress(period, now);
 
   const testMovements = useMemo(() => testInvoiceMovementIds(stockMovements, purchaseInvoiceItems, purchaseInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices]);
-  const inventory = useMemo(() => inventoryAt(products, stockMovements, period, testMovements), [products, stockMovements, period, testMovements]);
+  const inventory = useMemo(() => inventoryAt(products, stockMovements, period, testMovements, now), [products, stockMovements, period, testMovements, now]);
   const revenue = useMemo(
-    () => revenueByMethod({ payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff }, period),
-    [payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff, period],
+    () => revenueByMethod({ payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff }, period, now),
+    [payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff, period, now],
   );
   const open = useMemo(
     () => openPositionsAt({ payments, feeRules, ownDeliveries, courierSettlements, couriers, orders }, period, now),
     [payments, feeRules, ownDeliveries, courierSettlements, couriers, orders, period, now],
   );
-  const expenses = useMemo(() => expensesByCategory({ purchaseInvoices, suppliers, courierSettlements, cashMovements, revenue }, period), [purchaseInvoices, suppliers, courierSettlements, cashMovements, revenue, period]);
+  const expenses = useMemo(
+    () => expensesByCategory({ purchaseInvoices, suppliers, courierSettlements, cashMovements, revenue }, period, now),
+    [purchaseInvoices, suppliers, courierSettlements, cashMovements, revenue, period, now],
+  );
 
   if (!isManagerRole(user?.role)) return <p className="p-6">Só o proprietário e o gerente veem o fechamento anual.</p>;
 
-  const partialNote = partial ? [`O ano de ${year} ainda não terminou: os números vão até agora, não até 31/12.`] : [];
+  const cutoffLabel = brasiliaDateTime(positionCutoff(period, now));
+  const partialNote = partial ? [`O ano de ${year} ainda não terminou: os números vão até ${cutoffLabel} (horário de Brasília), não até 31/12.`] : [];
+  // Registros do ano datados depois do corte (lançados depois de abrir a tela, ou relógio
+  // errado): cada relatório conta as suas fontes, então a tela mostra por relatório.
+  const late = (
+    [
+      ['inventory', inventory.afterCutoff],
+      ['revenue', revenue.afterCutoff],
+      ['open', open.afterCutoff],
+      ['expenses', expenses.afterCutoff],
+    ] as Array<[AnnualReportKind, number]>
+  ).filter(([, n]) => n > 0);
   // Cada registro inválido é contado em um relatório só (o pagamento, no de faturamento).
   const invalidCount = inventory.invalidDates + revenue.invalidDates + open.invalidDates + expenses.invalidDates;
   const appNote = 'Pedidos dos apps de delivery (iFood etc.) NÃO estão neste relatório: a integração ainda está em homologação. Informe o faturamento e as comissões pelo extrato do app.';
@@ -205,8 +220,18 @@ export function AnnualClose() {
           {DEVICE_ONLY}
         </p>
         {partial && (
-          <p role="status" className="w-full rounded-xl bg-amarelo/15 p-3 text-sm">
-            {year} ainda não terminou: os números vão até agora. Gere de novo depois de 31/12.
+          <div role="status" className="flex w-full flex-wrap items-center justify-between gap-2 rounded-xl bg-amarelo/15 p-3 text-sm">
+            <span>
+              {year} ainda não terminou: os números vão até {cutoffLabel} (horário de Brasília), quando a tela foi aberta ou atualizada. Gere de novo depois de 31/12.
+            </span>
+            <Btn variant="secondary" aria-label="Atualizar os números até agora" onClick={() => setNow(new Date())}>
+              <RefreshCw className="h-4 w-4" /> Atualizar
+            </Btn>
+          </div>
+        )}
+        {late.length > 0 && (
+          <p role="alert" className="w-full rounded-xl bg-rose-100 p-3 text-sm">
+            Atenção: registros com data depois de {cutoffLabel} (instante deste relatório) ficaram de fora ({late.map(([k, n]) => `${REPORT_TITLE[k]}: ${n}`).join('; ')}). Se foram lançados agora, toque em Atualizar; se não, confira o relógio do aparelho.
           </p>
         )}
         {invalidCount > 0 && (

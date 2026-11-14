@@ -59,10 +59,6 @@ export function invoiceDate(iso: string | null | undefined): number | null {
   }
   return at(iso);
 }
-const inYear = (iso: string | null | undefined, p: YearPeriod): boolean => {
-  const t = at(iso);
-  return t !== null && t >= p.from && t < p.to;
-};
 
 // Formatadores criados uma vez: criar um Intl.DateTimeFormat por registro trava a tela
 // com um ano de vendas (200 mil pagamentos ≈ 10 s).
@@ -91,6 +87,13 @@ const DMY = new Intl.DateTimeFormat('pt-BR', { timeZone: SHIFT_TIME_ZONE, day: '
 /** "dd/mm/aaaa" no calendário de Brasília. */
 export function brasiliaDate(t: number | Date): string {
   return DMY.format(new Date(t));
+}
+
+const HM = new Intl.DateTimeFormat('pt-BR', { timeZone: SHIFT_TIME_ZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+
+/** "dd/mm/aaaa hh:mm" no horário de Brasília. */
+export function brasiliaDateTime(t: number | Date): string {
+  return `${brasiliaDate(t)} ${HM.format(new Date(t))}`;
 }
 
 /** Anos com algum registro, mais o ano corrente, do mais novo para o mais antigo. */
@@ -134,6 +137,13 @@ export function yearInProgress(p: YearPeriod, now: Date = new Date()): boolean {
 export function positionCutoff(p: YearPeriod, now: Date = new Date()): number {
   return Math.min(p.to, now.getTime());
 }
+
+/**
+ * Registro do ano com data no instante do relatório ou depois (só acontece com o ano em
+ * andamento: lançado depois de a tela abrir, ou relógio do aparelho errado). Fica fora
+ * dos números e é contado para o aviso. Ano encerrado: o corte é 01/01 seguinte e nada conta.
+ */
+const afterCutoff = (t: number, p: YearPeriod, cutoff: number): boolean => t >= cutoff && t < p.to;
 
 /**
  * Dia do repasse no calendário de Brasília (00:00 de Brasília, em ms), com a mesma regra
@@ -188,6 +198,10 @@ export interface InventoryReport {
   invalidDates: number;
   /** Entradas por NF-e de homologação (teste) que ficaram de fora. */
   testMovements: number;
+  /** Instante da posição: fim do ano, ou agora se o ano ainda não terminou. */
+  cutoff: number;
+  /** Movimentos do ano com data no instante da posição ou depois (ficaram de fora). */
+  afterCutoff: number;
 }
 
 /** Movimentos de estoque que vieram de NF-e de homologação (teste): não são mercadoria real. */
@@ -217,16 +231,25 @@ const qtyTimesCostCents = (qty: number, cost: number): number => Math.round((Mat
  * Produto com entrada de NF-e de homologação tem saldo e custo médio refeitos só com
  * as entradas reais (como o livro só tem entradas, a média ponderada delas é exata).
  */
-export function inventoryAt(products: readonly Product[], movements: readonly StockMovement[], p: YearPeriod, testMovementIds: ReadonlySet<string> = new Set()): InventoryReport {
+export function inventoryAt(
+  products: readonly Product[],
+  movements: readonly StockMovement[],
+  p: YearPeriod,
+  testMovementIds: ReadonlySet<string> = new Set(),
+  now: Date = new Date(),
+): InventoryReport {
+  const cutoff = positionCutoff(p, now);
   const byProduct = new Map<string, Array<{ t: number; m: StockMovement; idx: number }>>();
   let invalidDates = 0;
+  let late = 0;
   movements.forEach((m, idx) => {
     const t = at(m.created_at);
     if (t === null) {
       invalidDates += 1;
       return;
     }
-    if (t >= p.to) return;
+    if (afterCutoff(t, p, cutoff)) late += 1;
+    if (t >= cutoff) return;
     const list = byProduct.get(m.product_id);
     if (list) list.push({ t, m, idx });
     else byProduct.set(m.product_id, [{ t, m, idx }]);
@@ -279,7 +302,7 @@ export function inventoryAt(products: readonly Product[], movements: readonly St
     });
   }
   rows.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
-  return { rows, totalCost: fromCents(totalC), missingNcm, invalidDates, testMovements };
+  return { rows, totalCost: fromCents(totalC), missingNcm, invalidDates, testMovements, cutoff, afterCutoff: late };
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +374,10 @@ export interface RevenueReport {
   /** Dinheiro recebido fora de qualquer turno de caixa (não aparece nos fechamentos). */
   cashOutsideSessions: number;
   cashOutsideSessionsCount: number;
+  /** Fim do período: fim do ano, ou agora se o ano ainda não terminou. */
+  cutoff: number;
+  /** Pagamentos, pedidos de app, turnos e movimentos de caixa do ano com data no fim do período ou depois (ficaram de fora). */
+  afterCutoff: number;
 }
 
 const zeros = () => Array.from({ length: 12 }, () => 0);
@@ -370,7 +397,15 @@ export interface RevenueInput {
  * pela data do pagamento, mais os pedidos dos apps não cancelados pela data do pedido.
  * A taxa da maquininha incide sobre conta + gorjeta (igual à agenda de recebíveis).
  */
-export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueReport {
+export function revenueByMethod(input: RevenueInput, p: YearPeriod, now: Date = new Date()): RevenueReport {
+  const cutoff = positionCutoff(p, now);
+  let late = 0;
+  /** No período: do início do ano até o corte; conta o que caiu depois do corte. */
+  const inPeriod = (t: number | null): t is number => {
+    if (t === null) return false;
+    if (afterCutoff(t, p, cutoff)) late += 1;
+    return t >= p.from && t < cutoff;
+  };
   const acc = new Map<string, { label: string; gross: number; count: number; fee: number; noRule: number; marketplace: boolean; monthly: number[] }>();
   const bump = (key: string, label: string, marketplace: boolean) => {
     let r = acc.get(key);
@@ -389,7 +424,7 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
     if (pay.status !== 'APPROVED') continue;
     const t = at(pay.created_at);
     if (t === null) invalidDates += 1;
-    if (t === null || t < p.from || t >= p.to) continue;
+    if (!inPeriod(t)) continue;
     // Simulador da maquininha (demonstração/treino): não entrou dinheiro de verdade.
     if (pay.acquirer === 'MOCK') {
       simCount += 1;
@@ -412,7 +447,7 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
     if (sale.canceled) continue;
     const t = at(sale.created_at);
     if (t === null) invalidDates += 1;
-    if (t === null || t < p.from || t >= p.to) continue;
+    if (!inPeriod(t)) continue;
     const row = bump(`APP:${sale.channel}`, `App: ${sale.label}`, true);
     row.gross += sale.total_cents;
     row.count += 1;
@@ -447,11 +482,11 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
   const sessionIds = new Set<string>();
   for (const s of input.cashSessions) {
     if (s.status !== 'CLOSED') {
-      if (inYear(s.opened_at, p)) openSessions += 1;
+      if (inPeriod(at(s.opened_at))) openSessions += 1;
       continue;
     }
     if (at(s.closed_at) === null) invalidDates += 1;
-    if (!inYear(s.closed_at, p)) continue;
+    if (!inPeriod(at(s.closed_at))) continue;
     sessionIds.add(s.id);
     if (s.difference !== null) diffC += toCents(s.difference);
     closings.push({
@@ -476,7 +511,8 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
   for (const pay of input.payments) {
     if (pay.status !== 'APPROVED' || pay.method !== 'CASH' || pay.acquirer === 'MOCK') continue;
     const t = at(pay.created_at);
-    if (t === null || t < p.from || t >= p.to) continue;
+    // Mesmos pagamentos do faturamento (já contados lá se ficaram depois do corte).
+    if (t === null || t < p.from || t >= cutoff) continue;
     if (windows.some((w) => t >= w.from && t <= w.to)) continue;
     outsideC += toCents(pay.amount);
     outsideN += 1;
@@ -484,7 +520,7 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
   let suppliesC = 0;
   let withdrawalsC = 0;
   for (const mv of input.cashMovements) {
-    if (!inYear(mv.created_at, p)) continue;
+    if (!inPeriod(at(mv.created_at))) continue;
     if (mv.type === 'SUPPLY') suppliesC += toCents(mv.amount);
     else if (mv.type === 'WITHDRAWAL') withdrawalsC += toCents(mv.amount);
   }
@@ -509,6 +545,8 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
     simulatorAmount: fromCents(simC),
     cashOutsideSessions: fromCents(outsideC),
     cashOutsideSessionsCount: outsideN,
+    cutoff,
+    afterCutoff: late,
   };
 }
 
@@ -562,6 +600,8 @@ export interface OpenPositionsReport {
   cutoff: number;
   /** Entregas com data inválida (ficaram de fora; pagamento inválido é avisado no faturamento). */
   invalidDates: number;
+  /** Pagamentos, entregas e acertos do ano com data no instante da posição ou depois (ficaram de fora). */
+  afterCutoff: number;
 }
 
 export interface OpenPositionsInput {
@@ -628,9 +668,12 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
   const orderTotal = new Map(input.orders.map((o) => [o.id, toCents(o.total_amount)]));
   // Pago da senha até a posição (o dinheiro da entrega só vira pagamento no acerto).
   const paidBefore = new Map<string, number>();
+  let late = 0;
   for (const pay of input.payments) {
     if (pay.status !== 'APPROVED') continue;
     const t = at(pay.created_at);
+    // Conta aqui (todos os aprovados) o pagamento depois da posição, também o de cartão.
+    if (t !== null && afterCutoff(t, p, cutoff)) late += 1;
     if (t === null || t >= cutoff) continue;
     paidBefore.set(pay.order_id, (paidBefore.get(pay.order_id) ?? 0) + toCents(pay.amount));
   }
@@ -638,6 +681,7 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
     if (d.status !== 'DELIVERED' || d.courier_fee === null || d.courier_id === null) continue;
     const t = at(d.delivered_at);
     if (t === null) invalidDates += 1;
+    if (t !== null && afterCutoff(t, p, cutoff)) late += 1;
     if (t === null || t >= cutoff) continue;
     const s = d.settlement_id ? settledAt.get(d.settlement_id) : undefined;
     // Acertada antes da posição: já não devia nada naquele instante.
@@ -656,6 +700,8 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
       }
     }
   }
+  // Acerto depois da posição não vale (a entrega continua devida naquele instante): avisa.
+  for (const s of settledAt.values()) if (s !== null && s !== undefined && afterCutoff(s, p, cutoff)) late += 1;
   const courierName = (id: string) => input.couriers.find((c) => c.id === id)?.name ?? 'Entregador removido';
   const courierCash = [...cash.entries()]
     .map(([id, r]) => ({ courier: courierName(id), deliveries: r.deliveries, amount: fromCents(r.cents) }))
@@ -676,6 +722,7 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
     courierPayablesTotal: fromCents(courierPayables.reduce((a, r) => a + toCents(r.amount), 0)),
     cutoff,
     invalidDates,
+    afterCutoff: late,
   };
 }
 
@@ -723,6 +770,10 @@ export interface ExpensesReport {
   withdrawalsTotal: number;
   /** Notas, acertos e sangrias com data inválida (ficaram de fora). */
   invalidDates: number;
+  /** Fim do período: fim do ano, ou agora se o ano ainda não terminou. */
+  cutoff: number;
+  /** Notas, acertos e sangrias do ano com data no fim do período ou depois (ficaram de fora). */
+  afterCutoff: number;
 }
 
 export interface ExpensesInput {
@@ -741,7 +792,14 @@ const NOT_TRACKED = 'Não registrado no Tchê Food. Informe pelo seu controle (f
  * entregadores próprios. Taxa da maquininha e comissão dos apps = estimativa pela
  * taxa cadastrada (confira com o extrato). Folha, aluguel e outras: não registradas.
  */
-export function expensesByCategory(input: ExpensesInput, p: YearPeriod): ExpensesReport {
+export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Date = new Date()): ExpensesReport {
+  const cutoff = positionCutoff(p, now);
+  let late = 0;
+  const inPeriod = (t: number | null): t is number => {
+    if (t === null) return false;
+    if (afterCutoff(t, p, cutoff)) late += 1;
+    return t >= p.from && t < cutoff;
+  };
   const supplierById = new Map(input.suppliers.map((s) => [s.id, s]));
   const purchases: PurchaseRow[] = [];
   let purchasesC = 0;
@@ -751,7 +809,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod): Expense
     // Emissão (dhEmi ou dEmi); sem ela, a data da importação.
     const t = invoiceDate(inv.issued_at) ?? at(inv.imported_at);
     if (t === null) invalidDates += 1;
-    if (t === null || t < p.from || t >= p.to) continue;
+    if (!inPeriod(t)) continue;
     const when = new Date(t).toISOString();
     if (inv.environment !== 'PRODUCTION') {
       homologation += 1;
@@ -777,7 +835,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod): Expense
   for (const s of input.courierSettlements) {
     if (s.cash_movement_id) settlementMovements.add(s.cash_movement_id);
     if (at(s.created_at) === null) invalidDates += 1;
-    if (!inYear(s.created_at, p)) continue;
+    if (!inPeriod(at(s.created_at))) continue;
     courierC += toCents(s.courier_fees);
     courierN += 1;
   }
@@ -787,7 +845,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod): Expense
   for (const mv of input.cashMovements) {
     if (mv.type !== 'WITHDRAWAL' || settlementMovements.has(mv.id)) continue;
     if (at(mv.created_at) === null) invalidDates += 1;
-    if (!inYear(mv.created_at, p)) continue;
+    if (!inPeriod(at(mv.created_at))) continue;
     withdrawalsC += toCents(mv.amount);
     withdrawals.push({ date: mv.created_at, amount: mv.amount, reason: mv.reason });
   }
@@ -826,7 +884,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod): Expense
     { key: 'OTHER', label: 'Outras despesas (luz, água, gás, internet, impostos)', amount: null, count: 0, source: 'NOT_TRACKED', note: NOT_TRACKED },
   ];
   const total = rows.reduce((a, r) => a + (r.amount === null ? 0 : toCents(r.amount)), 0);
-  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates };
+  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates, cutoff, afterCutoff: late };
 }
 
 const fmt = (cents: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(fromCents(cents));

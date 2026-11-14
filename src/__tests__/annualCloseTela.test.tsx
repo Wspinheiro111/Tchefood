@@ -87,3 +87,65 @@ describe('Fechamento anual (tela)', () => {
     expect(screen.queryAllByRole('button', { name: /baixar Excel/ })).toHaveLength(0);
   });
 });
+
+describe('Fechamento anual (tela): corte único no ano em andamento (auditoria P2-02)', () => {
+  const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+  beforeEach(() => {
+    vi.setSystemTime(new Date('2026-11-14T10:00:00-03:00'));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('às 10:00, o registro das 09:00 entra e o das 11:00 fica fora com aviso na tela e no CSV; Atualizar pega o novo instante', async () => {
+    setup('own', [pay(30, '2026-11-14T09:00:00'), pay(70, '2026-11-14T11:00:00')]);
+    act(() => {
+      useTcheStore.setState({
+        stockMovements: [
+          { id: 'm9', tenant_id: 't', product_id: 'p1', type: 'PURCHASE_IN', quantity: 1, unit_cost: 1, balance_after: 1, avg_cost_after: 1, purchase_invoice_item_id: null, performed_by_user_id: 'own', created_at: '2026-11-14T11:00:00-03:00' },
+        ],
+      } as never);
+    });
+    render(<AnnualClose />);
+    expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2026');
+    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 10:00 \(ano em andamento\)/)).toHaveLength(2);
+    expect(screen.getByText(/os números vão até 14\/11\/2026 10:00/)).toBeTruthy();
+    const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
+    expect(alert.textContent).toContain('depois de 14/11/2026 10:00');
+    expect(alert.textContent).toContain('Inventário de insumos e mercadorias: 1');
+    expect(alert.textContent).toContain('Fechamento de caixa e formas de pagamento: 1');
+    expect(alert.textContent).toContain('Contas a pagar e a receber em aberto: 1');
+
+    // Exportação: o CSV leva o mesmo corte e o mesmo aviso.
+    let blob: Blob | null = null;
+    Object.assign(URL, { createObjectURL: vi.fn((b: Blob) => ((blob = b), 'blob:x')), revokeObjectURL: vi.fn() });
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    fireEvent.click(screen.getByRole('button', { name: /Fechamento de caixa e formas de pagamento: baixar Excel/ }));
+    // Blob do jsdom não tem .text(): lê pelo FileReader.
+    const csv = await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.readAsText(blob as unknown as Blob);
+    });
+    expect(csv).toContain('01/01/2026 a 14/11/2026 10:00 (ano em andamento)');
+    expect(csv).toContain('1 registro(s) com data depois de 14/11/2026 10:00 (instante deste relatório) ficaram de fora');
+
+    // Duas horas depois, "Atualizar" traz o registro das 11:00 e o aviso some.
+    vi.setSystemTime(new Date('2026-11-14T12:00:00-03:00'));
+    fireEvent.click(screen.getByRole('button', { name: 'Atualizar os números até agora' }));
+    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(100));
+    expect(screen.getByText(/os números vão até 14\/11\/2026 12:00/)).toBeTruthy();
+    expect(screen.queryAllByRole('alert').some((a) => a.textContent!.includes('instante deste relatório'))).toBe(false);
+  });
+
+  it('ano encerrado: sem botão Atualizar nem aviso de corte; 01/01 00:00 fica no ano seguinte', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    setup('own', [pay(30, '2025-12-31T23:59:00'), pay(70, '2026-01-01T00:00:00')]);
+    render(<AnnualClose />);
+    expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2025');
+    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.queryByRole('button', { name: 'Atualizar os números até agora' })).toBeNull();
+    expect(screen.queryAllByRole('alert')).toHaveLength(0);
+  });
+});

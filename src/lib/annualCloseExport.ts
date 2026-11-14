@@ -5,7 +5,7 @@
  * no CSV contra fórmula (=, +, -, @) e no HTML contra marcação.
  */
 import type { ExpensesReport, InventoryReport, OpenPositionsReport, RevenueReport, YearPeriod } from './annualClose';
-import { brasiliaDate, METHOD_LABEL } from './annualClose';
+import { brasiliaDate, brasiliaDateTime, METHOD_LABEL, positionCutoff } from './annualClose';
 import { fromCents, toCents } from './money';
 import { parseIsoInstant } from './reports';
 
@@ -62,17 +62,29 @@ export const DEVICE_ONLY =
 const invalid = (n: number, what: string): string[] =>
   n > 0 ? [`ATENÇÃO: ${n} ${what} com data inválida (não dá para saber o ano) ficaram fora. Se for deste ano, o total está menor: avise o suporte antes de enviar ao contador.`] : [];
 
+/**
+ * Aviso de registros do ano com data no instante do relatório ou depois (ano em
+ * andamento): lançados depois de a tela abrir, ou relógio do aparelho errado.
+ */
+export const afterCutoffNote = (n: number, cutoff: number): string[] =>
+  n > 0
+    ? [`ATENÇÃO: ${n} registro(s) com data depois de ${brasiliaDateTime(cutoff)} (instante deste relatório) ficaram de fora. Se foram lançados agora, atualize; se não, confira o relógio do aparelho.`]
+    : [];
+
 const qty = (v: number) => Math.round(v * 1000) / 1000;
 const day = (iso: string) => {
   const t = parseIsoInstant(iso);
   return t === null ? '' : brasiliaDate(t);
 };
 
-/** Com o ano em andamento, a posição é a de agora e o período vai até hoje (sem fingir 31/12). */
+/**
+ * Com o ano em andamento, a posição é a de agora e o período vai até o instante do
+ * relatório, com a hora (o mesmo corte dos cálculos; sem fingir 31/12).
+ */
 export function periodLabel(kind: AnnualReportKind, p: YearPeriod, now: Date = new Date()): string {
   const first = `01/01/${p.year}`;
   const partial = now.getTime() < p.to;
-  const last = partial ? brasiliaDate(now) : `31/12/${p.year}`;
+  const last = partial ? brasiliaDateTime(positionCutoff(p, now)) : `31/12/${p.year}`;
   if (kind === 'inventory' || kind === 'open') return partial ? `Posição em ${last} (ano em andamento)` : `Posição em ${last}`;
   return partial ? `${first} a ${last} (ano em andamento)` : `${first} a ${last}`;
 }
@@ -88,6 +100,7 @@ export function inventoryDoc(r: InventoryReport, base: Omit<ReportDoc, 'title' |
       ...(r.testMovements > 0 ? [`${r.testMovements} entrada(s) por NF-e de homologação (teste) ficaram de fora; o saldo e o custo desses produtos foram refeitos só com as notas reais.`] : []),
       ...(r.missingNcm > 0 ? [`${r.missingNcm} produto(s) com saldo estão sem NCM válido (8 dígitos) no cadastro.`] : []),
       ...invalid(r.invalidDates, 'movimento(s) de estoque'),
+      ...afterCutoffNote(r.afterCutoff, r.cutoff),
       ...extraNotes,
     ],
     tables: [
@@ -116,6 +129,7 @@ export function revenueDoc(r: RevenueReport, base: Omit<ReportDoc, 'title' | 'ta
       `Gorjetas no ano: R$ ${br(r.tips)}.`,
       ...(r.openSessions > 0 ? [`${r.openSessions} turno(s) de caixa aberto(s) no ano ainda não foram fechados.`] : []),
       ...invalid(r.invalidDates, 'pagamento(s) ou fechamento(s) de caixa'),
+      ...afterCutoffNote(r.afterCutoff, r.cutoff),
       ...extraNotes,
     ],
     tables: [
@@ -174,6 +188,7 @@ export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 
       ...noRuleNote(r),
       'NÃO registrados no Tchê Food (informe pelo seu controle): contas a pagar de fornecedores (boletos/duplicatas), fiado e convênios de clientes, repasses pendentes dos apps de delivery.',
       ...invalid(r.invalidDates, 'entrega(s)'),
+      ...afterCutoffNote(r.afterCutoff, r.cutoff),
       ...extraNotes,
     ],
     tables: [
@@ -207,6 +222,7 @@ export function expensesDoc(r: ExpensesReport, base: Omit<ReportDoc, 'title' | '
       'Total = só o que o app registra ou estima. Folha, aluguel e outras despesas não são registradas no Tchê Food e ficam de fora.',
       ...(r.homologationInvoices > 0 ? [`${r.homologationInvoices} NF-e de homologação (teste) no ano ficaram de fora.`] : []),
       ...invalid(r.invalidDates, 'nota(s), acerto(s) ou sangria(s)'),
+      ...afterCutoffNote(r.afterCutoff, r.cutoff),
       ...(r.withdrawals.length > 0 ? [`Sangrias do caixa sem categoria (R$ ${br(r.withdrawalsTotal)}) estão listadas à parte e NÃO entram no total: classifique com o contador.`] : []),
       ...extraNotes,
     ],
