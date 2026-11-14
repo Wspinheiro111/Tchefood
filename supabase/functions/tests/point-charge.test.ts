@@ -214,6 +214,12 @@ class MemoryStore implements ChargeStore {
     this.write(r, { cancel_reason: 'timeout', cancel_requested_by: null, cancel_requested_at: this.iso() });
     return { ...r };
   }
+  /** Como tchefood_point_charge_in_wait: relógio do "banco" contra a hora gravada, com ou sem encerramento pedido. */
+  async inCardWait(row: TerminalChargeRow) {
+    const r = this.get(row.id);
+    if (FINAL_STATES.has(r.status)) return false;
+    return this.nowMs < Date.parse(r.created_at) + 120_000;
+  }
   async listOpenForOrder(orderId: string) {
     return this.rows.filter((r) => r.order_id === orderId && !FINAL_STATES.has(r.status)).map((r) => ({ ...r }));
   }
@@ -1822,7 +1828,8 @@ describe('point-charge: leitura do pagamento', () => {
 
   it('parse do GET /v1/payments/{id}', () => {
     expect(parsePayment({ id: 123, status: 'approved', transaction_amount: 24.5, payment_method_id: 'master', payment_type_id: 'credit_card', authorization_code: '301299', card: { last_four_digits: '4242' }, installments: 1 }))
-      .toEqual({ id: '123', status: 'approved', amountCents: 2450, paymentMethodId: 'master', paymentTypeId: 'credit_card', authorizationCode: '301299', lastFour: '4242', installments: 1, externalReference: null, orderId: null });
+      .toEqual({ id: '123', status: 'approved', amountCents: 2450, paymentMethodId: 'master', paymentTypeId: 'credit_card', authorizationCode: '301299', lastFour: '4242', installments: 1, externalReference: null, orderId: null, statusDetail: null });
+    expect(parsePayment({ id: 8, status: 'charged_back', status_detail: 'reimbursed' })).toMatchObject({ status: 'charged_back', statusDetail: 'reimbursed' });
     // r5: referência e ordem do pagamento são lidas (para conferir contra a cobrança, nunca usadas sem conferência).
     expect(parsePayment({ id: 7, status: 'approved', external_reference: KEY, order: { id: 'ORD01', type: 'mercadopago' } })).toMatchObject({ externalReference: KEY, orderId: 'ORD01' });
     expect(parsePayment({ id: 7, external_reference: '', order: 'x' })).toMatchObject({ externalReference: null, orderId: null });
@@ -2183,13 +2190,19 @@ describe('point-charge: auditoria r5', () => {
       expect(store.rows[0]!.status).toBe('rejected');
     });
 
-    it('ordem processada com o pagamento estornado (refunded / charged_back): refunded', async () => {
-      for (const status of ['refunded', 'charged_back']) {
-        const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status }) });
-        seed(store);
-        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
-        expect(store.rows[0]).toMatchObject({ status: 'refunded', raw_status: `payment_${status}`, raw_status_detail: 'PAYMENT_REFUNDED' });
-      }
+    it('ordem processada com o pagamento estornado: refunded', async () => {
+      const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status: 'refunded' }) });
+      seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
+      expect(store.rows[0]).toMatchObject({ status: 'refunded', raw_status: 'payment_refunded', raw_status_detail: 'PAYMENT_REFUNDED' });
+    });
+
+    // Decisão do Will (auditoria interna 3): contestação nunca prova estorno, com PIN, em nenhum status_detail.
+    it.each(['settled', 'reimbursed', 'in_process', null])('revisão manual com o pagamento em contestação (charged_back, %s): continua em revisão', async (detail) => {
+      const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status: 'charged_back', statusDetail: detail }) });
+      const before = seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW' });
+      unchanged(store, before);
     });
 
     it('pagamento estornado de OUTRO valor não prova estorno desta cobrança', async () => {
@@ -2439,11 +2452,18 @@ describe('point-charge: auditoria r5', () => {
       unchanged(store, before);
     });
 
-    it.each(['refunded', 'charged_back', 'cancelled'])('pagamento "%s" no Mercado Pago: refunded', async (status) => {
+    it.each(['refunded', 'cancelled'])('pagamento "%s" no Mercado Pago: refunded', async (status) => {
       const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status }) });
       seed(store, approvedRow);
       expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
       expect(store.rows[0]).toMatchObject({ status: 'refunded', raw_status: `payment_${status}`, raw_status_detail: 'PAYMENT_REFUNDED' });
+    });
+
+    it.each(['settled', 'reimbursed', 'in_process', null])('contestação charged_back (%s) não prova estorno na conferência com PIN: nada gravado', async (detail) => {
+      const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status: 'charged_back', statusDetail: detail }) });
+      const before = seed(store, approvedRow);
+      expect((await reconcileCharge(ctx, RECONCILE)).status).toBe('MANUAL_REVIEW');
+      unchanged(store, before);
     });
 
     it('ordem cancelada mas pagamento aprovado: MISMATCH, continua aprovada', async () => {
@@ -2611,17 +2631,76 @@ describe('point-charge: auditoria r5', () => {
       expect(store.resolutions).toHaveLength(0);
     });
 
-    it('ainda no prazo de espera do cartão: só consulta (sem pedir cancelamento), WAITING_CARD', async () => {
-      const { ctx, store, calls } = setup({ get: async () => order() });
-      seed(store, atTerminal);
+    // Auditoria interna 3 (P1-02): no prazo a cobrança pode estar sendo feita em outro aparelho. Nada é lido nem gravado
+    // e nunca sai um fim, mesmo com o Mercado Pago já aprovado (quem cobra registra; dois registros = duas NFC-e).
+    it.each([
+      ['aberta na maquininha', async () => order()],
+      ['já aprovada no Mercado Pago', async () => approvedOrder()],
+      ['já cancelada no Mercado Pago', async () => order({ status: 'cancelled', rawStatus: 'canceled' })],
+    ] as const)('ainda no prazo de espera do cartão (%s): WAITING_CARD, sem consultar nem gravar', async (_n, get) => {
+      const { ctx, store, calls } = setup({ get, payment: async () => approvedPayment() });
+      const before = seed(store, atTerminal);
       at(store, 30_000);
-      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'WAITING_CARD' });
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'WAITING_CARD', reason: expect.stringContaining('outro aparelho') });
       expect(calls.cancel).toHaveLength(0);
-      expect(calls.get).toEqual(['ORD01']);
-      expect(store.rows[0]).toMatchObject({ status: 'at_terminal', cancel_requested_at: null });
+      expect(calls.get).toHaveLength(0);
+      expect(calls.payment).toHaveLength(0);
+      expect(calls.create).toHaveLength(0);
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+      unchanged(store, before);
     });
 
-    it.each([['no prazo', 30_000], ['depois do prazo', 10 * 60_000]] as const)('B: app fechado depois de a maquininha aprovar (%s): APPROVED com todas as conferências', async (_n, ms) => {
+    it('ainda no prazo com encerramento pedido pelo gerente (aparelho que cobra no meio do encerramento): WAITING_CARD, nada lido nem gravado', async () => {
+      const { ctx, store, calls } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment() });
+      const before = seed(store, { ...atTerminal, cancel_reason: 'operator', cancel_requested_by: STAFF, cancel_requested_at: CREATED_AT, cancel_authorized_by: 'manager', cancel_audit_id: 'audit-x' });
+      at(store, 30_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'WAITING_CARD' });
+      expect(calls.get).toHaveLength(0);
+      expect(calls.cancel).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('o mesmo encerramento do gerente depois do prazo: segue o Mercado Pago (aprovada com todas as conferências)', async () => {
+      const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment() });
+      seed(store, { ...atTerminal, cancel_reason: 'operator', cancel_requested_by: STAFF, cancel_requested_at: CREATED_AT, cancel_authorized_by: 'manager', cancel_audit_id: 'audit-x' });
+      at(store, 10 * 60_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toEqual(APPROVED_REPLY);
+    });
+
+    it('sem a resposta do banco sobre o prazo: WAITING_CARD (lado seguro), nada lido nem gravado', async () => {
+      const { ctx, store, calls } = setup({ get: async () => approvedOrder() });
+      const before = seed(store, atTerminal);
+      at(store, 10 * 60_000);
+      store.inCardWait = async () => { throw new Error('banco fora do ar'); };
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'WAITING_CARD' });
+      expect(calls.get).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('ainda no prazo, creating com envio sem resposta: a conferência não repete o envio (WAITING_CARD)', async () => {
+      const { ctx, store, calls } = setup();
+      const before = seed(store, { status: 'creating', external_order_id: null, raw_status: null, raw_status_detail: null, dispatch_lease_until: CREATED_AT });
+      at(store, 30_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'WAITING_CARD' });
+      expect(calls.create).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('terminou aprovada pela consulta do outro aparelho no meio desta chamada: APPROVED_ELSEWHERE, nunca APPROVED', async () => {
+      const { ctx, store, calls } = setup();
+      seed(store, atTerminal);
+      at(store, 10 * 60_000);
+      const real = store.requestTimeoutCancel.bind(store);
+      store.requestTimeoutCancel = async (row, waitMs) => {
+        // O aparelho que cobra gravou a aprovação entre a leitura desta conferência e o pedido de encerramento.
+        Object.assign(store.rows[0]!, { status: 'approved', external_payment_id: '123456789', paid_amount_cents: 2450, authorization_code: 'A1B2C3', card_brand: 'MASTERCARD', last_four: '4242' });
+        return real(row, waitMs);
+      };
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'APPROVED_ELSEWHERE' });
+      expect(calls.get).toHaveLength(0);
+    });
+
+    it.each([['depois do prazo', 10 * 60_000]] as const)('B: app fechado depois de a maquininha aprovar (%s): APPROVED com todas as conferências', async (_n, ms) => {
       const { ctx, store, calls } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment() });
       seed(store, atTerminal);
       at(store, ms);
@@ -2634,7 +2713,7 @@ describe('point-charge: auditoria r5', () => {
     it('B: aprovada no Mercado Pago com um dado que não confere: revisão, e a conferência com PIN não aprova', async () => {
       const { ctx, store } = setup({ get: async () => approvedOrder({ paidAmountCents: 100 }) });
       seed(store, { ...atTerminal, status: 'pending' });
-      at(store, 30_000);
+      at(store, 10 * 60_000);
       expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'PAID_AMOUNT_MISMATCH' });
       expect(store.rows[0]!.status).toBe('manual_review');
       expect(store.resolutions).toHaveLength(0);
@@ -2701,20 +2780,79 @@ describe('point-charge: auditoria r5', () => {
         unchanged(store, before);
       });
 
-      it('pagamento ilegível agora: MP_UNAVAILABLE; sem ID do pagamento: REFUNDED, sem ler', async () => {
+      it('pagamento ilegível agora: MP_UNAVAILABLE; sem ID do pagamento nem ordem: REFUNDED, sem ler', async () => {
         const down = setup({ payment: async () => { throw new Error('rede'); } });
         seed(down.store, refundedRow);
         expect(await reconcileCharge(down.ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_UNAVAILABLE' });
         const none = setup();
-        seed(none.store, { ...refundedRow, external_payment_id: null });
+        seed(none.store, { ...refundedRow, external_payment_id: null, external_order_id: null });
         expect(await reconcileCharge(none.ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'REFUNDED' });
         expect(none.calls.payment).toHaveLength(0);
+        expect(none.calls.get).toHaveLength(0);
+      });
+
+      it('o estorno provado responde DECLINED com code REFUNDED (não "nada foi cobrado")', async () => {
+        const { ctx, store } = setup({ payment: async () => approvedPayment({ status: 'refunded' }) });
+        seed(store, refundedRow);
+        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', code: 'REFUNDED' });
+      });
+
+      it.each(['settled', 'reimbursed', 'in_process', null])('contestação (charged_back, %s) não prova estorno sem PIN: REFUNDED, a trava fica', async (detail) => {
+        const { ctx, store } = setup({ payment: async () => approvedPayment({ status: 'charged_back', statusDetail: detail }) });
+        const before = seed(store, refundedRow);
+        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'REFUNDED' });
+        unchanged(store, before);
+      });
+
+      describe('sem ID do pagamento: a própria ordem, com o eco completo', () => {
+        const noPayment = { ...refundedRow, external_payment_id: null } as const;
+        const refundedOrder = (over: Partial<PaymentTerminalChargeResult> = {}) => order({ status: 'refunded', rawStatus: 'refunded', ...over });
+
+        it('ordem estornada, mesma ordem, referência, maquininha e valor: DECLINED REFUNDED, só leitura', async () => {
+          const { ctx, store, calls } = setup({ get: async () => refundedOrder() });
+          const before = seed(store, noPayment);
+          expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', code: 'REFUNDED' });
+          expect(calls.get).toEqual(['ORD01']);
+          expect(calls.payment).toHaveLength(0);
+          expect(store.count.authorizeReconcile ?? 0).toBe(0);
+          unchanged(store, before);
+        });
+
+        it.each([
+          ['outra ordem', { externalOrderId: 'ORD99' }],
+          ['ordem não estornada', { status: 'approved' as const }],
+          ['sem referência', { externalReference: null }],
+          ['outra referência', { externalReference: 'outra' }],
+          ['sem maquininha', { externalTerminalId: null }],
+          ['outra maquininha', { externalTerminalId: 'OUTRA' }],
+          ['outro valor', { amountCents: 100 }],
+        ] as const)('%s: REFUNDED, a trava fica', async (_n, over) => {
+          const { ctx, store } = setup({ get: async () => refundedOrder(over as Partial<PaymentTerminalChargeResult>) });
+          const before = seed(store, noPayment);
+          expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'REFUNDED' });
+          unchanged(store, before);
+        });
+
+        it('a ordem agora informa o pagamento: vale o pagamento (precisa provar o estorno)', async () => {
+          const ok = setup({ get: async () => refundedOrder({ externalPaymentId: '123456789' }), payment: async () => approvedPayment({ status: 'refunded' }) });
+          seed(ok.store, noPayment);
+          expect(await reconcileCharge(ok.ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', code: 'REFUNDED' });
+          const no = setup({ get: async () => refundedOrder({ externalPaymentId: '123456789' }), payment: async () => approvedPayment() });
+          seed(no.store, noPayment);
+          expect(await reconcileCharge(no.ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'REFUNDED' });
+        });
+
+        it('ordem ilegível: MP_UNAVAILABLE', async () => {
+          const { ctx, store } = setup({ get: async () => { throw new Error('rede'); } });
+          seed(store, noPayment);
+          expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_UNAVAILABLE' });
+        });
       });
 
       it('a consulta moveu a cobrança aberta para estornada: a conferência já confere o estorno', async () => {
         const { ctx, store } = setup({ get: async () => order({ status: 'refunded', rawStatus: 'refunded', externalPaymentId: '123456789' }), payment: async () => approvedPayment({ status: 'refunded' }) });
         seed(store, atTerminal);
-        at(store, 30_000);
+        at(store, 10 * 60_000);
         expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
         expect(store.rows[0]!.status).toBe('refunded');
       });

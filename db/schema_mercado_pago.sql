@@ -610,6 +610,34 @@ BEGIN
 END;
 $$;
 
+-- Prazo de espera do cartão (auditoria interna 3 P1-02): o mesmo de SERVER_TIMEOUT_MS em
+-- supabase/functions/point-charge/charge.ts (120 s; um teste confere os dois). tchefood_point_reservation usa para
+-- marcar a cobrança antiga (stale); a Edge Function manda o mesmo valor em p_wait_ms abaixo.
+CREATE OR REPLACE FUNCTION tchefood_point_charge_timeout()
+RETURNS INTERVAL
+LANGUAGE sql IMMUTABLE AS $$ SELECT INTERVAL '120 seconds' $$;
+
+-- A cobrança ainda está no prazo de espera do cartão (a Edge Function pergunta antes de deixar outro aparelho
+-- resolver): FALSE em estado final; senão, o relógio do banco antes de created_at + tchefood_point_charge_timeout(),
+-- sem olhar o pedido de encerramento. É exatamente o contrário de "stale" de tchefood_point_reservation para a
+-- cobrança aberta. Cobrança de outra loja ou que não existe: TF005. Só a service role.
+CREATE OR REPLACE FUNCTION tchefood_point_charge_in_wait(p_tenant UUID, p_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_charge terminal_charges%ROWTYPE;
+BEGIN
+    SELECT * INTO v_charge FROM terminal_charges WHERE id = p_id AND tenant_id = p_tenant;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
+    END IF;
+    IF v_charge.status IN ('approved', 'rejected', 'cancelled', 'expired', 'refunded') THEN
+        RETURN FALSE;
+    END IF;
+    RETURN clock_timestamp() < v_charge.created_at + tchefood_point_charge_timeout();
+END;
+$$;
+
 -- Encerramento por prazo: quem decide é o relógio do banco, contra a hora gravada da cobrança (também do
 -- banco). Um UPDATE só, com a linha travada: dois pedidos juntos gravam um encerramento.
 -- Devolve 0 (cedo demais, nada gravado), 1 (pedido gravado agora) ou 2 (já havia pedido, ou a cobrança
@@ -717,6 +745,7 @@ BEGIN
         'tchefood_begin_point_dispatch(UUID, UUID, INT, INT, BOOLEAN)',
         'tchefood_settle_point_dispatch(UUID, UUID)',
         'tchefood_request_point_timeout(UUID, UUID, INT)',
+        'tchefood_point_charge_in_wait(UUID, UUID)',
         'tchefood_block_point_key(UUID, VARCHAR, UUID, UUID, VARCHAR, VARCHAR, BIGINT, UUID)'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN

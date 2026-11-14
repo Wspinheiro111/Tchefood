@@ -11,7 +11,7 @@ import { cashSummary } from '../lib/cashRegister';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, getReviewHolds, setReviewHold } from '../lib/payments/reviewHolds';
 import { beginLocalClaim, localClaim, pendingRelease, resetClaimLedger, settleLocalClaim } from '../lib/payments/claimLedger';
 import { authorizeClaimRefunded, NOT_FOUND_SPAN_MS, reclaimPayment, releaseClaimAfterNoCharge, retryPendingClaimReleases, type ClaimDeps } from '../lib/payments/paymentClaim';
-import { RESERVED_EXCEEDS_BALANCE, rememberServerReservation, reservationExceeds, resetServerReservations, RESERVATION_READ_MAX_AGE_MS } from '../lib/payments/pointReservation';
+import { RESERVED_EXCEEDS_BALANCE, TOTAL_BELOW_PAID, rememberServerReservation, reservationExceeds, resetServerReservations, RESERVATION_READ_MAX_AGE_MS } from '../lib/payments/pointReservation';
 import { flushOutbox, sanitizePayload } from '../lib/sync/supabaseSync';
 import { confirmClaimRefunded, REFUND_NEEDS_MANAGER_RELEASE } from '../lib/payments/claimFlow';
 import type { SyncEvent } from '../types';
@@ -355,6 +355,47 @@ describe('P2-E: TF012 (reservado maior que o saldo)', () => {
     // Sem leitura do servidor: aplica (o servidor ainda confere com TF012).
     resetServerReservations();
     expect(st().applyDiscount(id, 5, auth).ok).toBe(true);
+  });
+});
+
+describe('TF012 total_below_paid: total abaixo do já pago, com ou sem reserva', () => {
+  it('desconto, cancelamento de item e taxa abaixo do já pago são recusados aqui, sem leitura de reserva', () => {
+    resetServerReservations();
+    const id = openTableWith(['101', '311']);
+    const before = order(id);
+    const auth = { managerPin: '9999', reason: 'Cortesia da casa ao cliente' };
+    // Paga quase tudo: sobra R$ 1,00.
+    expect(cash(id, before.remaining_balance - 1, 'k-quase').ok).toBe(true);
+    expect(st().applyDiscount(id, 5, auth)).toEqual({ ok: false, error: TOTAL_BELOW_PAID });
+    const item = st().orderItems.find((i) => i.order_id === id && i.status !== 'CANCELED')!;
+    expect(st().cancelOrderItem(item.id, auth)).toEqual({ ok: false, error: TOTAL_BELOW_PAID });
+    if (before.charge_service_fee && before.service_fee_amount > 1) expect(st().removeServiceFee(id, auth)).toEqual({ ok: false, error: TOTAL_BELOW_PAID });
+    expect(order(id).discount_amount).toBe(before.discount_amount);
+    // Até o saldo cabe.
+    expect(st().applyDiscount(id, 0.5, auth).ok).toBe(true);
+    expect(TOTAL_BELOW_PAID).toBe('O total ficaria abaixo do que já foi pago; estorne um pagamento antes.');
+  });
+
+  it('a recusa do banco mostra o DETAIL em reais', async () => {
+    const ev: SyncEvent = { id: 'e1', table: 'orders', op: 'UPDATE', row_id: 'o1', payload: { id: 'o1', discount_amount: 50 }, created_at: '' };
+    const body = JSON.stringify({ code: 'TF012', message: 'TCHEFOOD_TOTAL: total_below_paid', details: 'total_below_paid paid_cents=5000 total_cents=4250' });
+    const res = await flushOutbox([ev], cfg, async () => ({ ok: false, status: 400, text: async () => body }));
+    expect(res.rejected[0]!.message).toMatch(/^O total ficaria abaixo do que já foi pago; estorne um pagamento antes \(já pago R\$\s50,00; total ficaria R\$\s42,50\)\.$/);
+    const bare = JSON.stringify({ code: 'TF012', message: 'total_below_paid' });
+    const res2 = await flushOutbox([ev], cfg, async () => ({ ok: false, status: 400, text: async () => bare }));
+    expect(res2.rejected[0]!.message).toBe(TOTAL_BELOW_PAID);
+  });
+
+  it.each(['ainda aberta', 'já paga'])('recusa da maquininha (fora do Mercado Pago) com TF010 "%s": sai da fila sem parar a conta', async (why) => {
+    const declined: SyncEvent = { id: 'e-d', table: 'payments', op: 'INSERT', row_id: 'p-d', payload: { id: 'p-d', order_id: 'o-d', status: 'DECLINED', acquirer: 'STONE', idempotency_key: 'k-d' }, created_at: '' };
+    const close: SyncEvent = { id: 'e-o', table: 'orders', op: 'UPDATE', row_id: 'o-d', payload: { id: 'o-d' }, created_at: '' };
+    let n = 0;
+    const res = await flushOutbox([declined, close], cfg, async () => (n++ === 0
+      ? { ok: false, status: 400, text: async () => JSON.stringify({ code: 'TF010', message: `TCHEFOOD_PAGAMENTO: reserva ${why}` }) }
+      : { ok: true, status: 200, text: async () => '' }));
+    expect(res.rejected).toEqual([]);
+    expect(res.dropped?.map((d) => d.eventId)).toEqual(['e-d']);
+    expect(res.sent).toEqual(['e-o']);
   });
 });
 

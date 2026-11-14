@@ -253,4 +253,39 @@ describe.skipIf(!target)('point-charge: conferência no Mercado Pago com o banco
     expect((await store.update(row, { raw_status: 'x' })).raw_status).toBe('x');
     expect((await store.attachOrder(row, 'ORD-LIGADA')).external_order_id).toBe('ORD-LIGADA');
   });
+
+  it('prazo de espera do cartão (tchefood_point_charge_in_wait) pelo repositório: no prazo a conferência devolve WAITING_CARD sem ler nem gravar; passado o prazo, segue', async () => {
+    const store = supabaseChargeStore(serviceDb(), TENANT);
+    let calls = 0;
+    const counted = (ctx: ChargeContext): ChargeContext => ({
+      ...ctx,
+      provider: { ...ctx.provider, getCharge: async (...a) => { calls += 1; return ctx.provider.getCharge(...a); },
+        cancelCharge: async (...a) => { calls += 1; return ctx.provider.cancelCharge(...a); } },
+    });
+    // No prazo (criada agora), com e sem encerramento pedido: true, e a conferência não consulta o Mercado Pago.
+    const fresh = seedCharge({ status: 'at_terminal', raw_status: null, raw_status_detail: null });
+    const withCancel = seedCharge({ status: 'at_terminal', raw_status: null, raw_status_detail: null, cancel_requested_at: '2026-11-14T12:00:00Z', cancel_reason: 'operator' });
+    for (const key of [fresh, withCancel]) {
+      expect(await store.inCardWait(charge(key)), key).toBe(true);
+      const before = JSON.stringify(charge(key));
+      const ctx = counted(context(() => approvedOrder(key, charge(key).external_order_id!), () => approvedPayment()));
+      expect(await reconcileCharge(ctx, { idempotency_key: key, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: REASON }))
+        .toMatchObject({ status: 'MANUAL_REVIEW', code: 'WAITING_CARD' });
+      expect(calls, key).toBe(0);
+      expect(JSON.stringify(charge(key)), key).toBe(before);
+      expect(audits(key, 'POINT_CHARGE_RECONCILE_AUTHORIZED') + audits(key, 'POINT_CHARGE_RESOLVED'), key).toBe(0);
+    }
+    // Passado o prazo (created_at envelhecido sem os gatilhos): false, e a conferência segue a cobrança no Mercado Pago.
+    const old = seedCharge({ status: 'at_terminal', raw_status: null, raw_status_detail: null });
+    sql(`BEGIN; SET LOCAL session_replication_role = replica;
+         UPDATE terminal_charges SET created_at = clock_timestamp() - INTERVAL '121 seconds' WHERE idempotency_key = ${lit(old)}; COMMIT;`);
+    expect(await store.inCardWait(charge(old))).toBe(false);
+    const ctx = counted(context(() => approvedOrder(old, charge(old).external_order_id!), () => approvedPayment()));
+    const reply = await reconcileCharge(ctx, { idempotency_key: old, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: REASON });
+    expect(reply).not.toMatchObject({ code: 'WAITING_CARD' });
+    expect(calls).toBeGreaterThan(0);
+    // Estado final: false. Cobrança de outra loja: recusada (TF005 → not_found), não "no prazo".
+    expect(await store.inCardWait(charge(seedCharge({ status: 'rejected' })))).toBe(false);
+    await expect(supabaseChargeStore(serviceDb(), '99999999-9999-4999-8999-999999999999').inCardWait(charge(fresh))).rejects.toMatchObject({ code: 'not_found' });
+  });
 });

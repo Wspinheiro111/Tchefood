@@ -27,6 +27,9 @@ import { getReviewHoldByKey, reviewHoldKey, setReviewHold, type ReviewHold } fro
 export const CLAIM_RELEASED_DURING_CHARGE = 'A reserva foi liberada pelo gerente durante a cobrança: confira e estorne na maquininha';
 export const CLAIM_RELEASED_BEFORE_PUSH = 'Reserva liberada pelo gerente antes do pagamento chegar ao servidor: confira e estorne';
 export const CLAIM_UNCONFIRMED = 'Não foi possível confirmar a reserva com o servidor: a maquininha aprovou, mas o pagamento não foi registrado. Quando a conexão voltar, registre pelo comprovante.';
+/** A reserva foi recusada com código depois da aprovação (não é falta de conexão: esperar não resolve). */
+export const CLAIM_REFUSED_AFTER_APPROVAL =
+  'O servidor recusou a reserva desta cobrança: a maquininha aprovou, mas o pagamento não foi registrado. Chame o gerente: ele confere na maquininha e registra pelo comprovante ou estorna.';
 export const CLAIM_TOUCH_UNAVAILABLE = 'Sem conexão com o servidor para conferir a reserva: tente de novo.';
 
 /** Prazo da reserva no servidor (lease): sem batimento confirmado por este tempo, a aprovação não é registrada sozinha. */
@@ -161,7 +164,7 @@ export async function startPaymentClaim(
           markReleased();
           return { ok: false, code: 'CLAIM_RELEASED', reason: CLAIM_RELEASED_DURING_CHARGE };
         }
-        if (t.code) return { ok: false, code: 'CLAIM_UNCONFIRMED', reason: CLAIM_UNCONFIRMED };
+        if (t.code) return { ok: false, code: 'CLAIM_UNCONFIRMED', reason: CLAIM_REFUSED_AFTER_APPROVAL };
         // Sem resposta agora: dentro do prazo da reserva, o servidor ainda a segura; passou do prazo, não registra.
         if (now() - lastOkTouchAt >= CLAIM_LEASE_MS) return { ok: false, code: 'CLAIM_UNCONFIRMED', reason: CLAIM_UNCONFIRMED };
         return { ok: true };

@@ -140,6 +140,9 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
         // Sem a reserva desta chave neste aparelho (trava antiga, registro perdido): pede a reserva agora, com a
         // chave, a forma, a maquininha e o valor do comprovante, antes de registrar (o servidor exige, TF010).
         if (!current.idempotency_key || !localClaim(current.idempotency_key)) {
+          // A reserva nova mexe no servidor: o PIN do gerente é conferido antes (PIN errado não cria reserva).
+          const pinOk = store.verifyManagerPin({ managerPin: pinValue, reason }, { orderId: current.order_id, action: 'CHARGE_CONFIRMED_MANUALLY' });
+          if (!pinOk.ok) return refuse(pinOk.error);
           const key = current.idempotency_key ?? uuid();
           setChecking(true);
           const c = await startPaymentClaim(true, { orderId: current.order_id, key, method, acquirer, amount: current.amount }).finally(() => setChecking(false));

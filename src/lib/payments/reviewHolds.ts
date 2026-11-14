@@ -158,12 +158,29 @@ function persist(changed: Array<[string, ReviewHold | null]> = []): boolean {
   }
 }
 
+/** Contas com trava não gravada neste aparelho (para o aviso dizer quais). */
+export function unsavedReviewHoldOrders(): string[] {
+  if (!reviewHoldsUnsaved()) return [];
+  const ids = new Set<string>();
+  for (const [k, h] of unsaved) {
+    const order = h?.order_id ?? memory.get(k)?.order_id;
+    if (order) ids.add(order);
+  }
+  return [...ids];
+}
+
 /**
  * Há trava que não ficou gravada neste aparelho (some se o app fechar): a tela mostra um aviso fixo até gravar.
  * Fora do navegador (sem localStorage) não há onde gravar: não conta.
  */
 export function reviewHoldsUnsaved(): boolean {
-  return typeof localStorage !== 'undefined' && unsaved.size > 0;
+  if (unsaved.size === 0) return false;
+  try {
+    return typeof localStorage !== 'undefined';
+  } catch {
+    // Acesso bloqueado (SecurityError): o navegador tem o armazenamento e a trava não ficou gravada.
+    return true;
+  }
 }
 
 /** Todas as travas da comanda, da mais antiga para a mais nova. */

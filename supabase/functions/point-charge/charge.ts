@@ -163,6 +163,12 @@ export interface ChargeStore {
    * se ainda é cedo (nada gravado); senão a linha atual, com o pedido gravado (por esta ou outra chamada).
    */
   requestTimeoutCancel(row: TerminalChargeRow, waitMs: number): Promise<TerminalChargeRow | null>;
+  /**
+   * A cobrança ainda está no prazo de espera do cartão (SERVER_TIMEOUT_MS = tchefood_point_charge_timeout()) pelo relógio
+   * do banco contra a hora gravada dela, com ou sem pedido de encerramento (tchefood_point_charge_in_wait). Cobrança
+   * final: false.
+   */
+  inCardWait(row: TerminalChargeRow): Promise<boolean>;
   /** Cobranças da conta ainda não encerradas (para reconsultar antes de abrir outra). */
   listOpenForOrder(orderId: string): Promise<TerminalChargeRow[]>;
   /**
@@ -192,6 +198,8 @@ export interface ChargeStore {
 export interface PointPaymentDetails {
   id: string;
   status: string | null;
+  /** status_detail do pagamento (para charged_back: settled, reimbursed ou in_process). */
+  statusDetail?: string | null;
   amountCents: number | null;
   paymentMethodId: string | null;
   paymentTypeId: string | null;
@@ -251,7 +259,8 @@ export type ChargeReply =
       amount_cents: number;
       method: PointMethod;
     }
-  | { status: 'DECLINED'; idempotency_key: string; reason: string }
+  /** code REFUNDED: o Mercado Pago provou o estorno (houve cobrança e o dinheiro voltou), não "nada foi cobrado". */
+  | { status: 'DECLINED'; idempotency_key: string; reason: string; code?: 'REFUNDED' }
   | { status: 'MANUAL_REVIEW'; idempotency_key: string; reason: string; code: string };
 
 export class ChargeInputError extends Error {
@@ -945,7 +954,10 @@ export function validateReconcile(input: ReconcileInput): ReconcileRequest {
 }
 
 /** Status do pagamento do Mercado Pago que provam que o dinheiro voltou (ou nunca ficou). */
-const REFUND_PAYMENT_STATUSES: ReadonlySet<string> = new Set(['refunded', 'charged_back', 'cancelled']);
+// Decisão do Will (auditoria interna 3, a verificar 1): contestação (charged_back) nunca prova estorno, com ou sem PIN,
+// em nenhum status_detail (settled/reimbursed/in_process não dizem com clareza com quem ficou o dinheiro). A cobrança
+// fica em revisão manual e o gerente resolve com o Mercado Pago.
+const REFUND_PAYMENT_STATUSES: ReadonlySet<string> = new Set(['refunded', 'cancelled']);
 
 type ReconcileAuth = { staff: string; reason: string; audit_id: string; operation_id: string | null };
 
@@ -971,7 +983,7 @@ function verdictReview(row: TerminalChargeRow, code: string): ChargeReply {
 /** Resposta da conferência: estorno confirmado libera (DECLINED); o resto é a resposta de sempre. */
 function reconcileReply(row: TerminalChargeRow): ChargeReply {
   if (row.status === 'refunded') {
-    return { status: 'DECLINED', idempotency_key: row.idempotency_key, reason: 'O Mercado Pago confirmou o estorno: nada fica cobrado nesta cobrança.' };
+    return { status: 'DECLINED', idempotency_key: row.idempotency_key, code: 'REFUNDED', reason: 'O Mercado Pago confirmou o estorno: nada fica cobrado nesta cobrança.' };
   }
   return replyFor(row);
 }
@@ -987,7 +999,8 @@ async function reconcilable(ctx: ChargeContext, row: TerminalChargeRow): Promise
 const OPEN_STATUSES: ReadonlySet<ChargeStatus> = new Set(['creating', 'pending', 'at_terminal']);
 
 const OPEN_TEXT = {
-  WAITING_CARD: 'A cobrança ainda está no prazo de espera do cartão na maquininha. Aguarde e confira de novo. O valor segue reservado na conta.',
+  WAITING_CARD: 'A cobrança ainda está no prazo de espera do cartão e pode estar sendo cobrada em outro aparelho. Aguarde ela terminar e confira de novo; não cobre de novo. O valor segue reservado na conta.',
+  APPROVED_ELSEWHERE: 'A cobrança acabou de ser aprovada na maquininha, pela consulta do aparelho que cobrava. Aguarde ele registrar o pagamento; se não registrar, confira de novo (sem cobrar de novo).',
   DISPATCH_PENDING: 'O envio desta cobrança à maquininha ainda pode estar a caminho. Confira de novo em instantes. Nada foi liberado e o valor segue reservado na conta.',
 } as const;
 
@@ -1006,14 +1019,38 @@ function openReply(row: TerminalChargeRow): ChargeReply {
 
 /**
  * Estornada: confere, sem gravar nada, o próprio pagamento da cobrança no Mercado Pago. Estorno provado (mesmo ID,
- * valor e referência; status refunded/charged_back/cancelled) = DECLINED, e o aparelho tira a trava. Sem ID do
+ * valor e referência; status refunded/cancelled; contestação nunca) = DECLINED, e o aparelho tira a trava. Sem ID do
  * pagamento, sem leitura ou sem prova: a resposta de sempre (MANUAL_REVIEW REFUNDED), e a trava fica.
  */
 async function confirmRefund(ctx: ChargeContext, row: TerminalChargeRow): Promise<ChargeReply> {
-  if (!row.external_payment_id) return replyFor(row);
+  if (!row.external_payment_id) return confirmRefundByOrder(ctx, row);
   const payment = await readPayment(ctx, row.external_payment_id);
   if (!payment) return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
   if (!provesRefund(row, payment, row.external_payment_id)) return replyFor(row);
+  return reconcileReply(row);
+}
+
+/**
+ * Revisão PR #49 (a verificar 2): estornada sem ID do pagamento gravado (a ordem estornou sem informar o pagamento). A
+ * prova possível é a própria ordem lida agora: a mesma ordem ligada, estornada, ecoando a referência e a maquininha
+ * desta cobrança e com o mesmo valor (as conferências de judgeOrder para um fim). Se a ordem passou a informar um
+ * pagamento, vale o pagamento (que precisa provar o estorno). Sem ordem, sem leitura ou sem prova: a trava fica.
+ */
+async function confirmRefundByOrder(ctx: ChargeContext, row: TerminalChargeRow): Promise<ChargeReply> {
+  if (!row.external_order_id) return replyFor(row);
+  let order: PaymentTerminalChargeResult;
+  try {
+    order = await ctx.provider.getCharge(row.external_order_id);
+  } catch {
+    return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
+  }
+  if (order.externalOrderId !== row.external_order_id || order.status !== 'refunded') return replyFor(row);
+  if (order.externalReference !== row.idempotency_key || order.externalTerminalId !== row.external_terminal_id || order.amountCents !== row.amount_cents) return replyFor(row);
+  if (order.externalPaymentId) {
+    const payment = await readPayment(ctx, order.externalPaymentId);
+    if (!payment) return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
+    if (!provesRefund(row, payment, order.externalPaymentId)) return replyFor(row);
+  }
   return reconcileReply(row);
 }
 
@@ -1102,7 +1139,25 @@ export async function reconcileCharge(ctx: ChargeContext, input: ReconcileInput)
   // prazo, encerramento por prazo pelo relógio do banco). Nada disso pede PIN (é o que a consulta e o cancel "timeout"
   // já fazem); se ela cair em revisão manual, segue abaixo para a conferência com PIN como qualquer revisão.
   if (OPEN_STATUSES.has(row.status)) {
-    row = await settleStale(ctx, row, (r) => resume(ctx, r, false));
+    // Auditoria interna 3 (P1-02): dentro do prazo de espera do cartão (relógio do banco contra a hora gravada da
+    // cobrança, com ou sem pedido de encerramento, inclusive o do gerente) a cobrança pode estar sendo feita em outro
+    // aparelho. A conferência não consulta nem grava nada e nunca devolve um fim (o aparelho que cobra registra a
+    // aprovação; outro registrando junto daria dois pagamentos e duas NFC-e): WAITING_CARD. Sem a resposta do banco,
+    // vale o mesmo (lado seguro).
+    let waiting: boolean;
+    try {
+      waiting = await ctx.store.inCardWait(row);
+    } catch {
+      waiting = true;
+    }
+    if (waiting) return stillInReview(row, 'WAITING_CARD', OPEN_TEXT.WAITING_CARD);
+    let ended = false;
+    row = await settleStale(ctx, row, async (r) => {
+      ended = FINAL.has(r.status);
+      return r;
+    });
+    // Terminou no meio desta chamada, sem leitura nossa (a consulta do aparelho que cobra): a aprovação é dele registrar.
+    if (ended && row.status === 'approved') return stillInReview(row, 'APPROVED_ELSEWHERE', OPEN_TEXT.APPROVED_ELSEWHERE);
     if (row.status !== 'manual_review') return row.status === 'refunded' ? confirmRefund(ctx, row) : openReply(row);
   }
   // Revisão PR #49 (P2): estornada é final e não reserva no servidor, mas a trava do aparelho só sai com o Mercado Pago

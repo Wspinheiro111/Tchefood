@@ -142,21 +142,33 @@ repete a liberação que falhou por rede.
   (referência, valor, forma, autorização). Sem nada disso a cobrança continua em revisão e reservando;
 - aprovada sem pagamento registrado: o app registra o pagamento com os dados do servidor, sem cobrar de novo; se o
   Mercado Pago mostra o estorno, ela vira `refunded` e libera a reserva uma vez;
-- ainda não terminada (`creating`/`pending`/`at_terminal`: Point sem rede, app fechado no meio; revisão PR #49): segue
-  a cobrança no Mercado Pago como a consulta e o encerramento por prazo, sem PIN. No prazo de espera do cartão (2 min
-  pelo relógio do banco) só consulta; depois dele grava o pedido de encerramento, pede o cancelamento da ordem e grava
-  o que o Mercado Pago disser (aprovada com todas as conferências; recusada/cancelada/expirada com o eco da referência e
-  da maquininha). Sem ordem: nunca enviada = cancelada com prova; envio sem resposta = revisão manual, e aí a
-  conferência continua com o PIN. Ainda aberta no Mercado Pago = continua reservando (`WAITING_CARD`,
-  `DISPATCH_PENDING`, `MP_PENDING`); nada vira recusa nem revisão por tempo. A tela da conta mostra "Resolver cobrança
-  da Point" para essas cobranças em qualquer aparelho, menos no que a está cobrando agora;
-- estornada: só lê o pagamento da cobrança; estorno provado (mesmo ID, valor e referência) responde "recusada" e o
-  aparelho tira a trava. Nada é gravado (por isso o PIN não é conferido nessa leitura).
+- ainda não terminada (`creating`/`pending`/`at_terminal`: Point sem rede, app fechado no meio; revisão PR #49 e
+  auditoria interna 3): no prazo de espera do cartão (2 min pelo relógio do banco contra a hora gravada da cobrança,
+  `tchefood_point_charge_in_wait`, com ou sem pedido de encerramento, inclusive o do gerente) a conferência não consulta nem grava
+  nada e nunca devolve um fim (`WAITING_CARD`): a cobrança pode estar sendo feita em outro aparelho, que registra a
+  aprovação. Depois do prazo, sem PIN, segue como o encerramento por prazo: grava o pedido de encerramento, pede o
+  cancelamento da ordem e grava o que o Mercado Pago disser (aprovada com todas as conferências; recusada/cancelada/
+  expirada com o eco da referência e da maquininha). Sem ordem: nunca enviada = cancelada com prova; envio sem
+  resposta = revisão manual, e aí a conferência continua com o PIN. Ainda aberta no Mercado Pago = continua
+  reservando (`DISPATCH_PENDING`, `MP_PENDING`); nada vira recusa nem revisão por tempo. Se a cobrança terminar
+  aprovada no meio da chamada pela consulta de outro aparelho, a resposta é `APPROVED_ELSEWHERE`, nunca a aprovação.
+  A tela da conta só oferece "Resolver cobrança da Point" para a cobrança aberta que o servidor marca vencida
+  (`stale` em `tchefood_point_reservation`, relógio do banco); antes disso mostra "cobrando em outro aparelho", sem
+  ação;
+- estornada: só leitura, sem PIN e sem gravar nada. Com o ID do pagamento: o pagamento precisa provar o estorno (mesmo
+  ID, valor e referência; `refunded` ou `cancelled`; contestação `charged_back` nunca serve aqui). Sem o ID do
+  pagamento: a própria ordem lida agora, a mesma ligada, estornada, ecoando referência e maquininha e com o mesmo
+  valor (se ela passar a informar um pagamento, vale o pagamento). Provado: "recusada" com `code: REFUNDED`, e o
+  aparelho tira a trava avisando "estornada no Mercado Pago".
+- contestação (`charged_back`) nunca prova estorno, com ou sem PIN, em nenhum `status_detail` (decisão do Will,
+  auditoria interna 3): a cobrança fica em revisão manual e o gerente resolve com o Mercado Pago.
 
 Trava do aparelho quando a conferência responde "não há o que conferir" (409): o app lê o estado gravado (ação
-`status`) e só tira a trava com o fim provado no servidor: recusada/cancelada/expirada, ou aprovada com o pagamento já
-registrado neste aparelho. Aprovada com o pagamento só no servidor (outro aparelho registrou), estornada sem prova,
-em revisão, aberta, erro de leitura ou resposta de outra chave: a trava fica, com o motivo.
+`status`) e só tira a trava com o fim provado no servidor: recusada/cancelada/expirada, ou aprovada (409 numa aprovada
+= pagamento já registrado no servidor). Estornada sem prova, em revisão, aberta, erro de leitura ou resposta de outra
+chave: a trava fica, com o motivo. Antes de registrar uma aprovação da Point, o aparelho relê a reserva da conta: só
+registra se o servidor ainda mostra a cobrança aprovada sem pagamento; já registrada lá, tira a trava sem registrar
+(evita o segundo pagamento e a segunda NFC-e); sem leitura, não registra.
 Só `tchefood_resolve_point_charge` (service role, com a autorização do gerente, um registro por fim) tira uma
 cobrança da revisão ou estorna uma aprovada; a consulta normal não muda mais uma cobrança em revisão. Nada é
 liberado por tempo ou por declaração.

@@ -5,16 +5,26 @@ import { PinPad } from './PinPad';
 import { useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { clearReviewHold, getReviewHolds, reviewHoldKey } from '../lib/payments/reviewHolds';
-import { RECONCILE_MIN_REASON, readPointChargeStatus, reconcilePointCharge, type ReconcileDeps } from '../lib/payments/pointReconcile';
+import { RECONCILE_MIN_REASON, pointPaymentOnServer, readPointChargeStatus, reconcilePointCharge, type ReconcileDeps } from '../lib/payments/pointReconcile';
 import { formatBRL } from '../lib/money';
 import { playDeniedBuzz, vibrate } from '../lib/sound';
 
 export const POINT_NOT_CHARGED = 'O Mercado Pago confirmou que não foi cobrado. Valor liberado.';
+/** Estorno provado pelo Mercado Pago (houve cobrança e o dinheiro voltou ao cliente). */
+export const POINT_REFUNDED = 'Cobrança estornada no Mercado Pago: o dinheiro voltou ao cliente e nada fica cobrado. Valor liberado.';
+/** Cobrança ainda em andamento (no prazo, envio a caminho, aberta na maquininha): não é caso de digitar o ID da operação. */
+export const POINT_IN_PROGRESS = 'A cobrança está em andamento, talvez em outro aparelho. Aguarde ela terminar (ou finalize/cancele na maquininha) e confira de novo. Não cobre de novo.';
+/** Códigos da conferência para cobrança ainda em andamento (charge.ts: openReply, APPROVED_ELSEWHERE). */
+const IN_PROGRESS_CODES: ReadonlySet<string> = new Set(['WAITING_CARD', 'DISPATCH_PENDING', 'MP_PENDING', 'APPROVED_ELSEWHERE']);
 /** Conferência recusada (já terminou) e o servidor confirma o fim sem cobrança: a trava sai. */
 export const POINT_SERVER_CLOSED = 'O servidor confirma que esta cobrança terminou sem cobrar. Trava liberada.';
-/** Aprovada e com o pagamento registrado no servidor por outro aparelho: a trava só sai com o pagamento aqui. */
+/**
+ * Aprovada e com o pagamento registrado no servidor por outro aparelho (a conferência respondeu "já resolvida" e a
+ * consulta, APPROVED): o servidor tem o pagamento, então a trava sai. Este aparelho não baixa pagamentos da nuvem;
+ * uma nova cobrança acima do saldo do servidor é recusada lá.
+ */
 export const POINT_APPROVED_ELSEWHERE =
-  'A cobrança foi aprovada e o pagamento já está registrado no servidor (por outro aparelho). Não cobre de novo: aguarde este aparelho sincronizar e confira de novo para tirar a trava.';
+  'A cobrança foi aprovada e o pagamento já está registrado no servidor (por outro aparelho). Trava liberada. Não cobre de novo: o saldo desta conta neste aparelho ainda não mostra esse pagamento, e o servidor recusa cobrança acima do saldo dele.';
 export const POINT_STILL_OPEN = 'A cobrança ainda está aberta na maquininha. Finalize ou cancele nela e confira de novo.';
 export const POINT_REVIEW_PROCEDURE =
   'Confira a cobrança no app do Mercado Pago. Se houver a operação, digite o ID da operação acima e confira de novo. Se não houver, tente de novo mais tarde. Enquanto isso, a conta segue com o valor reservado.';
@@ -62,6 +72,8 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
   const [pin, setPin] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [review, setReview] = useState<string | null>(null);
+  /** A revisão mostrada é de cobrança em andamento (sem o procedimento do ID da operação). */
+  const [reviewInProgress, setReviewInProgress] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -71,6 +83,7 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
     setPin('');
     setError(null);
     setReview(null);
+    setReviewInProgress(false);
     setBusy(false);
   }, [open, charge.idempotency_key]);
 
@@ -111,11 +124,20 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
         onClose();
         return;
       }
-      setPin('');
-      setReview(POINT_APPROVED_ELSEWHERE);
+      if (r.amount_cents !== Math.round(charge.amount * 100) || (charge.method && r.method !== charge.method)) {
+        setPin('');
+        setReviewInProgress(false);
+        setReview(`O Mercado Pago aprovou ${formatBRL(r.amount_cents / 100)} (${METHOD_LABEL[r.method]}), diferente desta cobrança. A trava continua; confira com o gerente.`);
+        return;
+      }
+      clearHoldOf(charge.order_id, k);
+      toast.info(POINT_APPROVED_ELSEWHERE);
+      onReleased?.();
+      onClose();
       return;
     }
     setPin('');
+    setReviewInProgress(r.status === 'PENDING' || IN_PROGRESS_CODES.has(r.code));
     setReview(r.status === 'MANUAL_REVIEW' ? r.reason : POINT_STILL_OPEN);
   };
 
@@ -127,6 +149,7 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
     setBusy(true);
     setError(null);
     setReview(null);
+    setReviewInProgress(false);
     const out = await reconcilePointCharge({ idempotency_key: key, staff_id: staff, manager_pin: pinValue, reason_text: reason, operation_id: operationId }, deps);
     if (out.kind === 'error' && out.notApplicable) {
       await settleNotApplicable(key);
@@ -142,12 +165,13 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
     }
     if (reply.status === 'MANUAL_REVIEW') {
       setPin('');
+      setReviewInProgress(IN_PROGRESS_CODES.has(reply.code));
       setReview(reply.reason);
       return;
     }
     if (reply.status === 'DECLINED') {
       clearHoldOf(charge.order_id, key);
-      toast.success(POINT_NOT_CHARGED);
+      toast.success(out.refunded ? POINT_REFUNDED : POINT_NOT_CHARGED);
       onReleased?.();
       onClose();
       return;
@@ -164,6 +188,18 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
       onClose();
       return;
     }
+    // Auditoria interna 3 (P1-02): antes de registrar, o servidor ainda precisa mostrar esta cobrança aprovada SEM
+    // pagamento. Já registrada lá (outro aparelho): não registra aqui (seria o segundo pagamento e a segunda NFC-e).
+    const onServer = await pointPaymentOnServer(charge.order_id, key, deps);
+    if (onServer.kind === 'not_reserving') {
+      clearHoldOf(charge.order_id, key);
+      toast.info(POINT_APPROVED_ELSEWHERE);
+      onReleased?.();
+      onClose();
+      return;
+    }
+    if (onServer.kind === 'error') return fail(onServer.error);
+    if (onServer.kind === 'other') return fail(`A cobrança mudou no servidor (${onServer.status}). Nada foi registrado e a trava continua; confira de novo.`);
     const terminalId = charge.terminal_id ?? st.terminals.find((t) => t.acquirer === 'MERCADO_PAGO' && t.serial_number === reply.terminal_serial)?.id ?? null;
     const r = st.registerPayment({
       orderId: charge.order_id,
@@ -201,8 +237,8 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
 
       {review && (
         <div role="alert" className="mb-3 rounded-xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
-          <div className="font-bold text-brasa">Continua em revisão: {review}</div>
-          <p className="mt-1 text-slate-800">{POINT_REVIEW_PROCEDURE}</p>
+          <div className="font-bold text-brasa">{reviewInProgress ? 'Em andamento' : 'Continua em revisão'}: {review}</div>
+          <p className="mt-1 text-slate-800">{reviewInProgress ? POINT_IN_PROGRESS : POINT_REVIEW_PROCEDURE}</p>
         </div>
       )}
 

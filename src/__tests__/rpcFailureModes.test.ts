@@ -27,7 +27,7 @@ const pc = await import('../lib/payments/paymentClaim');
 const { claimPayment, releaseClaimAfterNoCharge, retryPendingClaimReleases, releasePaymentClaimManager, touchPaymentClaim, authorizeClaimRefunded, reclaimPayment } = pc;
 const { startPaymentClaim, reclaimForHold, confirmClaimRefunded, checkHoldClaim } = await import('../lib/payments/claimFlow');
 const { superviseSettledClaims, resetClaimSupervisor } = await import('../lib/payments/claimSupervisor');
-const { readPointChargeStatus, reconcilePointCharge } = await import('../lib/payments/pointReconcile');
+const { pointPaymentOnServer, readPointChargeStatus, reconcilePointCharge } = await import('../lib/payments/pointReconcile');
 const { MercadoPagoPointDriver } = await import('../lib/payments/mercadoPagoPointDriver');
 const { setReviewHold, getReviewHoldByKey, clearReviewHold } = await import('../lib/payments/reviewHolds');
 const { useTcheStore } = await import('../store/useTcheStore');
@@ -729,6 +729,29 @@ describe('point-charge reconcile: reconcilePointCharge', () => {
   it.each([...TRANSPORT, ...PROXY_4XX, ...POINT_BAD_200, ...POINT_FN_4XX])('readPointChargeStatus, %s: erro (a trava fica)', async (_n, a) => {
     routes['point:status'] = a;
     expect(show(await readPointChargeStatus(KEY, rdeps())).kind).toBe('error');
+  });
+  it('DECLINED com code REFUNDED: marca refunded (a tela avisa estorno, não "nada foi cobrado")', async () => {
+    routes['point:reconcile'] = json(200, { status: 'DECLINED', idempotency_key: KEY, reason: 'estorno', code: 'REFUNDED' });
+    expect(show(await reconcilePointCharge(input, rdeps()))).toEqual({ kind: 'reply', refunded: true, reply: { status: 'DECLINED', idempotency_key: KEY, reason: 'estorno' } });
+  });
+  describe('pointPaymentOnServer (antes de registrar a aprovação da Point)', () => {
+    const res = (charges: unknown) => json(200, { reserved_cents: 0, open_charges: 0, manual_review: false, charges });
+    const ch = (over: Record<string, unknown>) => ({ idempotency_key: KEY, status: 'approved', amount_cents: 1000, raw_status_detail: null, has_payment: false, ...over });
+    it.each([
+      ['aprovada sem pagamento', res([ch({})]), 'not_registered'],
+      ['aprovada com pagamento', res([ch({ has_payment: true })]), 'not_reserving'],
+      ['não aparece (não reserva mais)', res([]), 'not_reserving'],
+      ['outro estado', res([ch({ status: 'manual_review' })]), 'other'],
+      ['banco sem a lista', json(200, { reserved_cents: 0, open_charges: 0, manual_review: false }), 'error'],
+      ['erro 500', json(500, { message: 'x' }), 'error'],
+    ] as const)('%s → %s', async (_n, a, kind) => {
+      routes['tchefood_point_reservation'] = a;
+      expect(show(await pointPaymentOnServer('order-1', KEY, rdeps())).kind).toBe(kind);
+    });
+    it.each(TRANSPORT)('%s → error (não registra)', async (_n, a) => {
+      routes['tchefood_point_reservation'] = a;
+      expect(show(await pointPaymentOnServer('order-1', KEY, rdeps())).kind).toBe('error');
+    });
   });
   it('readPointChargeStatus: devolve a resposta do servidor sobre a chave', async () => {
     routes['point:status'] = json(200, { status: 'DECLINED', idempotency_key: KEY, reason: 'cancelada' });

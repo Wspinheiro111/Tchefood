@@ -93,8 +93,11 @@
 -- 14. Auditoria r8 P1-01: a chave é conferida em todo status do pagamento, com a conta e depois a chave travadas (a
 --    mesma ordem da abertura da cobrança). Fora do Mercado Pago: a chave de uma cobrança da Point é recusada em qualquer
 --    status (TF009 key_in_use); só aprovado ou recusado entra (PENDING e REFUNDED: TF007; o aparelho não grava esses);
---    o recusado com a chave de uma reserva, aberta ou já liberada, precisa ser da mesma loja, conta, forma e
---    credenciadora (TF010) e não move dinheiro. Pagamento PENDING do Mercado Pago também não entra (TF007).
+--    o recusado com a chave de uma reserva desta loja só entra com a reserva já liberada e da mesma conta (forma e
+--    credenciadora podem ser outras: auditoria interna F1); com a reserva aberta ou consumida, ou de outra conta,
+--    TF010 (auditoria interna 3 P1-01: o recusado ocuparia a chave, única em payments, e o aprovado da reserva
+--    aberta nunca entraria). Chave de reserva, cobrança ou pagamento de outra loja: TF009 key_in_use, a mesma recusa
+--    em todo status (auditoria interna F3). Não move dinheiro. Pagamento PENDING do Mercado Pago também não entra (TF007).
 -- =============================================================================
 
 -- Prazos da reserva, num lugar só. Prazo de atividade: quanto vale cada renovação do aparelho que cobra.
@@ -394,15 +397,27 @@ BEGIN
                 RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento % fora do Mercado Pago não é gravado no servidor (só aprovado ou recusado).', NEW.status
                     USING ERRCODE = 'TF007';
             END IF;
-            -- O recusado com a chave de uma reserva desta loja é o registro da recusa daquela cobrança: só precisa ser da
-            -- mesma conta. Auditoria interna F1: forma e credenciadora podem vir diferentes da reserva (a maquininha
-            -- respondeu por outra credenciadora, o retorno nativo da Stone, o simulador) e a recusa não move dinheiro;
-            -- recusá-la travava a fila da conta inteira e o aprovado da nova tentativa nunca subia. Vale com a reserva
-            -- aberta ou já liberada (a recusa libera a reserva e o registro dela sobe depois). Recusado sem reserva
-            -- nenhuma com a chave também entra (app sem nuvem antes).
-            IF v_claim_found AND v_claim.order_id <> NEW.order_id THEN
-                RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o recusado não é da conta da reserva com a chave %.', NEW.idempotency_key USING ERRCODE = 'TF010';
+            -- O recusado com a chave de uma reserva desta loja é o registro da recusa daquela cobrança: só entra com a
+            -- reserva já liberada (a recusa libera a reserva e o registro dela sobe depois) e da mesma conta.
+            -- Auditoria interna F1: forma e credenciadora podem vir diferentes da reserva (a maquininha respondeu por
+            -- outra credenciadora, o retorno nativo da Stone, o simulador). Auditoria interna 3 P1-01: com a reserva
+            -- ABERTA o recusado ocuparia a chave (única em payments) e o aprovado dela nunca entraria (23505), com a
+            -- reserva aberta para sempre; consumida, a chave já é do pagamento dela. As duas: TF010 (o aparelho tira da
+            -- fila o recusado com TF010 sem parar o resto). Recusado sem reserva nenhuma com a chave também entra (app
+            -- sem nuvem antes).
+            -- No UPDATE (pagamento antigo que vira recusado) a chave já é desta linha: não ocupa nada novo, vale só a conta.
+            IF v_claim_found AND (v_claim.order_id <> NEW.order_id OR (TG_OP = 'INSERT' AND v_claim.status <> 'released')) THEN
+                RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o recusado não entra com a chave % (reserva %).', NEW.idempotency_key,
+                    CASE WHEN v_claim.order_id <> NEW.order_id THEN 'de outra conta' WHEN v_claim.status = 'open' THEN 'ainda aberta'
+                         ELSE 'já paga' END
+                    USING ERRCODE = 'TF010';
             END IF;
+        END IF;
+        -- Auditoria interna (fuzzer, item 3): outro pagamento com a chave (desta loja ou de outra): TF009 key_in_use com a
+        -- chave travada, antes de a unicidade de payments.idempotency_key responder 23505 (dois recusados, ou duas linhas
+        -- do Mercado Pago para a mesma cobrança). Depois das recusas acima: a reserva paga com a chave continua TF010.
+        IF EXISTS (SELECT 1 FROM payments p WHERE p.idempotency_key = NEW.idempotency_key AND p.id <> NEW.id) THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % já está em uso (outra reserva, cobrança ou pagamento).', NEW.idempotency_key USING ERRCODE = 'TF009', DETAIL = 'key_in_use';
         END IF;
         RETURN NEW; -- o do Mercado Pago é conferido por trg_payments_mercado_pago
     END IF;
@@ -427,6 +442,12 @@ BEGIN
         -- Pagamento aprovado que muda de loja (ou de conta) para uma conta que não é da loja dele: a
         -- reserva seria somada na loja errada.
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a conta do pagamento não é da loja dele.';
+    END IF;
+    -- Auditoria interna (fuzzer, item 3): outro pagamento com a chave (desta loja ou de outra): TF009 key_in_use com a
+    -- chave travada, antes de a unicidade de payments.idempotency_key responder 23505 (dois recusados, ou duas linhas
+    -- do Mercado Pago para a mesma cobrança).
+    IF EXISTS (SELECT 1 FROM payments p WHERE p.idempotency_key = NEW.idempotency_key AND p.id <> NEW.id) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % já está em uso (outra reserva, cobrança ou pagamento).', NEW.idempotency_key USING ERRCODE = 'TF009', DETAIL = 'key_in_use';
     END IF;
     -- Auditoria interna F3 (estendida ao aprovado, decisão do coordenador): fora do Mercado Pago, chave de cobrança
     -- ou pagamento de OUTRA loja, ou de reserva de outra loja sem reserva desta loja com ela, é a mesma recusa do
@@ -566,11 +587,21 @@ CREATE OR REPLACE TRIGGER trg_payments_claim_consume AFTER INSERT OR UPDATE OF s
 -- uma reserva ou cobrança já está gravado quando o recálculo roda (gatilho AFTER de payments), e a soma reservada
 -- deixa de contar a reserva dele; pagamento sem reserva já é barrado no saldo livre pelo gatilho de payments. O que
 -- sobra é a redução do total (desconto, item cancelado, 10% retirado) com dinheiro reservado: recusada (TF012).
+-- Auditoria interna (fuzzer, item 1): o total também não fica abaixo do que já foi pago. Desconto ou item cancelado
+-- numa conta com pagamento aprovado e nada reservado deixava o pago acima do total (a conta fechava com total menor
+-- que o pago, ou ficava aberta com total zero). Com algo reservado, a conferência do reservado (saldo, que não fica
+-- negativo, contra o reservado) já recusa antes, com a mensagem de sempre. Para reduzir abaixo do pago, estorne antes
+-- (o pagamento estornado sai do pago). Só quando o total desce: o pagamento que sobe o pago já é conferido contra o
+-- saldo (tchefood_register_payment e o gatilho de payments). Item já marcado pago continua recusado antes
+-- (tchefood_check_item_cancel); o desconto do cashback é limitado ao saldo. Conta sem itens com o total gravado à
+-- mão (só em teste) tem o total zerado pelo recálculo no pagamento: agora esse pagamento é recusado.
 CREATE OR REPLACE FUNCTION tchefood_order_reserved_guard()
 RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
     v_reserved BIGINT;
+    v_total BIGINT := round(NEW.total_amount * 100)::BIGINT;
+    v_paid BIGINT := round(NEW.paid_amount * 100)::BIGINT;
 BEGIN
     v_reserved := tchefood_point_reserved_cents(NEW.tenant_id, NEW.id, NULL);
     IF v_reserved > 0 AND round(NEW.remaining_balance * 100)::BIGINT < v_reserved THEN
@@ -579,12 +610,57 @@ BEGIN
             USING ERRCODE = 'TF012', DETAIL = 'reserved_exceeds_balance reserved_cents=' || v_reserved
                 || ' remaining_cents=' || round(NEW.remaining_balance * 100)::BIGINT;
     END IF;
+    -- O reservado já foi conferido acima (o saldo cobre o reservado); aqui, o pago.
+    IF NEW.total_amount < OLD.total_amount AND v_total < v_paid THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a conta já tem R$ % pago; o total não fica abaixo disso (R$ %). Estorne o pagamento antes de reduzir o total.',
+            to_char(v_paid / 100.0, 'FM999999990.00'), to_char(v_total / 100.0, 'FM999999990.00')
+            USING ERRCODE = 'TF012', DETAIL = 'total_below_paid paid_cents=' || v_paid || ' total_cents=' || v_total;
+    END IF;
     RETURN NEW;
 END;
 $$;
 
-CREATE OR REPLACE TRIGGER trg_orders_reserved_guard BEFORE UPDATE OF remaining_balance ON orders
-    FOR EACH ROW WHEN (NEW.remaining_balance < OLD.remaining_balance) EXECUTE FUNCTION tchefood_order_reserved_guard();
+CREATE OR REPLACE TRIGGER trg_orders_reserved_guard BEFORE UPDATE OF remaining_balance, total_amount ON orders
+    FOR EACH ROW WHEN (NEW.remaining_balance < OLD.remaining_balance OR NEW.total_amount < OLD.total_amount)
+    EXECUTE FUNCTION tchefood_order_reserved_guard();
+
+-- Auditoria interna (fuzzer, item 2): item mudado (PATCH order_items: trava o item, depois a conta no recálculo) e o
+-- pagamento que quita a conta (trava a conta, depois os itens para marcar is_paid) esperavam um pelo outro (40P01).
+-- O fechamento marca só os itens livres (FOR NO KEY UPDATE SKIP LOCKED: a trava de chave das FKs não atrapalha) e o
+-- item que estava travado é marcado pela própria transação que o mudou, depois do recálculo (com a conta travada),
+-- se a conta ficou fechada. A gravação de is_paid passa pelo recálculo de novo, que não muda nada.
+CREATE OR REPLACE FUNCTION tchefood_auto_close()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.remaining_balance = 0 AND NEW.total_amount > 0 AND NEW.status IN ('OPEN', 'PAYING')
+       AND NEW.paid_amount >= NEW.total_amount THEN
+        UPDATE orders SET status = 'CLOSED', closed_at = NOW() WHERE id = NEW.id;
+        UPDATE order_items SET is_paid = TRUE
+         WHERE id IN (SELECT i.id FROM order_items i
+                       WHERE i.order_id = NEW.id AND i.status <> 'CANCELED' AND NOT i.is_paid
+                       FOR NO KEY UPDATE SKIP LOCKED);
+        UPDATE dining_tables SET status = 'FREE', current_order_id = NULL, updated_at = NOW()
+         WHERE id = NEW.table_id AND current_order_id = NEW.id;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION tchefood_after_item_change()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM tchefood_recalc_order(COALESCE(NEW.order_id, OLD.order_id));
+    -- O item que o fechamento pulou (estava travado por esta transação): marcado aqui, só no UPDATE de item que já
+    -- existia (item novo numa conta fechada não vira pago).
+    -- (IFs aninhados: o mesmo gatilho roda em payments, onde NEW não tem is_paid e status é outro tipo.)
+    IF TG_TABLE_NAME = 'order_items' AND TG_OP = 'UPDATE' THEN
+        UPDATE order_items i SET is_paid = TRUE
+         WHERE i.id = NEW.id AND NOT i.is_paid AND i.status <> 'CANCELED'
+           AND EXISTS (SELECT 1 FROM orders o WHERE o.id = i.order_id AND o.status = 'CLOSED');
+    END IF;
+    RETURN NULL;
+END;
+$$;
 
 -- -----------------------------------------------------------------------------
 -- 3. Leitura do aparelho: só a conta da própria loja (tenant do token)
@@ -592,7 +668,11 @@ CREATE OR REPLACE TRIGGER trg_orders_reserved_guard BEFORE UPDATE OF remaining_b
 -- reserved_cents = point_cents + claims_cents (a reserva única). claims: as reservas de pagamento abertas da
 -- conta (quem pediu, quando, forma e credenciadora; active_until = até quando o aparelho que pediu está cobrando,
 -- releasable_at = a partir de quando o gerente pode liberá-la). charges: as cobranças da Point da conta
--- que reservam, para o aparelho que não as criou mostrar e mandar conferir no Mercado Pago. has_payment:
+-- que reservam, para o aparelho que não as criou mostrar e mandar conferir no Mercado Pago. created_at: hora gravada
+-- da cobrança (relógio do banco). stale (auditoria interna 3 P1-02): a cobrança tem mais de
+-- tchefood_point_charge_timeout() (o prazo de espera do cartão de point-charge, SERVER_TIMEOUT_MS) pelo relógio do
+-- banco; só a idade, em qualquer estado da lista (quem mostra decide; o aparelho que não criou a cobrança só oferece
+-- "Resolver" para a aberta antiga). has_payment:
 -- há linha em payments desta loja com a chave da cobrança (qualquer estado; o aprovado do Mercado Pago tira
 -- a cobrança da lista).
 CREATE OR REPLACE FUNCTION tchefood_point_reservation(p_order UUID)
@@ -611,6 +691,8 @@ BEGIN
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
                'idempotency_key', c.idempotency_key, 'status', c.status, 'amount_cents', c.amount_cents,
                'raw_status_detail', c.raw_status_detail,
+               'created_at', c.created_at,
+               'stale', clock_timestamp() >= c.created_at + tchefood_point_charge_timeout(),
                -- Revisão r8 (F1): a mesma regra da soma e de point-charge (hasRegisteredPayment): só o APROVADO do Mercado Pago.
                'has_payment', EXISTS (SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = c.idempotency_key
                                          AND p.status = 'APPROVED' AND p.acquirer::text = 'MERCADO_PAGO'))

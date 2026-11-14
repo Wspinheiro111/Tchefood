@@ -27,25 +27,32 @@ import type { CloudPointCharge } from '../lib/sync/cloudPull';
 /** De quanto em quanto tempo o caixa relê a reserva da Point desta conta na nuvem. */
 const POINT_RESERVATION_POLL_MS = 5000;
 
-/** Loja com Point sem a leitura da reserva desta conta na nuvem: o caixa não recebe. */
-export const CLOUD_READ_BLOCK = 'Sem leitura da nuvem: com a Point na loja, só dá para receber com o servidor confirmando a reserva desta conta. Confira a internet e aguarde.';
+/** Sem a leitura da reserva desta conta na nuvem: o caixa não recebe (toda loja conectada à nuvem). */
+export const CLOUD_READ_BLOCK = 'Sem leitura da nuvem: loja conectada à nuvem só recebe com o servidor confirmando a reserva desta conta. Confira a internet e aguarde.';
 
 /** Cobrança da Point que ainda não terminou no servidor (enviando, na fila, na maquininha). */
 const OPEN_POINT_STATUSES: ReadonlySet<string> = new Set(['creating', 'pending', 'at_terminal']);
 
 /**
- * Cobrança da Point da conta que espera a conferência no Mercado Pago: revisão, aprovada sem pagamento, ou ainda não
- * terminada no servidor (revisão PR #49: aparelho fechado no meio, Point sem rede). A não terminada aparece em qualquer
- * aparelho, exceto o que a está cobrando agora; o servidor decide pelo relógio dele se ela já passou do prazo (a
- * conferência só consulta dentro do prazo e, depois dele, segue o encerramento por prazo).
+ * Cobrança da Point da conta que aparece na tela: revisão, aprovada sem pagamento, ou ainda não terminada no servidor
+ * (revisão PR #49: aparelho fechado no meio, Point sem rede), menos a que este aparelho está cobrando agora.
  */
 function needsResolution(c: CloudPointCharge, chargingKey: string | null): boolean {
   if (OPEN_POINT_STATUSES.has(c.status)) return c.idempotencyKey !== chargingKey;
   return c.status === 'manual_review' || (c.status === 'approved' && !c.hasPayment);
 }
 
-function resolutionLabel(c: CloudPointCharge): string {
-  if (OPEN_POINT_STATUSES.has(c.status)) return 'na maquininha, sem resposta';
+/**
+ * Auditoria interna 3 (P1-02): só tem ação ("Resolver") a cobrança em revisão, a aprovada sem pagamento e a aberta que
+ * o servidor diz vencida (`stale`, prazo de espera do cartão pelo relógio do banco). A aberta antes disso está sendo
+ * cobrada em outro aparelho: só o aviso, sem ação (dois aparelhos registrando a mesma aprovação = duas NFC-e).
+ */
+export function canResolve(c: CloudPointCharge): boolean {
+  return !OPEN_POINT_STATUSES.has(c.status) || c.stale === true;
+}
+
+export function resolutionLabel(c: CloudPointCharge): string {
+  if (OPEN_POINT_STATUSES.has(c.status)) return c.stale === true ? 'na maquininha, sem resposta' : 'cobrando em outro aparelho';
   return c.status === 'manual_review' ? 'em revisão' : 'aprovada sem pagamento registrado';
 }
 
@@ -103,7 +110,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const cloudConnected = useTcheStore((st) => st.cloud !== null);
   const needsClaim = useTcheStore((st) => requirePaymentClaim(st));
   const [cloudReservation, setCloudReservation] = useState<(Omit<PointReservation, 'source'> & { claimsCents?: number; pointCents?: number; charges?: CloudPointCharge[]; claims?: CloudPaymentClaim[] }) | null>(null);
-  /** Estado da leitura da reserva: com Point na loja, só 'ok' libera receber. */
+  /** Estado da leitura da reserva: loja na nuvem, só 'ok' libera receber. */
   const [reservationRead, setReservationRead] = useState<'pending' | 'ok' | 'failed'>('pending');
   /** Relê a reserva agora (depois de liberar uma reserva presa). */
   const [readTick, setReadTick] = useState(0);
@@ -130,8 +137,8 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
           setReservationRead('ok');
         }
       } catch {
-        // Sem leitura da nuvem: vale a cobrança incerta deste aparelho. Loja com Point: o caixa não recebe
-        // (aviso "Sem leitura da nuvem"); loja sem Point: o servidor confere de qualquer jeito.
+        // Sem leitura da nuvem: vale a cobrança incerta deste aparelho, e o caixa não recebe (aviso "Sem
+        // leitura da nuvem"; toda loja na nuvem pede a reserva antes).
         if (alive) {
           setCloudReservation(null);
           setReservationRead('failed');
@@ -194,7 +201,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     if (cloudBlocked) return toast.error(CLOUD_READ_BLOCK);
     const idempotency_key = uuid();
     const itemIds = mode === 'ITEMS' ? selected : [];
-    /** Loja com Point: reserva no servidor, com a chave do pagamento, antes de receber. */
+    /** Loja na nuvem: reserva no servidor, com a chave do pagamento, antes de receber. */
     let handle: ClaimHandle | null = null;
     const claim = async (claimMethod: ClaimMethod, acquirer: ClaimAcquirer): Promise<boolean> => {
       const c = await startPaymentClaim(needsClaim, { orderId, key: idempotency_key, method: claimMethod, acquirer, amount });
@@ -373,7 +380,9 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
               {unresolvedCharges.map((c) => (
                 <li key={c.idempotencyKey} className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-surface p-2">
                   <span>{formatBRL(c.amountCents / 100)} · {resolutionLabel(c)}{c.rawStatusDetail ? ` (${c.rawStatusDetail})` : ''}</span>
-                  <Btn variant="gold" onClick={() => setResolveTarget({ order_id: orderId, idempotency_key: c.idempotencyKey, amount: c.amountCents / 100, method: null, terminal_id: null, item_ids: [] })}>Resolver cobrança da Point</Btn>
+                  {canResolve(c) && (
+                    <Btn variant="gold" onClick={() => setResolveTarget({ order_id: orderId, idempotency_key: c.idempotencyKey, amount: c.amountCents / 100, method: null, terminal_id: null, item_ids: [] })}>Resolver cobrança da Point</Btn>
+                  )}
                 </li>
               ))}
             </ul>

@@ -5,8 +5,8 @@ import { PinPad } from './PinPad';
 import { useTcheStore } from '../store/useTcheStore';
 import { formatBRL } from '../lib/money';
 import { playDeniedBuzz, vibrate } from '../lib/sound';
-import { MANAGER_RELEASE_MIN_REASON, releasePaymentClaimManager, requirePaymentClaim } from '../lib/payments/paymentClaim';
-import { isClaimActiveHere, localClaim, pendingRelease } from '../lib/payments/claimLedger';
+import { MANAGER_RELEASE_MIN_REASON, releasePaymentClaim, releasePaymentClaimManager, requirePaymentClaim } from '../lib/payments/paymentClaim';
+import { endLocalClaim, isClaimActiveHere, localClaim, pendingRelease, removePendingRelease } from '../lib/payments/claimLedger';
 import { fetchPointReservation, type CloudPaymentClaim } from '../lib/sync/cloudPull';
 import { freshCloudConfig } from '../lib/sync/useCloudSync';
 import { clearReviewHold, getReviewHolds, reviewHoldKey, type ReviewHold } from '../lib/payments/reviewHolds';
@@ -275,21 +275,59 @@ interface HoldButtonProps {
 }
 
 /**
- * "Conferi no extrato: não foi cobrado" da trava de Stone/PagBank. Loja com Point: a reserva dessa chave no
- * servidor sai junto, pelo gerente (é ele quem atesta); a trava local só sai se a liberação deu certo (ou se
- * não havia reserva). Loja sem Point: tira a trava como sempre.
+ * Travas em que a maquininha APROVOU (ou disse que aprovou): "não foi cobrado" contradiz a maquininha, então só o
+ * gerente atesta (PIN, motivo e o prazo da reserva conferidos no servidor).
+ */
+const APPROVAL_EVIDENCE: ReadonlySet<string> = new Set(['REGISTER_FAILED', 'CLAIM_UNCONFIRMED', 'ACQUIRER_MISMATCH', 'INCONSISTENT_APPROVAL', 'CLAIM_RELEASED', 'PAYMENT_REJECTED']);
+
+/** A trava traz sinal de aprovação na maquininha. */
+export function holdHasApprovalEvidence(hold: Pick<ReviewHold, 'code'>): boolean {
+  return APPROVAL_EVIDENCE.has(hold.code) || hold.code.includes('APPROVED');
+}
+
+export const OWN_CLAIM_RELEASED = 'Reserva desta cobrança liberada no servidor (este aparelho tinha o código dela). Trava liberada.';
+
+/**
+ * "Conferi no extrato: não foi cobrado" da trava de Stone/PagBank. Loja na nuvem:
+ *  - reserva deste aparelho (ele tem o código), cobrança que já terminou aqui (não está rodando) e sem sinal de
+ *    aprovação na maquininha: libera na hora com o código, sem PIN nem espera;
+ *  - senão, pelo gerente (é ele quem atesta); a trava local só sai se a liberação deu certo (ou se não havia
+ *    reserva).
+ * Aparelho sem nuvem: tira a trava como sempre.
  */
 export function HoldNotChargedButton({ hold, label, onCleared, size = 'lg' }: HoldButtonProps) {
   const needsClaim = useTcheStore((s) => requirePaymentClaim(s));
   const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
   const clear = () => {
     clearReviewHold(hold.order_id, reviewHoldKey(hold));
     onCleared();
   };
   const key = hold.idempotency_key;
+  const releaseOwn = async (k: string, token: string) => {
+    setBusy(true);
+    const r = await releasePaymentClaim(k, 'Conferido no extrato: não foi cobrado', token);
+    setBusy(false);
+    if (r.ok) {
+      endLocalClaim(k);
+      removePendingRelease(k);
+      toast.success(OWN_CLAIM_RELEASED);
+      clear();
+      return;
+    }
+    // Sem resposta ou recusa: a trava fica; recusa definitiva vai para o gerente.
+    if (r.transient) toast.error(r.error);
+    else setOpen(true);
+  };
+  const onClick = () => {
+    if (!needsClaim || !key) return clear();
+    const token = localClaim(key)?.release_token;
+    if (token && !isClaimActiveHere(key) && !holdHasApprovalEvidence(hold)) return void releaseOwn(key, token);
+    setOpen(true);
+  };
   return (
     <>
-      <Btn variant="secondary" size={size} block onClick={() => (needsClaim && key ? setOpen(true) : clear())}>Conferi no extrato: não foi cobrado</Btn>
+      <Btn variant="secondary" size={size} block disabled={busy} onClick={onClick}>{busy ? 'Liberando…' : 'Conferi no extrato: não foi cobrado'}</Btn>
       {needsClaim && key && (
         <ReleaseClaimSheet
           open={open}

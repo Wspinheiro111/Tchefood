@@ -86,7 +86,7 @@ import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SEL
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, reviewHoldKey } from '../lib/payments/reviewHolds';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
-import { reservationExceeds } from '../lib/payments/pointReservation';
+import { reservationExceeds, TOTAL_BELOW_PAID } from '../lib/payments/pointReservation';
 import { localClaim } from '../lib/payments/claimLedger';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { buildAccessKey } from '../lib/nfce';
@@ -1168,7 +1168,8 @@ export const useTcheStore = create<TcheState>()(
 
       /**
        * Reduzir o total abaixo do que o servidor tem reservado na comanda (TF012): recusa aqui antes, com a
-       * última leitura da reserva (o servidor recusaria o evento depois).
+       * última leitura da reserva (o servidor recusaria o evento depois). Abaixo do já pago (TF012
+       * total_below_paid) cada ajuste confere antes, com TOTAL_BELOW_PAID; o cashback já é limitado ao saldo.
        */
       const reservationBlock = (simulated: Order): string | null => {
         const paidKeys = new Set(get().payments.filter((p) => p.status === 'APPROVED' && p.idempotency_key).map((p) => p.idempotency_key!));
@@ -1693,7 +1694,7 @@ export const useTcheStore = create<TcheState>()(
           const simulatedItems = get().orderItems.map((i) => canceledById.get(i.id) ?? i);
           const simulated = applyOrderTotals(order, simulatedItems, get().payments);
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
-            return fail('Cancelamento deixaria a conta abaixo do valor já pago. Estorne um pagamento primeiro.');
+            return fail(TOTAL_BELOW_PAID);
           }
           // Conta com cashback: se o cancelamento deixa o desconto abaixo do cashback usado,
           // a diferença volta para o cliente (REFUND). Quem grava na nuvem é o banco, no
@@ -1787,7 +1788,7 @@ export const useTcheStore = create<TcheState>()(
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
           const simulated = applyOrderTotals({ ...order, charge_service_fee: false }, get().orderItems, get().payments);
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
-            return fail('Remover a taxa deixaria a conta abaixo do valor já pago.');
+            return fail(TOTAL_BELOW_PAID);
           }
           const trayBlock = blocksSettleWithTray(simulated);
           if (trayBlock) return fail(trayBlock);
@@ -1872,7 +1873,7 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(discount) > toCents(gross)) return fail('Desconto maior que o valor da conta.');
           const simulated = applyOrderTotals({ ...order, discount_amount: discount }, get().orderItems, get().payments);
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
-            return fail('Desconto deixaria a conta abaixo do valor já pago.');
+            return fail(TOTAL_BELOW_PAID);
           }
           const trayBlock = blocksSettleWithTray(simulated);
           if (trayBlock) return fail(trayBlock);

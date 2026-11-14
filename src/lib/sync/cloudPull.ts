@@ -442,7 +442,15 @@ export function mergeStaffWithPins(local: readonly StaffUser[], cloud: readonly 
 }
 
 /** Cobrança da Point desta conta que ainda reserva valor (tchefood_point_reservation → charges). */
-export type CloudPointCharge = { idempotencyKey: string; status: string; amountCents: number; rawStatusDetail: string | null; hasPayment: boolean };
+export type CloudPointCharge = {
+  idempotencyKey: string; status: string; amountCents: number; rawStatusDetail: string | null; hasPayment: boolean;
+  /**
+   * Cobrança ainda aberta e já passada do prazo de espera do cartão pelo relógio do banco (tchefood_point_reservation,
+   * revisão PR #49). Só com true outro aparelho oferece "Resolver"; ausente (banco anterior) conta como false.
+   */
+  stale?: boolean;
+  createdAt?: string | null;
+};
 
 /** Reserva de pagamento fora da Point ainda aberta nesta conta (tchefood_point_reservation → claims). */
 export type CloudPaymentClaim = {
@@ -533,6 +541,9 @@ export async function fetchPointReservation(
         amountCents: amount,
         rawStatusDetail: typeof r.raw_status_detail === 'string' ? r.raw_status_detail : null,
         hasPayment: r.has_payment === true,
+        // Só quando o banco manda (banco anterior: ausentes, e a tela trata como não vencida).
+        ...(r.stale !== undefined ? { stale: r.stale === true } : {}),
+        ...(typeof r.created_at === 'string' ? { createdAt: r.created_at } : {}),
       };
     });
   }

@@ -68,6 +68,21 @@ export function pointReservationBlock(amount: number, remaining: number, reserva
 /** TF012 reserved_exceeds_balance: o servidor não reduz o total abaixo do que está reservado. */
 export const RESERVED_EXCEEDS_BALANCE = 'Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total.';
 
+/**
+ * TF012 total_below_paid: o banco não reduz o total da conta abaixo do que já foi pago (pagamentos aprovados;
+ * estornados não contam), com ou sem reserva. A mesma regra é conferida aqui antes de o ajuste ir para a fila.
+ */
+export const TOTAL_BELOW_PAID = 'O total ficaria abaixo do que já foi pago; estorne um pagamento antes.';
+
+/** Recusa do banco com DETAIL `total_below_paid paid_cents=… total_cents=…`, em texto para o operador. */
+export function describeTotalBelowPaid(detail: string): string | null {
+  if (!/total_below_paid/.test(detail)) return null;
+  const paid = /paid_cents=(-?\d+)/.exec(detail)?.[1];
+  const total = /total_cents=(-?\d+)/.exec(detail)?.[1];
+  if (paid === undefined || total === undefined) return TOTAL_BELOW_PAID;
+  return `${TOTAL_BELOW_PAID.slice(0, -1)} (já pago ${formatBRL(Number(paid) / 100)}; total ficaria ${formatBRL(Number(total) / 100)}).`;
+}
+
 /** Última leitura da reserva no servidor por comanda (para conferir antes de reduzir o total aqui). */
 const lastRead = new Map<string, { reservedCents: number; claims: Array<{ key: string; cents: number }>; at: number }>();
 export const RESERVATION_READ_MAX_AGE_MS = 60_000;

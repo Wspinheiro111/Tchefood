@@ -174,6 +174,15 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
       if (!current) throw new Error('Cobrança não encontrada para revisar.');
       return current;
     },
+    async inCardWait(row: TerminalChargeRow): Promise<boolean> {
+      // Relógio do banco contra a hora gravada da cobrança, com qualquer pedido de encerramento (tchefood_point_charge_in_wait).
+      const res = await db.rpc('tchefood_point_charge_in_wait', { p_tenant: tenantId, p_id: row.id });
+      const refused = refusal(res.error);
+      if (refused) throw refused;
+      const v: unknown = check(res, 'conferir o prazo de espera do cartão');
+      if (v !== true && v !== false) throw new Error('Resposta inesperada ao conferir o prazo de espera do cartão.');
+      return v;
+    },
     async requestTimeoutCancel(row: TerminalChargeRow, waitMs: number): Promise<TerminalChargeRow | null> {
       const res = await db.rpc('tchefood_request_point_timeout', { p_tenant: tenantId, p_id: row.id, p_wait_ms: waitMs });
       const refused = refusal(res.error);

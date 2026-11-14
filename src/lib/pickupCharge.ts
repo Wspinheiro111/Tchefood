@@ -42,7 +42,7 @@ export async function chargePickupOrder(params: {
   // conferir o extrato: se a maquininha tiver cobrado, receber de novo seria cobrança em dobro.
   if (getReviewHold(order.id)) return { status: 'MANUAL_REVIEW', reason: 'Há uma cobrança sem confirmação. Confira o extrato da maquininha antes de receber de novo.' };
 
-  // Loja com Point: reserva no servidor, com a chave do pagamento, antes de receber (sem resposta, não recebe).
+  // Loja na nuvem: reserva no servidor, com a chave do pagamento, antes de receber (sem resposta, não recebe).
   const needsClaim = requirePaymentClaim(s);
 
   if (params.method === 'CASH') {

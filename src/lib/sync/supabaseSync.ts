@@ -27,6 +27,7 @@
  *    o operador reenvia os recusados depois de corrigir a causa.
  */
 import type { SyncEvent } from '../../types';
+import { describeTotalBelowPaid } from '../payments/pointReservation';
 
 export interface SyncConfig {
   url: string;
@@ -454,6 +455,8 @@ export async function flushOutbox(
   fetchFn: FetchLike,
   limit = 50,
   held: SyncEvent[] = [],
+  /** Evento que ainda não pode subir (ex.: recusa da maquininha antes de a reserva ser liberada): espera na fila. */
+  waitFor: (event: SyncEvent) => boolean = () => false,
 ): Promise<FlushResult> {
   const sent: string[] = [];
   const rejected: SyncRejection[] = [];
@@ -475,7 +478,7 @@ export async function flushOutbox(
     // Eventos segurados não contam no limite: senão um bloco segurado no começo da fila
     // impediria para sempre que registros sem relação subissem.
     const keys = recordKeys(event);
-    if (keys.some((k) => blocked.has(k)) || (event.depends_on_event_ids ?? []).some((id) => unsent.has(id))) {
+    if (keys.some((k) => blocked.has(k)) || (event.depends_on_event_ids ?? []).some((id) => unsent.has(id)) || waitFor(event)) {
       // O segurado também segura o que vem depois dele em QUALQUER registro que ele
       // toca: a liberação da mesa da comanda A, segurada pelo pagamento recusado de A,
       // não pode ser ultrapassada pela ocupação da mesma mesa pela comanda B (senão,
@@ -569,10 +572,14 @@ function isUuidResponse(body: string): boolean {
 function describeError(body: string, status: number): string {
   try {
     const j = JSON.parse(body) as { code?: string; message?: string; details?: string; hint?: string };
-    // TF010 claim_required: pagamento sem a reserva do servidor numa loja com Point (db/schema_point_reserva.sql).
+    // TF010 claim_required: pagamento sem a reserva do servidor (toda loja na nuvem; db/schema_point_reserva.sql).
     // TF012 reserved_exceeds_balance: desconto, cancelamento ou cashback deixaria o total abaixo do reservado.
+    // TF012 total_below_paid: o total ficaria abaixo do já pago; o DETAIL vira os valores em reais.
+    const belowPaid = j.code === 'TF012' ? describeTotalBelowPaid(`${j.details ?? ''} ${j.message ?? ''}`) : null;
+    if (belowPaid) return belowPaid;
     const lead = j.code === 'TF010'
-      ? 'Esta loja tem a Point: o pagamento precisa da reserva no servidor.'
+      // O mesmo texto de CLAIM_REQUIRED_ERROR (paymentClaim.ts).
+      ? 'Loja conectada à nuvem: todo pagamento é reservado no servidor antes. Este pagamento chegou sem a reserva: confira na Retaguarda e registre de novo pelo caixa.'
       : j.code === 'TF012'
         ? 'Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total.'
         : undefined;

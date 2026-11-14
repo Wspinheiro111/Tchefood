@@ -5,8 +5,9 @@
  * (payment_claims, por loja, tchefood_claim_payment), (c) o dinheiro do entregador ("entrega-<id da entrega>"),
  * ou um pagamento já gravado. Regras conferidas aqui, em matriz dono × quem grava:
  *  - pagamento fora do Mercado Pago, de QUALQUER status, nunca usa a chave de uma cobrança da Point (TF009); só
- *    aprovado ou recusado entra (PENDING e REFUNDED: TF007); recusado com a chave de uma reserva da loja só da mesma
- *    conta (TF010; forma e credenciadora podem ser outras, auditoria interna F1); fora do Mercado Pago, em todo
+ *    aprovado ou recusado entra (PENDING e REFUNDED: TF007); recusado com a chave de uma reserva da loja só com ela
+ *    liberada e da mesma conta (aberta ou consumida: TF010, auditoria interna 3 P1-01; forma e credenciadora podem ser
+ *    outras, auditoria interna F1); fora do Mercado Pago, em todo
  *    status, chave de reserva, cobrança ou pagamento de outra loja é uma recusa só (TF009, auditoria interna F3);
  *  - pagamento do Mercado Pago só com a cobrança dele: APPROVED só com o comprovante completo, DECLINED só com a
  *    cobrança recusada/cancelada/expirada, REFUNDED só com a cobrança estornada; PENDING não entra (TF007);
@@ -277,9 +278,10 @@ function expected(kind: OwnerKind, s: OwnerState, w: Writer, cross: boolean): Ex
     // Auditoria interna F3: a chave da reserva de outra loja é TF009 key_in_use em todo status (sem dizer que é reserva).
     if (cross) return ref('TF009');
     if (w.status === 'PENDING' || w.status === 'REFUNDED') return REFUSED; // item 14: só aprovado ou recusado entra
+    // Auditoria interna 3 P1-01: o recusado com a chave de uma reserva aberta ou consumida da loja é TF010 (não ocupa a
+    // chave do aprovado dela); liberada, só precisa da mesma conta (auditoria interna F1: forma e credenciadora livres).
+    if (w.status === 'DECLINED') return st === 'released' ? { ok: true } : ref('TF010');
     if (st === 'consumed') return REFUSED; // chave já é do pagamento que a consumiu
-    // Auditoria interna F1: o recusado com a chave da reserva da loja só precisa da mesma conta (forma e credenciadora livres).
-    if (w.status === 'DECLINED') return { ok: true };
     if (st === 'released') return ref('TF013');
     return w.acq === 'CASH_DESK' ? { ok: true } : ref('TF010'); // a reserva é de dinheiro no caixa
   }

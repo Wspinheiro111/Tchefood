@@ -1,29 +1,36 @@
 /**
  * Reserva de pagamento no servidor antes de receber (decisão do Will, 14/11/2026; docs/integracoes/r6-spec.md C1).
  *
- * Loja com Point Smart (alguma maquininha MERCADO_PAGO em `terminals`): todo pagamento que não é cobrado na
+ * Loja conectada à nuvem (com ou sem Point Smart; auditoria r7 P1-01): todo pagamento que não é cobrado na
  * Point (dinheiro, Stone, PagBank, Pix manual, ficha rápida, retirada) pede ANTES a reserva no servidor
  * (tchefood_claim_payment), com a MESMA chave do pagamento. O servidor trava a conta, confere o saldo e o que
  * a Point e outras reservas já seguram; só depois o caixa recebe ou manda para a maquininha.
  *
  * Sem internet, sem sessão ou sem resposta no prazo: não recebe (nunca cai para "cobra assim mesmo").
- * Loja sem Point: nada muda (nenhuma chamada).
+ * Aparelho sem nuvem nenhuma (demonstração local): nenhuma chamada.
  */
 import type { UUID } from '../../types';
 import type { FetchLike, SyncConfig } from '../sync/supabaseSync';
 import type { OrderSyncCheck } from '../sync/useCloudSync';
-import { addPendingRelease, endLocalClaim, pendingReleases, removePendingRelease } from './claimLedger';
+import { addPendingRelease, endLocalClaim, localClaim, pendingReleases, removePendingRelease } from './claimLedger';
 
 export const CLAIM_TIMEOUT_MS = 10_000;
+/** Prazo para subir a fila desta conta antes da reserva (rodadas de envio longas não são "sem internet"). */
+export const CLAIM_PREPARE_TIMEOUT_MS = 30_000;
 
-/** TF010 claim_required: o servidor recusa pagamento sem reserva numa loja com Point. */
-export const CLAIM_REQUIRED_ERROR = 'Esta loja tem a Point: o pagamento precisa da reserva no servidor.';
+/** A fila desta conta ainda está subindo para a nuvem: nada foi pedido ao servidor nem recebido. */
+export const CLAIM_SYNC_PENDING =
+  'Enviando para a nuvem as alterações desta conta: tente de novo em instantes. Nada foi recebido.';
+
+/** TF010 claim_required: o servidor recusa pagamento sem a reserva (toda loja conectada à nuvem). */
+export const CLAIM_REQUIRED_ERROR =
+  'Loja conectada à nuvem: todo pagamento é reservado no servidor antes. Este pagamento chegou sem a reserva: confira na Retaguarda e registre de novo pelo caixa.';
 
 /** Motivo mínimo da liberação pelo gerente (tchefood_release_payment_claim_manager). */
 export const MANAGER_RELEASE_MIN_REASON = 10;
 
 export const CLAIM_OFFLINE_ERROR =
-  'Sem internet: com a Point na loja, só dá para receber com o servidor confirmando. Tente de novo quando voltar a conexão.';
+  'Loja conectada à nuvem: todo pagamento é reservado no servidor antes; sem conexão não dá para receber neste aparelho. Confira a internet e tente de novo. Nada foi recebido.';
 
 export type ClaimMethod = 'CASH' | 'CREDIT' | 'DEBIT' | 'PIX';
 export type ClaimAcquirer = 'CASH_DESK' | 'STONE' | 'PAGBANK';
@@ -40,6 +47,9 @@ export const CLAIM_ERRORS: Record<string, string> = {
   TF010: CLAIM_REQUIRED_ERROR,
   TF011: 'Reserva em andamento (outro aparelho): ainda não pode ser liberada.',
 };
+
+/** TF011 numa reserva que este aparelho fez: o prazo dela foi renovado pela cobrança daqui. */
+export const CLAIM_ACTIVE_HERE = 'A reserva desta cobrança (feita neste aparelho) ainda está no prazo: ainda não pode ser liberada pelo gerente.';
 
 export interface PaymentClaim {
   id: string;
@@ -96,12 +106,12 @@ export function requirePaymentClaim(store: { cloud?: unknown }): boolean {
 }
 
 /** `promise` com prazo: erro ou prazo vencido viram `{ done: false }`. */
-async function within<T>(promise: Promise<T>, deps: ClaimDeps): Promise<{ done: true; value: T } | { done: false }> {
+async function within<T>(promise: Promise<T>, deps: ClaimDeps, ms = CLAIM_TIMEOUT_MS): Promise<{ done: true; value: T } | { done: false }> {
   const safe = promise.then((value) => ({ done: true as const, value }), () => ({ done: false as const }));
   // O prazo é desligado quando a etapa termina antes (sem timer pendurado por chamada).
   const stop = typeof AbortController === 'function' ? new AbortController() : null;
   try {
-    return await Promise.race([safe, deps.timer(CLAIM_TIMEOUT_MS, stop?.signal).then(() => ({ done: false as const }))]);
+    return await Promise.race([safe, deps.timer(ms, stop?.signal).then(() => ({ done: false as const }))]);
   } finally {
     stop?.abort();
   }
@@ -186,8 +196,9 @@ export async function claimPayment(input: ClaimInput, deps: ClaimDeps = defaultC
   const session = await within(deps.config(), deps);
   if (!session.done || !session.value) return offline();
   const cfg = session.value;
-  const sync = await within(deps.prepareOrder(input.orderId), deps);
-  if (!sync.done) return offline();
+  // A fila da conta ainda subindo no prazo não é falta de internet; e a reserva nem foi pedida (nada a liberar).
+  const sync = await within(deps.prepareOrder(input.orderId), deps, CLAIM_PREPARE_TIMEOUT_MS);
+  if (!sync.done) return { ok: false, error: CLAIM_SYNC_PENDING };
   const prepared = sync.value;
   if (!prepared.ok) return { ok: false, error: prepared.reason };
   const balance = prepared.balance_cents;
@@ -417,7 +428,9 @@ export async function releasePaymentClaimManager(key: string, managerPin: string
       // O banco diz a partir de quando o gerente pode liberar (horário de Brasília): mostra isso quando vier.
       if (out.code === 'TF011') {
         const at = /a partir de (\d{2}:\d{2}(?::\d{2})?)/.exec(out.message)?.[1];
-        return { ok: false, active: true, error: at ? `${CLAIM_ERRORS.TF011!} O gerente pode liberar a partir de ${at} (horário de Brasília).` : CLAIM_ERRORS.TF011! };
+        // Reserva deste aparelho: não é "outro aparelho"; a cobrança desta chave renovou o prazo aqui.
+        const lead = localClaim(key) ? CLAIM_ACTIVE_HERE : CLAIM_ERRORS.TF011!;
+        return { ok: false, active: true, error: at ? `${lead} O gerente pode liberar a partir de ${at} (horário de Brasília).` : lead };
       }
       return { ok: false, error: `O servidor não liberou a reserva: ${out.message}` };
     }

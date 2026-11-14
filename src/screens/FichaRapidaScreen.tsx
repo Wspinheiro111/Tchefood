@@ -228,7 +228,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
     if (busy || order.status !== 'PAYING') return;
     const amount = order.remaining_balance;
     const idempotency_key = uuid();
-    // Loja com Point: reserva no servidor, com a chave do pagamento, antes de receber (sem resposta, não recebe).
+    // Loja na nuvem: reserva no servidor, com a chave do pagamento, antes de receber (sem resposta, não recebe).
     const needsClaim = requirePaymentClaim(useTcheStore.getState());
     // Maquininha aprovou e a reserva foi liberada (ou não confirmada): nem dinheiro até resolver a trava.
     if (holdBlocksCash(orderId)) return toast.error(HOLD_BLOCKS_ALL);

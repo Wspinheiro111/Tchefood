@@ -31,6 +31,11 @@ const ORDER3 = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const MANAGER_PIN = '8642';
 const OTHER_TERMINAL = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 const OTHER_MP_ID = 'OUTRA-POINT';
+/** SQL (sem gatilhos) que dá à conta um item de `balance` e os totais dele, sem 10% (o recálculo do banco os mantém). */
+const seedTotal = (order: string, balance: number) =>
+  `INSERT INTO order_items (order_id, product_id, waiter_id, quantity, unit_price, total_item_price, sector)
+   VALUES ('${order}', gen_random_uuid(), '${STAFF}', 1, ${balance}, ${balance}, 'NONE');
+   UPDATE orders SET charge_service_fee = false, subtotal_items = ${balance}, total_amount = ${balance}, paid_amount = 0, remaining_balance = ${balance} WHERE id = '${order}';`;
 const ORDER4 = 'abababab-abab-4bab-8bab-abababababab';
 const ORDER5 = 'cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd';
 const EX_MANAGER = 'e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1';
@@ -194,13 +199,11 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
                 ('${ORDER3}', '${TENANT}', '${TABLE}', '${STAFF}'), ('${ORDER4}', '${TENANT}', '${TABLE}', '${STAFF}'), ('${ORDER5}', '${TENANT}', '${TABLE}', '${STAFF}'),
                 ('${ORDER6}', '${TENANT}', '${TABLE}', '${STAFF}');`);
     // ORDER3 tem saldo folgado: dezenas de cobranças de teste ficam em andamento nela, reservando.
-    // Saldo de R$ 50,00 na ORDER2 sem montar itens (os totais só mudam pelo recálculo do banco).
+    // Saldo de R$ 50,00 na ORDER2 com um item do mesmo valor (o recálculo do banco mantém o total: desde o fuzzer,
+    // item 1, o total não desce abaixo do pago, e a conta sem itens desceria a zero no primeiro pagamento).
     sql(`BEGIN; SET LOCAL session_replication_role = replica;
-         UPDATE orders SET total_amount = 50, remaining_balance = 50 WHERE id = '${ORDER2}';
-         UPDATE orders SET total_amount = 100000, remaining_balance = 100000 WHERE id IN ('${ORDER3}', '${ORDER5}');
-         UPDATE orders SET total_amount = 50, remaining_balance = 50 WHERE id = '${ORDER4}';
-         UPDATE orders SET total_amount = 100, remaining_balance = 100 WHERE id = '${ORDER6}';
-         UPDATE orders SET total_amount = 50, remaining_balance = 50, status = 'CLOSED' WHERE id = '${CLOSED}';
+         ${seedTotal(ORDER2, 50)} ${seedTotal(ORDER3, 100000)} ${seedTotal(ORDER5, 100000)} ${seedTotal(ORDER4, 50)} ${seedTotal(ORDER6, 100)}
+         ${seedTotal(CLOSED, 50)} UPDATE orders SET status = 'CLOSED' WHERE id = '${CLOSED}';
          COMMIT;`);
   }, 120_000);
 
@@ -757,7 +760,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     it('auditoria r3 P0-01: enviada sem resposta, encerrada com PIN de gerente: revisão manual (nunca cancelada) e segue reservando o saldo', () => {
       const ORDER4 = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
       sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER4}', '${TENANT}', '${TABLE}', '${STAFF}');
-           BEGIN; SET LOCAL session_replication_role = replica; UPDATE orders SET total_amount = 100, remaining_balance = 100 WHERE id = '${ORDER4}'; COMMIT;`);
+           BEGIN; SET LOCAL session_replication_role = replica; ${seedTotal(ORDER4, 100)} COMMIT;`);
       const open4 = (key: string, cents: number) =>
         psql(target!, `SELECT tchefood_open_terminal_charge('${TENANT}', '${key}', '${ORDER4}', '${TERMINAL}', '${MP_ID}', 'CREDIT', ${cents}, '${STAFF}', ${bal(ORDER4)});`, DB);
       expect(open4('unk-a', 10000).ok).toBe(true);
@@ -1416,13 +1419,12 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
   // db/schema_point_reserva.sql: a cobrança da Point em andamento reserva o saldo para qualquer pagamento.
   describe('reserva da Point vale para dinheiro, outra maquininha e Pix', () => {
     let seq = 0;
-    /** Conta nova com saldo `balance` (sem itens: cada conta recebe um pagamento só, o recálculo zeraria o resto). */
+    /** Conta nova com saldo `balance` (um item do mesmo valor). */
     const fresh = (balance: number): string => {
       seq += 1;
       const id = `f0f0f0f0-0000-4000-8000-${String(seq).padStart(12, '0')}`;
       sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${id}', '${TENANT}', '${TABLE}', '${STAFF}');
-           BEGIN; SET LOCAL session_replication_role = replica;
-           UPDATE orders SET total_amount = ${balance}, remaining_balance = ${balance} WHERE id = '${id}'; COMMIT;`);
+           BEGIN; SET LOCAL session_replication_role = replica; ${seedTotal(id, balance)} COMMIT;`);
       return id;
     };
     const openPoint = (key: string, order: string, cents: number) =>
@@ -1543,18 +1545,11 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     });
 
     /**
-     * Conta de verdade com saldo `balance` (um item, sem 10%): ao contrário de fresh(), o recálculo do banco
-     * mantém o total depois de cada pagamento, então a conta aceita vários pagamentos e fecha sozinha no zero.
+     * Conta de verdade com saldo `balance` (um item, sem 10%): o recálculo do banco mantém o total depois de cada
+     * pagamento, então a conta aceita vários pagamentos e fecha sozinha no zero. Hoje igual a fresh(), que também
+     * monta o item (fuzzer, item 1: o total não desce abaixo do pago).
      */
-    const withItems = (balance: number): string => {
-      const order = fresh(balance);
-      sql(`BEGIN; SET LOCAL session_replication_role = replica;
-           INSERT INTO order_items (order_id, product_id, waiter_id, quantity, unit_price, total_item_price, sector)
-           VALUES ('${order}', gen_random_uuid(), '${STAFF}', 1, ${balance}, ${balance}, 'NONE');
-           UPDATE orders SET charge_service_fee = false, subtotal_items = ${balance}, total_amount = ${balance}, paid_amount = 0, remaining_balance = ${balance} WHERE id = '${order}';
-           COMMIT;`);
-      return order;
-    };
+    const withItems = (balance: number): string => fresh(balance);
     /** Roda q e devolve 'ok' ou 'recusado <SQLSTATE>: <mensagem>' (a sessão não cai, o resultado vira a última linha). */
     const tryFn = `CREATE FUNCTION pg_temp.t(q text) RETURNS text LANGUAGE plpgsql AS $f$ BEGIN EXECUTE q; RETURN 'ok'; EXCEPTION WHEN others THEN RETURN 'recusado ' || SQLSTATE || ': ' || SQLERRM; END $f$;`;
     const pointQ = (key: string, order: string, cents: number, expected: number | string) =>
@@ -1599,20 +1594,20 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
           expect(approved(order), key).toBe('100.00');
           expect(balanceOf(order), key).toBe('0.00|CLOSED');
         }
-        // Conta ainda aberta com saldo zero (fresh(): sem itens, o recálculo zera o total e a conta não fecha):
-        // com o saldo que o aparelho viu antes (R$ 100,00) a Point recusa por saldo diferente (TF008); mesmo
-        // mandando o saldo novo (R$ 0,00), os R$ 100,00 passam do saldo (TF003). Nada é gravado.
+        // Conta ainda aberta com saldo zero (estado de antes do fuzzer, item 1: a conta sem itens tinha o total zerado
+        // pelo recálculo no pagamento e não fechava; hoje o pagamento que deixaria o total abaixo do pago é recusado,
+        // então o estado é montado direto): com o saldo que o aparelho viu antes (R$ 100,00) a Point recusa por saldo
+        // diferente (TF008); mesmo mandando o saldo novo (R$ 0,00), os R$ 100,00 passam do saldo (TF003). Nada é gravado.
         for (const [expected, code] of [[10000, 'TF008'], [0, 'TF003']] as const) {
           const order = fresh(100);
           const key = `r4b-${code}`;
-          const [card, point] = await contend(lockOrder(order), [deviceQ(stone(order, 100)), pointQ(key, order, 10000, expected)]);
-          expect(lastOverlap, key).toBe(2);
-          expect(card, key).toBe('ok');
+          sql(`BEGIN; SET LOCAL session_replication_role = replica;
+               UPDATE orders SET total_amount = 0, paid_amount = 100, remaining_balance = 0 WHERE id = '${order}'; COMMIT;`);
+          const point = psql(target!, pointQ(key, order, 10000, expected), DB).out.split('\n').pop() ?? '';
           expect(point, key).toMatch(code === 'TF008'
             ? /^recusado TF008: .*saldo de R\$ 0\.00, diferente do R\$ 100\.00 mostrado no aparelho\. Nada foi cobrado/
             : /^recusado TF003: .*R\$ 100\.00 passa do saldo da conta no servidor \(R\$ 0\.00 livre\)/);
           expect(charges(key), key).toBe('0');
-          expect(approved(order), key).toBe('100.00');
         }
       }, 90_000);
 

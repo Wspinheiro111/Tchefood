@@ -11,14 +11,16 @@ import { useToast } from '../components/ui';
 
 const reconcile = vi.fn();
 const readStatus = vi.fn();
+const onServer = vi.fn();
 vi.mock('../lib/payments/pointReconcile', async (orig) => ({
   ...(await orig<typeof import('../lib/payments/pointReconcile')>()),
   reconcilePointCharge: (...a: unknown[]) => reconcile(...a),
   readPointChargeStatus: (...a: unknown[]) => readStatus(...a),
+  pointPaymentOnServer: (...a: unknown[]) => onServer(...a),
 }));
 
 const { ConfirmReviewedChargeSheet } = await import('../components/ConfirmReviewedChargeSheet');
-const { POINT_APPROVED_ELSEWHERE, POINT_NOT_CHARGED, POINT_REVIEW_PROCEDURE, POINT_SERVER_CLOSED, PointReviewSheet } = await import('../components/PointReviewSheet');
+const { POINT_APPROVED_ELSEWHERE, POINT_IN_PROGRESS, POINT_NOT_CHARGED, POINT_REFUNDED, POINT_REVIEW_PROCEDURE, POINT_SERVER_CLOSED, PointReviewSheet } = await import('../components/PointReviewSheet');
 
 const st = () => useTcheStore.getState();
 const KEY = 'pk-review-1';
@@ -68,6 +70,9 @@ beforeEach(() => {
   for (const o of st().orders) clearReviewHold(o.id);
   reconcile.mockReset();
   readStatus.mockReset();
+  onServer.mockReset();
+  // Padrão: o servidor mostra a cobrança aprovada e sem pagamento (pode registrar).
+  onServer.mockResolvedValue({ kind: 'not_registered' });
   useToast.setState({ toasts: [] });
 });
 afterEach(() => cleanup());
@@ -235,17 +240,31 @@ describe('revisão PR #49: trava da Point quando a cobrança não está mais em 
     expect(st().payments.filter((p) => p.order_id === id)).toHaveLength(0);
   });
 
-  it('P2 b: aprovada e registrada por outro aparelho, ainda sem o pagamento aqui: a trava fica e nada é registrado', async () => {
+  it('P2 b (auditoria 3): aprovada e registrada no servidor por outro aparelho: a trava sai com o aviso, nada é registrado aqui', async () => {
     const id = openTable();
     const hold = mpHold(id);
     reconcile.mockResolvedValue(NOT_APPLICABLE);
     readStatus.mockResolvedValue(approved(Math.round(hold.amount * 100)));
-    sheet(hold);
+    const { onReleased } = sheet(hold);
     fill();
     await pin();
-    await waitFor(() => expect(screen.getByText(new RegExp(POINT_APPROVED_ELSEWHERE.slice(0, 40)))).toBeTruthy());
-    expect(getReviewHold(id)).not.toBeNull();
+    await waitFor(() => expect(onReleased).toHaveBeenCalledTimes(1));
+    expect(toasts()).toContain(POINT_APPROVED_ELSEWHERE);
+    expect(getReviewHold(id)).toBeNull();
     expect(mpPayments(id)).toHaveLength(0);
+  });
+
+  it('auditoria 3: aprovada no servidor com outro valor: a trava fica', async () => {
+    const id = openTable();
+    const hold = mpHold(id);
+    reconcile.mockResolvedValue(NOT_APPLICABLE);
+    readStatus.mockResolvedValue(approved(Math.round(hold.amount * 100) + 100));
+    const { onReleased } = sheet(hold);
+    fill();
+    await pin();
+    expect(await screen.findByText(/diferente desta cobrança. A trava continua/)).toBeTruthy();
+    expect(onReleased).not.toHaveBeenCalled();
+    expect(getReviewHold(id)).not.toBeNull();
   });
 
   it('P2 b: aprovada com o pagamento já registrado neste aparelho: a trava sai, sem registrar de novo', async () => {
@@ -310,6 +329,73 @@ describe('revisão PR #49: trava da Point quando a cobrança não está mais em 
     await pin();
     await waitFor(() => expect(screen.getByText('Sem resposta do servidor.')).toBeTruthy());
     expect(readStatus).not.toHaveBeenCalled();
+    expect(getReviewHold(id)).not.toBeNull();
+  });
+});
+
+describe('auditoria interna 3: antes de registrar, o servidor ainda não tem o pagamento', () => {
+  const sheet = (hold: ReturnType<typeof mpHold>) => {
+    const onReleased = vi.fn();
+    const onSuccess = vi.fn();
+    render(<ConfirmReviewedChargeSheet open onClose={() => undefined} hold={hold} label="Mesa 1" onSuccess={onSuccess} onReleased={onReleased} />);
+    return { onReleased, onSuccess };
+  };
+
+  it('P1-02: o servidor já tem o pagamento (outro aparelho registrou): não registra aqui, tira a trava com o aviso', async () => {
+    const id = openTable();
+    const hold = mpHold(id);
+    reconcile.mockResolvedValue(approved(Math.round(hold.amount * 100)));
+    onServer.mockResolvedValue({ kind: 'not_reserving' });
+    const { onReleased, onSuccess } = sheet(hold);
+    fill();
+    await pin();
+    await waitFor(() => expect(onReleased).toHaveBeenCalledTimes(1));
+    expect(onServer).toHaveBeenCalledWith(id, KEY, undefined);
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(mpPayments(id)).toHaveLength(0);
+    expect(getReviewHold(id)).toBeNull();
+    expect(toasts()).toContain(POINT_APPROVED_ELSEWHERE);
+  });
+
+  it.each([
+    ['sem leitura', { kind: 'error', error: 'Não foi possível confirmar no servidor se este pagamento já foi registrado.' }, /Não foi possível confirmar no servidor/],
+    ['mudou de estado', { kind: 'other', status: 'refunded' }, /mudou no servidor \(refunded\)/],
+  ] as const)('%s: não registra e a trava fica', async (_n, state, text) => {
+    const id = openTable();
+    const hold = mpHold(id);
+    reconcile.mockResolvedValue(approved(Math.round(hold.amount * 100)));
+    onServer.mockResolvedValue(state);
+    const { onReleased } = sheet(hold);
+    fill();
+    await pin();
+    await waitFor(() => expect(screen.getByText(text)).toBeTruthy());
+    expect(onReleased).not.toHaveBeenCalled();
+    expect(mpPayments(id)).toHaveLength(0);
+    expect(getReviewHold(id)).not.toBeNull();
+  });
+
+  it('P3-02: estorno provado (refunded) avisa "estornada no Mercado Pago", não "não foi cobrado"', async () => {
+    const id = openTable();
+    const hold = mpHold(id);
+    reconcile.mockResolvedValue({ kind: 'reply', refunded: true, reply: { idempotency_key: KEY, status: 'DECLINED', reason: 'O Mercado Pago confirmou o estorno: nada fica cobrado nesta cobrança.' } });
+    const { onReleased } = sheet(hold);
+    fill();
+    await pin();
+    await waitFor(() => expect(onReleased).toHaveBeenCalledTimes(1));
+    expect(toasts()).toContain(POINT_REFUNDED);
+    expect(toasts()).not.toContain(POINT_NOT_CHARGED);
+    expect(getReviewHold(id)).toBeNull();
+  });
+
+  it.each(['WAITING_CARD', 'DISPATCH_PENDING', 'MP_PENDING', 'APPROVED_ELSEWHERE'])('P3-03: %s mostra "em andamento", sem o procedimento do ID da operação', async (code) => {
+    const id = openTable();
+    const hold = mpHold(id);
+    reconcile.mockResolvedValue({ kind: 'reply', reply: { idempotency_key: KEY, status: 'MANUAL_REVIEW', code, reason: 'Pode estar sendo cobrada em outro aparelho.' } });
+    sheet(hold);
+    fill();
+    await pin();
+    await waitFor(() => expect(screen.getByText(POINT_IN_PROGRESS)).toBeTruthy());
+    expect(screen.queryByText(POINT_REVIEW_PROCEDURE)).toBeNull();
     expect(getReviewHold(id)).not.toBeNull();
   });
 });

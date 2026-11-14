@@ -5,6 +5,7 @@
  */
 import type { SyncConfig } from '../sync/supabaseSync';
 import { parseChargeReply, pointChargeEndpoint, type ChargeReply, type PointFetch } from './mercadoPagoPointDriver';
+import { fetchPointReservation } from '../sync/cloudPull';
 
 /** Motivo mínimo que o servidor aceita na conferência (B2). */
 export const RECONCILE_MIN_REASON = 10;
@@ -20,7 +21,8 @@ export interface ReconcileInput {
 }
 
 export type ReconcileOutcome =
-  | { kind: 'reply'; reply: Exclude<ChargeReply, { status: 'PENDING' }> }
+  /** refunded: DECLINED com code REFUNDED (o Mercado Pago provou o estorno: houve cobrança e o dinheiro voltou). */
+  | { kind: 'reply'; reply: Exclude<ChargeReply, { status: 'PENDING' }>; refunded?: true }
   /** PIN de gerente recusado (403). */
   | { kind: 'pin'; error: string }
   /**
@@ -82,6 +84,7 @@ export async function reconcilePointCharge(input: ReconcileInput, deps: Reconcil
     if (out.status === 200) {
       const reply = parseChargeReply(out.text);
       if (!reply || reply.status === 'PENDING') return { kind: 'error', error: 'O servidor não trouxe uma resposta conclusiva. A cobrança continua em revisão.' };
+      if (reply.status === 'DECLINED' && parseObject(out.text)?.code === 'REFUNDED') return { kind: 'reply', reply, refunded: true };
       return { kind: 'reply', reply };
     }
     const err = parseObject(out.text);
@@ -122,6 +125,39 @@ export async function readPointChargeStatus(idempotencyKey: string, deps: Reconc
     if (!out || out.status !== 200) return fail;
     const reply = parseChargeReply(out.text);
     return reply ? { kind: 'reply', reply } : fail;
+  } catch {
+    return fail;
+  }
+}
+
+/**
+ * Pagamento da cobrança no servidor (tchefood_point_reservation da conta), lido logo antes de registrar uma aprovação
+ * da Point neste aparelho (auditoria interna 3, P1-02: dois aparelhos registrando o mesmo pagamento = duas NFC-e).
+ *  - not_registered: a cobrança aparece aprovada e sem pagamento (pode registrar);
+ *  - not_reserving: a cobrança não reserva mais nesta conta (aprovada com o pagamento já registrado no servidor);
+ *  - other: aparece em outro estado (mudou no meio);
+ *  - error: sem leitura (não registra).
+ */
+export type ServerPaymentState = { kind: 'not_registered' } | { kind: 'not_reserving' } | { kind: 'other'; status: string } | { kind: 'error'; error: string };
+
+export async function pointPaymentOnServer(orderId: string, idempotencyKey: string, deps: ReconcileDeps = defaultReconcileDeps()): Promise<ServerPaymentState> {
+  const fail = { kind: 'error', error: 'Não foi possível confirmar no servidor se este pagamento já foi registrado. Nada foi registrado e a trava continua; tente de novo.' } as const;
+  const deadline = deps.timer(RECONCILE_TIMEOUT_MS).then(() => null);
+  try {
+    const cfg = await Promise.race([deps.config().catch(() => null), deadline]);
+    if (!cfg) return fail;
+    const r = await Promise.race([fetchPointReservation(cfg, async (url, init) => {
+      const res = await deps.fetch(url, { method: init.method, headers: init.headers, body: init.body ?? '', ...(init.signal ? { signal: init.signal } : {}) });
+      return { ok: res.status >= 200 && res.status < 300, status: res.status, text: () => res.text() };
+    }, orderId), deadline]);
+    if (!r) return fail;
+    // Banco anterior (sem a lista de cobranças): não dá para provar nada.
+    if (!r.charges) return fail;
+    const c = r.charges.find((x) => x.idempotencyKey === idempotencyKey);
+    if (!c) return { kind: 'not_reserving' };
+    if (c.hasPayment) return { kind: 'not_reserving' };
+    if (c.status === 'approved') return { kind: 'not_registered' };
+    return { kind: 'other', status: c.status };
   } catch {
     return fail;
   }

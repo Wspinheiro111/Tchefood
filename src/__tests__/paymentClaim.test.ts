@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  CLAIM_ERRORS, CLAIM_OFFLINE_ERROR, CLAIM_REQUIRED_ERROR, claimPayment, releaseClaimAfterNoCharge, releasePaymentClaim, releasePaymentClaimManager,
+  CLAIM_ERRORS, CLAIM_OFFLINE_ERROR, CLAIM_REQUIRED_ERROR, CLAIM_SYNC_PENDING, claimPayment, releaseClaimAfterNoCharge, releasePaymentClaim, releasePaymentClaimManager,
   RELEASE_NEEDS_MANAGER, requirePaymentClaim, retryPendingClaimReleases, touchPaymentClaim, type ClaimDeps,
 } from '../lib/payments/paymentClaim';
 import { beginLocalClaim, isClaimActiveHere, localClaim, pendingRelease, pendingReleases, resetClaimLedger } from '../lib/payments/claimLedger';
@@ -87,7 +87,7 @@ describe('claimPayment (tchefood_claim_payment)', () => {
     ['TF006', /dados do pagamento inválidos/],
     ['TF008', /saldo desta conta no servidor é diferente/],
     ['TF009', /já está em uso/],
-    ['TF010', /^Esta loja tem a Point: o pagamento precisa da reserva no servidor\.$/],
+    ['TF010', /^Loja conectada à nuvem: todo pagamento é reservado no servidor antes\./],
   ])('recusa %s do banco vira mensagem clara e não libera', async (code, text) => {
     const { d } = deps(reply(400, JSON.stringify({ code, message: 'TCHEFOOD_CLAIM: x', details: null, hint: null })));
     const r = await claimPayment(INPUT, d);
@@ -106,16 +106,20 @@ describe('claimPayment (tchefood_claim_payment)', () => {
     expect(await claimPayment(INPUT, deps(async () => { throw new TypeError('Failed to fetch'); }).d)).toEqual(offline);
     expect(await claimPayment(INPUT, deps(reply(503, 'upstream')).d)).toEqual(offline);
     expect(await claimPayment(INPUT, deps(reply(401, '{"message":"JWT expired"}')).d)).toEqual(offline);
-    expect(CLAIM_OFFLINE_ERROR).toBe('Sem internet: com a Point na loja, só dá para receber com o servidor confirmando. Tente de novo quando voltar a conexão.');
+    // Auditoria 3: texto que vale para toda loja na nuvem (com ou sem Point).
+    expect(CLAIM_OFFLINE_ERROR).toBe('Loja conectada à nuvem: todo pagamento é reservado no servidor antes; sem conexão não dá para receber neste aparelho. Confira a internet e tente de novo. Nada foi recebido.');
+    expect(CLAIM_OFFLINE_ERROR).not.toMatch(/Point/);
   });
 
-  it('prazo de 10 s: servidor ou sincronização pendurados viram sem internet', async () => {
+  it('prazo de 10 s: servidor pendurado vira sem internet; fila da conta subindo (30 s) tem aviso próprio e não pede reserva', async () => {
     const timer = vi.fn(async () => undefined);
     const hung = deps(() => new Promise(() => undefined), { timer });
     expect(await claimPayment(INPUT, hung.d)).toMatchObject({ ok: false, offline: true });
     expect(timer).toHaveBeenCalledWith(10_000, expect.any(AbortSignal));
-    const syncHung = deps(reply(200, OK_BODY), { timer: async () => undefined, prepareOrder: () => new Promise(() => undefined) });
-    expect(await claimPayment(INPUT, syncHung.d)).toMatchObject({ ok: false, offline: true });
+    const prepTimer = vi.fn(async () => undefined);
+    const syncHung = deps(reply(200, OK_BODY), { timer: prepTimer, prepareOrder: () => new Promise(() => undefined) });
+    expect(await claimPayment(INPUT, syncHung.d)).toEqual({ ok: false, error: CLAIM_SYNC_PENDING });
+    expect(prepTimer).toHaveBeenCalledWith(30_000, expect.any(AbortSignal));
     expect(syncHung.calls).toHaveLength(0);
   });
 

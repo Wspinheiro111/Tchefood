@@ -7,6 +7,7 @@ import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, recordKeys, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
+import { pendingRelease } from '../payments/claimLedger';
 import type { SyncEvent, UUID } from '../../types';
 
 const INTERVAL_MS = 5_000;
@@ -105,7 +106,7 @@ async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getS
       return;
     }
     const held = (syncRejected ?? []).map((r) => r.event);
-    const result = await flushOutbox(events, cfg, fetchFn, 50, held);
+    const result = await flushOutbox(events, cfg, fetchFn, 50, held, declinedAwaitingRelease);
     const st = useTcheStore.getState();
     // Recusa da maquininha que o servidor não aceitou (TF010, sem dinheiro): sai da fila como os enviados, para
     // não parar a conta; o aviso abaixo diz que foi descartada.
@@ -127,6 +128,19 @@ async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getS
   }
 }
 
+/**
+ * Recusa da maquininha (pagamento DECLINED fora do Mercado Pago) cuja reserva ainda está sendo liberada por este
+ * aparelho (liberação pendente com o código, ainda tentando): espera a liberação. Com a reserva aberta, o servidor
+ * recusa o DECLINED com TF010 (protege o aprovado da mesma chave). Liberação final (só o gerente) não segura.
+ */
+export function declinedAwaitingRelease(event: SyncEvent): boolean {
+  if (event.table !== 'payments' || event.op !== 'INSERT') return false;
+  const p = event.payload;
+  if (p.status !== 'DECLINED' || p.acquirer === 'MERCADO_PAGO' || typeof p.idempotency_key !== 'string') return false;
+  const pending = pendingRelease(p.idempotency_key);
+  return Boolean(pending && pending.release_token && !pending.final);
+}
+
 /** Evento que mexe nesta conta: a própria conta ou linha dela (item, pagamento, cashback, desconto). */
 function touchesOrder(event: SyncEvent, orderId: UUID): boolean {
   // As mesmas ligações que a fila usa para segurar eventos da conta (recordKeys: a conta, linhas dela, mesa,
@@ -136,6 +150,25 @@ function touchesOrder(event: SyncEvent, orderId: UUID): boolean {
 }
 
 export type OrderSyncCheck = { ok: true; balance_cents: number } | { ok: false; reason: string };
+
+const REJECTED_WHAT: Partial<Record<SyncEvent['table'], string>> = {
+  payments: 'um pagamento',
+  orders: 'uma alteração',
+  order_items: 'um item',
+  dining_tables: 'a situação da mesa',
+  audit_logs: 'uma autorização do gerente',
+  cashback_ledger: 'um cashback',
+  own_deliveries: 'uma entrega',
+};
+
+/**
+ * A conta tem evento recusado pela nuvem: nenhum pagamento (nem dinheiro) é recebido nela até resolver, porque
+ * o servidor não tem a conta como este aparelho a mostra. Diz qual evento e o que fazer.
+ */
+export function rejectedOrderMessage(event: SyncEvent, message: string): string {
+  const what = REJECTED_WHAT[event.table] ?? 'uma alteração';
+  return `A nuvem recusou ${what} desta conta (${message}). Nada foi recebido: nenhum pagamento entra nesta conta até resolver. Em Retaguarda › Nuvem, corrija a causa e toque em Reenviar recusados.`;
+}
 
 /** Rodadas de envio que a preparação da cobrança tenta antes de desistir (o driver ainda põe prazo). */
 const ENSURE_ROUNDS = 3;
@@ -153,10 +186,9 @@ export async function ensureOrderSynced(orderId: UUID, fetchFn: FetchLike = brow
     // Rodada de outro chamador em andamento: espera ela terminar (pode ter começado depois da anterior).
     while (current) await current.catch(() => undefined);
     const st = useTcheStore.getState();
-    if (!st.cloud) return fail('Conecte a loja à nuvem para cobrar na Point Smart.');
-    if ((st.syncRejected ?? []).some((r) => touchesOrder(r.event, orderId))) {
-      return fail('A nuvem recusou uma alteração desta conta. Resolva em Retaguarda › Nuvem antes de cobrar na Point Smart.');
-    }
+    if (!st.cloud) return fail('Conecte a loja à nuvem para receber por este caminho. Nada foi recebido.');
+    const rejected = (st.syncRejected ?? []).find((r) => touchesOrder(r.event, orderId));
+    if (rejected) return fail(rejectedOrderMessage(rejected.event, rejected.message));
     const order = st.orders.find((o) => o.id === orderId);
     if (!order) return fail('Conta não encontrada neste aparelho.');
     if (!st.outbox.some((e) => touchesOrder(e, orderId))) {

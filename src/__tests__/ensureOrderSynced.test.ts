@@ -73,7 +73,7 @@ describe('ensureOrderSynced (auditoria r4 P1-01)', () => {
     useTcheStore.setState({ outbox: [event('e1')] });
     const { fetchFn } = cloud(400);
     const r = await ensureOrderSynced(ORDER_ID, fetchFn);
-    expect(r).toMatchObject({ ok: false, reason: expect.stringMatching(/recusou uma alteração desta conta/) });
+    expect(r).toMatchObject({ ok: false, reason: expect.stringMatching(/A nuvem recusou .* desta conta .*Retaguarda › Nuvem.*Reenviar recusados/) });
     // Recusa antiga, já fora da fila, também segura.
     const again = await ensureOrderSynced(ORDER_ID, cloud(200).fetchFn);
     expect(again.ok).toBe(false);

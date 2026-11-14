@@ -50,6 +50,8 @@ export function parsePayment(body: unknown): PointPaymentDetails {
   return {
     id,
     status: asText(p.status),
+    // Revisão PR #49: o status_detail diz como terminou um charged_back (settled / reimbursed / in_process).
+    statusDetail: asText(p.status_detail),
     amountCents: amountToCents(p.transaction_amount),
     paymentMethodId: asText(p.payment_method_id),
     paymentTypeId: asText(p.payment_type_id),

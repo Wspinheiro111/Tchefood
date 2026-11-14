@@ -337,17 +337,30 @@ describe('caixa da mesa (CheckoutScreen) numa loja com Point', () => {
     expect(screen.getByRole('button', { name: 'Conferir no Mercado Pago' })).toBeTruthy();
   });
 
-  it.each(['creating', 'pending', 'at_terminal'])('B: cobrança "%s" largada (app fechado no meio, sem trava): "Resolver cobrança da Point" aparece', async (status) => {
+  it.each(['creating', 'pending', 'at_terminal'])('B: cobrança "%s" largada e vencida no servidor (stale): "Resolver cobrança da Point" aparece', async (status) => {
     const id = openTable();
     withPoint();
     fetchPointReservation.mockResolvedValue({
       reservedCents: 1000, openCharges: 1, manualReview: false,
-      charges: [{ idempotencyKey: 'pk-largada', status, amountCents: 1000, rawStatusDetail: null, hasPayment: false }],
+      charges: [{ idempotencyKey: 'pk-largada', status, amountCents: 1000, rawStatusDetail: null, hasPayment: false, stale: true }],
     });
     render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
     expect(await screen.findByText(/na maquininha, sem resposta/)).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Resolver cobrança da Point' }));
     expect(screen.getByRole('button', { name: 'Conferir no Mercado Pago' })).toBeTruthy();
+  });
+
+  it.each([['stale false', { stale: false }], ['banco sem stale', {}]] as const)('auditoria 3 (P1-02): cobrança aberta ainda no prazo (%s): "cobrando em outro aparelho", sem ação', async (_n, extra) => {
+    const id = openTable();
+    withPoint();
+    fetchPointReservation.mockResolvedValue({
+      reservedCents: 1000, openCharges: 1, manualReview: false,
+      charges: [{ idempotencyKey: 'pk-cobrando', status: 'at_terminal', amountCents: 1000, rawStatusDetail: null, hasPayment: false, ...extra }],
+    });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    expect(await screen.findByText(/cobrando em outro aparelho/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Resolver cobrança da Point' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Consultar cobrança/ })).toBeNull();
   });
 
   it('cobrança terminada no servidor (sem reserva) não aparece para resolver', async () => {

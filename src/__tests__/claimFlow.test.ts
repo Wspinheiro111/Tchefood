@@ -15,7 +15,7 @@ vi.mock('../lib/payments/paymentClaim', async (orig) => ({
   releaseClaimAfterNoCharge: (...a: unknown[]) => releaseClaimAfterNoCharge(...a),
 }));
 
-const { CLAIM_LEASE_MS, CLAIM_RELEASED_DURING_CHARGE, CLAIM_UNCONFIRMED, startPaymentClaim, checkHoldClaim } = await import('../lib/payments/claimFlow');
+const { CLAIM_LEASE_MS, CLAIM_REFUSED_AFTER_APPROVAL, CLAIM_RELEASED_DURING_CHARGE, CLAIM_UNCONFIRMED, startPaymentClaim, checkHoldClaim } = await import('../lib/payments/claimFlow');
 const { isClaimActiveHere, localClaim, resetClaimLedger, settledClaims, beginLocalClaim, settleLocalClaim } = await import('../lib/payments/claimLedger');
 const { PENDING_CHARGE_TTL_MS } = await import('../store/useTcheStore');
 
@@ -190,6 +190,16 @@ describe('beforeRegister: antes de registrar a aprovação', () => {
     // Um batimento confirmado renova o prazo.
     touchPaymentClaim.mockResolvedValueOnce({ ok: true, status: 'open', activeUntil: null });
     expect(await c.handle.beforeRegister('STONE')).toEqual({ ok: true });
+    c.handle.settle();
+  });
+
+  it('auditoria 3: recusa com código (não TF005) tem aviso próprio, não o de falta de conexão', async () => {
+    const c = await startPaymentClaim(true, INPUT);
+    if (!c.ok) throw new Error('claim');
+    touchPaymentClaim.mockResolvedValueOnce({ ok: false, code: 'TF004', error: 'segredo' });
+    const out = await c.handle.beforeRegister('STONE');
+    expect(out).toEqual({ ok: false, code: 'CLAIM_UNCONFIRMED', reason: CLAIM_REFUSED_AFTER_APPROVAL });
+    expect(CLAIM_REFUSED_AFTER_APPROVAL).not.toMatch(/conexão/);
     c.handle.settle();
   });
 

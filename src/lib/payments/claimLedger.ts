@@ -174,6 +174,14 @@ export function forgetUnsavedClaim(key: string): void {
   if (access().kind !== 'none') load();
 }
 
+/** Contas com reserva ou liberação não gravada neste aparelho (para o aviso dizer quais). */
+export function unsavedClaimOrders(): string[] {
+  const ids = new Set<string>();
+  for (const v of unsavedClaims.values()) if (v) ids.add(v.order_id);
+  for (const v of unsavedReleases.values()) if (v) ids.add(v.order_id);
+  return [...ids];
+}
+
 /** Há mudança do registro de reservas que não foi gravada neste aparelho. */
 export function claimLedgerUnsaved(): boolean {
   return unsavedClaims.size > 0 || unsavedReleases.size > 0;
