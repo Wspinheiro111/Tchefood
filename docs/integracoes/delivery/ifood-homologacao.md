@@ -41,7 +41,20 @@ aprovou fica em `audit_logs.metadata.details`.
 
 Se o iFood aceitou e o banco falhou logo depois (cancelamento e negociação): 503 com `code: "sent_not_saved"` e "Enviado ao
 iFood, mas não deu para gravar; confira o pedido antes de repetir." O pedido fica reservado (nova tentativa recusada) até o
-evento do app chegar, ou por 10 min sem evento nenhum.
+evento do app chegar. A reserva de cancelamento sem confirmação (chamada em andamento, ou falha sem resposta clara: rede,
+5xx) não se libera só pelo tempo: passados 10 min sem evento nenhum, a nova tentativa só vai se o corpo trouxer
+`confirmUncertainRetry: true` (o gerente conferiu no Portal do Parceiro que o pedido não está cancelado nem com
+cancelamento em análise; a decisão fica em `audit_logs.metadata.details`). Sem ela: 409. Com ela, o servidor consulta o
+pedido no iFood (`GET /orders/{id}`): consulta falhou, 409 e segue bloqueado ("confira no Portal do Parceiro"); pedido já
+cancelado, grava e recusa; senão pede de novo uma vez e marca o pedido para conferência ("o pedido de cancelamento
+anterior ficou sem confirmação e foi repetido"). Por que a conferência humana: a doc oficial não dá prova de que a
+primeira chamada não foi aplicada. O detalhe do pedido não tem status nem cancelamento em análise
+(https://developer.ifood.com.br/en-US/docs/guides/modules/order/details/; o mapeamento daqui sempre lê `placed`), então a
+consulta só pega o caso de outro app que informe status; o pedido aplicado aparece pelos eventos CAR (pedido recebido),
+CARF (recusado) e CAN (https://developer.ifood.com.br/en-US/docs/guides/modules/order/events/), e nenhuma página que abriu
+diz o que o iFood faz com um `requestCancellation` repetido (a página de rotas só lista a rota, 300/min:
+https://developer.ifood.com.br/en-US/docs/getting-started/documentation/rate-limit/; as de cancelamento e workflow não
+abriram). Não é garantia de idempotência do iFood.
 
 | Método e rota | O que faz |
 |---|---|

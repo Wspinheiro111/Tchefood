@@ -63,9 +63,14 @@ export type DeliveryDisputeResponse = {
 //   sending   reservado, chamada em andamento (ou o processo caiu no meio: tratado como incerto)
 //   sent      o app aceitou o pedido; falta o evento dele (CAR, CARF ou CAN), que zera a reserva
 //   uncertain a chamada falhou sem resposta clara (rede, 5xx): pode ter chegado
-// "sending" e "uncertain" expiram em CANCELLATION_RESERVATION_TTL_MS: o app manda o CAR em segundos, então
-// passado esse prazo sem nenhum evento de cancelamento o pedido quase certamente não chegou, e a loja pode
-// tentar de novo (senão a reserva travaria o cancelamento para sempre).
+// "sending" e "uncertain" não se liberam só pelo tempo: o prazo (CANCELLATION_RESERVATION_TTL_MS) só abre a
+// possibilidade de repetir. Passado o prazo sem nenhum evento de cancelamento, a nova tentativa exige
+//  1. a conferência do gerente no Portal do Parceiro (confirmUncertainRetry), porque nada na API prova que a
+//     primeira chamada não foi aplicada: o detalhe do pedido do iFood (GET /orders/{id}) não traz status nem
+//     cancelamento em análise, e a doc não diz o que o iFood faz com um requestCancellation repetido;
+//  2. uma consulta ao detalhe do pedido no app: se ele já mostra o pedido cancelado, grava e não pede de novo; se a
+//     consulta falha, continua bloqueado.
+// O pedido repetido fica marcado para conferência (UNCERTAIN_CANCELLATION_RETRIED).
 export type DeliveryCancellationRequest = {
   state: "sending" | "sent" | "uncertain";
   reservedAt: string;
@@ -73,6 +78,15 @@ export type DeliveryCancellationRequest = {
 };
 
 export const CANCELLATION_RESERVATION_TTL_MS = 10 * 60_000;
+
+export const UNCERTAIN_CANCELLATION_RETRIED =
+  "O pedido de cancelamento anterior ficou sem confirmação do app e foi repetido: confira no Portal do Parceiro se não há dois pedidos de cancelamento.";
+
+export type DeliveryCancellationOptions = {
+  // O gerente conferiu no Portal do Parceiro que o pedido não está cancelado nem com cancelamento em análise.
+  // Só vale para repetir um pedido sem confirmação cujo prazo de reserva já passou.
+  confirmUncertainRetry?: boolean;
+};
 
 // O app aceitou a chamada, mas a gravação do resultado no banco falhou depois. Não é "banco indisponível, tente
 // de novo": o pedido já foi enviado e a tela precisa conferir antes de repetir.
@@ -278,14 +292,18 @@ export class DeliveryInbox {
   }
 
   // Pedido de cancelamento da loja. Reservado no pedido (gravação com versão) antes de chamar o app: dois pedidos
-  // ao mesmo tempo, ou uma nova tentativa depois de uma resposta incerta, não chegam ao app.
+  // ao mesmo tempo, ou uma nova tentativa depois de uma resposta incerta, não chegam ao app. Reserva sem confirmação
+  // com o prazo vencido: ver DeliveryCancellationRequest (conferência do gerente + consulta ao app).
   async requestCancellation(
     channel: DeliveryChannelKey,
     externalOrderId: string,
     reason: DeliveryCancellationReason,
     details?: string,
+    options: DeliveryCancellationOptions = {},
   ): Promise<DeliveryOrderRecord> {
     const adapter = this.adapter(channel);
+    // Reserva sem confirmação já vencida que esta chamada conferiu no app (null = nenhuma).
+    const checkedStale = await this.checkStaleCancellation(adapter, externalOrderId, options);
     const reservedAt = this.now().toISOString();
     await this.updateOrder(channel, externalOrderId, (latest) => {
       if (latest.order.status === "concluded" || latest.order.status === "cancelled") {
@@ -296,8 +314,8 @@ export class DeliveryInbox {
       }
       const current = latest.cancellationRequest;
       if (current) {
-        const expired = current.state !== "sent" && Date.parse(current.reservedAt) + CANCELLATION_RESERVATION_TTL_MS <= this.now().getTime();
-        if (!expired) {
+        // Só repete a reserva vencida que foi conferida acima; outra (gravada no meio) segue as regras de sempre.
+        if (!this.isStaleCancellation(current) || current.reservedAt !== checkedStale) {
           throw new DeliveryMarketplaceError(
             channel,
             "conflict",
@@ -306,6 +324,7 @@ export class DeliveryInbox {
               : "Já existe um pedido de cancelamento em andamento ou sem confirmação; confira o pedido no app antes de repetir.",
           );
         }
+        flag(latest, UNCERTAIN_CANCELLATION_RETRIED);
       }
       latest.cancellationRequest = { state: "sending", reservedAt, code: reason.code };
       return true;
@@ -334,6 +353,52 @@ export class DeliveryInbox {
     } catch (error) {
       throw new DeliverySentNotSavedError(channel, externalOrderId, error);
     }
+  }
+
+  private isStaleCancellation(request: DeliveryCancellationRequest): boolean {
+    return request.state !== "sent" && Date.parse(request.reservedAt) + CANCELLATION_RESERVATION_TTL_MS <= this.now().getTime();
+  }
+
+  // Antes de repetir um pedido de cancelamento sem confirmação e com o prazo vencido: exige a conferência do gerente e
+  // consulta o pedido no app. Devolve o reservedAt da reserva conferida, ou null se não há reserva vencida (as
+  // regras normais decidem depois, dentro da gravação).
+  private async checkStaleCancellation(
+    adapter: DeliveryMarketplaceAdapter,
+    externalOrderId: string,
+    options: DeliveryCancellationOptions,
+  ): Promise<string | null> {
+    const channel = adapter.channel;
+    const stale = (await this.requireOrder(channel, externalOrderId)).cancellationRequest;
+    if (!stale || !this.isStaleCancellation(stale)) return null;
+    if (options.confirmUncertainRetry !== true) {
+      throw new DeliveryMarketplaceError(
+        channel,
+        "conflict",
+        "O pedido de cancelamento anterior ficou sem confirmação do app e pode ter chegado. Confira no Portal do Parceiro se o pedido já foi cancelado ou tem cancelamento em análise; se não tiver, repita confirmando que conferiu.",
+      );
+    }
+    let detail: DeliveryOrder;
+    try {
+      detail = await adapter.getOrder(externalOrderId);
+    } catch (error) {
+      throw new DeliveryMarketplaceError(
+        channel,
+        "conflict",
+        `Não deu para consultar o pedido no app (${describe(error)}); o cancelamento anterior segue sem confirmação. Confira no Portal do Parceiro antes de repetir.`,
+      );
+    }
+    if (detail.status === "cancelled") {
+      // O app já cancelou: grava (o evento CAN confirma depois) e não manda outro pedido.
+      await this.updateOrder(channel, externalOrderId, (latest) => {
+        if (latest.cancellationRequest?.reservedAt !== stale.reservedAt) return false;
+        latest.order.status = mergeDeliveryStatus(latest.order.status, "cancelled");
+        latest.cancellationPending = false;
+        latest.cancellationRequest = null;
+        return true;
+      });
+      throw new DeliveryMarketplaceError(channel, "conflict", "O app já mostra o pedido cancelado; nada a pedir.");
+    }
+    return stale.reservedAt;
   }
 
   // Confere a resposta contra a negociação gravada sem gravar nada nem chamar o app (o servidor usa antes de pedir

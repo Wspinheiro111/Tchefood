@@ -413,10 +413,22 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           const reasons = await options.inbox.listCancellationReasons("ifood", orderId);
           const reason = reasons.find((candidate) => candidate.code === code);
           if (!reason) return { status: 400, body: { error: "Motivo não está entre os aceitos pelo iFood para este pedido." } };
-          const cancel = { ...manager, action: "DELIVERY_CANCEL" as const, externalOrderId: orderId, merchantExternalId: null, details: { code: reason.code } };
+          // Repetir um cancelamento que ficou sem confirmação (prazo da reserva vencido) é decisão do gerente depois de
+          // conferir no Portal do Parceiro; a decisão vai junto da autorização.
+          if (body.confirmUncertainRetry !== undefined && typeof body.confirmUncertainRetry !== "boolean") {
+            return { status: 400, body: { error: "confirmUncertainRetry precisa ser true ou false." } };
+          }
+          const confirmUncertainRetry = body.confirmUncertainRetry === true;
+          const cancel = {
+            ...manager,
+            action: "DELIVERY_CANCEL" as const,
+            externalOrderId: orderId,
+            merchantExternalId: null,
+            details: { code: reason.code, ...(confirmUncertainRetry ? { confirmUncertainRetry } : {}) },
+          };
           return await withManager(token, cancel, async () => ({
             status: 200,
-            body: publicRecord(await options.inbox.requestCancellation("ifood", orderId, reason, text(body.details, 250) ?? undefined)),
+            body: publicRecord(await options.inbox.requestCancellation("ifood", orderId, reason, text(body.details, 250) ?? undefined, { confirmUncertainRetry })),
           }));
         }
         if (request.method === "POST" && route === "dispute") {

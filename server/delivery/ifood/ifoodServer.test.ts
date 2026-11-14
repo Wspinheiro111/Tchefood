@@ -383,6 +383,27 @@ describe("servidor do iFood: alçada de gerente", () => {
     expect(manager.results.at(-1)?.outcome).toBe("failed");
   });
 
+  it("cancelamento sem confirmação com o prazo vencido: só repete com a conferência do gerente, que fica no registro", async () => {
+    const { sandbox, poller, call, manager, repository, api } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const stored = (await repository.getOrder("ifood", id))!;
+    stored.cancellationRequest = { state: "uncertain", reservedAt: new Date(NOW.getTime() - 11 * 60_000).toISOString(), code: "503" };
+    stored.version = await repository.saveOrder(stored);
+    const send = vi.spyOn(api, "requestCancellation");
+    const path = `/ifood/orders/${id}/cancellation`;
+    const base = { code: "503", description: "Item indisponível" };
+    const blocked = await call("POST", path, { ...base, authorization: auth() });
+    expect(blocked).toMatchObject({ status: 409, body: { code: "conflict", error: expect.stringMatching(/Portal do Parceiro/) } });
+    expect(send).not.toHaveBeenCalled();
+    expect((await call("POST", path, { ...base, confirmUncertainRetry: "sim", authorization: auth() })).status).toBe(400);
+    const retried = await call("POST", path, { ...base, confirmUncertainRetry: true, authorization: auth() });
+    expect(retried.status).toBe(200);
+    expect(send).toHaveBeenCalledOnce();
+    expect(manager.authorized.at(-1)?.details).toMatchObject({ code: "503", confirmUncertainRetry: true });
+    expect(manager.authorized[0]?.details).not.toHaveProperty("confirmUncertainRetry");
+  });
+
   it("reenvio com o mesmo id da tentativa não chama o iFood de novo (pausa não duplica)", async () => {
     const { sandbox, poller, call, manager } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });

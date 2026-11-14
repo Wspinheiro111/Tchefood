@@ -4,7 +4,9 @@ import {
   DeliveryInbox,
   DeliverySentNotSavedError,
   InMemoryDeliveryRepository,
+  CANCELLATION_RESERVATION_TTL_MS,
   ORDER_DETAIL_MAX_FAILURES,
+  UNCERTAIN_CANCELLATION_RETRIED,
   type DeliveryOrderRecord,
 } from "./deliveryInbox";
 import { IfoodMerchantApi } from "./ifood/ifoodMerchantApi";
@@ -794,15 +796,91 @@ describe("caixa de entrada de delivery", () => {
     await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "conflict" });
     now = new Date(now.getTime() + 9 * 60_000);
     await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "conflict" });
-    // Passado o prazo sem nenhum evento do app, a incerta expira e uma nova tentativa é aceita.
+    // Passado o prazo sem nenhum evento do app, a nova tentativa só vai com a conferência do gerente no portal.
     now = new Date(now.getTime() + 2 * 60_000);
-    const pending = await inbox.requestCancellation("ifood", id, reason);
+    const pending = await inbox.requestCancellation("ifood", id, reason, undefined, { confirmUncertainRetry: true });
     expect(pending).toMatchObject({ cancellationPending: true, cancellationRequest: { state: "sent" } });
     sandbox.decideCancellation(id, false);
     await inbox.runCycle();
     const record = (await repository.getOrder("ifood", id))!;
     expect(record.cancellationRequest).toBeNull();
     expect(record.cancellationPending).toBe(false);
+  });
+
+  describe("cancelamento sem confirmação, passado o prazo da reserva", () => {
+    async function expiredUncertain() {
+      let now = new Date("2026-11-14T15:00:00.000Z");
+      const ctx = setup({ now: () => now });
+      ctx.sandbox.autoAcceptCancellation = false;
+      const id = ctx.sandbox.placeOrder({ items: ITEMS });
+      await ctx.inbox.runCycle();
+      const [reason] = await ctx.inbox.listCancellationReasons("ifood", id);
+      vi.spyOn(ctx.api, "requestCancellation").mockRejectedValueOnce(new TypeError("fetch failed"));
+      await expect(ctx.inbox.requestCancellation("ifood", id, reason)).rejects.toThrow(/fetch failed/);
+      now = new Date(now.getTime() + CANCELLATION_RESERVATION_TTL_MS + 60_000);
+      const send = vi.spyOn(ctx.api, "requestCancellation");
+      send.mockClear();
+      const getOrder = vi.spyOn(ctx.api, "getOrder");
+      return { ...ctx, id, reason, send, getOrder };
+    }
+
+    it("sem a conferência do gerente continua bloqueado e nem consulta o app", async () => {
+      const { inbox, repository, id, reason, send, getOrder } = await expiredUncertain();
+      await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "conflict", message: expect.stringMatching(/Portal do Parceiro/) });
+      expect(send).not.toHaveBeenCalled();
+      expect(getOrder).not.toHaveBeenCalled();
+      expect((await repository.getOrder("ifood", id))!.cancellationRequest?.state).toBe("uncertain");
+    });
+
+    it("app já mostra o pedido cancelado: grava, recusa e não pede de novo", async () => {
+      const { inbox, repository, id, reason, send, getOrder } = await expiredUncertain();
+      const detail = (await repository.getOrder("ifood", id))!.order;
+      getOrder.mockResolvedValueOnce({ ...detail, status: "cancelled" });
+      await expect(inbox.requestCancellation("ifood", id, reason, undefined, { confirmUncertainRetry: true })).rejects.toMatchObject({ code: "conflict" });
+      expect(send).not.toHaveBeenCalled();
+      const record = (await repository.getOrder("ifood", id))!;
+      expect(record.order.status).toBe("cancelled");
+      expect(record.cancellationRequest).toBeNull();
+      expect(record.cancellationPending).toBe(false);
+    });
+
+    it("app não mostra cancelado: pede uma vez e deixa a pendência registrada", async () => {
+      const { inbox, repository, id, reason, send } = await expiredUncertain();
+      const record = await inbox.requestCancellation("ifood", id, reason, undefined, { confirmUncertainRetry: true });
+      expect(send).toHaveBeenCalledOnce();
+      expect(record).toMatchObject({ cancellationPending: true, cancellationRequest: { state: "sent" }, needsReview: true });
+      expect(record.reviewReasons).toContain(UNCERTAIN_CANCELLATION_RETRIED);
+      // A nova reserva vale de novo: um terceiro pedido não sai.
+      await expect(inbox.requestCancellation("ifood", id, reason, undefined, { confirmUncertainRetry: true })).rejects.toMatchObject({ code: "conflict" });
+      expect(send).toHaveBeenCalledOnce();
+      expect((await repository.getOrder("ifood", id))!.reviewReasons).toContain(UNCERTAIN_CANCELLATION_RETRIED);
+    });
+
+    it("consulta ao app falha: continua bloqueado", async () => {
+      const { inbox, repository, id, reason, send, getOrder } = await expiredUncertain();
+      getOrder.mockRejectedValueOnce(new TypeError("fetch failed"));
+      await expect(inbox.requestCancellation("ifood", id, reason, undefined, { confirmUncertainRetry: true })).rejects.toMatchObject({
+        code: "conflict",
+        message: expect.stringMatching(/Portal do Parceiro/),
+      });
+      expect(send).not.toHaveBeenCalled();
+      expect((await repository.getOrder("ifood", id))!.cancellationRequest?.state).toBe("uncertain");
+    });
+
+    it("dentro do prazo a conferência não libera", async () => {
+      let now = new Date("2026-11-14T15:00:00.000Z");
+      const { sandbox, api, inbox } = setup({ now: () => now });
+      const id = sandbox.placeOrder({ items: ITEMS });
+      await inbox.runCycle();
+      const [reason] = await inbox.listCancellationReasons("ifood", id);
+      vi.spyOn(api, "requestCancellation").mockRejectedValueOnce(new TypeError("fetch failed"));
+      await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toThrow(/fetch failed/);
+      now = new Date(now.getTime() + 60_000);
+      const send = vi.spyOn(api, "requestCancellation");
+      send.mockClear();
+      await expect(inbox.requestCancellation("ifood", id, reason, undefined, { confirmUncertainRetry: true })).rejects.toMatchObject({ code: "conflict" });
+      expect(send).not.toHaveBeenCalled();
+    });
   });
 
   it("negociação: iFood aceitou e o banco falhou depois: erro próprio (não 'banco indisponível')", async () => {
