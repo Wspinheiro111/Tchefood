@@ -18,6 +18,7 @@ import { availableCashback, cashbackOrphanCents } from '../../src/lib/loyalty';
 import type { CashbackLedgerEntry } from '../../src/types';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
 import { fetchCashbackPending, fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, reconcileCashback } from '../../src/lib/sync/cloudPull';
+import { fetchCloudOrders } from '../../src/lib/sync/orderPull';
 import { runReconcileDecision } from '../../src/lib/cashbackReconcile';
 import { syncOnce } from '../../src/lib/sync/useCloudSync';
 import { useArStore } from '../../src/store/useArStore';
@@ -3535,6 +3536,206 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT created_at >= '${released}'::timestamptz FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED' ORDER BY server_seq DESC LIMIT 1`)).toBe('t');
     forgetPinFailures();
   }, 30_000);
+
+  describe('contas e mesas descem para todos os aparelhos (db/schema_contas_aparelhos.sql)', () => {
+    // "Aparelho B": outro aparelho da mesma loja, falando direto com o PostgREST.
+    const fetchB = () => postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device-b' }, emulatorLog);
+    const fetchA = () => postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }, emulatorLog);
+    async function rawB(method: 'POST' | 'PATCH', path: string, body: unknown) {
+      const res = await fetchB()(`http://cloud.test/rest/v1/${path}`, { method, headers: { Prefer: 'return=minimal' }, body: JSON.stringify(body) });
+      return { status: res.status, body: await res.text() };
+    }
+    const cfgA = () => ({ url: 'http://cloud.test', anonKey: 'anon', accessToken: 'jwt' });
+    const tableNo = (n: number) => {
+      if (!st().tables.some((t) => t.number === n && t.kind === 'TABLE')) {
+        login(OWNER_PIN);
+        ok(st().saveTable({ number: n, label: `Mesa ${n}`, area: 'Salão', capacity: 4, active: true }));
+      }
+      return st().tables.find((t) => t.number === n && t.kind === 'TABLE')!;
+    };
+    const cashierId = () => st().staff.find((u) => u.pin_code === CASHIER_PIN)!.id;
+    /** B abre a mesa: a conta e a mesa sobem como a fila de B mandaria. */
+    async function bOpens(tableId: string): Promise<string> {
+      const id = crypto.randomUUID();
+      const ins = await rawB('POST', 'orders', {
+        id, tenant_id: TENANT, table_id: tableId, opened_by_user_id: cashierId(), status: 'OPEN', customer_count: 2, customer_cpf: null,
+        charge_service_fee: true, service_fee_pct: 10, discount_amount: 0, opened_at: new Date().toISOString(), closed_at: null,
+      });
+      expect(ins.status, ins.body).toBeLessThan(300);
+      const tbl = await rawB('PATCH', `dining_tables?id=eq.${tableId}`, { status: 'OCCUPIED', current_order_id: id, updated_at: new Date().toISOString() });
+      expect(tbl.status, tbl.body).toBeLessThan(300);
+      return id;
+    }
+    async function bAddsItem(orderId: string): Promise<string> {
+      const id = crypto.randomUUID();
+      const price = Number(sql(`SELECT tchefood_sale_price('${productId}', now())`));
+      const r = await rawB('POST', 'order_items', {
+        id, order_id: orderId, product_id: productId, waiter_id: cashierId(), quantity: 1, unit_price: price, modifiers_unit_price: 0,
+        sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER', priced_at: new Date().toISOString(), created_at: new Date().toISOString(),
+      });
+      expect(r.status, r.body).toBeLessThan(300);
+      return id;
+    }
+    async function bPaysCard(orderId: string, amount: number) {
+      const r = await rawB('POST', 'rpc/tchefood_register_payment', {
+        p_payment: {
+          id: crypto.randomUUID(), order_id: orderId, tenant_id: TENANT, waiter_id: cashierId(), terminal_id: null, amount, tip_amount: 0,
+          method: 'CREDIT', status: 'APPROVED', acquirer: 'STONE', acquirer_cnpj: null, card_brand: 'VISA', nsu: String(Math.floor(Math.random() * 1e9)),
+          authorization_code: 'AB12', terminal_serial: 'STONE-B', idempotency_key: crypto.randomUUID(), created_at: new Date().toISOString(),
+        },
+      });
+      expect(r.status, r.body).toBe(200);
+    }
+    const pullA = async () => {
+      const snap = await fetchCloudOrders(cfgA(), TENANT, fetchA());
+      return st().applyCloudOrders(snap);
+    };
+
+    it('conta aberta em A: item e pagamento de B descem com o saldo do banco; B fecha e a mesa fica livre em A', async () => {
+      forgetPinFailures();
+      login(CASHIER_PIN);
+      const mesa = tableNo(41);
+      await expectSynced('mesa 41');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await expectSynced('conta aberta em A');
+
+      const itemB = await bAddsItem(order.id);
+      const half = Math.round(Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${order.id}'`)) * 50) / 100;
+      await bPaysCard(order.id, half);
+      expect(ok(await pullA()).replaced).toBeGreaterThan(0);
+      const local = st().orders.find((o) => o.id === order.id)!;
+      const cloud = sql(`SELECT total_amount || ' ' || paid_amount || ' ' || remaining_balance || ' ' || status FROM orders WHERE id = '${order.id}'`);
+      expect(`${local.total_amount.toFixed(2)} ${local.paid_amount.toFixed(2)} ${local.remaining_balance.toFixed(2)} ${local.status}`).toBe(cloud);
+      expect(st().orderItems.some((i) => i.id === itemB && i.order_id === order.id)).toBe(true);
+      expect(st().payments.filter((x) => x.order_id === order.id).map((x) => x.amount)).toEqual([half]);
+      // A recebe o resto; o banco fecha e libera a mesa; tudo bate em A depois da leitura.
+      await bPaysCard(order.id, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${order.id}'`)));
+      ok(await pullA());
+      expect(st().orders.find((o) => o.id === order.id)!.status).toBe('CLOSED');
+      expect(st().orders.find((o) => o.id === order.id)!.remaining_balance).toBe(0);
+      expect(st().tables.find((t) => t.id === mesa.id)).toMatchObject({ status: 'FREE', current_order_id: null });
+      expect(st().orderItems.filter((i) => i.order_id === order.id).every((i) => i.is_paid)).toBe(true);
+    });
+
+    it('mesa aberta em B aparece ocupada em A, com a conta; A não abre a mesma mesa', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(42);
+      await expectSynced('mesa 42');
+      const x = await bOpens(mesa.id);
+      await bAddsItem(x);
+      ok(await pullA());
+      expect(st().tables.find((t) => t.id === mesa.id)).toMatchObject({ status: 'OCCUPIED', current_order_id: x });
+      expect(st().orders.find((o) => o.id === x)!.subtotal_items).toBeGreaterThan(0);
+      const again = st().openTable(mesa.id, 1, null);
+      expect(again.ok).toBe(false);
+      // A lança na conta aberta por B e paga: sobe sem recusa.
+      const p = st().products.find((y) => y.id === productId)!;
+      ok(st().addToTray({ order_id: x, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(x));
+      await expectSynced('A lança na conta de B');
+      expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${x}'`)).toBe('2');
+      ok(await pullA());
+      expect(st().orders.find((o) => o.id === x)!.total_amount.toFixed(2)).toBe(sql(`SELECT total_amount FROM orders WHERE id = '${x}'`));
+    });
+
+    it('mudança de A ainda na fila: a conta fica como está em A até subir', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(43);
+      await expectSynced('mesa 43');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      await expectSynced('conta 43');
+      ok(st().updateCustomerCount(order.id, 5)); // na fila, ainda não subiu
+      await bAddsItem(order.id); // B lança enquanto isso
+      ok(await pullA());
+      expect(st().orders.find((o) => o.id === order.id)!.customer_count).toBe(5);
+      expect(st().orderItems.some((i) => i.order_id === order.id)).toBe(false);
+      await expectSynced('pessoas sobem');
+      ok(await pullA());
+      expect(st().orders.find((o) => o.id === order.id)!.customer_count).toBe(5);
+      expect(st().orderItems.filter((i) => i.order_id === order.id)).toHaveLength(1);
+    });
+
+    it('dois aparelhos abrem a mesma mesa: a segunda conta é recusada e os itens passam para a conta da mesa', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(44);
+      await expectSynced('mesa 44');
+      // A abre e lança sem internet; B abre a mesma mesa antes de A subir.
+      const y = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: y.id, product_id: p.id, half_product_ids: [], quantity: 2, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(y.id));
+      const x = await bOpens(mesa.id);
+      await bAddsItem(x);
+      const before = Number(sql(`SELECT total_amount FROM orders WHERE id = '${x}'`));
+      const rejected = await sync();
+      expect(rejected).toHaveLength(1);
+      const rej = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === y.id)!;
+      expect(rej.message).toMatch(/TCHEFOOD_MESA_OCUPADA/);
+      expect(sql(`SELECT count(*) FROM orders WHERE id = '${y.id}'`)).toBe('0');
+      // Os itens e a mesa de A esperam atrás da recusa: nada subiu para a conta de B.
+      expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${x}'`)).toBe('1');
+      expect(sql(`SELECT current_order_id FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(x);
+      // A leitura não apaga a conta de A (pendente) e traz a conta de B.
+      ok(await pullA());
+      expect(st().tables.find((t) => t.id === mesa.id)!.current_order_id).toBe(y.id);
+      expect(st().orders.some((o) => o.id === x)).toBe(true);
+      // O gerente passa os itens para a conta da mesa.
+      const moved = ok(st().moveRejectedOrderToTableOrder(rej.event.id));
+      expect(moved).toEqual({ targetOrderId: x, items: 1 });
+      expect(st().orders.some((o) => o.id === y.id)).toBe(false);
+      expect(st().syncRejected).toHaveLength(0);
+      await expectSynced('itens passados para a conta da mesa');
+      const after = Number(sql(`SELECT total_amount FROM orders WHERE id = '${x}'`));
+      expect(after).toBeGreaterThan(before);
+      expect(sql(`SELECT sum(quantity) FROM order_items WHERE order_id = '${x}'`)).toBe('3.000');
+      ok(await pullA());
+      expect(st().tables.find((t) => t.id === mesa.id)).toMatchObject({ status: 'OCCUPIED', current_order_id: x });
+      expect(st().orders.find((o) => o.id === x)!.total_amount).toBe(after);
+    });
+
+    it('evento velho de mesa não libera mesa com conta aberta nem a aponta para conta encerrada', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(45);
+      await expectSynced('mesa 45');
+      const x = await bOpens(mesa.id);
+      // Aparelho que não viu a conta manda a mesa livre: aceito, mas a ocupação fica.
+      const stale = await rawB('PATCH', `dining_tables?id=eq.${mesa.id}`, { status: 'FREE', current_order_id: null, label: 'Mesa 45' });
+      expect(stale.status).toBeLessThan(300);
+      expect(sql(`SELECT status || ' ' || current_order_id FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(`OCCUPIED ${x}`);
+      // Outra conta não toma a mesa.
+      const other = crypto.randomUUID();
+      const ins = await rawB('POST', 'orders', {
+        id: other, tenant_id: TENANT, table_id: mesa.id, opened_by_user_id: cashierId(), status: 'OPEN', customer_count: 1, customer_cpf: null,
+        charge_service_fee: true, service_fee_pct: 10, discount_amount: 0, opened_at: new Date().toISOString(), closed_at: null,
+      });
+      expect(ins.body).toMatch(/TCHEFOOD_MESA_OCUPADA/);
+      // Conta zerada encerrada pelo UPDATE da conta: o banco libera a mesa sozinho.
+      const close = await rawB('PATCH', `orders?id=eq.${x}`, { status: 'CANCELED', closed_at: new Date().toISOString() });
+      expect(close.status, close.body).toBeLessThan(300);
+      expect(sql(`SELECT status || ' ' || (current_order_id IS NULL) FROM dining_tables WHERE id = '${mesa.id}'`)).toBe('FREE true');
+      // Reenvio velho que ocupa a mesa com a conta encerrada: a mesa continua livre.
+      const replay = await rawB('PATCH', `dining_tables?id=eq.${mesa.id}`, { status: 'OCCUPIED', current_order_id: x });
+      expect(replay.status).toBeLessThan(300);
+      expect(sql(`SELECT status || ' ' || (current_order_id IS NULL) FROM dining_tables WHERE id = '${mesa.id}'`)).toBe('FREE true');
+      ok(await pullA());
+      expect(st().tables.find((t) => t.id === mesa.id)).toMatchObject({ status: 'FREE', current_order_id: null });
+      expect(st().orders.find((o) => o.id === x)!.status).toBe('CANCELED');
+    });
+
+    it('a rodada de sincronização lê as contas a cada 10 s, com a fila vazia', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(46);
+      await expectSynced('mesa 46');
+      const x = await bOpens(mesa.id);
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_pull_at: new Date().toISOString(), last_orders_pull_at: null } });
+      await syncOnce(fetchA());
+      expect(st().pullStatus.last_error).toBeNull();
+      expect(st().tables.find((t) => t.id === mesa.id)!.current_order_id).toBe(x);
+    });
+  });
 
   it('as migrations rodam de novo sem erro (supabase db push numa base que já tem tudo)', () => {
     const dir = join(ROOT, 'supabase', 'migrations');

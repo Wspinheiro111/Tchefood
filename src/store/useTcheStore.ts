@@ -92,6 +92,8 @@ import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
 import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
 import { comboChildrenOf, comboComponents, comboNeedsDoneness, expandComboItem } from '../lib/combos';
+import { mergeCloudOrders, pendingOrderKeys, type CloudOrders } from '../lib/sync/orderPull';
+import { recordKeys } from '../lib/sync/supabaseSync';
 import { adaptTable, MERGE, mergeCashback, mergeRows, mergeStaffWithoutPins, mergeStaffWithPins, pendingRowKeys, type CloudCashback, type CloudSnapshot } from '../lib/sync/cloudPull';
 import { applyKegCancel, applyKegSale, resolveKegVolume, withRemaining } from '../lib/kegs';
 import { generateTicketToken, isValidTicketToken, normalizeTicketToken } from '../lib/eventTickets';
@@ -309,6 +311,8 @@ export interface PullStatus {
   last_error: string | null;
   /** Pessoas ativas na equipe da nuvem que este aparelho ainda não tem (entram com "Atualizar equipe"). */
   cloud_staff_unknown: number;
+  /** Última leitura das contas e mesas da nuvem (src/lib/sync/orderPull.ts). Ausente nas versões antigas. */
+  last_orders_pull_at?: string | null;
 }
 
 export const EMPTY_PULL_STATUS: PullStatus = { last_pull_at: null, last_error: null, cloud_staff_unknown: 0 };
@@ -502,6 +506,17 @@ interface Actions {
   applyCloudSnapshot: (snapshot: CloudSnapshot) => ActionResult<{ unknownStaff: number }>;
   /** Equipe com PIN vinda do servidor ("Atualizar equipe"). */
   applyCloudStaff: (staff: StaffUser[]) => ActionResult<{ added: number }>;
+  /**
+   * Contas, itens, pagamentos e ocupação das mesas lidos da nuvem (src/lib/sync/orderPull.ts):
+   * a nuvem manda no dinheiro; conta com mudança deste aparelho ainda pendente fica como está.
+   */
+  applyCloudOrders: (snapshot: CloudOrders) => ActionResult<{ replaced: number }>;
+  /**
+   * Conta recusada porque a mesa já tinha outra conta aberta (outro aparelho abriu antes,
+   * TCHEFOOD_MESA_OCUPADA): os itens dela passam para a conta aberta da mesa e a conta
+   * recusada sai deste aparelho (a nuvem nunca a gravou).
+   */
+  moveRejectedOrderToTableOrder: (eventId: UUID) => ActionResult<{ targetOrderId: UUID; items: number }>;
   setPullError: (message: string) => void;
   ackSyncedEvents: (eventIds: UUID[]) => void;
   setSyncError: (message: string | null, blockedEventId: UUID | null) => void;
@@ -3734,9 +3749,91 @@ export const useTcheStore = create<TcheState>()(
               : {}),
             // Desativado em outro aparelho: sai da sessão aqui também.
             currentUserId: currentStillActive ? state.currentUserId : null,
-            pullStatus: { last_pull_at: nowISO(), last_error: null, cloud_staff_unknown: team.unknown },
+            pullStatus: { ...(state.pullStatus ?? EMPTY_PULL_STATUS), last_pull_at: nowISO(), last_error: null, cloud_staff_unknown: team.unknown },
           });
           return { ok: true, data: { unknownStaff: team.unknown } };
+        },
+
+        applyCloudOrders: (snapshot) => {
+          const state = get();
+          if (!state.cloud || snapshot.tenant_id !== state.tenant.id || state.cloud.tenant_id !== state.tenant.id) {
+            return fail('As contas da nuvem não são da loja deste aparelho.');
+          }
+          const pending = pendingOrderKeys(
+            [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)],
+            // A mesma validade da trava de cobrança (activeCharge): trava vencida não segura a conta para sempre.
+            state.pendingCharges.filter((c) => Date.now() - c.started_at < PENDING_CHARGE_TTL_MS).map((c) => c.order_id),
+          );
+          const merged = mergeCloudOrders(state, snapshot, pending);
+          set({
+            orders: merged.orders,
+            orderItems: merged.orderItems,
+            payments: merged.payments,
+            tables: merged.tables,
+            pullStatus: { ...(state.pullStatus ?? EMPTY_PULL_STATUS), last_orders_pull_at: nowISO() },
+          });
+          return { ok: true, data: { replaced: merged.replaced } };
+        },
+
+        moveRejectedOrderToTableOrder: (eventId) => {
+          if (!currentUser()) return fail('Sessão expirada.');
+          const s = get();
+          const rejected = (s.syncRejected ?? []).find((r) => r.event.id === eventId);
+          if (!rejected) return fail('Evento recusado não encontrado.');
+          const ev = rejected.event;
+          if (ev.table !== 'orders' || ev.op !== 'INSERT' || !/TCHEFOOD_MESA_OCUPADA/.test(rejected.message ?? '')) {
+            return fail('Esta recusa não é de mesa ocupada por outra conta.');
+          }
+          const orderId = ev.row_id;
+          const order = s.orders.find((o) => o.id === orderId);
+          if (!order) return fail('A conta recusada não está mais neste aparelho.');
+          if (!EDITABLE_ORDER_STATUSES.includes(order.status)) return fail('A conta recusada já foi encerrada neste aparelho. Chame o suporte.');
+          if (s.pendingCharges.some((c) => c.order_id === orderId)) return fail(CHARGE_LOCK_ERROR);
+          const all = [...s.outbox, ...(s.syncRejected ?? []).map((r) => r.event)];
+          const touching = all.filter((e) => recordKeys(e).includes(`orders:${orderId}`));
+          // Só itens, a própria conta e a mesa: pagamento, desconto, cancelamento com gerente ou
+          // cashback dependem desta conta e não se movem sozinhos para outra.
+          const MOVABLE: ReadonlyArray<SyncEvent['table']> = ['orders', 'order_items', 'dining_tables'];
+          if (touching.some((e) => !MOVABLE.includes(e.table)) || s.payments.some((p) => p.order_id === orderId)) {
+            return fail('Esta conta já tem pagamento, desconto ou cancelamento. Ela não pode ser juntada sozinha: chame o suporte.');
+          }
+          const items = s.orderItems.filter((i) => i.order_id === orderId);
+          if (items.some((i) => i.status === 'CANCELED')) return fail('Esta conta tem item cancelado. Ela não pode ser juntada sozinha: chame o suporte.');
+          // A conta que ficou na mesa: aberta, da mesma mesa, e que a nuvem já tem (não é outra conta
+          // deste aparelho esperando para subir).
+          const targets = s.orders.filter(
+            (o) => o.id !== orderId && o.table_id === order.table_id && EDITABLE_ORDER_STATUSES.includes(o.status)
+              && !all.some((e) => e.table === 'orders' && e.op === 'INSERT' && e.row_id === o.id),
+          );
+          if (targets.length !== 1) return fail('A conta aberta desta mesa ainda não chegou a este aparelho. Toque em Sincronizar agora e tente de novo.');
+          const target = targets[0]!;
+          // Ids novos: os itens nunca chegaram à nuvem (estavam atrás da conta recusada), mas um id
+          // repetido seria ignorado pelo banco e o item ficaria fora da conta.
+          const newId = new Map(items.map((i) => [i.id, uuid()]));
+          const moved: OrderItem[] = items.map((i) => ({
+            ...i,
+            id: newId.get(i.id)!,
+            order_id: target.id,
+            is_paid: false,
+            combo_parent_item_id: i.combo_parent_item_id ? (newId.get(i.combo_parent_item_id) ?? i.combo_parent_item_id) : null,
+          }));
+          const dropped = new Set(touching.map((e) => e.id));
+          const orderItems = [...s.orderItems.filter((i) => i.order_id !== orderId), ...moved];
+          const recalculated = applyOrderTotals(target, orderItems, s.payments);
+          set({
+            orders: s.orders.filter((o) => o.id !== orderId).map((o) => (o.id === target.id ? recalculated : o)),
+            orderItems,
+            tray: s.tray.map((t) => (t.order_id === orderId ? { ...t, order_id: target.id } : t)),
+            // A mesa mostra a conta que ficou; a próxima leitura da nuvem traz a situação dela.
+            tables: s.tables.map((t) =>
+              t.id === order.table_id && t.current_order_id === orderId
+                ? { ...t, current_order_id: target.id, status: t.status === 'FREE' ? 'OCCUPIED' : t.status }
+                : t,
+            ),
+            outbox: [...s.outbox.filter((e) => !dropped.has(e.id)), ...moved.map((i) => itemEvent('INSERT', i, s.kegTapProducts))],
+            syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)),
+          });
+          return { ok: true, data: { targetOrderId: target.id, items: moved.length } };
         },
 
         applyCloudStaff: (cloudStaff) => {

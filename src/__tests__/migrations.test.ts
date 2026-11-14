@@ -21,7 +21,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_pin_equipe_trava.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_pin_equipe_trava.sql', 'schema_contas_aparelhos.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -72,6 +72,10 @@ describe('supabase/migrations', () => {
     for (const fn of ['tchefood_check_pin', 'tchefood_save_staff', 'tchefood_start_store']) {
       const defines = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes(`CREATE OR REPLACE FUNCTION ${fn}(`));
       expect(defines.at(-1), fn).toBe(files[idx('schema_pin_equipe_trava.sql')]);
+    }
+    // As contas descem depois de todas as colunas de orders, order_items e payments que a leitura devolve.
+    for (const db of ['schema_kiosk.sql', 'schema_entrega.sql', 'schema_combos.sql', 'schema_dinheiro_servidor.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_pin_equipe_trava.sql']) {
+      expect(idx('schema_contas_aparelhos.sql'), db).toBeGreaterThan(idx(db));
     }
   });
 
