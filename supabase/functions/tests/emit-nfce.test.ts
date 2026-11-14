@@ -14,6 +14,7 @@ import {
 } from '../emit-nfce/payload.ts';
 import { classifyTransmission, createFocusClient, focusEnvironment, normalizeProviderStatus, type FetchLike } from '../emit-nfce/focus.ts';
 import { emitNfce, type NfceDocumentRow, type NfceRepository } from '../emit-nfce/emit.ts';
+import { parseDanfePayload } from '../../../src/lib/sync/nfceEmission.ts';
 
 const TENANT = '11111111-1111-4111-8111-111111111111';
 const ORDER = '22222222-2222-4222-8222-222222222222';
@@ -82,6 +83,14 @@ describe('payload NFC-e', () => {
     expect(p.valor_total).toBe(95.65);
     expect(p.formas_pagamento.reduce((s, f) => s + cents(f.valor_pagamento), 0)).toBe(9565);
     expect(p.data_emissao).toBe('2026-11-09T03:00:00-03:00');
+  });
+
+  it('o payload transmitido é aceito pelo aparelho para montar o DANFE (contrato servidor ↔ telas)', () => {
+    const p = buildNfcePayload(source(), '2026-11-09T03:00:00-03:00');
+    const d = parseDanfePayload(JSON.parse(JSON.stringify(p)));
+    expect(d).not.toBeNull();
+    expect(d!.valor_total).toBe(p.valor_total);
+    expect(d!.items.map((i) => i.descricao)).toEqual(p.items.map((i) => i.descricao));
   });
 
   it('cartão Stone com prova sai integrado; dinheiro sem grupo de cartão', () => {
@@ -170,14 +179,15 @@ class MemoryRepo implements NfceRepository {
   async getDocument() {
     return this.doc ? { ...this.doc } : null;
   }
-  async insertProcessing(d: { tenant_id: string; order_id: string; reference: string; environment: 'homologacao' | 'producao'; payload_hash: string | null }) {
+  async insertProcessing(d: { tenant_id: string; order_id: string; reference: string; environment: 'homologacao' | 'producao'; payload_hash: string | null; payload: unknown }) {
     if (this.doc) return null;
-    this.doc = { id: 'd1', ...d, status: 'processing', access_key: null, protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, xml_path: null, sefaz_status: null, sefaz_message: null, offline_contingency: false, transmissions: 1 };
+    const { payload, ...rest } = d;
+    this.doc = { id: 'd1', ...rest, payload, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null, status: 'processing', access_key: null, protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, xml_path: null, sefaz_status: null, sefaz_message: null, offline_contingency: false, transmissions: 1 };
     return { ...this.doc };
   }
-  async claimRejected(id: string, expectedTransmissions: number, payloadHash: string) {
+  async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown = {}) {
     if (!this.doc || this.doc.id !== id || this.doc.status !== 'rejected' || this.doc.transmissions !== expectedTransmissions) return null;
-    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1 };
+    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, payload, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
     return { ...this.doc };
   }
   async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
@@ -212,6 +222,68 @@ describe('emitNfce', () => {
     const second = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
     expect(second.body.authorized).toBe(true);
     expect(calls).toHaveLength(1);
+  });
+
+  it('consulta (mode consult) sem documento não transmite nada e responde none', async () => {
+    const repo = new MemoryRepo(source());
+    const { calls, focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const deps = { repo, environment: 'homologacao' as const, focus, sha256Hex };
+    const r = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r.httpStatus).toBe(404);
+    expect(r.body).toMatchObject({ status: 'none', authorized: false, access_key: null, payload: null });
+    expect(calls).toHaveLength(0);
+    expect(repo.doc).toBeNull();
+    // Depois de emitida, a consulta devolve o documento sem nova transmissão.
+    await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
+    const again = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(again.body).toMatchObject({ status: 'authorized', access_key: KEY });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('consulta de rejeitada não reenvia', async () => {
+    const repo = new MemoryRepo(source());
+    const { calls, focus } = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', mensagem_sefaz: 'NCM' } }]);
+    const deps = { repo, environment: 'homologacao' as const, focus, sha256Hex };
+    await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
+    const r = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r.body.status).toBe('rejected');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('autorizada sem QR Code: a chamada seguinte só consulta (GET) e completa o QR, sem retransmitir', async () => {
+    const repo = new MemoryRepo(source());
+    const { calls, focus } = fakeFocus([{ status: 201, body: { ...AUTHORIZED, qrcode_url: null } }, { status: 200, body: AUTHORIZED }]);
+    const deps = { repo, environment: 'homologacao' as const, focus, sha256Hex };
+    const first = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
+    expect(first.body).toMatchObject({ status: 'authorized', qrcode_url: null });
+    const second = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(second.body).toMatchObject({ status: 'authorized', access_key: KEY, qrcode_url: QR });
+    expect(calls.map((c) => c.method)).toEqual(['POST', 'GET']);
+    expect(repo.doc!.payload).toEqual(first.body.payload);
+  });
+
+  it('devolve a data de emissão transmitida (a tela imprime no DANFE)', async () => {
+    const repo = new MemoryRepo(source());
+    const { focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const now = () => new Date('2026-11-14T13:00:00Z');
+    const r = await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex, now }, { tenantId: TENANT, orderId: ORDER });
+    expect(r.body.issued_at).toBe(fiscalIssuedAt(now()));
+    expect(r.body.issued_at).toMatch(/-03:00$/);
+    const missing = await emitNfce({ repo: new MemoryRepo(source({ tenant: { ...source().tenant, focus_nfe_token: null } })), environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(missing.body).toMatchObject({ status: 'invalid', issued_at: null, payload: null });
+  });
+
+  it('devolve o payload transmitido só para nota com chave (o DANFE da tela sai dele)', async () => {
+    const repo = new MemoryRepo(source());
+    const { focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const r = await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(r.body.payload).toEqual(repo.doc!.payload);
+    expect((r.body.payload as { items: unknown[] }).items.length).toBeGreaterThan(0);
+    const rej = new MemoryRepo(source());
+    const f2 = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', mensagem_sefaz: 'NCM' } }]);
+    const r2 = await emitNfce({ repo: rej, environment: 'homologacao', focus: f2.focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(r2.body.status).toBe('rejected');
+    expect(r2.body.payload).toBeNull();
   });
 
   it('falha de rede NÃO vira contingência nem sucesso; a próxima chamada só consulta', async () => {

@@ -1,14 +1,14 @@
 import { useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { AlertTriangle, BarChart3, Bike, CreditCard, Gauge, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
-import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
+import { isManagerRole, isRealFiscalStore, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { ReportHeader } from '../components/Brand';
-import { formatBRL } from '../lib/money';
+import { formatBRL, toCents } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
 import { AUDIT_LABEL, declinedInShift, formatShiftStart, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
 import { useShiftPeriod } from '../lib/useShiftStart';
 import { Badge, Btn, toast } from '../components/ui';
-import { NfceViewer } from './NfceViewer';
+import { NfceViewer, nfceCloudLabel } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
 import { CrmPanel } from './CrmPanel';
 import { PurchaseImport } from './PurchaseImport';
@@ -301,7 +301,12 @@ function AuditCenter() {
 function NfceList() {
   const orders = useTcheStore((s) => s.orders);
   const tables = useTcheStore((s) => s.tables);
-  const closed = orders.filter((o) => o.status === 'CLOSED' && o.nfce_key).sort((a, b) => (b.closed_at ?? '').localeCompare(a.closed_at ?? ''));
+  const cloud = useTcheStore(isRealFiscalStore);
+  const records = useTcheStore((s) => s.nfceCloud);
+  // Nuvem: toda conta fechada com valor tem NFC-e real (mesmo pendente, sem chave ainda).
+  const closed = orders
+    .filter((o) => o.status === 'CLOSED' && (o.nfce_key || (cloud && toCents(o.total_amount) > 0 && o.nfce_status !== 'DISPENSADA')))
+    .sort((a, b) => (b.closed_at ?? '').localeCompare(a.closed_at ?? ''));
   const [open, setOpen] = useState<string | null>(null);
   return (
     <div className="space-y-2">
@@ -309,9 +314,9 @@ function NfceList() {
       {closed.map((o) => (
         <button key={o.id} onClick={() => setOpen(o.id)} className="flex w-full items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-surface p-4 text-left">
           <div className="min-w-0">
-            <div className="font-bold">NFC-e nº {Number(o.nfce_key!.slice(25, 34))} · {tables.find((t) => t.id === o.table_id)?.label}</div>
-            <div className="truncate font-mono text-xs text-slate-500">{o.nfce_key}</div>
-            <div className="text-xs text-slate-500">{o.closed_at ? new Date(o.closed_at).toLocaleString('pt-BR') : ''} · {o.nfce_status}</div>
+            <div className="font-bold">{o.nfce_key ? `NFC-e nº ${(records ?? {})[o.id]?.number ?? Number(o.nfce_key.slice(25, 34))}` : 'NFC-e'} · {tables.find((t) => t.id === o.table_id)?.label}</div>
+            {o.nfce_key && <div className="truncate font-mono text-xs text-slate-500">{o.nfce_key}</div>}
+            <div className="text-xs text-slate-500">{o.closed_at ? new Date(o.closed_at).toLocaleString('pt-BR') : ''} · {cloud ? nfceCloudLabel(o, (records ?? {})[o.id], false) : o.nfce_status}</div>
           </div>
           <div className="text-right font-black tabular-nums text-verde">{formatBRL(o.total_amount)}</div>
         </button>

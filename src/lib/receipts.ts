@@ -3,9 +3,8 @@
  * Usados tanto pelo simulador visual quanto pelos drivers reais
  * (PlugPag printText / Stone printer), por isso são texto puro.
  */
-import type { DiningTable, Order, OrderItem, Payment, Product, StaffUser, Tenant } from '../types';
+import type { DiningTable, NfceDanfePayload, NfceIssuer, Order, OrderItem, Payment, Product, StaffUser, Tenant } from '../types';
 import { formatBRL, formatQty } from './money';
-import type { NfceDocument } from './nfce';
 import { CONSULTA_URL_RS, formatAccessKey } from './nfce';
 
 export const COLS = 32;
@@ -60,7 +59,7 @@ function formatCnpj(c: string): string {
   return c.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5');
 }
 
-function header(tenant: Tenant): string[] {
+function header(tenant: Pick<Tenant, 'name' | 'legal_name' | 'cnpj' | 'city' | 'state'>): string[] {
   return [center(tenant.name.toUpperCase()), ...wrap(tenant.legal_name).map(center), center(`CNPJ ${formatCnpj(tenant.cnpj)}`), center(`${tenant.city}/${tenant.state}`)];
 }
 
@@ -148,13 +147,36 @@ function cardReceiptRaw(params: { tenant: Tenant; payment: Payment; tableLabel: 
   ];
 }
 
+/** O que o DANFE imprime: a nota simulada (NfceDocument) ou a real (serverNfceDocument). */
+export interface DanfeDoc {
+  access_key: string;
+  protocol: string;
+  issued_at: string;
+  tributos_federais: number;
+  tributos_estaduais: number;
+  payload: NfceDanfePayload & { numero: number; serie: number };
+  /** Nota real: emitente congelado (ver NfceCloudRecord.issuer). Sem ele, usa o cadastro (demonstração). */
+  issuer?: NfceIssuer;
+}
+
 /** DANFE NFC-e simplificado (layout 58mm). O QR Code é desenhado à parte. */
-export function danfeLines(params: { tenant: Tenant; doc: NfceDocument }): { top: string[]; bottom: string[] } {
+export function danfeLines(params: {
+  tenant: Tenant;
+  doc: DanfeDoc;
+  /** Ambiente da nota; o aviso de homologação só sai em homologação. Padrão: homologação. */
+  environment?: 'homologacao' | 'producao';
+  /** Nota em contingência offline, ainda sem autorização da SEFAZ. */
+  contingency?: boolean;
+  /** false quando os tributos aproximados não foram enviados à SEFAZ nesta nota. */
+  showTributos?: boolean;
+}): { top: string[]; bottom: string[] } {
   const { doc } = params;
+  const homologacao = (params.environment ?? 'homologacao') === 'homologacao';
   const pl = doc.payload;
+  const em = doc.issuer ?? params.tenant;
   const top: string[] = [
-    ...header(params.tenant),
-    center(`IE ${params.tenant.state_registration ?? 'ISENTO'}`),
+    ...header(em),
+    center(`IE ${em.state_registration ?? 'ISENTO'}`),
     LINE,
     ...wrap('DANFE NFC-e - Documento Auxiliar da Nota Fiscal de Consumidor Eletronica').map(center),
     LINE,
@@ -175,16 +197,20 @@ export function danfeLines(params: { tenant: Tenant; doc: NfceDocument }): { top
   top.push(leftRight('VALOR A PAGAR R$', pl.valor_total.toFixed(2)), LINE, leftRight('FORMA PAGAMENTO', 'VALOR PAGO R$'));
   const formaNome: Record<string, string> = { '01': 'Dinheiro', '03': 'Cartao de Credito', '04': 'Cartao de Debito', '10': 'Vale Alimentacao', '17': 'PIX' };
   for (const f of pl.formas_pagamento) top.push(leftRight(formaNome[f.forma_pagamento] ?? f.forma_pagamento, f.valor_pagamento.toFixed(2)));
+  if (params.showTributos !== false) {
+    top.push(
+      LINE,
+      ...wrap(
+        `Tributos Totais Incidentes (Lei Federal 12.741/2012): Federal R$ ${doc.tributos_federais.toFixed(2)} Estadual R$ ${doc.tributos_estaduais.toFixed(2)} Fonte: IBPT`,
+      ),
+    );
+  }
   top.push(
-    LINE,
-    ...wrap(
-      `Tributos Totais Incidentes (Lei Federal 12.741/2012): Federal R$ ${doc.tributos_federais.toFixed(2)} Estadual R$ ${doc.tributos_estaduais.toFixed(2)} Fonte: IBPT`,
-    ),
     LINE,
     center(`NFC-e n ${pl.numero.toString().padStart(9, '0')} Serie ${pl.serie.toString().padStart(3, '0')}`),
     center(fmtDate(doc.issued_at)),
-    center('EMITIDA EM AMBIENTE DE HOMOLOGACAO'),
-    center('SEM VALOR FISCAL'),
+    ...(homologacao ? [center('EMITIDA EM AMBIENTE DE HOMOLOGACAO'), center('SEM VALOR FISCAL')] : []),
+    ...(params.contingency ? [center('EMITIDA EM CONTINGENCIA'), center('Pendente de autorizacao')] : []),
     LINE,
     center('Consulte pela Chave de Acesso em'),
     center(CONSULTA_URL_RS),
@@ -192,10 +218,8 @@ export function danfeLines(params: { tenant: Tenant; doc: NfceDocument }): { top
     LINE,
     center(pl.cpf_destinatario ? `CONSUMIDOR CPF ${pl.cpf_destinatario.replace(/^(\d{3})(\d{3})(\d{3})(\d{2})$/, '$1.$2.$3-$4')}` : 'CONSUMIDOR NAO IDENTIFICADO'),
     LINE,
-    center('Protocolo de Autorizacao'),
-    center(doc.protocol),
-    center(fmtDate(doc.issued_at)),
   );
+  if (!params.contingency && doc.protocol) top.push(center('Protocolo de Autorizacao'), center(doc.protocol), center(fmtDate(doc.issued_at)));
   const bottom = ['', center('Tche Food SmartPOS - tpIntegra 1'), '', ''];
   return { top: top.map(ascii), bottom };
 }

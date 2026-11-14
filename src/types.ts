@@ -752,6 +752,82 @@ export interface TrayItem {
   weight?: { gross_grams: number; tare_grams: number; source: WeightSource } | null;
 }
 
+/** Situação do documento NFC-e no servidor (nfce_documents.status, emit-nfce). */
+export type NfceCloudStatus = 'processing' | 'authorized' | 'rejected' | 'contingency' | 'cancelled';
+
+/** Parte do payload transmitido que o DANFE da bobina imprime (conferida ao chegar). */
+export interface NfceDanfePayload {
+  items: Array<{
+    numero_item: number;
+    codigo_produto: string;
+    descricao: string;
+    unidade_comercial: string;
+    quantidade_comercial: number;
+    valor_unitario_comercial: number;
+    valor_bruto: number;
+  }>;
+  valor_produtos: number;
+  valor_desconto: number;
+  valor_outras_despesas: number;
+  valor_total: number;
+  formas_pagamento: Array<{ forma_pagamento: string; valor_pagamento: number }>;
+  cpf_destinatario?: string;
+  /** CNPJ do emitente transmitido (o mesmo da chave). */
+  cnpj_emitente?: string;
+}
+
+/** Resultado da última chamada à emit-nfce que não trouxe documento. */
+/** none = consulta sem documento no servidor (nada foi transmitido). */
+export type NfceCallProblem = 'invalid' | 'not_found' | 'conflict' | 'none' | 'error' | 'network';
+
+/**
+ * NFC-e real de uma comanda, como a Edge Function emit-nfce respondeu. Tudo o que é
+ * fiscal (chave, protocolo, número, QR Code) vem do servidor; o aparelho só guarda.
+ */
+export interface NfceIssuer {
+  name: string;
+  legal_name: string;
+  /** Só letras e dígitos (14). */
+  cnpj: string;
+  state_registration: string | null;
+  city: string;
+  state: string;
+}
+
+export interface NfceCloudRecord {
+  order_id: UUID;
+  /** Status do documento no servidor; null enquanto não houve documento. */
+  status: NfceCloudStatus | null;
+  environment: 'homologacao' | 'producao' | null;
+  access_key: string | null;
+  protocol: string | null;
+  number: number | null;
+  series: string | null;
+  /** QR Code assinado da SEFAZ para esta chave (já conferido). */
+  qrcode_url: string | null;
+  /** Caminho do DANFE na Focus (relativo ao ambiente). */
+  danfe_path: string | null;
+  /** data_emissao enviada à SEFAZ. */
+  issued_at: ISODateTime | null;
+  /** Itens, valores e pagamentos como foram transmitidos (o DANFE sai daqui). */
+  payload: NfceDanfePayload | null;
+  /**
+   * Emitente (nome, razão social, IE, cidade) como estava no cadastro quando o documento
+   * apareceu pela primeira vez. O cabeçalho do DANFE sai daqui, não do cadastro atual.
+   */
+  issuer?: NfceIssuer | null;
+  /** Consultas feitas depois da autorização para buscar QR/data/payload que faltavam. */
+  print_attempts?: number;
+  message: string | null;
+  /** null = a última chamada trouxe o documento; senão, o que deu errado nela. */
+  problem: NfceCallProblem | null;
+  /** Chamadas feitas pelo aparelho (para o intervalo entre consultas). */
+  attempts: number;
+  /** Próxima chamada automática; null = só pelo botão. */
+  next_attempt_at: ISODateTime | null;
+  updated_at: ISODateTime;
+}
+
 /** Evento da fila offline-first, pronto para ser enviado ao Supabase. */
 export interface SyncEvent {
   id: UUID;
