@@ -24,6 +24,10 @@ ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS cancellation_request JSONB;
 -- até lá o pedido não pode virar venda nem NFC-e. Só vai de TRUE para FALSE, uma vez (ver tchefood_delivery_save_order).
 ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS detail_pending BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_delivery_orders_detail_pending ON delivery_orders (channel, placed_at) WHERE detail_pending;
+-- Próxima tentativa de buscar o detalhe (rodízio: a busca que falhou adia o pedido, para que pedidos cujo detalhe
+-- nunca vem não ocupem o lote todo). NULL = nunca adiado (vem primeiro). Só tchefood_delivery_defer_detail grava;
+-- tchefood_delivery_save_order não mexe nela nem a versão muda.
+ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS detail_retry_at TIMESTAMPTZ;
 ALTER TABLE delivery_orders DROP CONSTRAINT IF EXISTS delivery_orders_version_positive;
 ALTER TABLE delivery_orders ADD CONSTRAINT delivery_orders_version_positive CHECK (version >= 1);
 -- merchantId do iFood cadastrado à mão: só letras, números e hífen (o polling ignora, com aviso no log, um id
@@ -99,15 +103,28 @@ LANGUAGE sql STABLE SET search_path = public AS $$
              LIMIT LEAST(GREATEST(COALESCE(p_limit, 200), 1), 500)) q
 $$;
 
--- Pedidos ainda sem o detalhe do app, mais antigos primeiro (o servidor tenta buscar o detalhe de novo).
+-- Pedidos ainda sem o detalhe do app cuja próxima tentativa já chegou (o servidor tenta buscar o detalhe de novo):
+-- primeiro os nunca adiados, depois os de tentativa mais antiga; empate pelo pedido mais antigo.
 CREATE OR REPLACE FUNCTION tchefood_delivery_list_detail_pending(p_channel delivery_channel, p_limit INTEGER)
 RETURNS JSONB
 LANGUAGE sql STABLE SET search_path = public AS $$
-    SELECT COALESCE(jsonb_agg(tchefood_delivery_record_json(q) ORDER BY q.placed_at, q.external_id), '[]'::jsonb)
+    SELECT COALESCE(jsonb_agg(tchefood_delivery_record_json(q)
+                              ORDER BY q.detail_retry_at NULLS FIRST, q.placed_at, q.external_id), '[]'::jsonb)
       FROM (SELECT * FROM delivery_orders o
              WHERE o.channel = p_channel AND o.detail_pending
-             ORDER BY o.placed_at, o.external_id
+               AND COALESCE(o.detail_retry_at, '-infinity'::timestamptz) <= NOW()
+             ORDER BY o.detail_retry_at NULLS FIRST, o.placed_at, o.external_id
              LIMIT LEAST(GREATEST(COALESCE(p_limit, 20), 1), 100)) q
+$$;
+
+-- Adia a próxima busca do detalhe de um pedido ainda sem detalhe para daqui a p_seconds segundos (1 s a 1 dia).
+-- Só detail_retry_at muda: a versão fica, para não brigar com as gravações do pedido.
+CREATE OR REPLACE FUNCTION tchefood_delivery_defer_detail(p_channel delivery_channel, p_external_id VARCHAR, p_seconds INTEGER)
+RETURNS VOID
+LANGUAGE sql SET search_path = public AS $$
+    UPDATE delivery_orders
+       SET detail_retry_at = NOW() + make_interval(secs => LEAST(GREATEST(COALESCE(p_seconds, 300), 1), 86400))
+     WHERE channel = p_channel AND external_id = p_external_id AND detail_pending
 $$;
 
 CREATE OR REPLACE FUNCTION tchefood_delivery_has_event(p_channel delivery_channel, p_external_event_id VARCHAR)
@@ -446,6 +463,7 @@ BEGIN
         'tchefood_delivery_get_order(delivery_channel, VARCHAR)',
         'tchefood_delivery_list_orders(delivery_channel, INTEGER)',
         'tchefood_delivery_list_detail_pending(delivery_channel, INTEGER)',
+        'tchefood_delivery_defer_detail(delivery_channel, VARCHAR, INTEGER)',
         'tchefood_delivery_has_event(delivery_channel, VARCHAR)',
         'tchefood_delivery_save_order(delivery_channel, INTEGER, JSONB)',
         'tchefood_delivery_record_event(JSONB)',

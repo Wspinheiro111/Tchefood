@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  DETAIL_OTHER_STORE_RETRY_SECONDS,
   DETAIL_RECOVERED_REASON,
+  DETAIL_RECOVERY_BATCH,
+  DETAIL_RECOVERY_BUDGET_MS,
+  DETAIL_RETRY_DELAY_SECONDS,
   DeliveryConcurrencyError,
   DeliveryInbox,
   DeliverySentNotSavedError,
@@ -33,7 +37,7 @@ function setup(options: { onNewOrder?: (record: DeliveryOrderRecord) => void | P
     baseUrl: sandbox.baseUrl,
     fetchImpl: sandbox.fetch,
   });
-  const repository = new InMemoryDeliveryRepository();
+  const repository = new InMemoryDeliveryRepository({ now: options.now });
   const inbox = new DeliveryInbox({ adapters: [api], repository, onNewOrder: options.onNewOrder, now: options.now });
   return { sandbox, api, repository, inbox };
 }
@@ -954,7 +958,8 @@ describe("caixa de entrada de delivery", () => {
     const onNewOrder = vi.fn((record: DeliveryOrderRecord) => {
       announced.push(structuredClone(record));
     });
-    const { sandbox, api, repository, inbox } = setup({ onNewOrder });
+    let offset = 0;
+    const { sandbox, api, repository, inbox } = setup({ onNewOrder, now: () => new Date(Date.now() + offset) });
     sandbox.autoAcceptCancellation = false;
     const id = sandbox.placeOrder({ items: ITEMS, isTest: true });
     const realGetOrder = api.getOrder.bind(api);
@@ -977,6 +982,8 @@ describe("caixa de entrada de delivery", () => {
 
     // O pedido anda antes da recuperação: confirmado e com pedido de cancelamento da loja esperando o app.
     await inbox.performAction("ifood", id, "confirm");
+    // A recuperação que falhou adiou o pedido: a próxima tentativa só depois do espaçamento.
+    offset += DETAIL_RETRY_DELAY_SECONDS * 1000;
     await inbox.runCycle();
     // Ciclo acima: CFM aplicado e a recuperação (chamada 12) já trouxe o detalhe.
     record = (await repository.getOrder("ifood", id))!;
@@ -1010,7 +1017,8 @@ describe("caixa de entrada de delivery", () => {
   });
 
   it("recuperação preserva cancelamento, negociação, pendências e status já processados", async () => {
-    const { sandbox, api, repository, inbox } = setup();
+    let offset = 0;
+    const { sandbox, api, repository, inbox } = setup({ now: () => new Date(Date.now() + offset) });
     sandbox.autoAcceptCancellation = false;
     const id = sandbox.placeOrder({ items: ITEMS });
     const realGetOrder = api.getOrder.bind(api);
@@ -1032,6 +1040,7 @@ describe("caixa de entrada de delivery", () => {
     expect(before.dispute).not.toBeNull();
 
     broken = false;
+    offset += DETAIL_RETRY_DELAY_SECONDS * 1000;
     await inbox.runCycle();
     const after = (await repository.getOrder("ifood", id))!;
     expect(after.detailPending).toBe(false);
@@ -1048,7 +1057,8 @@ describe("caixa de entrada de delivery", () => {
   });
 
   it("recuperação respeita a versão: gravação concorrente no meio não é sobrescrita", async () => {
-    const { sandbox, api, repository, inbox } = setup();
+    let offset = 0;
+    const { sandbox, api, repository, inbox } = setup({ now: () => new Date(Date.now() + offset) });
     const id = sandbox.placeOrder({ items: ITEMS });
     const realGetOrder = api.getOrder.bind(api);
     let broken = true;
@@ -1058,6 +1068,7 @@ describe("caixa de entrada de delivery", () => {
     });
     await inbox.runCycle();
     broken = false;
+    offset += DETAIL_RETRY_DELAY_SECONDS * 1000;
     const save = repository.saveOrder.bind(repository);
     let raced = false;
     vi.spyOn(repository, "saveOrder").mockImplementation(async (record) => {
@@ -1082,23 +1093,29 @@ describe("caixa de entrada de delivery", () => {
   });
 
   it("falha na recuperação (app ou banco) deixa o pedido mínimo e não atrapalha o ack dos outros eventos", async () => {
-    const { sandbox, api, repository, inbox } = setup();
+    let offset = 0;
+    const { sandbox, api, repository, inbox } = setup({ now: () => new Date(Date.now() + offset) });
     const minimal = sandbox.placeOrder({ items: ITEMS });
     const realGetOrder = api.getOrder.bind(api);
     let failure: DeliveryMarketplaceError | null = new DeliveryMarketplaceError("ifood", "invalid_response", "Valor inválido no iFood: total.subTotal.");
-    vi.spyOn(api, "getOrder").mockImplementation(async (orderId) => {
+    const getOrder = vi.spyOn(api, "getOrder").mockImplementation(async (orderId) => {
       if (orderId === minimal && failure) throw failure;
       return realGetOrder(orderId);
     });
     await inbox.runCycle();
     for (const code of ["unavailable", "not_found", "rate_limited"] as const) {
       failure = new DeliveryMarketplaceError("ifood", code, `falha ${code}`);
+      // Cada falha adia o pedido: passado o espaçamento ele volta e falha de novo.
+      offset += DETAIL_RETRY_DELAY_SECONDS * 1000;
+      const callsBefore = getOrder.mock.calls.filter(([orderId]) => orderId === minimal).length;
       const other = sandbox.placeOrder({ items: ITEMS });
       const [report] = await inbox.runCycle();
       expect(report).toMatchObject({ acknowledged: 1, deferred: 0, newOrders: [other], error: null });
+      expect(getOrder.mock.calls.filter(([orderId]) => orderId === minimal).length).toBe(callsBefore + 1);
       expect((await repository.getOrder("ifood", minimal))!.detailPending).toBe(true);
     }
     // Banco fora do ar na lista de pendentes: o ciclo segue.
+    offset += DETAIL_RETRY_DELAY_SECONDS * 1000;
     vi.spyOn(repository, "listDetailPending").mockRejectedValueOnce(new Error("banco fora do ar"));
     const other = sandbox.placeOrder({ items: ITEMS });
     const [report] = await inbox.runCycle();
@@ -1173,5 +1190,143 @@ describe("caixa de entrada de delivery", () => {
     expect(record.reviewReasons.join(" ")).toMatch(/negociação/);
     const answered = await inbox.respondToDispute("ifood", id, { kind: "accept" }, disputeId);
     expect(answered.dispute?.response?.state).toBe("sent");
+  });
+});
+
+describe("recuperação do detalhe: rodízio, espaçamento e orçamento de tempo", () => {
+  const START = Date.parse("2026-11-14T12:00:00.000Z");
+
+  async function pendingSetup(count: number, getOrder: (id: string) => Promise<DeliveryOrder>) {
+    let clock = START;
+    const now = () => new Date(clock);
+    const repository = new InMemoryDeliveryRepository({ now });
+    const template = await baseOrder();
+    const ids: string[] = [];
+    for (let i = 0; i < count; i += 1) {
+      const id = `p${String(i).padStart(2, "0")}`;
+      ids.push(id);
+      const createdAt = new Date(START - (count - i) * 60_000).toISOString();
+      await repository.saveOrder({
+        order: { ...template, externalId: id, createdAt, items: [], payments: [] },
+        cancellationPending: false,
+        cancellationRequest: null,
+        detailPending: true,
+        needsReview: true,
+        reviewReasons: ["Detalhe do pedido ilegível no iFood."],
+        newOrderNotified: true,
+        lastCancellationEventAt: null,
+        lastEventAt: createdAt,
+        updatedAt: createdAt,
+        dispute: null,
+        version: 0,
+      });
+    }
+    const asked: string[] = [];
+    const adapter = {
+      channel: "ifood" as const,
+      pollEvents: async () => [],
+      acknowledge: async () => undefined,
+      getOrder: async (id: string) => {
+        asked.push(id);
+        return getOrder(id);
+      },
+      performAction: async () => undefined,
+      listCancellationReasons: async () => [],
+      requestCancellation: async () => undefined,
+      respondToDispute: async () => undefined,
+    };
+    const inbox = new DeliveryInbox({ adapters: [adapter], repository, now });
+    return { repository, inbox, ids, asked, template, advance: (ms: number) => (clock += ms) };
+  }
+
+  it(`${DETAIL_RECOVERY_BATCH} pedidos cujo detalhe nunca vem não travam um pedido mínimo novo; voltam depois do espaçamento`, async () => {
+    let ctx!: Awaited<ReturnType<typeof pendingSetup>>;
+    ctx = await pendingSetup(DETAIL_RECOVERY_BATCH + 1, async (id) => {
+      if (id === ctx.ids[DETAIL_RECOVERY_BATCH]) return { ...ctx.template, externalId: id };
+      throw new DeliveryMarketplaceError("ifood", "not_found", "Pedido não encontrado no iFood.", 404);
+    });
+    const newest = ctx.ids[DETAIL_RECOVERY_BATCH]!;
+    await ctx.inbox.runCycle();
+    expect(ctx.asked).toEqual(ctx.ids.slice(0, DETAIL_RECOVERY_BATCH));
+    ctx.asked.length = 0;
+    ctx.advance(30_000);
+    await ctx.inbox.runCycle();
+    // Os antigos foram adiados: o novo é buscado no ciclo seguinte e recuperado.
+    expect(ctx.asked).toEqual([newest]);
+    expect((await ctx.repository.getOrder("ifood", newest))!.detailPending).toBe(false);
+    ctx.asked.length = 0;
+    ctx.advance(30_000);
+    await ctx.inbox.runCycle();
+    expect(ctx.asked).toEqual([]);
+    // Passado o espaçamento, os antigos voltam a ser tentados.
+    ctx.advance(DETAIL_RETRY_DELAY_SECONDS * 1000);
+    await ctx.inbox.runCycle();
+    expect(ctx.asked).toEqual(ctx.ids.slice(0, DETAIL_RECOVERY_BATCH));
+  });
+
+  it("detalhe de outra loja: marca para conferência uma vez e só tenta de novo depois de 1 h", async () => {
+    let ctx!: Awaited<ReturnType<typeof pendingSetup>>;
+    ctx = await pendingSetup(1, async (id) => ({ ...ctx.template, externalId: id, merchantExternalId: "outra-loja" }));
+    await ctx.inbox.runCycle();
+    const record = (await ctx.repository.getOrder("ifood", ctx.ids[0]!))!;
+    expect(record.detailPending).toBe(true);
+    expect(record.reviewReasons.join(" ")).toMatch(/outra loja/);
+    ctx.advance(DETAIL_RETRY_DELAY_SECONDS * 1000);
+    await ctx.inbox.runCycle();
+    expect(ctx.asked).toHaveLength(1);
+    ctx.advance(DETAIL_OTHER_STORE_RETRY_SECONDS * 1000);
+    await ctx.inbox.runCycle();
+    expect(ctx.asked).toHaveLength(2);
+    expect((await ctx.repository.getOrder("ifood", ctx.ids[0]!))!.version).toBe(record.version);
+  });
+
+  it("detalhe lento: o laço para no orçamento de tempo e os que sobraram vêm no próximo ciclo", async () => {
+    let ctx!: Awaited<ReturnType<typeof pendingSetup>>;
+    ctx = await pendingSetup(DETAIL_RECOVERY_BATCH, async (id) => {
+      ctx.advance(4_000);
+      return { ...ctx.template, externalId: id };
+    });
+    await ctx.inbox.runCycle();
+    const first = Math.ceil(DETAIL_RECOVERY_BUDGET_MS / 4_000);
+    expect(ctx.asked).toEqual(ctx.ids.slice(0, first));
+    ctx.asked.length = 0;
+    ctx.advance(30_000);
+    await ctx.inbox.runCycle();
+    expect(ctx.asked).toEqual(ctx.ids.slice(first, 2 * first));
+  });
+
+  it("app fora do ar ou limite de uso: para no primeiro erro e adia só esse pedido", async () => {
+    for (const code of ["unavailable", "rate_limited"] as const) {
+      let ctx!: Awaited<ReturnType<typeof pendingSetup>>;
+      let fail = true;
+      ctx = await pendingSetup(3, async (id) => {
+        if (fail) {
+          fail = false;
+          throw new DeliveryMarketplaceError("ifood", code, `falha ${code}`);
+        }
+        return { ...ctx.template, externalId: id };
+      });
+      await ctx.inbox.runCycle();
+      expect(ctx.asked).toEqual([ctx.ids[0]]);
+      ctx.asked.length = 0;
+      ctx.advance(30_000);
+      await ctx.inbox.runCycle();
+      expect(ctx.asked).toEqual([ctx.ids[1], ctx.ids[2]]);
+      expect((await ctx.repository.getOrder("ifood", ctx.ids[0]!))!.detailPending).toBe(true);
+      ctx.advance(DETAIL_RETRY_DELAY_SECONDS * 1000);
+      await ctx.inbox.runCycle();
+      expect((await ctx.repository.getOrder("ifood", ctx.ids[0]!))!.detailPending).toBe(false);
+    }
+  });
+
+  it("falha ao adiar (banco) não derruba o ciclo", async () => {
+    let ctx!: Awaited<ReturnType<typeof pendingSetup>>;
+    ctx = await pendingSetup(2, async () => {
+      throw new DeliveryMarketplaceError("ifood", "not_found", "404");
+    });
+    vi.spyOn(ctx.repository, "deferDetail").mockRejectedValue(new Error("banco fora do ar"));
+    const [report] = await ctx.inbox.runCycle();
+    expect(report.error).toBeNull();
+    expect(ctx.asked).toEqual(ctx.ids);
   });
 });

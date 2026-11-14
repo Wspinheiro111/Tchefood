@@ -26,6 +26,18 @@ describe("gravação no Supabase", () => {
     expect(JSON.parse(calls[0]!.body!)).toEqual({ p_channel: "ifood", p_external_event_id: "e1" });
   });
 
+  it("adiar o detalhe chama tchefood_delivery_defer_detail com canal, pedido e segundos", async () => {
+    const calls: Array<{ url: string; body?: string }> = [];
+    const fetchImpl: RestFetch = async (url, init) => {
+      calls.push({ url, body: init.body });
+      return { ok: true, status: 204, text: async () => "" };
+    };
+    const repository = new SupabaseDeliveryRepository({ url: "https://x.supabase.co", serviceRoleKey: "s", channel: "ifood", fetchImpl });
+    await repository.deferDetail("ifood", "o1", 300);
+    expect(calls[0]!.url).toBe("https://x.supabase.co/rest/v1/rpc/tchefood_delivery_defer_detail");
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ p_channel: "ifood", p_external_id: "o1", p_seconds: 300 });
+  });
+
   it("lê a reserva do pedido de cancelamento gravada no banco", async () => {
     let row: Record<string, unknown> = {};
     const fetchImpl: RestFetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(row) });

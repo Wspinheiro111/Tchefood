@@ -187,10 +187,18 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
   primeiro evento do pedido e, no pedido mínimo abaixo, até recuperá-lo).
 - Pedido mínimo: quando o detalhe do iFood vem ilegível, ou é recusado (403/404) em 10 ciclos seguidos, o pedido entra
   sem itens nem valores, para conferência, com `detailPending = true` (coluna `delivery_orders.detail_pending`). A cada
-  ciclo, depois do ack, o servidor busca de novo o detalhe de até 20 desses pedidos (mais antigos primeiro); vindo
+  ciclo, depois do ack, o servidor busca de novo o detalhe de até 20 desses pedidos; vindo
   legível, grava itens, valores, pagamentos, cliente, endereço e `isTest` sem mexer no status nem no que os eventos já
   fizeram, troca para `detailPending = false` (uma vez só; o banco só aceita trocar o pedido e o total nessa
   passagem, na mesma loja do app) e deixa a pendência "Detalhe do pedido recuperado do app: confira itens e valores.".
+  Rodízio: busca que falha (erro do app, detalhe de outro pedido, conflito de gravação) adia aquele pedido 5 min
+  (`delivery_orders.detail_retry_at`, gravada só por `tchefood_delivery_defer_detail`, sem mudar a versão); detalhe
+  de outra loja do app marca a pendência para conferência uma vez e adia 1 h. A lista traz primeiro os pedidos nunca
+  adiados, depois os de prazo mais antigo, e só os de prazo vencido: pedidos cujo detalhe nunca vem (404/403/ilegível
+  para sempre) não tomam o lugar de um pedido mínimo novo. O laço tem orçamento de 10 s por ciclo (conferido antes de
+  cada busca; uma busca começada vai até o timeout de 15 s do iFood) e para no primeiro erro temporário (iFood fora
+  do ar, tempo esgotado ou limite de uso), adiando só aquele pedido; o resto fica na vez para o próximo ciclo, sem
+  segurar o polling de 30 s.
   Até a recuperação, pedido com `detailPending = true` não pode virar venda nem NFC-e (a guarda do item 5 usa esse
   campo).
 - Erro 5xx do iFood numa ação da tela volta para a tela (não há nova tentativa automática); no polling o próximo ciclo
@@ -220,5 +228,6 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
   encontrado | ok` com funções `tchefood_delivery_*` e quem as executa, privilégios de `anon`/`authenticated` nas
   tabelas `delivery_*`, RLS e policies por loja, `SECURITY DEFINER` com `search_path`, colunas novas, CHECKs e os
   triggers de `audit_logs`. Linha com `NÃO` sai primeiro: não ligue o servidor antes de corrigir.
-  `ainda não (opcional)` só vale para `detail_pending (rodada 3)`, enquanto essa migration não estiver aplicada.
+  `ainda não (opcional)` só vale para `detail_pending (rodada 3)` e `detail_retry_at (rodada 3)`, enquanto essa
+  migration não estiver aplicada.
   O mesmo script roda num Postgres migrado em `db/tests/verificarDeliveryServidor.pg.test.ts`.

@@ -120,13 +120,24 @@ export interface DeliveryRepository {
   // = DeliveryConcurrencyError, sem gravar nada.
   saveOrder(record: DeliveryOrderRecord): Promise<number>;
   listOrders(): Promise<DeliveryOrderRecord[]>;
-  // Pedidos do app ainda sem o detalhe (detailPending), mais antigos primeiro, no máximo limit.
+  // Pedidos do app ainda sem o detalhe (detailPending) cuja próxima tentativa já chegou (ver deferDetail): primeiro
+  // os nunca adiados, depois os de tentativa mais antiga; empate pelo pedido mais antigo. No máximo limit.
   listDetailPending(channel: DeliveryChannelKey, limit: number): Promise<DeliveryOrderRecord[]>;
+  // Adia a próxima tentativa de buscar o detalhe de um pedido ainda detailPending para daqui a seconds segundos
+  // (relógio do banco). Não muda a versão do pedido nem mais nada nele; pedido já completo não muda.
+  deferDetail(channel: DeliveryChannelKey, externalOrderId: string, seconds: number): Promise<void>;
 }
 
 export class InMemoryDeliveryRepository implements DeliveryRepository {
   private readonly events = new Set<string>();
   private readonly orders = new Map<string, DeliveryOrderRecord>();
+  // Próxima tentativa do detalhe por pedido (detail_retry_at no banco), fora do registro: saveOrder não mexe.
+  private readonly detailRetryAt = new Map<string, number>();
+  private readonly now: () => Date;
+
+  constructor(options: { now?: () => Date } = {}) {
+    this.now = options.now ?? (() => new Date());
+  }
 
   async hasEvent(channel: DeliveryChannelKey, externalEventId: string): Promise<boolean> {
     return this.events.has(`${channel}:${externalEventId}`);
@@ -157,11 +168,24 @@ export class InMemoryDeliveryRepository implements DeliveryRepository {
   }
 
   async listDetailPending(channel: DeliveryChannelKey, limit: number): Promise<DeliveryOrderRecord[]> {
+    const now = this.now().getTime();
+    const retryAt = (record: DeliveryOrderRecord) => this.detailRetryAt.get(`${record.order.channel}:${record.order.externalId}`) ?? -Infinity;
     return [...this.orders.values()]
-      .filter((record) => record.order.channel === channel && record.detailPending)
-      .sort((a, b) => a.order.createdAt.localeCompare(b.order.createdAt))
+      .filter((record) => record.order.channel === channel && record.detailPending && retryAt(record) <= now)
+      .sort(
+        (a, b) =>
+          retryAt(a) - retryAt(b) ||
+          a.order.createdAt.localeCompare(b.order.createdAt) ||
+          a.order.externalId.localeCompare(b.order.externalId),
+      )
       .slice(0, limit)
       .map((record) => structuredClone(record));
+  }
+
+  async deferDetail(channel: DeliveryChannelKey, externalOrderId: string, seconds: number): Promise<void> {
+    const key = `${channel}:${externalOrderId}`;
+    if (!this.orders.get(key)?.detailPending) return;
+    this.detailRetryAt.set(key, this.now().getTime() + seconds * 1000);
   }
 }
 
@@ -199,6 +223,15 @@ const PERSISTENT_DETAIL_FAILURES: readonly string[] = ["auth_failed", "not_found
 // Pedidos mínimos (detailPending) cujo detalhe é buscado de novo a cada ciclo, depois do ack: poucos, para não
 // atrasar o próximo polling nem gastar o limite de uso do app.
 export const DETAIL_RECOVERY_BATCH = 20;
+// Tempo máximo do laço de recuperação por ciclo (o iFood espera polling a cada 30 s). Conferido antes de cada
+// busca: uma busca já começada vai até o fim (ou até o timeout do adapter).
+export const DETAIL_RECOVERY_BUDGET_MS = 10_000;
+// Rodízio: pedido cuja busca falhou (app, detalhe de outro pedido, gravação) só volta à lista depois deste
+// intervalo fixo, para que pedidos que nunca melhoram (404/403/ilegível para sempre) não ocupem todo o lote e
+// deixem um pedido mínimo novo sem tentativa. Pedido nunca adiado vem antes de todos.
+export const DETAIL_RETRY_DELAY_SECONDS = 5 * 60;
+// Detalhe que veio de outra loja do app: só a conferência humana resolve; tenta de novo de hora em hora.
+export const DETAIL_OTHER_STORE_RETRY_SECONDS = 60 * 60;
 export const DETAIL_RECOVERED_REASON = "Detalhe do pedido recuperado do app: confira itens e valores.";
 
 export class DeliveryInbox {
@@ -639,8 +672,10 @@ export class DeliveryInbox {
 
   // Pedido mínimo (detailPending): busca o detalhe no app de novo e, se vier legível, grava itens, valores, cliente,
   // pagamentos etc. sem mexer no que os eventos já fizeram (status, cancelamento, negociação, pendências, aviso).
-  // Qualquer falha (app, banco, conflito de versão esgotado) deixa o pedido como está para o próximo ciclo e nunca
-  // derruba o ciclo.
+  // Qualquer falha (app, banco, conflito de versão esgotado) deixa o pedido como está e o adia
+  // (DETAIL_RETRY_DELAY_SECONDS; outra loja: DETAIL_OTHER_STORE_RETRY_SECONDS), e nunca derruba o ciclo. O laço
+  // para no orçamento de tempo (DETAIL_RECOVERY_BUDGET_MS) e no primeiro erro temporário do app (fora do ar,
+  // limite de uso, tempo esgotado): os que sobraram ficam na vez para o próximo ciclo.
   private async recoverPendingDetails(adapter: DeliveryMarketplaceAdapter): Promise<void> {
     const channel = adapter.channel;
     let pending: DeliveryOrderRecord[];
@@ -649,16 +684,24 @@ export class DeliveryInbox {
     } catch {
       return;
     }
+    const startedAt = this.now().getTime();
     for (const candidate of pending) {
+      if (this.now().getTime() - startedAt >= DETAIL_RECOVERY_BUDGET_MS) break;
       const externalId = candidate.order.externalId;
       let detail: DeliveryOrder;
       try {
         detail = await adapter.getOrder(externalId);
-      } catch {
+      } catch (error) {
+        await this.deferDetail(channel, externalId, DETAIL_RETRY_DELAY_SECONDS);
+        if (error instanceof DeliveryMarketplaceError && error.retryable) break;
         continue;
       }
-      if (detail.channel !== channel || detail.externalId !== externalId) continue;
+      if (detail.channel !== channel || detail.externalId !== externalId) {
+        await this.deferDetail(channel, externalId, DETAIL_RETRY_DELAY_SECONDS);
+        continue;
+      }
       let recovered = false;
+      let otherStore = false;
       let saved: DeliveryOrderRecord;
       try {
         saved = await this.updateOrder(channel, externalId, (latest) => {
@@ -666,11 +709,13 @@ export class DeliveryInbox {
           const merchant = detail.merchantExternalId || latest.order.merchantExternalId;
           if (merchant !== latest.order.merchantExternalId) {
             // O banco recusa a troca de loja; a pendência fica para a conferência humana.
+            otherStore = true;
             const reason = `O detalhe do pedido veio de outra loja do ${DELIVERY_CHANNEL_CATALOG[channel].label}: confira pelo Portal do Parceiro.`;
             if (latest.reviewReasons.includes(reason)) return false;
             flag(latest, reason);
             return true;
           }
+          otherStore = false;
           // Cancelamento só vale pelo evento do app (que também zera reservas e negociação).
           const status = detail.status === "cancelled" ? latest.order.status : mergeDeliveryStatus(latest.order.status, detail.status);
           latest.order = { ...structuredClone(detail), channel, externalId, merchantExternalId: merchant, status };
@@ -681,14 +726,25 @@ export class DeliveryInbox {
           return true;
         });
       } catch {
+        await this.deferDetail(channel, externalId, DETAIL_RETRY_DELAY_SECONDS);
         continue;
       }
+      if (otherStore) await this.deferDetail(channel, externalId, DETAIL_OTHER_STORE_RETRY_SECONDS);
       if (!recovered) continue;
       try {
         await this.options.onOrderUpdated?.(saved);
       } catch {
         // Aviso de atualização é melhor esforço: o pedido recuperado já está gravado e marcado para conferência.
       }
+    }
+  }
+
+  // Adiamento é melhor esforço: se o banco falhar, o pedido só volta mais cedo à lista.
+  private async deferDetail(channel: DeliveryChannelKey, externalOrderId: string, seconds: number): Promise<void> {
+    try {
+      await this.options.repository.deferDetail(channel, externalOrderId, seconds);
+    } catch {
+      // Nada: o ciclo segue.
     }
   }
 

@@ -92,6 +92,10 @@ export class SupabaseDeliveryRepository implements DeliveryRepository {
     return rows.map(toRecord);
   }
 
+  async deferDetail(channel: DeliveryChannelKey, externalOrderId: string, seconds: number): Promise<void> {
+    await this.rpc("tchefood_delivery_defer_detail", { p_channel: channel, p_external_id: externalOrderId, p_seconds: Math.round(seconds) });
+  }
+
   private async rpc(fn: string, args: Record<string, unknown>): Promise<unknown> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;

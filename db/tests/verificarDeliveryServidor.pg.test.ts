@@ -62,6 +62,8 @@ const opcional = (l: Linha) => l.item.includes('(rodada 3)');
     for (const l of linhas.filter(opcional)) expect(['sim', 'ainda não (opcional)']).toContain(l.ok);
     expect(linhas.map((l) => l.item)).toEqual(expect.arrayContaining([
       'quem executa public.tchefood_delivery_save_order',
+      'quem executa public.tchefood_delivery_defer_detail',
+      'coluna delivery_orders.detail_retry_at (rodada 3)',
       'quem executa public.tchefood_delivery_authorize',
       'authenticated grava em delivery_orders',
       'RLS ligada em delivery_events',

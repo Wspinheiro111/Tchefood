@@ -145,6 +145,10 @@ function setup() {
     // Primeiro: pedido mínimo, para revisão, sem itens nem valores e marcado sem detalhe.
     expect(sql(`SELECT detail_pending || '|' || needs_review || '|' || total_amount || '|' || jsonb_array_length(payload->'items') || '|' || (payload->>'isTest') FROM delivery_orders WHERE external_id = '${id}'`))
       .toBe('true|true|0.00|0|false');
+    // A recuperação do mesmo ciclo também levou 404: o pedido foi adiado e sai da lista até o prazo passar.
+    expect(sql(`SELECT detail_retry_at BETWEEN NOW() + INTERVAL '4 minutes' AND NOW() + INTERVAL '6 minutes' FROM delivery_orders WHERE external_id = '${id}'`)).toBe('t');
+    expect((await repository.listDetailPending('ifood', 20)).map((r) => r.order.externalId)).not.toContain(id);
+    sql(`UPDATE delivery_orders SET detail_retry_at = NOW() - INTERVAL '1 second' WHERE external_id = '${id}'`);
     expect((await repository.listDetailPending('ifood', 20)).map((r) => r.order.externalId)).toContain(id);
     expect((await repository.getOrder('ifood', id))!.detailPending).toBe(true);
 
@@ -198,6 +202,48 @@ function setup() {
     const again = (await repository.getOrder('ifood', id))!;
     await repository.saveOrder({ ...again, detailPending: false, order: { ...again.order, totals: { ...again.order.totals, orderCents: 1 } } });
     expect(sql(`SELECT total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${total}|false`);
+  });
+
+  it('rodízio do detalhe: adiado sai da lista até o prazo, nunca adiado vem primeiro, adiar não muda a versão', async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const spy = vi.spyOn(api, 'getOrder').mockRejectedValue(new DeliveryMarketplaceError('ifood', 'invalid_response', 'Valor inválido no iFood: total.subTotal.'));
+    const [a, b, c] = [sandbox.placeOrder({ items: ITEMS }), sandbox.placeOrder({ items: ITEMS }), sandbox.placeOrder({ items: ITEMS })];
+    await inbox.runChannel(api);
+    spy.mockRestore();
+    const mine = async () => (await repository.listDetailPending('ifood', 100)).map((r) => r.order.externalId).filter((x) => [a, b, c].includes(x!));
+    // Os três viraram pedido mínimo e a recuperação do mesmo ciclo falhou: todos adiados.
+    expect(await mine()).toEqual([]);
+    // a com prazo vencido, b nunca adiado (vem antes de qualquer adiado), c adiado para daqui a 1 h.
+    sql(`UPDATE delivery_orders SET detail_retry_at = NOW() - INTERVAL '1 minute' WHERE external_id = '${a}';
+         UPDATE delivery_orders SET detail_retry_at = NULL WHERE external_id = '${b}';
+         UPDATE delivery_orders SET detail_retry_at = NOW() + INTERVAL '1 hour' WHERE external_id = '${c}';`);
+    expect(await mine()).toEqual([b, a]);
+
+    const before = (await repository.getOrder('ifood', b))!;
+    await repository.deferDetail('ifood', b, 300);
+    expect(sql(`SELECT version || '|' || (detail_retry_at BETWEEN NOW() + INTERVAL '4 minutes' AND NOW() + INTERVAL '6 minutes') FROM delivery_orders WHERE external_id = '${b}'`))
+      .toBe(`${before.version}|true`);
+    expect(await mine()).toEqual([a]);
+    // Gravação do pedido (CAS) não mexe no prazo.
+    const retryAt = sql(`SELECT detail_retry_at FROM delivery_orders WHERE external_id = '${b}'`);
+    await repository.saveOrder({ ...before, needsReview: true, reviewReasons: [...before.reviewReasons, 'outra gravação'] });
+    expect(sql(`SELECT detail_retry_at FROM delivery_orders WHERE external_id = '${b}'`)).toBe(retryAt);
+
+    // O app não adia nada.
+    const res = await appFetch(TENANT)('http://cloud.test/rest/v1/rpc/tchefood_delivery_defer_detail', {
+      method: 'POST', headers: {}, body: JSON.stringify({ p_channel: 'ifood', p_external_id: a, p_seconds: 86400 }),
+    });
+    expect(res.ok).toBe(false);
+    expect(await mine()).toEqual([a]);
+
+    // Próximo ciclo (detalhe legível agora): só a, cujo prazo venceu, é recuperado; b e c continuam esperando.
+    const complete = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runChannel(api);
+    const pendingOf = (x: string) => sql(`SELECT detail_pending FROM delivery_orders WHERE external_id = '${x}'`);
+    expect([a, b, c].map(pendingOf)).toEqual(['f', 't', 't']);
+    // Pedido com detalhe completo não ganha prazo.
+    await repository.deferDetail('ifood', complete, 300);
+    expect(sql(`SELECT detail_pending || '|' || (detail_retry_at IS NULL) FROM delivery_orders WHERE external_id = '${complete}'`)).toBe('false|true');
   });
 
   it('merchantId com espaço ou caractere fora do padrão não entra em delivery_integrations', () => {
