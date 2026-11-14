@@ -207,11 +207,11 @@ describe("servidor do iFood: API do app", () => {
     const { sandbox, poller, call } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
     await poller.runOnce();
-    sandbox.openDispute(id);
+    const disputeId = sandbox.openDispute(id);
     await poller.runOnce();
-    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "reject", authorization: auth() })).status).toBe(400);
-    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "talvez", authorization: auth() })).status).toBe(400);
-    const rejected = await call("POST", `/ifood/orders/${id}/dispute`, { kind: "reject", reason: "Pedido já saiu", authorization: auth() });
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "reject", disputeId, authorization: auth() })).status).toBe(400);
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "talvez", disputeId, authorization: auth() })).status).toBe(400);
+    const rejected = await call("POST", `/ifood/orders/${id}/dispute`, { kind: "reject", reason: "Pedido já saiu", disputeId, authorization: auth() });
     expect(rejected.status).toBe(200);
     expect(sandbox.eventHistory().at(-1)?.code).toBe("HSS");
   });
@@ -220,28 +220,28 @@ describe("servidor do iFood: API do app", () => {
     const { sandbox, poller, inbox, call, manager } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
     await poller.runOnce();
-    const cancel =sandbox.openDispute(id, { acceptCancellationReasons: ["HIGH_STORE_DEMAND"] });
+    const cancel = sandbox.openDispute(id, { acceptCancellationReasons: ["HIGH_STORE_DEMAND"] });
     await poller.runOnce();
     const path = `/ifood/orders/${id}/dispute`;
-    const missing = await call("POST", path, { kind: "accept", authorization: auth() });
+    const missing = await call("POST", path, { kind: "accept", disputeId: cancel, authorization: auth() });
     expect(missing).toMatchObject({ status: 400, body: { error: expect.stringMatching(/motivo do aceite/) } });
-    expect((await call("POST", path, { kind: "accept", reason: "INVENTADO", authorization: auth() })).status).toBe(400);
+    expect((await call("POST", path, { kind: "accept", reason: "INVENTADO", disputeId: cancel, authorization: auth() })).status).toBe(400);
     expect(manager.authorized).toHaveLength(0);
-    const accepted = await call("POST", path, { kind: "accept", reason: "HIGH_STORE_DEMAND", detailReason: "Fila grande", authorization: auth() });
+    const accepted = await call("POST", path, { kind: "accept", reason: "HIGH_STORE_DEMAND", detailReason: "Fila grande", disputeId: cancel, authorization: auth() });
     expect(accepted.status).toBe(200);
     expect(sandbox.eventHistory().find((event) => event.code === "HSS")?.metadata).toMatchObject({ disputeId: cancel, status: "ACCEPTED", reason: "HIGH_STORE_DEMAND" });
 
     const other = sandbox.placeOrder({ items: ITEMS });
     await poller.runOnce();
-    sandbox.openDispute(other, { alternatives: [{ type: "REFUND", maxAmountCents: 2000 }] });
+    const otherDispute = sandbox.openDispute(other, { alternatives: [{ type: "REFUND", maxAmountCents: 2000 }] });
     await poller.runOnce();
     const alternativeId = (await inbox.listOrders()).find((record) => record.order.externalId === other)!.dispute!.alternatives[0]!.id;
     const otherPath = `/ifood/orders/${other}/dispute`;
-    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, authorization: auth() })).status).toBe(400);
-    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, amountCents: "15", authorization: auth() })).status).toBe(400);
-    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, amountCents: 2500, authorization: auth() })).status).toBe(400);
+    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, disputeId: otherDispute, authorization: auth() })).status).toBe(400);
+    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, amountCents: "15", disputeId: otherDispute, authorization: auth() })).status).toBe(400);
+    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, amountCents: 2500, disputeId: otherDispute, authorization: auth() })).status).toBe(400);
     expect(manager.authorized).toHaveLength(1);
-    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, amountCents: 1500, authorization: auth() })).status).toBe(200);
+    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, amountCents: 1500, disputeId: otherDispute, authorization: auth() })).status).toBe(200);
     expect(sandbox.eventHistory().at(-1)?.metadata).toMatchObject({ status: "ALTERNATIVE_REPLIED", selectedDisputeAlternative: { metadata: { amount: { value: "1500" } } } });
   });
 
@@ -355,14 +355,14 @@ describe("servidor do iFood: alçada de gerente", () => {
     const { sandbox, poller, call, manager } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
     await poller.runOnce();
-    sandbox.openDispute(id);
+    const disputeId = sandbox.openDispute(id);
     await poller.runOnce();
-    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept" })).status).toBe(400);
-    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", authorization: auth() }, "loja-b")).status).toBe(404);
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", disputeId })).status).toBe(400);
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", disputeId, authorization: auth() }, "loja-b")).status).toBe(404);
     expect((await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Gás", minutes: 10, authorization: auth({ managerPin: "1111" }) })).status).toBe(403);
     expect(sandbox.activeInterruptions()).toHaveLength(0);
     expect(manager.authorized).toHaveLength(0);
-    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", authorization: auth() })).status).toBe(200);
+    expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", disputeId, authorization: auth() })).status).toBe(200);
     expect(manager.authorized.map((request) => request.action)).toEqual(["DELIVERY_DISPUTE"]);
   });
 
@@ -443,15 +443,45 @@ describe("servidor do iFood: alçada de gerente", () => {
       return authorize(token, request);
     };
     const spy = vi.spyOn(api, "respondToDispute");
-    const response = await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", authorization: auth() });
+    const response = await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", disputeId: first, authorization: auth() });
     expect(response.status).toBe(409);
     expect(spy).not.toHaveBeenCalled();
     expect(manager.authorized.at(-1)?.details).toMatchObject({ disputeId: first, kind: "accept" });
     manager.approval.authorize = authorize;
     // A tela que mostra a negociação nova manda o id dela; um id velho é recusado antes do PIN.
+    const before = manager.authorized.length;
     expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", disputeId: first, authorization: auth() })).status).toBe(409);
+    expect(manager.authorized).toHaveLength(before);
     expect((await call("POST", `/ifood/orders/${id}/dispute`, { kind: "accept", disputeId: second, authorization: auth() })).status).toBe(200);
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("disputeId é obrigatório: a tela mostrou A, o app trocou por B; sem id ou com o id de A não autoriza nem chama o iFood", async () => {
+    const { sandbox, poller, call, manager, api } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const shown = sandbox.openDispute(id);
+    await poller.runOnce();
+    // Antes da requisição, o app fecha A e abre B (o polling grava a troca).
+    sandbox.expireDispute(shown);
+    const current = sandbox.openDispute(id);
+    await poller.runOnce();
+    const spy = vi.spyOn(api, "respondToDispute");
+    const path = `/ifood/orders/${id}/dispute`;
+    const missing = await call("POST", path, { kind: "accept", authorization: auth() });
+    expect(missing).toMatchObject({ status: 400, body: { error: expect.stringMatching(/negociação/) } });
+    for (const disputeId of ["", "../x", 42, null, "a".repeat(65)]) {
+      expect((await call("POST", path, { kind: "accept", disputeId, authorization: auth() })).status).toBe(400);
+    }
+    expect((await call("POST", path, { kind: "accept", disputeId: shown, authorization: auth() })).status).toBe(409);
+    expect(manager.authorized).toHaveLength(0);
+    expect(manager.results).toHaveLength(0);
+    expect(spy).not.toHaveBeenCalled();
+    const ok = await call("POST", path, { kind: "accept", disputeId: current, authorization: auth() });
+    expect(ok.status).toBe(200);
+    expect(manager.authorized.map((request) => request.details)).toEqual([{ disputeId: current, kind: "accept" }]);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(current, { kind: "accept" });
   });
 
   it("a autorização leva o que o gerente aprovou (motivo do iFood, resposta, duração da pausa)", async () => {
@@ -459,15 +489,15 @@ describe("servidor do iFood: alçada de gerente", () => {
     const id = sandbox.placeOrder({ items: ITEMS });
     const other = sandbox.placeOrder({ items: ITEMS });
     await poller.runOnce();
-    sandbox.openDispute(other, { alternatives: ["REFUND"] });
+    const otherDispute = sandbox.openDispute(other, { alternatives: ["REFUND"] });
     await poller.runOnce();
     await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", authorization: auth() });
-    await call("POST", `/ifood/orders/${other}/dispute`, { kind: "reject", reason: "Pedido já saiu", authorization: auth() });
+    await call("POST", `/ifood/orders/${other}/dispute`, { kind: "reject", reason: "Pedido já saiu", disputeId: otherDispute, authorization: auth() });
     const created = await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás", minutes: 30, authorization: auth() });
     await call("DELETE", `/ifood/merchants/${sandbox.merchantId}/pauses/${(created.body as { id: string }).id}`, { authorization: auth() });
     expect(manager.authorized.map((request) => request.details)).toEqual([
       { code: "503" },
-      { disputeId: expect.any(String), kind: "reject", reason: "Pedido já saiu" },
+      { disputeId: otherDispute, kind: "reject", reason: "Pedido já saiu" },
       { minutes: 30, description: "Falta de gás" },
       { pauseId: (created.body as { id: string }).id },
     ]);

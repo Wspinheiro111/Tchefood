@@ -339,12 +339,12 @@ export class DeliveryInbox {
   // Confere a resposta contra a negociação gravada sem gravar nada nem chamar o app (o servidor usa antes de pedir
   // o PIN de gerente). A mesma conferência roda de novo, já com a reserva, em respondToDispute.
   // Devolve também o id da negociação conferida: a resposta autorizada pelo gerente vale só para ela (ver
-  // expectedDisputeId em respondToDispute). expectedDisputeId aqui é o id que a tela mostrou, quando ela manda.
+  // expectedDisputeId em respondToDispute). expectedDisputeId é obrigatório: o id da negociação que a tela mostrou.
   async checkDisputeDecision(
     channel: DeliveryChannelKey,
     externalOrderId: string,
     decision: DeliveryDisputeDecision,
-    expectedDisputeId?: string,
+    expectedDisputeId: string,
   ): Promise<{ disputeId: string; decision: DeliveryDisputeDecision }> {
     const record = await this.requireOrder(channel, externalOrderId);
     assertSameDispute(channel, record, expectedDisputeId);
@@ -355,13 +355,13 @@ export class DeliveryInbox {
   // reservada no pedido (gravação com versão) antes de chamar o app: duas respostas ao mesmo tempo, ou uma nova
   // tentativa depois de uma resposta incerta, não chegam ao app. O que vai ao app é a resposta conferida contra a
   // negociação gravada (motivo do aceite da lista, valor até o teto, prazo e motivo permitidos).
-  // expectedDisputeId: a negociação que o gerente aprovou. Se o app fechou essa e abriu outra no meio (polling entre a
-  // conferência e a reserva), a resposta não vai para a nova: conflito, e a tela mostra a negociação nova.
+  // expectedDisputeId (obrigatório): a negociação que o gerente aprovou. Se o app fechou essa e abriu outra no meio
+  // (polling entre a conferência e a reserva), a resposta não vai para a nova: conflito, e a tela mostra a nova.
   async respondToDispute(
     channel: DeliveryChannelKey,
     externalOrderId: string,
     decision: DeliveryDisputeDecision,
-    expectedDisputeId?: string,
+    expectedDisputeId: string,
   ): Promise<DeliveryOrderRecord> {
     const adapter = this.adapter(channel);
     const reservedAt = this.now().toISOString();
@@ -703,9 +703,13 @@ function applySettlement(record: DeliveryOrderRecord, event: DeliveryEvent): voi
 
 // Confere a resposta da loja contra a negociação gravada e devolve a resposta que vai ao app (com o tipo da proposta
 // e só os campos que o app aceita). Erros: conflict (estado da negociação) ou invalid_request (dado da resposta).
-function assertSameDispute(channel: DeliveryChannelKey, record: DeliveryOrderRecord, expectedDisputeId: string | undefined): void {
+// A resposta só vale para a negociação que o gerente viu: sem o id dela não há "a negociação de agora" por padrão.
+function assertSameDispute(channel: DeliveryChannelKey, record: DeliveryOrderRecord, expectedDisputeId: string): void {
+  if (typeof expectedDisputeId !== "string" || !expectedDisputeId) {
+    throw new DeliveryMarketplaceError(channel, "invalid_request", "Informe a negociação que está respondendo.");
+  }
   if (!record.dispute) throw new DeliveryMarketplaceError(channel, "conflict", "Este pedido não tem negociação aberta.");
-  if (expectedDisputeId !== undefined && record.dispute.id !== expectedDisputeId) {
+  if (record.dispute.id !== expectedDisputeId) {
     throw new DeliveryMarketplaceError(channel, "conflict", "A negociação mudou (o app abriu outra); confira a nova antes de responder.");
   }
 }

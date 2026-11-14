@@ -426,11 +426,11 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           const manager = parseManager(body.authorization);
           if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
           // Motivo do aceite, valor e prazo da proposta conferidos contra a negociação gravada antes do PIN.
-          // A tela pode mandar o id da negociação que mostrou ao gerente; sem ele, vale a negociação conferida aqui.
-          if (body.disputeId !== undefined && !(typeof body.disputeId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(body.disputeId))) {
-            return { status: 400, body: { error: "Resposta da negociação inválida." } };
-          }
-          const checked = await options.inbox.checkDisputeDecision("ifood", orderId, decision, body.disputeId as string | undefined);
+          // A tela manda o id da negociação que mostrou ao gerente (obrigatório): sem ele, ou fora do formato, 400 antes
+          // do PIN; id de outra negociação, 409 antes do PIN. Nunca vale "a negociação de agora" por padrão.
+          const disputeId = typeof body.disputeId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(body.disputeId) ? body.disputeId : null;
+          if (!disputeId) return { status: 400, body: { error: "Informe a negociação que está respondendo." } };
+          const checked = await options.inbox.checkDisputeDecision("ifood", orderId, decision, disputeId);
           // O registro do gerente leva a negociação e a resposta como vai ao iFood (aceite com motivo, recusa, valor ou
           // prazo da proposta); a resposta só vai para essa negociação.
           const details = JSON.parse(JSON.stringify({ disputeId: checked.disputeId, ...checked.decision })) as Record<string, unknown>;
@@ -526,7 +526,7 @@ function parseManager(raw: unknown): Omit<ManagerRequest, "action" | "externalOr
   return { managerPin, performedBy, requestId, reason };
 }
 
-// Corpo da rota /dispute:
+// Corpo da rota /dispute (sempre com disputeId da negociação mostrada e authorization):
 //   aceite      {kind: "accept", reason?, detailReason?}  reason = código da lista do iFood (obrigatório se houver lista)
 //   recusa      {kind: "reject", reason}
 //   proposta    {kind: "alternative", alternativeId, amountCents?}                                (REFUND/BENEFIT)
