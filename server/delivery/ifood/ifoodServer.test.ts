@@ -217,7 +217,7 @@ describe("servidor do iFood: API do app", () => {
     expect((await call("POST", `/ifood/orders/${id}/actions/start_preparation`)).status).toBe(200);
   });
 
-  it("ação de status: falha não trava a nova tentativa; pedido que mudou (evento novo) libera a repetição", async () => {
+  it("ação de status: falha não trava a nova tentativa; gravação sem mudança de status não libera a repetição", async () => {
     const { sandbox, poller, call, api, repository } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
     await poller.runOnce();
@@ -227,11 +227,12 @@ describe("servidor do iFood: API do app", () => {
     const retried = await call("POST", `/ifood/orders/${id}/actions/confirm`);
     expect(retried).toMatchObject({ status: 200, body: { actionSent: "confirm" } });
     expect(send).toHaveBeenCalledTimes(2);
-    // Outro evento gravou o pedido (versão nova) dentro dos 60 s: a repetição não fica presa.
+    // Pedido gravado de novo (versão nova) sem mudar o status dentro dos 60 s: a trava continua (a liberação vem
+    // com o evento de status; ver o teste acima).
     const stored = (await repository.getOrder("ifood", id))!;
     await repository.saveOrder(stored);
-    await call("POST", `/ifood/orders/${id}/actions/confirm`);
-    expect(send).toHaveBeenCalledTimes(3);
+    expect((await call("POST", `/ifood/orders/${id}/actions/confirm`)).status).toBe(409);
+    expect(send).toHaveBeenCalledTimes(2);
   });
 
   it("cancelamento de pedido que o iFood não deixa cancelar (sem motivos): diz isso, não 'motivo inválido'", async () => {

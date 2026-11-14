@@ -1525,6 +1525,114 @@ describe("reserva gravada e resposta do banco perdida (timeout depois do commit)
     await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "conflict" });
     expect((await repository.getOrder("ifood", id))!.cancellationRequest?.state).toBe("uncertain");
   });
+
+  it("cancelamento: desfazer a repetição não apaga a conferência pedida por evento gravado no meio", async () => {
+    let now = new Date("2026-11-14T15:00:00.000Z");
+    const { sandbox, api, repository, inbox } = setup({ now: () => now });
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    vi.spyOn(api, "requestCancellation").mockRejectedValueOnce(new TypeError("fetch failed"));
+    await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toThrow(/fetch failed/);
+    now = new Date(now.getTime() + CANCELLATION_RESERVATION_TTL_MS + 60_000);
+    expect((await repository.getOrder("ifood", id))!.needsReview).toBe(false);
+    // O banco grava a reserva da repetição e a resposta demora (e se perde); no meio, o evento CCR é gravado.
+    const save = repository.saveOrder.bind(repository);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let first = true;
+    const spy = vi.spyOn(repository, "saveOrder").mockImplementation(async (record) => {
+      const version = await save(record);
+      if (first) {
+        first = false;
+        await gate;
+        throw new Error("Supabase não respondeu (tchefood_delivery_save_order).");
+      }
+      return version;
+    });
+    const retry = inbox.requestCancellation("ifood", id, reason, undefined, { confirmUncertainRetry: true });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    sandbox.emitFromMarketplace(id, "CCR");
+    const cycle = inbox.runCycle();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    release();
+    await expect(retry).rejects.toThrow(/não respondeu/);
+    await cycle;
+    spy.mockRestore();
+    const after = (await repository.getOrder("ifood", id))!;
+    expect(after.reviewReasons).not.toContain(UNCERTAIN_CANCELLATION_RETRIED);
+    expect(after.reviewReasons.length).toBeGreaterThan(0);
+    expect(after.needsReview).toBe(true);
+  });
+});
+
+describe("repetição conferida recusada com clareza pelo app", () => {
+  it("cancelamento: volta a reserva incerta anterior (a guarda de venda segue bloqueando) e sai a marca de repetido", async () => {
+    let now = new Date("2026-11-14T15:00:00.000Z");
+    const { sandbox, repository, inbox } = setup({ now: () => now });
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    sandbox.failNext("requestCancellation", 503);
+    await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toThrow();
+    now = new Date(now.getTime() + CANCELLATION_RESERVATION_TTL_MS + 60_000);
+    const before = (await repository.getOrder("ifood", id))!;
+    expect(before.cancellationRequest?.state).toBe("uncertain");
+    sandbox.failNext("requestCancellation", 429);
+    await expect(inbox.requestCancellation("ifood", id, reason, undefined, { confirmUncertainRetry: true })).rejects.toMatchObject({
+      code: "rate_limited",
+    });
+    const after = (await repository.getOrder("ifood", id))!;
+    expect(after.cancellationRequest).toEqual(before.cancellationRequest);
+    expect(after.reviewReasons).not.toContain(UNCERTAIN_CANCELLATION_RETRIED);
+    expect(after.needsReview).toBe(before.needsReview);
+    expect(deliverySaleBlockers(after).join(" ")).toMatch(/cancelamento/);
+    // A próxima repetição continua exigindo a conferência.
+    await expect(inbox.requestCancellation("ifood", id, reason)).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("negociação: volta a resposta incerta anterior e a próxima tentativa continua exigindo a conferência", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const disputeId = sandbox.openDispute(id);
+    await inbox.runCycle();
+    vi.spyOn(api, "respondToDispute")
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockRejectedValueOnce(new DeliveryMarketplaceError("ifood", "rate_limited", "429"));
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" }, disputeId)).rejects.toThrow(/fetch failed/);
+    const before = (await repository.getOrder("ifood", id))!.dispute?.response;
+    expect(before?.state).toBe("uncertain");
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" }, disputeId, { confirmUncertainRetry: true })).rejects.toThrow(/429/);
+    expect((await repository.getOrder("ifood", id))!.dispute?.response).toEqual(before);
+    await expect(inbox.checkDisputeDecision("ifood", id, { kind: "accept" }, disputeId)).rejects.toMatchObject({ code: "conflict" });
+  });
+});
+
+describe("ação de status já enviada (trava de 60 s)", () => {
+  it("gravação sem evento (recuperação do detalhe) muda a versão mas não libera a mesma ação", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    for (let i = 0; i < ORDER_DETAIL_MAX_FAILURES; i++) {
+      sandbox.failNext(`/orders/${id}`, 404);
+      // No último ciclo a recuperação não roda, para o pedido ficar mínimo.
+      if (i === ORDER_DETAIL_MAX_FAILURES - 1) vi.spyOn(repository, "listDetailPending").mockRejectedValueOnce(new Error("db"));
+      await inbox.runCycle();
+    }
+    const pending = (await repository.getOrder("ifood", id))!;
+    expect(pending.detailPending).toBe(true);
+    const perform = vi.spyOn(api, "performAction").mockResolvedValue(undefined as never);
+    await inbox.performAction("ifood", id, "confirm");
+    await inbox.runCycle(); // sem eventos: só a recuperação do detalhe, que grava o pedido
+    const recovered = (await repository.getOrder("ifood", id))!;
+    expect(recovered.detailPending).toBe(false);
+    expect(recovered.version).not.toBe(pending.version);
+    expect(recovered.order.status).toBe("placed");
+    await expect(inbox.performAction("ifood", id, "confirm")).rejects.toThrow(/já enviada/);
+    expect(perform).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("pedido concluído pelo app com o cancelamento em análise", () => {

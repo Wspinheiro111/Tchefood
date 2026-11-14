@@ -215,7 +215,7 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
   retomar exigem o PIN de gerente (ver "API do servidor"); a tela que pede o PIN entra com o item 5.
 - Não há bloqueio automático de consulta/atualização 8 h depois da entrega (o servidor só consulta o detalhe no
   primeiro evento do pedido e, no pedido mínimo abaixo, até recuperá-lo).
-- Pedido mínimo: quando o detalhe do iFood vem ilegível, ou é recusado (403/404) em 10 ciclos seguidos, o pedido entra
+- Pedido mínimo: quando o detalhe do iFood vem ilegível, ou é recusado 10 vezes, o pedido entra
   sem itens nem valores, para conferência, com `detailPending = true` (coluna `delivery_orders.detail_pending`). A cada
   ciclo, depois do ack, o servidor busca de novo o detalhe de até 20 desses pedidos; vindo
   legível, grava itens, valores, pagamentos, cliente, endereço e `isTest` sem mexer no status nem no que os eventos já
@@ -231,6 +231,11 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
   segurar o polling de 30 s.
   Até a recuperação, pedido com `detailPending = true` não pode virar venda nem NFC-e (a guarda do item 5 usa esse
   campo).
+  Contagem das 10 recusas: vale a resposta que o servidor trata como recusa definitiva (`auth_failed`, `not_found`,
+  `invalid_request`), ou seja 400, 401, 403, 404 e os demais 4xx menos 409 e 429, detalhe que volta vazio, e também
+  o iFood recusando as credenciais ao renovar o token. Não precisam ser ciclos seguidos: uma falha temporária no meio
+  (5xx, 409, 429, tempo esgotado) só adia o evento e não zera a conta. A conta é por pedido e só em memória: reiniciar
+  o processo recomeça do zero (o pedido mínimo atrasa, não se perde).
 - Erro 5xx do iFood numa ação da tela volta para a tela (não há nova tentativa automática); no polling o próximo ciclo
   já tenta de novo. A doc de boas práticas recomenda nova tentativa automática: avaliar na homologação.
 - Todas as lojas vão num único `x-polling-merchants`. A doc fala em usar o header a partir de 100 lojas e torná-lo
@@ -253,6 +258,10 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
   `needsReview` sozinho não bloqueia (junta avisos de naturezas diferentes; travar por ele pararia pedido bom): sai
   como aviso em `deliverySaleWarnings(registro)`, para a tela mostrar e pedir conferência. Ainda não está ligada em
   nada: a tela do item 5 chama a guarda antes de lançar a venda, mandar para a produção ou emitir a nota.
+- Pedido mínimo cujo detalhe nunca vem: passados 7 dias do pedido ele sai do rodízio de recuperação e continua com
+  `detailPending = true`, ou seja bloqueado pela guarda para sempre. Só uma liberação manual, com o PIN de gerente,
+  pode destravar (lançando itens e valores conferidos no Portal do Parceiro); essa liberação é trabalho do item 5 e
+  ainda não existe.
 - `newOrderNotified` não prova que alguém foi avisado: o servidor marca o campo depois de tentar o aviso, e o
   `main.ts` não passa `onNewOrder` para a caixa de entrada, então hoje ele fica verdadeiro sem aviso nenhum. O
   alerta/KDS do item 5 não pode depender desse campo para saber se o pedido já tocou na loja.

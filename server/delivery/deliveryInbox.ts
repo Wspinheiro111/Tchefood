@@ -250,7 +250,7 @@ export type DeliveryInboxOptions = {
   now?: () => Date;
 };
 
-// Janela em que a mesma ação de status, já aceita pelo app e sem evento novo do pedido, não é mandada de novo.
+// Janela em que a mesma ação de status, já aceita pelo app e com o pedido no mesmo status, não é mandada de novo.
 export const ACTION_RESEND_GUARD_MS = 60_000;
 
 // Falhas em que o app com certeza não aplicou o pedido.
@@ -297,10 +297,15 @@ export class DeliveryInbox {
   // sem chamar o app. Vale só neste processo; o app recusa a transição repetida de qualquer forma.
   private readonly actionsInFlight = new Set<string>();
   // Ação de status que o app aceitou e cujo evento ainda não chegou (o status novo só vem com ele), por pedido: a
-  // mesma ação de novo em ACTION_RESEND_GUARD_MS, com o pedido igual (mesma versão), é recusada sem chamar o app
-  // (a tela ainda mostra o botão; o app recusaria a transição repetida com um erro que parece falha). Só depois de
-  // sucesso, para não travar a nova tentativa depois de uma falha. Só em memória (vale neste processo).
-  private readonly actionsSent = new Map<string, { action: DeliveryOrderAction; at: number; version: number }>();
+  // mesma ação de novo em ACTION_RESEND_GUARD_MS, com o pedido no mesmo status (e o mesmo cancelamento em análise),
+  // é recusada sem chamar o app (a tela ainda mostra o botão; o app recusaria a transição repetida com um erro que
+  // parece falha). Compara o status, não a versão: gravação sem evento de status (recuperação do detalhe, aviso)
+  // muda a versão e não pode liberar a repetição. Só depois de sucesso, para não travar a nova tentativa depois de
+  // uma falha. Só em memória (vale neste processo).
+  private readonly actionsSent = new Map<
+    string,
+    { action: DeliveryOrderAction; at: number; status: DeliveryOrder["status"]; cancellationPending: boolean }
+  >();
 
   constructor(private readonly options: DeliveryInboxOptions) {
     for (const adapter of options.adapters) {
@@ -394,7 +399,7 @@ export class DeliveryInbox {
     const nowMs = this.now().getTime();
     for (const [sentKey, sent] of this.actionsSent) if (sent.at + ACTION_RESEND_GUARD_MS <= nowMs) this.actionsSent.delete(sentKey);
     const sent = this.actionsSent.get(key);
-    if (sent && sent.action === action && sent.version === record.version) {
+    if (sent && sent.action === action && sent.status === record.order.status && sent.cancellationPending === record.cancellationPending) {
       throw new DeliveryMarketplaceError(channel, "conflict", "Ação já enviada ao app, aguardando a confirmação dele; o status muda quando ela chegar.");
     }
     this.actionsInFlight.add(key);
@@ -406,7 +411,12 @@ export class DeliveryInbox {
     // O status oficial chega pelo evento do app; nada é gravado aqui, para que a resposta da ação nunca
     // sobrescreva um evento processado pelo polling enquanto a chamada estava em andamento.
     const latest = await this.requireOrder(channel, externalOrderId);
-    this.actionsSent.set(key, { action, at: this.now().getTime(), version: latest.version });
+    this.actionsSent.set(key, {
+      action,
+      at: this.now().getTime(),
+      status: latest.order.status,
+      cancellationPending: latest.cancellationPending,
+    });
     return latest;
   }
 
@@ -428,15 +438,25 @@ export class DeliveryInbox {
     // Reserva sem confirmação já vencida que esta chamada conferiu no app (null = nenhuma).
     const checkedStale = await this.checkStaleCancellation(adapter, externalOrderId, options);
     const reservedAt = this.now().toISOString();
-    // O que a reserva substituiu, para desfazê-la se a gravação falhar (ver reserveOrUndo).
+    // O que a reserva substituiu, para desfazê-la se a gravação falhar (ver reserveOrUndo) ou se o app recusar.
     let previous: DeliveryCancellationRequest | null = null;
-    let previousNeedsReview = false;
     let flaggedRetry = false;
     // Só mexe na reserva deste pedido: se um evento de cancelamento (CAR, CARF, CAN) chegou no meio, ele manda.
     const ours = (latest: DeliveryOrderRecord) => latest.cancellationRequest?.reservedAt === reservedAt;
+    // Volta ao que havia antes desta chamada: a reserva anterior (a incerta que esta repetição substituiu, ou null na
+    // primeira tentativa) e, se esta chamada pôs a marca de repetição, tira a marca. needsReview é recalculado pelos
+    // avisos que sobram (um evento gravado no meio pode ter pedido conferência).
+    const undoReservation = (latest: DeliveryOrderRecord) => {
+      if (!ours(latest)) return false;
+      latest.cancellationRequest = previous;
+      if (flaggedRetry) {
+        latest.reviewReasons = latest.reviewReasons.filter((item) => item !== UNCERTAIN_CANCELLATION_RETRIED);
+        latest.needsReview = latest.reviewReasons.length > 0;
+      }
+      return true;
+    };
     await this.reserveOrUndo(channel, externalOrderId, (latest) => {
       previous = latest.cancellationRequest;
-      previousNeedsReview = latest.needsReview;
       flaggedRetry = false;
       if (latest.order.status === "concluded" || latest.order.status === "cancelled") {
         throw new DeliveryMarketplaceError(channel, "conflict", "Pedido já finalizado não pode ser cancelado.");
@@ -461,23 +481,17 @@ export class DeliveryInbox {
       }
       latest.cancellationRequest = { state: "sending", reservedAt, code: reason.code };
       return true;
-    }, (latest) => {
-      if (!ours(latest)) return false;
-      latest.cancellationRequest = previous;
-      if (flaggedRetry) {
-        latest.reviewReasons = latest.reviewReasons.filter((item) => item !== UNCERTAIN_CANCELLATION_RETRIED);
-        latest.needsReview = previousNeedsReview;
-      }
-      return true;
-    });
+    }, undoReservation);
     try {
       await adapter.requestCancellation(externalOrderId, reason, details);
     } catch (error) {
-      // Recusa clara do app: nada foi aplicado e a reserva é desfeita. Qualquer outra falha pode ter chegado.
+      // Recusa clara do app: esta tentativa não foi aplicada e a reserva é desfeita, voltando à anterior (numa
+      // repetição, a incerta continua valendo: o primeiro pedido pode ter chegado). Qualquer outra falha pode ter chegado.
       const definite = error instanceof DeliveryMarketplaceError && DEFINITE_FAILURES.includes(error.code);
       await this.updateOrder(channel, externalOrderId, (latest) => {
+        if (definite) return undoReservation(latest);
         if (!ours(latest)) return false;
-        latest.cancellationRequest = definite ? null : { ...latest.cancellationRequest!, state: "uncertain" };
+        latest.cancellationRequest = { ...latest.cancellationRequest!, state: "uncertain" };
         return true;
       }).catch(() => undefined);
       throw error;
@@ -623,13 +637,14 @@ export class DeliveryInbox {
             : "A negociação já tinha sido respondida por fora (Portal do Parceiro); a resposta do PDV não foi aplicada. Confira o desfecho.",
         );
       }
-      // Recusa clara do app (4xx, limite de uso): nada foi aplicado e a reserva é desfeita. Qualquer outra falha
-      // (rede, 5xx, prazo) pode ter chegado: fica "incerta" e bloqueia novas tentativas.
+      // Recusa clara do app (4xx, limite de uso): esta resposta não foi aplicada e a reserva é desfeita, voltando à
+      // anterior (numa repetição, a incerta continua valendo: a primeira resposta pode ter chegado). Qualquer outra
+      // falha (rede, 5xx, prazo) pode ter chegado: fica "incerta" e bloqueia novas tentativas.
       const definite = error instanceof DeliveryMarketplaceError && DEFINITE_FAILURES.includes(error.code);
       await this.updateOrder(channel, externalOrderId, (latest) => {
         const dispute = ours(latest);
         if (!dispute) return false;
-        if (definite) dispute.response = null;
+        if (definite) dispute.response = previous;
         else dispute.response = { ...dispute.response!, state: "uncertain" };
         return true;
       }).catch(() => undefined);
