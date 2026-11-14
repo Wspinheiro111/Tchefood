@@ -85,7 +85,7 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
           {rec?.access_key && <div><b>Chave:</b> <span className="font-mono text-xs">{formatAccessKey(rec.access_key)}</span></div>}
           {rec?.message && <div className="rounded-xl bg-amber-50 p-2 text-amber-900">{rec.message}</div>}
           {(rec?.status === 'authorized' || rec?.status === 'contingency') && (
-            <div className="rounded-xl bg-rose-50 p-2 text-rose-700">O servidor não devolveu tudo o que o DANFE precisa (QR Code assinado, protocolo ou itens transmitidos): o DANFE não é impresso aqui. Use o DANFE da Focus.</div>
+            <div className="rounded-xl bg-rose-50 p-2 text-rose-700">O servidor não devolveu tudo o que o DANFE precisa (QR Code assinado, protocolo, itens transmitidos ou emitente igual ao da chave): o DANFE não é impresso aqui. Use o DANFE da Focus.</div>
           )}
           {rec?.environment && rec.danfe_path && (
             <a className="inline-flex items-center gap-1 font-bold text-verde underline" href={`${FOCUS_HOST[rec.environment]}${rec.danfe_path}`} target="_blank" rel="noreferrer">

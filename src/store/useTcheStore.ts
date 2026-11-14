@@ -3798,7 +3798,23 @@ export const useTcheStore = create<TcheState>()(
           const order = state.orders.find((o) => o.id === orderId);
           if (!order || order.status !== 'CLOSED') return fail('Comanda não encontrada ou não encerrada.');
           const prev = (state.nfceCloud ?? {})[orderId];
-          const record = nextNfceRecord(orderId, prev, outcome, nowMs);
+          const next = nextNfceRecord(orderId, prev, outcome, nowMs);
+          // Emitente congelado no primeiro documento: editar o cadastro depois não muda o DANFE.
+          const t = state.tenant;
+          const record: NfceCloudRecord =
+            next.status !== null && !next.issuer
+              ? {
+                  ...next,
+                  issuer: {
+                    name: t.name,
+                    legal_name: t.legal_name,
+                    cnpj: t.cnpj.toUpperCase().replace(/[^0-9A-Z]/g, ''),
+                    state_registration: t.state_registration ?? null,
+                    city: t.city,
+                    state: t.state,
+                  },
+                }
+              : next;
           // Situação fiscal da comanda só muda pelo documento (o upload ignora nfce_status/nfce_key).
           const fiscalChanged = record.status !== null && record.status !== (prev?.status ?? null);
           const keyed = record.status === 'authorized' || record.status === 'contingency' || record.status === 'cancelled';

@@ -20,7 +20,9 @@ const PAYLOAD = {
   valor_outras_despesas: 0,
   valor_total: 32,
   formas_pagamento: [{ forma_pagamento: '01', valor_pagamento: 32 }],
+  cnpj_emitente: '12345678000195',
 };
+const ISSUER = { name: 'Flip', legal_name: 'FLIP LTDA', cnpj: '12345678000195', state_registration: '0960000000', city: 'Santo Angelo', state: 'RS' };
 
 const authorizedBody = (over: Record<string, unknown> = {}) => ({
   status: 'authorized',
@@ -241,6 +243,7 @@ describe('DANFE da nota real', () => {
     qrcode_url: QR,
     issued_at: ISSUED,
     payload: PAYLOAD,
+    issuer: ISSUER,
   });
 
   it('sai só do que o servidor devolveu (payload transmitido, chave, protocolo, QR)', () => {
@@ -252,6 +255,10 @@ describe('DANFE da nota real', () => {
     expect(serverNfceDocument({ ...server(), protocol: null })).toBeNull();
     expect(serverNfceDocument({ ...server(), issued_at: null })).toBeNull();
     expect(serverNfceDocument({ ...server(), payload: null })).toBeNull();
+    // Emitente: sem o congelado, ou CNPJ diferente da chave, não imprime.
+    expect(serverNfceDocument({ ...server(), issuer: null })).toBeNull();
+    expect(serverNfceDocument({ ...server(), issuer: { ...ISSUER, cnpj: '48291736000155' } })).toBeNull();
+    expect(serverNfceDocument({ ...server(), payload: { ...PAYLOAD, cnpj_emitente: '48291736000155' } })).toBeNull();
     expect(serverNfceDocument({ ...server(), status: 'processing' })).toBeNull();
     const cont = serverNfceDocument({ ...server(), status: 'contingency', protocol: null })!;
     expect(cont.protocol).toBe('');
@@ -260,6 +267,7 @@ describe('DANFE da nota real', () => {
     expect(hom).toContain('SEM VALOR FISCAL');
     expect(hom).toContain('143260000000042');
     expect(hom).toContain('X-SALADA TRANSMITIDO');
+    expect(hom).toContain('FLIP LTDA');
     expect(hom).not.toContain('IBPT');
     const prod = danfeLines({ tenant: st().tenant, doc: d, environment: 'producao', showTributos: false }).top.join('\n');
     expect(prod).not.toContain('HOMOLOGACAO');
@@ -268,17 +276,22 @@ describe('DANFE da nota real', () => {
     expect(c).not.toContain('Protocolo de Autorizacao');
   });
 
-  it('editar o cardápio depois da autorização não muda o DANFE', async () => {
-    useTcheStore.setState({ cloud: session(st().tenant.id) });
+  it('editar o cardápio ou o cadastro da loja depois da autorização não muda o DANFE', async () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id), tenant: { ...st().tenant, cnpj: '12.345.678/0001-95', legal_name: 'RAZAO ORIGINAL' } });
     const id = closeOrder();
     useTcheStore.setState({ outbox: [], pullStatus: { last_pull_at: new Date().toISOString(), last_error: null, cloud_staff_unknown: 0 } });
     const f: FetchLike = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(authorizedBody()) });
     await syncOnce(f);
     const before = danfeLines({ tenant: st().tenant, doc: serverNfceDocument(st().nfceCloud[id]!)!, environment: 'homologacao', showTributos: false }).top.join('\n');
+    expect(before).toContain('RAZAO ORIGINAL');
     useTcheStore.setState({ products: st().products.map((p) => ({ ...p, name: 'NOME NOVO', price: 999, ncm: '99999999' })) });
+    useTcheStore.setState({ tenant: { ...st().tenant, name: 'LOJA NOVA', legal_name: 'RAZAO NOVA', state_registration: '111' } });
+    // Nova consulta (mesmo documento) não troca o emitente congelado.
+    st().applyNfceOutcome(id, doc(authorizedBody()));
     const after = danfeLines({ tenant: st().tenant, doc: serverNfceDocument(st().nfceCloud[id]!)!, environment: 'homologacao', showTributos: false }).top.join('\n');
     expect(after).toBe(before);
     expect(after).not.toContain('NOME NOVO');
+    expect(after).not.toContain('RAZAO NOVA');
   });
 
   it('payload incoerente ou malformado é descartado', () => {
@@ -292,6 +305,7 @@ describe('DANFE da nota real', () => {
     expect(bad({ ...PAYLOAD, items: [{ ...PAYLOAD.items[0], numero_item: 0 }] })).toBeNull();
     expect(bad({ ...PAYLOAD, items: [{ ...PAYLOAD.items[0], valor_bruto: 32.001 }] })).toBeNull();
     expect(bad({ ...PAYLOAD, cpf_destinatario: '123' })).toBeNull();
+    expect(bad({ ...PAYLOAD, cnpj_emitente: undefined })).toBeNull();
     expect(bad({ ...PAYLOAD, cpf_destinatario: '12345678909' })).toMatchObject({ cpf_destinatario: '12345678909' });
   });
 });

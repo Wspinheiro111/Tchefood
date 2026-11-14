@@ -772,6 +772,8 @@ export interface NfceDanfePayload {
   valor_total: number;
   formas_pagamento: Array<{ forma_pagamento: string; valor_pagamento: number }>;
   cpf_destinatario?: string;
+  /** CNPJ do emitente transmitido (o mesmo da chave). */
+  cnpj_emitente?: string;
 }
 
 /** Resultado da última chamada à emit-nfce que não trouxe documento. */
@@ -781,6 +783,16 @@ export type NfceCallProblem = 'invalid' | 'not_found' | 'conflict' | 'error' | '
  * NFC-e real de uma comanda, como a Edge Function emit-nfce respondeu. Tudo o que é
  * fiscal (chave, protocolo, número, QR Code) vem do servidor; o aparelho só guarda.
  */
+export interface NfceIssuer {
+  name: string;
+  legal_name: string;
+  /** Só letras e dígitos (14). */
+  cnpj: string;
+  state_registration: string | null;
+  city: string;
+  state: string;
+}
+
 export interface NfceCloudRecord {
   order_id: UUID;
   /** Status do documento no servidor; null enquanto não houve documento. */
@@ -798,6 +810,11 @@ export interface NfceCloudRecord {
   issued_at: ISODateTime | null;
   /** Itens, valores e pagamentos como foram transmitidos (o DANFE sai daqui). */
   payload: NfceDanfePayload | null;
+  /**
+   * Emitente (nome, razão social, IE, cidade) como estava no cadastro quando o documento
+   * apareceu pela primeira vez. O cabeçalho do DANFE sai daqui, não do cadastro atual.
+   */
+  issuer?: NfceIssuer | null;
   message: string | null;
   /** null = a última chamada trouxe o documento; senão, o que deu errado nela. */
   problem: NfceCallProblem | null;

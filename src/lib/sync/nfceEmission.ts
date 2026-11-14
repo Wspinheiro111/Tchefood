@@ -126,6 +126,9 @@ export function parseDanfePayload(value: unknown): NfceDanfePayload | null {
   if (c(produtos) + c(outras) - c(desconto) !== c(total)) return null;
   if (formas.reduce((s, f) => s + c(f.valor_pagamento), 0) !== c(total)) return null;
   const out: NfceDanfePayload = { items, valor_produtos: produtos, valor_desconto: desconto, valor_outras_despesas: outras, valor_total: total, formas_pagamento: formas };
+  const cnpj = text(p.cnpj_emitente, 14);
+  if (!cnpj || !/^[0-9A-Z]{14}$/.test(cnpj)) return null;
+  out.cnpj_emitente = cnpj;
   const cpf = text(p.cpf_destinatario, 11);
   if (cpf !== null) {
     if (!/^\d{11}$/.test(cpf)) return null;
@@ -233,6 +236,7 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
     danfe_path: null,
     issued_at: null,
     payload: null,
+    issuer: null,
     message: null,
     problem: null,
     attempts: 0,

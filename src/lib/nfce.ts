@@ -8,7 +8,7 @@
  * - Cada pagamento aprovado da rachadinha vira uma entrada em formas_pagamento
  *   com tipo_integracao = 1 (tpIntegra — pagamento integrado TEF/SmartPOS).
  */
-import type { NfceDanfePayload, Order, OrderItem, Payment, Product, Tenant } from '../types';
+import type { NfceDanfePayload, NfceIssuer, Order, OrderItem, Payment, Product, Tenant } from '../types';
 import type { DanfeDoc } from './receipts';
 import { allocateCents, fromCents, toCents } from './money';
 import { sha1Hex } from './sha1';
@@ -334,6 +334,7 @@ export interface ServerNfceFields {
   qrcode_url: string | null;
   issued_at: string | null;
   payload: NfceDanfePayload | null;
+  issuer?: NfceIssuer | null;
 }
 
 /**
@@ -351,6 +352,8 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
   if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key) || !server.issued_at || !server.payload) return null;
   if (authorized && !server.protocol) return null;
   const parsed = parseAccessKey(key);
+  // Emitente: o CNPJ transmitido e o congelado precisam ser os da chave; senão, só o DANFE da Focus.
+  if (!server.issuer || server.issuer.cnpj !== parsed.cnpj || server.payload.cnpj_emitente !== parsed.cnpj) return null;
   return {
     access_key: key,
     protocol: authorized ? server.protocol! : '',
@@ -358,6 +361,7 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
     qr_url: server.qrcode_url!,
     tributos_federais: 0,
     tributos_estaduais: 0,
+    issuer: server.issuer,
     payload: {
       ...server.payload,
       numero: server.number ?? parsed.numero,

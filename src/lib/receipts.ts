@@ -3,7 +3,7 @@
  * Usados tanto pelo simulador visual quanto pelos drivers reais
  * (PlugPag printText / Stone printer), por isso são texto puro.
  */
-import type { DiningTable, NfceDanfePayload, Order, OrderItem, Payment, Product, StaffUser, Tenant } from '../types';
+import type { DiningTable, NfceDanfePayload, NfceIssuer, Order, OrderItem, Payment, Product, StaffUser, Tenant } from '../types';
 import { formatBRL, formatQty } from './money';
 import { CONSULTA_URL_RS, formatAccessKey } from './nfce';
 
@@ -59,7 +59,7 @@ function formatCnpj(c: string): string {
   return c.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5');
 }
 
-function header(tenant: Tenant): string[] {
+function header(tenant: Pick<Tenant, 'name' | 'legal_name' | 'cnpj' | 'city' | 'state'>): string[] {
   return [center(tenant.name.toUpperCase()), ...wrap(tenant.legal_name).map(center), center(`CNPJ ${formatCnpj(tenant.cnpj)}`), center(`${tenant.city}/${tenant.state}`)];
 }
 
@@ -155,6 +155,8 @@ export interface DanfeDoc {
   tributos_federais: number;
   tributos_estaduais: number;
   payload: NfceDanfePayload & { numero: number; serie: number };
+  /** Nota real: emitente congelado (ver NfceCloudRecord.issuer). Sem ele, usa o cadastro (demonstração). */
+  issuer?: NfceIssuer;
 }
 
 /** DANFE NFC-e simplificado (layout 58mm). O QR Code é desenhado à parte. */
@@ -171,9 +173,10 @@ export function danfeLines(params: {
   const { doc } = params;
   const homologacao = (params.environment ?? 'homologacao') === 'homologacao';
   const pl = doc.payload;
+  const em = doc.issuer ?? params.tenant;
   const top: string[] = [
-    ...header(params.tenant),
-    center(`IE ${params.tenant.state_registration ?? 'ISENTO'}`),
+    ...header(em),
+    center(`IE ${em.state_registration ?? 'ISENTO'}`),
     LINE,
     ...wrap('DANFE NFC-e - Documento Auxiliar da Nota Fiscal de Consumidor Eletronica').map(center),
     LINE,
