@@ -93,6 +93,8 @@ describe('2. faturamento por forma', () => {
     expect(csv).toContain('Estorno feito na maquininha');
     expect(csv).toContain('sem turno de caixa aberto');
     expect(csv).toContain('Obs.: SOMENTE os registros gravados NESTE aparelho');
+    // Compras por NF-e descem da nuvem: o aviso manda não somar entre aparelhos.
+    expect(csv).toContain('NÃO some as compras de aparelhos diferentes');
     expect(toPrintableHtml(revenueDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g' }))).toContain('NESTE aparelho');
     expect(by['APP:ifood']).toMatchObject({ gross: 80, fee: 9.6, count: 1, marketplace: true });
     expect(r.totalGross).toBe(260);

@@ -55,7 +55,7 @@ export interface ReportDoc {
  * mas ainda não devolve; src/lib/sync/cloudPull.ts). Todo relatório diz isso.
  */
 export const DEVICE_ONLY =
-  'SOMENTE os registros gravados NESTE aparelho. Vendas, pagamentos, caixa e estoque de outro aparelho da loja não estão aqui (a nuvem ainda não devolve esses dados). Com mais de um aparelho, gere o relatório em cada um.';
+  'SOMENTE os registros gravados NESTE aparelho. Vendas, pagamentos, caixa e estoque de outro aparelho da loja não estão aqui (a nuvem ainda não devolve esses dados). Com mais de um aparelho, gere o relatório em cada um e some. EXCEÇÃO: as compras por NF-e vêm da nuvem e são as mesmas em todos os aparelhos ligados a ela; NÃO some as compras de aparelhos diferentes.';
 
 /** Aviso de registros que ficaram de fora por data inválida (nunca somem calados). */
 const invalid = (n: number, what: string): string[] =>
