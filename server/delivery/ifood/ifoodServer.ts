@@ -467,13 +467,21 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           // do PIN; id de outra negociação, 409 antes do PIN. Nunca vale "a negociação de agora" por padrão.
           const disputeId = typeof body.disputeId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(body.disputeId) ? body.disputeId : null;
           if (!disputeId) return { status: 400, body: { error: "Informe a negociação que está respondendo." } };
-          const checked = await options.inbox.checkDisputeDecision("ifood", orderId, decision, disputeId);
+          // Repetir uma resposta que ficou sem confirmação (falha incerta do iFood, ou processo que caiu no meio) é
+          // decisão do gerente depois de conferir no Portal do Parceiro; a decisão vai junto da autorização.
+          if (body.confirmUncertainRetry !== undefined && typeof body.confirmUncertainRetry !== "boolean") {
+            return { status: 400, body: { error: "confirmUncertainRetry precisa ser true ou false." } };
+          }
+          const confirmUncertainRetry = body.confirmUncertainRetry === true;
+          const checked = await options.inbox.checkDisputeDecision("ifood", orderId, decision, disputeId, { confirmUncertainRetry });
           // O registro do gerente leva a negociação e a resposta como vai ao iFood (aceite com motivo, recusa, valor ou
           // prazo da proposta); a resposta só vai para essa negociação.
-          const details = JSON.parse(JSON.stringify({ disputeId: checked.disputeId, ...checked.decision })) as Record<string, unknown>;
+          const details = JSON.parse(
+            JSON.stringify({ disputeId: checked.disputeId, ...checked.decision, ...(confirmUncertainRetry ? { confirmUncertainRetry } : {}) }),
+          ) as Record<string, unknown>;
           return await withManager(token, { ...manager, action: "DELIVERY_DISPUTE", externalOrderId: orderId, merchantExternalId: null, details }, async () => ({
             status: 200,
-            body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision, checked.disputeId)),
+            body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision, checked.disputeId, { confirmUncertainRetry })),
           }));
         }
         return { status: 405, body: { error: "Método não permitido." } };
@@ -565,7 +573,7 @@ function parseManager(raw: unknown): Omit<ManagerRequest, "action" | "externalOr
   return { managerPin, performedBy, requestId, reason };
 }
 
-// Corpo da rota /dispute (sempre com disputeId da negociação mostrada e authorization):
+// Corpo da rota /dispute (sempre com disputeId da negociação mostrada e authorization; confirmUncertainRetry opcional):
 //   aceite      {kind: "accept", reason?, detailReason?}  reason = código da lista do iFood (obrigatório se houver lista)
 //   recusa      {kind: "reject", reason}
 //   proposta    {kind: "alternative", alternativeId, amountCents?}                                (REFUND/BENEFIT)

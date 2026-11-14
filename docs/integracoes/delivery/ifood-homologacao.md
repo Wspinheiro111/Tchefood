@@ -50,7 +50,8 @@ oferecer outra pausa. Recusa clara do iFood (4xx) continua com o código do erro
 
 Se o iFood aceitou e o banco falhou logo depois (cancelamento e negociação): 503 com `code: "sent_not_saved"` e "Enviado ao
 iFood, mas não deu para gravar; confira o pedido antes de repetir." O pedido fica reservado (nova tentativa recusada) até o
-evento do app chegar. A reserva de cancelamento sem confirmação (chamada em andamento, ou falha sem resposta clara: rede,
+evento do app chegar (na negociação, passados 60 s, a repetição com `confirmUncertainRetry` volta 422 do iFood; ver
+abaixo). A reserva de cancelamento sem confirmação (chamada em andamento, ou falha sem resposta clara: rede,
 5xx) não se libera só pelo tempo: passados 10 min sem evento nenhum, a nova tentativa só vai se o corpo trouxer
 `confirmUncertainRetry: true` (o gerente conferiu no Portal do Parceiro que o pedido não está cancelado nem com
 cancelamento em análise; a decisão fica em `audit_logs.metadata.details`). Sem ela: 409. Dentro dos 10 min, o 409
@@ -66,6 +67,21 @@ CARF (recusado) e CAN (https://developer.ifood.com.br/en-US/docs/guides/modules/
 diz o que o iFood faz com um `requestCancellation` repetido (a página de rotas só lista a rota, 300/min:
 https://developer.ifood.com.br/en-US/docs/getting-started/documentation/rate-limit/; as de cancelamento e workflow não
 abriram). Não é garantia de idempotência do iFood.
+
+Resposta à negociação sem confirmação (falha incerta do iFood: rede, 5xx; ou reserva "em andamento" com mais de 60 s,
+de um processo que caiu no meio) não espera o app: se ela não chegou, o iFood aplica o `timeoutAction` no fim do prazo
+(ex.: aceita o cancelamento que a loja recusou). Sem `confirmUncertainRetry: true` no corpo: 409 antes do PIN, dizendo
+que a resposta anterior pode não ter chegado, para conferir no Portal do Parceiro se a negociação já tem resposta e
+repetir confirmando (com o prazo `expiresAt`, quando houver). Com ela, a resposta vai de novo (a decisão fica em
+`audit_logs.metadata.details`). Repetir é seguro do lado do iFood: se a primeira chegou, a segunda volta 422
+`DISPUTE_ALREADY_ANSWERED`, a negociação fica como respondida e vira pendência (409). Reserva "em andamento" com menos de
+60 s continua 409 (a chamada ainda pode estar no ar); `disputeId` continua obrigatório e conferido.
+
+Se a gravação da reserva (cancelamento ou resposta à negociação) falha com erro do banco, a reserva pode ter gravado e só
+a resposta do banco se perdido (timeout depois do commit). Como o iFood ainda não foi chamado, o servidor desfaz a reserva
+dessa chamada (volta o que havia antes) antes de responder 503 "Banco indisponível; tente de novo." e registrar a
+autorização como `failed`: a nova tentativa segue normal, sem esperar o prazo nem pedir conferência, e a guarda de venda
+não acusa um cancelamento que não foi pedido. Se o desfazer também falhar, a reserva fica (como antes da correção).
 
 | Método e rota | O que faz |
 |---|---|
@@ -219,7 +235,10 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
 - `server/delivery/deliverySaleGuard.ts` diz se um pedido do app pode virar venda, produção (cozinha/KDS) ou NFC-e.
   `deliverySaleBlockers(registro)` devolve os motivos que impedem (lista vazia = pode): pedido de teste do app,
   pedido gravado sem o detalhe (`detailPending`), pedido cancelado, cancelamento em análise no app, cancelamento pedido
-  pela loja (`cancellationRequest` em qualquer estado: em andamento e sem confirmação podem já ter chegado ao iFood) e
+  pela loja (`cancellationRequest` em qualquer estado: em andamento e sem confirmação podem já ter chegado ao iFood;
+  se o iFood concluir o pedido (CON) com o cancelamento em análise ou com a reserva ainda sem evento, os dois são
+  zerados e o pedido vai para conferência: "O app concluiu o pedido com o cancelamento ainda em análise: confira no
+  Portal do Parceiro antes de lançar.", senão a venda ficaria bloqueada para sempre) e
   negociação aberta (`dispute`: pode virar cancelamento ou mudar o valor). A negociação só vira aviso, em vez de
   bloqueio, quando a recusa da loja foi confirmada pelo iFood (falta só o fechamento) ou quando é `AFTER_DELIVERY` de
   pedido concluído (a comida foi entregue; muda o valor a receber, não se houve venda). Aceite ou proposta confirmados

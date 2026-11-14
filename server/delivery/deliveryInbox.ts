@@ -53,13 +53,32 @@ export type DeliveryOrderRecord = {
 // app, mesmo com dois pedidos ao mesmo tempo ou com o banco falhando depois que o app aceitou.
 //   sending   reservada, chamada em andamento (ou o processo caiu no meio: tratada como incerta)
 //   sent      o app aceitou a resposta; falta o evento que fecha a negociação
-//   uncertain a chamada falhou sem resposta clara (rede, 5xx): pode ter chegado; só o evento do app (ou o prazo)
-//             resolve, nunca uma nova tentativa
+//   uncertain a chamada falhou sem resposta clara (rede, 5xx): pode ter chegado, ou não
+// "uncertain" (e "sending" com mais de DISPUTE_RESPONSE_STALE_MS) não se libera sozinho, mas esperar o evento do app
+// não serve: se a resposta não chegou, o app aplica a ação padrão no fim do prazo (ex.: aceita o cancelamento que a
+// loja recusou). A nova tentativa vai com a conferência do gerente no Portal do Parceiro (confirmUncertainRetry).
+// Repetir é seguro do lado do app: se a primeira chegou, o iFood recusa a segunda (422 DISPUTE_ALREADY_ANSWERED,
+// tratado em respondToDispute).
 export type DeliveryDisputeResponse = {
   decision: DeliveryDisputeDecision;
   state: "sending" | "sent" | "uncertain";
   reservedAt: string;
 };
+
+// Resposta "sending" mais velha que isto é de uma chamada que não termina mais (o adapter desiste antes: o iFood tem
+// timeout de 15 s) ou de um processo que caiu: tratada como incerta.
+export const DISPUTE_RESPONSE_STALE_MS = 60_000;
+
+export type DeliveryDisputeOptions = {
+  // O gerente conferiu no Portal do Parceiro que a negociação ainda não tem resposta. Só vale para repetir uma
+  // resposta sem confirmação ("uncertain", ou "sending" vencida).
+  confirmUncertainRetry?: boolean;
+};
+
+// Pedido que o app concluiu com o cancelamento ainda em análise (CAR sem CARF/CAN) ou com o pedido de cancelamento da
+// loja ainda sem evento: o cancelamento não vale mais, mas não se sabe o que o app fez com ele.
+export const CONCLUDED_WITH_PENDING_CANCELLATION =
+  "O app concluiu o pedido com o cancelamento ainda em análise: confira no Portal do Parceiro antes de lançar.";
 
 // Pedido de cancelamento da loja, reservado ANTES da chamada ao app (mesmo esquema da resposta de negociação):
 // dois aparelhos ao mesmo tempo, ou uma nova tentativa depois de o banco falhar com o app já tendo aceitado,
@@ -386,7 +405,16 @@ export class DeliveryInbox {
     // Reserva sem confirmação já vencida que esta chamada conferiu no app (null = nenhuma).
     const checkedStale = await this.checkStaleCancellation(adapter, externalOrderId, options);
     const reservedAt = this.now().toISOString();
-    await this.updateOrder(channel, externalOrderId, (latest) => {
+    // O que a reserva substituiu, para desfazê-la se a gravação falhar (ver reserveOrUndo).
+    let previous: DeliveryCancellationRequest | null = null;
+    let previousNeedsReview = false;
+    let flaggedRetry = false;
+    // Só mexe na reserva deste pedido: se um evento de cancelamento (CAR, CARF, CAN) chegou no meio, ele manda.
+    const ours = (latest: DeliveryOrderRecord) => latest.cancellationRequest?.reservedAt === reservedAt;
+    await this.reserveOrUndo(channel, externalOrderId, (latest) => {
+      previous = latest.cancellationRequest;
+      previousNeedsReview = latest.needsReview;
+      flaggedRetry = false;
       if (latest.order.status === "concluded" || latest.order.status === "cancelled") {
         throw new DeliveryMarketplaceError(channel, "conflict", "Pedido já finalizado não pode ser cancelado.");
       }
@@ -405,13 +433,20 @@ export class DeliveryInbox {
               : `Já existe um pedido de cancelamento em andamento ou sem confirmação; confira o pedido no app antes de repetir. Se ele continuar sem confirmação, a repetição com a conferência do gerente vale a partir de ${brasiliaTime(Date.parse(current.reservedAt) + CANCELLATION_RESERVATION_TTL_MS)} (horário de Brasília).`,
           );
         }
+        flaggedRetry = !latest.reviewReasons.includes(UNCERTAIN_CANCELLATION_RETRIED);
         flag(latest, UNCERTAIN_CANCELLATION_RETRIED);
       }
       latest.cancellationRequest = { state: "sending", reservedAt, code: reason.code };
       return true;
+    }, (latest) => {
+      if (!ours(latest)) return false;
+      latest.cancellationRequest = previous;
+      if (flaggedRetry) {
+        latest.reviewReasons = latest.reviewReasons.filter((item) => item !== UNCERTAIN_CANCELLATION_RETRIED);
+        latest.needsReview = previousNeedsReview;
+      }
+      return true;
     });
-    // Só mexe na reserva deste pedido: se um evento de cancelamento (CAR, CARF, CAN) chegou no meio, ele manda.
-    const ours = (latest: DeliveryOrderRecord) => latest.cancellationRequest?.reservedAt === reservedAt;
     try {
       await adapter.requestCancellation(externalOrderId, reason, details);
     } catch (error) {
@@ -491,10 +526,11 @@ export class DeliveryInbox {
     externalOrderId: string,
     decision: DeliveryDisputeDecision,
     expectedDisputeId: string,
+    options: DeliveryDisputeOptions = {},
   ): Promise<{ disputeId: string; decision: DeliveryDisputeDecision }> {
     const record = await this.requireOrder(channel, externalOrderId);
     assertSameDispute(channel, record, expectedDisputeId);
-    return { disputeId: record.dispute!.id, decision: resolveDisputeDecision(channel, record, decision, this.now()) };
+    return { disputeId: record.dispute!.id, decision: resolveDisputeDecision(channel, record, decision, this.now(), options) };
   }
 
   // Resposta da loja a uma negociação aberta pelo app (cliente pediu cancelamento, reembolso...). A resposta é
@@ -503,43 +539,66 @@ export class DeliveryInbox {
   // negociação gravada (motivo do aceite da lista, valor até o teto, prazo e motivo permitidos).
   // expectedDisputeId (obrigatório): a negociação que o gerente aprovou. Se o app fechou essa e abriu outra no meio
   // (polling entre a conferência e a reserva), a resposta não vai para a nova: conflito, e a tela mostra a nova.
+  // options.confirmUncertainRetry: repetir uma resposta sem confirmação (ver DeliveryDisputeResponse).
   async respondToDispute(
     channel: DeliveryChannelKey,
     externalOrderId: string,
     decision: DeliveryDisputeDecision,
     expectedDisputeId: string,
+    options: DeliveryDisputeOptions = {},
   ): Promise<DeliveryOrderRecord> {
     const adapter = this.adapter(channel);
     const reservedAt = this.now().toISOString();
     let disputeId = "";
     let resolved: DeliveryDisputeDecision = decision;
-    await this.updateOrder(channel, externalOrderId, (latest) => {
-      assertSameDispute(channel, latest, expectedDisputeId);
-      resolved = resolveDisputeDecision(channel, latest, decision, this.now());
-      const dispute = latest.dispute!;
-      disputeId = dispute.id;
-      dispute.response = { decision: resolved, state: "sending", reservedAt };
-      return true;
-    });
+    // Resposta sem confirmação que esta tentativa substitui (null = primeira resposta).
+    let previous: DeliveryDisputeResponse | null = null;
     // Só mexe na reserva desta resposta: se o app fechou ou trocou a negociação no meio, o evento manda.
     const ours = (latest: DeliveryOrderRecord) =>
       latest.dispute && latest.dispute.id === disputeId && latest.dispute.response?.reservedAt === reservedAt ? latest.dispute : null;
+    await this.reserveOrUndo(channel, externalOrderId, (latest) => {
+      assertSameDispute(channel, latest, expectedDisputeId);
+      resolved = resolveDisputeDecision(channel, latest, decision, this.now(), options);
+      const dispute = latest.dispute!;
+      disputeId = dispute.id;
+      previous = dispute.response ?? null;
+      dispute.response = { decision: resolved, state: "sending", reservedAt };
+      return true;
+    }, (latest) => {
+      const dispute = ours(latest);
+      if (!dispute) return false;
+      dispute.response = previous;
+      return true;
+    });
     try {
       await adapter.respondToDispute(disputeId, resolved);
     } catch (error) {
       // O app diz que a negociação já tinha resposta (iFood: 422 DISPUTE_ALREADY_ANSWERED, ex.: respondida pelo
-      // Portal). A resposta DESTA tentativa não foi aplicada: a reserva sai (não fica registrada como enviada), a
-      // negociação fica marcada como respondida (nada mais pode ser enviado) e o desfecho vem pelo evento do app.
+      // Portal, ou a resposta anterior sem confirmação tinha chegado). A resposta DESTA tentativa não foi aplicada: a
+      // reserva sai (não fica registrada como enviada), a negociação fica marcada como respondida (nada mais pode ser
+      // enviado) e o desfecho vem pelo evento do app.
       if (error instanceof DeliveryMarketplaceError && error.providerCode === "DISPUTE_ALREADY_ANSWERED") {
+        const retried = previous !== null;
         await this.updateOrder(channel, externalOrderId, (latest) => {
           const dispute = ours(latest);
           if (!dispute) return false;
           dispute.response = null;
           dispute.respondedAt = this.now().toISOString();
-          flag(latest, "A negociação já tinha sido respondida por fora (talvez pelo Portal do Parceiro); a resposta do PDV não foi aplicada: confira o desfecho.");
+          flag(
+            latest,
+            retried
+              ? "A negociação já tinha resposta no app (a resposta anterior do PDV pode ter chegado, ou alguém respondeu pelo Portal do Parceiro); a repetição não foi aplicada: confira o desfecho."
+              : "A negociação já tinha sido respondida por fora (talvez pelo Portal do Parceiro); a resposta do PDV não foi aplicada: confira o desfecho.",
+          );
           return true;
         });
-        throw new DeliveryMarketplaceError(channel, "conflict", "A negociação já tinha sido respondida por fora (Portal do Parceiro); a resposta do PDV não foi aplicada. Confira o desfecho.");
+        throw new DeliveryMarketplaceError(
+          channel,
+          "conflict",
+          retried
+            ? "A negociação já tinha resposta no app (a resposta anterior pode ter chegado, ou foi respondida pelo Portal do Parceiro); a repetição não foi aplicada. Confira o desfecho."
+            : "A negociação já tinha sido respondida por fora (Portal do Parceiro); a resposta do PDV não foi aplicada. Confira o desfecho.",
+        );
       }
       // Recusa clara do app (4xx, limite de uso): nada foi aplicado e a reserva é desfeita. Qualquer outra falha
       // (rede, 5xx, prazo) pode ter chegado: fica "incerta" e bloqueia novas tentativas.
@@ -588,6 +647,27 @@ export class DeliveryInbox {
         }
       }
     });
+  }
+
+  // Grava a reserva (antes de chamar o app). Se a gravação falhar com erro que não é de regra (DeliveryMarketplaceError
+  // do próprio change) nem de versão esgotada, o banco pode ter gravado e só a resposta se perdido (timeout depois do
+  // commit): desfaz a reserva DESTA chamada (undo só mexe se ela estiver lá), para que ela não bloqueie a próxima
+  // tentativa como se tivesse chegado ao app. Seguro porque o app ainda não foi chamado. Falha do desfazer é engolida
+  // (a reserva fica, como antes); o erro original sobe.
+  private async reserveOrUndo(
+    channel: DeliveryChannelKey,
+    externalOrderId: string,
+    reserve: (record: DeliveryOrderRecord) => boolean,
+    undo: (record: DeliveryOrderRecord) => boolean,
+  ): Promise<void> {
+    try {
+      await this.updateOrder(channel, externalOrderId, reserve);
+    } catch (error) {
+      if (!(error instanceof DeliveryMarketplaceError) && !(error instanceof DeliveryConcurrencyError)) {
+        await this.updateOrder(channel, externalOrderId, undo).catch(() => undefined);
+      }
+      throw error;
+    }
   }
 
   // Serializa leitura-alteração-gravação de um mesmo pedido dentro deste processo.
@@ -858,6 +938,12 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
         if (before !== "cancelled" && before !== "placed") {
           flag(record, "Pedido cancelado pelo app depois de aceito: confira se já foi preparado ou impresso.");
         }
+      } else if (record.order.status === "concluded" && (record.cancellationPending || record.cancellationRequest)) {
+        // Concluído com o cancelamento em análise (CAR sem CARF/CAN) ou com o pedido de cancelamento da loja ainda sem
+        // evento: nenhum evento de cancelamento vem mais para soltar o pedido, e a venda ficaria bloqueada para sempre.
+        record.cancellationPending = false;
+        record.cancellationRequest = null;
+        flag(record, CONCLUDED_WITH_PENDING_CANCELLATION);
       }
     }
   }
@@ -944,22 +1030,26 @@ function resolveDisputeDecision(
   record: DeliveryOrderRecord,
   decision: DeliveryDisputeDecision,
   now: Date,
+  options: DeliveryDisputeOptions = {},
 ): DeliveryDisputeDecision {
   const dispute = record.dispute;
   const invalid = (message: string) => new DeliveryMarketplaceError(channel, "invalid_request", message);
-  if (!dispute) throw new DeliveryMarketplaceError(channel, "conflict", "Este pedido não tem negociação aberta.");
-  if (dispute.respondedAt || dispute.response) {
-    throw new DeliveryMarketplaceError(
-      channel,
-      "conflict",
-      dispute.response?.state === "sent" || dispute.respondedAt
-        ? "A negociação já foi respondida; aguarde o app."
-        : "Já existe uma resposta em andamento ou sem confirmação; aguarde o app fechar a negociação.",
-    );
+  const conflict = (message: string) => new DeliveryMarketplaceError(channel, "conflict", message);
+  if (!dispute) throw conflict("Este pedido não tem negociação aberta.");
+  const expired = Boolean(dispute.expiresAt && Date.parse(dispute.expiresAt) <= now.getTime());
+  const response = dispute.response;
+  if (dispute.respondedAt || response?.state === "sent") throw conflict("A negociação já foi respondida; aguarde o app.");
+  if (response) {
+    // Resposta sem confirmação: pode não ter chegado, e esperar deixa o app aplicar a ação padrão no fim do prazo.
+    const unconfirmed = response.state === "uncertain" || Date.parse(response.reservedAt) + DISPUTE_RESPONSE_STALE_MS <= now.getTime();
+    if (!unconfirmed) throw conflict("Já existe uma resposta em andamento; aguarde alguns segundos e confira o pedido.");
+    if (!expired && options.confirmUncertainRetry !== true) {
+      throw conflict(
+        `A resposta anterior ficou sem confirmação do app e pode não ter chegado. Confira no Portal do Parceiro se a negociação já foi respondida; se não foi, repita confirmando que conferiu${dispute.expiresAt ? ` (prazo da negociação: ${dispute.expiresAt})` : ""}.`,
+      );
+    }
   }
-  if (dispute.expiresAt && Date.parse(dispute.expiresAt) <= now.getTime()) {
-    throw new DeliveryMarketplaceError(channel, "conflict", "O prazo da negociação acabou; o app aplica a decisão padrão.");
-  }
+  if (expired) throw conflict("O prazo da negociação acabou; o app aplica a decisão padrão.");
   if (decision.kind === "accept") {
     // Negociação gravada antes destes campos existirem: tratada como sem lista.
     const reasons = dispute.acceptCancellationReasons ?? [];

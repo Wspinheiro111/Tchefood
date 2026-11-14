@@ -623,6 +623,34 @@ describe("servidor do iFood: alçada de gerente", () => {
     expect(spy).toHaveBeenCalledWith(current, { kind: "accept" });
   });
 
+  it("resposta à negociação sem confirmação (iFood 503): só repete com a conferência do gerente, que fica no registro", async () => {
+    const { sandbox, poller, call, manager, api } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const disputeId = sandbox.openDispute(id, { handshakeType: "PREPARATION_TIME", timeoutAction: "ACCEPT_CANCELLATION" });
+    await poller.runOnce();
+    const path = `/ifood/orders/${id}/dispute`;
+    const base = { kind: "reject", reason: "Já está saindo", disputeId };
+    sandbox.failNext("/disputes/", 503);
+    expect((await call("POST", path, { ...base, authorization: auth() })).status).toBe(503);
+    expect(manager.results.at(-1)?.outcome).toBe("uncertain");
+    const send = vi.spyOn(api, "respondToDispute");
+    // Sem a conferência: 409 antes do PIN, explicando que a resposta anterior pode não ter chegado.
+    const authorizedBefore = manager.authorized.length;
+    const blocked = await call("POST", path, { ...base, authorization: auth() });
+    expect(blocked).toMatchObject({ status: 409, body: { code: "conflict", error: expect.stringMatching(/pode não ter chegado.*Portal do Parceiro/) } });
+    expect(manager.authorized).toHaveLength(authorizedBefore);
+    expect((await call("POST", path, { ...base, confirmUncertainRetry: "sim", authorization: auth() })).status).toBe(400);
+    expect(send).not.toHaveBeenCalled();
+    const retried = await call("POST", path, { ...base, confirmUncertainRetry: true, authorization: auth() });
+    expect(retried.status).toBe(200);
+    expect(send).toHaveBeenCalledOnce();
+    expect(manager.authorized.at(-1)?.details).toMatchObject({ disputeId, kind: "reject", confirmUncertainRetry: true });
+    expect(manager.authorized[0]?.details).not.toHaveProperty("confirmUncertainRetry");
+    // O iFood recebeu a resposta: o prazo não aplica o timeoutAction.
+    expect(sandbox.eventHistory().filter((event) => event.code === "HSS")).toHaveLength(1);
+  });
+
   it("a autorização leva o que o gerente aprovou (motivo do iFood, resposta, duração da pausa)", async () => {
     const { sandbox, poller, call, manager } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
