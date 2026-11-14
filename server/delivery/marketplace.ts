@@ -240,6 +240,8 @@ export type DeliveryEvent = {
   createdAt: string;
   // Negociação aberta pelo app (só nos eventos "dispute_opened").
   dispute: DeliveryDispute | null;
+  // Andamento ou desfecho da negociação (só nos eventos "dispute_settled"; null = não deu para ler).
+  settlement?: DeliveryDisputeSettlement | null;
   // Evento que não deu para ler inteiro (ex.: código ausente). Se tem pedido, entra no histórico do pedido e vira
   // pendência para a loja conferir; nunca é descartado em silêncio.
   malformed?: boolean;
@@ -249,15 +251,68 @@ export type DeliveryEvent = {
 // e a loja responde dentro do prazo; sem resposta, o app aplica a ação padrão dele.
 export type DeliveryDispute = {
   id: string;
-  // O que o cliente pediu, no código do app (ex.: "CANCELLATION"). Só exibido.
+  // O que o cliente pediu, no código do app (iFood: CANCELLATION, PARTIAL_CANCELLATION, PROPOSED_AMOUNT_REFUND...).
   action: string | null;
+  // Tipo do fluxo (iFood: AFTER_DELIVERY, DELAY, PREPARATION_TIME...). DELAY não aceita recusa.
+  handshakeType: string | null;
+  // O que o app faz se a loja não responder no prazo (iFood: ACCEPT_CANCELLATION, REJECT_CANCELLATION, VOID).
+  timeoutAction: string | null;
   message: string | null;
   expiresAt: string | null;
   // Contrapropostas que a loja pode oferecer em vez de aceitar/recusar.
-  alternatives: Array<{ id: string; type: string | null; description: string | null }>;
+  alternatives: DeliveryDisputeAlternative[];
+  // Motivos aceitos pelo app para o aceite (iFood: acceptCancellationReasons). Lista vazia = o aceite vai sem motivo;
+  // com lista, o aceite exige um motivo dela.
+  acceptCancellationReasons: string[];
 };
 
-export type DeliveryDisputeDecision = { kind: "accept" } | { kind: "reject"; reason: string } | { kind: "alternative"; alternativeId: string };
+export type DeliveryDisputeAlternative = {
+  id: string;
+  // iFood: REFUND, BENEFIT ou ADDITIONAL_TIME.
+  type: string | null;
+  description: string | null;
+  // REFUND/BENEFIT: teto do valor que a loja pode oferecer, em centavos (null = o app não informou).
+  maxAmountCents: number | null;
+  currency: string | null;
+  // ADDITIONAL_TIME: minutos e motivos que o app aceita na proposta de novo prazo.
+  allowedAdditionalTimeInMinutes: number[];
+  allowedAdditionalTimeReasons: string[];
+};
+
+// Resposta da loja. Aceite: motivo da lista do app quando ela existe. Proposta: valor (reembolso/benefício) ou
+// minutos + motivo (mais prazo); o tipo da proposta (alternativeType) é preenchido pela caixa de entrada a partir
+// da negociação gravada, nunca pelo aparelho.
+export type DeliveryDisputeDecision =
+  | { kind: "accept"; reason?: string; detailReason?: string }
+  | { kind: "reject"; reason: string }
+  | {
+      kind: "alternative";
+      alternativeId: string;
+      alternativeType?: string;
+      amountCents?: number;
+      currency?: string;
+      additionalTimeInMinutes?: number;
+      additionalTimeReason?: string;
+    };
+
+// Evento do app sobre a negociação. "alternative_replied" = a contraproposta da loja foi entregue e o app espera o
+// cliente: a negociação continua aberta. accepted/rejected/expired são o desfecho.
+export type DeliveryDisputeSettlementStatus = "accepted" | "rejected" | "expired" | "alternative_replied" | "unknown";
+
+export type DeliveryDisputeSettlement = {
+  disputeId: string | null;
+  status: DeliveryDisputeSettlementStatus;
+  rawStatus: string | null;
+  reason: string | null;
+  // Contraproposta escolhida (quando o desfecho é uma das alternativas).
+  selectedAlternative: {
+    id: string | null;
+    type: string | null;
+    amountCents: number | null;
+    additionalTimeInMinutes: number | null;
+    additionalTimeReason: string | null;
+  } | null;
+};
 
 export type DeliveryCancellationReason = {
   code: string;
@@ -323,6 +378,8 @@ export class DeliveryMarketplaceError extends Error {
     readonly code: DeliveryMarketplaceErrorCode,
     message: string,
     readonly httpStatus: number | null = null,
+    // Código de erro do próprio app (ex.: iFood "DISPUTE_ALREADY_ANSWERED"), quando ele manda.
+    readonly providerCode: string | null = null,
   ) {
     super(message);
     this.name = "DeliveryMarketplaceError";

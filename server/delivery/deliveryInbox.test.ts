@@ -385,8 +385,8 @@ describe("caixa de entrada de delivery", () => {
     await inbox.runCycle();
     await inbox.performAction("ifood", id, "confirm");
     await inbox.runCycle();
-    sandbox.openDispute(id);
-    sandbox.pushRawEvent({ id: "hss-1", code: "HSS", fullCode: "HANDSHAKE_SETTLEMENT", orderId: id, merchantId: sandbox.merchantId, createdAt: new Date(Date.now() + 1_000).toISOString(), metadata: {} });
+    const disputeId = sandbox.openDispute(id);
+    sandbox.pushRawEvent({ id: "hss-1", code: "HSS", fullCode: "HANDSHAKE_SETTLEMENT", orderId: id, merchantId: sandbox.merchantId, createdAt: new Date(Date.now() + 1_000).toISOString(), metadata: { disputeId, status: "EXPIRED" } });
     sandbox.emitFromMarketplace(other, "CCR");
     const recordEvent = repository.recordEvent.bind(repository);
     // Só o HSD falha ao gravar.
@@ -471,6 +471,132 @@ describe("caixa de entrada de delivery", () => {
     await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toThrow(/fetch failed/);
     expect((await repository.getOrder("ifood", id))!.dispute?.response?.state).toBe("uncertain");
     await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("negociação: proposta de reembolso leva valor validado contra o teto do iFood", async () => {
+    const { sandbox, api, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id, { alternatives: [{ type: "REFUND", maxAmountCents: 2000 }] });
+    await inbox.runCycle();
+    const [record] = await inbox.listOrders();
+    const alternativeId = record.dispute!.alternatives[0]!.id;
+    const respond = vi.spyOn(api, "respondToDispute");
+    for (const amountCents of [undefined, 0, -5, 2001, 10.5]) {
+      await expect(inbox.respondToDispute("ifood", id, { kind: "alternative", alternativeId, amountCents })).rejects.toMatchObject({ code: "invalid_request" });
+    }
+    expect(respond).not.toHaveBeenCalled();
+    const answered = await inbox.respondToDispute("ifood", id, { kind: "alternative", alternativeId, amountCents: 1500 });
+    expect(respond).toHaveBeenCalledWith(record.dispute!.id, { kind: "alternative", alternativeId, alternativeType: "REFUND", amountCents: 1500, currency: "BRL" });
+    expect(answered.dispute?.response?.state).toBe("sent");
+  });
+
+  it("negociação: proposta de novo prazo só com minutos e motivo da lista do iFood", async () => {
+    const { sandbox, api, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id, { handshakeType: "DELAY", alternatives: [{ type: "ADDITIONAL_TIME", minutes: [15, 30], reasons: ["HIGH_STORE_DEMAND"] }] });
+    await inbox.runCycle();
+    const alternativeId = (await inbox.listOrders())[0]!.dispute!.alternatives[0]!.id;
+    const respond = vi.spyOn(api, "respondToDispute");
+    const attempt = (additionalTimeInMinutes?: number, additionalTimeReason?: string) =>
+      inbox.respondToDispute("ifood", id, { kind: "alternative", alternativeId, additionalTimeInMinutes, additionalTimeReason });
+    await expect(attempt(20, "HIGH_STORE_DEMAND")).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(attempt(15, "LACK_OF_DRIVERS")).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(attempt(15)).rejects.toMatchObject({ code: "invalid_request" });
+    // Negociação de atraso não aceita recusa: nem chega ao iFood.
+    await expect(inbox.respondToDispute("ifood", id, { kind: "reject", reason: "Não" })).rejects.toMatchObject({ code: "conflict" });
+    expect(respond).not.toHaveBeenCalled();
+    await attempt(15, "HIGH_STORE_DEMAND");
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(sandbox.eventHistory().at(-1)?.metadata).toMatchObject({ status: "ALTERNATIVE_REPLIED" });
+  });
+
+  it("negociação: aceite exige motivo da lista quando o iFood manda acceptCancellationReasons", async () => {
+    const { sandbox, api, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id, { acceptCancellationReasons: ["HIGH_STORE_DEMAND", "OTHER_REASONS"] });
+    await inbox.runCycle();
+    const respond = vi.spyOn(api, "respondToDispute");
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/motivo/) });
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept", reason: "INVENTADO" })).rejects.toMatchObject({ code: "invalid_request" });
+    expect(respond).not.toHaveBeenCalled();
+    await inbox.respondToDispute("ifood", id, { kind: "accept", reason: "OTHER_REASONS", detailReason: "Sem gás" });
+    expect(respond).toHaveBeenCalledWith(expect.any(String), { kind: "accept", reason: "OTHER_REASONS", detailReason: "Sem gás" });
+    await inbox.runCycle();
+    expect((await inbox.listOrders())[0]!.order.status).toBe("cancelled");
+  });
+
+  it("negociação sem lista de motivos: o aceite vai sem corpo", async () => {
+    const { sandbox, api, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id);
+    await inbox.runCycle();
+    const respond = vi.spyOn(api, "respondToDispute");
+    await inbox.respondToDispute("ifood", id, { kind: "accept", reason: "HIGH_STORE_DEMAND" });
+    expect(respond).toHaveBeenCalledWith(expect.any(String), { kind: "accept" });
+  });
+
+  it("negociação: contraproposta respondida não fecha; o desfecho com reembolso vira pendência com o valor", async () => {
+    const { sandbox, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const disputeId = sandbox.openDispute(id, { alternatives: ["REFUND"] });
+    await inbox.runCycle();
+    const alternativeId = (await inbox.listOrders())[0]!.dispute!.alternatives[0]!.id;
+    await inbox.respondToDispute("ifood", id, { kind: "alternative", alternativeId, amountCents: 1500 });
+    await inbox.runCycle();
+    let [record] = await inbox.listOrders();
+    // HSS ALTERNATIVE_REPLIED: a negociação continua aberta, esperando o cliente.
+    expect(record.dispute).toMatchObject({ id: disputeId, response: { state: "sent" } });
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
+    sandbox.settleAlternative(disputeId, true);
+    await inbox.runCycle();
+    [record] = await inbox.listOrders();
+    expect(record.dispute).toBeNull();
+    expect(record.needsReview).toBe(true);
+    expect(record.reviewReasons.join(" ")).toMatch(/reembolso de R\$ 15,00/);
+  });
+
+  it("negociação: fechamento de outra negociação ou ilegível não apaga a atual", async () => {
+    const { sandbox, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const disputeId = sandbox.openDispute(id);
+    await inbox.runCycle();
+    const later = () => new Date(Date.now() + 1_000).toISOString();
+    const hss = (eventId: string, metadata: Record<string, unknown>) =>
+      sandbox.pushRawEvent({ id: eventId, code: "HSS", fullCode: "HANDSHAKE_SETTLEMENT", orderId: id, merchantId: sandbox.merchantId, createdAt: later(), metadata });
+    hss("hss-outra", { disputeId: "outra-negociacao", status: "ACCEPTED" });
+    hss("hss-sem-id", { status: "ACCEPTED" });
+    hss("hss-status-novo", { disputeId, status: "NOVO_STATUS" });
+    await inbox.runCycle();
+    let record = (await repository.getOrder("ifood", id))!;
+    expect(record.dispute?.id).toBe(disputeId);
+    expect(record.reviewReasons.join(" ")).toMatch(/fechamento de negociação que não deu para ler/);
+    sandbox.expireDispute(disputeId);
+    await inbox.runCycle();
+    record = (await repository.getOrder("ifood", id))!;
+    expect(record.dispute).toBeNull();
+  });
+
+  it("negociação: 422 DISPUTE_ALREADY_ANSWERED conta como enviada e vira pendência", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const disputeId = sandbox.openDispute(id, { alternatives: ["REFUND"] });
+    await inbox.runCycle();
+    const alternativeId = (await inbox.listOrders())[0]!.dispute!.alternatives[0]!.id;
+    // Alguém já respondeu por fora (ex.: Portal do Parceiro) antes do PDV.
+    await api.respondToDispute(disputeId, { kind: "alternative", alternativeId, alternativeType: "REFUND", amountCents: 500 });
+    const record = await inbox.respondToDispute("ifood", id, { kind: "accept" });
+    expect(record.dispute?.response?.state).toBe("sent");
+    expect(record.dispute?.respondedAt).not.toBeNull();
+    expect(record.reviewReasons.join(" ")).toMatch(/já tinha sido respondida/);
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
+    expect((await repository.getOrder("ifood", id))!.dispute?.response?.state).toBe("sent");
   });
 
   it("evento ilegível com pedido não se perde: entra no histórico do pedido e vira pendência", async () => {

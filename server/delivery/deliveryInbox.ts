@@ -262,41 +262,47 @@ export class DeliveryInbox {
     });
   }
 
+  // Confere a resposta contra a negociação gravada sem gravar nada nem chamar o app (o servidor usa antes de pedir
+  // o PIN de gerente). A mesma conferência roda de novo, já com a reserva, em respondToDispute.
+  async checkDisputeDecision(channel: DeliveryChannelKey, externalOrderId: string, decision: DeliveryDisputeDecision): Promise<void> {
+    const record = await this.requireOrder(channel, externalOrderId);
+    resolveDisputeDecision(channel, record, decision, this.now());
+  }
+
   // Resposta da loja a uma negociação aberta pelo app (cliente pediu cancelamento, reembolso...). A resposta é
   // reservada no pedido (gravação com versão) antes de chamar o app: duas respostas ao mesmo tempo, ou uma nova
-  // tentativa depois de uma resposta incerta, não chegam ao app.
+  // tentativa depois de uma resposta incerta, não chegam ao app. O que vai ao app é a resposta conferida contra a
+  // negociação gravada (motivo do aceite da lista, valor até o teto, prazo e motivo permitidos).
   async respondToDispute(channel: DeliveryChannelKey, externalOrderId: string, decision: DeliveryDisputeDecision): Promise<DeliveryOrderRecord> {
     const adapter = this.adapter(channel);
     const reservedAt = this.now().toISOString();
     let disputeId = "";
+    let resolved: DeliveryDisputeDecision = decision;
     await this.updateOrder(channel, externalOrderId, (latest) => {
-      const dispute = latest.dispute;
-      if (!dispute) throw new DeliveryMarketplaceError(channel, "conflict", "Este pedido não tem negociação aberta.");
-      if (dispute.respondedAt || dispute.response) {
-        throw new DeliveryMarketplaceError(
-          channel,
-          "conflict",
-          dispute.response?.state === "sent" || dispute.respondedAt
-            ? "A negociação já foi respondida; aguarde o app."
-            : "Já existe uma resposta em andamento ou sem confirmação; aguarde o app fechar a negociação.",
-        );
-      }
-      if (dispute.expiresAt && Date.parse(dispute.expiresAt) <= this.now().getTime()) {
-        throw new DeliveryMarketplaceError(channel, "conflict", "O prazo da negociação acabou; o app aplica a decisão padrão.");
-      }
-      if (decision.kind === "alternative" && !dispute.alternatives.some((alternative) => alternative.id === decision.alternativeId)) {
-        throw new DeliveryMarketplaceError(channel, "invalid_request", "Proposta não pertence a esta negociação.");
-      }
+      resolved = resolveDisputeDecision(channel, latest, decision, this.now());
+      const dispute = latest.dispute!;
       disputeId = dispute.id;
-      dispute.response = { decision, state: "sending", reservedAt };
+      dispute.response = { decision: resolved, state: "sending", reservedAt };
       return true;
     });
     // Só mexe na reserva desta resposta: se o app fechou ou trocou a negociação no meio, o evento manda.
     const ours = (latest: DeliveryOrderRecord) =>
       latest.dispute && latest.dispute.id === disputeId && latest.dispute.response?.reservedAt === reservedAt ? latest.dispute : null;
     try {
-      await adapter.respondToDispute(disputeId, decision);
+      await adapter.respondToDispute(disputeId, resolved);
     } catch (error) {
+      // O app diz que a negociação já tinha resposta (iFood: 422 DISPUTE_ALREADY_ANSWERED, ex.: respondida pelo
+      // Portal): nada mais pode ser enviado. Conta como enviada e o desfecho vem pelo evento do app.
+      if (error instanceof DeliveryMarketplaceError && error.providerCode === "DISPUTE_ALREADY_ANSWERED") {
+        return this.updateOrder(channel, externalOrderId, (latest) => {
+          const dispute = ours(latest);
+          if (!dispute) return false;
+          dispute.response = { ...dispute.response!, state: "sent" };
+          dispute.respondedAt = this.now().toISOString();
+          flag(latest, "O app informou que a negociação já tinha sido respondida (talvez pelo Portal do Parceiro): confira o desfecho.");
+          return true;
+        });
+      }
       // Recusa clara do app (4xx, limite de uso): nada foi aplicado e a reserva é desfeita. Qualquer outra falha
       // (rede, 5xx, prazo) pode ter chegado: fica "incerta" e bloqueia novas tentativas.
       const definite = error instanceof DeliveryMarketplaceError && DEFINITE_FAILURES.includes(error.code);
@@ -504,7 +510,7 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
       );
       return;
     case "dispute_settled":
-      record.dispute = null;
+      applySettlement(record, event);
       return;
     case "unknown":
       // Códigos que não mexem no status (entregador chegando, troca de endereço...) ficam só no histórico.
@@ -562,6 +568,105 @@ function minimalOrder(event: DeliveryEvent): DeliveryOrder {
     notes: null,
     warnings: [],
   };
+}
+
+// Andamento/desfecho da negociação. Só o desfecho (aceita, recusada, vencida) da MESMA negociação fecha a
+// negociação gravada: "alternative_replied" é a contraproposta entregue, esperando o cliente, e o fechamento de
+// outra negociação (ex.: a anterior a uma contraproposta do cliente) não mexe na atual.
+function applySettlement(record: DeliveryOrderRecord, event: DeliveryEvent): void {
+  const settlement = event.settlement;
+  if (!settlement || !settlement.disputeId || settlement.status === "unknown") {
+    flag(record, `Chegou um fechamento de negociação que não deu para ler${settlement?.rawStatus ? ` (${settlement.rawStatus})` : ""}: confira no Portal do Parceiro.`);
+    return;
+  }
+  const current = record.dispute?.id === settlement.disputeId ? record.dispute : null;
+  if (settlement.status === "alternative_replied") {
+    // A contraproposta chegou ao app: uma reserva incerta ou interrompida vira enviada.
+    if (current?.response && current.response.state !== "sent") current.response = { ...current.response, state: "sent" };
+    if (current && !current.respondedAt) current.respondedAt = event.createdAt;
+    return;
+  }
+  if (current) record.dispute = null;
+  // Reembolso ou benefício aceito muda o valor que a loja recebe do app.
+  const selected = settlement.status === "accepted" ? settlement.selectedAlternative : null;
+  if (selected && (selected.type === "REFUND" || selected.type === "BENEFIT")) {
+    const label = selected.type === "REFUND" ? "reembolso" : "benefício";
+    const amount = selected.amountCents !== null ? ` de ${formatCents(selected.amountCents)}` : "";
+    flag(record, `Negociação fechada com ${label}${amount} ao cliente: confira o valor a receber do app.`);
+  }
+}
+
+// Confere a resposta da loja contra a negociação gravada e devolve a resposta que vai ao app (com o tipo da proposta
+// e só os campos que o app aceita). Erros: conflict (estado da negociação) ou invalid_request (dado da resposta).
+function resolveDisputeDecision(
+  channel: DeliveryChannelKey,
+  record: DeliveryOrderRecord,
+  decision: DeliveryDisputeDecision,
+  now: Date,
+): DeliveryDisputeDecision {
+  const dispute = record.dispute;
+  const invalid = (message: string) => new DeliveryMarketplaceError(channel, "invalid_request", message);
+  if (!dispute) throw new DeliveryMarketplaceError(channel, "conflict", "Este pedido não tem negociação aberta.");
+  if (dispute.respondedAt || dispute.response) {
+    throw new DeliveryMarketplaceError(
+      channel,
+      "conflict",
+      dispute.response?.state === "sent" || dispute.respondedAt
+        ? "A negociação já foi respondida; aguarde o app."
+        : "Já existe uma resposta em andamento ou sem confirmação; aguarde o app fechar a negociação.",
+    );
+  }
+  if (dispute.expiresAt && Date.parse(dispute.expiresAt) <= now.getTime()) {
+    throw new DeliveryMarketplaceError(channel, "conflict", "O prazo da negociação acabou; o app aplica a decisão padrão.");
+  }
+  if (decision.kind === "accept") {
+    // Negociação gravada antes destes campos existirem: tratada como sem lista.
+    const reasons = dispute.acceptCancellationReasons ?? [];
+    if (reasons.length === 0) return { kind: "accept" };
+    const reason = decision.reason?.trim();
+    if (!reason) throw invalid(`Escolha o motivo do aceite: ${reasons.join(", ")}.`);
+    if (!reasons.includes(reason)) throw invalid("Motivo do aceite não está entre os aceitos pelo app para esta negociação.");
+    const detailReason = decision.detailReason?.trim().slice(0, 250);
+    return { kind: "accept", reason, ...(detailReason ? { detailReason } : {}) };
+  }
+  if (decision.kind === "reject") {
+    // iFood: negociação de atraso não tem recusa (400 CANCELLATION_WHILE_NEGOTIATION_TIME_CANNOT_BE_REJECTED).
+    if (dispute.handshakeType === "DELAY") {
+      throw new DeliveryMarketplaceError(channel, "conflict", "Negociação de atraso não pode ser recusada: aceite ou proponha um novo prazo.");
+    }
+    return decision;
+  }
+  const alternative = dispute.alternatives.find((candidate) => candidate.id === decision.alternativeId);
+  if (!alternative) throw invalid("Proposta não pertence a esta negociação.");
+  if (alternative.type === "REFUND" || alternative.type === "BENEFIT") {
+    const amount = decision.amountCents;
+    const max = alternative.maxAmountCents ?? null;
+    if (max === null || (alternative.currency ?? "BRL") !== "BRL") {
+      throw invalid("O app não informou o valor máximo desta proposta; responda pelo Portal do Parceiro.");
+    }
+    if (typeof amount !== "number" || !Number.isInteger(amount) || amount <= 0 || amount > max) {
+      throw invalid(`Valor da proposta deve ser maior que zero e no máximo ${formatCents(max)}.`);
+    }
+    return { kind: "alternative", alternativeId: alternative.id, alternativeType: alternative.type, amountCents: amount, currency: "BRL" };
+  }
+  if (alternative.type === "ADDITIONAL_TIME") {
+    const minutesAllowed = alternative.allowedAdditionalTimeInMinutes ?? [];
+    const reasonsAllowed = alternative.allowedAdditionalTimeReasons ?? [];
+    const minutes = decision.additionalTimeInMinutes;
+    const reason = decision.additionalTimeReason?.trim();
+    if (typeof minutes !== "number" || !minutesAllowed.includes(minutes)) {
+      throw invalid(`Escolha um dos prazos aceitos pelo app: ${minutesAllowed.join(", ") || "nenhum"} minutos.`);
+    }
+    if (!reason || !reasonsAllowed.includes(reason)) {
+      throw invalid(`Escolha um dos motivos aceitos pelo app: ${reasonsAllowed.join(", ") || "nenhum"}.`);
+    }
+    return { kind: "alternative", alternativeId: alternative.id, alternativeType: alternative.type, additionalTimeInMinutes: minutes, additionalTimeReason: reason };
+  }
+  throw invalid("Tipo de proposta desconhecido; responda pelo Portal do Parceiro.");
+}
+
+function formatCents(cents: number): string {
+  return `R$ ${(cents / 100).toFixed(2).replace(".", ",")}`;
 }
 
 function flag(record: DeliveryOrderRecord, reason: string): void {

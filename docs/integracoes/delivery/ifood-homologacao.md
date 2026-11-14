@@ -40,11 +40,23 @@ bloqueado: 403 com `code` (`PIN_FAILED`, `PIN_LOCKED`, `DENIED`); mesmo `request
 | `POST /ifood/orders/:id/actions/:acao` | `confirm`, `start_preparation`, `ready_for_pickup`, `dispatch` |
 | `GET /ifood/orders/:id/cancellation-reasons` | Motivos que o iFood aceita agora para o pedido |
 | `POST /ifood/orders/:id/cancellation` | `{code, description, details?, authorization}`; o código precisa estar na lista atual |
-| `POST /ifood/orders/:id/dispute` | `{kind: "accept"}`, `{kind: "reject", reason}` ou `{kind: "alternative", alternativeId}`, mais `authorization` |
+| `POST /ifood/orders/:id/dispute` | Resposta à negociação (corpo abaixo), mais `authorization` (PIN de gerente) |
 | `GET /ifood/merchants/:id/status` | Loja aberta/fechada no iFood |
 | `GET /ifood/merchants/:id/pauses` | Pausas ativas |
 | `POST /ifood/merchants/:id/pauses` | `{description, minutes, authorization}` (1 a 1440 min); início e fim pelo relógio do servidor |
 | `DELETE /ifood/merchants/:id/pauses/:pauseId` | Retoma a loja; corpo `{authorization}` |
+
+Corpo de `POST /ifood/orders/:id/dispute` (a tela monta as opções a partir de `dispute` no pedido):
+
+| Resposta | Corpo | Conferido antes do PIN |
+|---|---|---|
+| Aceitar | `{kind: "accept", reason?, detailReason?}` | Se `dispute.acceptCancellationReasons` não está vazio, `reason` é obrigatório e tem que ser da lista (400). Sem lista, o aceite vai sem corpo. `detailReason` até 250 caracteres. |
+| Recusar | `{kind: "reject", reason}` | `reason` até 250 caracteres. `dispute.handshakeType = "DELAY"` não aceita recusa (409). |
+| Reembolso/benefício | `{kind: "alternative", alternativeId, amountCents}` | Inteiro em centavos, maior que zero e até `alternatives[].maxAmountCents` (400). |
+| Mais prazo | `{kind: "alternative", alternativeId, additionalTimeInMinutes, additionalTimeReason}` | Minutos em `alternatives[].allowedAdditionalTimeInMinutes` e motivo em `allowedAdditionalTimeReasons` (400). |
+
+O tipo da proposta (`REFUND`, `BENEFIT`, `ADDITIONAL_TIME`) vem da negociação gravada, nunca do aparelho. O pedido
+guarda também `dispute.action`, `dispute.timeoutAction` (o que o iFood faz sem resposta) e `dispute.expiresAt`.
 
 ## Rodar
 
@@ -80,13 +92,45 @@ Resumo em `/mnt/project-files/tche-food/ifood/conferencia-docs-oficiais.md` (pas
 - Rotas de loja: `GET /merchants/{id}/status`, `GET/POST /merchants/{id}/interruptions`,
   `DELETE /merchants/{id}/interruptions/{id}`.
 
+### Plataforma de negociação (conferida em 14/11/2026)
+
+Página: https://developer.ifood.com.br/en-US/docs/guides/modules/order/handshake-platform (a versão `/pt-BR/` não
+abriu para leitura automática). Confirmado nela:
+
+- `POST /order/v1.0/disputes/{disputeId}/alternatives/{alternativeId}` leva corpo:
+  `{"type": "REFUND" | "BENEFIT", "metadata": {"amount": {"value": "1500", "currency": "BRL"}}}` ou
+  `{"type": "ADDITIONAL_TIME", "metadata": {"additionalTimeInMinutes": 15, "additionalTimeReason": "..."}}`. O valor é
+  texto sem casas decimais (centavos). No HSD, cada alternativa traz `metadata.maxAmount` (REFUND/BENEFIT) ou
+  `metadata.allowedsAdditionalTimeInMinutes` e `metadata.allowedsAdditionalTimeReasons` (ADDITIONAL_TIME). Os
+  exemplos do HSD escrevem `ADDTIONAL_TIME`; o servidor lê os dois.
+- `POST .../accept`: corpo `{reason, detailReason?}` obrigatório quando o HSD traz `acceptCancellationReasons`
+  (lista de textos; os exemplos põem em `metadata.metadata`, a tabela em `metadata`, e o servidor lê os dois). Sem
+  motivo válido: 400 `INVALID_CANCELLATION_REASON`.
+- `POST .../reject`: `{reason}` até 250 caracteres. `handshakeType = DELAY` não tem recusa: 400
+  `CANCELLATION_WHILE_NEGOTIATION_TIME_CANNOT_BE_REJECTED`.
+- As três respondem 201 com `{id, status, disputeId, createdAt}` (status `ACCEPTED`, `REJECTED` ou
+  `ALTERNATIVE_REPLIED`). Erros: 404 `DISPUTE_NOT_FOUND`, 422 `DISPUTE_ALREADY_ANSWERED`, 422
+  `HANDSHAKE_ALREADY_CONCLUDED`, 400 `DISPUTE_ALTERNATIVE_INVALID`, `DISPUTE_ALTERNATIVE_TYPE_INVALID`,
+  `HANDSHAKE_NEGOTIATION_TIME_INVALID_REASON`, `HANDSHAKE_NEGOTIATION_TIME_INVALID_TIME_IN_MINUTES`. O 422
+  `DISPUTE_ALREADY_ANSWERED` conta como resposta enviada (não libera nova tentativa) e vira pendência.
+- HSD: `metadata.disputeId`, `action` (CANCELLATION, PARTIAL_CANCELLATION, PROPOSED_AMOUNT_REFUND,
+  PROPOSED_ADDITIONAL_TIME, VOID) e `handshakeType` (AFTER_DELIVERY, DELAY, PREPARATION_TIME, AFTER_DELIVERY_PARTIALLY)
+  são campos diferentes; `timeoutAction` (ACCEPT_CANCELLATION, REJECT_CANCELLATION, VOID) e `expiresAt`.
+- HSS: `metadata.disputeId`, `status` (ACCEPTED, REJECTED, EXPIRED, ALTERNATIVE_REPLIED), `reason`,
+  `selectedDisputeAlternative` (`id`, `type`, `metadata.amount` ou minutos e motivo). `ALTERNATIVE_REPLIED` não é
+  desfecho: a contraproposta foi entregue e outro HSS vem depois da resposta do cliente. O servidor só fecha a
+  negociação no desfecho do mesmo `disputeId`; HSS de outra negociação não apaga a atual; desfecho aceito com
+  reembolso ou benefício vira pendência com o valor (muda o que a loja recebe).
+
+A página não diz se valor acima de `maxAmount` tem código de erro próprio (o servidor recusa antes de chamar o iFood).
+
 ## Ainda a confirmar (o portal não abriu para leitura automática)
 
 Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a confirmar" quando for o caso.
 
 - Prefixos de versão (`/order/v1.0`, `/merchant/v1.0`, `/authentication/v1.0`).
 - Nomes dos campos do token (`grantType`, `clientId`, `clientSecret`) e resposta (`accessToken`, `expiresIn`).
-- Rota de `cancellationReasons` e corpo de `requestCancellation`; corpo de `reject` da negociação.
+- Rota de `cancellationReasons` e corpo de `requestCancellation`.
 - Corpo de `interruptions` (`id`, `description`, `start`, `end`) e resposta de `status`.
 - Tamanho máximo do lote de ack.
 - **Checklist oficial de homologação, item a item.** Pedir ao Will o PDF da página do portal (logado) para fechar.
@@ -102,7 +146,7 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
 | Confirmar, iniciar preparo, pronto para retirada, despachar | Pronto (API do servidor) |
 | Cancelar pela loja com motivo da lista | Pronto; vale só quando o iFood confirma (`CAN`/`CARF`) |
 | Cancelamento pedido pelo cliente | Pronto (pendência para a loja conferir) |
-| Negociação (aceitar, recusar, alternativa) | Pronto (API do servidor) |
+| Negociação (aceitar com motivo, recusar, reembolso/benefício, mais prazo) | Pronto (API do servidor; corpo conferido na doc oficial) |
 | Pedido agendado | Pronto no adapter (horários e aviso); tela no item 5 |
 | Pausar e retomar a loja | Pronto (API do servidor) |
 | Mostrar código de retirada e se é pedido de teste | Dados prontos; tela no item 5 |

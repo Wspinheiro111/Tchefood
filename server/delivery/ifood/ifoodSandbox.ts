@@ -12,7 +12,24 @@ type SandboxEvent = {
   metadata?: Record<string, unknown>;
 };
 
-type SandboxDispute = { id: string; orderId: string; action: string; alternatives: string[]; open: boolean };
+type SandboxAlternative = { id: string; type: string; maxAmountCents: number; minutes: number[]; reasons: string[] };
+// answered = a loja já respondeu com contraproposta e o "cliente" ainda não decidiu (settleAlternative).
+type SandboxDispute = {
+  id: string;
+  orderId: string;
+  action: string;
+  handshakeType: string;
+  alternatives: SandboxAlternative[];
+  acceptCancellationReasons: string[];
+  open: boolean;
+  answered: { alternativeId: string; body: Record<string, unknown> } | null;
+};
+
+export type IfoodSandboxAlternativeInput =
+  | string
+  | { type: string; maxAmountCents?: number; minutes?: number[]; reasons?: string[] };
+
+const SANDBOX_TIME_REASONS = ["HIGH_STORE_DEMAND", "OPERATIONAL_ISSUES", "LACK_OF_DRIVERS"];
 type SandboxInterruption = { id: string; description: string; start: string; end: string };
 
 type SandboxOrder = {
@@ -271,20 +288,77 @@ export class IfoodSandbox {
   }
 
   // Cliente abre uma negociação (ex.: pede o cancelamento depois de confirmado). Devolve o id da negociação.
-  openDispute(orderId: string, input: { action?: string; expiresAt?: string; alternatives?: string[] } = {}): string {
+  // Formato do HSD conforme a página da plataforma de negociação: propostas REFUND/BENEFIT com teto (maxAmount) e
+  // ADDITIONAL_TIME com minutos e motivos permitidos; acceptCancellationReasons em metadata.metadata.
+  openDispute(
+    orderId: string,
+    input: {
+      action?: string;
+      handshakeType?: string;
+      timeoutAction?: string;
+      expiresAt?: string;
+      alternatives?: IfoodSandboxAlternativeInput[];
+      acceptCancellationReasons?: string[];
+    } = {},
+  ): string {
     if (!this.orders.has(orderId)) throw new Error(`Pedido inexistente no simulador: ${orderId}`);
     this.sequence += 1;
     const id = this.uuid(`dispute-${this.sequence}`);
-    const alternatives = (input.alternatives ?? []).map((type, index) => ({ id: this.uuid(`alt-${this.sequence}-${index}`), type }));
-    this.disputes.set(id, { id, orderId, action: input.action ?? "CANCELLATION", alternatives: alternatives.map((alt) => alt.id), open: true });
+    const alternatives: SandboxAlternative[] = (input.alternatives ?? []).map((entry, index) => {
+      const spec = typeof entry === "string" ? { type: entry } : entry;
+      return {
+        id: this.uuid(`alt-${this.sequence}-${index}`),
+        type: spec.type,
+        maxAmountCents: spec.maxAmountCents ?? 6000,
+        minutes: spec.minutes ?? [10, 15, 20],
+        reasons: spec.reasons ?? SANDBOX_TIME_REASONS,
+      };
+    });
+    const action = input.action ?? (input.handshakeType === "DELAY" ? "PROPOSED_ADDITIONAL_TIME" : "CANCELLATION");
+    const handshakeType = input.handshakeType ?? "AFTER_DELIVERY";
+    const acceptCancellationReasons = input.acceptCancellationReasons ?? [];
+    this.disputes.set(id, { id, orderId, action, handshakeType, alternatives, acceptCancellationReasons, open: true, answered: null });
     this.emit(orderId, "HSD", {
       disputeId: id,
-      action: input.action ?? "CANCELLATION",
+      action,
+      handshakeType,
+      handshakeGroup: "CUSTOMER_ORDER_SUPPORT",
+      timeoutAction: input.timeoutAction ?? "VOID",
       message: "Cliente pediu o cancelamento",
+      createdAt: this.clock().toISOString(),
       expiresAt: input.expiresAt ?? new Date(this.clock().getTime() + 5 * 60_000).toISOString(),
-      alternatives: alternatives.map((alt) => ({ id: alt.id, type: alt.type, description: alt.type })),
+      alternatives: alternatives.map((alt) => ({
+        id: alt.id,
+        type: alt.type,
+        metadata:
+          alt.type === "ADDITIONAL_TIME"
+            ? { allowedsAdditionalTimeInMinutes: alt.minutes, allowedsAdditionalTimeReasons: alt.reasons }
+            : { maxAmount: { value: String(alt.maxAmountCents), currency: "BRL" } },
+      })),
+      ...(acceptCancellationReasons.length > 0 ? { metadata: { acceptCancellationReasons } } : {}),
     });
     return id;
+  }
+
+  // O cliente decide sobre a contraproposta da loja: só então chega o desfecho (HSS ACCEPTED/REJECTED).
+  settleAlternative(disputeId: string, accepted: boolean): void {
+    const found = this.disputes.get(disputeId);
+    if (!found?.open || !found.answered) throw new Error(`Negociação sem contraproposta pendente: ${disputeId}`);
+    found.open = false;
+    this.emit(found.orderId, "HSS", {
+      disputeId,
+      status: accepted ? "ACCEPTED" : "REJECTED",
+      createdAt: this.clock().toISOString(),
+      ...(accepted ? { selectedDisputeAlternative: { id: found.answered.alternativeId, ...found.answered.body } } : {}),
+    });
+  }
+
+  // Prazo da negociação acabou sem resposta: o iFood aplica a ação padrão e fecha como EXPIRED.
+  expireDispute(disputeId: string): void {
+    const found = this.disputes.get(disputeId);
+    if (!found?.open) throw new Error(`Negociação já fechada: ${disputeId}`);
+    found.open = false;
+    this.emit(found.orderId, "HSS", { disputeId, status: "EXPIRED", createdAt: this.clock().toISOString() });
   }
 
   // Evento cru (para testar evento incompleto ou estranho vindo do iFood).
@@ -385,26 +459,7 @@ export class IfoodSandbox {
     }
 
     const dispute = /^\/order\/v1\.0\/disputes\/([^/]+)\/(accept|reject|alternatives)(?:\/([^/]+))?$/.exec(path);
-    if (dispute && method === "POST") {
-      const found = this.disputes.get(decodeURIComponent(dispute[1] ?? ""));
-      if (!found || !found.open) return json(404, { error: { code: "NotFound", message: "dispute not found" } });
-      const kind = dispute[2];
-      if (kind === "reject") {
-        const reason = (JSON.parse(String(init.body ?? "{}")) as { reason?: string }).reason;
-        if (!reason) return json(400, { error: { code: "BadRequest", message: "reason required" } });
-      }
-      if (kind === "alternatives" && !found.alternatives.includes(decodeURIComponent(dispute[3] ?? ""))) {
-        return json(400, { error: { code: "BadRequest", message: "invalid alternative" } });
-      }
-      found.open = false;
-      this.emit(found.orderId, "HSS", { disputeId: found.id, outcome: kind?.toUpperCase() });
-      if (kind === "accept" && found.action === "CANCELLATION") {
-        const order = this.orders.get(found.orderId);
-        if (order) order.lastCode = "CAN";
-        this.emit(found.orderId, "CAN");
-      }
-      return new Response(null, { status: 202 });
-    }
+    if (dispute && method === "POST") return this.answerDispute(decodeURIComponent(dispute[1] ?? ""), dispute[2] ?? "", decodeURIComponent(dispute[3] ?? ""), init.body);
 
     const merchant = /^\/merchant\/v1\.0\/merchants\/([^/]+)\/(status|interruptions)(?:\/([^/]+))?$/.exec(path);
     if (merchant) {
@@ -441,6 +496,71 @@ export class IfoodSandbox {
 
     return json(404, { error: { code: "NotFound", message: `${method} ${path}` } });
   };
+
+  // Respostas à negociação com os códigos de erro da página da plataforma de negociação. Sucesso = 201 com
+  // {id, status, disputeId, createdAt}; o HSS vem em seguida (ALTERNATIVE_REPLIED para contraproposta).
+  private answerDispute(disputeId: string, kind: string, alternativeId: string, rawBody: BodyInit | null | undefined): Response {
+    const fail = (status: number, code: string) => json(status, { error: { code, message: code } });
+    const found = this.disputes.get(disputeId);
+    if (!found) return fail(404, "DISPUTE_NOT_FOUND");
+    if (!found.open) return fail(422, "HANDSHAKE_ALREADY_CONCLUDED");
+    if (found.answered) return fail(422, "DISPUTE_ALREADY_ANSWERED");
+    let body: Record<string, unknown> = {};
+    try {
+      const parsed = rawBody ? (JSON.parse(String(rawBody)) as unknown) : {};
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
+    } catch {
+      return fail(400, "BAD_REQUEST");
+    }
+    const createdAt = this.clock().toISOString();
+    const reply = (status: string) => {
+      this.sequence += 1;
+      return json(201, { id: this.uuid(`reply-${this.sequence}`), status, disputeId, createdAt });
+    };
+    if (kind === "accept") {
+      const reason = typeof body.reason === "string" ? body.reason : "";
+      if (found.acceptCancellationReasons.length > 0 && !found.acceptCancellationReasons.includes(reason)) return fail(400, "INVALID_CANCELLATION_REASON");
+      if (typeof body.detailReason === "string" && body.detailReason.length > 250) return fail(400, "DISPUTE_FIELD_EXCEEDS_MAXIMUM_LENGTH");
+      found.open = false;
+      this.emit(found.orderId, "HSS", { disputeId, status: "ACCEPTED", createdAt, ...(reason ? { reason } : {}) });
+      if (found.action === "CANCELLATION") {
+        const order = this.orders.get(found.orderId);
+        if (order) order.lastCode = "CAN";
+        this.emit(found.orderId, "CAN");
+      }
+      return reply("ACCEPTED");
+    }
+    if (kind === "reject") {
+      if (found.handshakeType === "DELAY") return fail(400, "CANCELLATION_WHILE_NEGOTIATION_TIME_CANNOT_BE_REJECTED");
+      const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+      if (!reason) return fail(400, "DISPUTE_REQUIRED_FIELDS_WERE_NOT_SENT");
+      if (reason.length > 250) return fail(400, "DISPUTE_FIELD_EXCEEDS_MAXIMUM_LENGTH");
+      found.open = false;
+      this.emit(found.orderId, "HSS", { disputeId, status: "REJECTED", reason, createdAt });
+      return reply("REJECTED");
+    }
+    const alternative = found.alternatives.find((alt) => alt.id === alternativeId);
+    if (!alternative) return fail(400, "DISPUTE_ALTERNATIVE_INVALID");
+    if (body.type !== alternative.type) return fail(400, "DISPUTE_ALTERNATIVE_TYPE_INVALID");
+    const metadata = (body.metadata && typeof body.metadata === "object" ? body.metadata : {}) as Record<string, unknown>;
+    if (alternative.type === "ADDITIONAL_TIME") {
+      if (!alternative.reasons.includes(String(metadata.additionalTimeReason ?? ""))) return fail(400, "HANDSHAKE_NEGOTIATION_TIME_INVALID_REASON");
+      if (!alternative.minutes.includes(Number(metadata.additionalTimeInMinutes))) return fail(400, "HANDSHAKE_NEGOTIATION_TIME_INVALID_TIME_IN_MINUTES");
+    } else {
+      // A documentação não dá o código para valor acima do teto; o simulador recusa com um código próprio.
+      const amount = (metadata.amount && typeof metadata.amount === "object" ? metadata.amount : {}) as Record<string, unknown>;
+      const value = typeof amount.value === "string" && /^\d+$/.test(amount.value) ? Number(amount.value) : Number.NaN;
+      if (!(value > 0 && value <= alternative.maxAmountCents) || amount.currency !== "BRL") return fail(400, "SANDBOX_INVALID_AMOUNT");
+    }
+    found.answered = { alternativeId, body: { type: body.type, metadata } };
+    this.emit(found.orderId, "HSS", {
+      disputeId,
+      status: "ALTERNATIVE_REPLIED",
+      createdAt,
+      selectedDisputeAlternative: { id: alternativeId, type: body.type, metadata },
+    });
+    return reply("ALTERNATIVE_REPLIED");
+  }
 
   private emit(orderId: string, code: string, metadata?: Record<string, unknown>): void {
     this.sequence += 1;

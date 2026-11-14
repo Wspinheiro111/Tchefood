@@ -398,6 +398,8 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           if (!decision) return { status: 400, body: { error: "Resposta da negociação inválida." } };
           const manager = parseManager(body.authorization);
           if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
+          // Motivo do aceite, valor e prazo da proposta conferidos contra a negociação gravada antes do PIN.
+          await options.inbox.checkDisputeDecision("ifood", orderId, decision);
           return await withManager(token, { ...manager, action: "DELIVERY_DISPUTE", externalOrderId: orderId, merchantExternalId: null }, async () => ({
             status: 200,
             body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision)),
@@ -487,15 +489,44 @@ function parseManager(raw: unknown): Omit<ManagerRequest, "action" | "externalOr
   return { managerPin, performedBy, requestId, reason };
 }
 
+// Corpo da rota /dispute:
+//   aceite      {kind: "accept", reason?, detailReason?}  reason = código da lista do iFood (obrigatório se houver lista)
+//   recusa      {kind: "reject", reason}
+//   proposta    {kind: "alternative", alternativeId, amountCents?}                                (REFUND/BENEFIT)
+//               {kind: "alternative", alternativeId, additionalTimeInMinutes?, additionalTimeReason?} (ADDITIONAL_TIME)
+// Aqui só se confere o formato; os limites da negociação são conferidos pela caixa de entrada.
 function parseDecision(body: Record<string, unknown>): DeliveryDisputeDecision | null {
-  if (body.kind === "accept") return { kind: "accept" };
+  const code = (value: unknown) => {
+    const parsed = text(value, 80);
+    return parsed && /^[A-Z0-9_]+$/.test(parsed) ? parsed : null;
+  };
+  const positiveInteger = (value: unknown) => (typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null);
+  if (body.kind === "accept") {
+    if (body.reason !== undefined && !code(body.reason)) return null;
+    const reason = code(body.reason);
+    const detailReason = text(body.detailReason, 250);
+    return { kind: "accept", ...(reason ? { reason } : {}), ...(detailReason ? { detailReason } : {}) };
+  }
   if (body.kind === "reject") {
     const reason = text(body.reason, 250);
     return reason ? { kind: "reject", reason } : null;
   }
   if (body.kind === "alternative") {
     const alternativeId = text(body.alternativeId, 64);
-    return alternativeId && /^[A-Za-z0-9-]+$/.test(alternativeId) ? { kind: "alternative", alternativeId } : null;
+    if (!alternativeId || !/^[A-Za-z0-9-]+$/.test(alternativeId)) return null;
+    const amountCents = positiveInteger(body.amountCents);
+    const additionalTimeInMinutes = positiveInteger(body.additionalTimeInMinutes);
+    const additionalTimeReason = code(body.additionalTimeReason);
+    if (body.amountCents !== undefined && amountCents === null) return null;
+    if (body.additionalTimeInMinutes !== undefined && additionalTimeInMinutes === null) return null;
+    if (body.additionalTimeReason !== undefined && additionalTimeReason === null) return null;
+    return {
+      kind: "alternative",
+      alternativeId,
+      ...(amountCents !== null ? { amountCents } : {}),
+      ...(additionalTimeInMinutes !== null ? { additionalTimeInMinutes } : {}),
+      ...(additionalTimeReason !== null ? { additionalTimeReason } : {}),
+    };
   }
   return null;
 }

@@ -206,6 +206,35 @@ describe("servidor do iFood: API do app", () => {
     expect(sandbox.eventHistory().at(-1)?.code).toBe("HSS");
   });
 
+  it("negociação: motivo do aceite, valor e prazo da proposta conferidos antes do PIN e enviados ao iFood", async () => {
+    const { sandbox, poller, inbox, call, manager } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const cancel =sandbox.openDispute(id, { acceptCancellationReasons: ["HIGH_STORE_DEMAND"] });
+    await poller.runOnce();
+    const path = `/ifood/orders/${id}/dispute`;
+    const missing = await call("POST", path, { kind: "accept", authorization: auth() });
+    expect(missing).toMatchObject({ status: 400, body: { error: expect.stringMatching(/motivo do aceite/) } });
+    expect((await call("POST", path, { kind: "accept", reason: "INVENTADO", authorization: auth() })).status).toBe(400);
+    expect(manager.authorized).toHaveLength(0);
+    const accepted = await call("POST", path, { kind: "accept", reason: "HIGH_STORE_DEMAND", detailReason: "Fila grande", authorization: auth() });
+    expect(accepted.status).toBe(200);
+    expect(sandbox.eventHistory().find((event) => event.code === "HSS")?.metadata).toMatchObject({ disputeId: cancel, status: "ACCEPTED", reason: "HIGH_STORE_DEMAND" });
+
+    const other = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    sandbox.openDispute(other, { alternatives: [{ type: "REFUND", maxAmountCents: 2000 }] });
+    await poller.runOnce();
+    const alternativeId = (await inbox.listOrders()).find((record) => record.order.externalId === other)!.dispute!.alternatives[0]!.id;
+    const otherPath = `/ifood/orders/${other}/dispute`;
+    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, authorization: auth() })).status).toBe(400);
+    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, amountCents: "15", authorization: auth() })).status).toBe(400);
+    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, amountCents: 2500, authorization: auth() })).status).toBe(400);
+    expect(manager.authorized).toHaveLength(1);
+    expect((await call("POST", otherPath, { kind: "alternative", alternativeId, amountCents: 1500, authorization: auth() })).status).toBe(200);
+    expect(sandbox.eventHistory().at(-1)?.metadata).toMatchObject({ status: "ALTERNATIVE_REPLIED", selectedDisputeAlternative: { metadata: { amount: { value: "1500" } } } });
+  });
+
   it("JSON quebrado é 400, não 500", async () => {
     const { sandbox, poller } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });

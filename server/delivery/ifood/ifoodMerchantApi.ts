@@ -4,7 +4,10 @@ import {
   type DeliveryCancellationReason,
   type DeliveryCourier,
   type DeliveryDispute,
+  type DeliveryDisputeAlternative,
   type DeliveryDisputeDecision,
+  type DeliveryDisputeSettlement,
+  type DeliveryDisputeSettlementStatus,
   type DeliveryEvent,
   type DeliveryEventSignal,
   type DeliveryFulfillment,
@@ -40,7 +43,7 @@ export const IFOOD_PATHS = {
   acknowledgment: "/order/v1.0/events/acknowledgment",
   order: (orderId: string) => `/order/v1.0/orders/${orderId}`,
   orderAction: (orderId: string, action: string) => `/order/v1.0/orders/${orderId}/${action}`,
-  // conferido na página de limites (caminho completo).
+  // conferido na página de limites e na da plataforma de negociação (handshake-platform), com o corpo de cada uma.
   disputeAccept: (disputeId: string) => `/order/v1.0/disputes/${disputeId}/accept`,
   disputeReject: (disputeId: string) => `/order/v1.0/disputes/${disputeId}/reject`,
   disputeAlternative: (disputeId: string, alternativeId: string) => `/order/v1.0/disputes/${disputeId}/alternatives/${alternativeId}`,
@@ -204,17 +207,23 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
     });
   }
 
+  // Corpos conforme a página da plataforma de negociação (developer.ifood.com.br/en-US/docs/guides/modules/order/
+  // handshake-platform): todas respondem 201. O aceite leva {reason, detailReason?} quando a negociação traz
+  // acceptCancellationReasons; a proposta leva o tipo e o valor (centavos, em texto) ou os minutos e o motivo.
   async respondToDispute(disputeId: string, decision: DeliveryDisputeDecision): Promise<void> {
     const id = this.safeId(disputeId, "negociação");
-    // Corpo das respostas a confirmar no portal: a recusa leva o motivo, o resto vai sem corpo.
     if (decision.kind === "accept") {
-      await this.request("POST", IFOOD_PATHS.disputeAccept(id));
+      const reason = decision.reason?.trim();
+      const detailReason = decision.detailReason?.trim().slice(0, 250);
+      const json = reason ? { reason, ...(detailReason ? { detailReason } : {}) } : undefined;
+      await this.request("POST", IFOOD_PATHS.disputeAccept(id), json ? { json } : {});
     } else if (decision.kind === "reject") {
       const reason = decision.reason.trim();
       if (!reason) throw new DeliveryMarketplaceError("ifood", "invalid_request", "Informe o motivo da recusa.");
       await this.request("POST", IFOOD_PATHS.disputeReject(id), { json: { reason: reason.slice(0, 250) } });
     } else {
-      await this.request("POST", IFOOD_PATHS.disputeAlternative(id, this.safeId(decision.alternativeId, "proposta")));
+      const alternativeId = this.safeId(decision.alternativeId, "proposta");
+      await this.request("POST", IFOOD_PATHS.disputeAlternative(id, alternativeId), { json: ifoodAlternativeBody(decision) });
     }
   }
 
@@ -353,7 +362,13 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
   private readBody(response: RawResponse): unknown {
     if (response.status === 204) return null;
     if (!response.ok) {
-      throw new DeliveryMarketplaceError("ifood", errorCodeForStatus(response.status), describeIfoodError(response.status, response.text), response.status);
+      throw new DeliveryMarketplaceError(
+        "ifood",
+        errorCodeForStatus(response.status),
+        describeIfoodError(response.status, response.text),
+        response.status,
+        ifoodErrorCode(response.text),
+      );
     }
     if (!response.text.trim()) return null;
     try {
@@ -373,6 +388,18 @@ function errorCodeForStatus(status: number): DeliveryMarketplaceErrorCode {
   if (status === 429) return "rate_limited";
   if (status >= 500) return "unavailable";
   return "invalid_request";
+}
+
+// Código de erro do iFood no corpo (ex.: 422 "DISPUTE_ALREADY_ANSWERED"), em {error: {code}} ou {code}.
+function ifoodErrorCode(text: string): string | null {
+  try {
+    const record = asRecord(JSON.parse(text));
+    const error = asRecord(record?.error) ?? record;
+    const code = optionalString(error?.code);
+    return code && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? code : null;
+  } catch {
+    return null;
+  }
 }
 
 function describeIfoodError(status: number, text: string): string {
@@ -449,6 +476,7 @@ export function parseIfoodEvent(raw: unknown): DeliveryEvent {
     signal,
     createdAt: isoInstant(record.createdAt),
     dispute: signal === "dispute_opened" ? parseIfoodDispute(record.metadata) : null,
+    ...(signal === "dispute_settled" ? { settlement: parseIfoodSettlement(record.metadata) } : {}),
   };
 }
 
@@ -479,27 +507,124 @@ export function parseIfoodEventLenient(raw: unknown): DeliveryEvent | null {
   }
 }
 
-// Metadados da negociação (HSD). Os nomes dos campos vêm do exemplo da página de eventos e ficam a confirmar;
-// sem id a negociação não pode ser respondida e o pedido vai para conferência humana.
+// Metadados da negociação (HSD), conforme a página da plataforma de negociação. Sem id a negociação não pode ser
+// respondida e o pedido vai para conferência humana. A documentação põe acceptCancellationReasons ora em
+// metadata.metadata (exemplos), ora em metadata (tabela): os dois lugares são lidos.
 export function parseIfoodDispute(raw: unknown): DeliveryDispute | null {
   const metadata = asRecord(raw);
   const id = optionalString(metadata?.disputeId) ?? optionalString(metadata?.id);
   if (!metadata || !id || !ID_PATTERN.test(id)) return null;
   const alternatives = Array.isArray(metadata.alternatives)
-    ? metadata.alternatives.flatMap((entry) => {
+    ? metadata.alternatives.flatMap((entry): DeliveryDisputeAlternative[] => {
         const alternative = asRecord(entry);
         const alternativeId = optionalString(alternative?.id);
         if (!alternative || !alternativeId || !ID_PATTERN.test(alternativeId)) return [];
-        return [{ id: alternativeId, type: optionalString(alternative.type), description: optionalString(alternative.description) }];
+        const details = asRecord(alternative.metadata);
+        const maxAmount = asRecord(details?.maxAmount);
+        return [{
+          id: alternativeId,
+          type: alternativeType(alternative.type),
+          description: optionalString(alternative.description),
+          maxAmountCents: minorUnits(maxAmount?.value),
+          currency: optionalString(maxAmount?.currency),
+          allowedAdditionalTimeInMinutes: integerList(details?.allowedsAdditionalTimeInMinutes),
+          allowedAdditionalTimeReasons: stringList(details?.allowedsAdditionalTimeReasons),
+        }];
       })
     : [];
+  const nested = asRecord(metadata.metadata);
   return {
     id,
-    action: optionalString(metadata.action) ?? optionalString(metadata.handshakeType),
+    action: optionalString(metadata.action),
+    handshakeType: optionalString(metadata.handshakeType),
+    timeoutAction: optionalString(metadata.timeoutAction),
     message: optionalString(metadata.message),
     expiresAt: optionalString(metadata.expiresAt) ?? optionalString(metadata.timeoutAt),
     alternatives,
+    acceptCancellationReasons: stringList(nested?.acceptCancellationReasons ?? metadata.acceptCancellationReasons),
   };
+}
+
+const SETTLEMENT_STATUSES: Readonly<Record<string, DeliveryDisputeSettlementStatus>> = {
+  ACCEPTED: "accepted",
+  REJECTED: "rejected",
+  EXPIRED: "expired",
+  ALTERNATIVE_REPLIED: "alternative_replied",
+};
+
+// Andamento/desfecho da negociação (HSS). Status fora da lista vira "unknown" (a caixa de entrada não fecha nada).
+export function parseIfoodSettlement(raw: unknown): DeliveryDisputeSettlement {
+  const metadata = asRecord(raw);
+  const disputeId = optionalString(metadata?.disputeId);
+  const rawStatus = optionalString(metadata?.status);
+  const selected = asRecord(metadata?.selectedDisputeAlternative);
+  const details = asRecord(selected?.metadata);
+  return {
+    disputeId: disputeId && ID_PATTERN.test(disputeId) ? disputeId : null,
+    status: SETTLEMENT_STATUSES[rawStatus ?? ""] ?? "unknown",
+    rawStatus,
+    reason: optionalString(metadata?.reason),
+    selectedAlternative: selected
+      ? {
+          id: optionalString(selected.id),
+          type: alternativeType(selected.type),
+          amountCents: minorUnits(asRecord(details?.amount)?.value),
+          additionalTimeInMinutes: minorUnits(details?.additionalTimeInMinutes),
+          additionalTimeReason: optionalString(details?.additionalTimeReason),
+        }
+      : null,
+  };
+}
+
+// Os exemplos do iFood escrevem "ADDTIONAL_TIME" no evento e "ADDITIONAL_TIME" na resposta.
+function alternativeType(value: unknown): string | null {
+  const type = optionalString(value)?.toUpperCase() ?? null;
+  return type === "ADDTIONAL_TIME" ? "ADDITIONAL_TIME" : type;
+}
+
+// Valor sem casas decimais (centavos), em texto ou número ("6000" = R$ 60,00). Qualquer outra coisa = null.
+function minorUnits(value: unknown): number | null {
+  const text = optionalString(value);
+  if (!text || !/^\d{1,9}$/.test(text)) return null;
+  return Number(text);
+}
+
+function integerList(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const parsed = minorUnits(entry);
+    return parsed !== null && parsed > 0 ? [parsed] : [];
+  });
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const parsed = optionalString(entry);
+    return parsed && parsed.length <= 80 ? [parsed] : [];
+  });
+}
+
+// Corpo da proposta. Os limites (teto do valor, minutos e motivos aceitos) são conferidos pela caixa de entrada
+// contra a negociação gravada; aqui só se garante que nada sai incompleto.
+function ifoodAlternativeBody(decision: Extract<DeliveryDisputeDecision, { kind: "alternative" }>): Record<string, unknown> {
+  const type = decision.alternativeType;
+  if (type === "REFUND" || type === "BENEFIT") {
+    const amount = decision.amountCents;
+    if (typeof amount !== "number" || !Number.isInteger(amount) || amount <= 0) {
+      throw new DeliveryMarketplaceError("ifood", "invalid_request", "Informe o valor da proposta.");
+    }
+    return { type, metadata: { amount: { value: String(amount), currency: decision.currency ?? "BRL" } } };
+  }
+  if (type === "ADDITIONAL_TIME") {
+    const minutes = decision.additionalTimeInMinutes;
+    const reason = decision.additionalTimeReason?.trim();
+    if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes <= 0 || !reason) {
+      throw new DeliveryMarketplaceError("ifood", "invalid_request", "Informe os minutos e o motivo do novo prazo.");
+    }
+    return { type, metadata: { additionalTimeInMinutes: minutes, additionalTimeReason: reason } };
+  }
+  throw new DeliveryMarketplaceError("ifood", "invalid_request", "Tipo de proposta desconhecido; responda pelo Portal do Parceiro.");
 }
 
 const STORE_STATES: Readonly<Record<string, DeliveryStoreState>> = {

@@ -255,15 +255,150 @@ describe("iFood: conferência com a documentação oficial", () => {
     const api = makeApi(sandbox);
     const orderId = sandbox.placeOrder({ items: [PICANHA] });
     await api.acknowledge(await api.pollEvents());
-    const disputeId = sandbox.openDispute(orderId, { alternatives: ["REFUND_PARTIAL"] });
+    const disputeId = sandbox.openDispute(orderId, { alternatives: ["REFUND"] });
     const [event] = await api.pollEvents();
     expect(event.signal).toBe("dispute_opened");
     expect(event.dispute).toMatchObject({ id: disputeId, action: "CANCELLATION" });
-    expect(event.dispute?.alternatives[0]?.type).toBe("REFUND_PARTIAL");
+    expect(event.dispute?.alternatives[0]).toMatchObject({ type: "REFUND", maxAmountCents: 6000, currency: "BRL" });
 
     await expect(api.respondToDispute(disputeId, { kind: "reject", reason: "  " })).rejects.toMatchObject({ code: "invalid_request" });
-    await api.respondToDispute(disputeId, { kind: "alternative", alternativeId: event.dispute!.alternatives[0]!.id });
-    expect(sandbox.eventHistory().at(-1)?.code).toBe("HSS");
+    const alternativeId = event.dispute!.alternatives[0]!.id;
+    await api.respondToDispute(disputeId, { kind: "alternative", alternativeId, alternativeType: "REFUND", amountCents: 1500 });
+    expect(sandbox.eventHistory().at(-1)).toMatchObject({ code: "HSS", metadata: { disputeId, status: "ALTERNATIVE_REPLIED" } });
+  });
+
+  it("negociação: HSD no formato da documentação (handshakeType, action, timeoutAction, limites das propostas, motivos do aceite)", () => {
+    const event = parseIfoodEvent({
+      id: "e1",
+      code: "HSD",
+      orderId: "o1",
+      metadata: {
+        disputeId: "d-1",
+        action: "PROPOSED_ADDITIONAL_TIME",
+        handshakeType: "DELAY",
+        timeoutAction: "ACCEPT_CANCELLATION",
+        expiresAt: "2026-11-14T15:05:00Z",
+        message: "Está demorando",
+        alternatives: [
+          { id: "a-1", type: "REFUND", metadata: { maxAmount: { value: "6000", currency: "BRL" } } },
+          {
+            id: "a-2",
+            type: "ADDTIONAL_TIME",
+            metadata: { allowedsAdditionalTimeInMinutes: [10, 20], allowedsAdditionalTimeReasons: ["HIGH_STORE_DEMAND", "LACK_OF_DRIVERS"] },
+          },
+        ],
+        metadata: { acceptCancellationReasons: ["HIGH_STORE_DEMAND", "OTHER_REASONS"] },
+      },
+    });
+    expect(event.dispute).toEqual({
+      id: "d-1",
+      action: "PROPOSED_ADDITIONAL_TIME",
+      handshakeType: "DELAY",
+      timeoutAction: "ACCEPT_CANCELLATION",
+      message: "Está demorando",
+      expiresAt: "2026-11-14T15:05:00Z",
+      acceptCancellationReasons: ["HIGH_STORE_DEMAND", "OTHER_REASONS"],
+      alternatives: [
+        { id: "a-1", type: "REFUND", description: null, maxAmountCents: 6000, currency: "BRL", allowedAdditionalTimeInMinutes: [], allowedAdditionalTimeReasons: [] },
+        {
+          id: "a-2",
+          type: "ADDITIONAL_TIME",
+          description: null,
+          maxAmountCents: null,
+          currency: null,
+          allowedAdditionalTimeInMinutes: [10, 20],
+          allowedAdditionalTimeReasons: ["HIGH_STORE_DEMAND", "LACK_OF_DRIVERS"],
+        },
+      ],
+    });
+  });
+
+  it("negociação: HSS traz id, status e a proposta escolhida", () => {
+    const settled = parseIfoodEvent({
+      id: "e2",
+      code: "HSS",
+      orderId: "o1",
+      metadata: {
+        disputeId: "d-1",
+        status: "ACCEPTED",
+        selectedDisputeAlternative: { id: "a-1", type: "REFUND", metadata: { amount: { value: "1500", currency: "BRL" } } },
+      },
+    });
+    expect(settled.settlement).toEqual({
+      disputeId: "d-1",
+      status: "accepted",
+      rawStatus: "ACCEPTED",
+      reason: null,
+      selectedAlternative: { id: "a-1", type: "REFUND", amountCents: 1500, additionalTimeInMinutes: null, additionalTimeReason: null },
+    });
+    expect(parseIfoodEvent({ id: "e3", code: "HSS", orderId: "o1", metadata: { disputeId: "d-1", status: "ALTERNATIVE_REPLIED" } }).settlement?.status).toBe("alternative_replied");
+    expect(parseIfoodEvent({ id: "e4", code: "HSS", orderId: "o1", metadata: { disputeId: "d-1", status: "NOVO" } }).settlement?.status).toBe("unknown");
+    expect(parseIfoodEvent({ id: "e5", code: "HSS", orderId: "o1", metadata: {} }).settlement).toMatchObject({ disputeId: null, status: "unknown" });
+  });
+
+  it("negociação: corpo das respostas no formato da documentação", async () => {
+    const sandbox = new IfoodSandbox();
+    const spy = vi.fn(sandbox.fetch);
+    const api = makeApi(sandbox, { fetchImpl: spy as unknown as typeof fetch });
+    const orderId = sandbox.placeOrder({ items: [PICANHA] });
+    const bodyOf = (index: number) => JSON.parse(String((spy.mock.calls.at(index)![1] as RequestInit).body ?? "null")) as unknown;
+
+    const refund = sandbox.openDispute(orderId, { alternatives: ["REFUND", "ADDITIONAL_TIME"] });
+    const [, hsd] = await api.pollEvents();
+    const [refundAlt, timeAlt] = hsd!.dispute!.alternatives;
+    await api.respondToDispute(refund, { kind: "alternative", alternativeId: refundAlt!.id, alternativeType: "REFUND", amountCents: 1500 });
+    expect(bodyOf(-1)).toEqual({ type: "REFUND", metadata: { amount: { value: "1500", currency: "BRL" } } });
+
+    const delay = sandbox.openDispute(orderId, { handshakeType: "DELAY", alternatives: ["ADDITIONAL_TIME"] });
+    const delayAlt = (await api.pollEvents()).find((event) => event.dispute?.id === delay)!.dispute!.alternatives[0]!;
+    await api.respondToDispute(delay, {
+      kind: "alternative",
+      alternativeId: delayAlt.id,
+      alternativeType: "ADDITIONAL_TIME",
+      additionalTimeInMinutes: 15,
+      additionalTimeReason: "HIGH_STORE_DEMAND",
+    });
+    expect(bodyOf(-1)).toEqual({ type: "ADDITIONAL_TIME", metadata: { additionalTimeInMinutes: 15, additionalTimeReason: "HIGH_STORE_DEMAND" } });
+
+    const cancel = sandbox.openDispute(orderId, { acceptCancellationReasons: ["HIGH_STORE_DEMAND"] });
+    await api.respondToDispute(cancel, { kind: "accept", reason: "HIGH_STORE_DEMAND", detailReason: "Muito movimento" });
+    expect(bodyOf(-1)).toEqual({ reason: "HIGH_STORE_DEMAND", detailReason: "Muito movimento" });
+    expect(timeAlt).toBeDefined();
+
+    // Proposta sem valor/prazo ou de tipo desconhecido não sai do servidor.
+    const calls = spy.mock.calls.length;
+    await expect(api.respondToDispute(refund, { kind: "alternative", alternativeId: refundAlt!.id, alternativeType: "REFUND" })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(api.respondToDispute(refund, { kind: "alternative", alternativeId: refundAlt!.id })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(api.respondToDispute(refund, { kind: "alternative", alternativeId: timeAlt!.id, alternativeType: "ADDITIONAL_TIME", additionalTimeInMinutes: 15 })).rejects.toMatchObject({ code: "invalid_request" });
+    expect(spy.mock.calls.length).toBe(calls);
+  });
+
+  it("negociação: o simulador recusa o que o iFood real recusa, com o código do iFood no erro", async () => {
+    const sandbox = new IfoodSandbox();
+    const api = makeApi(sandbox);
+    const orderId = sandbox.placeOrder({ items: [PICANHA] });
+    // Aceite sem motivo quando a negociação traz a lista.
+    const cancel = sandbox.openDispute(orderId, { acceptCancellationReasons: ["HIGH_STORE_DEMAND"] });
+    await expect(api.respondToDispute(cancel, { kind: "accept" })).rejects.toMatchObject({ httpStatus: 400, providerCode: "INVALID_CANCELLATION_REASON" });
+    // Recusa em negociação de atraso.
+    const delay = sandbox.openDispute(orderId, { handshakeType: "DELAY", alternatives: ["ADDITIONAL_TIME"] });
+    await expect(api.respondToDispute(delay, { kind: "reject", reason: "Não" })).rejects.toMatchObject({
+      httpStatus: 400,
+      providerCode: "CANCELLATION_WHILE_NEGOTIATION_TIME_CANNOT_BE_REJECTED",
+    });
+    // Resposta repetida depois da contraproposta: 422 DISPUTE_ALREADY_ANSWERED.
+    const refund = sandbox.openDispute(orderId, { alternatives: ["REFUND"] });
+    const events = await api.pollEvents();
+    const alt = events.find((event) => event.dispute?.id === refund)!.dispute!.alternatives[0]!;
+    await api.respondToDispute(refund, { kind: "alternative", alternativeId: alt.id, alternativeType: "REFUND", amountCents: 1000 });
+    await expect(api.respondToDispute(refund, { kind: "accept" })).rejects.toMatchObject({ httpStatus: 422, providerCode: "DISPUTE_ALREADY_ANSWERED" });
+    // O cliente responde à contraproposta: só então vem o desfecho.
+    sandbox.settleAlternative(refund, true);
+    expect(sandbox.eventHistory().at(-1)).toMatchObject({
+      code: "HSS",
+      metadata: { disputeId: refund, status: "ACCEPTED", selectedDisputeAlternative: { id: alt.id, type: "REFUND", metadata: { amount: { value: "1000", currency: "BRL" } } } },
+    });
+    await expect(api.respondToDispute(refund, { kind: "accept" })).rejects.toMatchObject({ httpStatus: 422, providerCode: "HANDSHAKE_ALREADY_CONCLUDED" });
   });
 
   it("negociação sem id utilizável não vira negociação respondível", () => {
