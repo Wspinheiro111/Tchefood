@@ -29,6 +29,9 @@ describe("iFood: códigos de evento", () => {
     expect(mapIfoodEventCode("CCR")).toBe("customer_cancellation_requested");
     expect(mapIfoodEventCode("HSD")).toBe("dispute_opened");
     expect(mapIfoodEventCode("HSS")).toBe("dispute_settled");
+    // Pedido alterado pelo iFood (ORDER_PATCHED): o detalhe é buscado de novo.
+    expect(mapIfoodEventCode("OPA")).toBe("order_patched");
+    expect(parseIfoodEvent({ id: "e1", code: "OPA", fullCode: "ORDER_PATCHED", orderId: "o1" }).signal).toBe("order_patched");
     // Entregador, troca de endereço etc.: só histórico.
     expect(mapIfoodEventCode("ADR")).toBe("unknown");
     expect(mapIfoodEventCode("XYZ")).toBe("unknown");
@@ -119,6 +122,23 @@ describe("iFood: chamadas HTTP", () => {
     sandbox.revokeTokens();
     sandbox.placeOrder({ items: [PICANHA] });
     await expect(api.pollEvents()).resolves.toHaveLength(1);
+    expect(sandbox.stats.tokenRequests).toBe(2);
+  });
+
+  it("401 que chega depois de outra chamada já ter renovado o token usa o token novo, sem pedir outro", async () => {
+    const sandbox = new IfoodSandbox();
+    let polls = 0;
+    // A segunda chamada (com o token velho) só recebe o 401 depois que a primeira já renovou e repetiu.
+    const slowFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await sandbox.fetch(input, init);
+      if (String(input).includes("events:polling") && (polls += 1) === 2) await new Promise((resolve) => setTimeout(resolve, 30));
+      return response;
+    }) as typeof fetch;
+    const api = makeApi(sandbox, { fetchImpl: slowFetch });
+    await api.pollEvents();
+    sandbox.revokeTokens();
+    polls = 0;
+    await expect(Promise.all([api.pollEvents(), api.pollEvents()])).resolves.toHaveLength(2);
     expect(sandbox.stats.tokenRequests).toBe(2);
   });
 

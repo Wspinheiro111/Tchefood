@@ -21,6 +21,10 @@ type SandboxDispute = {
   handshakeType: string;
   alternatives: SandboxAlternative[];
   acceptCancellationReasons: string[];
+  timeoutAction: string;
+  // Cancelamento parcial: itens que o pedido passa a ter se o cancelamento for aplicado (aceite da loja, ou prazo
+  // vencido com timeoutAction ACCEPT_CANCELLATION). Null = o detalhe não muda.
+  remainingItems: IfoodSandboxOrderInput["items"] | null;
   open: boolean;
   answered: { alternativeId: string; body: Record<string, unknown> } | null;
 };
@@ -34,6 +38,7 @@ type SandboxInterruption = { id: string; description: string; start: string; end
 
 type SandboxOrder = {
   body: Record<string, unknown>;
+  input: IfoodSandboxOrderInput;
   lastCode: string;
   fulfillment: string;
   deliveredBy: string | null;
@@ -78,6 +83,7 @@ const CODE_NAMES: Readonly<Record<string, string>> = {
   CCD: "CONSUMER_CANCELLATION_DENIED",
   HSD: "HANDSHAKE_DISPUTE",
   HSS: "HANDSHAKE_SETTLEMENT",
+  OPA: "ORDER_PATCHED",
   ADR: "ASSIGN_DRIVER",
 };
 
@@ -160,40 +166,6 @@ export class IfoodSandbox {
     const createdAt = this.clock().toISOString();
     const orderType = input.orderType ?? "DELIVERY";
     const deliveredBy = orderType === "DELIVERY" ? input.deliveredBy ?? "IFOOD" : null;
-    const items = input.items.map((item, index) => {
-      const options = (item.options ?? []).map((option) => ({
-        name: option.name,
-        externalCode: option.externalCode,
-        quantity: option.quantity,
-        unitPrice: option.unitPrice,
-        price: round2(option.unitPrice * option.quantity),
-      }));
-      // Documentação oficial: price = quantity x unitPrice; totalPrice = price + optionsPrice, com optionsPrice
-      // já somando os complementos de todas as unidades.
-      const optionsPrice = round2(options.reduce((sum, option) => sum + option.price, 0) * item.quantity);
-      const price = round2(item.unitPrice * item.quantity);
-      return {
-        index: index + 1,
-        id: this.uuid(`item-${this.sequence}-${index}`),
-        uniqueId: this.uuid(`unique-${this.sequence}-${index}`),
-        name: item.name,
-        externalCode: item.externalCode ?? undefined,
-        unit: "UN",
-        quantity: item.quantity,
-        unitPrice: item.unitPrice,
-        optionsPrice,
-        price,
-        totalPrice: round2(price + optionsPrice),
-        observations: item.observations,
-        options,
-      };
-    });
-    const subTotal = round2(items.reduce((sum, item) => sum + item.totalPrice, 0));
-    const deliveryFee = orderType === "DELIVERY" ? input.deliveryFee ?? 0 : 0;
-    const benefits = input.benefits ?? 0;
-    const orderAmount = round2(subTotal + deliveryFee - benefits);
-    const payment = input.payment ?? { method: "CREDIT", prepaid: true };
-    const sponsor = input.benefitsSponsor ?? "MERCHANT";
     const body: Record<string, unknown> = {
       id: orderId,
       displayId: input.displayId ?? String(1000 + this.sequence),
@@ -209,39 +181,12 @@ export class IfoodSandbox {
             preparationStartDateTime: input.schedule.preparationStart ?? input.schedule.start,
           }
         : { preparationStartDateTime: createdAt }),
-      ...(benefits > 0
-        ? {
-            benefits: [
-              {
-                value: benefits,
-                target: "CART",
-                sponsorshipValues: [{ name: sponsor, value: benefits, description: "Cupom" }],
-              },
-            ],
-          }
-        : {}),
       merchant: { id: this.merchantId, name: "Galpão Crioulo" },
       customer: {
         id: this.uuid(`customer-${this.sequence}`),
         name: input.customerName ?? "Cliente Teste",
         documentNumber: null,
         phone: { number: "0800 705 0500", localizer: String(10_000_000 + this.sequence), localizerExpiration: createdAt },
-      },
-      items,
-      total: { subTotal, deliveryFee, benefits, orderAmount, additionalFees: 0 },
-      payments: {
-        prepaid: payment.prepaid ? orderAmount : 0,
-        pending: payment.prepaid ? 0 : orderAmount,
-        methods: [
-          {
-            value: orderAmount,
-            currency: "BRL",
-            method: payment.method,
-            type: payment.prepaid ? "ONLINE" : "OFFLINE",
-            ...(payment.method === "CREDIT" ? { card: { brand: "MASTERCARD" } } : {}),
-            ...(payment.method === "CASH" && payment.changeFor ? { cash: { changeFor: payment.changeFor } } : {}),
-          },
-        ],
       },
       ...(orderType === "DELIVERY"
         ? {
@@ -266,9 +211,90 @@ export class IfoodSandbox {
           }
         : { takeout: { mode: "DEFAULT", takeoutDateTime: input.schedule?.start ?? createdAt } }),
     };
-    this.orders.set(orderId, { body, lastCode: "PLC", fulfillment: orderType, deliveredBy });
+    this.priceOrder(body, input, `${this.sequence}`);
+    this.orders.set(orderId, { body, input, lastCode: "PLC", fulfillment: orderType, deliveredBy });
     this.emit(orderId, "PLC");
     return orderId;
+  }
+
+  // O iFood alterou o pedido depois de feito (itens trocados ou removidos): o detalhe passa a ter estes itens, com
+  // totais e pagamento refeitos, e chega o evento OPA (ORDER_PATCHED).
+  patchOrder(orderId: string, items: IfoodSandboxOrderInput["items"]): void {
+    this.replaceItems(orderId, items);
+    this.emit(orderId, "OPA");
+  }
+
+  private replaceItems(orderId: string, items: IfoodSandboxOrderInput["items"]): void {
+    const order = this.orders.get(orderId);
+    if (!order) throw new Error(`Pedido inexistente no simulador: ${orderId}`);
+    this.sequence += 1;
+    order.input = { ...order.input, items };
+    this.priceOrder(order.body, order.input, `${this.sequence}`);
+  }
+
+  // Itens, descontos, totais e pagamento do pedido, a partir da entrada (no pedido novo e na alteração).
+  private priceOrder(body: Record<string, unknown>, input: IfoodSandboxOrderInput, seed: string): void {
+    const orderType = input.orderType ?? "DELIVERY";
+    const items = input.items.map((item, index) => {
+      const options = (item.options ?? []).map((option) => ({
+        name: option.name,
+        externalCode: option.externalCode,
+        quantity: option.quantity,
+        unitPrice: option.unitPrice,
+        price: round2(option.unitPrice * option.quantity),
+      }));
+      // Documentação oficial: price = quantity x unitPrice; totalPrice = price + optionsPrice, com optionsPrice
+      // já somando os complementos de todas as unidades.
+      const optionsPrice = round2(options.reduce((sum, option) => sum + option.price, 0) * item.quantity);
+      const price = round2(item.unitPrice * item.quantity);
+      return {
+        index: index + 1,
+        id: this.uuid(`item-${seed}-${index}`),
+        uniqueId: this.uuid(`unique-${seed}-${index}`),
+        name: item.name,
+        externalCode: item.externalCode ?? undefined,
+        unit: "UN",
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        optionsPrice,
+        price,
+        totalPrice: round2(price + optionsPrice),
+        observations: item.observations,
+        options,
+      };
+    });
+    const subTotal = round2(items.reduce((sum, item) => sum + item.totalPrice, 0));
+    const deliveryFee = orderType === "DELIVERY" ? input.deliveryFee ?? 0 : 0;
+    const benefits = input.benefits ?? 0;
+    const orderAmount = round2(subTotal + deliveryFee - benefits);
+    const payment = input.payment ?? { method: "CREDIT", prepaid: true };
+    const sponsor = input.benefitsSponsor ?? "MERCHANT";
+    delete body.benefits;
+    if (benefits > 0) {
+      body.benefits = [
+        {
+          value: benefits,
+          target: "CART",
+          sponsorshipValues: [{ name: sponsor, value: benefits, description: "Cupom" }],
+        },
+      ];
+    }
+    body.items = items;
+    body.total = { subTotal, deliveryFee, benefits, orderAmount, additionalFees: 0 };
+    body.payments = {
+      prepaid: payment.prepaid ? orderAmount : 0,
+      pending: payment.prepaid ? 0 : orderAmount,
+      methods: [
+        {
+          value: orderAmount,
+          currency: "BRL",
+          method: payment.method,
+          type: payment.prepaid ? "ONLINE" : "OFFLINE",
+          ...(payment.method === "CREDIT" ? { card: { brand: "MASTERCARD" } } : {}),
+          ...(payment.method === "CASH" && payment.changeFor ? { cash: { changeFor: payment.changeFor } } : {}),
+        },
+      ],
+    };
   }
 
   // Ações que só o iFood/cliente fazem (entregador concluiu, cliente cancelou, entregador designado...).
@@ -290,6 +316,8 @@ export class IfoodSandbox {
   // Cliente abre uma negociação (ex.: pede o cancelamento depois de confirmado). Devolve o id da negociação.
   // Formato do HSD conforme a página da plataforma de negociação: propostas REFUND/BENEFIT com teto (maxAmount) e
   // ADDITIONAL_TIME com minutos e motivos permitidos; acceptCancellationReasons em metadata.metadata.
+  // remainingItems (cancelamento parcial): os itens que sobram se o cancelamento for aplicado; o detalhe do pedido
+  // muda no aceite da loja ou no fim do prazo com timeoutAction ACCEPT_CANCELLATION.
   openDispute(
     orderId: string,
     input: {
@@ -299,6 +327,7 @@ export class IfoodSandbox {
       expiresAt?: string;
       alternatives?: IfoodSandboxAlternativeInput[];
       acceptCancellationReasons?: string[];
+      remainingItems?: IfoodSandboxOrderInput["items"];
     } = {},
   ): string {
     if (!this.orders.has(orderId)) throw new Error(`Pedido inexistente no simulador: ${orderId}`);
@@ -317,13 +346,25 @@ export class IfoodSandbox {
     const action = input.action ?? (input.handshakeType === "DELAY" ? "PROPOSED_ADDITIONAL_TIME" : "CANCELLATION");
     const handshakeType = input.handshakeType ?? "AFTER_DELIVERY";
     const acceptCancellationReasons = input.acceptCancellationReasons ?? [];
-    this.disputes.set(id, { id, orderId, action, handshakeType, alternatives, acceptCancellationReasons, open: true, answered: null });
+    const timeoutAction = input.timeoutAction ?? "VOID";
+    this.disputes.set(id, {
+      id,
+      orderId,
+      action,
+      handshakeType,
+      timeoutAction,
+      remainingItems: input.remainingItems ?? null,
+      alternatives,
+      acceptCancellationReasons,
+      open: true,
+      answered: null,
+    });
     this.emit(orderId, "HSD", {
       disputeId: id,
       action,
       handshakeType,
       handshakeGroup: "CUSTOMER_ORDER_SUPPORT",
-      timeoutAction: input.timeoutAction ?? "VOID",
+      timeoutAction,
       message: "Cliente pediu o cancelamento",
       createdAt: this.clock().toISOString(),
       expiresAt: input.expiresAt ?? new Date(this.clock().getTime() + 5 * 60_000).toISOString(),
@@ -358,7 +399,14 @@ export class IfoodSandbox {
     const found = this.disputes.get(disputeId);
     if (!found?.open) throw new Error(`Negociação já fechada: ${disputeId}`);
     found.open = false;
+    if (found.timeoutAction === "ACCEPT_CANCELLATION") this.applyPartialCancellation(found);
     this.emit(found.orderId, "HSS", { disputeId, status: "EXPIRED", createdAt: this.clock().toISOString() });
+  }
+
+  // Cancelamento parcial aplicado (aceite ou prazo vencido que aceita): o detalhe do pedido fica com os itens que
+  // sobraram. No simulador só o HSS avisa (a documentação não diz se o iFood real manda também um OPA).
+  private applyPartialCancellation(dispute: SandboxDispute): void {
+    if (dispute.action === "PARTIAL_CANCELLATION" && dispute.remainingItems) this.replaceItems(dispute.orderId, dispute.remainingItems);
   }
 
   // Evento cru (para testar evento incompleto ou estranho vindo do iFood).
@@ -522,6 +570,7 @@ export class IfoodSandbox {
       if (found.acceptCancellationReasons.length > 0 && !found.acceptCancellationReasons.includes(reason)) return fail(400, "INVALID_CANCELLATION_REASON");
       if (typeof body.detailReason === "string" && body.detailReason.length > 250) return fail(400, "DISPUTE_FIELD_EXCEEDS_MAXIMUM_LENGTH");
       found.open = false;
+      this.applyPartialCancellation(found);
       this.emit(found.orderId, "HSS", { disputeId, status: "ACCEPTED", createdAt, ...(reason ? { reason } : {}) });
       if (found.action === "CANCELLATION") {
         const order = this.orders.get(found.orderId);

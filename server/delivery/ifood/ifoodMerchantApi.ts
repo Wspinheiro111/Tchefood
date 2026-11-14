@@ -30,8 +30,9 @@ import {
 //  1. Token OAuth2 (client_credentials) de app centralizado (sem refresh token). Reaproveitado até perto de vencer.
 //  2. Polling de eventos a cada 30 s com o header x-polling-merchants: o polling mantém a loja ativa no iFood.
 //  3. Ack de TODO evento recebido (até os ignorados), só DEPOIS de gravar. Evento sem ack volta no próximo polling.
-//  4. Detalhe do pedido consultado uma vez (é imutável); ações confirm/startPreparation/readyToPickup/dispatch
-//     respondem 202 e só valem quando o evento correspondente chega no polling.
+//  4. Detalhe do pedido consultado quando o pedido chega e de novo quando o iFood o altera (evento OPA, ou
+//     cancelamento parcial aplicado na negociação): não é imutável. Ações confirm/startPreparation/readyToPickup/
+//     dispatch respondem 202 e só valem quando o evento correspondente chega no polling.
 //
 // Conferência com a documentação oficial (14/11/2026): docs/integracoes/delivery/ifood-homologacao.md. As rotas
 // abaixo marcadas "a confirmar" existem no portal (página de limites), mas o prefixo de versão ou o corpo não
@@ -72,8 +73,11 @@ export function isValidIfoodMerchantId(id: string): boolean {
 }
 
 // Código do evento -> sinal comum (lista oficial: /pt-BR/docs/guides/order/events). Código ausente desta tabela
-// (entregador, troca de endereço, alteração de itens etc.) vira "unknown": o evento é registrado e confirmado,
-// mas não mexe no pedido. SPS/SPE são só do iFood Mercado; ficam como "preparando" por segurança.
+// (entregador, troca de endereço etc.) vira "unknown": o evento é registrado e confirmado, mas não mexe no pedido.
+// SPS e SPE são só do iFood Mercado: SPS fica como "preparando" por segurança; SPE não está na tabela (vira
+// "unknown") porque a documentação conferida não diz o que ele muda no pedido.
+// OPA (ORDER_PATCHED, grupo "Other" da lista oficial, que não dá para filtrar): o iFood alterou o pedido; o detalhe
+// gravado fica velho e é buscado de novo.
 const IFOOD_EVENT_SIGNALS: Readonly<Record<string, DeliveryEventSignal>> = {
   PLC: "placed",
   CFM: "confirmed",
@@ -90,6 +94,7 @@ const IFOOD_EVENT_SIGNALS: Readonly<Record<string, DeliveryEventSignal>> = {
   CCD: "customer_cancellation_denied",
   HSD: "dispute_opened",
   HSS: "dispute_settled",
+  OPA: "order_patched",
 };
 
 export function mapIfoodEventCode(code: string): DeliveryEventSignal {
@@ -281,8 +286,10 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
     return new DeliveryMarketplaceError("ifood", "invalid_response", message);
   }
 
-  private async accessToken(forceRefresh = false): Promise<string> {
-    if (!forceRefresh && this.token && this.token.expiresAt - TOKEN_EXPIRY_MARGIN_MS > this.now()) return this.token.value;
+  // rejected: token que o iFood acabou de recusar (401). Só ele é renovado: se outra chamada já trocou o token no
+  // meio, o novo é usado sem pedir outro (o /oauth/token tem limite de uso).
+  private async accessToken(rejected: string | null = null): Promise<string> {
+    if (this.token && this.token.value !== rejected && this.token.expiresAt - TOKEN_EXPIRY_MARGIN_MS > this.now()) return this.token.value;
     // Um único pedido de token por vez, mesmo com várias chamadas simultâneas.
     if (!this.tokenRequest) {
       this.tokenRequest = this.fetchToken().finally(() => {
@@ -320,8 +327,9 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
     path: string,
     init: { headers?: Record<string, string>; json?: unknown } = {},
   ): Promise<unknown> {
+    let rejected: string | null = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const token = await this.accessToken(attempt > 0);
+      const token = await this.accessToken(rejected);
       const headers: Record<string, string> = { accept: "application/json", authorization: `Bearer ${token}`, ...init.headers };
       if (init.json !== undefined) headers["content-type"] = "application/json";
       const response = await this.send(path, {
@@ -329,8 +337,11 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
         headers,
         body: init.json === undefined ? undefined : JSON.stringify(init.json),
       });
-      // Token revogado/expirado antes da hora: renova uma vez e repete.
-      if (response.status === 401 && attempt === 0) continue;
+      // Token revogado/expirado antes da hora: renova uma vez (se ninguém renovou no meio) e repete.
+      if (response.status === 401 && attempt === 0) {
+        rejected = token;
+        continue;
+      }
       return this.readBody(response);
     }
     throw new DeliveryMarketplaceError("ifood", "auth_failed", "O iFood recusou o token renovado.", 401);

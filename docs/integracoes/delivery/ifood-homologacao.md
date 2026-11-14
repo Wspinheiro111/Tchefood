@@ -121,6 +121,9 @@ CORS_ORIGINS=https://app.tchefood.com.br PORT=8787 npm run start:ifood
   para testar a tela; nunca em produção.
 - Antes: aplicar as migrations no Supabase (`supabase db push`) e cadastrar a loja em `delivery_integrations`
   (`tenant_id`, `channel = 'ifood'`, `merchant_external_id` = merchantId do Portal do Parceiro), pelo SQL Editor.
+- Se a migration `20261114150000_delivery_servidor.sql` já tinha sido aplicada antes no Supabase, o `supabase db push`
+  não roda de novo uma versão já registrada: cole o arquivo inteiro no SQL Editor e rode (é idempotente). Sem isso
+  ficam as funções antigas (ex.: `tchefood_delivery_save_order` sem a volta do pedido para "sem detalhe").
 
 ## Conferido na documentação oficial (developer.ifood.com.br)
 
@@ -130,6 +133,10 @@ Resumo em `/mnt/project-files/tche-food/ifood/conferencia-docs-oficiais.md` (pas
 - Eventos e o que o Tchê Food faz com cada um (`IFOOD_EVENT_SIGNALS` em `ifoodMerchantApi.ts`). Todo evento recebe
   ack, inclusive os ignorados e os desconhecidos; evento sem pedido é confirmado e descartado.
 - `PRS` é início do preparo (`SPS`/`SPE` são só do iFood Mercado). `CON` pode chegar até 2 h depois da entrega.
+- `OPA` (ORDER_PATCHED, grupo "Other", que não dá para filtrar): o iFood alterou o pedido. O pedido volta a "sem
+  detalhe" (`detail_pending`), não pode virar venda e o servidor busca o detalhe de novo. O mesmo vale para o
+  cancelamento parcial (`HSD` com `action = PARTIAL_CANCELLATION`) fechado com `ACCEPTED` sem contraproposta, ou com
+  `EXPIRED` quando o `timeoutAction` era `ACCEPT_CANCELLATION` (ou veio vazio ou desconhecido).
 - Cancelamento pelo cliente (`CCR`, `CCA`, `CCD`) e plataforma de negociação (`HSD`, `HSS`, com
   `POST /order/v1.0/disputes/{id}/accept | reject | alternatives/{id}`).
 - Pedido: `orderAmount = subTotal + deliveryFee + additionalFees − benefits`; `benefits[].sponsorshipValues` com

@@ -19,14 +19,17 @@ ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS dispute JSONB;
 -- Pedido de cancelamento da loja reservado antes da chamada ao app ({state, reservedAt, code}; ver
 -- DeliveryCancellationRequest em server/delivery/deliveryInbox.ts). NULL = nenhum.
 ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS cancellation_request JSONB;
--- Pedido gravado sem o detalhe do app (detalhe ilegível ou recusado em todos os ciclos: o pedido mínimo de
--- server/delivery/deliveryInbox.ts, sem itens nem valores). O servidor tenta buscar o detalhe de novo a cada ciclo;
--- até lá o pedido não pode virar venda nem NFC-e. Só vai de TRUE para FALSE, uma vez (ver tchefood_delivery_save_order).
+-- Pedido sem o detalhe do app em vigor: detalhe ilegível ou recusado em todos os ciclos (o pedido mínimo de
+-- server/delivery/deliveryInbox.ts, sem itens nem valores), ou pedido que o app alterou depois de gravado (evento OPA,
+-- cancelamento parcial aplicado). O servidor tenta buscar o detalhe de novo a cada ciclo; até lá o pedido não pode
+-- virar venda nem NFC-e. FALSE -> TRUE só muda a marca; o detalhe gravado só troca na volta TRUE -> FALSE (ver
+-- tchefood_delivery_save_order).
 ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS detail_pending BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_delivery_orders_detail_pending ON delivery_orders (channel, placed_at) WHERE detail_pending;
 -- Próxima tentativa de buscar o detalhe (rodízio: a busca que falhou adia o pedido, para que pedidos cujo detalhe
--- nunca vem não ocupem o lote todo). NULL = nunca adiado (vem primeiro). Só tchefood_delivery_defer_detail grava;
--- tchefood_delivery_save_order não mexe nela nem a versão muda.
+-- nunca vem não ocupem o lote todo). NULL = nunca adiado (vem primeiro). Só tchefood_delivery_defer_detail adia
+-- (sem mudar a versão); tchefood_delivery_save_order só a zera quando o pedido volta a ficar sem detalhe (FALSE ->
+-- TRUE: busca logo).
 ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS detail_retry_at TIMESTAMPTZ;
 ALTER TABLE delivery_orders DROP CONSTRAINT IF EXISTS delivery_orders_version_positive;
 ALTER TABLE delivery_orders ADD CONSTRAINT delivery_orders_version_positive CHECK (version >= 1);
@@ -104,7 +107,8 @@ LANGUAGE sql STABLE SET search_path = public AS $$
 $$;
 
 -- Pedidos ainda sem o detalhe do app cuja próxima tentativa já chegou (o servidor tenta buscar o detalhe de novo):
--- primeiro os nunca adiados, depois os de tentativa mais antiga; empate pelo pedido mais antigo.
+-- primeiro os nunca adiados, depois os de tentativa mais antiga; empate pelo pedido mais antigo. Pedido cancelado ou
+-- feito há mais de 7 dias fica de fora (não vira venda; a pendência gravada fica para a conferência).
 CREATE OR REPLACE FUNCTION tchefood_delivery_list_detail_pending(p_channel delivery_channel, p_limit INTEGER)
 RETURNS JSONB
 LANGUAGE sql STABLE SET search_path = public AS $$
@@ -112,6 +116,7 @@ LANGUAGE sql STABLE SET search_path = public AS $$
                               ORDER BY q.detail_retry_at NULLS FIRST, q.placed_at, q.external_id), '[]'::jsonb)
       FROM (SELECT * FROM delivery_orders o
              WHERE o.channel = p_channel AND o.detail_pending
+               AND o.status <> 'cancelled' AND o.placed_at > NOW() - INTERVAL '7 days'
                AND COALESCE(o.detail_retry_at, '-infinity'::timestamptz) <= NOW()
              ORDER BY o.detail_retry_at NULLS FIRST, o.placed_at, o.external_id
              LIMIT LEAST(GREATEST(COALESCE(p_limit, 20), 1), 100)) q
@@ -148,6 +153,9 @@ DECLARE
     -- Gravação que traz o detalhe recuperado do app (detailPending FALSE explícito). Sem a chave, nada muda.
     v_detail_done BOOLEAN := p_record ? 'detailPending' AND jsonb_typeof(p_record->'detailPending') = 'boolean'
                              AND NOT (p_record->>'detailPending')::BOOLEAN;
+    -- Gravação que marca o pedido de novo sem detalhe (o app alterou o pedido: detailPending TRUE explícito).
+    v_detail_reopen BOOLEAN := p_record ? 'detailPending' AND jsonb_typeof(p_record->'detailPending') = 'boolean'
+                               AND (p_record->>'detailPending')::BOOLEAN;
 BEGIN
     IF v_order IS NULL OR jsonb_typeof(v_order) <> 'object' OR v_external IS NULL OR v_external = ''
        OR v_order->>'channel' IS DISTINCT FROM p_channel::text THEN
@@ -189,14 +197,19 @@ BEGIN
         RETURN v_version;
     END IF;
 
-    -- O dono (tenant), o total e o pedido do app não mudam depois de gravados: o detalhe do pedido é imutável.
-    -- Exceção única: o pedido mínimo (detail_pending) recebe o detalhe recuperado do app, uma vez, na gravação
-    -- que manda detailPending FALSE. A loja do app (merchantId) tem que ser a mesma; outra loja é recusada.
+    -- O dono (tenant), o total e o pedido do app só mudam na troca do detalhe: o pedido sem detalhe (detail_pending)
+    -- recebe o detalhe buscado no app na gravação que manda detailPending FALSE. A loja do app (merchantId) tem que
+    -- ser a mesma; outra loja é recusada. Pedido completo volta a detail_pending com detailPending TRUE (o app alterou
+    -- o pedido): só a marca muda e detail_retry_at é zerado; o detalhe gravado fica até a próxima troca.
+    -- Pedido cancelado não sai de cancelled.
     SELECT * INTO v_row FROM delivery_orders
      WHERE channel = p_channel AND external_id = v_external AND version = p_expected_version
        FOR UPDATE;
     IF NOT FOUND THEN
         RETURN NULL;
+    END IF;
+    IF v_row.status = 'cancelled' AND v_order->>'status' IS DISTINCT FROM 'cancelled' THEN
+        RAISE EXCEPTION 'Pedido % já cancelado não pode mudar de status.', v_external USING ERRCODE = '22023';
     END IF;
     IF v_row.detail_pending AND v_detail_done
        AND v_order->>'merchantExternalId' IS DISTINCT FROM v_row.payload->>'merchantExternalId' THEN
@@ -207,7 +220,10 @@ BEGIN
            total_amount = CASE WHEN v_row.detail_pending AND v_detail_done THEN v_total / 100 ELSE total_amount END,
            display_id = CASE WHEN v_row.detail_pending AND v_detail_done
                              THEN left(COALESCE(v_order->>'displayId', ''), 20) ELSE display_id END,
-           detail_pending = v_row.detail_pending AND NOT v_detail_done,
+           placed_at = CASE WHEN v_row.detail_pending AND v_detail_done
+                            THEN COALESCE((v_order->>'createdAt')::TIMESTAMPTZ, placed_at) ELSE placed_at END,
+           detail_pending = CASE WHEN v_row.detail_pending THEN NOT v_detail_done ELSE v_detail_reopen END,
+           detail_retry_at = CASE WHEN NOT v_row.detail_pending AND v_detail_reopen THEN NULL ELSE detail_retry_at END,
            status = (v_order->>'status')::delivery_order_status,
            cancellation_pending = COALESCE((p_record->>'cancellationPending')::BOOLEAN, FALSE),
            needs_review = COALESCE((p_record->>'needsReview')::BOOLEAN, FALSE),
@@ -257,8 +273,8 @@ END $$;
 -- de 3 erros em 60 s de tchefood_authorize_manager (mesma trava e mesmos registros
 -- MANAGER_PIN_FAILED / MANAGER_PIN_LOCKOUT). A autorização vira um audit_log com gerente, com o
 -- que o gerente aprovou em metadata.details (p_details: cancelamento {code, reason} com o texto
--- exato enviado ao app, negociação {kind, alternativeId?}, pausa {minutes, description},
--- retomada {pauseId}).
+-- exato enviado ao app, negociação {disputeId, kind, alternativeId?} com o id da negociação aprovada,
+-- pausa {minutes, description}, retomada {pauseId}).
 -- Devolve {"status": "OK", "auditId", "repeated"} ou {"status": "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT"}.
 -- repeated = TRUE: reenvio de uma tentativa já autorizada; o servidor NÃO chama o app de novo.
 -- lastOutcome (só no reenvio): resultado já gravado da tentativa; "failed" = nada chegou ao app.
@@ -305,7 +321,8 @@ BEGIN
     IF p_details IS NULL OR jsonb_typeof(p_details) <> 'object' OR NOT COALESCE(CASE p_action
            WHEN 'DELIVERY_CANCEL' THEN jsonb_typeof(p_details->'code') = 'string'
                 AND jsonb_typeof(p_details->'reason') = 'string'
-           WHEN 'DELIVERY_DISPUTE' THEN p_details->>'kind' IN ('accept', 'reject', 'alternative')
+           WHEN 'DELIVERY_DISPUTE' THEN jsonb_typeof(p_details->'disputeId') = 'string'
+                AND p_details->>'kind' IN ('accept', 'reject', 'alternative')
                 AND (p_details->>'kind' <> 'alternative' OR jsonb_typeof(p_details->'alternativeId') = 'string')
            WHEN 'DELIVERY_PAUSE' THEN jsonb_typeof(p_details->'minutes') = 'number'
                 AND jsonb_typeof(p_details->'description') = 'string'

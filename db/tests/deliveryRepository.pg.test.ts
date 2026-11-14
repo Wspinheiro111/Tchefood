@@ -168,7 +168,7 @@ function setup() {
     expect(sql(`SELECT count(*) FROM delivery_events WHERE external_order_id = '${id}'`)).toBe('2');
   });
 
-  it('o detalhe só troca uma vez, de pendente para completo, na mesma loja; gravação com versão velha não troca', async () => {
+  it('o detalhe só troca na volta de pendente para completo, na mesma loja; gravação com versão velha não troca', async () => {
     const { sandbox, api, repository, inbox } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
     const realGetOrder = api.getOrder.bind(api);
@@ -194,14 +194,57 @@ function setup() {
     // Mesma loja, versão atual: troca uma vez.
     const version = await repository.saveOrder({ ...current, detailPending: false, order: { ...detail, status: current.order.status } });
     expect(sql(`SELECT tenant_id || '|' || total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${TENANT}|${total}|false`);
-    // Depois disso o pedido do app é imutável de novo e detail_pending não volta para TRUE.
+    // Na troca, placed_at passa a ser o horário do pedido no app (o mínimo tinha o do evento).
+    expect(sql(`SELECT placed_at = '${detail.createdAt}'::timestamptz FROM delivery_orders WHERE external_id = '${id}'`)).toBe('t');
+    // Completo: o pedido do app não muda sem voltar a pendente.
     const done = (await repository.getOrder('ifood', id))!;
     expect(done.version).toBe(version);
-    await repository.saveOrder({ ...done, detailPending: true, order: { ...done.order, totals: { ...done.order.totals, orderCents: 1 } } });
+    await repository.saveOrder({ ...done, detailPending: false, order: { ...done.order, totals: { ...done.order.totals, orderCents: 1 } } });
     expect(sql(`SELECT total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${total}|false`);
+    // O app alterou o pedido: volta a pendente (só a marca; o detalhe gravado fica) e o adiamento antigo é zerado.
+    sql(`UPDATE delivery_orders SET detail_retry_at = NOW() + INTERVAL '1 hour' WHERE external_id = '${id}'`);
+    const changed = (await repository.getOrder('ifood', id))!;
+    await repository.saveOrder({ ...changed, detailPending: true, order: { ...changed.order, totals: { ...changed.order.totals, orderCents: 1 } } });
+    expect(sql(`SELECT total_amount || '|' || detail_pending || '|' || (detail_retry_at IS NULL) FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${total}|true|true`);
+    expect((await repository.listDetailPending('ifood', 100)).map((r) => r.order.externalId)).toContain(id);
+    // A volta seguinte para completo troca o detalhe e o total de novo.
     const again = (await repository.getOrder('ifood', id))!;
     await repository.saveOrder({ ...again, detailPending: false, order: { ...again.order, totals: { ...again.order.totals, orderCents: 1 } } });
-    expect(sql(`SELECT total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${total}|false`);
+    expect(sql(`SELECT total_amount || '|' || detail_pending || '|' || (payload->'totals'->>'orderCents') FROM delivery_orders WHERE external_id = '${id}'`)).toBe('0.01|false|1');
+  });
+
+  it('pedido alterado pelo iFood (OPA) volta a pendente e o detalhe novo vai para o banco', async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: [...ITEMS, { name: 'Refri', externalCode: '501', quantity: 1, unitPrice: 8 }] });
+    await inbox.runChannel(api);
+    expect(sql(`SELECT total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe('85.00|false');
+    sandbox.patchOrder(id, ITEMS);
+    await inbox.runChannel(api);
+    expect(sql(`SELECT total_amount || '|' || detail_pending || '|' || jsonb_array_length(payload->'items') FROM delivery_orders WHERE external_id = '${id}'`)).toBe('77.00|false|1');
+    expect(sql(`SELECT string_agg(raw_code || ':' || signal, ',' ORDER BY event_created_at) FROM delivery_events WHERE external_order_id = '${id}'`)).toBe('PLC:placed,OPA:order_patched');
+    expect((await repository.getOrder('ifood', id))!.needsReview).toBe(true);
+  });
+
+  it('recuperação do detalhe ignora pedido cancelado e pedido de mais de 7 dias; cancelado não sai de cancelled', async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const spy = vi.spyOn(api, 'getOrder').mockRejectedValue(new DeliveryMarketplaceError('ifood', 'invalid_response', 'Valor inválido no iFood: total.subTotal.'));
+    const [old, cancelled, fresh] = [sandbox.placeOrder({ items: ITEMS }), sandbox.placeOrder({ items: ITEMS }), sandbox.placeOrder({ items: ITEMS })];
+    await inbox.runChannel(api);
+    spy.mockRestore();
+    sandbox.emitFromMarketplace(cancelled, 'CAN');
+    await inbox.runChannel(api);
+    sql(`UPDATE delivery_orders SET detail_retry_at = NULL WHERE external_id IN ('${old}', '${cancelled}', '${fresh}');
+         UPDATE delivery_orders SET placed_at = NOW() - INTERVAL '8 days' WHERE external_id = '${old}';`);
+    const state = (x: string) => sql(`SELECT status || ':' || detail_pending FROM delivery_orders WHERE external_id = '${x}'`);
+    expect([old, cancelled, fresh].map(state)).toEqual(['placed:true', 'cancelled:true', 'placed:true']);
+    const listed = (await repository.listDetailPending('ifood', 100)).map((r) => r.order.externalId);
+    expect(listed).toContain(fresh);
+    expect(listed).not.toContain(old);
+    expect(listed).not.toContain(cancelled);
+    // Gravação que tira o pedido de cancelled é recusada (nada muda).
+    const record = (await repository.getOrder('ifood', cancelled))!;
+    await expect(repository.saveOrder({ ...record, order: { ...record.order, status: 'confirmed' } })).rejects.toThrow(/cancelado/);
+    expect(sql(`SELECT status || '|' || version FROM delivery_orders WHERE external_id = '${cancelled}'`)).toBe(`cancelled|${record.version}`);
   });
 
   it('rodízio do detalhe: adiado sai da lista até o prazo, nunca adiado vem primeiro, adiar não muda a versão', async () => {
@@ -344,7 +387,7 @@ function setup() {
   describe('alçada de gerente (tchefood_delivery_authorize)', () => {
     const DETAILS: Record<string, unknown> = {
       DELIVERY_CANCEL: { code: '503', reason: 'Item indisponível' },
-      DELIVERY_DISPUTE: { kind: 'accept' },
+      DELIVERY_DISPUTE: { disputeId: 'd-1', kind: 'accept' },
       DELIVERY_PAUSE: { minutes: 30, description: 'Falta de gás' },
       DELIVERY_RESUME: { pauseId: 'p-1' },
     };
@@ -390,6 +433,11 @@ function setup() {
       expect((await authorize(TENANT, { p_external_order_id: id, p_details: { code: '503' } })).ok).toBe(false);
       expect((await authorize(TENANT, { p_external_order_id: id, p_details: { code: '503', reason: 7 } })).ok).toBe(false);
       expect((await authorize(TENANT, { p_action: 'DELIVERY_PAUSE', p_merchant_external_id: merchantId, p_details: { minutes: 0, description: 'x' } })).ok).toBe(false);
+      // Resposta de negociação vale só para a negociação aprovada: sem disputeId (ou com id que não é texto), recusada.
+      expect((await authorize(TENANT, { p_action: 'DELIVERY_DISPUTE', p_external_order_id: id, p_details: { kind: 'accept' } })).ok).toBe(false);
+      expect((await authorize(TENANT, { p_action: 'DELIVERY_DISPUTE', p_external_order_id: id, p_details: { disputeId: 7, kind: 'accept' } })).ok).toBe(false);
+      expect((await authorize(TENANT, { p_action: 'DELIVERY_DISPUTE', p_external_order_id: id, p_details: { disputeId: 'd-1', kind: 'accept' } })).body)
+        .toMatchObject({ status: 'OK' });
 
       // Resultado: só o servidor grava; o app não chama a função.
       const denied = await appFetch(TENANT)('http://cloud.test/rest/v1/rpc/tchefood_delivery_audit_result', {

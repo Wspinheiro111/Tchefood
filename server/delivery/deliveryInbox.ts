@@ -28,8 +28,10 @@ export type DeliveryOrderRecord = {
   // Pedido de cancelamento da loja reservado antes da chamada ao app (null = nenhum). Não trava as outras ações
   // (isso é cancellationPending); só impede um segundo pedido de cancelamento.
   cancellationRequest: DeliveryCancellationRequest | null;
-  // Pedido gravado sem o detalhe do app (pedido mínimo: sem itens nem valores). O servidor tenta buscar o detalhe de
-  // novo a cada ciclo; até lá o pedido não pode virar venda nem NFC-e. Só vai de true para false, uma vez.
+  // Pedido sem o detalhe do app em vigor: pedido mínimo (sem itens nem valores) ou pedido que o app alterou depois de
+  // gravado (evento de pedido alterado, cancelamento parcial aplicado), cujos itens e valores gravados estão velhos.
+  // O servidor busca o detalhe de novo a cada ciclo; até lá o pedido não pode virar venda nem NFC-e. Volta a true a
+  // cada alteração do app; o detalhe gravado só troca na volta para false.
   detailPending: boolean;
   // Precisa de olho humano: avisos do pedido, status desconhecido, ação recusada pelo app.
   needsReview: boolean;
@@ -145,10 +147,13 @@ export interface DeliveryRepository {
   saveOrder(record: DeliveryOrderRecord): Promise<number>;
   listOrders(): Promise<DeliveryOrderRecord[]>;
   // Pedidos do app ainda sem o detalhe (detailPending) cuja próxima tentativa já chegou (ver deferDetail): primeiro
-  // os nunca adiados, depois os de tentativa mais antiga; empate pelo pedido mais antigo. No máximo limit.
+  // os nunca adiados, depois os de tentativa mais antiga; empate pelo pedido mais antigo. No máximo limit. Ficam de
+  // fora o pedido cancelado e o feito há mais de DETAIL_PENDING_MAX_AGE_DAYS dias (não viram venda; a conferência
+  // fica com a pendência gravada).
   listDetailPending(channel: DeliveryChannelKey, limit: number): Promise<DeliveryOrderRecord[]>;
   // Adia a próxima tentativa de buscar o detalhe de um pedido ainda detailPending para daqui a seconds segundos
-  // (relógio do banco). Não muda a versão do pedido nem mais nada nele; pedido já completo não muda.
+  // (relógio do banco). Não muda a versão do pedido nem mais nada nele; pedido já completo não muda. A gravação que
+  // volta o pedido para detailPending zera o adiamento (a busca é logo).
   deferDetail(channel: DeliveryChannelKey, externalOrderId: string, seconds: number): Promise<void>;
 }
 
@@ -178,8 +183,10 @@ export class InMemoryDeliveryRepository implements DeliveryRepository {
 
   async saveOrder(record: DeliveryOrderRecord): Promise<number> {
     const key = `${record.order.channel}:${record.order.externalId}`;
-    const storedVersion = this.orders.get(key)?.version ?? 0;
+    const stored = this.orders.get(key);
+    const storedVersion = stored?.version ?? 0;
     if (storedVersion !== record.version) throw new DeliveryConcurrencyError(record.order.channel, record.order.externalId);
+    if (stored && !stored.detailPending && record.detailPending) this.detailRetryAt.delete(key);
     const version = storedVersion + 1;
     this.orders.set(key, { ...structuredClone(record), version });
     return version;
@@ -193,9 +200,17 @@ export class InMemoryDeliveryRepository implements DeliveryRepository {
 
   async listDetailPending(channel: DeliveryChannelKey, limit: number): Promise<DeliveryOrderRecord[]> {
     const now = this.now().getTime();
+    const oldest = now - DETAIL_PENDING_MAX_AGE_DAYS * 86_400_000;
     const retryAt = (record: DeliveryOrderRecord) => this.detailRetryAt.get(`${record.order.channel}:${record.order.externalId}`) ?? -Infinity;
     return [...this.orders.values()]
-      .filter((record) => record.order.channel === channel && record.detailPending && retryAt(record) <= now)
+      .filter(
+        (record) =>
+          record.order.channel === channel &&
+          record.detailPending &&
+          record.order.status !== "cancelled" &&
+          Date.parse(record.order.createdAt) >= oldest &&
+          retryAt(record) <= now,
+      )
       .sort(
         (a, b) =>
           retryAt(a) - retryAt(b) ||
@@ -260,6 +275,14 @@ export const DETAIL_RETRY_DELAY_SECONDS = 5 * 60;
 // Detalhe que veio de outra loja do app: só a conferência humana resolve; tenta de novo de hora em hora.
 export const DETAIL_OTHER_STORE_RETRY_SECONDS = 60 * 60;
 export const DETAIL_RECOVERED_REASON = "Detalhe do pedido recuperado do app: confira itens e valores.";
+// Detalhe buscado de novo num pedido que já tinha itens (o app alterou o pedido depois de gravado).
+export const DETAIL_REFRESHED_REASON = "Detalhe do pedido atualizado pelo app (itens e valores novos): confira antes de lançar.";
+// Pedido sem detalhe mais velho que isto sai da recuperação (o banco filtra pelo horário do pedido).
+export const DETAIL_PENDING_MAX_AGE_DAYS = 7;
+export const ORDER_PATCHED_REASON = "O app alterou o pedido: itens e valores serão buscados de novo; confira antes de lançar.";
+export const PARTIAL_CANCELLATION_APPLIED_REASON = "Cancelamento parcial aplicado pelo app: itens e valores mudaram; confira antes de lançar.";
+export const PARTIAL_CANCELLATION_UNCERTAIN_REASON =
+  "Negociação de cancelamento parcial venceu sem a ação padrão do app gravada: itens e valores serão buscados de novo; confira antes de lançar.";
 
 export class DeliveryInbox {
   private readonly adapters = new Map<DeliveryChannelKey, DeliveryMarketplaceAdapter>();
@@ -771,8 +794,9 @@ export class DeliveryInbox {
     return announce ? "new_order" : "updated";
   }
 
-  // Pedido mínimo (detailPending): busca o detalhe no app de novo e, se vier legível, grava itens, valores, cliente,
-  // pagamentos etc. sem mexer no que os eventos já fizeram (status, cancelamento, negociação, pendências, aviso).
+  // Pedido sem detalhe em vigor (detailPending: pedido mínimo, ou alterado pelo app): busca o detalhe no app de novo e,
+  // se vier legível, grava itens, valores, cliente, pagamentos etc. sem mexer no que os eventos já fizeram (status,
+  // cancelamento, negociação, pendências, aviso).
   // Qualquer falha (app, banco, conflito de versão esgotado) deixa o pedido como está e o adia
   // (DETAIL_RETRY_DELAY_SECONDS; outra loja: DETAIL_OTHER_STORE_RETRY_SECONDS), e nunca derruba o ciclo. O laço
   // para no orçamento de tempo (DETAIL_RECOVERY_BUDGET_MS) e no primeiro erro temporário do app (fora do ar,
@@ -817,11 +841,13 @@ export class DeliveryInbox {
             return true;
           }
           otherStore = false;
+          // Pedido mínimo (sem itens) recuperado, ou pedido com itens que o app alterou e foi buscado de novo.
+          const refreshed = latest.order.items.length > 0;
           // Cancelamento só vale pelo evento do app (que também zera reservas e negociação).
           const status = detail.status === "cancelled" ? latest.order.status : mergeDeliveryStatus(latest.order.status, detail.status);
           latest.order = { ...structuredClone(detail), channel, externalId, merchantExternalId: merchant, status };
           for (const warning of detail.warnings) flag(latest, warning);
-          flag(latest, DETAIL_RECOVERED_REASON);
+          flag(latest, refreshed ? DETAIL_REFRESHED_REASON : DETAIL_RECOVERED_REASON);
           latest.detailPending = false;
           recovered = true;
           return true;
@@ -921,6 +947,12 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
     case "dispute_settled":
       applySettlement(record, event);
       return;
+    case "order_patched":
+      // O app mudou itens/valores depois do pedido gravado: o detalhe gravado ficou velho. Volta a ser buscado (e a
+      // venda fica bloqueada até lá). Pedido cancelado não vira venda: nada a buscar.
+      if (record.order.status === "cancelled") return;
+      reopenDetail(record, ORDER_PATCHED_REASON);
+      return;
     case "unknown":
       // Códigos que não mexem no status (entregador chegando, troca de endereço...) ficam só no histórico.
       // Evento que não deu para ler é diferente: pode ser um cancelamento ou uma negociação.
@@ -1003,6 +1035,19 @@ function applySettlement(record: DeliveryOrderRecord, event: DeliveryEvent): voi
     return;
   }
   if (current) record.dispute = null;
+  // Cancelamento parcial aplicado (aceite sem contraproposta, ou prazo vencido com a ação padrão de aceitar): itens e
+  // valores do pedido mudaram no app. O app aplica a ação padrão (timeoutAction) no vencimento: ACCEPT_CANCELLATION
+  // aplica o cancelamento; REJECT_CANCELLATION e VOID não. Sem a ação padrão gravada não dá para saber: busca de novo.
+  if (current?.action === "PARTIAL_CANCELLATION" && record.order.status !== "cancelled") {
+    const timeoutAction = current.timeoutAction;
+    if (settlement.status === "accepted" && !settlement.selectedAlternative) {
+      reopenDetail(record, PARTIAL_CANCELLATION_APPLIED_REASON);
+    } else if (settlement.status === "expired" && timeoutAction === "ACCEPT_CANCELLATION") {
+      reopenDetail(record, PARTIAL_CANCELLATION_APPLIED_REASON);
+    } else if (settlement.status === "expired" && timeoutAction !== "REJECT_CANCELLATION" && timeoutAction !== "VOID") {
+      reopenDetail(record, PARTIAL_CANCELLATION_UNCERTAIN_REASON);
+    }
+  }
   // Reembolso ou benefício aceito muda o valor que a loja recebe do app.
   const selected = settlement.status === "accepted" ? settlement.selectedAlternative : null;
   if (selected && (selected.type === "REFUND" || selected.type === "BENEFIT")) {
@@ -1097,6 +1142,13 @@ function resolveDisputeDecision(
     return { kind: "alternative", alternativeId: alternative.id, alternativeType: alternative.type, additionalTimeInMinutes: minutes, additionalTimeReason: reason };
   }
   throw invalid("Tipo de proposta desconhecido; responda pelo Portal do Parceiro.");
+}
+
+// O detalhe gravado deixou de valer (o app alterou o pedido): volta a ser buscado pela recuperação do ciclo e, até lá,
+// o pedido não vira venda. O detalhe gravado só é trocado quando a busca trouxer o novo.
+function reopenDetail(record: DeliveryOrderRecord, reason: string): void {
+  record.detailPending = true;
+  flag(record, reason);
 }
 
 function formatCents(cents: number): string {

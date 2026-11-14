@@ -114,8 +114,9 @@ export type DeliveryOrderStatus =
   | "unknown";
 
 // O que um evento do app comunica: um novo status do pedido, o andamento de um pedido de cancelamento
-// (que não muda o status até o app confirmar com "cancelled"), o pedido de cancelamento feito pelo cliente, ou
-// uma negociação aberta pelo app (cliente pede cancelamento/reembolso e a loja aceita, recusa ou propõe outra coisa).
+// (que não muda o status até o app confirmar com "cancelled"), o pedido de cancelamento feito pelo cliente,
+// uma negociação aberta pelo app (cliente pede cancelamento/reembolso e a loja aceita, recusa ou propõe outra coisa),
+// ou o pedido alterado pelo app depois de feito (itens e valores mudaram: o detalhe tem que ser buscado de novo).
 export type DeliveryEventSignal =
   | DeliveryOrderStatus
   | "cancellation_requested"
@@ -124,7 +125,8 @@ export type DeliveryEventSignal =
   | "customer_cancellation_accepted"
   | "customer_cancellation_denied"
   | "dispute_opened"
-  | "dispute_settled";
+  | "dispute_settled"
+  | "order_patched";
 
 export type DeliveryFulfillment = "delivery" | "takeout" | "indoor";
 // Quem leva o pedido: entregador do app ou motoboy da própria loja.

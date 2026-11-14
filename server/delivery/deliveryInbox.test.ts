@@ -4,6 +4,7 @@ import {
   DETAIL_RECOVERED_REASON,
   DETAIL_RECOVERY_BATCH,
   DETAIL_RECOVERY_BUDGET_MS,
+  DETAIL_REFRESHED_REASON,
   DETAIL_RETRY_DELAY_SECONDS,
   DeliveryConcurrencyError,
   DeliveryInbox,
@@ -13,6 +14,9 @@ import {
   CONCLUDED_WITH_PENDING_CANCELLATION,
   DISPUTE_RESPONSE_STALE_MS,
   ORDER_DETAIL_MAX_FAILURES,
+  ORDER_PATCHED_REASON,
+  PARTIAL_CANCELLATION_APPLIED_REASON,
+  PARTIAL_CANCELLATION_UNCERTAIN_REASON,
   UNCERTAIN_CANCELLATION_RETRIED,
   type DeliveryOrderRecord,
 } from "./deliveryInbox";
@@ -1568,5 +1572,167 @@ describe("pedido concluído pelo app com o cancelamento em análise", () => {
     sandbox.emitFromMarketplace(id, "CON");
     await inbox.runCycle();
     expect((await repository.getOrder("ifood", id))!.reviewReasons).not.toContain(CONCLUDED_WITH_PENDING_CANCELLATION);
+  });
+});
+
+describe("pedido alterado pelo app depois de gravado (cancelamento parcial, OPA)", () => {
+  const XIS = { name: "Xis Galpão", externalCode: "301", quantity: 1, unitPrice: 38 };
+  const REFRI = { name: "Refri lata", externalCode: "501", quantity: 1, unitPrice: 8 };
+
+  async function confirmedOrder(now?: () => Date) {
+    const ctx = setup({ now });
+    const id = ctx.sandbox.placeOrder({ items: [XIS, REFRI] });
+    await ctx.inbox.runCycle();
+    await ctx.inbox.performAction("ifood", id, "confirm");
+    await ctx.inbox.runCycle();
+    const before = (await ctx.repository.getOrder("ifood", id))!;
+    expect(before.order.totals.orderCents).toBe(4600);
+    return { ...ctx, id };
+  }
+
+  it("cancelamento parcial aceito pela loja: bloqueia a venda e busca o detalhe de novo (itens e valor novos)", async () => {
+    let offset = 0;
+    const { sandbox, api, repository, inbox, id } = await confirmedOrder(() => new Date(Date.now() + offset));
+    const disputeId = sandbox.openDispute(id, { action: "PARTIAL_CANCELLATION", handshakeType: "PREPARATION_TIME", remainingItems: [XIS] });
+    await inbox.runCycle();
+    await inbox.respondToDispute("ifood", id, { kind: "accept" }, disputeId);
+    // A primeira busca do detalhe novo falha: o pedido fica bloqueado com o valor antigo, nunca liberado com ele.
+    const getOrder = vi.spyOn(api, "getOrder").mockRejectedValueOnce(new DeliveryMarketplaceError("ifood", "unavailable", "fora do ar"));
+    await inbox.runCycle();
+    expect(getOrder).toHaveBeenCalledTimes(1);
+    let record = (await repository.getOrder("ifood", id))!;
+    expect(record).toMatchObject({ dispute: null, detailPending: true, needsReview: true, order: { status: "confirmed" } });
+    expect(record.order.totals.orderCents).toBe(4600);
+    expect(record.reviewReasons).toContain(PARTIAL_CANCELLATION_APPLIED_REASON);
+    expect(deliverySaleBlockers(record)).toEqual([expect.stringContaining("sem o detalhe do app")]);
+
+    offset += DETAIL_RETRY_DELAY_SECONDS * 1000;
+    await inbox.runCycle();
+    record = (await repository.getOrder("ifood", id))!;
+    expect(record.detailPending).toBe(false);
+    expect(record.order.status).toBe("confirmed");
+    expect(record.order.items.map((item) => item.name)).toEqual(["Xis Galpão"]);
+    expect(record.order.totals.orderCents).toBe(3800);
+    expect(record.reviewReasons).toContain(DETAIL_REFRESHED_REASON);
+    expect(record.reviewReasons).not.toContain(DETAIL_RECOVERED_REASON);
+    expect(deliverySaleBlockers(record)).toEqual([]);
+  });
+
+  it("cancelamento parcial vencido: ACCEPT_CANCELLATION aplica (busca de novo); REJECT_CANCELLATION e VOID não mexem", async () => {
+    const expired = async (timeoutAction: string) => {
+      const ctx = await confirmedOrder();
+      const disputeId = ctx.sandbox.openDispute(ctx.id, { action: "PARTIAL_CANCELLATION", handshakeType: "PREPARATION_TIME", timeoutAction, remainingItems: [XIS] });
+      await ctx.inbox.runCycle();
+      ctx.sandbox.expireDispute(disputeId);
+      const getOrder = vi.spyOn(ctx.api, "getOrder");
+      await ctx.inbox.runCycle();
+      return { record: (await ctx.repository.getOrder("ifood", ctx.id))!, fetched: getOrder.mock.calls.length };
+    };
+    const accepted = await expired("ACCEPT_CANCELLATION");
+    expect(accepted.fetched).toBe(1);
+    expect(accepted.record).toMatchObject({ dispute: null, detailPending: false, order: { totals: { orderCents: 3800 } } });
+    expect(accepted.record.reviewReasons).toEqual(expect.arrayContaining([PARTIAL_CANCELLATION_APPLIED_REASON, DETAIL_REFRESHED_REASON]));
+    for (const timeoutAction of ["REJECT_CANCELLATION", "VOID"]) {
+      const kept = await expired(timeoutAction);
+      expect(kept.fetched, timeoutAction).toBe(0);
+      expect(kept.record, timeoutAction).toMatchObject({ dispute: null, detailPending: false, order: { totals: { orderCents: 4600 } } });
+      expect(kept.record.reviewReasons, timeoutAction).not.toContain(PARTIAL_CANCELLATION_APPLIED_REASON);
+    }
+  });
+
+  it("cancelamento parcial vencido sem saber a ação padrão do app: busca o detalhe de novo por segurança", async () => {
+    const { sandbox, api, repository, inbox, id } = await confirmedOrder();
+    const disputeId = sandbox.openDispute(id, { action: "PARTIAL_CANCELLATION", handshakeType: "PREPARATION_TIME" });
+    await inbox.runCycle();
+    // Negociação gravada sem timeoutAction (o HSD não trouxe o campo).
+    const stored = (await repository.getOrder("ifood", id))!;
+    await repository.saveOrder({ ...stored, dispute: { ...stored.dispute!, timeoutAction: null } });
+    sandbox.expireDispute(disputeId);
+    const getOrder = vi.spyOn(api, "getOrder");
+    await inbox.runCycle();
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(getOrder).toHaveBeenCalledTimes(1);
+    expect(record.detailPending).toBe(false);
+    expect(record.reviewReasons).toContain(PARTIAL_CANCELLATION_UNCERTAIN_REASON);
+    expect(record.reviewReasons).not.toContain(PARTIAL_CANCELLATION_APPLIED_REASON);
+  });
+
+  it("cancelamento parcial recusado, ou trocado por uma proposta aceita pelo cliente, não busca o detalhe", async () => {
+    const rejected = await confirmedOrder();
+    const first = rejected.sandbox.openDispute(rejected.id, { action: "PARTIAL_CANCELLATION", handshakeType: "PREPARATION_TIME", remainingItems: [XIS] });
+    await rejected.inbox.runCycle();
+    await rejected.inbox.respondToDispute("ifood", rejected.id, { kind: "reject", reason: "Pedido já saiu" }, first);
+    await rejected.inbox.runCycle();
+    expect((await rejected.repository.getOrder("ifood", rejected.id))!).toMatchObject({ dispute: null, detailPending: false });
+
+    const refunded = await confirmedOrder();
+    const second = refunded.sandbox.openDispute(refunded.id, { action: "PARTIAL_CANCELLATION", handshakeType: "PREPARATION_TIME", alternatives: ["REFUND"] });
+    await refunded.inbox.runCycle();
+    const [alternative] = (await refunded.repository.getOrder("ifood", refunded.id))!.dispute!.alternatives;
+    await refunded.inbox.respondToDispute("ifood", refunded.id, { kind: "alternative", alternativeId: alternative!.id, amountCents: 800 }, second);
+    await refunded.inbox.runCycle();
+    refunded.sandbox.settleAlternative(second, true);
+    await refunded.inbox.runCycle();
+    const record = (await refunded.repository.getOrder("ifood", refunded.id))!;
+    expect(record).toMatchObject({ dispute: null, detailPending: false });
+    expect(record.reviewReasons).not.toContain(PARTIAL_CANCELLATION_APPLIED_REASON);
+    expect(record.reviewReasons.join(" ")).toMatch(/reembolso de R\$ 8,00/);
+  });
+
+  it("OPA (pedido alterado pelo app): pendência, venda bloqueada e detalhe buscado de novo", async () => {
+    let offset = 0;
+    const { sandbox, api, repository, inbox, id } = await confirmedOrder(() => new Date(Date.now() + offset));
+    sandbox.patchOrder(id, [XIS]);
+    const getOrder = vi.spyOn(api, "getOrder").mockRejectedValueOnce(new DeliveryMarketplaceError("ifood", "unavailable", "fora do ar"));
+    const [report] = await inbox.runCycle();
+    expect(report).toMatchObject({ acknowledged: 1, deferred: 0, error: null });
+    let record = (await repository.getOrder("ifood", id))!;
+    expect(record).toMatchObject({ detailPending: true, needsReview: true, order: { status: "confirmed", totals: { orderCents: 4600 } } });
+    expect(record.reviewReasons).toContain(ORDER_PATCHED_REASON);
+    expect(deliverySaleBlockers(record)).toHaveLength(1);
+
+    offset += DETAIL_RETRY_DELAY_SECONDS * 1000;
+    await inbox.runCycle();
+    expect(getOrder).toHaveBeenCalledTimes(2);
+    record = (await repository.getOrder("ifood", id))!;
+    expect(record).toMatchObject({ detailPending: false, order: { status: "confirmed", totals: { orderCents: 3800 } } });
+    expect(record.order.items).toHaveLength(1);
+    expect(record.reviewReasons).toContain(DETAIL_REFRESHED_REASON);
+    expect(deliverySaleBlockers(record)).toEqual([]);
+  });
+
+  it("OPA de pedido cancelado não reabre nada", async () => {
+    const { sandbox, repository, inbox, id } = await confirmedOrder();
+    sandbox.emitFromMarketplace(id, "CAN");
+    await inbox.runCycle();
+    sandbox.patchOrder(id, [XIS]);
+    await inbox.runCycle();
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record).toMatchObject({ detailPending: false, order: { status: "cancelled" } });
+    expect(record.reviewReasons).not.toContain(ORDER_PATCHED_REASON);
+  });
+
+  it("repositório em memória: voltar a pendente zera o adiamento (busca logo); cancelado e pedido de mais de 7 dias saem da lista", async () => {
+    let now = Date.parse("2026-11-14T12:00:00Z");
+    const repository = new InMemoryDeliveryRepository({ now: () => new Date(now) });
+    const order = await baseOrder();
+    const save = async (record: DeliveryOrderRecord) => ({ ...record, version: await repository.saveOrder(record) });
+    const fresh = (externalId: string): DeliveryOrderRecord => ({
+      order: { ...order, externalId, createdAt: new Date(now).toISOString() },
+      cancellationPending: false, cancellationRequest: null, detailPending: true, needsReview: false, reviewReasons: [],
+      newOrderNotified: true, lastCancellationEventAt: null, lastEventAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(),
+      dispute: null, version: 0,
+    });
+    let record = await save(fresh("o1"));
+    await repository.deferDetail("ifood", "o1", 3600);
+    record = await save({ ...record, detailPending: false });
+    record = await save({ ...record, detailPending: true });
+    expect((await repository.listDetailPending("ifood", 20)).map((r) => r.order.externalId)).toEqual(["o1"]);
+    await save({ ...record, order: { ...record.order, status: "cancelled" } });
+    expect(await repository.listDetailPending("ifood", 20)).toEqual([]);
+    await save(fresh("o2"));
+    expect((await repository.listDetailPending("ifood", 20)).map((r) => r.order.externalId)).toEqual(["o2"]);
+    now += 8 * 24 * 3600_000;
+    expect(await repository.listDetailPending("ifood", 20)).toEqual([]);
   });
 });

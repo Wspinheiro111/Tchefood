@@ -63,7 +63,8 @@ const opcional = (l: Linha) => l.item.includes('(rodada 3)');
     expect(linhas.map((l) => l.item)).toEqual(expect.arrayContaining([
       'quem executa public.tchefood_delivery_save_order',
       'quem executa public.tchefood_delivery_defer_detail',
-      'coluna delivery_orders.detail_retry_at (rodada 3)',
+      'coluna delivery_orders.detail_pending',
+      'coluna delivery_orders.detail_retry_at',
       'quem executa public.tchefood_delivery_authorize',
       'authenticated grava em delivery_orders',
       'RLS ligada em delivery_events',
@@ -81,6 +82,16 @@ const opcional = (l: Linha) => l.item.includes('(rodada 3)');
   it('o script não grava nada (roda dentro de uma transação só leitura)', () => {
     const r = psql(target!, `BEGIN READ ONLY;\n${SCRIPT}\nCOMMIT;`, DB);
     expect(r.ok).toBe(true);
+  });
+
+  it('sem as colunas do detalhe (detail_pending, detail_retry_at) a conferência falha: não são mais opcionais', () => {
+    sql('ALTER TABLE delivery_orders DROP COLUMN detail_retry_at;');
+    try {
+      const falhas = conferir().filter((l) => l.ok === 'NÃO').map((l) => l.item);
+      expect(falhas).toEqual(['coluna delivery_orders.detail_retry_at']);
+    } finally {
+      sql('ALTER TABLE delivery_orders ADD COLUMN detail_retry_at TIMESTAMPTZ;');
+    }
   });
 
   it('GRANT INSERT a authenticated numa tabela delivery_* faz a linha correspondente falhar', () => {

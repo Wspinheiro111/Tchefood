@@ -55,8 +55,8 @@ col (ordem, nome, tipo, nulo, padrao, opcional) AS (VALUES
     (1, 'version', 'integer', 'NO', '1', FALSE),
     (2, 'dispute', 'jsonb', 'YES', NULL, FALSE),
     (3, 'cancellation_request', 'jsonb', 'YES', NULL, FALSE),
-    (4, 'detail_pending', 'boolean', 'NO', 'false', TRUE),
-    (5, 'detail_retry_at', 'timestamp with time zone', 'YES', NULL, TRUE)
+    (4, 'detail_pending', 'boolean', 'NO', 'false', FALSE),
+    (5, 'detail_retry_at', 'timestamp with time zone', 'YES', NULL, FALSE)
 ),
 trg (ordem, nome, funcao, quando) AS (VALUES
     (1, 'trg_audit_logs_guard', 'tchefood_guard_audit_insert', 'BEFORE INSERT FOR EACH ROW'),
