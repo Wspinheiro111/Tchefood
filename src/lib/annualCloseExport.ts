@@ -50,16 +50,23 @@ export interface ReportDoc {
 // Montagem dos documentos
 // ---------------------------------------------------------------------------
 
+/** Aviso de registros que ficaram de fora por data inválida (nunca somem calados). */
+const invalid = (n: number, what: string): string[] =>
+  n > 0 ? [`ATENÇÃO: ${n} ${what} com data inválida ficaram FORA deste relatório. Avise o suporte antes de enviar ao contador.`] : [];
+
 const qty = (v: number) => Math.round(v * 1000) / 1000;
 const day = (iso: string) => {
   const t = parseIsoInstant(iso);
   return t === null ? '' : brasiliaDate(t);
 };
 
-export function periodLabel(kind: AnnualReportKind, p: YearPeriod): string {
+/** Com o ano em andamento, a posição é a de agora e o período vai até hoje (sem fingir 31/12). */
+export function periodLabel(kind: AnnualReportKind, p: YearPeriod, now: Date = new Date()): string {
   const first = `01/01/${p.year}`;
-  const last = `31/12/${p.year}`;
-  return kind === 'inventory' || kind === 'open' ? `Posição em ${last}` : `${first} a ${last}`;
+  const partial = now.getTime() < p.to;
+  const last = partial ? brasiliaDate(now) : `31/12/${p.year}`;
+  if (kind === 'inventory' || kind === 'open') return partial ? `Posição em ${last} (ano em andamento)` : `Posição em ${last}`;
+  return partial ? `${first} a ${last} (ano em andamento)` : `${first} a ${last}`;
 }
 
 export function inventoryDoc(r: InventoryReport, base: Omit<ReportDoc, 'title' | 'tables' | 'notes'>, extraNotes: string[] = []): ReportDoc {
@@ -69,14 +76,16 @@ export function inventoryDoc(r: InventoryReport, base: Omit<ReportDoc, 'title' |
     notes: [
       'Saldo pelo livro de estoque do Tchê Food: hoje ele registra só as ENTRADAS por NF-e de compra. As vendas ainda não baixam o estoque, então o saldo não é o físico. Faça a contagem física em 31/12 e use este relatório como conferência.',
       'Custo unitário = custo médio ponderado das compras (com frete, IPI, ICMS-ST etc. da nota).',
+      'A entrada conta pela data em que a nota foi IMPORTADA no app (nota emitida em 30/12 e importada em 03/01 não está neste saldo, mas está nas compras do ano).',
+      ...(r.testMovements > 0 ? [`${r.testMovements} entrada(s) por NF-e de homologação (teste) ficaram de fora; o saldo e o custo desses produtos foram refeitos só com as notas reais.`] : []),
       ...(r.missingNcm > 0 ? [`${r.missingNcm} produto(s) com saldo estão sem NCM válido (8 dígitos) no cadastro.`] : []),
-      ...(r.invalidDates > 0 ? [`${r.invalidDates} movimento(s) com data inválida ficaram de fora.`] : []),
+      ...invalid(r.invalidDates, 'movimento(s) de estoque'),
       ...extraNotes,
     ],
     tables: [
       {
         head: ['Código', 'Descrição', 'NCM', 'Unidade', 'Saldo', 'Custo unitário (R$)', 'Custo total (R$)', 'Situação'],
-        rows: r.rows.map((x) => [code(x.code), x.name, code(x.ncm), x.unit, qty(x.quantity), x.unitCost, x.total, x.inactive ? 'Desativado' : 'Ativo']),
+        rows: r.rows.map((x) => [code(x.code), x.name, code(x.ncm), x.unit, qty(x.quantity), x.unitCost, x.total, `${x.inactive ? 'Desativado' : 'Ativo'}${x.withoutTestInvoices ? ' (sem NF-e de teste)' : ''}`]),
         foot: ['', 'Total', '', '', null, null, r.totalCost, ''],
       },
     ],
@@ -88,11 +97,14 @@ export function revenueDoc(r: RevenueReport, base: Omit<ReportDoc, 'title' | 'ta
     ...base,
     title: REPORT_TITLE.revenue,
     notes: [
-      'Pagamentos aprovados pela data do pagamento (estornados e recusados ficam fora). Gorjeta não entra no faturamento.',
-      'Taxa = estimativa pela taxa da maquininha e pela comissão dos apps cadastradas em Taxas e recebíveis. Confira com os extratos.',
+      'Pagamentos aprovados pela data do pagamento (recusados ficam fora). Dinheiro devolvido ao cliente por sangria NÃO abate daqui: está na lista de sangrias do relatório de despesas. Gorjeta não entra no faturamento.',
+      'Entrega própria paga em dinheiro conta na data do acerto com o entregador (é quando o dinheiro entra no caixa).',
+      'Taxa = estimativa pela taxa da maquininha cadastrada em Taxas e recebíveis, sobre conta + gorjeta (como a maquininha cobra). Confira com os extratos.',
+      ...(r.simulatorCount > 0 ? [`${r.simulatorCount} pagamento(s) no simulador de maquininha (R$ ${br(r.simulatorAmount)}) ficaram de fora: não são dinheiro real.`] : []),
       ...(r.totalWithoutRule > 0 ? [`R$ ${br(r.totalWithoutRule)} foram recebidos sem taxa cadastrada: a taxa deles NÃO foi descontada.`] : []),
       `Gorjetas no ano: R$ ${br(r.tips)}.`,
       ...(r.openSessions > 0 ? [`${r.openSessions} turno(s) de caixa aberto(s) no ano ainda não foram fechados.`] : []),
+      ...invalid(r.invalidDates, 'pagamento(s) ou pedido(s) de app'),
       ...extraNotes,
     ],
     tables: [
@@ -131,9 +143,11 @@ export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 
     ...base,
     title: REPORT_TITLE.open,
     notes: [
-      'A RECEBER de maquininha: vendas até 31/12 com repasse previsto para 01/01 ou depois, pelo prazo e taxa cadastrados (estimativa; confira com a agenda da adquirente).',
+      'A RECEBER de maquininha: vendas até a posição com repasse previsto para depois dela, pelo prazo e taxa cadastrados (estimativa; feriado não conta; confira com a agenda da adquirente).',
+      'A RECEBER de entregador: dinheiro de entregas pagas na entrega feitas até a posição e ainda não acertadas.',
       ...(r.cardWithoutRuleCount > 0 ? [`${r.cardWithoutRuleCount} venda(s) no ano na maquininha (R$ ${br(r.cardWithoutRule)}) sem taxa cadastrada: não dá para saber se já caíram.`] : []),
       'NÃO registrados no Tchê Food (informe pelo seu controle): contas a pagar de fornecedores (boletos/duplicatas), fiado e convênios de clientes, repasses pendentes dos apps de delivery.',
+      ...invalid(r.invalidDates, 'pagamento(s) ou entrega(s)'),
       ...extraNotes,
     ],
     tables: [
@@ -142,6 +156,12 @@ export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 
         head: ['Maquininha', 'Forma', 'Qtde', 'Valor passado (R$)', 'Taxa estimada (R$)', 'Líquido a receber (R$)'],
         rows: r.cardReceivables.map((x) => [x.acquirer, METHOD_LABEL[x.method], String(x.count), x.gross, x.fee, x.net]),
         foot: ['Total', '', String(r.cardReceivables.reduce((a, x) => a + x.count, 0)), null, null, r.cardReceivablesNet],
+      },
+      {
+        title: 'A receber: dinheiro com entregadores (entregas pagas na entrega sem acerto)',
+        head: ['Entregador', 'Entregas', 'A receber (R$)'],
+        rows: r.courierCash.map((x) => [x.courier, String(x.deliveries), x.amount]),
+        foot: ['Total', String(r.courierCash.reduce((a, x) => a + x.deliveries, 0)), r.courierCashTotal],
       },
       {
         title: 'A pagar: entregadores próprios ainda não acertados',
@@ -160,6 +180,7 @@ export function expensesDoc(r: ExpensesReport, base: Omit<ReportDoc, 'title' | '
     notes: [
       'Total = só o que o app registra ou estima. Folha, aluguel e outras despesas não são registradas no Tchê Food e ficam de fora.',
       ...(r.homologationInvoices > 0 ? [`${r.homologationInvoices} NF-e de homologação (teste) no ano ficaram de fora.`] : []),
+      ...invalid(r.invalidDates, 'nota(s), acerto(s) ou sangria(s)'),
       ...(r.withdrawals.length > 0 ? [`Sangrias do caixa sem categoria (R$ ${br(r.withdrawalsTotal)}) estão listadas à parte e NÃO entram no total: classifique com o contador.`] : []),
       ...extraNotes,
     ],
@@ -205,10 +226,12 @@ function csvCell(c: Cell): string {
     // Só para código feito de dígitos; qualquer outra coisa vira texto comum (escapado).
     return /^\d+$/.test(c.code) ? `="${c.code}"` : csvCell(c.code);
   }
-  let s = c.replace(/\r?\n/g, ' ');
-  // Planilha executa célula que começa com = + - @ (ou tab/CR): vira texto com apóstrofo.
-  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
-  return /[;"\n]/.test(s) || s !== s.trim() ? `"${s.replace(/"/g, '""')}"` : s;
+  // Quebra de linha (inclusive CR sozinho) dentro do texto quebraria a linha do CSV.
+  let s = c.replace(/[\r\n]+/g, ' ');
+  // Planilha executa célula que começa com = + - @ (mesmo depois de espaço, tab ou aspas):
+  // vira texto com apóstrofo na frente.
+  if (/^[\s"']*[=+\-@]/.test(s)) s = `'${s}`;
+  return /[;"\t]/.test(s) || s !== s.trim() ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 const line = (cells: Cell[]) => cells.map(csvCell).join(';');
@@ -217,7 +240,7 @@ export function toCsv(doc: ReportDoc): string {
   const out: string[] = [];
   out.push(line([doc.title]));
   out.push(line([doc.period]));
-  out.push(line([`${doc.store.legalName || doc.store.name} · CNPJ ${doc.store.cnpj} · ${doc.store.city}/${doc.store.state}`]));
+  out.push(line([`${doc.store.legalName || doc.store.name} · CNPJ ${doc.store.cnpj || 'não cadastrado'} · ${doc.store.city}/${doc.store.state}`]));
   out.push(line([`Gerado em ${doc.generatedAt}`]));
   for (const n of doc.notes) out.push(line([`Obs.: ${n}`]));
   for (const t of doc.tables) {
@@ -243,7 +266,7 @@ export function escapeHtml(s: string): string {
 const money = new Intl.NumberFormat('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
 function htmlCell(c: Cell, tag: 'td' | 'th'): string {
   if (c === null) return `<${tag}></${tag}>`;
-  if (typeof c === 'number') return `<${tag} class="n">${escapeHtml(money.format(c))}</${tag}>`;
+  if (typeof c === 'number') return `<${tag} class="n">${Number.isFinite(c) ? escapeHtml(money.format(c)) : ''}</${tag}>`;
   if (typeof c === 'object') return `<${tag}>${escapeHtml(c.code)}</${tag}>`;
   return `<${tag}>${escapeHtml(c)}</${tag}>`;
 }
@@ -272,7 +295,7 @@ export function toPrintableHtml(doc: ReportDoc): string {
   @media print{body{margin:10mm}h2{break-after:avoid}tr{break-inside:avoid}}
 </style></head><body>
 <h1>${escapeHtml(doc.title)}</h1>
-<div class="meta"><strong>${escapeHtml(doc.period)}</strong> · ${escapeHtml(doc.store.legalName || doc.store.name)} · CNPJ ${escapeHtml(doc.store.cnpj)} · ${escapeHtml(`${doc.store.city}/${doc.store.state}`)}<br>Gerado em ${escapeHtml(doc.generatedAt)} pelo Tchê Food</div>
+<div class="meta"><strong>${escapeHtml(doc.period)}</strong> · ${escapeHtml(doc.store.legalName || doc.store.name)} · CNPJ ${escapeHtml(doc.store.cnpj || 'não cadastrado')} · ${escapeHtml(`${doc.store.city}/${doc.store.state}`)}<br>Gerado em ${escapeHtml(doc.generatedAt)} pelo Tchê Food</div>
 ${notes ? `<ul>${notes}</ul>` : ''}
 ${tables}
 </body></html>`;

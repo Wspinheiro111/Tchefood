@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { expensesByCategory, inventoryAt, openPositionsAt, revenueByMethod, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { defaultYear, expensesByCategory, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { br, code, escapeHtml, expensesDoc, fileName, inventoryDoc, periodLabel, revenueDoc, toCsv, toPrintableHtml, type ReportDoc } from '../lib/annualCloseExport';
 import type { FeeRule } from '../lib/cardFees';
 import type { CashMovement, CashSession, CourierSettlement, OwnDelivery, Payment, Product, PurchaseInvoice, StockMovement, Supplier } from '../types';
@@ -137,11 +137,14 @@ describe('3. contas em aberto na virada', () => {
         ],
         courierSettlements: [{ id: 's-dez', created_at: '2025-12-31T23:00:00-03:00' } as CourierSettlement, { id: 's-jan', created_at: '2026-01-02T10:00:00-03:00' } as CourierSettlement],
         couriers: [{ id: 'c1', name: 'Beto' }],
+        orders: [],
       },
       P,
+      new Date('2026-11-14T12:00:00-03:00'),
     );
     expect(r.cardReceivables).toEqual([{ acquirer: 'STONE', method: 'CREDIT', gross: 100, fee: 3, net: 97, count: 1 }]);
     expect(r.cardWithoutRule).toBe(70);
+    expect(r.cutoff).toBe(P.to);
     expect(r.courierPayables).toEqual([{ courier: 'Beto', deliveries: 2, amount: 16 }]);
   });
 });
@@ -203,5 +206,110 @@ describe('exportação', () => {
     expect(html).not.toContain('<script>');
     expect(html).toContain('&lt;script&gt;');
     expect(html).toContain('Cartão de crédito');
+  });
+});
+
+describe('rodada 1 de revisão', () => {
+  const NOW = new Date('2026-11-14T12:00:00-03:00');
+  const openInput = { payments: [] as Payment[], feeRules: [rule({ days: 1 })], ownDeliveries: [] as OwnDelivery[], courierSettlements: [] as CourierSettlement[], couriers: [{ id: 'c1', name: 'Beto' }], orders: [] as { id: string; total_amount: number }[] };
+
+  it('o dia do repasse é o do calendário de Brasília, em qualquer fuso do aparelho', () => {
+    // 31/12/2025 10:00 BRT, D+1 corrido → 01/01/2026 00:00 BRT (= fim do ano).
+    expect(settlementDayBrasilia(Date.parse('2025-12-31T10:00:00-03:00'), { days: 1, businessDays: false })).toBe(P.to);
+    // 31/12/2025 22:30 BRT já é 01/01 em UTC: continua contando de 31/12.
+    expect(settlementDayBrasilia(Date.parse('2025-12-31T22:30:00-03:00'), { days: 0, businessDays: false })).toBe(P.to - 24 * 3600_000);
+    // Sexta 26/12/2025, D+1 útil → segunda 29/12; D+0 no sábado 27/12 → segunda 29/12.
+    expect(settlementDayBrasilia(Date.parse('2025-12-26T20:00:00-03:00'), { days: 1, businessDays: true })).toBe(Date.parse('2025-12-29T00:00:00-03:00'));
+    expect(settlementDayBrasilia(Date.parse('2025-12-27T20:00:00-03:00'), { days: 0, businessDays: true })).toBe(Date.parse('2025-12-29T00:00:00-03:00'));
+    const r = openPositionsAt({ ...openInput, payments: [pay({ created_at: '2025-12-31T10:00:00-03:00' }), pay({ created_at: '2025-12-30T10:00:00-03:00' })] }, P, NOW);
+    expect(r.cardReceivables.map((x) => x.count)).toEqual([1]);
+  });
+
+  it('ano em andamento: a posição é a de agora (repasse de hoje em diante ainda está a receber)', () => {
+    const P26 = yearPeriod(2026);
+    const r = openPositionsAt(
+      {
+        ...openInput,
+        feeRules: [rule({ days: 30 })],
+        payments: [pay({ created_at: '2026-11-10T20:00:00-03:00' }), pay({ created_at: '2026-09-01T20:00:00-03:00' }), pay({ created_at: '2026-11-20T20:00:00-03:00' })],
+      },
+      P26,
+      NOW,
+    );
+    expect(r.cutoff).toBe(NOW.getTime());
+    expect(r.cardReceivables.map((x) => x.count)).toEqual([1]);
+  });
+
+  it('dinheiro com o entregador: entrega paga na entrega sem acerto na posição', () => {
+    const d = (x: Partial<OwnDelivery>): OwnDelivery => ({ id: Math.random().toString(), order_id: 'o9', status: 'DELIVERED', courier_id: 'c1', courier_fee: 7, pay_on_delivery: true, delivered_at: '2025-12-31T21:00:00-03:00', settlement_id: 's1', ...x }) as OwnDelivery;
+    const r = openPositionsAt(
+      {
+        ...openInput,
+        ownDeliveries: [d({}), d({ order_id: 'o10', pay_on_delivery: false })],
+        courierSettlements: [{ id: 's1', created_at: '2026-01-02T10:00:00-03:00' } as CourierSettlement],
+        // O pagamento em dinheiro só nasce no acerto (02/01): na virada estava com o entregador.
+        payments: [pay({ order_id: 'o9', method: 'CASH', acquirer: 'CASH_DESK', amount: 55, created_at: '2026-01-02T10:00:00-03:00' })],
+        orders: [{ id: 'o9', total_amount: 55 }, { id: 'o10', total_amount: 40 }],
+      },
+      P,
+      NOW,
+    );
+    expect(r.courierCash).toEqual([{ courier: 'Beto', deliveries: 1, amount: 55 }]);
+    expect(r.courierPayablesTotal).toBe(14);
+  });
+
+  it('simulador de maquininha fica fora; Pix direto sem taxa não vira "sem taxa cadastrada"', () => {
+    const r = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ acquirer: 'MOCK', amount: 99 }), pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 10 }), pay({ created_at: '2025-06-01 10:00:00' })] }, P);
+    expect(r.totalGross).toBe(10);
+    expect(r.totalWithoutRule).toBe(0);
+    expect([r.simulatorCount, r.simulatorAmount]).toEqual([1, 99]);
+    expect(r.invalidDates).toBe(1);
+    const csv = toCsv(revenueDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '', city: 'C', state: 'RS' }, generatedAt: 'g' }));
+    expect(csv).toContain('simulador');
+    expect(csv).toContain('ATENÇÃO: 1 pagamento(s)');
+    expect(csv).toContain('CNPJ não cadastrado');
+  });
+
+  it('sem pedidos de app, a comissão dos apps é "não registrado", não R$ 0,00', () => {
+    const r = expensesByCategory({ purchaseInvoices: [], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P) }, P);
+    expect(r.rows.find((x) => x.key === 'APP_FEES')).toMatchObject({ amount: null, source: 'NOT_TRACKED' });
+  });
+
+  it('inventário: entrada de NF-e de homologação sai do saldo e do custo; total em centavos exatos', () => {
+    const movs = [
+      mov({ id: 'real', quantity: 10, unit_cost: 2, balance_after: 10, avg_cost_after: 2, purchase_invoice_item_id: 'i1' }),
+      mov({ id: 'teste', quantity: 5, unit_cost: 8, balance_after: 15, avg_cost_after: 4, purchase_invoice_item_id: 'i2', created_at: '2025-07-01T12:00:00-03:00' }),
+      mov({ id: 'real2', quantity: 10, unit_cost: 3, balance_after: 25, avg_cost_after: 3.6, purchase_invoice_item_id: 'i3', created_at: '2025-08-01T12:00:00-03:00' }),
+      mov({ id: 'centavo', product_id: 'p2', balance_after: 3, avg_cost_after: 1.005 }),
+    ];
+    const ids = testInvoiceMovementIds(movs, [{ id: 'i1', invoice_id: 'nf1' }, { id: 'i2', invoice_id: 'nf2' }, { id: 'i3', invoice_id: 'nf1' }], [{ id: 'nf1', environment: 'PRODUCTION' }, { id: 'nf2', environment: 'HOMOLOGATION' }]);
+    expect([...ids]).toEqual(['teste']);
+    const r = inventoryAt([product({}), product({ id: 'p2', code: '002', name: 'Água' })], movs, P, ids);
+    expect(r.rows.map((x) => [x.code, x.quantity, x.unitCost, x.total, x.withoutTestInvoices])).toEqual([
+      ['002', 3, 1.005, 3.02, false],
+      ['001', 20, 2.5, 50, true],
+    ]);
+    expect(r.testMovements).toBe(1);
+  });
+
+  it('ano padrão: de janeiro a abril abre o ano que terminou; relógio errado não quebra', () => {
+    expect(defaultYear([2027, 2026], new Date('2027-01-05T10:00:00-03:00'))).toBe(2026);
+    expect(defaultYear([2027], new Date('2027-01-05T10:00:00-03:00'))).toBe(2027);
+    expect(defaultYear([2026, 2025], new Date('2026-11-14T10:00:00-03:00'))).toBe(2026);
+    expect(defaultYear([], new Date())).toBeNull();
+    // Relógio em 1970: não vira ano do seletor, mas os anos dos dados continuam.
+    expect(yearsWithData(['2025-03-01T10:00:00-03:00'], new Date(0))).toEqual([2025]);
+  });
+
+  it('CSV: CR sozinho, espaço ou aspas antes de = + - @ não viram fórmula', () => {
+    const doc = { period: 'p', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g', title: 'T', notes: [], tables: [{ head: ['A'], rows: [['ACME\r=HYPERLINK("x")'], [' =1+1'], ['"@SUM(A1)'], ['\t-2'], ['+5'], [NaN]] }] } as ReportDoc;
+    const lines = toCsv(doc).split('\r\n');
+    expect(lines).toContain('"ACME =HYPERLINK(""x"")"');
+    expect(lines).toContain("' =1+1");
+    expect(lines).toContain(`"'""@SUM(A1)"`);
+    expect(lines).toContain(`"'\t-2"`);
+    expect(lines).toContain("'+5");
+    expect(toPrintableHtml(doc)).not.toContain('NaN');
+    expect(lines.every((l) => !/^[=+\-@]/.test(l))).toBe(true);
   });
 });

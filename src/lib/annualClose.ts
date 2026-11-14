@@ -11,8 +11,8 @@
  * (America/Sao_Paulo), o mesmo dia da NFC-e. Não usa a virada das 05:00 do turno.
  * Tudo em centavos.
  */
-import type { CashMovement, CashSession, CourierSettlement, OwnDelivery, Payment, PaymentMethod, Product, PurchaseInvoice, StaffUser, StockMovement, Supplier } from '../types';
-import { feeCents, ruleFor, settlementDate, type FeeRule } from './cardFees';
+import type { CashMovement, CashSession, CourierSettlement, Order, OwnDelivery, Payment, PaymentMethod, Product, PurchaseInvoice, PurchaseInvoiceItem, StaffUser, StockMovement, Supplier } from '../types';
+import { feeCents, ruleFor, type FeeRule } from './cardFees';
 import { fromCents, round3, toCents } from './money';
 import type { MarketplaceSale } from './ownerDashboard';
 import { brasiliaInstant, parseIsoInstant, SHIFT_TIME_ZONE } from './reports';
@@ -25,6 +25,7 @@ export interface YearPeriod {
   to: number;
 }
 
+const DAY_MS = 24 * 3600_000;
 export const MIN_YEAR = 2000;
 export const MAX_YEAR = 2100;
 
@@ -65,7 +66,9 @@ export function brasiliaDate(t: number | Date): string {
 /** Anos com algum registro, mais o ano corrente, do mais novo para o mais antigo. */
 export function yearsWithData(dates: Iterable<string | null | undefined>, now: Date = new Date()): number[] {
   const set = new Set<number>();
-  const current = brasiliaYear(now.toISOString());
+  const raw = Number.isFinite(now.getTime()) ? brasiliaYear(now.toISOString()) : null;
+  // Relógio do aparelho fora de 2000–2100 (POS sem hora certa): não vira ano do seletor.
+  const current = raw !== null && validYear(raw) ? raw : null;
   if (current !== null) set.add(current);
   for (const d of dates) {
     const y = brasiliaYear(d);
@@ -74,9 +77,57 @@ export function yearsWithData(dates: Iterable<string | null | undefined>, now: D
   return [...set].sort((a, b) => b - a);
 }
 
+/**
+ * Ano que a tela abre: de janeiro a abril (época do fechamento), o ano que acabou de
+ * terminar, se ele tiver dados; senão o mais novo da lista. Null se a lista está vazia.
+ */
+export function defaultYear(years: readonly number[], now: Date = new Date()): number | null {
+  if (years.length === 0) return null;
+  const current = Number.isFinite(now.getTime()) ? brasiliaYear(now.toISOString()) : null;
+  const month = Number.isFinite(now.getTime()) ? brasiliaMonth(now.getTime()) : 12;
+  if (current !== null && month <= 4 && years.includes(current - 1)) return current - 1;
+  return years[0]!;
+}
+
 /** O ano ainda não terminou: a "posição em 31/12" é a posição de agora. */
 export function yearInProgress(p: YearPeriod, now: Date = new Date()): boolean {
   return now.getTime() < p.to;
+}
+
+/** Até onde vale a "posição": fim do ano, ou agora se o ano ainda não terminou. */
+export function positionCutoff(p: YearPeriod, now: Date = new Date()): number {
+  return Math.min(p.to, now.getTime());
+}
+
+/** Y/M/D de Brasília do instante. */
+function brasiliaYmd(t: number): { y: number; m: number; d: number } {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', { timeZone: SHIFT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(t)).map((x) => [x.type, x.value]),
+  );
+  return { y: Number(parts.year), m: Number(parts.month) - 1, d: Number(parts.day) };
+}
+
+/**
+ * Dia do repasse no calendário de Brasília (00:00 de Brasília, em ms), com a mesma regra
+ * de cardFees.settlementDate (D+n corrido, ou em dias úteis pulando sábado e domingo;
+ * D+0 vendido no fim de semana cai na segunda) mas sem depender do fuso do aparelho.
+ */
+export function settlementDayBrasilia(createdAtMs: number, rule: Pick<FeeRule, 'days' | 'businessDays'>): number {
+  const { y, m, d } = brasiliaYmd(createdAtMs);
+  // Aritmética de calendário em UTC (sem fuso); o dia da semana é o do calendário de Brasília.
+  const day = new Date(Date.UTC(y, m, d));
+  const weekend = () => day.getUTCDay() === 0 || day.getUTCDay() === 6;
+  if (!rule.businessDays) {
+    day.setUTCDate(day.getUTCDate() + rule.days);
+  } else {
+    let left = rule.days;
+    while (left > 0) {
+      day.setUTCDate(day.getUTCDate() + 1);
+      if (!weekend()) left -= 1;
+    }
+    while (weekend()) day.setUTCDate(day.getUTCDate() + 1);
+  }
+  return brasiliaInstant(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +147,8 @@ export interface InventoryRow {
   total: number;
   /** Produto desativado no cadastro (ainda tem saldo no livro). */
   inactive: boolean;
+  /** Teve entrada por NF-e de homologação (teste): saldo e custo recalculados sem ela. */
+  withoutTestInvoices: boolean;
 }
 
 export interface InventoryReport {
@@ -105,16 +158,39 @@ export interface InventoryReport {
   missingNcm: number;
   /** Movimentos com data inválida (ficaram de fora). */
   invalidDates: number;
+  /** Entradas por NF-e de homologação (teste) que ficaram de fora. */
+  testMovements: number;
 }
+
+/** Movimentos de estoque que vieram de NF-e de homologação (teste): não são mercadoria real. */
+export function testInvoiceMovementIds(
+  movements: readonly StockMovement[],
+  items: ReadonlyArray<Pick<PurchaseInvoiceItem, 'id' | 'invoice_id'>>,
+  invoices: ReadonlyArray<Pick<PurchaseInvoice, 'id' | 'environment'>>,
+): Set<string> {
+  const test = new Set(invoices.filter((i) => i.environment !== 'PRODUCTION').map((i) => i.id));
+  const itemInvoice = new Map(items.map((i) => [i.id, i.invoice_id]));
+  const out = new Set<string>();
+  for (const m of movements) {
+    const inv = m.purchase_invoice_item_id ? itemInvoice.get(m.purchase_invoice_item_id) : undefined;
+    if (inv !== undefined && test.has(inv)) out.add(m.id);
+  }
+  return out;
+}
+
+/** quantidade (3 casas) × custo (4 casas) em centavos, só com inteiros. */
+const qtyTimesCostCents = (qty: number, cost: number): number => Math.round((Math.round(qty * 1000) * Math.round(cost * 10_000)) / 100_000);
 
 /**
  * Posição do estoque no fim do ano: para cada produto, o último movimento do livro
  * (stock_movements, só INSERT) com data até 31/12 23:59:59 de Brasília. O app hoje só
  * registra ENTRADA por nota de compra (PURCHASE_IN): as vendas ainda não baixam o
  * estoque, então este saldo é o que entrou, não o que sobrou na prateleira.
+ * Produto com entrada de NF-e de homologação tem saldo e custo médio refeitos só com
+ * as entradas reais (como o livro só tem entradas, a média ponderada delas é exata).
  */
-export function inventoryAt(products: readonly Product[], movements: readonly StockMovement[], p: YearPeriod): InventoryReport {
-  const last = new Map<string, { t: number; m: StockMovement; idx: number }>();
+export function inventoryAt(products: readonly Product[], movements: readonly StockMovement[], p: YearPeriod, testMovementIds: ReadonlySet<string> = new Set()): InventoryReport {
+  const byProduct = new Map<string, Array<{ t: number; m: StockMovement; idx: number }>>();
   let invalidDates = 0;
   movements.forEach((m, idx) => {
     const t = at(m.created_at);
@@ -123,20 +199,41 @@ export function inventoryAt(products: readonly Product[], movements: readonly St
       return;
     }
     if (t >= p.to) return;
-    const prev = last.get(m.product_id);
-    // Mesmo instante: vale o que foi gravado depois (ordem do livro).
-    if (!prev || t > prev.t || (t === prev.t && idx > prev.idx)) last.set(m.product_id, { t, m, idx });
+    const list = byProduct.get(m.product_id);
+    if (list) list.push({ t, m, idx });
+    else byProduct.set(m.product_id, [{ t, m, idx }]);
   });
   const byId = new Map(products.map((x) => [x.id, x]));
   const rows: InventoryRow[] = [];
   let totalC = 0;
   let missingNcm = 0;
-  for (const [productId, { m }] of last) {
-    const qty = round3(m.balance_after);
+  let testMovements = 0;
+  for (const [productId, list] of byProduct) {
+    // Mesmo instante: vale o que foi gravado depois (ordem do livro).
+    list.sort((a, b) => a.t - b.t || a.idx - b.idx);
+    const tests = list.filter((x) => testMovementIds.has(x.m.id)).length;
+    testMovements += tests;
+    let qty: number;
+    let unitCost: number;
+    if (tests === 0) {
+      const lastMov = list[list.length - 1]!.m;
+      qty = round3(lastMov.balance_after);
+      unitCost = Math.round(lastMov.avg_cost_after * 10_000) / 10_000;
+    } else {
+      let milli = 0;
+      let costTimes = 0; // Σ quantidade(milésimos) × custo(décimos de milésimo)
+      for (const { m } of list) {
+        if (testMovementIds.has(m.id)) continue;
+        const q = Math.round(m.quantity * 1000);
+        milli += q;
+        costTimes += q * Math.round(m.unit_cost * 10_000);
+      }
+      qty = milli / 1000;
+      unitCost = milli > 0 ? Math.round(costTimes / milli) / 10_000 : 0;
+    }
     if (qty === 0) continue;
     const prod = byId.get(productId);
-    const unitCost = Math.round(m.avg_cost_after * 10_000) / 10_000;
-    const totalCents = Math.round(qty * unitCost * 100);
+    const totalCents = qtyTimesCostCents(qty, unitCost);
     totalC += totalCents;
     const ncm = prod?.ncm ?? '';
     if (!/^\d{8}$/.test(ncm)) missingNcm += 1;
@@ -150,10 +247,11 @@ export function inventoryAt(products: readonly Product[], movements: readonly St
       unitCost,
       total: fromCents(totalCents),
       inactive: prod ? !prod.active : true,
+      withoutTestInvoices: tests > 0,
     });
   }
   rows.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
-  return { rows, totalCost: fromCents(totalC), missingNcm, invalidDates };
+  return { rows, totalCost: fromCents(totalC), missingNcm, invalidDates, testMovements };
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +310,11 @@ export interface RevenueReport {
   withdrawals: number;
   /** Turnos de caixa abertos no ano que ainda não foram fechados. */
   openSessions: number;
+  /** Pagamentos aprovados e pedidos de app com data inválida (ficaram de fora). */
+  invalidDates: number;
+  /** Pagamentos do simulador de maquininha (MOCK) no ano: não são dinheiro real, ficam fora. */
+  simulatorCount: number;
+  simulatorAmount: number;
 }
 
 const zeros = () => Array.from({ length: 12 }, () => 0);
@@ -243,10 +346,20 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
   };
   for (const m of METHOD_ORDER) bump(m, METHOD_LABEL[m], false);
   let tipsC = 0;
+  let invalidDates = 0;
+  let simCount = 0;
+  let simC = 0;
   for (const pay of input.payments) {
     if (pay.status !== 'APPROVED') continue;
     const t = at(pay.created_at);
+    if (t === null) invalidDates += 1;
     if (t === null || t < p.from || t >= p.to) continue;
+    // Simulador da maquininha (demonstração/treino): não entrou dinheiro de verdade.
+    if (pay.acquirer === 'MOCK') {
+      simCount += 1;
+      simC += toCents(pay.amount);
+      continue;
+    }
     const row = bump(pay.method, METHOD_LABEL[pay.method] ?? pay.method, false);
     const amountC = toCents(pay.amount);
     row.gross += amountC;
@@ -256,11 +369,13 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
     if (pay.method === 'CASH') continue;
     const rule = ruleFor(pay, input.feeRules);
     if (rule) row.fee += feeCents(pay, rule);
-    else row.noRule += amountC;
+    // Sem taxa a descontar só conta para maquininha (Pix direto no caixa não tem taxa).
+    else if (pay.acquirer === 'STONE' || pay.acquirer === 'PAGBANK') row.noRule += amountC;
   }
   for (const sale of input.marketplace) {
     if (sale.canceled) continue;
     const t = at(sale.created_at);
+    if (t === null) invalidDates += 1;
     if (t === null || t < p.from || t >= p.to) continue;
     const row = bump(`APP:${sale.channel}`, `App: ${sale.label}`, true);
     row.gross += sale.total_cents;
@@ -337,6 +452,9 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
     supplies: fromCents(suppliesC),
     withdrawals: fromCents(withdrawalsC),
     openSessions,
+    invalidDates,
+    simulatorCount: simCount,
+    simulatorAmount: fromCents(simC),
   };
 }
 
@@ -359,7 +477,16 @@ export interface CourierPayableRow {
   amount: number;
 }
 
+export interface CourierCashRow {
+  courier: string;
+  deliveries: number;
+  amount: number;
+}
+
 export interface OpenPositionsReport {
+  /** Dinheiro de entregas pagas na entrega feitas até a posição e ainda não acertadas (está com o entregador). */
+  courierCash: CourierCashRow[];
+  courierCashTotal: number;
   /** Vendas na maquininha até 31/12 com repasse previsto para depois (pela taxa cadastrada). */
   cardReceivables: CardReceivableRow[];
   cardReceivablesNet: number;
@@ -369,6 +496,10 @@ export interface OpenPositionsReport {
   /** Entregas feitas até 31/12 e ainda não acertadas com o entregador naquela data. */
   courierPayables: CourierPayableRow[];
   courierPayablesTotal: number;
+  /** Instante da posição: fim do ano, ou agora se o ano ainda não terminou. */
+  cutoff: number;
+  /** Pagamentos e entregas com data inválida (ficaram de fora). */
+  invalidDates: number;
 }
 
 export interface OpenPositionsInput {
@@ -377,16 +508,24 @@ export interface OpenPositionsInput {
   ownDeliveries: readonly OwnDelivery[];
   courierSettlements: readonly CourierSettlement[];
   couriers: ReadonlyArray<{ id: string; name: string }>;
+  orders: ReadonlyArray<Pick<Order, 'id' | 'total_amount'>>;
 }
 
-export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod): OpenPositionsReport {
+/**
+ * Posição na virada do ano (ou agora, se o ano ainda não terminou): o que estava a
+ * receber da maquininha e o que estava a pagar aos entregadores naquele instante.
+ */
+export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: Date = new Date()): OpenPositionsReport {
+  const cutoff = positionCutoff(p, now);
   const card = new Map<string, { acquirer: string; method: PaymentMethod; gross: number; fee: number; count: number }>();
   let noRuleC = 0;
   let noRuleCount = 0;
+  let invalidDates = 0;
   for (const pay of input.payments) {
     if (pay.status !== 'APPROVED' || pay.method === 'CASH') continue;
     const t = at(pay.created_at);
-    if (t === null || t >= p.to) continue;
+    if (t === null) invalidDates += 1;
+    if (t === null || t >= cutoff) continue;
     const rule = ruleFor(pay, input.feeRules);
     if (!rule) {
       if ((pay.acquirer === 'STONE' || pay.acquirer === 'PAGBANK') && t >= p.from) {
@@ -395,8 +534,10 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod): OpenP
       }
       continue;
     }
-    // Repasse previsto a partir de 01/01: ainda estava a receber na virada do ano.
-    if (settlementDate(pay.created_at, rule).getTime() < p.to) continue;
+    // Já recebido = o dia do repasse (de Brasília) terminou antes da posição. Com a
+    // posição em 31/12, repasse em 01/01 ou depois estava a receber; com o ano em
+    // andamento, repasse de hoje em diante ainda está a receber.
+    if (settlementDayBrasilia(t, rule) + DAY_MS <= cutoff) continue;
     const key = `${pay.acquirer}|${pay.method}`;
     const row = card.get(key) ?? { acquirer: pay.acquirer, method: pay.method, gross: 0, fee: 0, count: 0 };
     const g = toCents(pay.amount) + toCents(pay.tip_amount ?? 0);
@@ -411,28 +552,56 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod): OpenP
 
   const settledAt = new Map(input.courierSettlements.map((s) => [s.id, at(s.created_at)]));
   const courier = new Map<string, { deliveries: number; cents: number }>();
+  const cash = new Map<string, { deliveries: number; cents: number }>();
+  const orderTotal = new Map(input.orders.map((o) => [o.id, toCents(o.total_amount)]));
+  // Pago da senha até a posição (o dinheiro da entrega só vira pagamento no acerto).
+  const paidBefore = new Map<string, number>();
+  for (const pay of input.payments) {
+    if (pay.status !== 'APPROVED') continue;
+    const t = at(pay.created_at);
+    if (t === null || t >= cutoff) continue;
+    paidBefore.set(pay.order_id, (paidBefore.get(pay.order_id) ?? 0) + toCents(pay.amount));
+  }
   for (const d of input.ownDeliveries) {
     if (d.status !== 'DELIVERED' || d.courier_fee === null || d.courier_id === null) continue;
     const t = at(d.delivered_at);
-    if (t === null || t >= p.to) continue;
+    if (t === null) invalidDates += 1;
+    if (t === null || t >= cutoff) continue;
     const s = d.settlement_id ? settledAt.get(d.settlement_id) : undefined;
-    // Acertada antes da virada: já não devia nada em 31/12.
-    if (s !== undefined && s !== null && s < p.to) continue;
+    // Acertada antes da posição: já não devia nada naquele instante.
+    if (s !== undefined && s !== null && s < cutoff) continue;
     const row = courier.get(d.courier_id) ?? { deliveries: 0, cents: 0 };
     row.deliveries += 1;
     row.cents += toCents(d.courier_fee);
     courier.set(d.courier_id, row);
+    if (d.pay_on_delivery) {
+      const owed = (orderTotal.get(d.order_id) ?? 0) - (paidBefore.get(d.order_id) ?? 0);
+      if (owed > 0) {
+        const c = cash.get(d.courier_id) ?? { deliveries: 0, cents: 0 };
+        c.deliveries += 1;
+        c.cents += owed;
+        cash.set(d.courier_id, c);
+      }
+    }
   }
+  const courierName = (id: string) => input.couriers.find((c) => c.id === id)?.name ?? 'Entregador removido';
+  const courierCash = [...cash.entries()]
+    .map(([id, r]) => ({ courier: courierName(id), deliveries: r.deliveries, amount: fromCents(r.cents) }))
+    .sort((a, b) => a.courier.localeCompare(b.courier, 'pt-BR'));
   const courierPayables = [...courier.entries()]
-    .map(([id, r]) => ({ courier: input.couriers.find((c) => c.id === id)?.name ?? 'Entregador removido', deliveries: r.deliveries, amount: fromCents(r.cents) }))
+    .map(([id, r]) => ({ courier: courierName(id), deliveries: r.deliveries, amount: fromCents(r.cents) }))
     .sort((a, b) => a.courier.localeCompare(b.courier, 'pt-BR'));
   return {
+    courierCash,
+    courierCashTotal: fromCents(courierCash.reduce((a, r) => a + toCents(r.amount), 0)),
     cardReceivables,
     cardReceivablesNet: fromCents(cardReceivables.reduce((a, r) => a + toCents(r.net), 0)),
     cardWithoutRule: fromCents(noRuleC),
     cardWithoutRuleCount: noRuleCount,
     courierPayables,
     courierPayablesTotal: fromCents(courierPayables.reduce((a, r) => a + toCents(r.amount), 0)),
+    cutoff,
+    invalidDates,
   };
 }
 
@@ -478,6 +647,8 @@ export interface ExpensesReport {
   /** Sangrias do caixa no ano que não são acerto de entregador: sem categoria. */
   withdrawals: WithdrawalRow[];
   withdrawalsTotal: number;
+  /** Notas, acertos e sangrias com data inválida (ficaram de fora). */
+  invalidDates: number;
 }
 
 export interface ExpensesInput {
@@ -501,8 +672,10 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod): Expense
   const purchases: PurchaseRow[] = [];
   let purchasesC = 0;
   let homologation = 0;
+  let invalidDates = 0;
   for (const inv of input.purchaseInvoices) {
     const when = at(inv.issued_at) !== null ? inv.issued_at! : inv.imported_at;
+    if (at(when) === null) invalidDates += 1;
     if (!inYear(when, p)) continue;
     if (inv.environment !== 'PRODUCTION') {
       homologation += 1;
@@ -527,6 +700,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod): Expense
   const settlementMovements = new Set<string>();
   for (const s of input.courierSettlements) {
     if (s.cash_movement_id) settlementMovements.add(s.cash_movement_id);
+    if (at(s.created_at) === null) invalidDates += 1;
     if (!inYear(s.created_at, p)) continue;
     courierC += toCents(s.courier_fees);
     courierN += 1;
@@ -535,7 +709,9 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod): Expense
   const withdrawals: WithdrawalRow[] = [];
   let withdrawalsC = 0;
   for (const mv of input.cashMovements) {
-    if (mv.type !== 'WITHDRAWAL' || settlementMovements.has(mv.id) || !inYear(mv.created_at, p)) continue;
+    if (mv.type !== 'WITHDRAWAL' || settlementMovements.has(mv.id)) continue;
+    if (at(mv.created_at) === null) invalidDates += 1;
+    if (!inYear(mv.created_at, p)) continue;
     withdrawalsC += toCents(mv.amount);
     withdrawals.push({ date: mv.created_at, amount: mv.amount, reason: mv.reason });
   }
@@ -559,20 +735,22 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod): Expense
       source: 'ESTIMATED',
       note: `Estimativa pela taxa cadastrada em Taxas e recebíveis; confira com o extrato da adquirente.${cardNoRuleC > 0 ? ` ${fmt(cardNoRuleC)} em vendas sem taxa cadastrada ficaram de fora.` : ''}`,
     },
-    {
-      key: 'APP_FEES',
-      label: 'Comissão dos apps de delivery',
-      amount: fromCents(appFeeC),
-      count: 0,
-      source: 'ESTIMATED',
-      note: `Estimativa pelo % cadastrado; confira com o extrato do app.${appNoRuleC > 0 ? ` ${fmt(appNoRuleC)} em pedidos sem comissão cadastrada ficaram de fora.` : ''}`,
-    },
+    appRows.length === 0
+      ? { key: 'APP_FEES', label: 'Comissão dos apps de delivery', amount: null, count: 0, source: 'NOT_TRACKED', note: 'Os pedidos dos apps (iFood etc.) ainda não chegam ao Tchê Food. Informe pelo extrato do app.' }
+      : {
+          key: 'APP_FEES',
+          label: 'Comissão dos apps de delivery',
+          amount: fromCents(appFeeC),
+          count: 0,
+          source: 'ESTIMATED',
+          note: `Estimativa pelo % cadastrado; confira com o extrato do app.${appNoRuleC > 0 ? ` ${fmt(appNoRuleC)} em pedidos sem comissão cadastrada ficaram de fora.` : ''}`,
+        },
     { key: 'PAYROLL', label: 'Folha de pagamento', amount: null, count: 0, source: 'NOT_TRACKED', note: NOT_TRACKED },
     { key: 'RENT', label: 'Aluguel', amount: null, count: 0, source: 'NOT_TRACKED', note: NOT_TRACKED },
     { key: 'OTHER', label: 'Outras despesas (luz, água, gás, internet, impostos)', amount: null, count: 0, source: 'NOT_TRACKED', note: NOT_TRACKED },
   ];
   const total = rows.reduce((a, r) => a + (r.amount === null ? 0 : toCents(r.amount)), 0);
-  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, withdrawals, withdrawalsTotal: fromCents(withdrawalsC) };
+  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates };
 }
 
 const fmt = (cents: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(fromCents(cents));
