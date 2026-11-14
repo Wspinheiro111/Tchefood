@@ -22,7 +22,10 @@ import { isValidNfceQrCodeContent } from '../nfce';
 import { recordKeys, type FetchLike, type SyncConfig } from './supabaseSync';
 
 const DOC_STATUSES: ReadonlyArray<NfceCloudStatus> = ['processing', 'authorized', 'rejected', 'contingency', 'cancelled'];
-const PROBLEMS: ReadonlyArray<Exclude<NfceCallProblem, 'error' | 'network'>> = ['invalid', 'not_found', 'conflict'];
+const PROBLEMS: ReadonlyArray<Exclude<NfceCallProblem, 'error' | 'network'>> = ['invalid', 'not_found', 'conflict', 'none'];
+
+/** Consultas automáticas de uma nota autorizada que veio sem dados de impressão. */
+export const NFCE_PRINT_DATA_MAX_ATTEMPTS = 8;
 
 /** Situação local da comanda (orders.nfce_status) para cada status do documento — o mesmo do trigger tchefood_nfce_mirror_order. */
 export const NFCE_ORDER_STATUS: Record<NfceCloudStatus, string> = {
@@ -193,14 +196,17 @@ export function parseEmitResponse(httpStatus: number, body: string): NfceEmitOut
   return { kind: 'error', httpStatus, message: message ? `${why}: ${message}` : `${why}. A NFC-e não foi confirmada.` };
 }
 
-/** POST /functions/v1/emit-nfce com o JWT do aparelho; o corpo só leva o order_id. */
-export async function requestNfceEmission(cfg: SyncConfig, orderId: string, fetchFn: FetchLike): Promise<NfceEmitOutcome> {
+/**
+ * POST /functions/v1/emit-nfce com o JWT do aparelho; o corpo só leva o order_id e o modo.
+ * consult: o servidor só devolve/consulta o documento existente, nunca transmite.
+ */
+export async function requestNfceEmission(cfg: SyncConfig, orderId: string, fetchFn: FetchLike, mode: NfceCallMode = 'emit'): Promise<NfceEmitOutcome> {
   let res: Awaited<ReturnType<FetchLike>>;
   try {
     res = await fetchFn(`${cfg.url.replace(/\/+$/, '')}/functions/v1/emit-nfce`, {
       method: 'POST',
       headers: { apikey: cfg.anonKey, Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ order_id: orderId }),
+      body: JSON.stringify({ order_id: orderId, mode }),
     });
   } catch {
     return { kind: 'network', httpStatus: 0, message: 'Sem resposta do servidor. A NFC-e não foi confirmada; o aparelho consulta de novo.' };
@@ -253,7 +259,9 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
     const done = base.status === 'authorized' || base.status === 'cancelled';
     return { ...base, attempts, next_attempt_at: done ? null : retryAt, updated_at: ts };
   }
-  const polling = outcome.status === 'processing' || outcome.status === 'contingency';
+  // Autorizada sem tudo o que o DANFE precisa: consulta (só leitura) com intervalo crescente, até um limite.
+  const missing = outcome.status === 'authorized' && missingPrintData({ ...base, ...outcome, payload: outcome.payload ?? base.payload, qrcode_url: outcome.qrcode_url ?? base.qrcode_url, issued_at: outcome.issued_at ?? base.issued_at });
+  const polling = outcome.status === 'processing' || outcome.status === 'contingency' || (missing && attempts < NFCE_PRINT_DATA_MAX_ATTEMPTS);
   return {
     ...base,
     status: outcome.status,
@@ -274,6 +282,11 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
   };
 }
 
+/** Nota autorizada sem os dados do servidor que o DANFE da bobina exige. */
+export function missingPrintData(rec: Pick<NfceCloudRecord, 'protocol' | 'qrcode_url' | 'issued_at' | 'payload'>): boolean {
+  return !rec.protocol || !rec.qrcode_url || !rec.issued_at || !rec.payload;
+}
+
 /** Comandas com evento ainda na fila ou recusado: não estão inteiras na nuvem. */
 export function ordersWithPendingEvents(events: readonly SyncEvent[]): Set<string> {
   const out = new Set<string>();
@@ -291,31 +304,63 @@ export interface NfceQueueState {
 }
 
 /** A comanda já está pronta para a emissão real: fechada, com valor e com tudo na nuvem. */
-export function nfceEligible(order: Order, pending: ReadonlySet<string>): boolean {
-  return (
-    order.status === 'CLOSED' &&
-    toCents(order.total_amount) > 0 &&
-    toCents(order.paid_amount) > 0 &&
-    OPEN_ORDER_STATUSES.includes(order.nfce_status ?? '') &&
-    !pending.has(order.id)
-  );
+export type NfceCallMode = 'emit' | 'consult';
+
+/**
+ * Que chamada à emit-nfce esta comanda pede agora (null = nenhuma):
+ *  - situação aberta (pendente, processando, contingência, rejeitada pelo botão): emit;
+ *  - autorizada sem QR/data/payload: consult (só leitura), até o limite ou pelo botão;
+ *  - comanda antiga com NFC-e simulada no aparelho (AUTORIZADA sem registro do servidor):
+ *    consult primeiro. Se o servidor não tem documento (none), só o botão emite a nota real
+ *    (o servidor é idempotente por comanda, então não há duplicidade).
+ */
+export function nfceCall(
+  order: Order,
+  rec: NfceCloudRecord | undefined,
+  pending: ReadonlySet<string>,
+  forced: boolean,
+  nowMs: number,
+): NfceCallMode | null {
+  if (order.status !== 'CLOSED' || toCents(order.total_amount) <= 0 || toCents(order.paid_amount) <= 0 || pending.has(order.id)) return null;
+  const due = forced || (!!rec?.next_attempt_at && Date.parse(rec.next_attempt_at) <= nowMs);
+  if (rec?.status === 'cancelled') return null;
+  if (rec?.status === 'authorized') {
+    if (!missingPrintData(rec)) return null;
+    return due ? 'consult' : null;
+  }
+  if (OPEN_ORDER_STATUSES.includes(order.nfce_status ?? '')) {
+    if (!rec || due) return 'emit';
+    return null;
+  }
+  // Situação local final sem documento do servidor: NFC-e simulada antes da emissão real.
+  if (order.nfce_status !== 'AUTORIZADA') return null;
+  if (rec && rec.status !== null) return due ? 'emit' : null;
+  if (rec?.problem === 'none') return forced ? 'emit' : null;
+  if (!rec) return 'consult';
+  return due ? 'consult' : null;
+}
+
+/** Compatível com a regra antiga: há chamada a fazer, se pedida já? */
+export function nfceEligible(order: Order, pending: ReadonlySet<string>, rec?: NfceCloudRecord): boolean {
+  return nfceCall(order, rec, pending, true, Date.now()) !== null;
 }
 
 /** Comandas a pedir/consultar agora, das mais antigas para as mais novas. */
-export function dueNfceOrders(state: NfceQueueState, nowMs: number, limit = 3): string[] {
+export function dueNfceCalls(state: NfceQueueState, nowMs: number, limit = 3): Array<{ orderId: string; mode: NfceCallMode }> {
   const pending = ordersWithPendingEvents([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]);
   const records = state.nfceCloud ?? {};
   const forced = new Set(state.nfceForced ?? []);
-  return state.orders
-    .filter((o) => nfceEligible(o, pending))
-    .filter((o) => {
-      const rec = records[o.id];
-      if (rec && (rec.status === 'authorized' || rec.status === 'cancelled')) return false;
-      if (forced.has(o.id)) return true;
-      if (!rec) return true;
-      return rec.next_attempt_at !== null && Date.parse(rec.next_attempt_at) <= nowMs;
-    })
-    .sort((a, b) => (a.closed_at ?? '').localeCompare(b.closed_at ?? ''))
+  const out: Array<{ orderId: string; mode: NfceCallMode; closed: string }> = [];
+  for (const o of state.orders) {
+    const mode = nfceCall(o, records[o.id], pending, forced.has(o.id), nowMs);
+    if (mode) out.push({ orderId: o.id, mode, closed: o.closed_at ?? '' });
+  }
+  return out
+    .sort((a, b) => a.closed.localeCompare(b.closed))
     .slice(0, limit)
-    .map((o) => o.id);
+    .map(({ orderId, mode }) => ({ orderId, mode }));
+}
+
+export function dueNfceOrders(state: NfceQueueState, nowMs: number, limit = 3): string[] {
+  return dueNfceCalls(state, nowMs, limit).map((c) => c.orderId);
 }

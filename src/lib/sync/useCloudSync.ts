@@ -7,7 +7,8 @@ import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
-import { dueNfceOrders, requestNfceEmission } from './nfceEmission';
+import { dueNfceCalls, dueNfceOrders, requestNfceEmission } from './nfceEmission';
+import type { CloudSession } from '../../store/useTcheStore';
 
 const INTERVAL_MS = 5_000;
 /** Leitura dos cadastros da nuvem (só com a fila vazia: o que é daqui sobe antes). */
@@ -39,13 +40,19 @@ async function pullOnce(cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
  * NFC-e real: pede/consulta na emit-nfce as comandas fechadas que já subiram inteiras
  * (no máximo 3 por rodada). A resposta só é gravada se o aparelho ainda é da mesma loja.
  */
-async function emitDueNfce(cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
-  const tenantId = useTcheStore.getState().tenant.id;
-  for (const orderId of dueNfceOrders(useTcheStore.getState(), Date.now())) {
-    const outcome = await requestNfceEmission(cfg, orderId, fetchFn);
+async function emitDueNfce(cfg: SyncConfig, session: CloudSession, fetchFn: FetchLike): Promise<void> {
+  // A rodada inteira fica presa à loja e ao projeto da sessão que a começou: as comandas são
+  // escolhidas, pedidas e gravadas só enquanto o aparelho continua nessa mesma loja.
+  const sameStore = () => {
     const st = useTcheStore.getState();
-    if (!st.cloud || st.tenant.id !== tenantId) return;
-    st.applyNfceOutcome(orderId, outcome);
+    return st.cloud !== null && st.cloud.tenant_id === session.tenant_id && st.cloud.url === session.url && st.tenant.id === session.tenant_id;
+  };
+  if (!sameStore()) return;
+  for (const { orderId, mode } of dueNfceCalls(useTcheStore.getState(), Date.now())) {
+    if (!sameStore() || !useTcheStore.getState().orders.some((o) => o.id === orderId && o.tenant_id === session.tenant_id)) return;
+    const outcome = await requestNfceEmission(cfg, orderId, fetchFn, mode);
+    if (!sameStore()) return;
+    useTcheStore.getState().applyNfceOutcome(orderId, outcome);
   }
 }
 
@@ -83,7 +90,7 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
     const { outbox: events, syncRejected } = useTcheStore.getState();
     if (events.length === 0) {
       if (wantsPull) await pullOnce(cfg, fetchFn);
-      await emitDueNfce(cfg, fetchFn);
+      await emitDueNfce(cfg, session, fetchFn);
       return;
     }
     const held = (syncRejected ?? []).map((r) => r.event);
@@ -101,7 +108,7 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
     // Fila zerou nesta rodada: lê a nuvem agora, se estava na hora.
     if (wantsPull && useTcheStore.getState().outbox.length === 0 && !result.retryLater) await pullOnce(cfg, fetchFn);
     // Conta que acabou de subir inteira já pede a NFC-e nesta rodada.
-    if (!result.retryLater) await emitDueNfce(cfg, fetchFn);
+    if (!result.retryLater) await emitDueNfce(cfg, session, fetchFn);
   } finally {
     running = false;
   }

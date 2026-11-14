@@ -224,6 +224,44 @@ describe('emitNfce', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('consulta (mode consult) sem documento não transmite nada e responde none', async () => {
+    const repo = new MemoryRepo(source());
+    const { calls, focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const deps = { repo, environment: 'homologacao' as const, focus, sha256Hex };
+    const r = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r.httpStatus).toBe(404);
+    expect(r.body).toMatchObject({ status: 'none', authorized: false, access_key: null, payload: null });
+    expect(calls).toHaveLength(0);
+    expect(repo.doc).toBeNull();
+    // Depois de emitida, a consulta devolve o documento sem nova transmissão.
+    await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
+    const again = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(again.body).toMatchObject({ status: 'authorized', access_key: KEY });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('consulta de rejeitada não reenvia', async () => {
+    const repo = new MemoryRepo(source());
+    const { calls, focus } = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', mensagem_sefaz: 'NCM' } }]);
+    const deps = { repo, environment: 'homologacao' as const, focus, sha256Hex };
+    await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
+    const r = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r.body.status).toBe('rejected');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('autorizada sem QR Code: a chamada seguinte só consulta (GET) e completa o QR, sem retransmitir', async () => {
+    const repo = new MemoryRepo(source());
+    const { calls, focus } = fakeFocus([{ status: 201, body: { ...AUTHORIZED, qrcode_url: null } }, { status: 200, body: AUTHORIZED }]);
+    const deps = { repo, environment: 'homologacao' as const, focus, sha256Hex };
+    const first = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
+    expect(first.body).toMatchObject({ status: 'authorized', qrcode_url: null });
+    const second = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(second.body).toMatchObject({ status: 'authorized', access_key: KEY, qrcode_url: QR });
+    expect(calls.map((c) => c.method)).toEqual(['POST', 'GET']);
+    expect(repo.doc!.payload).toEqual(first.body.payload);
+  });
+
   it('devolve a data de emissão transmitida (a tela imprime no DANFE)', async () => {
     const repo = new MemoryRepo(source());
     const { focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);

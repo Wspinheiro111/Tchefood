@@ -18,6 +18,8 @@ const FOCUS_HOST: Record<'homologacao' | 'producao', string> = {
 /** Texto da situação da NFC-e real para a tela. */
 export function nfceCloudLabel(order: Order, rec: NfceCloudRecord | undefined, waitingSync: boolean): string {
   if (rec?.status === 'authorized') return 'Autorizada pela SEFAZ';
+  if (rec?.problem === 'none') return 'Nota simulada antes da emissão real: não há NFC-e desta conta no servidor';
+  if (!rec && order.nfce_status === 'AUTORIZADA') return 'Nota simulada antes da emissão real: conferindo no servidor';
   if (rec?.status === 'cancelled') return 'Cancelada';
   if (rec?.status === 'contingency') return 'Emitida em contingência, aguardando a SEFAZ';
   if (rec?.status === 'rejected') return 'Rejeitada pela SEFAZ';
@@ -59,8 +61,11 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
 
   if (cloud && !doc) {
     const waiting = ordersWithPendingEvents([...s.outbox, ...(s.syncRejected ?? []).map((r) => r.event)]).has(orderId);
-    const finalState = rec?.status === 'authorized' || rec?.status === 'cancelled';
+    // Aqui a nota autorizada não tem tudo para a bobina: o botão só consulta, sem nova emissão.
+    const finalState = rec?.status === 'cancelled';
+    const legacyNone = rec?.problem === 'none';
     const askNow = () => {
+      if (legacyNone && !window.confirm('Esta conta foi fechada com nota simulada e não tem NFC-e no servidor. Emitir agora a NFC-e real dela?')) return;
       const r = s.requestNfceNow(orderId);
       if (!r.ok) return toast.error(r.error);
       toast.info(rec?.status === 'rejected' ? 'Reenvio pedido ao servidor.' : 'Consulta pedida ao servidor.');
@@ -74,7 +79,14 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
         footer={
           !finalState && order.status === 'CLOSED' ? (
             <Btn variant="gold" block onClick={askNow}>
-              <RefreshCw className="h-5 w-5" /> {rec?.status === 'rejected' || rec?.problem === 'invalid' ? 'Tentar emitir de novo' : 'Emitir / consultar agora'}
+              <RefreshCw className="h-5 w-5" />{' '}
+              {rec?.status === 'authorized'
+                ? 'Consultar de novo (sem nova emissão)'
+                : legacyNone
+                  ? 'Emitir a NFC-e real agora'
+                  : rec?.status === 'rejected' || rec?.problem === 'invalid'
+                    ? 'Tentar emitir de novo'
+                    : 'Emitir / consultar agora'}
             </Btn>
           ) : undefined
         }

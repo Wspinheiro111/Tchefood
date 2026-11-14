@@ -777,7 +777,8 @@ export interface NfceDanfePayload {
 }
 
 /** Resultado da última chamada à emit-nfce que não trouxe documento. */
-export type NfceCallProblem = 'invalid' | 'not_found' | 'conflict' | 'error' | 'network';
+/** none = consulta sem documento no servidor (nada foi transmitido). */
+export type NfceCallProblem = 'invalid' | 'not_found' | 'conflict' | 'none' | 'error' | 'network';
 
 /**
  * NFC-e real de uma comanda, como a Edge Function emit-nfce respondeu. Tudo o que é

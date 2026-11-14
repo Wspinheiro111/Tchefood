@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { useTcheStore, type CloudSession } from '../store/useTcheStore';
-import { dueNfceOrders, nextNfceRecord, parseEmitResponse, requestNfceEmission, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
+import { dueNfceCalls, dueNfceOrders, nextNfceRecord, parseEmitResponse, requestNfceEmission, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
 import { syncOnce } from '../lib/sync/useCloudSync';
 import { serverNfceDocument } from '../lib/nfce';
 import { danfeLines } from '../lib/receipts';
@@ -111,7 +111,7 @@ describe('resposta da emit-nfce', () => {
     expect(await requestNfceEmission({ url: 'https://p', anonKey: 'a', accessToken: 't' }, 'o', offline)).toMatchObject({ kind: 'network' });
   });
 
-  it('o pedido leva só o order_id, com o JWT do aparelho', async () => {
+  it('o pedido leva só o order_id e o modo, com o JWT do aparelho', async () => {
     const calls: Array<{ url: string; init: Parameters<FetchLike>[1] }> = [];
     const f: FetchLike = async (url, init) => {
       calls.push({ url, init });
@@ -121,7 +121,16 @@ describe('resposta da emit-nfce', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe('https://proj.supabase.co/functions/v1/emit-nfce');
     expect(calls[0]!.init.headers.Authorization).toBe('Bearer jwt');
-    expect(JSON.parse(calls[0]!.init.body!)).toEqual({ order_id: 'ord-1' });
+    expect(JSON.parse(calls[0]!.init.body!)).toEqual({ order_id: 'ord-1', mode: 'emit' });
+    await requestNfceEmission({ url: 'https://proj.supabase.co/', anonKey: 'anon', accessToken: 'jwt' }, 'ord-1', f, 'consult');
+    expect(JSON.parse(calls[1]!.init.body!)).toEqual({ order_id: 'ord-1', mode: 'consult' });
+  });
+
+  it('consulta sem documento (none) não tenta de novo sozinha', () => {
+    const none = parseEmitResponse(404, JSON.stringify({ status: 'none', authorized: false, message: 'Esta comanda não tem NFC-e no servidor.' }));
+    expect(none).toMatchObject({ kind: 'none' });
+    const rec = nextNfceRecord('o1', undefined, none, Date.now());
+    expect(rec).toMatchObject({ status: null, problem: 'none', next_attempt_at: null });
   });
 });
 
@@ -255,6 +264,10 @@ describe('DANFE da nota real', () => {
     expect(serverNfceDocument({ ...server(), protocol: null })).toBeNull();
     expect(serverNfceDocument({ ...server(), issued_at: null })).toBeNull();
     expect(serverNfceDocument({ ...server(), payload: null })).toBeNull();
+    // Número/série que contradizem a chave (nota 42, série 1): não imprime.
+    expect(serverNfceDocument({ ...server(), number: 43 })).toBeNull();
+    expect(serverNfceDocument({ ...server(), series: '2' })).toBeNull();
+    expect(serverNfceDocument({ ...server(), number: null, series: null })!.payload).toMatchObject({ numero: 42, serie: 1 });
     // Emitente: sem o congelado, ou CNPJ diferente da chave, não imprime.
     expect(serverNfceDocument({ ...server(), issuer: null })).toBeNull();
     expect(serverNfceDocument({ ...server(), issuer: { ...ISSUER, cnpj: '48291736000155' } })).toBeNull();
@@ -307,5 +320,100 @@ describe('DANFE da nota real', () => {
     expect(bad({ ...PAYLOAD, cpf_destinatario: '123' })).toBeNull();
     expect(bad({ ...PAYLOAD, cnpj_emitente: undefined })).toBeNull();
     expect(bad({ ...PAYLOAD, cpf_destinatario: '12345678909' })).toMatchObject({ cpf_destinatario: '12345678909' });
+  });
+});
+
+describe('achados da auditoria (rodada 8b171a7)', () => {
+  const settle = () => useTcheStore.setState({ outbox: [], pullStatus: { last_pull_at: new Date().toISOString(), last_error: null, cloud_staff_unknown: 0 } });
+
+  it('autorizada sem QR Code volta a ser consultada (só leitura) e imprime quando o QR chega', async () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id), tenant: { ...st().tenant, cnpj: '12345678000195' } });
+    const id = closeOrder();
+    settle();
+    const bodies = [authorizedBody({ qrcode_url: null }), authorizedBody()];
+    const modes: string[] = [];
+    const f: FetchLike = async (_url, init) => {
+      modes.push(JSON.parse(init.body!).mode);
+      return { ok: true, status: 200, text: async () => JSON.stringify(bodies.shift()) };
+    };
+    await syncOnce(f);
+    const rec = st().nfceCloud[id]!;
+    expect(rec).toMatchObject({ status: 'authorized', qrcode_url: null });
+    expect(serverNfceDocument(rec)).toBeNull();
+    expect(rec.next_attempt_at).not.toBeNull();
+    expect(dueNfceCalls(st(), Date.parse(rec.next_attempt_at!) + 1)).toEqual([{ orderId: id, mode: 'consult' }]);
+    // Botão: consulta já, sem nova emissão.
+    expect(st().requestNfceNow(id).ok).toBe(true);
+    await syncOnce(f);
+    expect(modes).toEqual(['emit', 'consult']);
+    expect(serverNfceDocument(st().nfceCloud[id]!)).not.toBeNull();
+    expect(dueNfceCalls(st(), Date.now() + 3_600_000)).toEqual([]);
+    expect(st().requestNfceNow(id).ok).toBe(false);
+  });
+
+  it('conta antiga com NFC-e simulada: consulta primeiro; sem nota no servidor, só o botão emite', async () => {
+    // Fechada sem nuvem (chave simulada), depois a loja liga na nuvem.
+    const id = closeOrder();
+    expect(order(id)).toMatchObject({ nfce_status: 'AUTORIZADA' });
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    settle();
+    expect(dueNfceCalls(st(), Date.now())).toEqual([{ orderId: id, mode: 'consult' }]);
+    const modes: string[] = [];
+    let reply: unknown = { status: 'none', authorized: false, message: 'Esta comanda não tem NFC-e no servidor. Nada foi transmitido.' };
+    const f: FetchLike = async (_url, init) => {
+      modes.push(JSON.parse(init.body!).mode);
+      return { ok: reply === null, status: 404, text: async () => JSON.stringify(reply) };
+    };
+    await syncOnce(f);
+    expect(st().nfceCloud[id]).toMatchObject({ problem: 'none', next_attempt_at: null });
+    // Nada automático depois disso.
+    expect(dueNfceCalls(st(), Date.now() + 3_600_000)).toEqual([]);
+    await syncOnce(f);
+    expect(modes).toEqual(['consult']);
+    // O gerente pede a nota real: aí sim vai em modo emit.
+    expect(st().requestNfceNow(id).ok).toBe(true);
+    expect(dueNfceCalls(st(), Date.now())).toEqual([{ orderId: id, mode: 'emit' }]);
+    reply = authorizedBody();
+    const ok: FetchLike = async (_u, init) => {
+      modes.push(JSON.parse(init.body!).mode);
+      return { ok: true, status: 200, text: async () => JSON.stringify(reply) };
+    };
+    await syncOnce(ok);
+    expect(modes).toEqual(['consult', 'emit']);
+    expect(order(id)).toMatchObject({ nfce_status: 'AUTORIZADA', nfce_key: KEY });
+    expect(st().nfceCloud[id]!.status).toBe('authorized');
+  });
+
+  it('conta antiga já emitida de verdade (outro aparelho): a consulta só traz o documento', async () => {
+    const id = closeOrder();
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    settle();
+    const modes: string[] = [];
+    const f: FetchLike = async (_url, init) => {
+      modes.push(JSON.parse(init.body!).mode);
+      return { ok: true, status: 200, text: async () => JSON.stringify(authorizedBody()) };
+    };
+    await syncOnce(f);
+    expect(modes).toEqual(['consult']);
+    expect(order(id)).toMatchObject({ nfce_key: KEY });
+  });
+
+  it('troca de loja durante a chamada: resultado atrasado não é gravado na outra loja e nada mais é pedido', async () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const a = closeOrder();
+    settle();
+    const tenantA = st().tenant.id;
+    const urls: string[] = [];
+    const f: FetchLike = async (url) => {
+      urls.push(url);
+      // Durante a chamada o aparelho vira outra loja (sessão B).
+      useTcheStore.setState({ tenant: { ...st().tenant, id: 'tenant-b' }, cloud: { ...session('tenant-b'), access_token: 'jwt-b' } });
+      return { ok: true, status: 200, text: async () => JSON.stringify(authorizedBody()) };
+    };
+    await syncOnce(f);
+    expect(urls).toHaveLength(1);
+    expect(st().nfceCloud[a]).toBeUndefined();
+    expect(order(a).nfce_status).toBe('PENDING');
+    expect(tenantA).not.toBe('tenant-b');
   });
 });

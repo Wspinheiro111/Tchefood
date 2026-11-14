@@ -89,7 +89,7 @@ import { clearReviewHold, getReviewHold } from '../lib/payments/reviewHolds';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { buildAccessKey } from '../lib/nfce';
-import { NFCE_ORDER_STATUS, nextNfceRecord, nfceEligible, ordersWithPendingEvents, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
+import { NFCE_ORDER_STATUS, missingPrintData, nextNfceRecord, nfceEligible, ordersWithPendingEvents, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
 import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
@@ -3836,10 +3836,10 @@ export const useTcheStore = create<TcheState>()(
           const order = state.orders.find((o) => o.id === orderId);
           if (!order) return fail('Comanda não encontrada.');
           const rec = (state.nfceCloud ?? {})[orderId];
-          if (rec?.status === 'authorized' || rec?.status === 'cancelled') return fail('Esta NFC-e já tem situação final no servidor.');
+          if (rec?.status === 'cancelled' || (rec?.status === 'authorized' && !missingPrintData(rec))) return fail('Esta NFC-e já tem situação final no servidor.');
           const pending = ordersWithPendingEvents([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]);
           if (pending.has(orderId)) return fail('A conta ainda não terminou de subir para a nuvem (ou tem evento recusado). A NFC-e sai depois disso.');
-          if (!nfceEligible(order, pending)) return fail('Esta comanda não tem NFC-e a emitir.');
+          if (!nfceEligible(order, pending, rec)) return fail('Esta comanda não tem NFC-e a emitir.');
           set((s) => ({ nfceForced: [...(s.nfceForced ?? []).filter((id) => id !== orderId), orderId] }));
           return { ok: true, data: undefined };
         },

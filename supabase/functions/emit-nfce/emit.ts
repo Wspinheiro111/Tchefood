@@ -98,7 +98,7 @@ export interface EmitDeps {
 export interface EmitResponse {
   httpStatus: number;
   body: {
-    status: NfceDocumentStatus | 'invalid' | 'not_found' | 'conflict';
+    status: NfceDocumentStatus | 'invalid' | 'not_found' | 'conflict' | 'none';
     /** true somente com protocolo de autorização da SEFAZ. */
     authorized: boolean;
     /** Emitida em contingência offline e ainda não efetivada na SEFAZ. */
@@ -155,7 +155,7 @@ function respond(doc: NfceDocumentRow, message?: string | null): EmitResponse {
   };
 }
 
-function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict', environment: FocusEnvironment, message: string, reference: string | null = null): EmitResponse {
+function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict' | 'none', environment: FocusEnvironment, message: string, reference: string | null = null): EmitResponse {
   return {
     httpStatus,
     body: {
@@ -219,6 +219,7 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
 async function reconcile(deps: EmitDeps, doc: NfceDocumentRow, token: string): Promise<EmitResponse> {
   const result = await deps.focus(token).query(doc.reference);
   if (!result.ok) {
+    if (doc.status === 'authorized') return respond(doc, `A NFC-e segue autorizada; a consulta do QR Code na Focus não respondeu (HTTP ${result.httpStatus || 'sem resposta'}).`);
     const note = result.httpStatus === 404
       ? 'A Focus ainda não reconhece esta referência. A NFC-e continua em processamento; não reemita sem conferir no painel da Focus.'
       : `Consulta inconclusiva (HTTP ${result.httpStatus || 'sem resposta'}). A NFC-e continua em ${doc.status === 'contingency' ? 'contingência' : 'processamento'}.`;
@@ -244,7 +245,12 @@ async function transmit(deps: EmitDeps, doc: NfceDocumentRow, token: string, pay
   return apply(deps, doc, classifyTransmission(result));
 }
 
-export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderId: string }): Promise<EmitResponse> {
+/**
+ * consultOnly (mode "consult"): só devolve ou consulta na Focus o documento que já existe
+ * (inclusive autorizada sem QR Code). Sem documento responde status "none" e não transmite
+ * nada; rejeitada é devolvida como está, sem reenvio.
+ */
+export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderId: string; consultOnly?: boolean }): Promise<EmitResponse> {
   const env = deps.environment;
   const source = await deps.repo.loadSource(input.tenantId, input.orderId);
   if (!source) return failure(404, 'not_found', env, 'Comanda não encontrada para este estabelecimento.');
@@ -262,8 +268,14 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
   if (doc && doc.environment !== env) {
     return failure(409, 'conflict', env, `Esta comanda já tem NFC-e em ${doc.environment}; o servidor está em ${env}. Nada foi transmitido.`, doc.reference);
   }
+  // Autorizada sem o QR Code assinado: consulta a Focus (só GET) para completar o DANFE.
+  if (doc && doc.status === 'authorized' && !doc.qrcode_url) return reconcile(deps, doc, token);
   if (doc && (doc.status === 'authorized' || doc.status === 'cancelled')) return respond(doc);
   if (doc && (doc.status === 'processing' || doc.status === 'contingency')) return reconcile(deps, doc, token);
+  if (input.consultOnly) {
+    if (doc) return respond(doc);
+    return failure(404, 'none', env, 'Esta comanda não tem NFC-e no servidor. Nada foi transmitido.', reference);
+  }
 
   let payload;
   try {

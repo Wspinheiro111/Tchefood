@@ -352,6 +352,10 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
   if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key) || !server.issued_at || !server.payload) return null;
   if (authorized && !server.protocol) return null;
   const parsed = parseAccessKey(key);
+  // Número, série e modelo devolvidos precisam ser os da chave (modelo 65 = NFC-e).
+  if (parsed.modelo !== '65') return null;
+  if (server.number !== null && server.number !== parsed.numero) return null;
+  if (server.series !== null && (!/^\d{1,3}$/.test(server.series) || Number(server.series) !== parsed.serie)) return null;
   // Emitente: o CNPJ transmitido e o congelado precisam ser os da chave; senão, só o DANFE da Focus.
   if (!server.issuer || server.issuer.cnpj !== parsed.cnpj || server.payload.cnpj_emitente !== parsed.cnpj) return null;
   return {
@@ -364,8 +368,8 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
     issuer: server.issuer,
     payload: {
       ...server.payload,
-      numero: server.number ?? parsed.numero,
-      serie: server.series ? Number(server.series) : parsed.serie,
+      numero: parsed.numero,
+      serie: parsed.serie,
     },
   };
 }
