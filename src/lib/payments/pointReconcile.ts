@@ -23,7 +23,11 @@ export type ReconcileOutcome =
   | { kind: 'reply'; reply: Exclude<ChargeReply, { status: 'PENDING' }> }
   /** PIN de gerente recusado (403). */
   | { kind: 'pin'; error: string }
-  | { kind: 'error'; error: string };
+  /**
+   * notApplicable: o servidor disse que a cobrança não tem o que conferir (409 not_applicable: já terminou, ou aprovada
+   * com o pagamento registrado). Quem chama lê o estado gravado (readPointChargeStatus) antes de decidir a trava.
+   */
+  | { kind: 'error'; error: string; notApplicable?: true };
 
 export interface ReconcileDeps {
   config: () => Promise<SyncConfig | null>;
@@ -83,10 +87,42 @@ export async function reconcilePointCharge(input: ReconcileInput, deps: Reconcil
     const err = parseObject(out.text);
     const message = err && typeof err.message === 'string' ? err.message : null;
     if (out.status === 403) return { kind: 'pin', error: message ?? 'PIN de gerente incorreto ou bloqueado. Nada mudou.' };
-    if (out.status === 409) return { kind: 'error', error: message ?? 'Esta cobrança não está em revisão: não há o que conferir.' };
+    if (out.status === 409) {
+      const error = message ?? 'Esta cobrança não está em revisão: não há o que conferir.';
+      return err?.error === 'not_applicable' ? { kind: 'error', error, notApplicable: true } : { kind: 'error', error };
+    }
     if (out.status === 400) return { kind: 'error', error: message ?? 'Pedido de conferência inválido.' };
     return { kind: 'error', error: NO_ANSWER };
   } catch {
     return { kind: 'error', error: NO_ANSWER };
+  }
+}
+
+export type StatusOutcome = { kind: 'reply'; reply: ChargeReply } | { kind: 'error'; error: string };
+
+/**
+ * Estado gravado da cobrança no servidor (ação `status`, a mesma consulta do aparelho que cobra; cobrança final não é
+ * reconsultada no Mercado Pago). Usado depois de um 409 not_applicable da conferência (revisão PR #49, P2): só a
+ * resposta do servidor sobre ESTA chave decide se a trava local sai.
+ */
+export async function readPointChargeStatus(idempotencyKey: string, deps: ReconcileDeps = defaultReconcileDeps()): Promise<StatusOutcome> {
+  const fail = { kind: 'error', error: 'Não foi possível ler esta cobrança no servidor. A trava continua; tente de novo.' } as const;
+  const deadline = deps.timer(RECONCILE_TIMEOUT_MS).then(() => null);
+  try {
+    const cfg = await Promise.race([deps.config().catch(() => null), deadline]);
+    if (!cfg) return { kind: 'error', error: 'Sem sessão da nuvem. Conecte a loja e tente de novo; a trava continua.' };
+    const endpoint = pointChargeEndpoint(cfg);
+    const out = await Promise.race([
+      (async () => {
+        const res = await deps.fetch(endpoint.url, { method: 'POST', headers: endpoint.headers, body: JSON.stringify({ action: 'status', idempotency_key: idempotencyKey }) });
+        return { status: res.status, text: await res.text() };
+      })(),
+      deadline,
+    ]);
+    if (!out || out.status !== 200) return fail;
+    const reply = parseChargeReply(out.text);
+    return reply ? { kind: 'reply', reply } : fail;
+  } catch {
+    return fail;
   }
 }

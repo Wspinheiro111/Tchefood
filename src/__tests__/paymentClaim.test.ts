@@ -113,7 +113,7 @@ describe('claimPayment (tchefood_claim_payment)', () => {
     const timer = vi.fn(async () => undefined);
     const hung = deps(() => new Promise(() => undefined), { timer });
     expect(await claimPayment(INPUT, hung.d)).toMatchObject({ ok: false, offline: true });
-    expect(timer).toHaveBeenCalledWith(10_000);
+    expect(timer).toHaveBeenCalledWith(10_000, expect.any(AbortSignal));
     const syncHung = deps(reply(200, OK_BODY), { timer: async () => undefined, prepareOrder: () => new Promise(() => undefined) });
     expect(await claimPayment(INPUT, syncHung.d)).toMatchObject({ ok: false, offline: true });
     expect(syncHung.calls).toHaveLength(0);

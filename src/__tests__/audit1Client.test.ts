@@ -294,3 +294,108 @@ describe('P3-1 (cliente): resposta da Point sobre outra chave nunca decide esta 
     expect(parseChargeReply(JSON.stringify({ status: 'DECLINED', idempotency_key: 'K', reason: 'x' }))).toEqual({ status: 'DECLINED', idempotency_key: 'K', reason: 'x' });
   });
 });
+
+describe('Auditoria 2 P1: gravação no aparelho que falha (cheio, Safari privado antigo)', () => {
+  function failingWrites() {
+    const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('full', 'QuotaExceededError');
+    });
+    return () => spy.mockRestore();
+  }
+
+  it('trava de revisão continua valendo em memória, com aviso, e é gravada na próxima mudança que conseguir', async () => {
+    vi.resetModules();
+    const holds = await import('../lib/payments/reviewHolds');
+    const restore = failingWrites();
+    holds.setReviewHold({ order_id: 'o1', amount: 10, reason: 'r', code: 'MANUAL_REVIEW', refund: 'TERMINAL', idempotency_key: 'k1' });
+    expect(holds.getReviewHold('o1')).not.toBeNull();
+    expect(holds.getReviewHoldByKey('k1')).not.toBeNull();
+    expect(holds.reviewHoldsUnsaved()).toBe(true);
+    restore();
+    holds.setReviewHold({ order_id: 'o2', amount: 5, reason: 'r', code: 'REGISTER_FAILED', refund: 'TERMINAL', idempotency_key: 'k2' });
+    expect(holds.reviewHoldsUnsaved()).toBe(false);
+    vi.resetModules();
+    const reopened = await import('../lib/payments/reviewHolds');
+    expect(reopened.getReviewHoldByKey('k1')).not.toBeNull();
+    expect(reopened.getReviewHoldByKey('k2')).not.toBeNull();
+  });
+
+  it('trava tirada com a gravação falhando não volta da leitura', async () => {
+    vi.resetModules();
+    const holds = await import('../lib/payments/reviewHolds');
+    holds.setReviewHold({ order_id: 'o1', amount: 10, reason: 'r', code: 'MANUAL_REVIEW', refund: 'TERMINAL', idempotency_key: 'k1' });
+    const restore = failingWrites();
+    holds.clearReviewHold('o1', 'k1');
+    expect(holds.getReviewHoldByKey('k1')).toBeNull();
+    restore();
+  });
+
+  it('registro de reservas: o segredo e o fim continuam em memória e são gravados depois', async () => {
+    const ledger = await freshTab();
+    const restore = failingWrites();
+    expect(ledger.beginLocalClaim('k2', 'o2', TOKEN_A, { method: 'CREDIT', acquirer: 'STONE', amount_cents: 1000 })).toBe(false);
+    expect(ledger.localClaim('k2')?.release_token).toBe(TOKEN_A);
+    ledger.settleLocalClaim('k2');
+    expect(ledger.settledClaims().map((c) => c.key)).toContain('k2');
+    ledger.addPendingRelease({ key: 'k3', order_id: 'o2', reason: 'r', release_token: TOKEN_B });
+    expect(ledger.pendingRelease('k3')?.release_token).toBe(TOKEN_B);
+    expect(ledger.claimLedgerUnsaved()).toBe(true);
+    restore();
+    ledger.markClaimAbsent('k2', null); // próxima mudança: grava tudo
+    expect(ledger.claimLedgerUnsaved()).toBe(false);
+    const reopened = await freshTab();
+    expect(reopened.localClaim('k2')).toMatchObject({ state: 'settled', release_token: TOKEN_A });
+    expect(reopened.pendingRelease('k3')?.release_token).toBe(TOKEN_B);
+  });
+
+  it('reserva nova que não pôde ser gravada: não chama o servidor nem cobra; o registro anterior da chave fica', async () => {
+    const ledger = await freshTab();
+    const { startPaymentClaim, CLAIM_NOT_STORED } = await import('../lib/payments/claimFlow');
+    ledger.beginLocalClaim('k-old', 'o1', TOKEN_B);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const restore = failingWrites();
+    const r = await startPaymentClaim(true, { orderId: 'o1', key: 'k-new', method: 'CREDIT', acquirer: 'STONE', amount: 10 });
+    const again = await startPaymentClaim(true, { orderId: 'o1', key: 'k-old', method: 'CREDIT', acquirer: 'STONE', amount: 10 });
+    restore();
+    expect(r).toEqual({ ok: false, code: 'CLAIM_NOT_STORED', error: CLAIM_NOT_STORED });
+    expect(again).toMatchObject({ ok: false, code: 'CLAIM_NOT_STORED' });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+    expect(ledger.localClaim('k-new')).toBeNull();
+    expect(ledger.isClaimActiveHere('k-new')).toBe(false);
+    expect(ledger.localClaim('k-old')?.release_token).toBe(TOKEN_B);
+    expect(ledger.claimLedgerUnsaved()).toBe(false);
+  });
+});
+
+describe('Auditoria 2 P3: flushOutbox e prazo das chamadas', () => {
+  it('descartado antes de uma queda da nuvem sai junto (é confirmado, não sobe de novo)', async () => {
+    const { flushOutbox } = await import('../lib/sync/supabaseSync');
+    const ev = (id: string, table: SyncEvent['table'], payload: Record<string, unknown>) => ({ id, table, op: 'INSERT', row_id: `${id}r`, payload, created_at: '2026-11-01T10:00:00Z' }) as SyncEvent;
+    let n = 0;
+    const r = await flushOutbox(
+      [ev('e1', 'payments', { order_id: 'A', status: 'DECLINED', acquirer: 'STONE' }), ev('e2', 'products', { id: 'p' })],
+      CFG,
+      async () => {
+        n += 1;
+        return n === 1 ? { ok: false, status: 400, text: async () => JSON.stringify({ code: 'TF010', message: 'x' }) } : { ok: false, status: 503, text: async () => '' };
+      },
+    );
+    expect(r.retryLater).toBeTruthy();
+    expect(r.dropped?.map((d) => d.eventId)).toEqual(['e1']);
+  });
+
+  it('o prazo de cada etapa é desligado quando a chamada termina antes', async () => {
+    const { touchPaymentClaim } = await import('../lib/payments/paymentClaim');
+    const signals: AbortSignal[] = [];
+    await touchPaymentClaim('K', TOKEN_A, hangingDeps({
+      fetch: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ idempotency_key: 'K', status: 'open', active_until: null }) }),
+      timer: (_ms, signal) => {
+        if (signal) signals.push(signal);
+        return new Promise<void>(() => undefined);
+      },
+    }));
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.every((s) => s.aborted)).toBe(true);
+  });
+});

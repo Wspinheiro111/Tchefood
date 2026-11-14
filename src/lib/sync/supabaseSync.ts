@@ -468,6 +468,8 @@ export async function flushOutbox(
     unsent.add(event.id);
     for (const k of recordKeys(event)) blocked.add(k);
   };
+  // Toda saída leva os descartados (senão o evento descartado antes de uma queda de rede subiria de novo).
+  const done = (retryLater: string | null): FlushResult => ({ sent, retryLater, rejected, ...(dropped.length > 0 ? { dropped } : {}) });
   let attempts = 0;
   for (const event of serverOrder(events)) {
     // Eventos segurados não contam no limite: senão um bloco segurado no começo da fila
@@ -502,7 +504,7 @@ export async function flushOutbox(
         text = await res.text().catch(() => '');
       }
     } catch (e) {
-      return { sent, retryLater: `Sem conexão com a nuvem: ${(e as Error).message}`, rejected };
+      return done(`Sem conexão com a nuvem: ${(e as Error).message}`);
     }
     if (res.ok) {
       // A RPC responde null quando o PIN não confere no servidor (ou está bloqueado):
@@ -521,9 +523,9 @@ export async function flushOutbox(
       unsent.delete(event.id);
       continue;
     }
-    if (res.status === 401) return { sent, retryLater: 'Sessão da nuvem expirada. Renovando o acesso.', rejected };
+    if (res.status === 401) return done('Sessão da nuvem expirada. Renovando o acesso.');
     if (res.status >= 500 || res.status === 408 || res.status === 429) {
-      return { sent, retryLater: `Nuvem indisponível (HTTP ${res.status}).`, rejected };
+      return done(`Nuvem indisponível (HTTP ${res.status}).`);
     }
     if (isDroppableDeclined(event, text)) {
       dropped.push({ eventId: event.id, status: res.status, message: describeError(text, res.status) });
@@ -532,7 +534,7 @@ export async function flushOutbox(
     }
     reject(event, res.status, describeError(text, res.status));
   }
-  return { sent, retryLater: null, rejected, ...(dropped.length > 0 ? { dropped } : {}) };
+  return done(null);
 }
 
 /**

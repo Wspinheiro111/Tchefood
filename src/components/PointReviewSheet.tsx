@@ -5,11 +5,17 @@ import { PinPad } from './PinPad';
 import { useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { clearReviewHold, getReviewHolds, reviewHoldKey } from '../lib/payments/reviewHolds';
-import { RECONCILE_MIN_REASON, reconcilePointCharge, type ReconcileDeps } from '../lib/payments/pointReconcile';
+import { RECONCILE_MIN_REASON, readPointChargeStatus, reconcilePointCharge, type ReconcileDeps } from '../lib/payments/pointReconcile';
 import { formatBRL } from '../lib/money';
 import { playDeniedBuzz, vibrate } from '../lib/sound';
 
 export const POINT_NOT_CHARGED = 'O Mercado Pago confirmou que não foi cobrado. Valor liberado.';
+/** Conferência recusada (já terminou) e o servidor confirma o fim sem cobrança: a trava sai. */
+export const POINT_SERVER_CLOSED = 'O servidor confirma que esta cobrança terminou sem cobrar. Trava liberada.';
+/** Aprovada e com o pagamento registrado no servidor por outro aparelho: a trava só sai com o pagamento aqui. */
+export const POINT_APPROVED_ELSEWHERE =
+  'A cobrança foi aprovada e o pagamento já está registrado no servidor (por outro aparelho). Não cobre de novo: aguarde este aparelho sincronizar e confira de novo para tirar a trava.';
+export const POINT_STILL_OPEN = 'A cobrança ainda está aberta na maquininha. Finalize ou cancele nela e confira de novo.';
 export const POINT_REVIEW_PROCEDURE =
   'Confira a cobrança no app do Mercado Pago. Se houver a operação, digite o ID da operação acima e confira de novo. Se não houver, tente de novo mais tarde. Enquanto isso, a conta segue com o valor reservado.';
 
@@ -79,6 +85,40 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
     vibrate([80, 40, 80]);
   };
 
+  /**
+   * Revisão PR #49 (P2): a conferência respondeu que não há o que conferir (a cobrança terminou por uma consulta, outro
+   * aparelho resolveu, ou está aprovada com o pagamento registrado). Lê o estado gravado no servidor e só tira a trava
+   * com o fim provado lá: recusada/cancelada/expirada (DECLINED, que o servidor só dá com o Mercado Pago ou com a prova
+   * de que nada saiu daqui) ou aprovada com o pagamento já registrado NESTE aparelho. Aprovada com o pagamento só no
+   * servidor, estornada, em revisão ou aberta: a trava fica, com o motivo. Erro ou resposta de outra chave: fica.
+   */
+  const settleNotApplicable = async (k: string) => {
+    const status = await readPointChargeStatus(k, deps);
+    if (status.kind !== 'reply') return fail(status.error);
+    const r = status.reply;
+    if (r.idempotency_key !== k) return fail('O servidor respondeu sobre outra cobrança. Nada foi registrado e a trava continua; confira com o gerente.');
+    if (r.status === 'DECLINED') {
+      clearHoldOf(charge.order_id, k);
+      toast.success(`${POINT_SERVER_CLOSED} ${r.reason}`);
+      onReleased?.();
+      onClose();
+      return;
+    }
+    if (r.status === 'APPROVED') {
+      if (useTcheStore.getState().payments.some((p) => p.idempotency_key === k && p.status === 'APPROVED')) {
+        clearHoldOf(charge.order_id, k);
+        toast.info('Este pagamento já está registrado neste aparelho.');
+        onClose();
+        return;
+      }
+      setPin('');
+      setReview(POINT_APPROVED_ELSEWHERE);
+      return;
+    }
+    setPin('');
+    setReview(r.status === 'MANUAL_REVIEW' ? r.reason : POINT_STILL_OPEN);
+  };
+
   const submit = async (pinValue = pin) => {
     if (!key) return fail('Esta cobrança não tem a chave da Point gravada. Confira no app do Mercado Pago com o gerente.');
     if (!reasonOk) return fail(`Informe o motivo (mínimo ${RECONCILE_MIN_REASON} caracteres) antes do PIN.`);
@@ -88,6 +128,11 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
     setError(null);
     setReview(null);
     const out = await reconcilePointCharge({ idempotency_key: key, staff_id: staff, manager_pin: pinValue, reason_text: reason, operation_id: operationId }, deps);
+    if (out.kind === 'error' && out.notApplicable) {
+      await settleNotApplicable(key);
+      setBusy(false);
+      return;
+    }
     setBusy(false);
     if (out.kind !== 'reply') return fail(out.error);
     const reply = out.reply;

@@ -17,7 +17,7 @@
 import { PENDING_CHARGE_TTL_MS, useTcheStore } from '../../store/useTcheStore';
 import type { ActionResult, AuditLog } from '../../types';
 import { uuid } from '../ids';
-import { beginLocalClaim, detachLocalClaim, endLocalClaim, generateReleaseToken, localClaim, settleLocalClaim } from './claimLedger';
+import { beginLocalClaim, detachLocalClaim, endLocalClaim, forgetUnsavedClaim, generateReleaseToken, localClaim, settleLocalClaim } from './claimLedger';
 import {
   authorizeClaimRefunded, CLAIM_HEARTBEAT_MS, CLAIM_OFFLINE_ERROR, claimPayment, reclaimPayment, releaseClaimAfterNoCharge, releasePaymentClaim,
   requirePaymentClaim, touchPaymentClaim, type ClaimAcquirer, type ClaimDeps, type ClaimInput, type ClaimResult,
@@ -59,6 +59,10 @@ function mismatchReason(claimed: ClaimAcquirer, got: string): string {
   return `A maquininha respondeu como ${ACQUIRER_NAME[got] ?? got}, mas a reserva foi para ${ACQUIRER_NAME[claimed] ?? claimed}: confira a maquininha antes de registrar.`;
 }
 
+/** O registro da reserva (com o segredo) não pôde ser gravado no aparelho: nada é pedido nem cobrado. */
+export const CLAIM_NOT_STORED =
+  'Não foi possível gravar no aparelho (armazenamento cheio ou bloqueado): nada foi cobrado. Libere espaço no navegador ou saia da janela privada e tente de novo.';
+
 export async function startPaymentClaim(
   required: boolean,
   input: Omit<ClaimInput, 'releaseToken'>,
@@ -67,7 +71,12 @@ export async function startPaymentClaim(
   if (!required) return { ok: true, handle: NONE };
   // O segredo vive só aqui e no registro local; nunca vai para a tela nem para log.
   const token = generateReleaseToken();
-  beginLocalClaim(input.key, input.orderId, token, { method: input.method, acquirer: input.acquirer, amount_cents: Math.round(input.amount * 100) });
+  // Sem o segredo gravado no aparelho, uma reserva criada no servidor não teria como ser liberada depois de uma
+  // queda: não pede a reserva nem cobra.
+  if (!beginLocalClaim(input.key, input.orderId, token, { method: input.method, acquirer: input.acquirer, amount_cents: Math.round(input.amount * 100) })) {
+    forgetUnsavedClaim(input.key);
+    return { ok: false, code: 'CLAIM_NOT_STORED', error: CLAIM_NOT_STORED };
+  }
   const full: ClaimInput = { ...input, releaseToken: token };
   const attempt = async (): Promise<ClaimResult> => {
     try {
@@ -174,7 +183,10 @@ export async function reclaimForHold(hold: ReviewHold, method: ClaimInput['metho
   if (!oldKey || !oldToken) return { ok: false, error: 'Este aparelho não tem o código da reserva antiga: o gerente libera a reserva na lista e registra de novo.' };
   const newKey = hold.reclaim_key ?? uuid();
   const newToken = localClaim(newKey)?.release_token ?? generateReleaseToken();
-  beginLocalClaim(newKey, hold.order_id, newToken, { method, acquirer, amount_cents: Math.round(hold.amount * 100) });
+  if (!beginLocalClaim(newKey, hold.order_id, newToken, { method, acquirer, amount_cents: Math.round(hold.amount * 100) })) {
+    forgetUnsavedClaim(newKey);
+    return { ok: false, error: CLAIM_NOT_STORED };
+  }
   if (hold.reclaim_key !== newKey) setReviewHold({ ...hold, reclaim_key: newKey });
   const input = { oldKey, oldToken, newKey, newToken, method, acquirer, amount: hold.amount };
   let r = await reclaimPayment(input);

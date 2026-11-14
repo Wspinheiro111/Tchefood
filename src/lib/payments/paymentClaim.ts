@@ -65,8 +65,8 @@ export interface ClaimDeps {
   prepareOrder: (orderId: UUID) => Promise<OrderSyncCheck>;
   /** Quem está no caixa. */
   staff: () => Promise<string | null>;
-  /** Resolve depois de ms (prazo de cada etapa). */
-  timer: (ms: number) => Promise<void>;
+  /** Resolve depois de ms (prazo de cada etapa). `signal` abortado: o timer é desligado (não precisa resolver). */
+  timer: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Espera entre tentativas da liberação (padrão: o mesmo timer). */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -77,7 +77,11 @@ export function defaultClaimDeps(): ClaimDeps {
     fetch: (url, init) => fetch(url, init),
     prepareOrder: async (orderId) => (await import('../sync/useCloudSync')).ensureOrderSynced(orderId),
     staff: async () => (await import('../../store/useTcheStore')).useTcheStore.getState().currentUserId,
-    timer: (ms) => new Promise((r) => setTimeout(r, ms)),
+    timer: (ms, signal) =>
+      new Promise((r) => {
+        const id = setTimeout(r, ms);
+        signal?.addEventListener('abort', () => clearTimeout(id), { once: true });
+      }),
   };
 }
 
@@ -94,7 +98,13 @@ export function requirePaymentClaim(store: { cloud?: unknown }): boolean {
 /** `promise` com prazo: erro ou prazo vencido viram `{ done: false }`. */
 async function within<T>(promise: Promise<T>, deps: ClaimDeps): Promise<{ done: true; value: T } | { done: false }> {
   const safe = promise.then((value) => ({ done: true as const, value }), () => ({ done: false as const }));
-  return Promise.race([safe, deps.timer(CLAIM_TIMEOUT_MS).then(() => ({ done: false as const }))]);
+  // O prazo é desligado quando a etapa termina antes (sem timer pendurado por chamada).
+  const stop = typeof AbortController === 'function' ? new AbortController() : null;
+  try {
+    return await Promise.race([safe, deps.timer(CLAIM_TIMEOUT_MS, stop?.signal).then(() => ({ done: false as const }))]);
+  } finally {
+    stop?.abort();
+  }
 }
 
 function rpcUrl(cfg: SyncConfig, fn: string): string {

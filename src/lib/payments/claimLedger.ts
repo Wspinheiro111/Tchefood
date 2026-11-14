@@ -67,65 +67,128 @@ const STORAGE_KEY = 'tchefood.paymentClaims.v1';
 const active = new Set<string>();
 let ledger: Ledger | null = null;
 
-function storage(): Storage | null {
+/**
+ * 'none': ambiente sem localStorage (fora do navegador): o registro vive só na memória, como sempre foi.
+ * 'blocked': o navegador tem o armazenamento, mas o acesso falha. 'ok': lê e grava.
+ */
+type Access = { kind: 'none' } | { kind: 'blocked' } | { kind: 'ok'; st: Storage };
+
+function access(): Access {
   try {
-    return typeof localStorage === 'undefined' ? null : localStorage;
+    return typeof localStorage === 'undefined' ? { kind: 'none' } : { kind: 'ok', st: localStorage };
   } catch {
-    return null;
+    return { kind: 'blocked' };
   }
 }
 
 const emptyLedger = (): Ledger => ({ inFlight: [], pendingReleases: [] });
 
 /**
- * O registro como está guardado agora. Lido do armazenamento a cada uso (não de uma cópia desta aba): outra aba
- * pode ter gravado uma reserva no meio. Sem armazenamento: a cópia em memória desta aba.
+ * Entradas que esta aba mudou e não conseguiu gravar (armazenamento cheio, Safari privado antigo): valem por cima
+ * do que for lido, e cada nova mudança tenta gravá-las de novo. null = apagada aqui.
+ */
+const unsavedClaims = new Map<string, LocalClaim | null>();
+const unsavedReleases = new Map<string, PendingRelease | null>();
+
+function overlay<T extends { key: string }>(list: T[], unsaved: Map<string, T | null>): T[] {
+  if (unsaved.size === 0) return list;
+  const out = list.filter((x) => !unsaved.has(x.key));
+  for (const v of unsaved.values()) if (v) out.push(v);
+  return out;
+}
+
+/**
+ * O registro como está guardado agora, com as mudanças desta aba que não foram gravadas por cima. Lido do
+ * armazenamento a cada uso (não de uma cópia desta aba): outra aba pode ter gravado uma reserva no meio.
+ * Fora do navegador: a cópia em memória.
  */
 function load(): Ledger {
-  const st = storage();
-  if (!st) return (ledger ??= emptyLedger());
-  try {
-    const raw = st.getItem(STORAGE_KEY);
-    const out = emptyLedger();
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<Ledger>;
-      out.inFlight = Array.isArray(parsed.inFlight) ? parsed.inFlight : [];
-      out.pendingReleases = Array.isArray(parsed.pendingReleases) ? parsed.pendingReleases : [];
+  const a = access();
+  if (a.kind === 'none') return (ledger ??= emptyLedger());
+  let base = emptyLedger();
+  if (a.kind === 'ok') {
+    try {
+      const raw = a.st.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<Ledger>;
+        base.inFlight = Array.isArray(parsed.inFlight) ? parsed.inFlight : [];
+        base.pendingReleases = Array.isArray(parsed.pendingReleases) ? parsed.pendingReleases : [];
+      }
+    } catch {
+      // Conteúdo corrompido ou leitura bloqueada: a última leitura (o servidor ainda lista as reservas abertas).
+      base = ledger ? { inFlight: [...ledger.inFlight], pendingReleases: [...ledger.pendingReleases] } : emptyLedger();
     }
-    ledger = out;
-    return out;
-  } catch {
-    // Conteúdo corrompido ou leitura bloqueada: a cópia em memória (o servidor ainda lista as reservas abertas).
-    return (ledger ??= emptyLedger());
   }
+  const out = { inFlight: overlay(base.inFlight, unsavedClaims), pendingReleases: overlay(base.pendingReleases, unsavedReleases) };
+  ledger = out;
+  return out;
+}
+
+function byKey<T extends { key: string }>(list: T[]): Map<string, string> {
+  return new Map(list.map((x) => [x.key, JSON.stringify(x)]));
+}
+
+function noteChanges<T extends { key: string }>(before: Map<string, string>, after: T[], unsaved: Map<string, T | null>) {
+  const now = new Map(after.map((x) => [x.key, x]));
+  for (const [k, v] of now) if (before.get(k) !== JSON.stringify(v)) unsaved.set(k, v);
+  for (const k of before.keys()) if (!now.has(k)) unsaved.set(k, null);
 }
 
 /**
  * Lê, muda uma entrada e grava, no mesmo passo síncrono: nunca regrava o registro inteiro a partir de uma cópia
  * antiga desta aba (duas abas abertas não apagam o segredo uma da outra). Síncrono de propósito: a reserva é
  * gravada antes da chamada ao servidor, e navigator.locks só existe assíncrono.
+ * Gravação que falha: a mudança fica por cima do que for lido (unsaved*) e a próxima mudança tenta de novo.
+ * Devolve se ficou gravado (fora do navegador, sempre true: não há onde gravar).
  */
-function mutate<T>(change: (l: Ledger) => T): T {
+function mutate<T>(change: (l: Ledger) => T): { value: T; durable: boolean } {
   const l = load();
-  const out = change(l);
+  const beforeClaims = byKey(l.inFlight);
+  const beforeReleases = byKey(l.pendingReleases);
+  const value = change(l);
   ledger = l;
-  try {
-    storage()?.setItem(STORAGE_KEY, JSON.stringify(l));
-  } catch {
-    // Sem armazenamento: fica em memória enquanto o app estiver aberto.
+  const a = access();
+  if (a.kind === 'none') return { value, durable: true };
+  noteChanges(beforeClaims, l.inFlight, unsavedClaims);
+  noteChanges(beforeReleases, l.pendingReleases, unsavedReleases);
+  if (a.kind === 'ok') {
+    try {
+      a.st.setItem(STORAGE_KEY, JSON.stringify(l));
+      unsavedClaims.clear();
+      unsavedReleases.clear();
+      return { value, durable: true };
+    } catch {
+      // Cheio ou bloqueado: fica por cima, em memória, e tenta de novo na próxima mudança.
+    }
   }
-  return out;
+  return { value, durable: false };
+}
+
+/**
+ * Desfaz a mudança não gravada desta reserva (volta ao que está guardado). Para a reserva nova que não pôde ser
+ * gravada: nada foi pedido ao servidor, e um registro anterior com a mesma chave (gravado) continua valendo.
+ */
+export function forgetUnsavedClaim(key: string): void {
+  unsavedClaims.delete(key);
+  active.delete(key);
+  if (access().kind !== 'none') load();
+}
+
+/** Há mudança do registro de reservas que não foi gravada neste aparelho. */
+export function claimLedgerUnsaved(): boolean {
+  return unsavedClaims.size > 0 || unsavedReleases.size > 0;
 }
 
 /**
  * A reserva vai ser pedida; a cobrança vai começar. Gravado ANTES de chamar o servidor (com o segredo): se a
  * resposta se perder, o aparelho ainda consegue liberar a reserva que o servidor criou.
+ * Devolve false quando não ficou gravado no aparelho (cheio ou bloqueado): quem chama não pede a reserva.
  */
-export function beginLocalClaim(key: string, orderId: string, releaseToken: string | null = null, terms?: ClaimTerms): void {
+export function beginLocalClaim(key: string, orderId: string, releaseToken: string | null = null, terms?: ClaimTerms): boolean {
   active.add(key);
-  mutate((l) => {
+  return mutate((l) => {
     l.inFlight = [...l.inFlight.filter((c) => c.key !== key), { key, order_id: orderId, started_at: new Date().toISOString(), release_token: releaseToken, state: 'charging', ...(terms ? { terms } : {}) }];
-  });
+  }).durable;
 }
 
 /** Fim conhecido (pago ou em conferência): o registro fica, com o segredo, até o servidor consumir ou liberar. */
@@ -156,7 +219,7 @@ export function markClaimAbsent(key: string, nowMs: number | null): { count: num
       return { ...c, absent_count: count, absent_first_at: firstAt };
     });
     return out as { count: number; firstAt: number } | null;
-  });
+  }).value;
 }
 
 /** Reservas terminadas aqui que aguardam o servidor (batimento e limpeza pelo laço de sincronização). */
@@ -225,6 +288,8 @@ export function pendingRelease(key: string): PendingRelease | null {
 /** Só para testes. */
 export function resetClaimLedger(): void {
   active.clear();
+  unsavedClaims.clear();
+  unsavedReleases.clear();
   ledger = emptyLedger();
   mutate((l) => {
     l.inFlight = [];

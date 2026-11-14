@@ -68,3 +68,20 @@ describe('P3-1: maquininha simulada termina com a adquirente do começo da cobra
     expect(result).toMatchObject({ status: 'DECLINED', acquirer: 'STONE', terminal_serial: 'STONE-SMART-EMB' });
   });
 });
+
+describe('Auditoria 2 P1: aviso fixo de trava não gravada', () => {
+  it('trava só em memória: o aviso aparece; gravada, some', async () => {
+    const { UnsavedStorageBanner, UNSAVED_STORAGE_WARNING } = await import('../components/UnsavedStorageBanner');
+    const holds = await import('../lib/payments/reviewHolds');
+    render(<UnsavedStorageBanner />);
+    expect(screen.queryByRole('alert')).toBeNull();
+    const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('full', 'QuotaExceededError');
+    });
+    act(() => void holds.setReviewHold({ order_id: 'o-b', amount: 1, reason: 'r', code: 'MANUAL_REVIEW', refund: 'TERMINAL', idempotency_key: 'k-b' }));
+    expect(screen.getByRole('alert').textContent).toBe(UNSAVED_STORAGE_WARNING);
+    spy.mockRestore();
+    act(() => holds.clearReviewHold('o-b', 'k-b'));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+});

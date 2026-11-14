@@ -30,9 +30,23 @@ const POINT_RESERVATION_POLL_MS = 5000;
 /** Loja com Point sem a leitura da reserva desta conta na nuvem: o caixa não recebe. */
 export const CLOUD_READ_BLOCK = 'Sem leitura da nuvem: com a Point na loja, só dá para receber com o servidor confirmando a reserva desta conta. Confira a internet e aguarde.';
 
-/** Cobrança da Point da conta que espera a conferência no Mercado Pago (revisão ou aprovada sem pagamento). */
-function needsResolution(c: CloudPointCharge): boolean {
+/** Cobrança da Point que ainda não terminou no servidor (enviando, na fila, na maquininha). */
+const OPEN_POINT_STATUSES: ReadonlySet<string> = new Set(['creating', 'pending', 'at_terminal']);
+
+/**
+ * Cobrança da Point da conta que espera a conferência no Mercado Pago: revisão, aprovada sem pagamento, ou ainda não
+ * terminada no servidor (revisão PR #49: aparelho fechado no meio, Point sem rede). A não terminada aparece em qualquer
+ * aparelho, exceto o que a está cobrando agora; o servidor decide pelo relógio dele se ela já passou do prazo (a
+ * conferência só consulta dentro do prazo e, depois dele, segue o encerramento por prazo).
+ */
+function needsResolution(c: CloudPointCharge, chargingKey: string | null): boolean {
+  if (OPEN_POINT_STATUSES.has(c.status)) return c.idempotencyKey !== chargingKey;
   return c.status === 'manual_review' || (c.status === 'approved' && !c.hasPayment);
+}
+
+function resolutionLabel(c: CloudPointCharge): string {
+  if (OPEN_POINT_STATUSES.has(c.status)) return 'na maquininha, sem resposta';
+  return c.status === 'manual_review' ? 'em revisão' : 'aprovada sem pagamento registrado';
 }
 
 type SplitMode = 'EQUAL' | 'FREE' | 'ITEMS';
@@ -69,7 +83,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   /** Cobrança da Point de outro aparelho (sem trava aqui) aberta para conferência. */
   const [resolveTarget, setResolveTarget] = useState<PointReviewTarget | null>(null);
   /** Cobrança na Point em andamento neste aparelho: o operador pode pedir o cancelamento (PIN de gerente). */
-  const [pointCharge, setPointCharge] = useState<{ driver: IPaymentTerminalDriver; requestId: string } | null>(null);
+  const [pointCharge, setPointCharge] = useState<{ driver: IPaymentTerminalDriver; requestId: string; idempotencyKey: string } | null>(null);
   const [cancelOpen, setCancelOpen] = useState(false);
 
   // Trava criada fora da tela (reserva liberada antes do pagamento chegar ao servidor): aparece na hora.
@@ -135,7 +149,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   }, [orderId, cloudConnected, busy, readTick]);
   const pointReservation = effectiveReservation(cloudReservation, reviewHold);
   const cloudBlocked = needsClaim && reservationRead !== 'ok';
-  const unresolvedCharges = (cloudReservation?.charges ?? []).filter((c) => needsResolution(c) && c.idempotencyKey !== reviewHold?.idempotency_key);
+  const unresolvedCharges = (cloudReservation?.charges ?? []).filter((c) => needsResolution(c, pointCharge?.idempotencyKey ?? null) && c.idempotencyKey !== reviewHold?.idempotency_key);
 
   if (closedOrderId) {
     const closedOrder = s.orders.find((o) => o.id === closedOrderId)!;
@@ -234,7 +248,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     try {
       if (claimed && !(await claim(method, driver.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE'))) return;
       if (opMode === 'TEF_POS_WIRELESS') toast.info(`📡 Cobrança de ${formatBRL(amount)} enviada para ${terminal?.name} (${terminal?.serial_number}).`);
-      if (viaPoint) setPointCharge({ driver, requestId: req.request_id });
+      if (viaPoint) setPointCharge({ driver, requestId: req.request_id, idempotencyKey: idempotency_key });
       const result = await driver.charge(req);
       if (result.status === 'MANUAL_REVIEW') {
         // Não registra pagamento nem recusa: o resultado é desconhecido e não pode ser repetido sozinho.
@@ -358,7 +372,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
             <ul className="mt-3 grid gap-2">
               {unresolvedCharges.map((c) => (
                 <li key={c.idempotencyKey} className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-surface p-2">
-                  <span>{formatBRL(c.amountCents / 100)} · {c.status === 'manual_review' ? 'em revisão' : 'aprovada sem pagamento registrado'}{c.rawStatusDetail ? ` (${c.rawStatusDetail})` : ''}</span>
+                  <span>{formatBRL(c.amountCents / 100)} · {resolutionLabel(c)}{c.rawStatusDetail ? ` (${c.rawStatusDetail})` : ''}</span>
                   <Btn variant="gold" onClick={() => setResolveTarget({ order_id: orderId, idempotency_key: c.idempotencyKey, amount: c.amountCents / 100, method: null, terminal_id: null, item_ids: [] })}>Resolver cobrança da Point</Btn>
                 </li>
               ))}

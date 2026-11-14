@@ -203,12 +203,22 @@ describe.skipIf(!target)('point-charge: conferência no Mercado Pago com o banco
     expect(charge(other).status).toBe('manual_review');
   });
 
-  it('aprovada sem pagamento registrado e estornada no Mercado Pago: refunded com só raw_status/raw_status_detail; segunda conferência 409', async () => {
+  it('aprovada sem pagamento registrado e estornada no Mercado Pago: refunded com só raw_status/raw_status_detail; segunda conferência só lê', async () => {
     const key = seedCharge({ status: 'approved', raw_status_detail: 'accredited', external_payment_id: '123456789', paid_amount_cents: 2450, authorization_code: 'A1B2C3', card_brand: 'MASTERCARD', last_four: '4242' });
     const ctx = context(() => approvedOrder(key, charge(key).external_order_id!), () => approvedPayment({ status: 'refunded' }));
     expect(await reconcileCharge(ctx, { idempotency_key: key, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: REASON })).toMatchObject({ status: 'DECLINED' });
     expect(charge(key)).toMatchObject({ status: 'refunded', raw_status: 'payment_refunded', raw_status_detail: 'PAYMENT_REFUNDED', authorization_code: 'A1B2C3', external_payment_id: '123456789' });
-    await expect(reconcileCharge(ctx, { idempotency_key: key, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: REASON })).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+    // Revisão PR #49 (P2): a segunda conferência da estornada só lê o pagamento no Mercado Pago. Estorno provado pelo
+    // pagamento = DECLINED (o aparelho tira a trava); nada é gravado no banco (linha, registros e tentativas de PIN).
+    const before = charge(key);
+    const logs = () => Number(sql(`SELECT count(*) FROM audit_logs WHERE metadata->>'idempotency_key' = ${lit(key)};`));
+    const logsBefore = logs();
+    expect(await reconcileCharge(ctx, { idempotency_key: key, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: REASON })).toMatchObject({ status: 'DECLINED', reason: expect.stringContaining('estorno') });
+    // Só a ordem mostrando o estorno (o pagamento não): a resposta de sempre da estornada, e a trava fica.
+    const orderOnly = context(() => approvedOrder(key, charge(key).external_order_id!), () => approvedPayment());
+    expect(await reconcileCharge(orderOnly, { idempotency_key: key, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: REASON })).toMatchObject({ status: 'MANUAL_REVIEW', code: 'REFUNDED' });
+    expect(charge(key)).toEqual(before);
+    expect(logs()).toBe(logsBefore);
     expect(audits(key, 'POINT_CHARGE_RESOLVED')).toBe(1);
   });
 

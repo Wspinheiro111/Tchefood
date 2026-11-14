@@ -27,7 +27,7 @@ const pc = await import('../lib/payments/paymentClaim');
 const { claimPayment, releaseClaimAfterNoCharge, retryPendingClaimReleases, releasePaymentClaimManager, touchPaymentClaim, authorizeClaimRefunded, reclaimPayment } = pc;
 const { startPaymentClaim, reclaimForHold, confirmClaimRefunded, checkHoldClaim } = await import('../lib/payments/claimFlow');
 const { superviseSettledClaims, resetClaimSupervisor } = await import('../lib/payments/claimSupervisor');
-const { reconcilePointCharge } = await import('../lib/payments/pointReconcile');
+const { readPointChargeStatus, reconcilePointCharge } = await import('../lib/payments/pointReconcile');
 const { MercadoPagoPointDriver } = await import('../lib/payments/mercadoPagoPointDriver');
 const { setReviewHold, getReviewHoldByKey, clearReviewHold } = await import('../lib/payments/reviewHolds');
 const { useTcheStore } = await import('../store/useTcheStore');
@@ -719,6 +719,20 @@ describe('point-charge reconcile: reconcilePointCharge', () => {
     routes['point:reconcile'] = json(200, { status: 'MANUAL_REVIEW', idempotency_key: KEY, reason: 'ainda', code: 'X' });
     const r = show(await reconcilePointCharge(input, rdeps()));
     expect(r).toMatchObject({ kind: 'reply', reply: { status: 'MANUAL_REVIEW' } });
+  });
+  it('409 not_applicable: marca notApplicable (a tela lê o estado gravado antes de mexer na trava)', async () => {
+    routes['point:reconcile'] = json(409, { error: 'not_applicable', message: 'nada a conferir' });
+    expect(show(await reconcilePointCharge(input, rdeps()))).toEqual({ kind: 'error', error: 'nada a conferir', notApplicable: true });
+    routes['point:reconcile'] = json(409, { error: 'idempotency_conflict', message: 'outra' });
+    expect(show(await reconcilePointCharge(input, rdeps()))).toEqual({ kind: 'error', error: 'outra' });
+  });
+  it.each([...TRANSPORT, ...PROXY_4XX, ...POINT_BAD_200, ...POINT_FN_4XX])('readPointChargeStatus, %s: erro (a trava fica)', async (_n, a) => {
+    routes['point:status'] = a;
+    expect(show(await readPointChargeStatus(KEY, rdeps())).kind).toBe('error');
+  });
+  it('readPointChargeStatus: devolve a resposta do servidor sobre a chave', async () => {
+    routes['point:status'] = json(200, { status: 'DECLINED', idempotency_key: KEY, reason: 'cancelada' });
+    expect(show(await readPointChargeStatus(KEY, rdeps()))).toEqual({ kind: 'reply', reply: { status: 'DECLINED', idempotency_key: KEY, reason: 'cancelada' } });
   });
   it.each(POINT_APPROVED_WRONG)('%s: a biblioteca devolve a aprovação crua (a tela confere valor/forma)', async (_n, a) => {
     routes['point:reconcile'] = a;

@@ -697,18 +697,25 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
 }
 
 async function settleSibling(ctx: ChargeContext, row: TerminalChargeRow): Promise<void> {
-  if (FINAL.has(row.status)) return;
+  await settleStale(ctx, row, (r) => refreshCharge(ctx, r));
+}
+
+/**
+ * Cobrança não final (creating/pending/at_terminal) que pode ter sido largada: as regras do encerramento por prazo,
+ * sem PIN (como settleSibling e o cancel "timeout"). Dentro do prazo de espera do cartão (relógio do banco) só
+ * `inWindow`; passado o prazo, grava o pedido de encerramento e: sem ordem, closeUnsent (nunca enviada = cancelada com
+ * prova; envio sem resposta = revisão manual quando a posse vencer); com ordem, pede o cancelamento no Mercado Pago e
+ * grava o que ele disser na reconsulta. Nunca grava recusa sem o Mercado Pago (ou a prova de que nada saiu daqui).
+ * Devolve a linha como ficou.
+ */
+async function settleStale(ctx: ChargeContext, row: TerminalChargeRow, inWindow: (row: TerminalChargeRow) => Promise<TerminalChargeRow>): Promise<TerminalChargeRow> {
+  if (FINAL.has(row.status)) return row;
   const current = row.cancel_requested_at ? row : await ctx.store.requestTimeoutCancel(row, SERVER_TIMEOUT_MS);
-  if (!current || FINAL.has(current.status) || !current.cancel_requested_at) {
-    await refreshCharge(ctx, current ?? row); // ainda no prazo: só reconsulta
-    return;
-  }
-  if (!current.external_order_id) {
-    await closeUnsent(ctx, current);
-    return;
-  }
+  if (!current) return inWindow(row); // ainda no prazo: só acompanha
+  if (FINAL.has(current.status) || !current.cancel_requested_at) return inWindow(current);
+  if (!current.external_order_id) return closeUnsent(ctx, current);
   await ctx.provider.cancelCharge(current.external_order_id, { idempotencyKey: `${current.idempotency_key}-cancel` }).catch(() => undefined);
-  await refreshCharge(ctx, current);
+  return refreshCharge(ctx, current);
 }
 
 /**
@@ -894,6 +901,11 @@ export async function voidCharge(ctx: ChargeContext, terminal: TerminalRecord, i
 //    acima. Não achou: só com o ID da operação digitado, e só se o pagamento lido for desta cobrança e aprovado;
 //  - aprovada sem pagamento registrado: estorno só com o Mercado Pago mostrando estorno/cancelamento; continua aprovada
 //    = devolve a aprovação para o aparelho registrar o pagamento (sem cobrar de novo).
+//  - ainda não final (creating/pending/at_terminal; revisão PR #49): segue a cobrança no Mercado Pago como a consulta e
+//    o encerramento por prazo (settleStale), sem PIN; aprovada só com todas as conferências, recusa/cancelamento/
+//    expiração só com o eco da referência e da maquininha; ainda aberta = MANUAL_REVIEW (WAITING_CARD, DISPATCH_PENDING
+//    ou MP_PENDING) e continua reservando. Caiu em revisão manual: segue a conferência com PIN acima;
+//  - estornada: só lê o pagamento; estorno provado = DECLINED (o aparelho tira a trava), nada é gravado.
 
 export interface ReconcileInput {
   idempotency_key: unknown;
@@ -969,6 +981,40 @@ async function reconcilable(ctx: ChargeContext, row: TerminalChargeRow): Promise
   if (row.status === 'manual_review') return true;
   if (row.status === 'approved') return !(await ctx.store.hasRegisteredPayment(row.idempotency_key));
   return false;
+}
+
+/** Cobrança ainda não final: a conferência a segue no Mercado Pago (settleStale) em vez de recusar. */
+const OPEN_STATUSES: ReadonlySet<ChargeStatus> = new Set(['creating', 'pending', 'at_terminal']);
+
+const OPEN_TEXT = {
+  WAITING_CARD: 'A cobrança ainda está no prazo de espera do cartão na maquininha. Aguarde e confira de novo. O valor segue reservado na conta.',
+  DISPATCH_PENDING: 'O envio desta cobrança à maquininha ainda pode estar a caminho. Confira de novo em instantes. Nada foi liberado e o valor segue reservado na conta.',
+} as const;
+
+/**
+ * Resposta da conferência para a cobrança que seguiu no Mercado Pago (settleStale) e não caiu em revisão: fim gravado
+ * = a resposta de sempre; ainda aberta = continua reservando, com o que falta (a conferência nunca devolve PENDING).
+ */
+function openReply(row: TerminalChargeRow): ChargeReply {
+  if (FINAL.has(row.status)) return replyFor(row);
+  if (!row.cancel_requested_at) return stillInReview(row, 'WAITING_CARD', OPEN_TEXT.WAITING_CARD);
+  if (!row.external_order_id) return stillInReview(row, 'DISPATCH_PENDING', OPEN_TEXT.DISPATCH_PENDING);
+  // Encerramento pedido e o Mercado Pago ainda mostra a ordem aberta (maquininha sem rede, por exemplo): só a
+  // maquininha ou o Mercado Pago terminam a ordem. Não vira recusa nem revisão por tempo.
+  return stillInReview(row, 'MP_PENDING', REVIEW_TEXT.MP_PENDING);
+}
+
+/**
+ * Estornada: confere, sem gravar nada, o próprio pagamento da cobrança no Mercado Pago. Estorno provado (mesmo ID,
+ * valor e referência; status refunded/charged_back/cancelled) = DECLINED, e o aparelho tira a trava. Sem ID do
+ * pagamento, sem leitura ou sem prova: a resposta de sempre (MANUAL_REVIEW REFUNDED), e a trava fica.
+ */
+async function confirmRefund(ctx: ChargeContext, row: TerminalChargeRow): Promise<ChargeReply> {
+  if (!row.external_payment_id) return replyFor(row);
+  const payment = await readPayment(ctx, row.external_payment_id);
+  if (!payment) return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
+  if (!provesRefund(row, payment, row.external_payment_id)) return replyFor(row);
+  return reconcileReply(row);
 }
 
 function notApplicable(): ChargeInputError {
@@ -1049,8 +1095,19 @@ async function readPayment(ctx: ChargeContext, id: string): Promise<PointPayment
  */
 export async function reconcileCharge(ctx: ChargeContext, input: ReconcileInput): Promise<ChargeReply> {
   const req = validateReconcile(input);
-  const row = await ctx.store.findByKey(req.idempotency_key);
+  let row = await ctx.store.findByKey(req.idempotency_key);
   if (!row) throw new ChargeInputError('not_found', 'Cobrança não encontrada nesta loja.', 404);
+  // Revisão PR #49 (P1): cobrança ainda não final (largada na maquininha, app fechado no meio) não fica presa. A
+  // conferência segue a cobrança no Mercado Pago com as regras de sempre (settleStale: consulta no prazo; passado o
+  // prazo, encerramento por prazo pelo relógio do banco). Nada disso pede PIN (é o que a consulta e o cancel "timeout"
+  // já fazem); se ela cair em revisão manual, segue abaixo para a conferência com PIN como qualquer revisão.
+  if (OPEN_STATUSES.has(row.status)) {
+    row = await settleStale(ctx, row, (r) => resume(ctx, r, false));
+    if (row.status !== 'manual_review') return row.status === 'refunded' ? confirmRefund(ctx, row) : openReply(row);
+  }
+  // Revisão PR #49 (P2): estornada é final e não reserva no servidor, mas a trava do aparelho só sai com o Mercado Pago
+  // provando o estorno. Só leitura: nada é gravado (por isso o PIN não é conferido nem registrado aqui).
+  if (row.status === 'refunded') return confirmRefund(ctx, row);
   // Antes do PIN: cobrança que não tem o que conferir não gasta tentativa de PIN nem grava registro.
   if (!(await reconcilable(ctx, row))) throw notApplicable();
   let audit: string | null;

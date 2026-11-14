@@ -1271,12 +1271,11 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       }
     });
 
-    it('auditoria r3 P2-01: o mesmo pedido autorizado dez vezes deixa UM registro e devolve sempre o mesmo', () => {
+    it('auditoria r3 P2-01: o mesmo pedido autorizado dez vezes (PIN certo) deixa UM registro e devolve sempre o mesmo', () => {
       expect(open('pin-ten').ok).toBe(true);
       const ids = new Set<string>();
       for (let i = 0; i < 10; i += 1) {
-        // Da segunda em diante nem o PIN é conferido de novo (PIN errado não vira falha nem outro registro).
-        const r = authorize('pin-ten', i === 0 ? MANAGER_PIN : i % 2 ? '0000' : MANAGER_PIN);
+        const r = authorize('pin-ten', MANAGER_PIN);
         expect(r.ok, r.message ?? '').toBe(true);
         ids.add(r.out);
       }
@@ -1284,6 +1283,20 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       expect(audits('POINT_CHARGE_CANCELED', 'pin-ten')).toBe('1');
       expect(audits('MANAGER_PIN_FAILED', 'pin-ten')).toBe('0');
       expect(sql(`SELECT cancel_audit_id FROM terminal_charges WHERE idempotency_key = 'pin-ten'`)).toBe([...ids][0]);
+      // Auditoria interna 2: já autorizado, o PIN errado não devolve a autorização (NULL, falha registrada), e com a
+      // loja bloqueada nem o PIN certo devolve. Desfeito no fim para não sujar as tentativas da loja.
+      const cancelText = (pin: string) => `SELECT COALESCE(tchefood_authorize_point_cancel('${TENANT}', 'pin-ten', '${STAFF}', '${pin}', 'cliente desistiu')::text, 'null');`;
+      const failed = `SELECT count(*) FROM audit_logs WHERE action_type = 'MANAGER_PIN_FAILED' AND metadata->>'idempotency_key' = 'pin-ten';`;
+      const lines = (q: string) => sql(q).split('\n').filter((l) => l !== '');
+      expect(lines(`BEGIN; ${cancelText('0000')} ${failed} ROLLBACK;`)).toEqual(['null', '1']);
+      expect(lines(`BEGIN;
+        INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata)
+          SELECT '${TENANT}', '${STAFF}', 'MANAGER_PIN_FAILED', 'teste do bloqueio', '{}'::jsonb FROM generate_series(1, 3);
+        ${cancelText(MANAGER_PIN)}
+        SELECT count(*) FROM audit_logs WHERE action_type = 'MANAGER_PIN_LOCKOUT' AND metadata->>'idempotency_key' = 'pin-ten';
+        ROLLBACK;`)).toEqual(['null', '1']);
+      expect(audits('POINT_CHARGE_CANCELED', 'pin-ten')).toBe('1');
+      expect(audits('MANAGER_PIN_FAILED', 'pin-ten')).toBe('0');
     });
 
     it('auditoria r3 P2-01: oito autorizações ao mesmo tempo gravam um registro só', async () => {

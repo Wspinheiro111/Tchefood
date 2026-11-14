@@ -21,6 +21,7 @@ import { CashRegisterScreen } from './screens/CashRegisterScreen';
 import { useCloudSync } from './lib/sync/useCloudSync';
 import { setClaimAlertHandler } from './lib/payments/claimSupervisor';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
+import { UnsavedStorageBanner } from './components/UnsavedStorageBanner';
 import { PrintSimulatorModal } from './components/PrintSimulator';
 import { ToastHost, toast } from './components/ui';
 import type { UserRole } from './types';
@@ -134,6 +135,7 @@ export default function App() {
         </span>
         <button aria-label="Sair" onClick={() => { const r = logout(); if (!r.ok) toast.error(r.error); }}className="grid h-11 w-11 place-items-center rounded-xl bg-surface"><LogOut className="h-5 w-5" /></button>
       </header>
+      <UnsavedStorageBanner />
 
       <main>
         {view.name === 'map' && <TableMap onOpenOrder={(orderId) => setView({ name: 'order', orderId })} />}

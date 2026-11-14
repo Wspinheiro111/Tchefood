@@ -48,7 +48,8 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   (`tchefood_authorize_point_cancel`, mesmas regras de `tchefood_authorize_manager`: 3 PINs errados em 60 s
   bloqueiam). Fica um registro `POINT_CHARGE_CANCELED` em `audit_logs` e a cobrança guarda operador, gerente e
   registro; o banco recusa encerramento "pelo operador" sem gerente. O pedido também confere conta, valor e forma.
-  Repetir o mesmo pedido reaproveita a primeira autorização (um registro só); cobrança que já terminou não gera
+  Repetir o mesmo pedido reaproveita a primeira autorização (um registro só), mas só com o PIN conferido de novo
+  (PIN errado ou bloqueado: nada é autorizado e a falha conta no bloqueio); cobrança que já terminou não gera
   registro de encerramento.
 - **Um pedido por vez fala com o Mercado Pago**, em três passos no banco (relógio do banco):
   1. `tchefood_claim_point_dispatch` dá a posse do envio (30 s, maior que o prazo de 15 s da chamada; no máximo 8
@@ -140,7 +141,22 @@ repete a liberação que falhou por rede.
   segue como acima; sem ordem, o gerente pode digitar o ID da operação do comprovante, que o servidor confere
   (referência, valor, forma, autorização). Sem nada disso a cobrança continua em revisão e reservando;
 - aprovada sem pagamento registrado: o app registra o pagamento com os dados do servidor, sem cobrar de novo; se o
-  Mercado Pago mostra o estorno, ela vira `refunded` e libera a reserva uma vez.
+  Mercado Pago mostra o estorno, ela vira `refunded` e libera a reserva uma vez;
+- ainda não terminada (`creating`/`pending`/`at_terminal`: Point sem rede, app fechado no meio; revisão PR #49): segue
+  a cobrança no Mercado Pago como a consulta e o encerramento por prazo, sem PIN. No prazo de espera do cartão (2 min
+  pelo relógio do banco) só consulta; depois dele grava o pedido de encerramento, pede o cancelamento da ordem e grava
+  o que o Mercado Pago disser (aprovada com todas as conferências; recusada/cancelada/expirada com o eco da referência e
+  da maquininha). Sem ordem: nunca enviada = cancelada com prova; envio sem resposta = revisão manual, e aí a
+  conferência continua com o PIN. Ainda aberta no Mercado Pago = continua reservando (`WAITING_CARD`,
+  `DISPATCH_PENDING`, `MP_PENDING`); nada vira recusa nem revisão por tempo. A tela da conta mostra "Resolver cobrança
+  da Point" para essas cobranças em qualquer aparelho, menos no que a está cobrando agora;
+- estornada: só lê o pagamento da cobrança; estorno provado (mesmo ID, valor e referência) responde "recusada" e o
+  aparelho tira a trava. Nada é gravado (por isso o PIN não é conferido nessa leitura).
+
+Trava do aparelho quando a conferência responde "não há o que conferir" (409): o app lê o estado gravado (ação
+`status`) e só tira a trava com o fim provado no servidor: recusada/cancelada/expirada, ou aprovada com o pagamento já
+registrado neste aparelho. Aprovada com o pagamento só no servidor (outro aparelho registrou), estornada sem prova,
+em revisão, aberta, erro de leitura ou resposta de outra chave: a trava fica, com o motivo.
 Só `tchefood_resolve_point_charge` (service role, com a autorização do gerente, um registro por fim) tira uma
 cobrança da revisão ou estorna uma aprovada; a consulta normal não muda mais uma cobrança em revisão. Nada é
 liberado por tempo ou por declaração.

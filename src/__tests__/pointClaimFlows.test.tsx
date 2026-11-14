@@ -337,6 +337,31 @@ describe('caixa da mesa (CheckoutScreen) numa loja com Point', () => {
     expect(screen.getByRole('button', { name: 'Conferir no Mercado Pago' })).toBeTruthy();
   });
 
+  it.each(['creating', 'pending', 'at_terminal'])('B: cobrança "%s" largada (app fechado no meio, sem trava): "Resolver cobrança da Point" aparece', async (status) => {
+    const id = openTable();
+    withPoint();
+    fetchPointReservation.mockResolvedValue({
+      reservedCents: 1000, openCharges: 1, manualReview: false,
+      charges: [{ idempotencyKey: 'pk-largada', status, amountCents: 1000, rawStatusDetail: null, hasPayment: false }],
+    });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    expect(await screen.findByText(/na maquininha, sem resposta/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Resolver cobrança da Point' }));
+    expect(screen.getByRole('button', { name: 'Conferir no Mercado Pago' })).toBeTruthy();
+  });
+
+  it('cobrança terminada no servidor (sem reserva) não aparece para resolver', async () => {
+    const id = openTable();
+    withPoint();
+    fetchPointReservation.mockResolvedValue({
+      reservedCents: 1000, openCharges: 1, manualReview: false,
+      charges: [{ idempotencyKey: 'pk-paga', status: 'approved', amountCents: 1000, rawStatusDetail: null, hasPayment: true }],
+    });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await waitFor(() => expect(screen.getByText('Há uma cobrança na Point em andamento nesta conta')).toBeTruthy());
+    expect(screen.queryByRole('button', { name: 'Resolver cobrança da Point' })).toBeNull();
+  });
+
   it('aparelho sem nuvem (demonstração local): nada muda (sem reserva e sem bloqueio pela leitura da nuvem)', async () => {
     const id = openTable();
     localOnly();

@@ -222,11 +222,12 @@ class MemoryStore implements ChargeStore {
     const r = this.rows.find((x) => x.idempotency_key === input.idempotency_key)!;
     if (input.performed_by !== STAFF) throw new ChargeRefusedError('invalid_staff', 'operador não é da equipe ativa desta loja.');
     if (FINAL_STATES.has(r.status)) throw new ChargeRefusedError('not_applicable', 'a cobrança já terminou.');
-    if (r.cancel_reason === 'operator' && r.cancel_audit_id) return r.cancel_audit_id;
     if (input.manager_pin !== MANAGER_PIN) {
       this.audits.push({ key: input.idempotency_key, action: 'MANAGER_PIN_FAILED', performed_by: input.performed_by, reason: 'PIN de gerente incorreto' });
       return null;
     }
+    // Como no banco: a autorização já gravada só volta depois do PIN conferido.
+    if (r.cancel_reason === 'operator' && r.cancel_audit_id) return r.cancel_audit_id;
     this.audits.push({ key: input.idempotency_key, action: 'POINT_CHARGE_CANCELED', performed_by: input.performed_by, reason: input.reason });
     const id = `audit-${this.audits.length}`;
     this.write(r, { cancel_reason: 'operator', cancel_requested_by: input.performed_by, cancel_requested_at: this.iso(), cancel_authorized_by: 'manager', cancel_audit_id: id });
@@ -1039,7 +1040,7 @@ describe('point-charge: auditoria r3', () => {
   });
 
   describe('P2-01: autorização do gerente idempotente', () => {
-    it('o mesmo pedido autorizado dez vezes grava um registro só e pede o cancelamento sem conferir o PIN de novo', async () => {
+    it('o mesmo pedido autorizado dez vezes (PIN certo) grava um registro só e repete o pedido de cancelamento', async () => {
       const { ctx, store, calls } = setup();
       await startCharge(ctx, terminal, input());
       for (let i = 0; i < 10; i += 1) await cancelCharge(ctx, store.rows[0]!, OPERATOR);
@@ -1047,6 +1048,18 @@ describe('point-charge: auditoria r3', () => {
       expect(store.rows[0]!.cancel_audit_id).toBe('audit-1');
       expect(calls.cancel).toHaveLength(10); // cada volta repete o pedido à maquininha, com a mesma chave de cancelamento
       expect(new Set(calls.cancel.map((c) => c.key))).toEqual(new Set([`${KEY}-cancel`]));
+    });
+
+    it('auditoria interna 2: já autorizado, o reenvio com PIN errado é 403 e não pede de novo o cancelamento ao Mercado Pago', async () => {
+      const { ctx, store, calls } = setup();
+      await startCharge(ctx, terminal, input());
+      await cancelCharge(ctx, store.rows[0]!, OPERATOR);
+      expect(calls.cancel).toHaveLength(1);
+      await expect(cancelCharge(ctx, store.rows[0]!, { ...OPERATOR, manager_pin: '0000' })).rejects.toMatchObject({ code: 'manager_denied', httpStatus: 403 });
+      expect(calls.cancel).toHaveLength(1);
+      expect(store.audits.filter((a) => a.action === 'MANAGER_PIN_FAILED')).toHaveLength(1);
+      expect(store.audits.filter((a) => a.action === 'POINT_CHARGE_CANCELED')).toHaveLength(1);
+      expect(store.rows[0]!.cancel_audit_id).toBe('audit-1');
     });
 
     it('cobrança que vira aprovada antes da autorização: nenhum registro de encerramento, devolve a aprovação', async () => {
@@ -2059,7 +2072,8 @@ describe('point-charge: auditoria r5', () => {
       await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_found', httpStatus: 404 });
     });
 
-    it.each(['creating', 'pending', 'at_terminal', 'rejected', 'cancelled', 'expired', 'refunded'] as const)('cobrança "%s": 409 not_applicable, sem gastar PIN', async (status) => {
+    // Revisão PR #49: creating/pending/at_terminal seguem no Mercado Pago e estornada confere o estorno (bloco abaixo).
+    it.each(['rejected', 'cancelled', 'expired'] as const)('cobrança "%s": 409 not_applicable, sem gastar PIN', async (status) => {
       const { ctx, store, calls } = setup();
       const before = seed(store, { status });
       await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
@@ -2122,7 +2136,8 @@ describe('point-charge: auditoria r5', () => {
       seed(store);
       expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', reason: expect.stringContaining('estorno') });
       expect(store.rows[0]!.status).toBe('refunded');
-      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      // Revisão PR #49 (P2): a segunda conferência só lê o pagamento (estorno provado), sem gravar de novo.
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', reason: expect.stringContaining('estorno') });
       expect(store.resolutions).toHaveLength(1);
     });
 
@@ -2405,13 +2420,15 @@ describe('point-charge: auditoria r5', () => {
       unchanged(store, before);
     });
 
-    it('ordem estornada no Mercado Pago: refunded uma vez; a segunda conferência é 409', async () => {
+    it('ordem estornada no Mercado Pago: refunded uma vez; a segunda conferência não grava de novo', async () => {
       const { ctx, store } = setup({ get: async () => order({ status: 'refunded', rawStatus: 'refunded', rawStatusDetail: 'refunded', externalPaymentId: '123456789', paidAmountCents: 2450 }) });
       seed(store, approvedRow);
       expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', reason: expect.stringContaining('estorno') });
       expect(store.rows[0]).toMatchObject({ status: 'refunded', raw_status: 'refunded', raw_status_detail: 'ORDER_REFUNDED', external_payment_id: '123456789', authorization_code: 'A1B2C3' });
       expect(store.resolutions).toEqual([expect.objectContaining({ from: 'approved', to: 'refunded' })]);
-      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      // Revisão PR #49 (P2): a segunda conferência só lê o pagamento; aqui ele não mostra o estorno (só a ordem), então
+      // a resposta é a de sempre da estornada e a trava do aparelho fica.
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'REFUNDED' });
       expect(store.resolutions).toHaveLength(1);
     });
 
@@ -2537,5 +2554,170 @@ describe('point-charge: auditoria r5', () => {
     const before = seed(store, unknownDispatch);
     expect(await pollCharge(ctx, store.rows[0]!)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
     unchanged(store, before);
+  });
+
+  describe('revisão PR #49: cobrança largada antes do fim e trava que não sai', () => {
+    const START = Date.parse(CREATED_AT);
+    /** Relógio do "banco" `ms` depois da hora gravada da cobrança. */
+    const at = (store: MemoryStore, ms: number) => { store.nowMs = START + ms; };
+    const atTerminal = { status: 'at_terminal', raw_status: 'at_terminal', raw_status_detail: 'at_terminal', paid_amount_cents: null } as const;
+    const cancelledOrder = () => order({ status: 'cancelled', rawStatus: 'canceled', rawStatusDetail: 'canceled' });
+
+    it('A: Point sem rede, ordem ainda na maquininha depois do prazo: pede o cancelamento, continua reservando (MP_PENDING), sem PIN', async () => {
+      const { ctx, store, calls } = setup({ get: async () => order() });
+      seed(store, atTerminal);
+      at(store, 10 * 60_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', idempotency_key: KEY, code: 'MP_PENDING' });
+      expect(calls.cancel).toEqual([{ id: 'ORD01', key: `${KEY}-cancel` }]);
+      expect(calls.get).toEqual(['ORD01']);
+      expect(store.rows[0]).toMatchObject({ status: 'at_terminal', cancel_reason: 'timeout' });
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('A: depois do pedido de cancelamento o Mercado Pago mostra a ordem cancelada (eco da referência e da maquininha): DECLINED', async () => {
+      const { ctx, store } = setup({ get: async () => cancelledOrder() });
+      seed(store, atTerminal);
+      at(store, 10 * 60_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', idempotency_key: KEY });
+      expect(store.rows[0]!.status).toBe('cancelled');
+    });
+
+    it('A: cancelada sem o eco da referência não libera: vai para revisão e segue para a conferência com PIN', async () => {
+      const { ctx, store } = setup({ get: async () => order({ status: 'cancelled', rawStatus: 'canceled', externalReference: null }) });
+      seed(store, atTerminal);
+      at(store, 10 * 60_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'FINAL_WITHOUT_REFERENCE' });
+      expect(store.rows[0]!.status).toBe('manual_review');
+      expect(store.count.authorizeReconcile).toBe(1);
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('A: caiu em revisão e o PIN está errado: 403, nada é liberado', async () => {
+      const { ctx, store } = setup({ get: async () => order({ status: 'cancelled', rawStatus: 'canceled', externalTerminalId: null }) });
+      seed(store, atTerminal);
+      at(store, 10 * 60_000);
+      await expect(reconcileCharge(ctx, { ...RECONCILE, manager_pin: '0000' })).rejects.toMatchObject({ code: 'manager_denied', httpStatus: 403 });
+      expect(store.rows[0]!.status).toBe('manual_review');
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('A: Mercado Pago fora do ar: nada muda além do pedido de encerramento, continua reservando', async () => {
+      const { ctx, store } = setup({ get: async () => { throw new Error('rede'); } });
+      seed(store, atTerminal);
+      at(store, 10 * 60_000);
+      expect((await reconcileCharge(ctx, RECONCILE)).status).toBe('MANUAL_REVIEW');
+      expect(store.rows[0]!.status).toBe('at_terminal');
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('ainda no prazo de espera do cartão: só consulta (sem pedir cancelamento), WAITING_CARD', async () => {
+      const { ctx, store, calls } = setup({ get: async () => order() });
+      seed(store, atTerminal);
+      at(store, 30_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'WAITING_CARD' });
+      expect(calls.cancel).toHaveLength(0);
+      expect(calls.get).toEqual(['ORD01']);
+      expect(store.rows[0]).toMatchObject({ status: 'at_terminal', cancel_requested_at: null });
+    });
+
+    it.each([['no prazo', 30_000], ['depois do prazo', 10 * 60_000]] as const)('B: app fechado depois de a maquininha aprovar (%s): APPROVED com todas as conferências', async (_n, ms) => {
+      const { ctx, store, calls } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment() });
+      seed(store, atTerminal);
+      at(store, ms);
+      expect(await reconcileCharge(ctx, RECONCILE)).toEqual(APPROVED_REPLY);
+      expect(store.rows[0]).toMatchObject({ status: 'approved', external_payment_id: '123456789', authorization_code: 'A1B2C3', card_brand: 'MASTERCARD' });
+      expect(calls.payment).toEqual(['123456789']);
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+    });
+
+    it('B: aprovada no Mercado Pago com um dado que não confere: revisão, e a conferência com PIN não aprova', async () => {
+      const { ctx, store } = setup({ get: async () => approvedOrder({ paidAmountCents: 100 }) });
+      seed(store, { ...atTerminal, status: 'pending' });
+      at(store, 30_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'PAID_AMOUNT_MISMATCH' });
+      expect(store.rows[0]!.status).toBe('manual_review');
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('nunca enviada (creating sem envio) depois do prazo: cancelada com prova, sem Mercado Pago', async () => {
+      const { ctx, store, calls } = setup();
+      seed(store, { status: 'creating', external_order_id: null, dispatched_at: null, dispatch_attempts: 0, raw_status: null, raw_status_detail: null });
+      at(store, 10 * 60_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', reason: expect.stringContaining('não chegou à maquininha') });
+      expect(store.rows[0]).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send' });
+      expect(calls.create).toHaveLength(0);
+      expect(calls.get).toHaveLength(0);
+    });
+
+    it('nunca enviada, ainda no prazo: a conferência não manda a ordem (WAITING_CARD)', async () => {
+      const { ctx, store, calls } = setup();
+      seed(store, { status: 'creating', external_order_id: null, dispatched_at: null, dispatch_attempts: 0, raw_status: null, raw_status_detail: null });
+      at(store, 30_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'WAITING_CARD' });
+      expect(calls.create).toHaveLength(0);
+      expect(store.rows[0]!.status).toBe('creating');
+    });
+
+    it('enviada sem resposta, depois do prazo: revisão (DISPATCH_UNKNOWN) e a conferência com PIN acha a ordem pela referência', async () => {
+      const { ctx, store, calls } = setup({ find: async () => approvedOrder(), get: async () => approvedOrder() });
+      seed(store, { status: 'creating', external_order_id: null, raw_status: null, raw_status_detail: null, dispatch_lease_until: CREATED_AT });
+      at(store, 10 * 60_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toEqual(APPROVED_REPLY);
+      expect(calls.create).toHaveLength(0);
+      expect(store.count.authorizeReconcile).toBe(1);
+      expect(store.resolutions).toEqual([expect.objectContaining({ from: 'manual_review', to: 'approved' })]);
+    });
+
+    it('enviada sem resposta, posse do envio ainda valendo: espera (DISPATCH_PENDING), sem PIN', async () => {
+      const { ctx, store } = setup();
+      seed(store, { status: 'creating', external_order_id: null, raw_status: null, raw_status_detail: null, dispatch_lease_until: new Date(START + 10 * 60_000 + 20_000).toISOString() });
+      at(store, 10 * 60_000);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_PENDING' });
+      expect(store.rows[0]!.status).toBe('creating');
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+    });
+
+    describe('P2: estornada', () => {
+      const refundedRow = { ...approvedRow, status: 'refunded', raw_status: 'refunded', raw_status_detail: 'refunded' } as const;
+
+      it('pagamento mostra o estorno: DECLINED, só leitura (nada gravado, PIN não usado)', async () => {
+        const { ctx, store, calls } = setup({ payment: async () => approvedPayment({ status: 'refunded' }) });
+        const before = seed(store, refundedRow);
+        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', idempotency_key: KEY, reason: expect.stringContaining('estorno') });
+        expect(calls.payment).toEqual(['123456789']);
+        expect(store.count.authorizeReconcile ?? 0).toBe(0);
+        unchanged(store, before);
+      });
+
+      it.each([
+        ['pagamento ainda aprovado', async () => approvedPayment()],
+        ['outro valor', async () => approvedPayment({ status: 'refunded', amountCents: 100 })],
+        ['outra referência', async () => approvedPayment({ status: 'refunded', externalReference: 'outra' })],
+      ] as const)('%s: a resposta de sempre (MANUAL_REVIEW REFUNDED), a trava fica', async (_n, payment) => {
+        const { ctx, store } = setup({ payment });
+        const before = seed(store, refundedRow);
+        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'REFUNDED' });
+        unchanged(store, before);
+      });
+
+      it('pagamento ilegível agora: MP_UNAVAILABLE; sem ID do pagamento: REFUNDED, sem ler', async () => {
+        const down = setup({ payment: async () => { throw new Error('rede'); } });
+        seed(down.store, refundedRow);
+        expect(await reconcileCharge(down.ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_UNAVAILABLE' });
+        const none = setup();
+        seed(none.store, { ...refundedRow, external_payment_id: null });
+        expect(await reconcileCharge(none.ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'REFUNDED' });
+        expect(none.calls.payment).toHaveLength(0);
+      });
+
+      it('a consulta moveu a cobrança aberta para estornada: a conferência já confere o estorno', async () => {
+        const { ctx, store } = setup({ get: async () => order({ status: 'refunded', rawStatus: 'refunded', externalPaymentId: '123456789' }), payment: async () => approvedPayment({ status: 'refunded' }) });
+        seed(store, atTerminal);
+        at(store, 30_000);
+        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
+        expect(store.rows[0]!.status).toBe('refunded');
+      });
+    });
   });
 });

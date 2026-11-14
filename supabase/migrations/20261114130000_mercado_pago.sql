@@ -365,7 +365,9 @@ END $$;
 -- (FOR UPDATE, auditoria interna F4: a ordem de tchefood_register_payment e do gatilho do Mercado Pago; na ordem
 -- inversa o registro em audit_logs esperava a conta e o pagamento esperava a cobrança, 40P01). O resultado é um destes:
 --   * autorização aplicada: grava UM audit_log POINT_CHARGE_CANCELED e marca a cobrança; devolve o id;
---   * já autorizada: devolve o id do audit_log da primeira autorização, sem conferir PIN nem gravar outro;
+--   * já autorizada: com o PIN certo (e fora do bloqueio), devolve o id do audit_log da primeira autorização, sem
+--     gravar outro (auditoria interna 2: antes devolvia sem conferir o PIN, e um PIN errado "autorizava" de novo
+--     o cancelamento no Mercado Pago); PIN errado ou bloqueado: NULL, com a falha registrada, como abaixo;
 --   * não se aplica (cobrança em estado final): TF007, sem audit_log;
 --   * PIN errado ou bloqueado: NULL (a falha fica em audit_logs).
 CREATE OR REPLACE FUNCTION tchefood_authorize_point_cancel(
@@ -401,9 +403,6 @@ BEGIN
     IF v_charge.status IN ('approved', 'rejected', 'cancelled', 'expired', 'refunded') THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança já está "%"; não há o que encerrar.', v_charge.status USING ERRCODE = 'TF007';
     END IF;
-    IF v_charge.cancel_reason = 'operator' AND v_charge.cancel_audit_id IS NOT NULL THEN
-        RETURN v_charge.cancel_audit_id; -- mesma intenção, repetida: vale a primeira autorização
-    END IF;
     SELECT o.id INTO v_order FROM orders o WHERE o.id = v_charge.order_id AND o.tenant_id = p_tenant;
     -- Janela de 60 s pelo relógio de agora (a chamada pode ter esperado pelas travas), como na main (#50); as falhas
     -- e o bloqueio são gravados com esse horário.
@@ -424,6 +423,10 @@ BEGIN
         VALUES (p_tenant, v_order, p_performed_by, 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto',
                 jsonb_build_object('attempted_action', 'POINT_CHARGE_CANCELED', 'idempotency_key', p_key), v_checked_at);
         RETURN NULL;
+    END IF;
+    -- Mesma intenção, repetida: vale a primeira autorização, só depois do PIN conferido (sem outro registro).
+    IF v_charge.cancel_reason = 'operator' AND v_charge.cancel_audit_id IS NOT NULL THEN
+        RETURN v_charge.cancel_audit_id;
     END IF;
     INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
     VALUES (p_tenant, v_order, p_performed_by, v_manager.id, 'POINT_CHARGE_CANCELED', v_charge.amount_cents / 100.0, trim(p_reason),

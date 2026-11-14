@@ -15,7 +15,9 @@
 //     "operation_id": "123456789" }                           (opcional: ID da operação do comprovante / app do MP)
 //                                                             (conferência no Mercado Pago da cobrança em revisão manual ou
 //                                                             aprovada sem pagamento registrado; PIN e motivo só pedem a
-//                                                             leitura, quem libera é o que o MP mostrar; ver charge.ts)
+//                                                             leitura, quem libera é o que o MP mostrar; ver charge.ts).
+//                                                             Cobrança ainda não final: segue no MP como a consulta e o
+//                                                             encerramento por prazo; estornada: só confere o estorno.
 //   O encerramento não estorna nada: cobrança paga continua paga.
 //   Cancel sem cobrança gravada não cancela nada: com "timeout" grava o bloqueio preventivo da chave (operador
 //   ativo da loja, com registro), e a criação atrasada não chega mais à Point; com "operator" é recusado (404).

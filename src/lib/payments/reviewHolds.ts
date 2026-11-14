@@ -50,6 +50,11 @@ const STORAGE_KEY = 'tchefood.paymentReviewHolds.v2';
 /** Formato antigo: uma trava por comanda (migrado na primeira leitura). */
 const LEGACY_KEY = 'tchefood.paymentReviewHolds.v1';
 const memory = new Map<string, ReviewHold>();
+/**
+ * Travas que esta aba mudou e não conseguiu gravar (armazenamento cheio, Safari privado antigo): valem por cima do
+ * que for lido, e cada nova mudança tenta gravar de novo. null = tirada aqui.
+ */
+const unsaved = new Map<string, ReviewHold | null>();
 let loaded = false;
 const listeners = new Set<(orderId: string) => void>();
 
@@ -102,14 +107,23 @@ function load() {
   if (stored) {
     memory.clear();
     for (const h of stored) memory.set(reviewHoldKey(h), h);
+    for (const [k, h] of unsaved) {
+      if (h) memory.set(k, h);
+      else memory.delete(k);
+    }
   }
   if (loaded) return;
   loaded = true;
   listenOtherTabs();
   const legacy = read(LEGACY_KEY) ?? [];
-  for (const h of legacy) if (!memory.has(reviewHoldKey(h))) memory.set(reviewHoldKey(h), h);
+  const migrated: Array<[string, ReviewHold]> = [];
+  for (const h of legacy) {
+    if (memory.has(reviewHoldKey(h))) continue;
+    memory.set(reviewHoldKey(h), h);
+    migrated.push([reviewHoldKey(h), h]);
+  }
   // A versão antiga só sai depois que a nova foi gravada (sem isso a trava se perderia ao reabrir o app).
-  if (legacy.length > 0 && !persist()) return;
+  if (legacy.length > 0 && !persist(migrated)) return;
   try {
     storage()?.removeItem(LEGACY_KEY);
   } catch {
@@ -129,17 +143,27 @@ function listenOtherTabs() {
   });
 }
 
-/** true = gravado. */
-function persist(): boolean {
+/** true = gravado. `changed`: as travas mudadas agora (ficam por cima, em memória, se a gravação falhar). */
+function persist(changed: Array<[string, ReviewHold | null]> = []): boolean {
+  for (const [k, h] of changed) unsaved.set(k, h);
   try {
     const st = storage();
     if (!st) return false;
     st.setItem(STORAGE_KEY, JSON.stringify([...memory.values()]));
+    unsaved.clear();
     return true;
   } catch {
-    // Sem armazenamento: a trava continua em memória enquanto o app estiver aberto.
+    // Cheio ou bloqueado: a trava continua em memória (por cima do que for lido) e a próxima mudança tenta de novo.
     return false;
   }
+}
+
+/**
+ * Há trava que não ficou gravada neste aparelho (some se o app fechar): a tela mostra um aviso fixo até gravar.
+ * Fora do navegador (sem localStorage) não há onde gravar: não conta.
+ */
+export function reviewHoldsUnsaved(): boolean {
+  return typeof localStorage !== 'undefined' && unsaved.size > 0;
 }
 
 /** Todas as travas da comanda, da mais antiga para a mais nova. */
@@ -166,7 +190,7 @@ export function setReviewHold(hold: Omit<ReviewHold, 'created_at'> & { created_a
   const prev = memory.get(key);
   const full = { ...hold, created_at: prev?.created_at ?? new Date().toISOString() };
   memory.set(key, full);
-  persist();
+  persist([[key, full]]);
   notify(hold.order_id);
   return full;
 }
@@ -177,12 +201,21 @@ export function setReviewHold(hold: Omit<ReviewHold, 'created_at'> & { created_a
  */
 export function clearReviewHold(orderId: string, key?: string) {
   load();
+  const removed: Array<[string, null]> = [];
   if (key !== undefined) {
     const h = memory.get(key);
-    if (h && h.order_id === orderId) memory.delete(key);
+    if (h && h.order_id === orderId) {
+      memory.delete(key);
+      removed.push([key, null]);
+    }
   } else {
-    for (const [k, h] of memory) if (h.order_id === orderId) memory.delete(k);
+    for (const [k, h] of memory) {
+      if (h.order_id === orderId) {
+        memory.delete(k);
+        removed.push([k, null]);
+      }
+    }
   }
-  persist();
+  persist(removed);
   notify(orderId);
 }
