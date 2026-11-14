@@ -1,0 +1,20 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body { @apply bg-fundo text-slate-800 font-sans antialiased; }
+  ::selection { background: rgba(210, 35, 42, 0.25); }
+}
+
+@layer components {
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50; }
+  .btn-primario { @apply btn bg-brasa text-white hover:bg-red-700; }
+  .btn-verde { @apply btn bg-verde text-white hover:bg-green-800; }
+  .btn-secundario { @apply btn border border-borda bg-white text-slate-800 hover:border-slate-400; }
+  .card { @apply rounded-xl border border-borda bg-white p-4; }
+  .campo { @apply w-full rounded-lg border border-borda bg-white px-3 py-2 text-sm outline-none focus:border-slate-500; }
+  .rotulo { @apply mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500; }
+  .tabela th { @apply px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500; }
+  .tabela td { @apply border-t border-borda px-3 py-2 align-top text-sm; }
+}
