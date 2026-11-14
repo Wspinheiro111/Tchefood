@@ -260,8 +260,12 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
     return { ...base, attempts, next_attempt_at: done ? null : retryAt, updated_at: ts };
   }
   // Autorizada sem tudo o que o DANFE precisa: consulta (só leitura) com intervalo crescente, até um limite.
+  // Contador próprio, a partir da primeira autorização: tentativas de emissão não gastam este limite.
   const missing = outcome.status === 'authorized' && missingPrintData({ ...base, ...outcome, payload: outcome.payload ?? base.payload, qrcode_url: outcome.qrcode_url ?? base.qrcode_url, issued_at: outcome.issued_at ?? base.issued_at });
-  const polling = outcome.status === 'processing' || outcome.status === 'contingency' || (missing && attempts < NFCE_PRINT_DATA_MAX_ATTEMPTS);
+  const printAttempts = missing ? (base.status === 'authorized' ? (base.print_attempts ?? 0) : 0) + 1 : 0;
+  const printPolling = missing && printAttempts < NFCE_PRINT_DATA_MAX_ATTEMPTS;
+  const polling = outcome.status === 'processing' || outcome.status === 'contingency' || printPolling;
+  const nextAt = printPolling ? new Date(nowMs + nfceBackoffMs(printAttempts)).toISOString() : retryAt;
   return {
     ...base,
     status: outcome.status,
@@ -277,7 +281,8 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
     message: outcome.message,
     problem: null,
     attempts,
-    next_attempt_at: polling ? retryAt : null,
+    print_attempts: printAttempts,
+    next_attempt_at: polling ? nextAt : null,
     updated_at: ts,
   };
 }

@@ -816,6 +816,8 @@ export interface NfceCloudRecord {
    * apareceu pela primeira vez. O cabeçalho do DANFE sai daqui, não do cadastro atual.
    */
   issuer?: NfceIssuer | null;
+  /** Consultas feitas depois da autorização para buscar QR/data/payload que faltavam. */
+  print_attempts?: number;
   message: string | null;
   /** null = a última chamada trouxe o documento; senão, o que deu errado nela. */
   problem: NfceCallProblem | null;

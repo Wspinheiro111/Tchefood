@@ -126,6 +126,21 @@ describe('resposta da emit-nfce', () => {
     expect(JSON.parse(calls[1]!.init.body!)).toEqual({ order_id: 'ord-1', mode: 'consult' });
   });
 
+  it('consultas de QR depois da autorização têm limite próprio (emissões anteriores não contam)', () => {
+    let rec = nextNfceRecord('o1', undefined, doc(authorizedBody({ status: 'processing', authorized: false, protocol: null, qrcode_url: null })), 0);
+    for (let i = 0; i < 12; i++) rec = nextNfceRecord('o1', rec, doc(authorizedBody({ status: 'processing', authorized: false, protocol: null, qrcode_url: null })), 0);
+    expect(rec.attempts).toBe(13);
+    rec = nextNfceRecord('o1', rec, doc(authorizedBody({ qrcode_url: null })), 0);
+    expect(rec).toMatchObject({ status: 'authorized', print_attempts: 1 });
+    expect(rec.next_attempt_at).toBe(new Date(10_000).toISOString());
+    for (let i = 2; i < 8; i++) rec = nextNfceRecord('o1', rec, doc(authorizedBody({ qrcode_url: null })), 0);
+    expect(rec.print_attempts).toBe(7);
+    expect(rec.next_attempt_at).not.toBeNull();
+    rec = nextNfceRecord('o1', rec, doc(authorizedBody({ qrcode_url: null })), 0);
+    expect(rec.print_attempts).toBe(8);
+    expect(rec.next_attempt_at).toBeNull();
+  });
+
   it('consulta sem documento (none) não tenta de novo sozinha', () => {
     const none = parseEmitResponse(404, JSON.stringify({ status: 'none', authorized: false, message: 'Esta comanda não tem NFC-e no servidor.' }));
     expect(none).toMatchObject({ kind: 'none' });
