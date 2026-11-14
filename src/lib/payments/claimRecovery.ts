@@ -20,7 +20,7 @@ import { fetchServerOrderBalance } from '../sync/cloudPull';
 import { beginLocalClaim, detachLocalClaim, endLocalClaim, forgetUnsavedClaim, generateReleaseToken, localClaim, settleLocalClaim } from './claimLedger';
 import { CLAIM_NOT_STORED } from './claimFlow';
 import { NFCE_ISSUED_NOTE, refundText } from './claimSupervisor';
-import { CLAIM_REQUIRED_ERROR, claimPayment, defaultClaimDeps, type ClaimAcquirer, type ClaimDeps, type ClaimMethod } from './paymentClaim';
+import { CLAIM_REQUIRED_ERROR, claimPayment, defaultClaimDeps, releaseClaimAfterNoCharge, type ClaimAcquirer, type ClaimDeps, type ClaimMethod } from './paymentClaim';
 import { holdAcquirer, setReviewHold } from './reviewHolds';
 
 export const RECOVERY_REASON = 'não aceito pela nuvem';
@@ -59,6 +59,24 @@ export function isRecoverableRejectedPayment(r: Pick<RejectedSyncEvent, 'event' 
   if (!p || !p.idempotency_key) return false;
   const own = localClaim(p.idempotency_key);
   return !own || own.terms?.recovery === true;
+}
+
+/**
+ * Pagamento recuperado (reserva pedida pela recuperação) que a nuvem recusou de novo, por outro motivo: o supervisor
+ * não o retira sozinho (claimSupervisor); fica aqui, com o caminho do gerente.
+ */
+export function isRecoveredRejectedPayment(r: Pick<RejectedSyncEvent, 'event' | 'message'>): boolean {
+  const e = r.event;
+  if (e.table !== 'payments' || e.op !== 'INSERT' || e.payload.status !== 'APPROVED' || e.payload.acquirer === 'MERCADO_PAGO') return false;
+  const p = paymentOf(e);
+  return Boolean(p?.idempotency_key && localClaim(p.idempotency_key)?.terms?.recovery === true && !isRecoverableRejectedPayment(r));
+}
+
+/** Há reserva da recuperação sendo pedida agora para este recusado (a retirada espera). */
+export function recoveryInFlight(eventId: string): boolean {
+  const r = (useTcheStore.getState().syncRejected ?? []).find((x) => x.event.id === eventId);
+  const key = r?.event.payload.idempotency_key;
+  return typeof key === 'string' && inFlight.has(key);
 }
 
 export type RecoveryResult =
@@ -152,17 +170,30 @@ export async function resendRejected(deps: RecoveryDeps = defaultRecoveryDeps())
  * Caminho do gerente para o recusado que a recuperação não resolve: PIN e motivo, o pagamento sai da conta
  * (withdrawUnacceptedPayment, com as consequências na fila) e fica a trava PAYMENT_REJECTED dizendo como devolver.
  */
-export function withdrawRejectedPayment(eventId: string, auth: { managerPin: string; reason: string }): { ok: true; message: string } | { ok: false; error: string } {
+export function withdrawRejectedPayment(
+  eventId: string,
+  auth: { managerPin: string; reason: string },
+  release: (key: string, orderId: string, reason: string, token: string, unknownClaim: boolean) => Promise<{ ok: boolean }> = (k, o, why, t, unknown) =>
+    releaseClaimAfterNoCharge(k, o, why, t, undefined, { unknownClaim: unknown }),
+): { ok: true; message: string } | { ok: false; error: string } {
   const st = useTcheStore.getState();
   const r = (st.syncRejected ?? []).find((x) => x.event.id === eventId);
-  if (!r || !isRecoverableRejectedPayment(r)) return { ok: false, error: 'Este recusado não é um pagamento sem reserva.' };
+  if (!r || !(isRecoverableRejectedPayment(r) || isRecoveredRejectedPayment(r))) return { ok: false, error: 'Este recusado não é um pagamento sem reserva.' };
   const p = paymentOf(r.event)!;
+  if (inFlight.has(p.idempotency_key!)) return { ok: false, error: 'A reserva deste pagamento está sendo pedida agora: aguarde terminar e tente de novo.' };
   const pin = st.verifyManagerPin(auth, { orderId: p.order_id, action: 'CLAIM_RELEASED_REFUNDED' });
   if (!pin.ok) return { ok: false, error: pin.error };
   const w = st.withdrawUnacceptedPayment(p.idempotency_key!, `${RECOVERY_REASON}: ${auth.reason.trim()}`);
   if (!w.ok) return { ok: false, error: w.error };
-  // Uma reserva da recuperação que ficou sem resposta continua no registro (com o segredo): o estorno da trava
-  // libera ela no servidor antes de confirmar.
+  // A reserva que a recuperação pediu (aberta, ou sem resposta) não vale mais: sai do servidor pelo segredo (a
+  // pendência, com o segredo, fica gravada até terminar) e então do registro.
+  const own = localClaim(p.idempotency_key!);
+  if (own?.terms?.recovery && own.release_token) {
+    const key = p.idempotency_key!;
+    void release(key, p.order_id, `${RECOVERY_REASON}: pagamento retirado pelo gerente`, own.release_token, own.state !== 'settled')
+      .then((out) => { if (out.ok) endLocalClaim(key); })
+      .catch(() => undefined);
+  }
   const reason = `${w.data.nfceIssued ? `${NFCE_ISSUED_NOTE} ` : ''}A nuvem não aceitou o pagamento (${r.message}): ele foi retirado desta conta pelo gerente. ${refundText(p)}`;
   setReviewHold({
     order_id: p.order_id, amount: p.amount, reason, code: 'PAYMENT_REJECTED', refund: p.method === 'CASH' ? 'CASH' : 'TERMINAL',

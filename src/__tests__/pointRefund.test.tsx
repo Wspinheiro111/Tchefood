@@ -52,6 +52,13 @@ describe('refundPointPayment', () => {
     expect(calls).toEqual([{ action: 'refund', idempotency_key: KEY, staff_id: 'staff-1', manager_pin: '1234', reason_text: 'venda estornada na maquininha' }]);
   });
 
+  it('payment_registered do servidor chega ao chamador (só quando é booleano)', async () => {
+    for (const v of [true, false]) {
+      expect(await refundPointPayment(INPUT, deps({ status: 200, body: { ...REFUNDED.body, payment_registered: v } }).d)).toEqual({ kind: 'refunded', paymentRegistered: v });
+    }
+    expect(await refundPointPayment(INPUT, deps({ status: 200, body: { ...REFUNDED.body, payment_registered: 'sim' } }).d)).toEqual({ kind: 'refunded' });
+  });
+
   it('MANUAL_REVIEW: not_proven com o código e o texto do servidor', async () => {
     const { d } = deps({ status: 200, body: { status: 'MANUAL_REVIEW', idempotency_key: KEY, code: 'CHARGEBACK', reason: 'contestação não prova estorno' } });
     expect(await refundPointPayment(INPUT, d)).toEqual({ kind: 'not_proven', code: 'CHARGEBACK', error: 'contestação não prova estorno' });

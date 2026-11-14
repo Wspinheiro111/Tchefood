@@ -6,7 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { seedId } from '../data/seed';
-import { CLAIM_MISSING_REGISTER_ERROR, CLAIM_TERMS_REGISTER_ERROR, useTcheStore } from '../store/useTcheStore';
+import { CLAIM_MISSING_REGISTER_ERROR, CLAIM_TERMS_REGISTER_ERROR, revertibleRejectedDiscount, useTcheStore } from '../store/useTcheStore';
 import { cashSummary } from '../lib/cashRegister';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, getReviewHolds, setReviewHold } from '../lib/payments/reviewHolds';
 import { beginLocalClaim, localClaim, pendingRelease, resetClaimLedger, settleLocalClaim } from '../lib/payments/claimLedger';
@@ -347,8 +347,14 @@ describe('P2-E: TF012 (reservado maior que o saldo)', () => {
     useTcheStore.setState((s) => ({ outbox: [...s.outbox, later] }));
     const msg = 'Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total (reservado R$ 30,00; o saldo ficaria R$ 25,00). Em Retaguarda › Nuvem, desfaça o desconto ou o ajuste recusado, ou reenvie depois de a cobrança terminar.';
     st().rejectSyncEvents([{ eventId: disc.id, status: 400, message: msg }]);
-    const r = st().revertRejectedDiscount(disc.id);
+    expect(st().revertRejectedDiscount(disc.id, { managerPin: '0000', reason: 'Desconto recusado pela nuvem' }).ok).toBe(false);
+    expect(order(id).discount_amount).toBe(5);
+    const logs = st().auditLogs.length;
+    const r = st().revertRejectedDiscount(disc.id, { managerPin: '9999', reason: 'Desconto recusado pela nuvem' });
     expect(r, JSON.stringify(r)).toEqual({ ok: true, data: { discount: before.discount_amount } });
+    expect(st().auditLogs.length).toBe(logs + 1);
+    expect(st().auditLogs[0]).toMatchObject({ action_type: 'DISCOUNT_APPLIED', metadata: expect.objectContaining({ discount_before: 5, discount_after: before.discount_amount, local_only: true }) });
+    expect(st().outbox.some((e) => e.table === 'audit_logs' && e.row_id === st().auditLogs[0]!.id)).toBe(false);
     expect(order(id)).toMatchObject({ discount_amount: before.discount_amount, total_amount: before.total_amount, remaining_balance: before.remaining_balance });
     expect(st().syncRejected).toEqual([]);
     const q = st().outbox.filter((e) => e.table === 'orders' && e.row_id === id);
@@ -359,7 +365,7 @@ describe('P2-E: TF012 (reservado maior que o saldo)', () => {
     expect(st().applyDiscount(id, 4, auth).ok).toBe(true);
     const d2 = st().outbox.filter((e) => e.table === 'orders' && e.row_id === id).at(-1)!;
     st().rejectSyncEvents([{ eventId: d2.id, status: 403, message: 'permissão' }]);
-    expect(st().revertRejectedDiscount(d2.id).ok).toBe(false);
+    expect(st().revertRejectedDiscount(d2.id, { managerPin: '9999', reason: 'Desconto recusado pela nuvem' }).ok).toBe(false);
     expect(order(id).discount_amount).toBe(4);
   });
 
@@ -370,8 +376,48 @@ describe('P2-E: TF012 (reservado maior que o saldo)', () => {
     const disc = st().outbox.filter((e) => e.table === 'orders' && e.row_id === id).at(-1)!;
     expect(st().applyDiscount(id, 3, auth).ok).toBe(true);
     st().rejectSyncEvents([{ eventId: disc.id, status: 400, message: 'O total ficaria abaixo do que já foi pago; estorne um pagamento antes.' }]);
-    expect(st().revertRejectedDiscount(disc.id)).toEqual({ ok: false, error: 'Há outra troca de desconto desta conta na fila: chame o gerente.' });
+    expect(st().revertRejectedDiscount(disc.id, { managerPin: '9999', reason: 'Desconto recusado pela nuvem' }).ok).toBe(false);
     expect(order(id).discount_amount).toBe(3);
+  });
+
+  it.each([
+    ['desconto aceito, retirada dos 10% recusada: não desfaz o desconto aceito', [10]],
+    ['desconto 10 depois 5 aceitos, retirada dos 10% recusada: não sobe o desconto', [10, 5]],
+  ])('auditoria 1 P1-A: %s', (_n, discounts) => {
+    const id = openTableWith(['101', '311']);
+    const auth = { managerPin: '9999', reason: 'Cortesia da casa ao cliente' };
+    for (const d of discounts) {
+      expect(st().applyDiscount(id, d, auth).ok).toBe(true);
+      st().ackSyncedEvents(st().outbox.map((e) => e.id));
+    }
+    // Retirada dos 10% numa ação seguinte (o relógio anda).
+    vi.useFakeTimers({ now: Date.now() + 5_000, toFake: ['Date'] });
+    try {
+      expect(st().removeServiceFee(id, auth).ok).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+    const ev = st().outbox.filter((e) => e.table === 'orders' && e.row_id === id).at(-1)!;
+    st().rejectSyncEvents([{ eventId: ev.id, status: 400, message: 'Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total. Em Retaguarda › Nuvem…' }]);
+    const before = order(id);
+    expect(revertibleRejectedDiscount(st(), st().syncRejected[0]!)).toBeNull();
+    expect(st().revertRejectedDiscount(ev.id, auth).ok).toBe(false);
+    expect(order(id)).toMatchObject({ discount_amount: before.discount_amount, charge_service_fee: false });
+    expect(st().syncRejected).toHaveLength(1);
+  });
+
+  it('auditoria 1 P1-A: versão recusada de outra ação, bem depois do desconto aceito (sem autorização própria): não desfaz', () => {
+    const id = openTableWith(['101', '311']);
+    const auth = { managerPin: '9999', reason: 'Cortesia da casa ao cliente' };
+    expect(st().applyDiscount(id, 5, auth).ok).toBe(true);
+    const disc = st().outbox.filter((e) => e.table === 'orders' && e.row_id === id).at(-1)!;
+    st().ackSyncedEvents(st().outbox.map((e) => e.id));
+    // Outra versão da conta, 5 s depois, com o mesmo desconto (ex.: mudança de situação), recusada com TF012.
+    const later: SyncEvent = { ...disc, id: 'e-depois', created_at: new Date(Date.parse(disc.created_at) + 5_000).toISOString() };
+    useTcheStore.setState({ syncRejected: [{ event: later, status: 400, message: 'Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total.', rejected_at: '' }] });
+    expect(revertibleRejectedDiscount(st(), st().syncRejected[0]!)).toBeNull();
+    expect(st().revertRejectedDiscount('e-depois', auth).ok).toBe(false);
+    expect(order(id).discount_amount).toBe(5);
   });
 
   it('caixa: reserva cuja chave é pagamento aprovado aqui não conta de novo; a de outro aparelho conta', () => {

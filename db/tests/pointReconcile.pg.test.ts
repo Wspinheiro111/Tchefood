@@ -205,7 +205,7 @@ describe.skipIf(!target)('point-charge: conferência no Mercado Pago com o banco
 
   it('aprovada sem pagamento registrado e estornada no Mercado Pago: refunded com só raw_status/raw_status_detail; segunda conferência só lê', async () => {
     const key = seedCharge({ status: 'approved', raw_status_detail: 'accredited', external_payment_id: '123456789', paid_amount_cents: 2450, authorization_code: 'A1B2C3', card_brand: 'MASTERCARD', last_four: '4242' });
-    const ctx = context(() => approvedOrder(key, charge(key).external_order_id!), () => approvedPayment({ status: 'refunded' }));
+    const ctx = context(() => approvedOrder(key, charge(key).external_order_id!), () => approvedPayment({ status: 'refunded', amountRefundedCents: 2450 }));
     expect(await reconcileCharge(ctx, { idempotency_key: key, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: REASON })).toMatchObject({ status: 'DECLINED' });
     expect(charge(key)).toMatchObject({ status: 'refunded', raw_status: 'payment_refunded', raw_status_detail: 'PAYMENT_REFUNDED', authorization_code: 'A1B2C3', external_payment_id: '123456789' });
     // Revisão PR #49 (P2): a segunda conferência da estornada só lê o pagamento no Mercado Pago. Estorno provado pelo

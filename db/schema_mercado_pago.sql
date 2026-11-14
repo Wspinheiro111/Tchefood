@@ -488,8 +488,9 @@ BEGIN
     IF p_staff IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_staff AND u.tenant_id = p_tenant AND u.active) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
     END IF;
-    IF p_reason IS NULL OR length(trim(p_reason)) < 10 THEN
-        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: motivo obrigatório (mínimo 10 caracteres).' USING ERRCODE = 'TF006';
+    -- Auditoria interna 1: motivo de 10 a 500 caracteres (texto livre gravado em audit_logs).
+    IF p_reason IS NULL OR length(trim(p_reason)) < 10 OR length(trim(p_reason)) > 500 THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: motivo obrigatório (de 10 a 500 caracteres).' USING ERRCODE = 'TF006';
     END IF;
     IF v_charge.status NOT IN ('manual_review', 'approved') THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança está "%"; não há o que conferir.', v_charge.status USING ERRCODE = 'TF007';
@@ -616,6 +617,12 @@ $$;
 -- Prazo de espera do cartão (auditoria interna 3 P1-02): o mesmo de SERVER_TIMEOUT_MS em
 -- supabase/functions/point-charge/charge.ts (120 s; um teste confere os dois). tchefood_point_reservation usa para
 -- marcar a cobrança antiga (stale); a Edge Function manda o mesmo valor em p_wait_ms abaixo.
+-- Auditoria interna 1: validade do pedido de conferência com PIN (tchefood_authorize_point_reconcile) para o fim
+-- verificado e o estorno do pagamento (relógio do banco contra a hora do registro).
+CREATE OR REPLACE FUNCTION tchefood_point_authorization_ttl()
+RETURNS INTERVAL
+LANGUAGE sql IMMUTABLE AS $$ SELECT INTERVAL '10 minutes' $$;
+
 CREATE OR REPLACE FUNCTION tchefood_point_charge_timeout()
 RETURNS INTERVAL
 LANGUAGE sql IMMUTABLE AS $$ SELECT INTERVAL '120 seconds' $$;

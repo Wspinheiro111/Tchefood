@@ -168,6 +168,9 @@ UNION ALL SELECT 'I2 reservado > saldo: conta ' || id || ' reservado ' || reserv
   WHERE reserved > round(remaining_balance * 100)
 UNION ALL SELECT 'I7 conta fechada com saldo ou reserva: ' || id || ' saldo ' || remaining_balance || ' reservado ' || reserved FROM paid
   WHERE status IN ('CLOSED', 'CANCELED') AND (remaining_balance <> 0 OR reserved <> 0)
+    -- Conta fechada que teve o pagamento da Point estornado (tchefood_refund_point_payment) fica fechada com o saldo
+    -- devolvido (como na main, a conta encerrada não reabre; decisão do Will): fora do I7.
+    AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = paid.id AND p.status = 'REFUNDED' AND p.acquirer::text = 'MERCADO_PAGO')
 UNION ALL SELECT 'I7b reserva aberta em conta fechada: ' || pc.idempotency_key FROM payment_claims pc JOIN orders o ON o.id = pc.order_id
   WHERE pc.status = 'open' AND o.status IN ('CLOSED', 'CANCELED') AND o.id >= '${minOrder}'
 UNION ALL SELECT 'I3 chave de reserva e de cobrança: ' || pc.idempotency_key FROM payment_claims pc JOIN terminal_charges c ON c.idempotency_key = pc.idempotency_key
@@ -226,6 +229,7 @@ const ALLOWED: Record<string, readonly string[]> = {
   charge_step: ['P0001'],
   mp_pay: ['TF005', 'TF006', 'TF007', 'TF009', 'P0001'],
   resolve: ['TF005', 'TF006', 'TF007'],
+  refund: ['TF006', 'TF007'],
   cancel_item: ['TF012', 'P0001'],
   discount: ['TF012', 'P0001'],
 };
@@ -390,6 +394,20 @@ function genOp(ctx: Ctx, s: Session): () => Promise<OpResult> {
     ctx.sent.push(`${o.tenant}|${j}`);
     return run('mp_pay', `mp_pay ${c.key} [${c.status}] ${status} ${c.cents}`, device(c.tenant, `SELECT tchefood_register_payment('${j}'::jsonb)`, sleepFor(rng)));
   }
+  // --- estorno do pagamento da Point registrado (auditoria interna 1, revisão de concorrência F2) ---------------------
+  const refundable = snap.charges.filter((c) => c.status === 'approved' && c.has_mp);
+  if (r < 0.93 && refundable.length && chance(rng, 0.8)) {
+    const c = pick(rng, refundable);
+    return async () => {
+      const auth = await s.run(service(`SELECT tchefood_authorize_point_reconcile('${c.tenant}', '${c.key}', '${STAFF[c.tenant]}', '${PIN[c.tenant]}', 'conferir no Mercado Pago')`));
+      if (!auth.ok) return { kind: 'refund', desc: `refund-auth ${c.key}`, res: auth, allowed: ALLOWED.refund };
+      const ev = `{"authorization_audit_id":"${auth.out.split('\n').pop()}","operation_id":"${c.nsu}","mp_payment_id":"${c.nsu}","mp_amount_cents":${c.cents},`
+        + `"mp_amount_refunded_cents":${c.cents},"mp_external_reference":"${c.key}","mp_status":"refunded"}`;
+      const res = await s.run(service(`SELECT status FROM tchefood_refund_point_payment('${c.tenant}', '${c.id}', '${STAFF[c.tenant]}', 'conferido no Mercado Pago',
+        '{"raw_status":"payment_refunded"}'::jsonb, '${ev}'::jsonb)`, sleepFor(rng)));
+      return { kind: 'refund', desc: `refund ${c.key} ${c.cents}`, res, allowed: ALLOWED.refund };
+    };
+  }
   const resolvable = snap.charges.filter((c) => c.status === 'manual_review' || (c.status === 'approved' && !c.has_mp));
   if (r < 0.95 && resolvable.length) {
     const c = pick(rng, resolvable);
@@ -400,7 +418,7 @@ function genOp(ctx: Ctx, s: Session): () => Promise<OpResult> {
       const auth = await s.run(service(`SELECT tchefood_authorize_point_reconcile('${c.tenant}', '${c.key}', '${STAFF[c.tenant]}', '${PIN[c.tenant]}', 'conferir no Mercado Pago')`));
       if (!auth.ok) return { kind: 'resolve', desc: `reconcile ${c.key} [${c.status}]`, res: auth, allowed: ALLOWED.resolve };
       const res = await s.run(service(`SELECT status FROM tchefood_resolve_point_charge('${c.tenant}', '${c.id}', '${c.status}', '${to}', '${patch}'::jsonb, '${STAFF[c.tenant]}',
-        'conferido no Mercado Pago', '{"authorization_audit_id":"${auth.out.split('\n').pop()}","operation_id":"op-1"}'::jsonb)`, sleepFor(rng)));
+        'conferido no Mercado Pago', '{"authorization_audit_id":"${auth.out.split('\n').pop()}","operation_id":"op-1","mp_status":"refunded","mp_amount_refunded_cents":${c.cents}}'::jsonb)`, sleepFor(rng)));
       return { kind: 'resolve', desc: `resolve ${c.key} ${c.status}->${to}`, res, allowed: ALLOWED.resolve };
     };
   }

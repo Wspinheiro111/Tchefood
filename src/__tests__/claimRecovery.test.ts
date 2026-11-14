@@ -10,7 +10,7 @@ import { LEGACY_CONSEQUENCE_WINDOW_MS, useTcheStore } from '../store/useTcheStor
 import { CLAIM_REQUIRED_ERROR } from '../lib/payments/paymentClaim';
 import { beginLocalClaim, localClaim, resetClaimLedger } from '../lib/payments/claimLedger';
 import { clearReviewHold, getReviewHoldByKey } from '../lib/payments/reviewHolds';
-import { isRecoverableRejectedPayment, recoverRejectedPayment, resendRejected, withdrawRejectedPayment, RECOVERY_MANAGER_PATH, type RecoveryDeps } from '../lib/payments/claimRecovery';
+import { isRecoverableRejectedPayment, isRecoveredRejectedPayment, recoverRejectedPayment, recoveryInFlight, resendRejected, withdrawRejectedPayment, RECOVERY_MANAGER_PATH, type RecoveryDeps } from '../lib/payments/claimRecovery';
 import type { SyncEvent } from '../types';
 
 const st = () => useTcheStore.getState();
@@ -174,6 +174,44 @@ describe('caminho do gerente: retirar o pagamento não aceito pela nuvem', () =>
   });
 });
 
+describe('auditoria 1: recuperado e recusado de novo; retirada durante a recuperação', () => {
+  it('P2-E: recusado de novo por outro motivo: caminho do gerente; retirar libera a reserva da recuperação pelo segredo', async () => {
+    const id = openTable();
+    const { ev, payment } = legacyRejected(id, 20, 'k-again');
+    expect(await recoverRejectedPayment(ev.id, deps(opened).d)).toEqual({ ok: true });
+    const token = localClaim('k-again')!.release_token!;
+    // Sobe e é recusado de novo (outro motivo).
+    st().rejectSyncEvents([{ eventId: ev.id, status: 400, message: 'Há cobrança reservada nesta comanda…' }]);
+    const r = st().syncRejected[0]!;
+    expect(isRecoverableRejectedPayment(r)).toBe(false);
+    expect(isRecoveredRejectedPayment(r)).toBe(true);
+    const released: unknown[][] = [];
+    const out = withdrawRejectedPayment(ev.id, { managerPin: '9999', reason: 'Conferido com o cliente' }, async (...a) => { released.push(a); return { ok: true }; });
+    expect(out.ok).toBe(true);
+    expect(st().payments.find((p) => p.id === payment.id)!.status).toBe('REFUNDED');
+    expect(released).toEqual([['k-again', id, 'não aceito pela nuvem: pagamento retirado pelo gerente', token, false]]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(localClaim('k-again')).toBeNull();
+  });
+
+  it('P2-F: com a reserva sendo pedida, a retirada espera', async () => {
+    const id = openTable();
+    const { ev, payment } = legacyRejected(id, 20, 'k-busy');
+    let finish: (v: unknown) => void = () => undefined;
+    const slow = deps(opened);
+    slow.d.balance = () => new Promise((r) => (finish = r as never));
+    const pending = recoverRejectedPayment(ev.id, slow.d);
+    expect(recoveryInFlight(ev.id)).toBe(true);
+    const w = withdrawRejectedPayment(ev.id, { managerPin: '9999', reason: 'Conferido com o cliente' }, async () => ({ ok: true }));
+    expect(w.ok).toBe(false);
+    expect(st().payments.find((p) => p.id === payment.id)!.status).toBe('APPROVED');
+    finish({ balanceCents: 5000, status: 'PAYING' });
+    expect(await pending).toEqual({ ok: true });
+    expect(recoveryInFlight(ev.id)).toBe(false);
+  });
+});
+
 describe('retirada: consequências da fila antiga (sem caused_by_payment_id) um milissegundo depois', () => {
   const legacyQueue = (shiftMs: number) => {
     const payId = st().payments.at(-1)!.id;
@@ -201,6 +239,31 @@ describe('retirada: consequências da fila antiga (sem caused_by_payment_id) um 
     expect(st().withdrawUnacceptedPayment('k-l', 'x').ok).toBe(true);
     expect(st().outbox.some((e) => e.table === 'orders' && e.payload.status === 'CLOSED')).toBe(false);
     expect(st().outbox.some((e) => e.table === 'dining_tables' && e.payload.status === 'FREE' && e.depends_on_order_id === id)).toBe(false);
+  });
+
+  it('auditoria 1 P2-C: mudança de item de outra ação dentro da janela sai da fila, mas o estado atual do item sobe de novo', () => {
+    const id = openTable();
+    st().ackSyncedEvents(st().outbox.map((e) => e.id));
+    expect(st().registerPayment({
+      orderId: id, amount: 10, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null,
+      card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'k-kds', item_ids: [],
+    }).ok).toBe(true);
+    const item = st().orderItems.find((i) => i.order_id === id)!;
+    expect(st().advanceItemStatus(item.id).ok).toBe(true);
+    const after = st().orderItems.find((i) => i.id === item.id)!.status;
+    useTcheStore.setState((s) => {
+      const ins = s.outbox.find((e) => e.table === 'payments' && e.payload.idempotency_key === 'k-kds')!;
+      const t0 = Date.parse(ins.created_at);
+      return {
+        outbox: s.outbox.map((e) => {
+          const { caused_by_payment_id: _x, ...rest } = e;
+          return (e.table === 'order_items' && e.row_id === item.id ? { ...rest, created_at: new Date(t0 + 300).toISOString() } : rest) as SyncEvent;
+        }),
+      };
+    });
+    expect(st().withdrawUnacceptedPayment('k-kds', 'x').ok).toBe(true);
+    const left = st().outbox.filter((e) => e.table === 'order_items' && e.row_id === item.id);
+    expect(left.at(-1)?.payload).toMatchObject({ status: after });
   });
 
   it('fora da janela, ou depois do próximo pagamento da conta: não é deste pagamento', () => {

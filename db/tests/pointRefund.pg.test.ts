@@ -161,7 +161,7 @@ describe.skipIf(!target)('point-charge: conferência no Mercado Pago com o banco
   };
   const payStatus = (key: string) => sql(`SELECT status FROM payments WHERE idempotency_key = ${lit(key)};`);
   const REQ = (key: string) => ({ idempotency_key: key, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: REASON });
-  const refunded = (key: string, over: Partial<PointPaymentDetails> = {}) => approvedPayment({ status: 'refunded', externalReference: key, ...over });
+  const refunded = (key: string, over: Partial<PointPaymentDetails> = {}) => approvedPayment({ status: 'refunded', externalReference: key, amountRefundedCents: 2450, ...over });
 
   it('refund de ponta a ponta: cobrança refunded + pagamento REFUNDED, UM POINT_PAYMENT_REFUNDED; repetição não grava', async () => {
     const key = seedPaid();
@@ -199,7 +199,7 @@ describe.skipIf(!target)('point-charge: conferência no Mercado Pago com o banco
     const k2 = seedPaid();
     const auth = (await store.authorizeReconcile({ idempotency_key: k2, performed_by: STAFF, manager_pin: MANAGER_PIN, reason: REASON }))!;
     const row = (await store.findByKey(k2))!;
-    const evidence = { authorization_audit_id: auth, operation_id: '123456789', mp_payment_id: '123456789', mp_amount_cents: 2450, mp_external_reference: k2, mp_status: 'refunded' };
+    const evidence = { authorization_audit_id: auth, operation_id: '123456789', mp_payment_id: '123456789', mp_amount_cents: 2450, mp_external_reference: k2, mp_status: 'refunded', mp_amount_refunded_cents: 2450 };
     expect((await store.refundPayment(row, { raw_status: 'payment_refunded' }, { staff: STAFF, reason: REASON, evidence })).status).toBe('refunded');
     await expect(store.refundPayment(row, {}, { staff: STAFF, reason: REASON, evidence: { ...evidence, mp_status: 'charged_back' } })).rejects.toMatchObject({ code: 'invalid_reason' });
     const k3 = seedPaid();

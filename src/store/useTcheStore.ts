@@ -584,7 +584,7 @@ interface Actions {
    * de antes (o que o servidor tem), tira a recusa e corrige o desconto das versões seguintes da conta na fila.
    * Sem isso a recusa segura a conta (inclusive o pagamento que consumiria a reserva).
    */
-  revertRejectedDiscount: (eventId: UUID) => ActionResult<{ discount: number }>;
+  revertRejectedDiscount: (eventId: UUID, auth: ManagerAuthInput) => ActionResult<{ discount: number }>;
   /**
    * Resgate de cashback recusado pela nuvem (o banco não concedeu o crédito): desfaz aqui o
    * resgate, a baixa dos créditos e o desconto da conta, e refaz as versões seguintes da conta
@@ -774,6 +774,30 @@ function tableEventForOrder(table: DiningTable, orderId: UUID): SyncEvent {
  * loja (TCHEFOOD_REGISTRO_LOJA; antes da rodada 4 vinha como TCHEFOOD_PRECO com "não encontrado
  * nesta loja") não é preço: o PIN não resolve, então fica na lista sem o botão.
  */
+/**
+ * Desconto que dá para desfazer numa recusa TF012 da conta: a versão recusada é a da troca de desconto (a última
+ * autorização da conta até ela é DISCOUNT_APPLIED com este desconto, gravada na mesma ação — até 1 s antes). Recusa
+ * de outro ajuste (retirada dos 10%, cancelamento de item: a autorização deles é a última) não desfaz desconto
+ * nenhum, que pode já estar aceito pela nuvem. Devolve a autorização e o desconto de antes, ou null.
+ */
+export function revertibleRejectedDiscount(
+  state: Pick<TcheState, 'auditLogs'>,
+  r: Pick<RejectedSyncEvent, 'event' | 'message'>,
+): { audit: AuditLog; before: number } | null {
+  const e = r.event;
+  if (e.table !== 'orders' || e.op !== 'UPDATE' || e.payload.discount_amount === undefined || !isTf012Rejection(r.message)) return null;
+  const own = toCents(Number(e.payload.discount_amount));
+  const at = Date.parse(e.created_at);
+  if (!Number.isFinite(own) || !Number.isFinite(at)) return null;
+  const last = state.auditLogs
+    .filter((l) => l.order_id === e.row_id && Date.parse(l.created_at) <= at)
+    .reduce<AuditLog | null>((a, l) => (!a || Date.parse(l.created_at) > Date.parse(a.created_at) ? l : a), null);
+  if (!last || last.action_type !== 'DISCOUNT_APPLIED' || at - Date.parse(last.created_at) > 1_000) return null;
+  if (toCents(Number(last.metadata?.discount_after)) !== own) return null;
+  const before = Number(last.metadata?.discount_before);
+  return Number.isFinite(before) ? { audit: last, before } : null;
+}
+
 export function isRejectedItemPrice(r: RejectedSyncEvent): boolean {
   const message = r.message ?? '';
   return r.event.table === 'order_items' && r.event.op === 'INSERT'
@@ -2307,6 +2331,8 @@ export const useTcheStore = create<TcheState>()(
           const tableNow = table ?? state.tables.find((x) => x.id === order.table_id) ?? null;
           // A mesa: se o fechamento dela saiu da fila, sobe o estado atual (que pode já ser de outra comanda).
           const tableDropped = [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)].some((e) => droppedIds.has(e.id) && e.table === 'dining_tables');
+          const droppedItemIds = new Set([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]
+            .filter((e) => droppedIds.has(e.id) && e.table === 'order_items').map((e) => e.row_id));
           const keep = (e: SyncEvent): SyncEvent | null => {
             if (droppedIds.has(e.id)) return null;
             return e.depends_on_event_ids?.some((id) => droppedIds.has(id)) ? { ...e, depends_on_event_ids: e.depends_on_event_ids.filter((id) => !droppedIds.has(id)) } : e;
@@ -2319,6 +2345,11 @@ export const useTcheStore = create<TcheState>()(
             outbox: [
               ...s.outbox.map(keep).filter((e): e is SyncEvent => e !== null),
               ...changedItems.map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
+              // Item cuja mudança saiu da fila junto (fila antiga: pela janela de tempo, pode ser de outra ação, como o
+              // KDS avançando o preparo): sobe o estado atual dele, para nada que não era do pagamento se perder.
+              ...orderItems
+                .filter((i) => droppedItemIds.has(i.id) && !changedItems.includes(i))
+                .map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
               syncEvent('orders', 'UPDATE', recalculated),
               ...(tableNow && (table || tableDropped) ? [tableEventForOrder(tableNow, tableNow.current_order_id ?? order.id)] : []),
             ],
@@ -2334,6 +2365,8 @@ export const useTcheStore = create<TcheState>()(
           const hold = getReviewHoldByKey(idempotencyKey);
           const orderId = payment?.order_id ?? hold?.order_id ?? null;
           const order = orderId ? state.orders.find((o) => o.id === orderId) ?? null : null;
+          // Já espelhado (pagamento estornado aqui): nada de novo (sem outro registro, sem mexer na trava).
+          if (payment && payment.status === 'REFUNDED') return { ok: true, data: { payment, nfceIssued: Boolean(order?.nfce_key) } };
           let mirrored: Payment | null = payment;
           let orders = state.orders;
           let payments = state.payments;
@@ -2347,7 +2380,8 @@ export const useTcheStore = create<TcheState>()(
             }
           }
           const user = currentUser();
-          const log = user
+          // Sem pagamento aqui: nada a registrar neste aparelho (o servidor tem o registro do estorno).
+          const log = user && payment
             ? buildAudit({
               order_id: orderId,
               performed_by_user_id: user.id,
@@ -2365,7 +2399,21 @@ export const useTcheStore = create<TcheState>()(
               },
             })
             : null;
-          set((s) => ({ payments, orders, ...(log ? { auditLogs: [log, ...s.auditLogs] } : {}) }));
+          // A inclusão deste pagamento ainda na fila ou nos recusados (APROVADO) seria recusada para sempre (TF007: a
+          // cobrança está estornada no servidor): sobe como estornado, que o servidor aceita com a cobrança estornada
+          // (db/schema_mercado_pago.sql), e sai dos recusados.
+          const isInsert = (e: SyncEvent) => payment !== null && e.table === 'payments' && e.op === 'INSERT' && e.row_id === payment.id;
+          const asRefunded = (e: SyncEvent): SyncEvent => (isInsert(e) ? { ...e, payload: { ...e.payload, status: 'REFUNDED' } } : e);
+          set((s) => {
+            const back = (s.syncRejected ?? []).filter((r) => isInsert(r.event)).map((r) => asRefunded(r.event));
+            return {
+              payments,
+              orders,
+              ...(log ? { auditLogs: [log, ...s.auditLogs] } : {}),
+              outbox: [...back, ...s.outbox.map(asRefunded)],
+              syncRejected: (s.syncRejected ?? []).filter((r) => !isInsert(r.event)),
+            };
+          });
           if (hold && orderId) clearReviewHold(orderId, reviewHoldKey(hold));
           return { ok: true, data: { payment: mirrored, nfceIssued: Boolean(order?.nfce_key) } };
         },
@@ -4155,11 +4203,13 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: log };
         },
 
-        revertRejectedDiscount: (eventId) => {
+        revertRejectedDiscount: (eventId, managerAuth) => {
           const state = get();
           const rejected = (state.syncRejected ?? []).find((r) => r.event.id === eventId);
           if (!rejected || rejected.event.table !== 'orders' || rejected.event.op !== 'UPDATE') return fail('Conta recusada não encontrada.');
           if (!isTf012Rejection(rejected.message)) return fail('Esta recusa não é de desconto abaixo do reservado ou do já pago.');
+          const revertible = revertibleRejectedDiscount(state, rejected);
+          if (!revertible) return fail('A versão recusada não é a de uma troca de desconto deste aparelho: nada a desfazer aqui. Chame o gerente.');
           const orderId = rejected.event.row_id;
           const order = state.orders.find((o) => o.id === orderId);
           if (!order) return fail('Conta não encontrada neste aparelho.');
@@ -4170,20 +4220,40 @@ export const useTcheStore = create<TcheState>()(
           }
           const own = toCents(Number(rejected.event.payload.discount_amount ?? Number.NaN));
           if (!Number.isFinite(own)) return fail('A recusa não traz o desconto desta conta.');
-          // O desconto de antes: o da autorização (deste aparelho) que levou a este valor.
-          const auth = state.auditLogs.find(
-            (l) => l.order_id === orderId && l.action_type === 'DISCOUNT_APPLIED' && toCents(Number(l.metadata?.discount_after)) === own,
-          );
-          const before = auth ? Number(auth.metadata?.discount_before) : Number.NaN;
-          if (!Number.isFinite(before)) return fail('Não achei neste aparelho o desconto de antes desta troca: chame o gerente.');
+          // O desconto de antes: o da autorização da troca recusada.
+          const before = revertible.before;
           // Versões da conta na fila: as que levam este desconto passam ao de antes; as de antes já estão certas.
           // Outro desconto (outra troca depois): o gerente decide.
           const queued = state.outbox.filter((e) => e.table === 'orders' && e.row_id === orderId && e.payload.discount_amount !== undefined);
           if (queued.some((e) => ![own, toCents(before)].includes(toCents(Number(e.payload.discount_amount))))) {
             return fail('Há outra troca de desconto desta conta na fila: chame o gerente.');
           }
+          // Volta o desconto (às vezes para cima, se a troca recusada o baixou): sempre com o PIN do gerente.
+          const authRes = authorizeManager(managerAuth, { orderId, action: 'DISCOUNT_APPLIED' });
+          if (!authRes.ok) return authRes;
+          const user = currentUser()!;
           const reverted = applyOrderTotals({ ...order, discount_amount: before }, state.orderItems, state.payments);
+          // Registro só deste aparelho: no servidor o desconto nunca mudou (a troca foi recusada).
+          const log = buildAudit({
+            order_id: orderId,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: authRes.data.id,
+            action_type: 'DISCOUNT_APPLIED',
+            amount_impact: round2(reverted.total_amount - order.total_amount),
+            reason: managerAuth.reason.trim(),
+            metadata: {
+              table: tableLabel(order.table_id),
+              discount_before: own / 100,
+              discount_after: before,
+              reverts_audit_id: revertible.audit.id,
+              server_rejected: rejected.message,
+              local_only: true,
+              waiter_name: user.name,
+              manager_name: authRes.data.name,
+            },
+          });
           set((s) => ({
+            auditLogs: [log, ...s.auditLogs],
             orders: s.orders.map((o) => (o.id === orderId ? reverted : o)),
             syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
             outbox: [

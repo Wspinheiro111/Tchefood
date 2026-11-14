@@ -53,6 +53,8 @@ export function parsePayment(body: unknown): PointPaymentDetails {
     // Revisão PR #49: o status_detail diz como terminou um charged_back (settled / reimbursed / in_process).
     statusDetail: asText(p.status_detail),
     amountCents: amountToCents(p.transaction_amount),
+    // Auditoria interna 1: quanto o Mercado Pago diz que voltou (mesma regra estrita; 0 ou ausente = null).
+    amountRefundedCents: amountToCents(p.transaction_amount_refunded),
     paymentMethodId: asText(p.payment_method_id),
     paymentTypeId: asText(p.payment_type_id),
     authorizationCode: asText(p.authorization_code),

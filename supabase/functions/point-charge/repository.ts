@@ -254,6 +254,14 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
       );
       return Boolean(found);
     },
+    async hasPaymentRecord(idempotencyKey: string): Promise<boolean> {
+      // Pagamento do Mercado Pago com a chave, em qualquer status (idempotency_key é única em payments).
+      const found = check(
+        await db.from('payments').select('id').eq('tenant_id', tenantId).eq('idempotency_key', idempotencyKey).eq('acquirer', 'MERCADO_PAGO').maybeSingle(),
+        'ler o pagamento da cobrança',
+      );
+      return Boolean(found);
+    },
     async resolve(row, toStatus, patch, audit): Promise<TerminalChargeRow> {
       // Uma transação no banco: só grava se o estado ainda for o lido, com UM audit_log. Devolve a linha atual.
       const res = await db.rpc('tchefood_resolve_point_charge', {

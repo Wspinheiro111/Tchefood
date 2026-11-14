@@ -101,6 +101,22 @@ describe('superviseSettledClaims', () => {
     expect(holds[0]!.acquirer).toBeUndefined();
   });
 
+  it('auditoria 1 P2-E: reserva da recuperação (pagamento antigo) recusado de novo, ou liberada antes de subir: não retira sozinho', async () => {
+    beginLocalClaim('k-rec', 'o1', TOKEN, { method: 'CREDIT', acquirer: 'STONE', amount_cents: 1200, recovery: true });
+    settleLocalClaim('k-rec');
+    const rej = deps({ payments: () => [pay('k-rec')], rejected: () => 'TF012 reservado maior que o saldo' });
+    await superviseSettledClaims(rej.d, 0, true);
+    expect(rej.withdrawn).toEqual([]);
+    expect(rej.holds).toEqual([]);
+    expect(localClaim('k-rec')).toMatchObject({ release_token: TOKEN });
+    resetClaimSupervisor();
+    const rel = deps({ payments: () => [pay('k-rec')], touch: vi.fn(async () => ({ ok: true as const, status: 'released' as const, activeUntil: null })) });
+    await superviseSettledClaims(rel.d, 0, true);
+    expect(rel.withdrawn).toEqual([]);
+    expect(rel.holds).toEqual([]);
+    expect(localClaim('k-rec')).not.toBeNull();
+  });
+
   it('P1-A: pagamento recusado pelo servidor (syncRejected): trava PAYMENT_REJECTED com a mensagem, tira da conta, guarda o segredo e não renova mais', async () => {
     settled('k-r');
     const { d, holds, alerts, withdrawn } = deps({ payments: () => [pay('k-r')], rejected: () => 'TF012 reservado maior que o saldo' });

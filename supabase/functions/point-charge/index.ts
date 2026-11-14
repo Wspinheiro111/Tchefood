@@ -95,7 +95,7 @@ Deno.serve(async (req: Request) => {
   }
   if (action === 'reconcile' || action === 'refund') {
     try {
-      validateReconcile(body as { idempotency_key: unknown });
+      validateReconcile(body as { idempotency_key: unknown }, { ignoreOperation: action === 'refund' });
     } catch (error) {
       if (error instanceof ChargeInputError) return json({ error: error.code, message: error.message }, error.httpStatus);
       throw error;

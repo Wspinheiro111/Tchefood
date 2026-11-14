@@ -186,6 +186,8 @@ export interface ChargeStore {
   authorizeReconcile(input: { idempotency_key: string; performed_by: string; manager_pin: string; reason: string }): Promise<string | null>;
   /** Há pagamento APPROVED do Mercado Pago gravado com a chave desta cobrança (o aparelho já registrou)? */
   hasRegisteredPayment(idempotencyKey: string): Promise<boolean>;
+  /** Há pagamento do Mercado Pago gravado com a chave desta cobrança, em qualquer status (aprovado ou já estornado)? */
+  hasPaymentRecord(idempotencyKey: string): Promise<boolean>;
   /**
    * Fim verificado (tchefood_resolve_point_charge, só service role): grava `toStatus` e `patch` só se a cobrança ainda
    * estiver em `row.status`, com UM audit_log (quem, motivo, o que foi lido no Mercado Pago). Devolve a linha atual:
@@ -208,6 +210,8 @@ export interface PointPaymentDetails {
   /** status_detail do pagamento (para charged_back: settled, reimbursed ou in_process). */
   statusDetail?: string | null;
   amountCents: number | null;
+  /** transaction_amount_refunded em centavos (null = ausente, zero ou fora da regra estrita). */
+  amountRefundedCents?: number | null;
   paymentMethodId: string | null;
   paymentTypeId: string | null;
   authorizationCode: string | null;
@@ -267,7 +271,8 @@ export type ChargeReply =
       method: PointMethod;
     }
   /** code REFUNDED: o Mercado Pago provou o estorno (houve cobrança e o dinheiro voltou), não "nada foi cobrado". */
-  | { status: 'DECLINED'; idempotency_key: string; reason: string; code?: 'REFUNDED' }
+  /** payment_registered (só na ação refund): há pagamento do Mercado Pago gravado no servidor com esta chave. */
+  | { status: 'DECLINED'; idempotency_key: string; reason: string; code?: 'REFUNDED'; payment_registered?: boolean }
   | { status: 'MANUAL_REVIEW'; idempotency_key: string; reason: string; code: string };
 
 export class ChargeInputError extends Error {
@@ -942,16 +947,22 @@ export interface ReconcileRequest {
 
 /** Motivo mínimo da conferência (o banco confere de novo). */
 export const RECONCILE_REASON_MIN = 10;
+/** Motivo máximo da conferência e do estorno (auditoria interna 1). */
+export const RECONCILE_REASON_MAX = 500;
 
-export function validateReconcile(input: ReconcileInput): ReconcileRequest {
+/** `ignoreOperation` (ação refund): operation_id não é usado, então não é conferido (qualquer valor passa e vira null). */
+export function validateReconcile(input: ReconcileInput, opts: { ignoreOperation?: boolean } = {}): ReconcileRequest {
   if (!validKey(input.idempotency_key)) throw new ChargeInputError('invalid_key', 'Chave da cobrança inválida.');
   if (typeof input.staff_id !== 'string' || !UUID.test(input.staff_id)) throw new ChargeInputError('invalid_staff', 'Informe quem está conferindo a cobrança.');
   if (typeof input.manager_pin !== 'string' || !/^\d{4,8}$/.test(input.manager_pin)) throw new ChargeInputError('manager_required', 'Conferir a cobrança exige o PIN do gerente.', 403);
   if (typeof input.reason_text !== 'string' || input.reason_text.trim().length < RECONCILE_REASON_MIN) {
     throw new ChargeInputError('invalid_reason', `Informe o motivo (mínimo ${RECONCILE_REASON_MIN} caracteres).`);
   }
+  if (input.reason_text.trim().length > RECONCILE_REASON_MAX) {
+    throw new ChargeInputError('invalid_reason', `Motivo longo demais (máximo ${RECONCILE_REASON_MAX} caracteres).`);
+  }
   let operation: string | null = null;
-  if (input.operation_id !== undefined && input.operation_id !== null && input.operation_id !== '') {
+  if (!opts.ignoreOperation && input.operation_id !== undefined && input.operation_id !== null && input.operation_id !== '') {
     if (typeof input.operation_id !== 'string' || !/^\d{1,20}$/.test(input.operation_id.trim())) {
       throw new ChargeInputError('invalid_operation', 'ID da operação inválido (só números).');
     }
@@ -960,11 +971,10 @@ export function validateReconcile(input: ReconcileInput): ReconcileRequest {
   return { idempotency_key: input.idempotency_key, staff_id: input.staff_id, manager_pin: input.manager_pin, reason_text: input.reason_text.trim(), operation_id: operation };
 }
 
-/** Status do pagamento do Mercado Pago que provam que o dinheiro voltou (ou nunca ficou). */
+// Status do pagamento que provam que o dinheiro voltou: ver refundProof (refunded total; cancelled só sem aprovação).
 // Decisão do Will (auditoria interna 3, a verificar 1): contestação (charged_back) nunca prova estorno, com ou sem PIN,
 // em nenhum status_detail (settled/reimbursed/in_process não dizem com clareza com quem ficou o dinheiro). A cobrança
 // fica em revisão manual e o gerente resolve com o Mercado Pago.
-const REFUND_PAYMENT_STATUSES: ReadonlySet<string> = new Set(['refunded', 'cancelled']);
 
 type ReconcileAuth = { staff: string; reason: string; audit_id: string; operation_id: string | null };
 
@@ -1033,15 +1043,16 @@ async function confirmRefund(ctx: ChargeContext, row: TerminalChargeRow): Promis
   if (!row.external_payment_id) return confirmRefundByOrder(ctx, row);
   const payment = await readPayment(ctx, row.external_payment_id);
   if (!payment) return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
-  if (!provesRefund(row, payment, row.external_payment_id)) return replyFor(row);
+  const proof = refundProof(row, payment, row.external_payment_id);
+  if (proof !== 'proven') return proofReview(row, proof) ?? replyFor(row);
   return reconcileReply(row);
 }
 
 /**
- * Revisão PR #49 (a verificar 2): estornada sem ID do pagamento gravado (a ordem estornou sem informar o pagamento). A
- * prova possível é a própria ordem lida agora: a mesma ordem ligada, estornada, ecoando a referência e a maquininha
- * desta cobrança e com o mesmo valor (as conferências de judgeOrder para um fim). Se a ordem passou a informar um
- * pagamento, vale o pagamento (que precisa provar o estorno). Sem ordem, sem leitura ou sem prova: a trava fica.
+ * Revisão PR #49 (a verificar 2): estornada sem ID do pagamento gravado. Lê a ordem ligada: estornada, ecoando a
+ * referência, a maquininha e o valor desta cobrança. Alinhamento com o banco (auditoria interna 1): só a ordem não diz
+ * quanto voltou, então o pagamento que ela lista precisa provar o estorno total; ordem sem pagamento =
+ * REFUND_WITHOUT_PAYMENT. Sem ordem, sem leitura ou sem prova: a trava fica.
  */
 async function confirmRefundByOrder(ctx: ChargeContext, row: TerminalChargeRow): Promise<ChargeReply> {
   if (!row.external_order_id) return replyFor(row);
@@ -1053,11 +1064,12 @@ async function confirmRefundByOrder(ctx: ChargeContext, row: TerminalChargeRow):
   }
   if (order.externalOrderId !== row.external_order_id || order.status !== 'refunded') return replyFor(row);
   if (order.externalReference !== row.idempotency_key || order.externalTerminalId !== row.external_terminal_id || order.amountCents !== row.amount_cents) return replyFor(row);
-  if (order.externalPaymentId) {
-    const payment = await readPayment(ctx, order.externalPaymentId);
-    if (!payment) return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
-    if (!provesRefund(row, payment, order.externalPaymentId)) return replyFor(row);
-  }
+  // Só a ordem não mostra o valor estornado: sem o pagamento, não há prova de estorno total.
+  if (!order.externalPaymentId) return stillInReview(row, 'REFUND_WITHOUT_PAYMENT', PROOF_TEXT.REFUND_WITHOUT_PAYMENT);
+  const payment = await readPayment(ctx, order.externalPaymentId);
+  if (!payment) return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
+  const proof = refundProof(row, payment, order.externalPaymentId);
+  if (proof !== 'proven') return proofReview(row, proof) ?? replyFor(row);
   return reconcileReply(row);
 }
 
@@ -1102,12 +1114,38 @@ async function resolveTo(ctx: ChargeContext, row: TerminalChargeRow, to: ChargeS
  * Pagamento desta cobrança (ID já conhecido) mostra o dinheiro devolvido? Só com o pagamento lido agora, com o mesmo
  * ID, o mesmo valor e, se informada, a mesma referência.
  */
-function provesRefund(row: TerminalChargeRow, payment: PointPaymentDetails | null, paymentId: string | null): boolean {
-  if (!payment || !paymentId || payment.id !== paymentId) return false;
-  if (payment.amountCents !== row.amount_cents) return false;
-  if (payment.externalReference != null && payment.externalReference !== row.idempotency_key) return false;
-  if (isOrdersApiId(payment.orderId) && row.external_order_id != null && payment.orderId !== row.external_order_id) return false;
-  return payment.status !== null && REFUND_PAYMENT_STATUSES.has(payment.status);
+/**
+ * Auditoria interna 1: o que o pagamento lido diz sobre o estorno desta cobrança (depois das conferências de ID, valor,
+ * referência e ordem). Só estorno total prova: status refunded e transaction_amount_refunded igual ao valor da
+ * cobrança. Valor estornado menor = parcial. "cancelled" (nunca capturado) só prova quando a cobrança nunca chegou a
+ * aprovada (`neverApproved`: a revisão manual); numa cobrança aprovada é contradição. Contestação nunca prova.
+ */
+type RefundProof = 'proven' | 'partial' | 'cancelled_after_approval' | 'none';
+
+function refundProof(row: TerminalChargeRow, payment: PointPaymentDetails | null, paymentId: string | null, neverApproved = false): RefundProof {
+  if (!payment || !paymentId || payment.id !== paymentId) return 'none';
+  if (payment.amountCents !== row.amount_cents) return 'none';
+  if (payment.externalReference != null && payment.externalReference !== row.idempotency_key) return 'none';
+  if (isOrdersApiId(payment.orderId) && row.external_order_id != null && payment.orderId !== row.external_order_id) return 'none';
+  if (payment.status === null || payment.status === 'charged_back') return 'none';
+  const refunded = payment.amountRefundedCents ?? null;
+  if (refunded !== null && refunded < row.amount_cents) return 'partial';
+  if (payment.status === 'refunded') return refunded === row.amount_cents ? 'proven' : 'none';
+  if (payment.status === 'cancelled') return neverApproved ? 'proven' : 'cancelled_after_approval';
+  return 'none';
+}
+
+const PROOF_TEXT = {
+  REFUND_WITHOUT_PAYMENT: 'O Mercado Pago mostra a ordem estornada, mas sem o pagamento dela não dá para conferir se o estorno foi total. Confira no app do Mercado Pago. Nada foi liberado.',
+  PARTIAL_REFUND: 'O Mercado Pago mostra estorno parcial; o sistema só registra estorno total. Registre a diferença com o gerente fora do sistema.',
+  CANCELLED_AFTER_APPROVAL: 'O Mercado Pago mostra este pagamento como cancelado, mas a cobrança foi aprovada: os dados se contradizem e não provam o estorno. Confira no app do Mercado Pago. Nada foi liberado.',
+} as const;
+
+/** Revisão própria do estorno parcial e do cancelado depois de aprovado; null para os outros casos. */
+function proofReview(row: TerminalChargeRow, proof: RefundProof): ChargeReply | null {
+  if (proof === 'partial') return stillInReview(row, 'PARTIAL_REFUND', PROOF_TEXT.PARTIAL_REFUND);
+  if (proof === 'cancelled_after_approval') return stillInReview(row, 'CANCELLED_AFTER_APPROVAL', PROOF_TEXT.CANCELLED_AFTER_APPROVAL);
+  return null;
 }
 
 function orderEvidence(order: PaymentTerminalChargeResult, payment: PointPaymentDetails | null, foundBy: string): Record<string, unknown> {
@@ -1115,6 +1153,7 @@ function orderEvidence(order: PaymentTerminalChargeResult, payment: PointPayment
     source: 'mercado_pago_order', found_by: foundBy, external_order_id: order.externalOrderId, order_status: order.rawStatus, order_status_detail: order.rawStatusDetail,
     external_reference: order.externalReference, external_terminal_id: order.externalTerminalId, amount_cents: order.amountCents, paid_amount_cents: order.paidAmountCents,
     external_payment_id: order.externalPaymentId, payment_status: payment?.status ?? null, payment_amount_cents: payment?.amountCents ?? null,
+    mp_status: payment?.status ?? null, mp_amount_refunded_cents: payment?.amountRefundedCents ?? null,
   };
 }
 
@@ -1122,6 +1161,7 @@ function paymentEvidence(payment: PointPaymentDetails, foundBy: string): Record<
   return {
     source: 'mercado_pago_payment', found_by: foundBy, external_payment_id: payment.id, payment_status: payment.status, payment_amount_cents: payment.amountCents,
     payment_type_id: payment.paymentTypeId, external_reference: payment.externalReference ?? null, payment_order_id: payment.orderId ?? null,
+    mp_status: payment.status, mp_amount_refunded_cents: payment.amountRefundedCents ?? null,
   };
 }
 
@@ -1220,7 +1260,9 @@ const REFUND_TEXT = {
   NO_PAYMENT_ID: 'A aprovação desta cobrança não tem o ID do pagamento no Mercado Pago, e sem ele o estorno não pode ser conferido. Confira no app do Mercado Pago. Nada foi alterado.',
   NOT_REFUNDED: 'O Mercado Pago não mostra este pagamento estornado ou cancelado. Nada foi alterado: o pagamento segue registrado na conta.',
   CHARGEBACK: 'O Mercado Pago mostra este pagamento contestado pelo cliente (chargeback), e contestação não prova estorno. Resolva com o Mercado Pago. Nada foi alterado: o pagamento segue registrado na conta.',
-  REFUSED: 'O banco recusou o estorno: o que o Mercado Pago mostrou não confere com a cobrança e o pagamento registrados. Nada foi alterado.',
+  REFUSED: 'O servidor recusou o registro do estorno (prova ou autorização). Nada foi alterado. Consulte de novo.',
+  PARTIAL_REFUND: 'O Mercado Pago mostra estorno parcial; o sistema só registra estorno total. Registre a diferença com o gerente fora do sistema.',
+  CANCELLED_AFTER_APPROVAL: 'O Mercado Pago mostra este pagamento como cancelado, mas ele foi aprovado e registrado: os dados se contradizem e não provam o estorno. Confira no app do Mercado Pago. Nada foi alterado: o pagamento segue registrado na conta.',
 } as const;
 
 function refundNotApplicable(): ChargeInputError {
@@ -1238,18 +1280,18 @@ function refundMismatch(row: TerminalChargeRow, detail: string): ChargeReply {
  * ChargeInputError (400/403/404/409).
  */
 export async function refundCharge(ctx: ChargeContext, input: ReconcileInput): Promise<ChargeReply> {
-  const req = validateReconcile(input);
+  const req = validateReconcile(input, { ignoreOperation: true });
   const row = await ctx.store.findByKey(req.idempotency_key);
   if (!row) throw new ChargeInputError('not_found', 'Cobrança não encontrada nesta loja.', 404);
   // Repetição: o estorno já está gravado; o aparelho só tira a trava com o Mercado Pago provando (sem PIN, sem gravar).
-  if (row.status === 'refunded') return confirmRefund(ctx, row);
+  if (row.status === 'refunded') return withPaymentRecord(ctx, row, await confirmRefund(ctx, row));
   // Antes do PIN: nada a estornar não gasta tentativa de PIN nem grava registro.
   if (row.status !== 'approved' || !(await ctx.store.hasRegisteredPayment(row.idempotency_key))) throw refundNotApplicable();
   if (!row.external_payment_id) return stillInReview(row, 'NO_PAYMENT_ID', REFUND_TEXT.NO_PAYMENT_ID);
   const auth = await authorizeWithPin(ctx, row, req, refundNotApplicable);
   // Relê depois do PIN: outro aparelho pode ter registrado o estorno no meio.
   const current = (await ctx.store.findByKey(row.idempotency_key)) ?? row;
-  if (current.status === 'refunded') return confirmRefund(ctx, current);
+  if (current.status === 'refunded') return withPaymentRecord(ctx, current, await confirmRefund(ctx, current));
   if (current.status !== 'approved' || current.external_payment_id !== row.external_payment_id) throw refundNotApplicable();
   const paymentId = row.external_payment_id;
   const payment = await readPayment(ctx, paymentId);
@@ -1260,7 +1302,13 @@ export async function refundCharge(ctx: ChargeContext, input: ReconcileInput): P
   if (payment.externalReference !== current.idempotency_key) return refundMismatch(current, 'referência');
   if (isOrdersApiId(payment.orderId) && current.external_order_id != null && payment.orderId !== current.external_order_id) return refundMismatch(current, 'ordem');
   if (payment.status === 'charged_back') return stillInReview(current, 'CHARGEBACK', REFUND_TEXT.CHARGEBACK);
-  if (!provesRefund(current, payment, paymentId)) return stillInReview(current, 'NOT_REFUNDED', REFUND_TEXT.NOT_REFUNDED);
+  // Auditoria interna 1: só estorno total (refunded com o valor estornado igual ao da cobrança); "cancelled" num
+  // pagamento aprovado e registrado é contradição; parcial tem a revisão própria.
+  const proof = refundProof(current, payment, paymentId);
+  if (proof === 'cancelled_after_approval') return stillInReview(current, 'CANCELLED_AFTER_APPROVAL', REFUND_TEXT.CANCELLED_AFTER_APPROVAL);
+  if (proof === 'partial') return stillInReview(current, 'PARTIAL_REFUND', REFUND_TEXT.PARTIAL_REFUND);
+  if (proof !== 'proven') return payment.status === 'refunded' ? refundMismatch(current, 'valor estornado') : stillInReview(current, 'NOT_REFUNDED', REFUND_TEXT.NOT_REFUNDED);
+  const refundedCents = payment.amountRefundedCents ?? null;
   let saved: TerminalChargeRow;
   try {
     saved = await ctx.store.refundPayment(current, { raw_status: clip(`payment_${payment.status}`, 50), raw_status_detail: 'PAYMENT_REFUNDED' }, {
@@ -1273,6 +1321,7 @@ export async function refundCharge(ctx: ChargeContext, input: ReconcileInput): P
         operation_id: payment.id,
         mp_payment_id: payment.id,
         mp_amount_cents: payment.amountCents,
+        mp_amount_refunded_cents: refundedCents,
         mp_external_reference: payment.externalReference,
         mp_status: payment.status,
         mp_status_detail: payment.statusDetail ?? null,
@@ -1283,14 +1332,20 @@ export async function refundCharge(ctx: ChargeContext, input: ReconcileInput): P
     if (error instanceof ChargeRefusedError) {
       // TF007: autorização já usada, cobrança não mais aprovada ou sem pagamento registrado. Nada foi gravado.
       if (error.code === 'not_applicable') throw new ChargeInputError('not_applicable', `${error.message} Nada foi alterado.`, 409);
-      // TF006: a prova não conferiu no banco. Nada foi gravado.
+      // TF006: prova ou autorização recusada pelo banco (o motivo exato fica no log do servidor). Nada foi gravado.
       if (error.code === 'invalid_reason') throw new ChargeInputError('refund_refused', REFUND_TEXT.REFUSED, 409);
       if (error.code === 'invalid_staff') throw new ChargeInputError(error.code, error.message, 403);
       if (error.code === 'not_found') throw new ChargeInputError('not_found', error.message, 404);
     }
     throw error;
   }
-  return reconcileReply(saved);
+  return withPaymentRecord(ctx, saved, reconcileReply(saved));
+}
+
+/** Estorno confirmado (DECLINED REFUNDED): diz ao aparelho se há pagamento gravado no servidor (como espelhar). */
+async function withPaymentRecord(ctx: ChargeContext, row: TerminalChargeRow, reply: ChargeReply): Promise<ChargeReply> {
+  if (reply.status !== 'DECLINED' || reply.code !== 'REFUNDED') return reply;
+  return { ...reply, payment_registered: await ctx.store.hasPaymentRecord(row.idempotency_key) };
 }
 
 async function reconcileReview(ctx: ChargeContext, row: TerminalChargeRow, auth: ReconcileAuth): Promise<ChargeReply> {
@@ -1337,8 +1392,14 @@ async function reconcileReview(ctx: ChargeContext, row: TerminalChargeRow, auth:
       return stillInReview(current, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
     case 'mismatch':
       // Pago e devolvido: só com o próprio pagamento da ordem mostrando o estorno.
-      if (verdict.code === 'PAYMENT_NOT_APPROVED' && provesRefund(current, verdict.payment, order.externalPaymentId)) {
-        return resolveTo(ctx, current, 'refunded', { raw_status: clip(`payment_${verdict.payment!.status}`, 50), raw_status_detail: 'PAYMENT_REFUNDED' }, auth, orderEvidence(order, verdict.payment, foundBy));
+      // Revisão manual: a cobrança nunca chegou a aprovada, então "cancelled" (nunca capturado) também prova.
+      if (verdict.code === 'PAYMENT_NOT_APPROVED') {
+        const proof = refundProof(current, verdict.payment, order.externalPaymentId, true);
+        if (proof === 'proven') {
+          return resolveTo(ctx, current, 'refunded', { raw_status: clip(`payment_${verdict.payment!.status}`, 50), raw_status_detail: 'PAYMENT_REFUNDED' }, auth, orderEvidence(order, verdict.payment, foundBy));
+        }
+        const review = proofReview(current, proof);
+        if (review) return review;
       }
       return verdictReview(current, verdict.code);
     case 'status':
@@ -1348,7 +1409,8 @@ async function reconcileReview(ctx: ChargeContext, row: TerminalChargeRow, auth:
         if (!order.externalPaymentId) return verdictReview(current, 'REFUND_WITHOUT_PAYMENT');
         const payment = await readPayment(ctx, order.externalPaymentId);
         if (!payment) return stillInReview(current, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
-        if (!provesRefund(current, payment, order.externalPaymentId)) return verdictReview(current, 'REFUND_NOT_PROVEN');
+        const proof = refundProof(current, payment, order.externalPaymentId, true);
+        if (proof !== 'proven') return proofReview(current, proof) ?? verdictReview(current, 'REFUND_NOT_PROVEN');
         return resolveTo(ctx, current, 'refunded', verdict.patch, auth, orderEvidence(order, payment, foundBy));
       }
       return resolveTo(ctx, current, verdict.status, verdict.patch, auth, orderEvidence(order, verdict.payment, foundBy));
@@ -1398,7 +1460,10 @@ async function reconcileApproved(ctx: ChargeContext, row: TerminalChargeRow, aut
     if (!row.external_payment_id) return mismatchReview(row, 'aprovação sem ID do pagamento');
     const payment = await readPayment(ctx, row.external_payment_id);
     if (!payment) return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
-    if (provesRefund(row, payment, row.external_payment_id)) return refund(payment, null);
+    const proof = refundProof(row, payment, row.external_payment_id);
+    if (proof === 'proven') return refund(payment, null);
+    const review = proofReview(row, proof);
+    if (review) return review;
     if (payment.id === row.external_payment_id && checkPayment(row, payment, row.external_order_id).kind === 'ok' && payment.externalReference === row.idempotency_key) return replyFor(row);
     return mismatchReview(row, 'pagamento');
   }
@@ -1417,11 +1482,24 @@ async function reconcileApproved(ctx: ChargeContext, row: TerminalChargeRow, aut
     if (verdict.patch.external_payment_id !== row.external_payment_id) return mismatchReview(row, 'ID do pagamento');
     return replyFor(row);
   }
-  // Estorno da ordem: a referência precisa vir ecoada (não basta faltar).
-  if (verdict.kind === 'status' && verdict.status === 'refunded' && order.externalReference === row.idempotency_key) return refund(null, order);
+  // Estorno da ordem: a referência precisa vir ecoada (não basta faltar), e o próprio pagamento (o que a ordem lista ou,
+  // sem isso, o desta aprovação) precisa mostrar o estorno total: só a ordem não diz quanto voltou.
+  if (verdict.kind === 'status' && verdict.status === 'refunded' && order.externalReference === row.idempotency_key) {
+    const paymentId = order.externalPaymentId ?? row.external_payment_id;
+    if (!paymentId) return stillInReview(row, 'REFUND_WITHOUT_PAYMENT', PROOF_TEXT.REFUND_WITHOUT_PAYMENT);
+    if (row.external_payment_id && paymentId !== row.external_payment_id) return mismatchReview(row, 'ID do pagamento');
+    const refundedPayment = await readPayment(ctx, paymentId);
+    if (!refundedPayment) return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
+    const refundedProof = refundProof(row, refundedPayment, paymentId);
+    if (refundedProof === 'proven') return refund(refundedPayment, order);
+    return proofReview(row, refundedProof) ?? verdictReview(row, 'REFUND_NOT_PROVEN');
+  }
   // Ordem em qualquer outro estado: só o próprio pagamento desta aprovação mostrando o estorno prova algo.
   const payment = verdict.kind === 'mismatch' && verdict.payment ? verdict.payment : row.external_payment_id ? await readPayment(ctx, row.external_payment_id) : null;
-  if (provesRefund(row, payment, row.external_payment_id)) return refund(payment, order);
+  const proof = refundProof(row, payment, row.external_payment_id);
+  if (proof === 'proven') return refund(payment, order);
+  const review = proofReview(row, proof);
+  if (review) return review;
   if (!payment && row.external_payment_id && verdict.kind !== 'mismatch') return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
   return mismatchReview(row, verdict.kind === 'mismatch' ? verdict.code : `ordem ${order.rawStatus ?? 'sem status'}`);
 }

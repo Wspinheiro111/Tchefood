@@ -152,6 +152,9 @@ export async function superviseSettledClaims(deps: SupervisorDeps = defaultDeps(
       }
       // Recusado pelo servidor: não renova (seria para sempre); o pagamento sai da conta e o caixa devolve.
       const rejected = deps.rejected(paid.id);
+      // Reserva pedida pela recuperação de um pagamento antigo (claimRecovery): nada some sozinho; o pagamento fica
+      // nos recusados com o caminho do gerente (retirada com PIN), sem renovar.
+      if (c.terms?.recovery && rejected !== null) continue;
       if (rejected !== null) {
         const w = deps.withdraw(c.key, REJECTED_REASON);
         const reason = withNfce(`O servidor recusou o pagamento (${rejected}): ele foi retirado desta conta. ${refundText(paid)}`, w);
@@ -172,6 +175,9 @@ export async function superviseSettledClaims(deps: SupervisorDeps = defaultDeps(
       const notInServer = deps.unpushed(paid.id) || deps.rejected(paid.id) !== null;
       // Recusa com código (TF004/TF005…) com o pagamento ainda fora do servidor: guarda o registro (o segredo) e tenta de novo.
       if (!t.ok && notInServer) continue;
+      // Recuperação liberada antes de o pagamento subir: não retira sozinho; o registro fica, e o pagamento, recusado
+      // ao subir, aparece em Retaguarda › Nuvem com o caminho do gerente.
+      if (t.ok && t.status === 'released' && notInServer && c.terms?.recovery) continue;
       if (t.ok && t.status === 'released' && notInServer) {
         const w = deps.withdraw(c.key, WITHDRAWN_REASON);
         const reason = withNfce(`${CLAIM_RELEASED_BEFORE_PUSH}: o pagamento foi retirado desta conta. ${refundText(paid)}`, w);

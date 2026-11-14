@@ -123,7 +123,9 @@ grava; a cobrança em andamento fica em `terminal_charges`).
 **Estorno do pagamento da Point já registrado (GPT r9 P1-01).** Pagamento APROVADO do Mercado Pago só vira REFUNDED
 por `tchefood_refund_point_payment(p_tenant, p_id, p_staff, p_reason, p_patch, p_evidence)` (só a service role, chamada
 pela Edge Function): PIN de gerente pela conferência (`tchefood_authorize_point_reconcile`, uso único) e o estorno
-provado no Mercado Pago (mesmo pagamento, valor e referência; `refunded` ou `cancelled`; contestação nunca). Numa
+provado no Mercado Pago (mesmo pagamento, valor e referência; `refunded` com o valor estornado igual ao valor,
+`mp_amount_refunded_cents`; `cancelled` só existe antes da aprovação e é recusado; estorno parcial não tem caminho;
+contestação nunca; autorização de até 10 min, pedida com a cobrança já aprovada; motivo de 10 a 500 caracteres). Numa
 transação, com as travas na ordem PIN, conta, cobrança, pagamento: a cobrança vira `refunded`, o pagamento REFUNDED, a
 conta é recalculada e fica UM registro `POINT_PAYMENT_REFUNDED` (gerente, motivo, prova). Conta ainda aberta: o saldo
 volta. Conta já fechada: continua fechada, mostrando o saldo devolvido (como na main, a conta encerrada não reabre).
@@ -132,15 +134,19 @@ cobrança estornada sem gravar de novo.
 Quem chama é a ação `refund` da point-charge (`refundCharge`), pedida na retaguarda (Conciliação → "Pagamentos da
 Point" → "Registrar estorno", PIN de gerente e motivo). Antes do PIN ela confere que a cobrança está aprovada com o
 pagamento registrado (senão 409; a aprovada sem pagamento segue pela conferência). Depois do PIN lê só o próprio
-pagamento (`GET /v1/payments/{id}`, token da loja) e exige o mesmo ID, o mesmo valor, a referência ecoada (= chave) e
-`refunded`/`cancelled`; a prova enviada ao banco é montada só com essa resposta. Sem prova não grava nada e responde
-revisão (`NOT_REFUNDED`, `CHARGEBACK`, `MISMATCH`, `MP_UNAVAILABLE`, `NO_PAYMENT_ID`); recusa do banco = 409
-(`refund_refused` / `not_applicable`). Gravado, o aparelho que pediu espelha o pagamento REFUNDED e o saldo e tira a
+pagamento (`GET /v1/payments/{id}`, token da loja) e exige o mesmo ID, o mesmo valor, a referência ecoada (= chave),
+status `refunded` e `transaction_amount_refunded` igual ao valor da cobrança (só estorno total); a prova enviada ao
+banco (com `mp_amount_refunded_cents`) é montada só com essa resposta. Sem prova não grava nada e responde revisão
+(`NOT_REFUNDED`, `PARTIAL_REFUND`, `CANCELLED_AFTER_APPROVAL` — `cancelled` num pagamento aprovado é contradição —,
+`CHARGEBACK`, `MISMATCH`, `MP_UNAVAILABLE`, `NO_PAYMENT_ID`); recusa do banco = 409 (`refund_refused`, texto neutro, /
+`not_applicable`). Motivo de 10 a 500 caracteres (também na conferência); `operation_id` é ignorado no estorno. A
+resposta do estorno confirmado traz `payment_registered` (há pagamento do Mercado Pago gravado com a chave). Gravado, o aparelho que pediu espelha o pagamento REFUNDED e o saldo e tira a
 trava da chave; os outros aparelhos não recebem pagamentos pela nuvem (`applyCloudSnapshot` não traz pagamentos).
 Sem resposta conclusiva, o aparelho não muda nada e pede para repetir (a repetição não grava duas vezes).
 
-**Pagamento aprovado é final.** Fora desse estorno, nenhum papel (aparelho, service role, dono do banco) tira um
-pagamento de APROVADO: DECLINED, PENDING ou REFUNDED fora do Mercado Pago são TF007 (`approved_is_final`). Estorno
+**Pagamento aprovado é final por UPDATE.** Fora desse estorno, nenhum papel (aparelho, service role, dono do banco)
+tira um pagamento de APROVADO por UPDATE (DELETE da linha pela service role ou pelo dono do banco continua possível,
+como na main; o aparelho não apaga pagamento): DECLINED, PENDING ou REFUNDED fora do Mercado Pago são TF007 (`approved_is_final`). Estorno
 fora do Mercado Pago (Stone, PagBank, dinheiro) não tem caminho no sistema (como na main); fica decisão do Will.
 
 **Chave conferida em todo status (auditoria r8 P1-01).** Fora do Mercado Pago, pagamento com a chave de uma cobrança
@@ -179,12 +185,21 @@ repete a liberação que falhou por rede.
   (`stale` em `tchefood_point_reservation`, relógio do banco); antes disso mostra "cobrando em outro aparelho", sem
   ação;
 - estornada: só leitura, sem PIN e sem gravar nada. Com o ID do pagamento: o pagamento precisa provar o estorno (mesmo
-  ID, valor e referência; `refunded` ou `cancelled`; contestação `charged_back` nunca serve aqui). Sem o ID do
+  ID, valor e referência; `refunded` com `transaction_amount_refunded` igual ao valor; contestação `charged_back` nunca
+  serve aqui). Sem o ID do
   pagamento: a própria ordem lida agora, a mesma ligada, estornada, ecoando referência e maquininha e com o mesmo
-  valor (se ela passar a informar um pagamento, vale o pagamento). Provado: "recusada" com `code: REFUNDED`, e o
+  valor, e o pagamento que ela lista provando o estorno total (ordem sem pagamento = `REFUND_WITHOUT_PAYMENT`: só a
+  ordem não diz quanto voltou). Na aprovada sem pagamento registrado, a ordem estornada também só vale com o
+  pagamento (o da ordem ou, sem ele, o da aprovação) provando o estorno total; a prova gravada leva `mp_status` e
+  `mp_amount_refunded_cents`. Provado: "recusada" com `code: REFUNDED`, e o
   aparelho tira a trava avisando "estornada no Mercado Pago".
 - contestação (`charged_back`) nunca prova estorno, com ou sem PIN, em nenhum `status_detail` (decisão do Will,
   auditoria interna 3): a cobrança fica em revisão manual e o gerente resolve com o Mercado Pago.
+- só estorno total prova (auditoria interna 1), em toda conferência pelo pagamento: `refunded` com
+  `transaction_amount_refunded` igual ao valor. Valor estornado menor = `PARTIAL_REFUND` (o sistema não registra
+  estorno parcial). `cancelled` só prova na cobrança em revisão manual (nunca chegou a aprovada); na aprovada ou na
+  estornada é contradição: `CANCELLED_AFTER_APPROVAL`. Nada é gravado nesses casos. A prova gravada pelo fim
+  verificado leva `mp_amount_refunded_cents`.
 
 Trava do aparelho quando a conferência responde "não há o que conferir" (409): o app lê o estado gravado (ação
 `status`) e só tira a trava com o fim provado no servidor: recusada/cancelada/expirada, ou aprovada (409 numa aprovada

@@ -175,7 +175,8 @@ export async function pointPaymentOnServer(orderId: string, idempotencyKey: stri
  *    seguro (a repetição não grava de novo) e é o único jeito de saber.
  */
 export type RefundOutcome =
-  | { kind: 'refunded' }
+  /** paymentRegistered: o servidor diz se há pagamento do Mercado Pago gravado com a chave (ausente = não disse). */
+  | { kind: 'refunded'; paymentRegistered?: boolean }
   | { kind: 'not_proven'; code: string; error: string }
   | { kind: 'pin'; error: string }
   | { kind: 'refused'; error: string }
@@ -222,7 +223,9 @@ export async function refundPointPayment(input: RefundInput, deps: ReconcileDeps
       const parsed = parseChargeReply(out.text);
       // Resposta de outra cobrança não prova nada sobre esta.
       const reply = parsed && parsed.idempotency_key === input.idempotency_key ? parsed : null;
-      if (reply?.status === 'DECLINED' && obj?.code === 'REFUNDED') return { kind: 'refunded' };
+      if (reply?.status === 'DECLINED' && obj?.code === 'REFUNDED') {
+        return typeof obj.payment_registered === 'boolean' ? { kind: 'refunded', paymentRegistered: obj.payment_registered } : { kind: 'refunded' };
+      }
       if (reply?.status === 'MANUAL_REVIEW') return { kind: 'not_proven', code: reply.code, error: reply.reason };
       // APPROVED, DECLINED sem REFUNDED, PENDING ou resposta ilegível: não é a resposta deste pedido.
       return { kind: 'unknown', error: REFUND_UNKNOWN };

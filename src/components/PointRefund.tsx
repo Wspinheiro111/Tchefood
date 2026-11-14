@@ -51,14 +51,14 @@ export function PointRefundButton({ payment, label }: { payment: Payment; label:
   );
 }
 
-/** Pagamentos da Point aprovados e registrados no período, com o pedido de estorno. */
+/** Pagamentos da Point aprovados neste aparelho no período (o servidor pode ainda não ter algum), com o pedido de estorno. */
 export function PointRefunds({ payments }: { payments: readonly Payment[] }) {
   const rows = useMemo(() => payments.filter((p) => p.acquirer === 'MERCADO_PAGO' && p.status === 'APPROVED' && p.idempotency_key), [payments]);
   if (rows.length === 0) return null;
   return (
     <div className="rounded-2xl border border-slate-200 bg-surface p-4 text-sm">
-      <div className="mb-1 font-bold">Pagamentos da Point (Mercado Pago)</div>
-      <p className="mb-2 text-xs text-slate-500">Estornou uma venda na maquininha ou no app do Mercado Pago? Registre aqui com o PIN do gerente.</p>
+      <div className="mb-1 font-bold">Pagamentos da Point aprovados neste aparelho (Mercado Pago)</div>
+      <p className="mb-2 text-xs text-slate-500">Lista deste aparelho: algum pode ainda não ter chegado ao servidor. Estornou uma venda na maquininha ou no app do Mercado Pago? Registre aqui com o PIN do gerente; o servidor confere a cobrança no Mercado Pago.</p>
       {rows.map((p) => {
         const label = `${new Date(p.created_at).toLocaleTimeString('pt-BR')} · ${p.card_brand ?? 'cartão'} · NSU ${p.nsu ?? '?'}`;
         return (
