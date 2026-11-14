@@ -2648,6 +2648,49 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     forgetPinFailures();
   }, 30_000);
 
+  it('janela de 60 s na conciliação do cashback pelo relógio de agora: falha vencida durante a espera não bloqueia, e a falha grava a hora da conferência (P2-01 da rodada 2 do GPT no PR #50)', async () => {
+    vi.useRealTimers();
+    forgetPinFailures();
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    const customer = sql(`SELECT id FROM loyalty_customers WHERE tenant_id = '${TENANT}' LIMIT 1`);
+    const hold = crypto.randomUUID();
+    sql(`INSERT INTO cashback_ledger (id, tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, created_by_user_id)
+         VALUES ('${hold}', '${TENANT}', '${customer}', NULL, 'HOLD', 2.50, 0, '${cashier}');`);
+    const PIN_LOCK = `SELECT pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || '${TENANT}'));`;
+    const PIN_HELD = `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity s ON s.pid = l.pid WHERE s.application_name = 'tchefood_holder' AND l.locktype = 'advisory' AND l.granted)`;
+    const waiting = (app: string) => `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = '${app}' AND wait_event_type = 'Lock' AND wait_event = 'advisory')`;
+    const reconcile = (pin: string, app: string) => pinSession(`SELECT tchefood_reconcile_cashback('${crypto.randomUUID()}', 'HOLD', '${customer}', '${hold}', 'DISCARD', 2.50, '${pin}', '${cashier}', 'Conferido com o cliente')->>'status';`, app);
+    const recent = (type: string) => sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = '${type}'
+         AND metadata->>'attempted_action' = 'CASHBACK_RECONCILED' AND created_at >= NOW() - INTERVAL '60 seconds'`);
+    const failures = (when: string) => sql(`INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata, created_at)
+         SELECT '${TENANT}', '${cashier}', 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto', '{}'::jsonb, ${when} FROM generate_series(1, 3);`);
+
+    // Três falhas que vencem durante a espera pela trava: a conciliação com o PIN certo passa.
+    failures(`clock_timestamp() - INTERVAL '58 seconds'`);
+    let holder = await holdLock(PIN_LOCK, PIN_HELD);
+    const late = reconcile(MANAGER_PIN, 'tchefood_late_reconcile');
+    await waitFor(waiting('tchefood_late_reconcile'));
+    await new Promise((r) => setTimeout(r, 3000));
+    await holder.release();
+    expect(await late).toBe('OK');
+    expect(sql(`SELECT count(*) FROM cashback_reconciliations WHERE hold_id = '${hold}'`)).toBe('1');
+    expect(recent('MANAGER_PIN_LOCKOUT')).toBe('0');
+
+    // A falha que esperou pela trava grava a hora da conferência, não a do início da transação.
+    forgetPinFailures();
+    holder = await holdLock(PIN_LOCK, PIN_HELD);
+    const wrong = reconcile('0000', 'tchefood_wrong_reconcile');
+    await waitFor(waiting('tchefood_wrong_reconcile'));
+    await new Promise((r) => setTimeout(r, 1500));
+    const released = sql(`SELECT clock_timestamp()`);
+    await holder.release();
+    expect(await wrong).toBe('PIN_FAILED');
+    expect(sql(`SELECT created_at >= '${released}'::timestamptz FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'
+         AND metadata->>'attempted_action' = 'CASHBACK_RECONCILED' ORDER BY server_seq DESC LIMIT 1`)).toBe('t');
+    expect(sql(`SELECT count(*) FROM cashback_reconciliations WHERE hold_id = '${hold}'`)).toBe('1');
+    forgetPinFailures();
+  }, 30_000);
+
   it('troca de barril com PIN de gerente: histórico, audit_log e barril novo pela função do servidor', async () => {
     forgetPinFailures();
     const tapId = crypto.randomUUID();
