@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Copy, ExternalLink, FileJson, Printer, Receipt, RefreshCw } from 'lucide-react';
-import { useTcheStore } from '../store/useTcheStore';
+import { isRealFiscalStore, useTcheStore } from '../store/useTcheStore';
 import { buildNfce, formatAccessKey, isValidNfceQrCodeContent, serverNfceDocument } from '../lib/nfce';
 import { danfeLines, type DanfeDoc } from '../lib/receipts';
 import { printDocument } from '../lib/payments/drivers';
@@ -33,7 +33,8 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
   const order = s.orders.find((o) => o.id === orderId);
   const table = s.tables.find((t) => t.id === order?.table_id);
   const [tab, setTab] = useState<'danfe' | 'json'>('danfe');
-  const cloud = s.cloud !== null;
+  // Loja da nuvem, mesmo desconectada: só mostra o que o servidor devolveu.
+  const cloud = isRealFiscalStore(s);
   const rec = (s.nfceCloud ?? {})[orderId];
 
   // Demonstração: nota simulada a partir da comanda. Nuvem: só o que o servidor devolveu

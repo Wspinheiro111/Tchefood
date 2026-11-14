@@ -396,6 +396,11 @@ interface DeviceSlice {
   nfceCloud: Record<UUID, NfceCloudRecord>;
   /** Comandas que o operador pediu para emitir/consultar já (botão da tela). */
   nfceForced: UUID[];
+  /**
+   * Loja da nuvem a que os dados deste aparelho pertencem, mesmo com a sessão
+   * desconectada. Enquanto for a loja atual, a NFC-e é real (servidor), nunca simulada.
+   */
+  cloudTenantId: UUID | null;
 }
 
 interface Actions {
@@ -638,6 +643,7 @@ function initialDevice(): DeviceSlice {
     pullStatus: EMPTY_PULL_STATUS,
     nfceCloud: {},
     nfceForced: [],
+    cloudTenantId: null,
   };
 }
 
@@ -797,6 +803,14 @@ export function isValidCnpj(cnpj: string): boolean {
     return r < 2 ? 0 : 11 - r;
   };
   return calc(12) === Number(cnpj[12]) && calc(13) === Number(cnpj[13]);
+}
+
+/**
+ * NFC-e real (servidor) ou simulada (demonstração)? Real quando há sessão da nuvem ou
+ * quando os dados do aparelho são de uma loja da nuvem que só foi desconectada.
+ */
+export function isRealFiscalStore(s: { cloud: CloudSession | null; cloudTenantId?: UUID | null; tenant: { id: UUID } }): boolean {
+  return s.cloud !== null || (s.cloudTenantId != null && s.cloudTenantId === s.tenant.id);
 }
 
 export const useTcheStore = create<TcheState>()(
@@ -1095,9 +1109,9 @@ export const useTcheStore = create<TcheState>()(
           return { order: recalculated, orderItems, nfceSeq: s.nfceSeq, table: null, closed: false };
         }
         const table = s.tables.find((t) => t.id === recalculated.table_id);
-        // Loja na nuvem: a NFC-e é real e sai do servidor (emit-nfce) depois que a conta
-        // sobe; até lá fica pendente, sem chave. Sem nuvem (demonstração), segue simulada.
-        const real = s.cloud !== null;
+        // Loja na nuvem (mesmo desconectada): a NFC-e é real e sai do servidor (emit-nfce)
+        // depois que a conta sobe; até lá fica pendente, sem chave. Demonstração: simulada.
+        const real = isRealFiscalStore(s);
         const nfceSeq = real ? s.nfceSeq : s.nfceSeq + 1;
         return {
           order: {
@@ -3625,6 +3639,7 @@ export const useTcheStore = create<TcheState>()(
             nfceSeq: 1,
             nfceCloud: {},
             nfceForced: [],
+            cloudTenantId: linkedCloud ? tenantId : null,
             syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
             pullStatus: EMPTY_PULL_STATUS,
           });
@@ -3638,7 +3653,8 @@ export const useTcheStore = create<TcheState>()(
           if (session && session.tenant_id !== get().tenant.id) {
             return fail('Esta conta da nuvem é de outra loja. Use a conta desta loja ou inicie uma loja nova.');
           }
-          set({ cloud: session });
+          // Desconectar (session null) não volta a loja para demonstração: cloudTenantId fica.
+          set(session ? { cloud: session, cloudTenantId: session.tenant_id } : { cloud: null });
           return { ok: true, data: undefined };
         },
 
@@ -3715,6 +3731,7 @@ export const useTcheStore = create<TcheState>()(
             nfceSeq: 1,
             nfceCloud: {},
             nfceForced: [],
+            cloudTenantId: tenantId,
             syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
             pullStatus: { last_pull_at: ts, last_error: null, cloud_staff_unknown: 0 },
           });

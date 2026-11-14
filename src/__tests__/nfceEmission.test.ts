@@ -160,6 +160,21 @@ describe('fechamento da conta com a loja na nuvem', () => {
     expect(order(id).nfce_key).toHaveLength(44);
   });
 
+  it('loja da nuvem desconectada continua real: conta fecha pendente e é emitida ao reconectar', () => {
+    const tenantId = st().tenant.id;
+    expect(st().setCloudSession(session(tenantId)).ok).toBe(true);
+    expect(st().setCloudSession(null).ok).toBe(true);
+    expect(st().cloud).toBeNull();
+    const seq = st().nfceSeq;
+    const id = closeOrder();
+    expect(order(id)).toMatchObject({ status: 'CLOSED', nfce_status: 'PENDING', nfce_key: null });
+    expect(st().nfceSeq).toBe(seq);
+    expect(st().requestNfceNow(id).ok).toBe(false); // sem sessão não pede
+    expect(st().setCloudSession(session(tenantId)).ok).toBe(true);
+    useTcheStore.setState({ outbox: [] });
+    expect(dueNfceOrders(st(), Date.now())).toContain(id);
+  });
+
   it('na nuvem a conta fecha com NFC-e pendente e sem chave; sai depois que a conta sobe', () => {
     useTcheStore.setState({ cloud: session(st().tenant.id) });
     const seq = st().nfceSeq;

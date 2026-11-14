@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { AlertTriangle, BarChart3, Bike, CreditCard, Gauge, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
-import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
+import { isManagerRole, isRealFiscalStore, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { ReportHeader } from '../components/Brand';
 import { formatBRL, toCents } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
@@ -301,7 +301,7 @@ function AuditCenter() {
 function NfceList() {
   const orders = useTcheStore((s) => s.orders);
   const tables = useTcheStore((s) => s.tables);
-  const cloud = useTcheStore((s) => s.cloud !== null);
+  const cloud = useTcheStore(isRealFiscalStore);
   const records = useTcheStore((s) => s.nfceCloud);
   // Nuvem: toda conta fechada com valor tem NFC-e real (mesmo pendente, sem chave ainda).
   const closed = orders
