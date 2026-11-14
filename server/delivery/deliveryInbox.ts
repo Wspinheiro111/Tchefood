@@ -149,10 +149,17 @@ export class DeliveryInbox {
       // Ordem cronológica: PLC antes de CFM do mesmo pedido.
       const ordered = [...events].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       const toAck: DeliveryEvent[] = [];
+      // Pedido com evento que falhou neste ciclo: os eventos seguintes dele também ficam sem ack, para voltarem
+      // juntos e na ordem (ex.: HSD que falhou não pode ser aplicado depois do HSS que fecha a negociação).
+      const blockedOrders = new Set<string>();
       for (const event of ordered) {
         // Evento sem pedido (ou que não deu para ler): confirmado e ignorado, senão volta para sempre no polling.
         if (!event.externalOrderId) {
           toAck.push(event);
+          continue;
+        }
+        if (blockedOrders.has(event.externalOrderId)) {
+          report.deferred += 1;
           continue;
         }
         try {
@@ -162,6 +169,7 @@ export class DeliveryInbox {
           toAck.push(event);
         } catch (error) {
           // Não confirma: o app reenvia e tentamos de novo no próximo ciclo.
+          blockedOrders.add(event.externalOrderId);
           report.deferred += 1;
           report.error = describe(error);
         }

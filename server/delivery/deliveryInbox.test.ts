@@ -372,6 +372,32 @@ describe("caixa de entrada de delivery", () => {
     expect(record.order.status).toBe("cancelled");
   });
 
+  it("evento que falhou segura os seguintes do mesmo pedido: negociação fechada não reabre", async () => {
+    const { sandbox, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    const other = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    await inbox.performAction("ifood", id, "confirm");
+    await inbox.runCycle();
+    sandbox.openDispute(id);
+    sandbox.pushRawEvent({ id: "hss-1", code: "HSS", fullCode: "HANDSHAKE_SETTLEMENT", orderId: id, merchantId: sandbox.merchantId, createdAt: new Date(Date.now() + 1_000).toISOString(), metadata: {} });
+    sandbox.emitFromMarketplace(other, "CCR");
+    const recordEvent = repository.recordEvent.bind(repository);
+    // Só o HSD falha ao gravar.
+    const spy = vi.spyOn(repository, "recordEvent").mockImplementation(async (event) => {
+      if (event.rawCode === "HSD") throw new Error("banco fora do ar");
+      return recordEvent(event);
+    });
+    const first = await inbox.runCycle();
+    expect(first[0]).toMatchObject({ acknowledged: 1, deferred: 2 });
+    spy.mockImplementation(recordEvent);
+    const second = await inbox.runCycle();
+    expect(second[0]).toMatchObject({ acknowledged: 2, deferred: 0 });
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record.dispute).toBeNull();
+    expect((await repository.getOrder("ifood", other))!.reviewReasons.join(" ")).toMatch(/cancelamento/);
+  });
+
   it("negociação vencida ou proposta de outra negociação não chegam ao iFood", async () => {
     let clock = new Date("2026-11-14T15:00:00.000Z");
     const { sandbox, api, inbox } = setup({ now: () => clock });

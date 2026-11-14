@@ -7,7 +7,7 @@ import type { DeliveryChannelKey, DeliveryEvent } from "./marketplace";
 
 export type RestFetch = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string },
+  init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
 
 export type SupabaseDeliveryRepositoryOptions = {
@@ -105,6 +105,8 @@ export class SupabaseDeliveryRepository implements DeliveryRepository {
           accept: "application/json",
         },
         body: JSON.stringify(args),
+        // Sem o signal o abort do prazo não cancelaria a requisição: ela seguiria (e poderia gravar) em segundo plano.
+        signal: controller.signal,
       });
       return { status: response.status, ok: response.ok, text: await response.text() };
     })();
