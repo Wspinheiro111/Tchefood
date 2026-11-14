@@ -134,7 +134,7 @@ const DEFINITE_FAILURES: readonly string[] = ["invalid_request", "not_found", "c
 // entra mesmo sem detalhe, para a loja ver e confirmar pelo portal antes que o app cancele por falta de confirmação.
 // Falhas temporárias (fora do ar, limite de uso, tempo esgotado) não contam: só adiam.
 export const ORDER_DETAIL_MAX_FAILURES = 10;
-const PERSISTENT_DETAIL_FAILURES: readonly string[] = ["auth_failed", "not_found"];
+const PERSISTENT_DETAIL_FAILURES: readonly string[] = ["auth_failed", "not_found", "invalid_request"];
 
 export class DeliveryInbox {
   private readonly adapters = new Map<DeliveryChannelKey, DeliveryMarketplaceAdapter>();
