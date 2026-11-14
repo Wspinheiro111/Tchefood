@@ -25,7 +25,8 @@ iFood ──polling 30 s──> servidor (Node, 1 instância) ──service_role
 
 ### API do servidor (para a tela, no item 5 do piloto)
 
-Todas exigem `Authorization: Bearer <JWT da sessão do app>`, menos `/health`.
+Todas exigem `Authorization: Bearer <JWT da sessão do app>`, menos `/health`. Corpo acima de 16 KB: 413
+`{error: "Corpo grande demais."}` com `connection: close` (o servidor para de ler, responde e só depois fecha a conexão).
 
 Cancelar, responder negociação, pausar e retomar a loja são ações de gerente: o corpo leva também
 `authorization: {managerPin, performedBy, requestId, reason}` (PIN de gerente de 4 a 6 dígitos, UUID do operador,
@@ -42,12 +43,18 @@ tentativa com esse id falhou antes de chegar ao iFood (banco fora do ar na reser
 `RETRY_WITH_NEW_ID` (nada foi enviado; a tela gera outro `requestId` e pede o PIN de novo). O que o gerente
 aprovou fica em `audit_logs.metadata.details`.
 
+Pausa e cancelamento com resultado incerto (tempo esgotado, iFood fora do ar ou resposta estranha depois de enviar):
+o status HTTP do erro (503/502) com `code: "uncertain"` e "pode ter sido aplicado; confira a lista de pausas (ou o pedido
+no Portal do Parceiro) antes de tentar de novo", nunca só "iFood indisponível". A tela relê `GET .../pauses` antes de
+oferecer outra pausa. Recusa clara do iFood (4xx) continua com o código do erro (nada foi aplicado).
+
 Se o iFood aceitou e o banco falhou logo depois (cancelamento e negociação): 503 com `code: "sent_not_saved"` e "Enviado ao
 iFood, mas não deu para gravar; confira o pedido antes de repetir." O pedido fica reservado (nova tentativa recusada) até o
 evento do app chegar. A reserva de cancelamento sem confirmação (chamada em andamento, ou falha sem resposta clara: rede,
 5xx) não se libera só pelo tempo: passados 10 min sem evento nenhum, a nova tentativa só vai se o corpo trouxer
 `confirmUncertainRetry: true` (o gerente conferiu no Portal do Parceiro que o pedido não está cancelado nem com
-cancelamento em análise; a decisão fica em `audit_logs.metadata.details`). Sem ela: 409. Com ela, o servidor consulta o
+cancelamento em análise; a decisão fica em `audit_logs.metadata.details`). Sem ela: 409. Dentro dos 10 min, o 409
+diz a partir de que horas (horário de Brasília, `reservedAt` + 10 min) a repetição com a conferência vale. Com ela, o servidor consulta o
 pedido no iFood (`GET /orders/{id}`): consulta falhou, 409 e segue bloqueado ("confira no Portal do Parceiro"); pedido já
 cancelado no detalhe, grava e recusa (com o iFood esse ramo nunca roda: o mapeamento do detalhe sempre devolve `placed`,
 então no iFood a única proteção contra o pedido repetido é o `confirmUncertainRetry` do gerente); senão pede de novo uma vez e marca o pedido para conferência ("o pedido de cancelamento
@@ -63,9 +70,9 @@ abriram). Não é garantia de idempotência do iFood.
 | Método e rota | O que faz |
 |---|---|
 | `GET /health` | Público: `ok`, `running`, `merchants`, `lastCycleAt` e `hasError` (sim/não). O texto do erro fica só no log. |
-| `POST /ifood/orders/:id/actions/:acao` | `confirm`, `start_preparation`, `ready_for_pickup`, `dispatch` |
+| `POST /ifood/orders/:id/actions/:acao` | `confirm`, `start_preparation`, `ready_for_pickup`, `dispatch`. 200 com o pedido **ainda no status de antes** (o novo só chega com o evento do iFood) e `actionSent: <ação>`: a tela mostra "enviado, aguardando o app" no lugar do botão. A mesma ação de novo para o mesmo pedido em até 60 s, sem evento novo do pedido: 409 "Ação já enviada ao app, aguardando a confirmação dele" sem chamar o iFood (só em memória do processo; só depois de sucesso, então a nova tentativa depois de uma falha segue normal) |
 | `GET /ifood/orders/:id/cancellation-reasons` | Motivos que o iFood aceita agora para o pedido |
-| `POST /ifood/orders/:id/cancellation` | `{code, description, details?, authorization}`; o código precisa estar na lista atual |
+| `POST /ifood/orders/:id/cancellation` | `{code, description, details?, authorization}`; o código precisa estar na lista atual. Lista vazia (pedido concluído, cancelado ou fora da janela): 400 "O iFood não aceita cancelamento deste pedido agora." |
 | `POST /ifood/orders/:id/dispute` | Resposta à negociação (corpo abaixo), mais `authorization` (PIN de gerente) e `disputeId` da negociação mostrada (obrigatório: ausente ou fora do formato dá 400, outra negociação dá 409, os dois antes do PIN e sem chamar o iFood). A resposta só vai para essa negociação; se o app trocar a negociação depois da conferência, a reserva dá 409 sem chamar o iFood |
 | `GET /ifood/merchants/:id/status` | Loja aberta/fechada no iFood |
 | `GET /ifood/merchants/:id/pauses` | Pausas ativas |

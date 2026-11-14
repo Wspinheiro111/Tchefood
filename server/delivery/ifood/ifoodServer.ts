@@ -316,6 +316,10 @@ const ACTIONS: Readonly<Record<string, DeliveryOrderAction>> = {
   dispatch: "dispatch",
 };
 
+const UNCERTAIN_PAUSE = "A pausa pode ter sido aplicada no iFood (sem resposta clara); confira a lista de pausas antes de tentar de novo.";
+const UNCERTAIN_CANCELLATION =
+  "O cancelamento pode ter sido aplicado no iFood (sem resposta clara); confira o pedido no Portal do Parceiro antes de tentar de novo.";
+
 // Pausa: até 24 h por vez (pausa mais longa é fechar a loja no Portal do Parceiro).
 const MAX_PAUSE_MINUTES = 24 * 60;
 
@@ -335,7 +339,9 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
 
   // PIN de gerente conferido no banco antes de qualquer chamada ao iFood; o resultado da chamada também fica no
   // audit_logs. Falha ao gravar o resultado não muda a resposta (a autorização já está gravada), mas vai para o log.
-  const withManager = async (token: string, request: ManagerRequest, run: () => Promise<ApiResponse>): Promise<ApiResponse> => {
+  // uncertainMessage: com resultado incerto (tempo esgotado, iFood fora do ar ou resposta estranha depois de enviar), a
+  // resposta diz que pode ter sido aplicado (code "uncertain") em vez de só "iFood indisponível", que convida a repetir.
+  const withManager = async (token: string, request: ManagerRequest, run: () => Promise<ApiResponse>, uncertainMessage?: string): Promise<ApiResponse> => {
     const decision = await options.approval.authorize(token, request);
     if (decision.status !== "OK") {
       return { status: decision.status === "CONFLICT" ? 409 : 403, body: { error: decision.message, code: decision.status } };
@@ -370,6 +376,10 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
       // O iFood aceitou e só a gravação local falhou: para a auditoria, foi enviado.
       const outcome: ManagerOutcome = error instanceof DeliverySentNotSavedError ? "sent" : definite ? "failed" : "uncertain";
       await record(outcome, error instanceof Error ? error.message : String(error));
+      if (outcome === "uncertain" && uncertainMessage && error instanceof DeliveryMarketplaceError) {
+        log(`[ifood] ${request.action} com resultado incerto: ${error.message}`);
+        return { status: errorResponse(error).status, body: { error: uncertainMessage, code: "uncertain" } };
+      }
       throw error;
     }
   };
@@ -400,7 +410,9 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
         if (request.method === "POST" && order[3]) {
           const action = ACTIONS[order[3]];
           if (!action) return { status: 404, body: { error: "Ação desconhecida." } };
-          return { status: 200, body: publicRecord(await options.inbox.performAction("ifood", orderId, action)) };
+          // O pedido volta com o status de antes: o novo só chega com o evento do iFood. actionSent diz à tela que a ação
+          // foi aceita ("enviado, aguardando o app"); repetir a mesma ação logo em seguida é 409 sem chamar o iFood.
+          return { status: 200, body: { ...publicRecord(await options.inbox.performAction("ifood", orderId, action)), actionSent: action } };
         }
         if (request.method === "GET" && route === "cancellation-reasons") {
           return { status: 200, body: await options.inbox.listCancellationReasons("ifood", orderId) };
@@ -414,6 +426,8 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
           // O motivo tem que ser um dos que o iFood oferece agora para este pedido (conferido antes do PIN).
           const reasons = await options.inbox.listCancellationReasons("ifood", orderId);
+          // Sem nenhum motivo (pedido concluído, cancelado ou fora da janela), o iFood não deixa cancelar agora.
+          if (reasons.length === 0) return { status: 400, body: { error: "O iFood não aceita cancelamento deste pedido agora." } };
           const reason = reasons.find((candidate) => candidate.code === code);
           if (!reason) return { status: 400, body: { error: "Motivo não está entre os aceitos pelo iFood para este pedido." } };
           // Repetir um cancelamento que ficou sem confirmação (prazo da reserva vencido) é decisão do gerente depois de
@@ -432,10 +446,15 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
             merchantExternalId: null,
             details: { code: reason.code, reason: sent, ...(confirmUncertainRetry ? { confirmUncertainRetry } : {}) },
           };
-          return await withManager(token, cancel, async () => ({
-            status: 200,
-            body: publicRecord(await options.inbox.requestCancellation("ifood", orderId, reason, sent, { confirmUncertainRetry })),
-          }));
+          return await withManager(
+            token,
+            cancel,
+            async () => ({
+              status: 200,
+              body: publicRecord(await options.inbox.requestCancellation("ifood", orderId, reason, sent, { confirmUncertainRetry })),
+            }),
+            UNCERTAIN_CANCELLATION,
+          );
         }
         if (request.method === "POST" && route === "dispute") {
           const body = parseBody(request.body);
@@ -488,7 +507,7 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
             // O id da interrupção é o id da tentativa: a mesma tentativa nunca cria duas pausas no iFood.
             const created = await options.api.pauseStore(merchantId, { id: manager.requestId, description, start: start.toISOString(), end: end.toISOString() });
             return { status: 201, body: created };
-          });
+          }, UNCERTAIN_PAUSE);
         }
         if (request.method === "DELETE" && merchant[2] === "pauses" && merchant[3]) {
           const pauseId = merchant[3];

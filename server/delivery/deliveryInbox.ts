@@ -85,6 +85,11 @@ export type DeliveryCancellationRequest = {
 
 export const CANCELLATION_RESERVATION_TTL_MS = 10 * 60_000;
 
+// Hora (HH:mm, horário de Brasília) para as mensagens à loja.
+function brasiliaTime(ms: number): string {
+  return new Date(ms).toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" });
+}
+
 export const UNCERTAIN_CANCELLATION_RETRIED =
   "O pedido de cancelamento anterior ficou sem confirmação do app e foi repetido: confira no Portal do Parceiro se não há dois pedidos de cancelamento.";
 
@@ -211,6 +216,9 @@ export type DeliveryInboxOptions = {
   now?: () => Date;
 };
 
+// Janela em que a mesma ação de status, já aceita pelo app e sem evento novo do pedido, não é mandada de novo.
+export const ACTION_RESEND_GUARD_MS = 60_000;
+
 // Falhas em que o app com certeza não aplicou o pedido.
 export const DEFINITE_FAILURES: readonly string[] = ["invalid_request", "not_found", "conflict", "auth_failed", "rate_limited"];
 
@@ -246,6 +254,11 @@ export class DeliveryInbox {
   // Ação de status em andamento por pedido (clique duplo / dois toques no mesmo aparelho): a segunda é recusada
   // sem chamar o app. Vale só neste processo; o app recusa a transição repetida de qualquer forma.
   private readonly actionsInFlight = new Set<string>();
+  // Ação de status que o app aceitou e cujo evento ainda não chegou (o status novo só vem com ele), por pedido: a
+  // mesma ação de novo em ACTION_RESEND_GUARD_MS, com o pedido igual (mesma versão), é recusada sem chamar o app
+  // (a tela ainda mostra o botão; o app recusaria a transição repetida com um erro que parece falha). Só depois de
+  // sucesso, para não travar a nova tentativa depois de uma falha. Só em memória (vale neste processo).
+  private readonly actionsSent = new Map<string, { action: DeliveryOrderAction; at: number; version: number }>();
 
   constructor(private readonly options: DeliveryInboxOptions) {
     for (const adapter of options.adapters) {
@@ -336,6 +349,12 @@ export class DeliveryInbox {
     if (this.actionsInFlight.has(key)) {
       throw new DeliveryMarketplaceError(channel, "conflict", "Já há uma ação em andamento para este pedido; aguarde.");
     }
+    const nowMs = this.now().getTime();
+    for (const [sentKey, sent] of this.actionsSent) if (sent.at + ACTION_RESEND_GUARD_MS <= nowMs) this.actionsSent.delete(sentKey);
+    const sent = this.actionsSent.get(key);
+    if (sent && sent.action === action && sent.version === record.version) {
+      throw new DeliveryMarketplaceError(channel, "conflict", "Ação já enviada ao app, aguardando a confirmação dele; o status muda quando ela chegar.");
+    }
     this.actionsInFlight.add(key);
     try {
       await adapter.performAction(externalOrderId, action);
@@ -344,7 +363,9 @@ export class DeliveryInbox {
     }
     // O status oficial chega pelo evento do app; nada é gravado aqui, para que a resposta da ação nunca
     // sobrescreva um evento processado pelo polling enquanto a chamada estava em andamento.
-    return this.requireOrder(channel, externalOrderId);
+    const latest = await this.requireOrder(channel, externalOrderId);
+    this.actionsSent.set(key, { action, at: this.now().getTime(), version: latest.version });
+    return latest;
   }
 
   async listCancellationReasons(channel: DeliveryChannelKey, externalOrderId: string): Promise<DeliveryCancellationReason[]> {
@@ -381,7 +402,7 @@ export class DeliveryInbox {
             "conflict",
             current.state === "sent"
               ? "O cancelamento já foi pedido; aguarde a resposta do app."
-              : "Já existe um pedido de cancelamento em andamento ou sem confirmação; confira o pedido no app antes de repetir.",
+              : `Já existe um pedido de cancelamento em andamento ou sem confirmação; confira o pedido no app antes de repetir. Se ele continuar sem confirmação, a repetição com a conferência do gerente vale a partir de ${brasiliaTime(Date.parse(current.reservedAt) + CANCELLATION_RESERVATION_TTL_MS)} (horário de Brasília).`,
           );
         }
         flag(latest, UNCERTAIN_CANCELLATION_RETRIED);

@@ -56,24 +56,25 @@ function fakeApproval() {
   return { approval, authorized, results };
 }
 
-function setup(options: { merchants?: string[]; authorizer?: TenantAuthorizer } = {}) {
+function setup(options: { merchants?: string[]; authorizer?: TenantAuthorizer; now?: () => Date } = {}) {
   const manager = fakeApproval();
-  const sandbox = new IfoodSandbox(undefined, undefined, () => NOW);
+  const clock = options.now ?? (() => NOW);
+  const sandbox = new IfoodSandbox(undefined, undefined, clock);
   const api = new IfoodMerchantApi({
     credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret },
     baseUrl: sandbox.baseUrl,
     fetchImpl: sandbox.fetch,
   });
   const repository = new InMemoryDeliveryRepository();
-  const inbox = new DeliveryInbox({ adapters: [api], repository, now: () => NOW });
+  const inbox = new DeliveryInbox({ adapters: [api], repository, now: clock });
   const merchants = { activeMerchants: vi.fn(async () => (options.merchants ?? [sandbox.merchantId]).map((merchantExternalId) => ({ merchantExternalId }))) };
-  const poller = new IfoodPoller({ api, inbox, merchants, now: () => NOW.getTime() });
+  const poller = new IfoodPoller({ api, inbox, merchants, now: () => clock().getTime() });
   // Loja do token "loja-a": vê tudo; "loja-b": não vê nada (outro tenant).
   const authorizer: TenantAuthorizer = options.authorizer ?? {
     canAccessOrder: async (token) => token === "loja-a",
     canAccessMerchant: async (token) => token === "loja-a",
   };
-  const handle = createIfoodApiHandler({ inbox, api, authorizer, approval: manager.approval, poller, now: () => NOW });
+  const handle = createIfoodApiHandler({ inbox, api, authorizer, approval: manager.approval, poller, now: clock });
   const call = (method: string, path: string, body?: unknown, token = "loja-a") =>
     handle({ method, path, headers: { authorization: token ? `Bearer ${token}` : undefined }, body: body === undefined ? "" : JSON.stringify(body) } satisfies ApiRequest);
   return { sandbox, api, inbox, poller, merchants, call, manager, repository };
@@ -191,6 +192,57 @@ describe("servidor do iFood: API do app", () => {
     expect(sandbox.lastEventCode(id)).toBe("CFM");
     expect((await call("POST", `/ifood/orders/${id}/actions/dispatch`)).status).toBe(409);
     expect((await call("POST", `/ifood/orders/${id}/actions/voar`)).status).toBe(404);
+  });
+
+  it("ação de status: a resposta diz qual ação foi enviada; repetir em 60 s sem evento novo é 409 sem chamar o iFood", async () => {
+    let clock = NOW;
+    const { sandbox, poller, call, api, repository } = setup({ now: () => clock });
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const send = vi.spyOn(api, "performAction");
+    const confirmed = await call("POST", `/ifood/orders/${id}/actions/confirm`);
+    // O status novo só vem com o evento do iFood: a resposta ainda traz "placed", mas diz que a ação foi enviada.
+    expect(confirmed).toMatchObject({ status: 200, body: { actionSent: "confirm", order: { status: "placed" } } });
+    expect(send).toHaveBeenCalledTimes(1);
+    const again = await call("POST", `/ifood/orders/${id}/actions/confirm`);
+    expect(again).toMatchObject({ status: 409, body: { error: expect.stringMatching(/já enviad.*aguardando/i) } });
+    expect(send).toHaveBeenCalledTimes(1);
+    // Passados os 60 s sem evento, a ação vai de novo ao iFood (que decide).
+    clock = new Date(NOW.getTime() + 61_000);
+    await call("POST", `/ifood/orders/${id}/actions/confirm`);
+    expect(send).toHaveBeenCalledTimes(2);
+    // Com o evento do iFood gravado, a trava some e a próxima ação segue normal.
+    await poller.runOnce();
+    expect((await repository.getOrder("ifood", id))?.order.status).toBe("confirmed");
+    expect((await call("POST", `/ifood/orders/${id}/actions/start_preparation`)).status).toBe(200);
+  });
+
+  it("ação de status: falha não trava a nova tentativa; pedido que mudou (evento novo) libera a repetição", async () => {
+    const { sandbox, poller, call, api, repository } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const send = vi.spyOn(api, "performAction");
+    sandbox.failNext("/confirm", 503);
+    expect((await call("POST", `/ifood/orders/${id}/actions/confirm`)).status).toBe(503);
+    const retried = await call("POST", `/ifood/orders/${id}/actions/confirm`);
+    expect(retried).toMatchObject({ status: 200, body: { actionSent: "confirm" } });
+    expect(send).toHaveBeenCalledTimes(2);
+    // Outro evento gravou o pedido (versão nova) dentro dos 60 s: a repetição não fica presa.
+    const stored = (await repository.getOrder("ifood", id))!;
+    await repository.saveOrder(stored);
+    await call("POST", `/ifood/orders/${id}/actions/confirm`);
+    expect(send).toHaveBeenCalledTimes(3);
+  });
+
+  it("cancelamento de pedido que o iFood não deixa cancelar (sem motivos): diz isso, não 'motivo inválido'", async () => {
+    const { sandbox, poller, call } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    sandbox.emitFromMarketplace(id, "CON");
+    await poller.runOnce();
+    const response = await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", authorization: auth() });
+    expect(response.status).toBe(400);
+    expect((response.body as { error: string }).error).toMatch(/iFood não aceita cancelamento deste pedido agora/);
   });
 
   it("cancelamento só com motivo que o iFood oferece agora para o pedido", async () => {
@@ -377,7 +429,9 @@ describe("servidor do iFood: alçada de gerente", () => {
     await poller.runOnce();
     sandbox.failNext("/requestCancellation", 503);
     const path = `/ifood/orders/${id}/cancellation`;
-    expect((await call("POST", path, { code: "503", description: "Item indisponível", authorization: auth() })).status).toBe(503);
+    const uncertain = await call("POST", path, { code: "503", description: "Item indisponível", authorization: auth() });
+    // Não diz só "iFood indisponível": a tela precisa saber que pode ter sido aplicado.
+    expect(uncertain).toMatchObject({ status: 503, body: { code: "uncertain", error: expect.stringMatching(/pode ter sido aplicado.*antes de tentar de novo/) } });
     expect(manager.results.at(-1)?.outcome).toBe("uncertain");
     // Pode ter chegado ao iFood: outra tentativa (outro PIN, outro aparelho) não manda um segundo cancelamento.
     expect((await call("POST", path, { code: "503", description: "Item indisponível", authorization: auth() })).status).toBe(409);
@@ -406,6 +460,49 @@ describe("servidor do iFood: alçada de gerente", () => {
     expect(send).toHaveBeenCalledOnce();
     expect(manager.authorized.at(-1)?.details).toMatchObject({ code: "503", confirmUncertainRetry: true });
     expect(manager.authorized[0]?.details).not.toHaveProperty("confirmUncertainRetry");
+  });
+
+  it("pausa com resultado incerto (tempo esgotado): pode ter sido aplicada, a tela confere a lista antes de repetir", async () => {
+    const sandbox = new IfoodSandbox(undefined, undefined, () => NOW);
+    let hang = true;
+    // O iFood aplica a pausa e a resposta nunca chega.
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const response = await sandbox.fetch(input, init);
+      if (hang && String(input).endsWith("/interruptions") && init?.method === "POST") return new Promise<Response>(() => undefined);
+      return response;
+    };
+    const api = new IfoodMerchantApi({ credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret }, baseUrl: sandbox.baseUrl, fetchImpl, timeoutMs: 20 });
+    const inbox = new DeliveryInbox({ adapters: [api], repository: new InMemoryDeliveryRepository(), now: () => NOW });
+    const manager = fakeApproval();
+    const handle = createIfoodApiHandler({ inbox, api, authorizer: { canAccessOrder: async () => true, canAccessMerchant: async () => true }, approval: manager.approval, now: () => NOW });
+    const path = `/ifood/merchants/${sandbox.merchantId}/pauses`;
+    const response = await handle({ method: "POST", path, headers: { authorization: "Bearer x" }, body: JSON.stringify({ description: "Gás", minutes: 30, authorization: auth() }) });
+    expect(response).toEqual({
+      status: 503,
+      body: { code: "uncertain", error: "A pausa pode ter sido aplicada no iFood (sem resposta clara); confira a lista de pausas antes de tentar de novo." },
+    });
+    expect(manager.results.at(-1)?.outcome).toBe("uncertain");
+    hang = false;
+    // A lista mostra a pausa que foi aplicada.
+    expect(sandbox.activeInterruptions()).toHaveLength(1);
+    // Recusa clara do iFood continua com o código do iFood (nada foi aplicado).
+    sandbox.failNext("/interruptions", 400);
+    const refused = await handle({ method: "POST", path, headers: { authorization: "Bearer x" }, body: JSON.stringify({ description: "Gás", minutes: 30, authorization: auth() }) });
+    expect(refused).toMatchObject({ status: 400, body: { code: "invalid_request" } });
+  });
+
+  it("cancelamento sem confirmação ainda no prazo da reserva: avisa a partir de quando a repetição com conferência vale", async () => {
+    const { sandbox, poller, call, repository, api } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const stored = (await repository.getOrder("ifood", id))!;
+    // Reservado às 14:57Z (11:57 em Brasília): a repetição com conferência vale a partir de 12:07.
+    stored.cancellationRequest = { state: "uncertain", reservedAt: new Date(NOW.getTime() - 3 * 60_000).toISOString(), code: "503" };
+    await repository.saveOrder(stored);
+    const send = vi.spyOn(api, "requestCancellation");
+    const blocked = await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", confirmUncertainRetry: true, authorization: auth() });
+    expect(blocked).toMatchObject({ status: 409, body: { code: "conflict", error: expect.stringMatching(/a partir de 12:07 \(horário de Brasília\)/) } });
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("reenvio com o mesmo id da tentativa não chama o iFood de novo (pausa não duplica)", async () => {

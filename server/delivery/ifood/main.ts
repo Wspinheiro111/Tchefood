@@ -1,6 +1,7 @@
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer } from "node:http";
 import { DeliveryInbox, InMemoryDeliveryRepository, type DeliveryRepository } from "../deliveryInbox";
 import { SupabaseDeliveryRepository } from "../supabaseDeliveryRepository";
+import { readBodyOrReject } from "./httpBody";
 import { IfoodMerchantApi } from "./ifoodMerchantApi";
 import { IfoodSandbox } from "./ifoodSandbox";
 import {
@@ -25,8 +26,6 @@ import {
 // Rodar exatamente UMA instância: o polling de duas instâncias não perde pedido (versão no banco), mas avisaria
 // pedido novo em dobro.
 
-const MAX_BODY_BYTES = 16 * 1024;
-
 function required(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) {
@@ -34,24 +33,6 @@ function required(name: string): string {
     process.exit(1);
   }
   return value;
-}
-
-function readBody(request: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks: Buffer[] = [];
-    request.on("data", (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        reject(new Error("too_large"));
-        request.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    request.on("error", reject);
-  });
 }
 
 function build(): { api: IfoodMerchantApi; repository: DeliveryRepository; merchants: MerchantSource; authorizer: TenantAuthorizer; approval: ManagerApproval } {
@@ -111,13 +92,16 @@ function main(): void {
       response.writeHead(204).end();
       return;
     }
-    let body = "";
+    let body: string | null;
     try {
-      body = await readBody(request);
+      // Corpo acima do limite: readBodyOrReject já respondeu 413 (e fecha a conexão depois).
+      body = await readBodyOrReject(request, response);
     } catch {
-      response.writeHead(413, { "content-type": "application/json" }).end(JSON.stringify({ error: "Corpo grande demais." }));
+      // O app derrubou a conexão no meio do envio: não há a quem responder.
+      request.destroy();
       return;
     }
+    if (body === null) return;
     const result = await handle({
       method: request.method ?? "GET",
       path: request.url ?? "/",
