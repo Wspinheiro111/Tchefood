@@ -5,7 +5,7 @@ import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../st
 import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
-import { AUDIT_LABEL, formatShiftStart, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
+import { AUDIT_LABEL, declinedInShift, formatShiftStart, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
 import { useShiftPeriod } from '../lib/useShiftStart';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
@@ -177,7 +177,7 @@ export function Reconciliation() {
   const methods = ['CREDIT', 'DEBIT', 'PIX', 'CASH'] as const;
   const label = { CREDIT: 'Crédito', DEBIT: 'Débito', PIX: 'Pix', CASH: 'Dinheiro' } as const;
   const totals = methods.map((m) => rows.reduce((a, r) => a + r.byMethod[m], 0));
-  const declined = payments.filter((p) => p.status === 'DECLINED');
+  const declined = useMemo(() => declinedInShift(payments, period), [payments, period]);
   return (
     <div className="space-y-4">
       <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-surface">

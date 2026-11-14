@@ -10,7 +10,7 @@ import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { CASH_ROLES, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { useTerminalBus } from '../lib/payments/drivers';
 import { formatBRL } from '../lib/money';
-import { shiftStart } from '../lib/reports';
+import { shiftStartBrasilia } from '../lib/reports';
 import { cashOutsideSessions, cashSummary, closingDifference, closingReceiptLines, parseMoneyInput, validCashAmount } from '../lib/cashRegister';
 import type { CashSession } from '../types';
 
@@ -83,7 +83,7 @@ export function CashRegisterScreen() {
   const open = sessions.find((c) => c.status === 'OPEN') ?? null;
   const isManager = user?.role === 'MANAGER' || user?.role === 'OWNER';
   const summary = useMemo(() => (open ? cashSummary(open, payments, movements, now) : null), [open, payments, movements, now]);
-  const outside = useMemo(() => cashOutsideSessions(payments, sessions, shiftStart(now), now), [payments, sessions, now]);
+  const outside = useMemo(() => cashOutsideSessions(payments, sessions, shiftStartBrasilia(now), now), [payments, sessions, now]);
   const name = (id: string | null) => (id ? staff.find((u) => u.id === id)?.name ?? '?' : '-');
   const history = sessions.filter((c) => c.status === 'CLOSED').slice(0, 10);
 
