@@ -172,7 +172,10 @@ export interface StoreRow {
   overdue_count: number;
   overdue_amount: number;
   oldest_overdue_due: string | null;
-  last_order_at: string | null;
+  /** Última venda concluída (conta fechada no salão ou delivery concluído). */
+  last_sale_at: string | null;
+  /** Último pedido aberto, concluído ou não (indicador de uso). */
+  last_order_opened_at: string | null;
   orders_7d: number;
   staff_active: number;
 }

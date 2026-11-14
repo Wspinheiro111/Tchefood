@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { handleDeviceAccount, randomPasswordFrom, type AuthUser, type DeviceAccountDeps, type RpcResult } from '../admin-device-account/handler.ts';
+import { suggestedDeviceEmail as uiSuggestedDeviceEmail } from '../../../admin/src/lib/format';
+import { handleDeviceAccount, randomPasswordFrom, suggestedDeviceEmail, type AuthUser, type DeviceAccountDeps, type RpcResult } from '../admin-device-account/handler.ts';
 
 const TENANT = '11111111-1111-4111-8111-111111111111';
 const USER = '33333333-3333-4333-8333-333333333333';
@@ -23,6 +24,8 @@ interface FakeDb {
 function fake(opts: {
   deviceStatus?: 'PENDING' | 'READY' | null; storeError?: RpcResult['error']; subscription?: boolean; confirmError?: boolean; createError?: string;
   db?: FakeDb; users?: Map<string, AuthUser & { password?: string }>; beforeAuthWrite?: () => Promise<void>;
+  /** CNPJ da loja; com reservedEmails, a reserva nova usa o e-mail pedido e recusa e-mail de outra loja (UNIQUE). */
+  cnpj?: string; userId?: string; reservedEmails?: Map<string, string>;
 } = {}): Fake {
   const calls: string[] = [];
   const users = opts.users ?? new Map<string, AuthUser & { password?: string }>();
@@ -34,7 +37,7 @@ function fake(opts: {
       calls.push(`${fn} ${JSON.stringify(args)}`);
       if (fn === 'tchefood_admin_store') {
         if (opts.storeError) return { data: null, error: opts.storeError };
-        return { data: { cnpj: '11444777000161', subscription: opts.subscription === false ? null : { device_status: db.deviceStatus } }, error: null };
+        return { data: { cnpj: opts.cnpj ?? '11444777000161', subscription: opts.subscription === false ? null : { device_status: db.deviceStatus } }, error: null };
       }
       if (fn === 'tchefood_admin_device_lock') {
         if (db.opId !== null && db.opId !== args.p_op) return { data: null, error: { message: 'TCHEFOOD_ADMIN: outra operação na conta do aparelho desta loja está em andamento', code: '55P03' } };
@@ -49,6 +52,13 @@ function fake(opts: {
         if (args.p_replace_user_id) {
           if (args.p_replace_user_id !== db.reservation.user_id || db.deviceStatus !== 'PENDING') return { data: null, error: { message: 'TCHEFOOD_ADMIN: a reserva da conta do aparelho mudou' } };
           db.reservation = { user_id: USER2, email: String(args.p_email) };
+        }
+        if (opts.reservedEmails && db.deviceStatus === null) {
+          const email = String(args.p_email).toLowerCase();
+          const owner = opts.reservedEmails.get(email);
+          if (owner && owner !== args.p_tenant) return { data: null, error: { message: 'TCHEFOOD_ADMIN: este e-mail já é de outra loja' } };
+          opts.reservedEmails.set(email, String(args.p_tenant));
+          db.reservation = { user_id: opts.userId ?? USER, email };
         }
         db.deviceStatus ??= 'PENDING';
         return { data: { ...db.reservation, status: db.deviceStatus }, error: null };
@@ -260,5 +270,26 @@ describe('admin-device-account', () => {
     f.deps.rpc = async (fn, args) => (fn === 'tchefood_admin_reserve_device' ? { data: null, error: { message: 'TCHEFOOD_ADMIN: este e-mail já é de outra loja' } } : rpc(fn, args));
     expect((await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps)).status).toBe(409);
     expect(f.db.opId).toBeNull();
+  });
+
+  it('CNPJs alfanuméricos que só diferem nas letras ganham e-mails diferentes, sem conflito de reserva', async () => {
+    const reserved = new Map<string, string>();
+    const users = new Map<string, AuthUser & { password?: string }>();
+    const tenantB = '22222222-2222-4222-8222-222222222222';
+    const a = fake({ cnpj: '00A0000000A082', reservedEmails: reserved, users });
+    const b = fake({ cnpj: '00A0000000L082', userId: USER2, reservedEmails: reserved, users });
+    const ra = await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, a.deps);
+    const rb = await handleDeviceAccount({ tenant_id: tenantB, action: 'create' }, b.deps);
+    expect(ra).toMatchObject({ status: 200, body: { email: 'loja-00a0000000a082@aparelho.tchefood.com.br' } });
+    expect(rb).toMatchObject({ status: 200, body: { email: 'loja-00a0000000l082@aparelho.tchefood.com.br' } });
+    expect(users.get(USER)!.app_metadata).toEqual({ tenant_id: TENANT });
+    expect(users.get(USER2)!.app_metadata).toEqual({ tenant_id: tenantB });
+  });
+
+  it('e-mail sugerido igual ao da tela, para CNPJ numérico, alfanumérico e com máscara', () => {
+    for (const cnpj of ['11444777000161', '00A0000000A082', '00.A00.000/00L0-82', '12abc34501de35']) {
+      expect(suggestedDeviceEmail(cnpj)).toBe(uiSuggestedDeviceEmail(cnpj));
+    }
+    expect(suggestedDeviceEmail('00.A00.000/00L0-82')).toBe('loja-00a0000000l082@aparelho.tchefood.com.br');
   });
 });

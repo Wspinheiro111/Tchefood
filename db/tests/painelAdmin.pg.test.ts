@@ -369,26 +369,45 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     expect(r.status).toBe(403);
   });
 
-  it('uso da loja: última venda e pedidos dos últimos 7 dias, sem cancelado, com delivery', async () => {
+  it('uso da loja: última venda só com pedido concluído; aberto, pagando e cancelado não contam', async () => {
     let hand = (await admin().stores()).find((x) => x.tenant_id === HAND_TENANT)!;
-    expect(hand).toMatchObject({ last_order_at: null, orders_7d: 0, staff_active: 0 });
-    // Venda válida ontem e pedido cancelado aberto hoje: a última venda continua a de ontem.
+    expect(hand).toMatchObject({ last_sale_at: null, last_order_opened_at: null, orders_7d: 0, staff_active: 0 });
+    const epoch = (iso: string | null) => (iso === null ? null : Math.round(new Date(iso).getTime() / 1000));
+    const dbEpoch = (expr: string) => Number(sql(`SELECT round(extract(epoch FROM (${expr})))`));
+    // Salão: fechada ontem (aberta anteontem), aberta há 1 hora, pagando há 30 min, cancelada agora.
+    // Delivery: concluído há 3 dias, saiu para entrega há 5 min, cancelado há 1 hora, concluído há 20 dias.
     // (sem mesa nem garçom de verdade: chaves estrangeiras desligadas só nesta inserção)
     sql(`SET session_replication_role = replica;
-         INSERT INTO orders (tenant_id, table_id, opened_by_user_id, status, opened_at) VALUES
-           ('${HAND_TENANT}', gen_random_uuid(), gen_random_uuid(), 'CLOSED', NOW() - INTERVAL '1 day'),
-           ('${HAND_TENANT}', gen_random_uuid(), gen_random_uuid(), 'CANCELED', NOW());
+         INSERT INTO orders (tenant_id, table_id, opened_by_user_id, status, opened_at, closed_at) VALUES
+           ('${HAND_TENANT}', gen_random_uuid(), gen_random_uuid(), 'CLOSED', NOW() - INTERVAL '2 days', NOW() - INTERVAL '1 day'),
+           ('${HAND_TENANT}', gen_random_uuid(), gen_random_uuid(), 'OPEN', NOW() - INTERVAL '1 hour', NULL),
+           ('${HAND_TENANT}', gen_random_uuid(), gen_random_uuid(), 'PAYING', NOW() - INTERVAL '30 minutes', NULL),
+           ('${HAND_TENANT}', gen_random_uuid(), gen_random_uuid(), 'CANCELED', NOW(), NULL);
          INSERT INTO delivery_orders (tenant_id, channel, external_id, display_id, status, total_amount, payload, placed_at, last_event_at) VALUES
-           ('${HAND_TENANT}', 'ifood', 'ext-1', '1001', 'concluded', 50, '{}', NOW() - INTERVAL '3 days', NOW()),
+           ('${HAND_TENANT}', 'ifood', 'ext-1', '1001', 'concluded', 50, '{}', NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days' + INTERVAL '1 hour'),
+           ('${HAND_TENANT}', 'ifood', 'ext-4', '1004', 'dispatched', 50, '{}', NOW() - INTERVAL '5 minutes', NOW() - INTERVAL '1 minute'),
            ('${HAND_TENANT}', 'ifood', 'ext-2', '1002', 'cancelled', 50, '{}', NOW() - INTERVAL '1 hour', NOW()),
-           ('${HAND_TENANT}', 'ifood', 'ext-3', '1003', 'concluded', 50, '{}', NOW() - INTERVAL '20 days', NOW());`);
+           ('${HAND_TENANT}', 'ifood', 'ext-3', '1003', 'concluded', 50, '{}', NOW() - INTERVAL '20 days', NOW() - INTERVAL '20 days');`);
+    const closedAt = dbEpoch(`SELECT closed_at FROM orders WHERE tenant_id = '${HAND_TENANT}' AND status = 'CLOSED'`);
+    const dispatchedPlaced = dbEpoch(`SELECT placed_at FROM delivery_orders WHERE external_id = 'ext-4'`);
     hand = (await admin().stores()).find((x) => x.tenant_id === HAND_TENANT)!;
-    const yesterday = sql(`SELECT max(opened_at) FROM orders WHERE tenant_id = '${HAND_TENANT}' AND status = 'CLOSED'`);
-    expect(new Date(hand.last_order_at!).getTime()).toBe(new Date(yesterday.replace(' ', 'T').replace(/([+-]\d\d)$/, '$1:00')).getTime());
-    // Salão de ontem + delivery de 3 dias; o delivery cancelado não conta.
-    expect(hand.orders_7d).toBe(2);
-    const detail = await admin().store(HAND_TENANT);
-    expect(detail.last_order_at).toBe(hand.last_order_at);
-    expect(detail).toMatchObject({ orders_7d: 2, orders_30d: 3 });
+    // Última venda = fechamento da conta de ontem (não a abertura, nem os pedidos abertos/pagando/em entrega).
+    expect(epoch(hand.last_sale_at)).toBe(closedAt);
+    // Último pedido aberto = o delivery em entrega (o cancelado de agora não conta).
+    expect(epoch(hand.last_order_opened_at)).toBe(dispatchedPlaced);
+    // Uso em 7 dias: fechada, aberta, pagando, delivery de 3 dias e em entrega; cancelados fora.
+    expect(hand.orders_7d).toBe(5);
+    let detail = await admin().store(HAND_TENANT);
+    expect(detail).toMatchObject({ last_sale_at: hand.last_sale_at, last_order_opened_at: hand.last_order_opened_at, orders_7d: 5, orders_30d: 6 });
+    // O delivery em entrega conclui agora: vira a última venda, no momento da conclusão.
+    sql(`UPDATE delivery_orders SET status = 'concluded', last_event_at = NOW() WHERE external_id = 'ext-4'`);
+    const concludedAt = dbEpoch(`SELECT last_event_at FROM delivery_orders WHERE external_id = 'ext-4'`);
+    detail = await admin().store(HAND_TENANT);
+    expect(epoch(detail.last_sale_at)).toBe(concludedAt);
+    // A conta que está pagando é cancelada: some do uso e não vira venda.
+    sql(`UPDATE orders SET status = 'CANCELED' WHERE tenant_id = '${HAND_TENANT}' AND status = 'PAYING'`);
+    detail = await admin().store(HAND_TENANT);
+    expect(detail).toMatchObject({ orders_7d: 4, orders_30d: 5 });
+    expect(epoch(detail.last_sale_at)).toBe(concludedAt);
   });
 });

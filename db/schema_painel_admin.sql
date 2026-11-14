@@ -262,13 +262,21 @@ CREATE OR REPLACE FUNCTION tchefood_admin_day_start(p_day DATE) RETURNS TIMESTAM
     SELECT (p_day::timestamp AT TIME ZONE 'America/Sao_Paulo')
 $$;
 
--- Vendas da loja para os indicadores de uso: pedidos do salão/balcão não cancelados e pedidos
--- de delivery (iFood) não cancelados.
-CREATE OR REPLACE FUNCTION tchefood_admin_sales(p_tenant UUID) RETURNS TABLE (at TIMESTAMPTZ) LANGUAGE sql STABLE
+-- Pedidos da loja para os indicadores de uso: salão/balcão e delivery (iFood), sem cancelados.
+-- at = quando o pedido foi aberto (contadores de 7 e 30 dias e "último pedido aberto");
+-- sold_at = quando virou venda concluída, ou NULL se ainda não concluiu ("última venda").
+-- Salão: só CLOSED conta como venda, no closed_at (fechamento pago; aberto ou pagando não conta).
+-- Delivery: só 'concluded' conta, no last_event_at (o evento de conclusão é o último do pedido).
+DROP FUNCTION IF EXISTS tchefood_admin_sales(UUID);
+CREATE OR REPLACE FUNCTION tchefood_admin_sales(p_tenant UUID) RETURNS TABLE (at TIMESTAMPTZ, sold_at TIMESTAMPTZ) LANGUAGE sql STABLE
 SET search_path = public, pg_temp AS $$
-    SELECT o.opened_at FROM orders o WHERE o.tenant_id = p_tenant AND o.status <> 'CANCELED'
+    SELECT o.opened_at,
+           CASE WHEN o.status = 'CLOSED' THEN COALESCE(o.closed_at, o.opened_at) END
+      FROM orders o WHERE o.tenant_id = p_tenant AND o.status <> 'CANCELED'
     UNION ALL
-    SELECT d.placed_at FROM delivery_orders d WHERE d.tenant_id = p_tenant AND d.status <> 'cancelled'
+    SELECT d.placed_at,
+           CASE WHEN d.status = 'concluded' THEN GREATEST(d.last_event_at, d.placed_at) END
+      FROM delivery_orders d WHERE d.tenant_id = p_tenant AND d.status <> 'cancelled'
 $$;
 
 -- Mês de cobrança aceito: de 12 meses atrás até o mês que vem (evita 1990 por engano).
@@ -392,7 +400,7 @@ BEGIN
                    'subscription', CASE WHEN s.tenant_id IS NULL THEN NULL ELSE tchefood_admin_subscription_json(s) END,
                    'open_count', c.open_count, 'open_amount', c.open_amount,
                    'overdue_count', c.overdue_count, 'overdue_amount', c.overdue_amount, 'oldest_overdue_due', c.oldest_overdue_due,
-                   'last_order_at', u.last_order_at, 'orders_7d', u.orders_7d,
+                   'last_sale_at', u.last_sale_at, 'last_order_opened_at', u.last_order_opened_at, 'orders_7d', u.orders_7d,
                    'staff_active', (SELECT count(*) FROM staff_users su WHERE su.tenant_id = t.id AND su.active))
                  ORDER BY t.name, t.id)
           FROM tenants t
@@ -405,7 +413,7 @@ BEGIN
                      min(sc.due_date) FILTER (WHERE sc.status = 'OPEN' AND sc.due_date < v_today) AS oldest_overdue_due
                 FROM store_charges sc WHERE sc.tenant_id = t.id) c ON TRUE
           LEFT JOIN LATERAL (
-              SELECT max(x.at) AS last_order_at, count(*) FILTER (WHERE x.at >= tchefood_admin_day_start(v_today - 6)) AS orders_7d
+              SELECT max(x.sold_at) AS last_sale_at, max(x.at) AS last_order_opened_at, count(*) FILTER (WHERE x.at >= tchefood_admin_day_start(v_today - 6)) AS orders_7d
                 FROM tchefood_admin_sales(t.id) x) u ON TRUE), '[]'::jsonb);
 END;
 $$;
@@ -434,7 +442,8 @@ BEGIN
                              'created_at', a.created_at, 'admin_name', pa.name) AS j
                         FROM platform_admin_audit a LEFT JOIN platform_admins pa ON pa.user_id = a.admin_user_id
                        WHERE a.tenant_id = p_tenant ORDER BY a.created_at DESC LIMIT 50) x), '[]'::jsonb),
-        'last_order_at', (SELECT max(x.at) FROM tchefood_admin_sales(p_tenant) x),
+        'last_sale_at', (SELECT max(x.sold_at) FROM tchefood_admin_sales(p_tenant) x),
+        'last_order_opened_at', (SELECT max(x.at) FROM tchefood_admin_sales(p_tenant) x),
         'orders_7d', (SELECT count(*) FROM tchefood_admin_sales(p_tenant) x WHERE x.at >= tchefood_admin_day_start(tchefood_admin_today() - 6)),
         'orders_30d', (SELECT count(*) FROM tchefood_admin_sales(p_tenant) x WHERE x.at >= tchefood_admin_day_start(tchefood_admin_today() - 29)),
         'staff_active', (SELECT count(*) FROM staff_users su WHERE su.tenant_id = p_tenant AND su.active));

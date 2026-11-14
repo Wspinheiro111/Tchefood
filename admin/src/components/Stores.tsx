@@ -99,7 +99,7 @@ export default function Stores({ client, today, onOpenStore }: { client: AdminCl
                   </td>
                   <td>
                     <p>{r.orders_7d} pedido(s) em 7 dias</p>
-                    <p className="text-xs text-slate-500">última venda: {dateTimeBr(r.last_order_at)}</p>
+                    <p className="text-xs text-slate-500">última venda: {r.last_sale_at ? dateTimeBr(r.last_sale_at) : 'nenhuma'}</p>
                   </td>
                 </tr>
               ))}

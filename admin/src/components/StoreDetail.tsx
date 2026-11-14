@@ -30,8 +30,9 @@ export default function StoreDetail({ client, tenantId, today, onBack }: { clien
             </div>
             <Selo status={data.subscription?.status ?? null} />
           </div>
-          <div className="grid gap-3 sm:grid-cols-4">
-            <Numero titulo="Última venda" valor={data.last_order_at ? dateTimeBr(data.last_order_at) : 'nenhuma'} />
+          <div className="grid gap-3 sm:grid-cols-5">
+            <Numero titulo="Última venda concluída" valor={data.last_sale_at ? dateTimeBr(data.last_sale_at) : 'nenhuma'} />
+            <Numero titulo="Último pedido aberto" valor={data.last_order_opened_at ? dateTimeBr(data.last_order_opened_at) : 'nenhum'} />
             <Numero titulo="Pedidos em 7 dias" valor={String(data.orders_7d)} />
             <Numero titulo="Pedidos em 30 dias" valor={String(data.orders_30d)} />
             <Numero titulo="Equipe ativa" valor={String(data.staff_active)} />

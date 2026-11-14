@@ -67,8 +67,10 @@ function rpcFailure(error: { message: string; code?: string }): HandlerResult {
   return fail(400, message);
 }
 
+// Igual a suggestedDeviceEmail de admin/src/lib/format.ts (o teste confere): letras e números do
+// CNPJ, em minúsculas. Só tirar os dígitos juntaria CNPJs alfanuméricos diferentes no mesmo e-mail.
 export function suggestedDeviceEmail(cnpj: string): string {
-  return `loja-${cnpj.replace(/\D/g, '')}@aparelho.tchefood.com.br`;
+  return `loja-${cnpj.replace(/[^0-9A-Za-z]/g, '').toLowerCase()}@aparelho.tchefood.com.br`;
 }
 
 /** Senha de 20 caracteres sem letras parecidas (0/O, 1/l/I), sorteada sem viés. */

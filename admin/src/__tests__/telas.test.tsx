@@ -37,7 +37,7 @@ const CHARGE: Charge = {
 function detail(over: Partial<Detail> = {}): Detail {
   return {
     tenant_id: 't1', name: 'Flip', legal_name: 'Flip Ltda', cnpj: '12ABC34501DE35', city: 'Santo Ângelo', state: 'RS', created_at: '', subscription: SUB,
-    last_order_at: null, orders_7d: 0, staff_active: 1, charges: [CHARGE], audit: [], orders_30d: 0, ...over,
+    last_sale_at: null, last_order_opened_at: null, orders_7d: 0, staff_active: 1, charges: [CHARGE], audit: [], orders_30d: 0, ...over,
   };
 }
 
