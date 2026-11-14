@@ -146,7 +146,7 @@ describe('releasePaymentClaim (tchefood_release_payment_claim)', () => {
     const refused = await releasePaymentClaim('k-1', 'motivo', 'tok-1', deps(reply(400, '{"code":"TF004","message":"só quem criou libera"}')).d);
     expect(refused).toEqual({ ok: false, transient: false, error: 'O servidor não liberou a reserva: só quem criou libera' });
     // Não existe (TF005) ou já virou pagamento (TF007): nada a liberar.
-    expect(await releasePaymentClaim('k-1', 'motivo', 'tok-1', deps(reply(400, '{"code":"TF005","message":"x"}')).d)).toEqual({ ok: true });
+    expect(await releasePaymentClaim('k-1', 'motivo', 'tok-1', deps(reply(400, '{"code":"TF005","message":"x"}')).d)).toEqual({ ok: true, notFound: true });
     expect(await releasePaymentClaim('k-1', 'motivo', 'tok-1', deps(reply(400, '{"code":"TF007","message":"x"}')).d)).toEqual({ ok: true });
     // Motivo curto demais para o banco (≥ 3) vai com o texto padrão.
     const short = deps(reply(200, '{}'));
@@ -297,11 +297,11 @@ describe('releasePaymentClaimManager (tchefood_release_payment_claim_manager)', 
     });
   });
 
-  it('motivo curto não sai do aparelho; não existe conta como liberada; já paga e sem rede não liberam', async () => {
+  it('motivo curto não sai do aparelho; não existe volta notFound (a tela confere o PIN aqui); já paga e sem rede não liberam', async () => {
     const short = deps(reply(200, '{}'));
     expect((await releasePaymentClaimManager('k-1', '9999', 'curto', short.d)).ok).toBe(false);
     expect(short.calls).toHaveLength(0);
-    expect(await releasePaymentClaimManager('k-1', '9999', 'Não houve cobrança', deps(reply(400, '{"code":"TF005","message":"x"}')).d)).toEqual({ ok: true });
+    expect(await releasePaymentClaimManager('k-1', '9999', 'Não houve cobrança', deps(reply(400, '{"code":"TF005","message":"x"}')).d)).toEqual({ ok: true, notFound: true });
     expect((await releasePaymentClaimManager('k-1', '9999', 'Não houve cobrança', deps(reply(400, '{"code":"TF007","message":"x"}')).d)).ok).toBe(false);
     expect(await releasePaymentClaimManager('k-1', '9999', 'Não houve cobrança', deps(async () => { throw new Error('rede'); }).d)).toEqual({ ok: false, error: CLAIM_OFFLINE_ERROR });
   });

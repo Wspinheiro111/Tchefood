@@ -64,3 +64,31 @@ export function pointReservationBlock(amount: number, remaining: number, reserva
   if (toCents(amount) <= free) return null;
   return `${reservationNotice(parts)} (${formatBRL(reservation.reservedCents / 100)} reservado). Livre para este pagamento: ${formatBRL(free / 100)}.`;
 }
+
+/** TF012 reserved_exceeds_balance: o servidor não reduz o total abaixo do que está reservado. */
+export const RESERVED_EXCEEDS_BALANCE = 'Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total.';
+
+/** Última leitura da reserva no servidor por comanda (para conferir antes de reduzir o total aqui). */
+const lastRead = new Map<string, { reservedCents: number; claims: Array<{ key: string; cents: number }>; at: number }>();
+export const RESERVATION_READ_MAX_AGE_MS = 60_000;
+
+export function rememberServerReservation(orderId: string, reservedCents: number, claims: ReadonlyArray<{ idempotencyKey: string; amountCents: number }> = [], nowMs = Date.now()): void {
+  lastRead.set(orderId, { reservedCents, claims: claims.map((c) => ({ key: c.idempotencyKey, cents: c.amountCents })), at: nowMs });
+}
+
+/**
+ * Reduzir o total para `newRemaining` passaria do que está reservado no servidor? Usa a última leitura (até
+ * 60 s); reservas cujo pagamento já está aprovado aqui não contam (o saldo daqui já as descontou).
+ * Sem leitura recente: null (o servidor ainda confere, com TF012).
+ */
+export function reservationExceeds(orderId: string, newRemaining: number, paidKeys: ReadonlySet<string>, nowMs = Date.now()): string | null {
+  const r = lastRead.get(orderId);
+  if (!r || nowMs - r.at > RESERVATION_READ_MAX_AGE_MS) return null;
+  const counted = r.reservedCents - r.claims.filter((c) => paidKeys.has(c.key)).reduce((a, c) => a + c.cents, 0);
+  return counted > toCents(newRemaining) ? RESERVED_EXCEEDS_BALANCE : null;
+}
+
+/** Só para testes. */
+export function resetServerReservations(): void {
+  lastRead.clear();
+}

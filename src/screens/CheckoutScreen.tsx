@@ -12,12 +12,12 @@ import { NfceViewer } from './NfceViewer';
 import { ReviewCapture } from '../components/ReviewCapture';
 import { CashbackCapture, CashbackRedeem } from '../components/CashbackPanel';
 import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
-import { effectiveReservation, freeCents, onlyClaims, pointReservationBlock, reservationNotice, type PointReservation } from '../lib/payments/pointReservation';
+import { effectiveReservation, freeCents, onlyClaims, pointReservationBlock, rememberServerReservation, reservationNotice, type PointReservation } from '../lib/payments/pointReservation';
 import { fetchPointReservation } from '../lib/sync/cloudPull';
 import { freshCloudConfig } from '../lib/sync/useCloudSync';
 import { requirePaymentClaim, type ClaimAcquirer, type ClaimMethod } from '../lib/payments/paymentClaim';
 import { startPaymentClaim, type ClaimHandle } from '../lib/payments/claimFlow';
-import { HOLD_BLOCKS_ALL, holdBlocksCash, HoldNotChargedButton, RefundedAtTerminalButton, StuckClaimsPanel } from '../components/StuckClaims';
+import { HOLD_BLOCKS_ALL, holdBlocksCash, HoldNotChargedButton, isRefundHold, RefundedAtTerminalButton, StuckClaimsPanel } from '../components/StuckClaims';
 import type { CloudPaymentClaim } from '../lib/sync/cloudPull';
 import { PointReviewSheet, type PointReviewTarget } from '../components/PointReviewSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
@@ -105,6 +105,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         const cfg = await freshCloudConfig();
         if (!cfg) throw new Error('sem sessão');
         const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
+        rememberServerReservation(orderId, r.reservedCents, r.claims ?? []);
         if (alive) {
           setCloudReservation(r);
           setReservationRead('ok');
@@ -188,7 +189,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     const leaveClaim = () => handle?.leave();
 
     // Maquininha aprovou e a reserva foi liberada (ou não confirmada): nem dinheiro até resolver a trava.
-    if (holdBlocksCash(reviewHold)) return toast.error(HOLD_BLOCKS_ALL);
+    if (holdBlocksCash(orderId)) return toast.error(HOLD_BLOCKS_ALL);
     if (method === 'CASH') {
       if (cashGivenValue > 0 && cashGivenValue < amount) return toast.error('Valor recebido menor que a cobrança.');
       setBusy(true);
@@ -230,7 +231,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       const result = await driver.charge(req);
       if (result.status === 'MANUAL_REVIEW') {
         // Não registra pagamento nem recusa: o resultado é desconhecido e não pode ser repetido sozinho.
-        setReviewHoldState(setReviewHold({
+        void (setReviewHold({
           order_id: orderId, amount, reason: result.reason, code: result.failure_code, method,
           acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
           idempotency_key, item_ids: itemIds,
@@ -255,7 +256,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       if (check && !check.ok) {
         // Aprovou, mas a reserva já não é desta cobrança (ou não deu para confirmar, ou outra adquirente):
         // nunca registra sozinho; trava a conta para conferência.
-        setReviewHoldState(setReviewHold({
+        void (setReviewHold({
           order_id: orderId, amount, reason: check.reason, code: check.code, method,
           acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
           idempotency_key, item_ids: itemIds,
@@ -272,7 +273,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       });
       if (!r.ok) {
         // A maquininha aprovou mas o registro falhou: trava a conta (nunca cobra de novo) e o gerente registra pelo comprovante.
-        setReviewHoldState(setReviewHold({
+        void (setReviewHold({
           order_id: orderId, amount, reason: `Aprovado na maquininha, mas não registrado: ${r.error}`, code: 'REGISTER_FAILED', method,
           acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
           idempotency_key, item_ids: itemIds,
@@ -295,7 +296,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
 
   /** Pagamento registrado pela conferência (comprovante ou Mercado Pago): mesmos ajustes de afterApproved, sem reimprimir. */
   const afterReviewed = (outcome: PaymentOutcome) => {
-    setReviewHoldState(null);
+    setReviewHoldState(getReviewHold(orderId));
     if (mode === 'EQUAL') setPeopleLeft((n) => Math.max(1, n - 1));
     setSelected([]);
     setFreeRaw('');
@@ -487,16 +488,16 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
           <div className="mb-1 font-black text-brasa">Cobrança de {formatBRL(reviewHold.amount)} sem confirmação ({reviewHold.code})</div>
           <p className="mb-3 text-slate-800">{reviewHold.reason} Se a maquininha mostra a transação aprovada, não cobre de novo: o gerente registra pelo comprovante. Se não houve cobrança, libere abaixo.</p>
-          {reviewHold.code === 'CLAIM_RELEASED' ? (
+          {isRefundHold(reviewHold) ? (
             // Reserva liberada: o comprovante não entra (o servidor recusaria); só o estorno com PIN de gerente.
-            <RefundedAtTerminalButton hold={reviewHold} label={table.label} onCleared={() => setReviewHoldState(null)} />
+            <RefundedAtTerminalButton hold={reviewHold} label={table.label} onCleared={() => setReviewHoldState(getReviewHold(orderId))} />
           ) : reviewHold.acquirer === 'MERCADO_PAGO' ? (
             // Point: só a leitura do Mercado Pago pelo servidor registra ou libera (decisão do Will, 14/11/2026).
             <Btn variant="success" size="lg" block onClick={() => setConfirmOpen(true)}>Conferir no Mercado Pago</Btn>
           ) : (
             <div className="grid gap-2 sm:grid-cols-2">
               <Btn variant="success" size="lg" onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
-              <HoldNotChargedButton hold={reviewHold} label={table.label} onCleared={() => setReviewHoldState(null)} />
+              <HoldNotChargedButton hold={reviewHold} label={table.label} onCleared={() => setReviewHoldState(getReviewHold(orderId))} />
             </div>
           )}
           <ConfirmReviewedChargeSheet
@@ -506,7 +507,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
             label={table.label}
             // Sem reimprimir o comprovante TEF (a maquininha já imprimiu).
             onSuccess={afterReviewed}
-            onReleased={() => setReviewHoldState(null)}
+            onReleased={() => setReviewHoldState(getReviewHold(orderId))}
             onHoldChanged={setReviewHoldState}
           />
         </div>
@@ -517,7 +518,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       )}
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_2fr]">
         <Btn variant="secondary" size="lg" onClick={printPreview}>Prévia de conferência</Btn>
-        <Btn variant="success" size="lg" disabled={!amountValid || busy || trayPending || cloudBlocked || (reviewHold !== null && (method !== 'CASH' || holdBlocksCash(reviewHold)))} onClick={charge}>
+        <Btn variant="success" size="lg" disabled={!amountValid || busy || trayPending || cloudBlocked || (reviewHold !== null && (method !== 'CASH' || holdBlocksCash(orderId)))} onClick={charge}>
           {busy ? (method === 'CASH' ? 'Confirmando com o servidor…' : 'Aguardando maquininha…') : `${method === 'CASH' ? 'Receber' : opMode === 'TEF_POS_WIRELESS' ? 'Enviar para maquininha' : 'Cobrar na SmartPOS'} ${formatBRL(amount)}`}
         </Btn>
       </div>

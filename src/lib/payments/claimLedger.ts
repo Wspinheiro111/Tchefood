@@ -19,6 +19,9 @@ export interface LocalClaim {
   release_token?: string | null;
   /** 'charging': cobrança em andamento (ou o app caiu no meio). 'settled': fim conhecido, aguardando o servidor. */
   state?: 'charging' | 'settled';
+  /** Leituras do servidor em que a reserva não apareceu (para limpar registros de cobranças que caíram). */
+  absent_count?: number;
+  absent_first_at?: number;
 }
 
 /** Segredo novo da reserva: 32 bytes aleatórios em hex (64 caracteres). */
@@ -38,6 +41,13 @@ export interface PendingRelease {
   release_token: string | null;
   /** O servidor recusou de vez (ou falta o segredo): não tenta mais sozinho; só o gerente libera. */
   final?: boolean;
+  /**
+   * A chamada da reserva ficou sem resposta: o servidor pode gravá-la depois. "Não existe" (TF005) não encerra;
+   * só depois de 3 respostas "não existe" espaçadas por 2 min ou mais.
+   */
+  unknown_claim?: boolean;
+  not_found_count?: number;
+  not_found_first_at?: number;
 }
 
 interface Ledger {
@@ -100,6 +110,29 @@ export function settleLocalClaim(key: string): void {
   persist();
 }
 
+/** Todos os registros de reserva deste aparelho. */
+export function inFlightClaims(): LocalClaim[] {
+  return [...load().inFlight];
+}
+
+/**
+ * Leitura do servidor sem a reserva (`nowMs`) ou com ela (null, zera a contagem). Devolve a contagem atual.
+ */
+export function markClaimAbsent(key: string, nowMs: number | null): { count: number; firstAt: number } | null {
+  const l = load();
+  let out: { count: number; firstAt: number } | null = null;
+  l.inFlight = l.inFlight.map((c) => {
+    if (c.key !== key) return c;
+    if (nowMs === null) return { ...c, absent_count: 0, absent_first_at: undefined };
+    const count = (c.absent_count ?? 0) + 1;
+    const firstAt = c.absent_first_at ?? nowMs;
+    out = { count, firstAt };
+    return { ...c, absent_count: count, absent_first_at: firstAt };
+  });
+  persist();
+  return out;
+}
+
 /** Reservas terminadas aqui que aguardam o servidor (batimento e limpeza pelo laço de sincronização). */
 export function settledClaims(): LocalClaim[] {
   return load().inFlight.filter((c) => c.state === 'settled');
@@ -131,7 +164,9 @@ export function localClaim(key: string): LocalClaim | null {
   return load().inFlight.find((c) => c.key === key) ?? null;
 }
 
-export function addPendingRelease(p: Omit<PendingRelease, 'created_at' | 'last_error' | 'release_token' | 'final'> & { last_error?: string | null; release_token?: string | null; final?: boolean }): void {
+export function addPendingRelease(
+  p: Omit<PendingRelease, 'created_at' | 'last_error' | 'release_token' | 'final'> & { last_error?: string | null; release_token?: string | null; final?: boolean },
+): void {
   const l = load();
   const prev = l.pendingReleases.find((r) => r.key === p.key);
   l.pendingReleases = [
@@ -140,6 +175,8 @@ export function addPendingRelease(p: Omit<PendingRelease, 'created_at' | 'last_e
       key: p.key, order_id: p.order_id, reason: p.reason, created_at: prev?.created_at ?? new Date().toISOString(), last_error: p.last_error ?? null,
       release_token: p.release_token ?? prev?.release_token ?? null,
       final: Boolean(p.final),
+      ...((p.unknown_claim ?? prev?.unknown_claim) ? { unknown_claim: true } : {}),
+      ...(p.not_found_count !== undefined ? { not_found_count: p.not_found_count, not_found_first_at: p.not_found_first_at } : prev?.not_found_count !== undefined ? { not_found_count: prev.not_found_count, not_found_first_at: prev.not_found_first_at } : {}),
     },
   ];
   persist();

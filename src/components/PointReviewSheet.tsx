@@ -4,7 +4,7 @@ import { Btn, Sheet, toast } from './ui';
 import { PinPad } from './PinPad';
 import { useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
-import { clearReviewHold, getReviewHold } from '../lib/payments/reviewHolds';
+import { clearReviewHold, getReviewHolds, reviewHoldKey } from '../lib/payments/reviewHolds';
 import { RECONCILE_MIN_REASON, reconcilePointCharge, type ReconcileDeps } from '../lib/payments/pointReconcile';
 import { formatBRL } from '../lib/money';
 import { playDeniedBuzz, vibrate } from '../lib/sound';
@@ -39,8 +39,10 @@ const METHOD_LABEL = { CREDIT: 'Crédito', DEBIT: 'Débito' } as const;
 
 /** Tira a trava local só se for desta cobrança. */
 function clearHoldOf(orderId: string, key: string) {
-  const hold = getReviewHold(orderId);
-  if (hold && (hold.idempotency_key === key || !hold.idempotency_key) && hold.acquirer === 'MERCADO_PAGO') clearReviewHold(orderId);
+  // Só a trava desta cobrança (ou a antiga, sem chave); as outras travas da comanda ficam.
+  for (const hold of getReviewHolds(orderId)) {
+    if ((hold.idempotency_key === key || !hold.idempotency_key) && hold.acquirer === 'MERCADO_PAGO') clearReviewHold(orderId, reviewHoldKey(hold));
+  }
 }
 
 /**

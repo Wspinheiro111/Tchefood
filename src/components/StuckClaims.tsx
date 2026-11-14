@@ -9,8 +9,10 @@ import { MANAGER_RELEASE_MIN_REASON, releasePaymentClaimManager, requirePaymentC
 import { isClaimActiveHere, localClaim, pendingRelease } from '../lib/payments/claimLedger';
 import { fetchPointReservation, type CloudPaymentClaim } from '../lib/sync/cloudPull';
 import { freshCloudConfig } from '../lib/sync/useCloudSync';
-import { clearReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
+import { clearReviewHold, getReviewHolds, reviewHoldKey, type ReviewHold } from '../lib/payments/reviewHolds';
 import { ManagerAuthSheet } from './ManagerAuthSheet';
+import { rememberServerReservation } from '../lib/payments/pointReservation';
+import { confirmClaimRefunded } from '../lib/payments/claimFlow';
 
 /** Hora no horário de Brasília (o servidor também fala nesse horário). */
 export function brasiliaTime(ms: number): string {
@@ -18,33 +20,45 @@ export function brasiliaTime(ms: number): string {
 }
 
 /** Travas criadas pela reserva com a maquininha aprovada: bloqueiam qualquer forma de pagamento, inclusive dinheiro. */
-const CLAIM_HOLD_CODES = new Set(['CLAIM_RELEASED', 'CLAIM_UNCONFIRMED', 'ACQUIRER_MISMATCH']);
-export function holdBlocksCash(hold: ReviewHold | null): boolean {
-  return hold !== null && CLAIM_HOLD_CODES.has(hold.code);
+const CLAIM_HOLD_CODES = new Set(['CLAIM_RELEASED', 'PAYMENT_REJECTED', 'CLAIM_UNCONFIRMED', 'ACQUIRER_MISMATCH']);
+/** Alguma trava da comanda (todas, não só a mostrada) bloqueia também o dinheiro. */
+export function holdBlocksCash(orderId: string): boolean {
+  return getReviewHolds(orderId).some((h) => CLAIM_HOLD_CODES.has(h.code));
+}
+
+/** Pagamento que não entrou no servidor: só sai com "Estornei / devolvi" (PIN de gerente); sem comprovante. */
+export function isRefundHold(hold: ReviewHold | null): boolean {
+  return hold !== null && (hold.code === 'CLAIM_RELEASED' || hold.code === 'PAYMENT_REJECTED');
 }
 
 export const HOLD_BLOCKS_ALL = 'A maquininha aprovou uma cobrança desta conta que não pôde ser registrada: resolva a trava antes de receber de novo, em qualquer forma de pagamento.';
 
 export const REFUND_INSTRUCTION =
   'A maquininha aprovou, mas a reserva deste pagamento foi liberada no servidor: o pagamento não pode ser registrado. Estorne (cancele a venda) na maquininha e, depois, o gerente confirma aqui.';
+export const REFUND_TERMINAL = 'Estorne na maquininha.';
+export const REFUND_CASH = 'Devolva o dinheiro ao cliente (o pagamento não entrou no servidor).';
 
-/** Trava CLAIM_RELEASED: em vez de "registrar comprovante", a instrução de estorno e "Estornei na maquininha" (PIN de gerente). */
+/**
+ * Trava de pagamento que não entrou no servidor (CLAIM_RELEASED / PAYMENT_REJECTED): em vez de "registrar
+ * comprovante", a instrução (estornar na maquininha ou devolver o dinheiro) e "Estornei / devolvi" (PIN de gerente).
+ */
 export function RefundedAtTerminalButton({ hold, label, onCleared, size = 'lg' }: { hold: ReviewHold; label: string; onCleared: () => void; size?: 'md' | 'lg' }) {
   const [open, setOpen] = useState(false);
+  const cash = hold.refund === 'CASH';
   return (
     <>
-      <p className="mb-2 rounded-xl bg-brasa/10 p-2 font-semibold text-brasa">{REFUND_INSTRUCTION}</p>
-      <Btn variant="secondary" size={size} block onClick={() => setOpen(true)}>Estornei na maquininha</Btn>
+      <p className="mb-2 rounded-xl bg-brasa/10 p-2 font-semibold text-brasa">{cash ? REFUND_CASH : hold.code === 'CLAIM_RELEASED' && !hold.refund ? REFUND_INSTRUCTION : REFUND_TERMINAL}</p>
+      <Btn variant="secondary" size={size} block onClick={() => setOpen(true)}>Estornei / devolvi</Btn>
       <ManagerAuthSheet
         open={open}
         onClose={() => setOpen(false)}
-        title="Estornei na maquininha"
-        summary={<span>{label} · {formatBRL(hold.amount)} · confirme que a venda foi estornada (cancelada) na maquininha.</span>}
-        confirmLabel="Confirmar estorno"
-        quickReasons={['Venda estornada na maquininha', 'Cancelado na maquininha, cliente reembolsado']}
-        onSubmit={(pin, reason) => useTcheStore.getState().resolveRefundedClaimHold(hold.order_id, { managerPin: pin, reason })}
+        title="Estornei / devolvi"
+        summary={<span>{label} · {formatBRL(hold.amount)} · {cash ? 'confirme que o dinheiro foi devolvido ao cliente.' : 'confirme que a venda foi estornada (cancelada) na maquininha.'}</span>}
+        confirmLabel="Confirmar"
+        quickReasons={cash ? ['Dinheiro devolvido ao cliente'] : ['Venda estornada na maquininha', 'Cancelado na maquininha, cliente reembolsado']}
+        onSubmit={(pin, reason) => confirmClaimRefunded(hold, { managerPin: pin, reason })}
         onSuccess={() => onCleared()}
-        successMessage="Estorno registrado (audit_logs deste aparelho)."
+        successMessage="Estorno registrado no servidor (audit_logs)."
       />
     </>
   );
@@ -92,6 +106,15 @@ export function ReleaseClaimSheet({ open, onClose, claimKey, title = 'Liberar re
     setError(null);
     const out = await releasePaymentClaimManager(claimKey, pinValue, reason);
     setBusy(false);
+    // O servidor não tem a reserva (TF005): ele não conferiu o PIN, então o PIN do gerente é conferido aqui.
+    const local = out.ok && out.notFound ? useTcheStore.getState().verifyManagerPin({ managerPin: pinValue, reason }, { orderId: null, action: 'CHARGE_CONFIRMED_MANUALLY' }) : null;
+    if (local && !local.ok) {
+      setError(local.error);
+      setPin('');
+      playDeniedBuzz();
+      vibrate([80, 40, 80]);
+      return;
+    }
     if (!out.ok) {
       setError(out.error);
       setPin('');
@@ -220,6 +243,7 @@ export function useOrderClaims(orderId: string): { claims: CloudPaymentClaim[]; 
         const cfg = await freshCloudConfig();
         if (!cfg) return;
         const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
+        rememberServerReservation(orderId, r.reservedCents, r.claims ?? []);
         if (alive) setClaims(r.claims ?? []);
       } catch {
         // Sem leitura: fica a última lista (o servidor ainda recusa o que passar da reserva).
@@ -251,7 +275,7 @@ export function HoldNotChargedButton({ hold, label, onCleared, size = 'lg' }: Ho
   const needsClaim = useTcheStore((s) => requirePaymentClaim(s));
   const [open, setOpen] = useState(false);
   const clear = () => {
-    clearReviewHold(hold.order_id);
+    clearReviewHold(hold.order_id, reviewHoldKey(hold));
     onCleared();
   };
   const key = hold.idempotency_key;

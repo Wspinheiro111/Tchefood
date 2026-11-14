@@ -20,6 +20,8 @@ const releasePaymentClaimManager = vi.fn();
 const fetchPointReservation = vi.fn();
 const createDriver = vi.fn();
 const touchPaymentClaim = vi.fn();
+const authorizeClaimRefunded = vi.fn();
+const reclaimPayment = vi.fn();
 
 vi.mock('../lib/payments/paymentClaim', async (orig) => ({
   ...(await orig<typeof import('../lib/payments/paymentClaim')>()),
@@ -27,6 +29,8 @@ vi.mock('../lib/payments/paymentClaim', async (orig) => ({
   releaseClaimAfterNoCharge: (...a: unknown[]) => releasePaymentClaim(...a),
   releasePaymentClaimManager: (...a: unknown[]) => releasePaymentClaimManager(...a),
   touchPaymentClaim: (...a: unknown[]) => touchPaymentClaim(...a),
+  authorizeClaimRefunded: (...a: unknown[]) => authorizeClaimRefunded(...a),
+  reclaimPayment: (...a: unknown[]) => reclaimPayment(...a),
 }));
 vi.mock('../lib/sync/cloudPull', async (orig) => ({
   ...(await orig<typeof import('../lib/sync/cloudPull')>()),
@@ -104,6 +108,8 @@ beforeEach(() => {
   claimLog.length = 0;
   claimPayment.mockReset();
   releasePaymentClaim.mockReset().mockResolvedValue({ ok: true });
+  authorizeClaimRefunded.mockReset().mockResolvedValue({ ok: true, auditId: '11111111-2222-4333-8444-555555555555' });
+  reclaimPayment.mockReset().mockImplementation(async (i: { newKey: string; amount: number }) => ({ ok: true, claim: { id: 'c', idempotency_key: i.newKey, status: 'open', amount_cents: Math.round(i.amount * 100) } }));
   releasePaymentClaimManager.mockReset().mockResolvedValue({ ok: true });
   resetClaimLedger();
   fetchPointReservation.mockReset().mockResolvedValue(NO_RESERVATION);
@@ -444,6 +450,20 @@ describe('revisão independente: reservas presas, conferência do extrato, falha
     expect(releasePaymentClaimManager).toHaveBeenLastCalledWith('k-trava', '9999', 'Extrato da Stone sem a venda');
   });
 
+  it('"Conferi no extrato": reserva que o servidor não tem (TF005) só tira a trava com o PIN do gerente conferido aqui', async () => {
+    const id = openTable();
+    withPoint();
+    setReviewHold({ order_id: id, amount: 2, reason: 'sem resposta', code: 'X', method: 'CREDIT', acquirer: 'STONE', terminal_id: null, terminal_serial: 'S', idempotency_key: 'k-sumiu' });
+    releasePaymentClaimManager.mockResolvedValue({ ok: true, notFound: true });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Conferi no extrato: não foi cobrado' }));
+    managerRelease('Extrato da Stone sem a venda', '1234');
+    await waitFor(() => expect(screen.getByText(/PIN de gerente inválido/)).toBeTruthy());
+    expect(getReviewHold(id)).not.toBeNull();
+    managerRelease('Extrato da Stone sem a venda', '9999');
+    await waitFor(() => expect(getReviewHold(id)).toBeNull());
+  });
+
   it('"Conferi no extrato" sem nuvem tira a trava como antes', async () => {
     const id = openTable();
     localOnly();
@@ -716,7 +736,7 @@ describe('r7 revisão: trava CLAIM_RELEASED, comprovante, adquirente, aviso e re
     for (const d of pin) fireEvent.click(within(dialog).getByRole('button', { name: d }));
   }
 
-  it('caixa da mesa: com CLAIM_RELEASED nem dinheiro recebe; sem "registrar comprovante"; "Estornei na maquininha" com PIN tira a trava (registro local)', async () => {
+  it('caixa da mesa: com CLAIM_RELEASED nem dinheiro recebe; sem "registrar comprovante"; "Estornei / devolvi" com PIN: o servidor registra primeiro; sem resposta a trava fica', async () => {
     const id = openTable();
     withPoint();
     setReviewHoldState(id);
@@ -731,11 +751,19 @@ describe('r7 revisão: trava CLAIM_RELEASED, comprovante, adquirente, aviso e re
     expect(screen.queryByRole('button', { name: 'Conferi no extrato: não foi cobrado' })).toBeNull();
     expect(screen.getByText(/Estorne \(cancele a venda\) na maquininha/)).toBeTruthy();
     const outboxBefore = st().outbox.length;
-    fireEvent.click(screen.getByRole('button', { name: 'Estornei na maquininha' }));
-    // O PIN completo confirma (como nas outras autorizações de gerente).
+    // Sem resposta do servidor: a trava fica.
+    authorizeClaimRefunded.mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem conexão com o servidor.' });
+    fireEvent.click(screen.getByRole('button', { name: 'Estornei / devolvi' }));
     managerAuth('Venda estornada na maquininha Stone');
+    expect(await screen.findByText('Sem conexão com o servidor.')).toBeTruthy();
+    expect(getReviewHold(id)).toMatchObject({ code: 'CLAIM_RELEASED' });
+    for (const d of '9999') fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: d }));
+    // O PIN completo confirma (como nas outras autorizações de gerente).
     await waitFor(() => expect(getReviewHold(id)).toBeNull());
+    expect(authorizeClaimRefunded).toHaveBeenLastCalledWith('k-liberada', '9999', 'Venda estornada na maquininha Stone', { refund_kind: 'card' }, undefined);
     expect(st().auditLogs[0]).toMatchObject({ action_type: 'CLAIM_RELEASED_REFUNDED', order_id: id, reason: 'Venda estornada na maquininha Stone' });
+    expect(st().auditLogs[0]!.metadata).toMatchObject({ server_audit_id: '11111111-2222-4333-8444-555555555555' });
+    // Não sobe pela fila: o servidor já gravou o audit_log dele.
     expect(st().outbox.length).toBe(outboxBefore);
     // O registro pelo comprovante também recusa direto na loja.
     releasedHold(id);
@@ -757,7 +785,7 @@ describe('r7 revisão: trava CLAIM_RELEASED, comprovante, adquirente, aviso e re
     fireEvent.click(screen.getByRole('button', { name: /Dinheiro/ }));
     expect(screen.queryByRole('button', { name: /^Cobrar R\$/ })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Maquininha aprovou: registrar comprovante' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Estornei na maquininha' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Estornei / devolvi' })).toBeTruthy();
     expect(claimPayment).not.toHaveBeenCalled();
     clearReviewHold(sale.data.id);
   });
@@ -790,13 +818,51 @@ describe('r7 revisão: trava CLAIM_RELEASED, comprovante, adquirente, aviso e re
     await openReceiptAndSubmit();
     await waitFor(() => expect(getReviewHold(id)).toMatchObject({ code: 'CLAIM_RELEASED' }));
     expect(payments(id)).toHaveLength(0);
-    expect(await screen.findByRole('button', { name: 'Estornei na maquininha' })).toBeTruthy();
+    expect(await screen.findByRole('button', { name: 'Estornei / devolvi' })).toBeTruthy();
     v2.unmount();
 
     setReviewHold({ order_id: id, amount: 5, reason: 'Aprovado na maquininha, mas não registrado', code: 'REGISTER_FAILED', method: 'CREDIT', acquirer: 'STONE', terminal_id: null, terminal_serial: 'S1', idempotency_key: 'k-falhou' });
     render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
     await openReceiptAndSubmit();
     await waitFor(() => expect(payments(id).filter((x) => x.status === 'APPROVED')).toHaveLength(1));
+    expect(getReviewHold(id)).toBeNull();
+  });
+
+  it('P1-1 outra adquirente: PIN errado não troca a reserva; troca já pedida não confere a antiga e repete a mesma troca', async () => {
+    const id = openTable();
+    withPoint();
+    const amount = st().orders.find((o) => o.id === id)!.remaining_balance;
+    beginLocalClaim('k-velha', id, 'ef'.repeat(32));
+    settleLocalClaim('k-velha');
+    setReviewHold({ order_id: id, amount, reason: 'outra adquirente', code: 'ACQUIRER_MISMATCH', method: 'CREDIT', acquirer: 'PAGBANK', terminal_id: null, terminal_serial: 'S1', idempotency_key: 'k-velha' });
+    const view = render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Maquininha aprovou: registrar comprovante' }));
+    let dialog = screen.getByRole('dialog');
+    fireEvent.change(within(dialog).getByPlaceholderText('Só números'), { target: { value: '445566' } });
+    fireEvent.change(within(dialog).getByPlaceholderText('Letras e números'), { target: { value: 'AB12CD' } });
+    for (const d of '1234') fireEvent.click(within(dialog).getByRole('button', { name: d }));
+    expect(await screen.findByText(/PIN de gerente inválido/)).toBeTruthy();
+    expect(reclaimPayment).not.toHaveBeenCalled();
+    expect(touchPaymentClaim).not.toHaveBeenCalled();
+    view.unmount();
+
+    // Primeira troca ficou sem resposta: a chave nova fica na trava. Na volta, a antiga (já liberada pela troca) não é conferida.
+    reclaimPayment.mockResolvedValueOnce({ ok: false, offline: true, error: 'rede' }).mockResolvedValueOnce({ ok: false, offline: true, error: 'rede' });
+    const v2 = render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    await waitFor(() => expect(reclaimPayment).toHaveBeenCalledTimes(2));
+    const first = reclaimPayment.mock.calls[0]![0] as { newKey: string; newToken: string };
+    await waitFor(() => expect(getReviewHold(id)?.reclaim_key).toBe(first.newKey));
+    v2.unmount();
+    touchPaymentClaim.mockClear();
+    touchPaymentClaim.mockResolvedValue({ ok: true, status: 'released', activeUntil: null });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    await waitFor(() => expect(payments(id).filter((x) => x.status === 'APPROVED')).toHaveLength(1));
+    expect(touchPaymentClaim).not.toHaveBeenCalledWith('k-velha', expect.anything());
+    const last = reclaimPayment.mock.calls.at(-1)![0] as { newKey: string; newToken: string };
+    expect([last.newKey, last.newToken]).toEqual([first.newKey, first.newToken]);
+    expect(payments(id)[0]).toMatchObject({ idempotency_key: first.newKey, acquirer: 'PAGBANK' });
     expect(getReviewHold(id)).toBeNull();
   });
 
@@ -839,9 +905,9 @@ describe('r7 revisão: trava CLAIM_RELEASED, comprovante, adquirente, aviso e re
     const id = openTable();
     withPoint();
     render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
-    expect(screen.queryByRole('button', { name: 'Estornei na maquininha' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Estornei / devolvi' })).toBeNull();
     act(() => { releasedHold(id); });
-    expect(await screen.findByRole('button', { name: 'Estornei na maquininha' })).toBeTruthy();
+    expect(await screen.findByRole('button', { name: 'Estornei / devolvi' })).toBeTruthy();
     clearReviewHold(id);
   });
 

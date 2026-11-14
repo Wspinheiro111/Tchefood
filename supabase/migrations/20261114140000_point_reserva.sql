@@ -22,7 +22,10 @@
 --    conta é travada (FOR UPDATE) antes da soma: tchefood_open_terminal_charge trava a mesma
 --    linha, então cobrança nova e pagamento na mesma conta não passam juntos do saldo. Cobrança
 --    que termina (recusada, cancelada, expirada, estornada) deixa de reservar; nunca acontece o
---    contrário (nada volta a reservar sem passar pela trava da conta).
+--    contrário (nada volta a reservar sem passar pela trava da conta). Cobrança aprovada deixa de
+--    reservar quando o pagamento do Mercado Pago dela é gravado e continua sem reservar se ele depois
+--    for estornado ou recusado (REFUNDED, DECLINED): só o pagamento ainda PENDING não a libera
+--    (segunda revisão independente, item 3).
 --    Auditoria r4 P0-01: o UPDATE também passa pela conferência quando o pagamento VIRA aprovado,
 --    quando o valor aprovado sobe, quando ele muda de conta, de loja, de chave ou de credenciadora.
 --    Conta de outra loja é recusada no UPDATE. No INSERT e no UPDATE, só o pagamento do Mercado Pago
@@ -56,7 +59,7 @@
 -- inválido ou motivo curto, TF007 não se aplica, TF008 saldo diferente do mostrado, TF009 chave já
 -- usada por outro pagamento, TF010 pagamento sem a reserva que o cobre (claim_required), TF011 reserva ainda em
 -- andamento no aparelho que a pediu (claim_active), TF012 saldo da conta abaixo do que está reservado
--- (reserved_exceeds_balance).
+-- (reserved_exceeds_balance), TF013 pagamento com a chave de uma reserva já liberada (claim_released).
 -- 8. Revisão independente (P1-B, P2-A, P3): na loja com Point (tchefood_point_store) o próprio gatilho de payments
 --    exige que o pagamento aprovado fora da Point tenha a reserva aberta da mesma conta, até o valor dela e com a
 --    mesma forma e credenciadora (TF010), sem confiar na lista de maquininhas do aparelho. Única exceção,
@@ -265,7 +268,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
        AND c.idempotency_key IS DISTINCT FROM p_exclude_key
        AND (c.status IN ('creating', 'pending', 'at_terminal', 'manual_review')
             OR (c.status = 'approved' AND NOT EXISTS (
-                SELECT 1 FROM payments p WHERE p.tenant_id = p_tenant AND p.idempotency_key = c.idempotency_key AND p.status = 'APPROVED'
+                SELECT 1 FROM payments p WHERE p.tenant_id = p_tenant AND p.idempotency_key = c.idempotency_key AND p.status <> 'PENDING'
                   AND p.acquirer::text = 'MERCADO_PAGO')));
 $$;
 
@@ -373,6 +376,12 @@ BEGIN
         v_claim_found := FOUND;
         IF v_claim_found AND v_claim.order_id <> NEW.order_id THEN
             RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % é da reserva de pagamento de outra conta.', NEW.idempotency_key USING ERRCODE = 'TF010';
+        END IF;
+        -- Segunda revisão independente (item 1), em qualquer loja: a reserva liberada (pelo gerente ou pelo aparelho)
+        -- não volta a cobrir nada. O dinheiro dela, se entrou, precisa ser devolvido, não gravado.
+        IF v_claim_found AND v_claim.status = 'released' THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a reserva deste pagamento foi liberada pelo gerente; o valor não pode entrar: confira e devolva ao cliente.'
+                USING ERRCODE = 'TF013', DETAIL = 'claim_released idempotency_key=' || NEW.idempotency_key;
         END IF;
         v_claim_ok := v_claim_found AND (v_claim.status = 'open'
                                          OR (v_claim.status = 'consumed' AND TG_OP = 'UPDATE' AND v_claim.consumed_payment_id = OLD.id AND OLD.id = NEW.id));
@@ -507,7 +516,7 @@ BEGIN
      WHERE c.tenant_id = v_tenant AND c.order_id = p_order
        AND (c.status IN ('creating', 'pending', 'at_terminal', 'manual_review')
             OR (c.status = 'approved' AND NOT EXISTS (
-                SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = c.idempotency_key AND p.status = 'APPROVED'
+                SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = c.idempotency_key AND p.status <> 'PENDING'
                   AND p.acquirer::text = 'MERCADO_PAGO')));
     -- Auditoria r5: as reservas de pagamento abertas da conta (presas de outro aparelho aparecem aqui para o
     -- gerente liberar com PIN).
@@ -638,6 +647,124 @@ END;
 $$;
 
 -- -----------------------------------------------------------------------------
+-- 4c. Trocar a reserva por outra (segunda revisão independente, item 2)
+-- -----------------------------------------------------------------------------
+-- A maquininha respondeu com outra credenciadora (ou forma) que a reservada (o aparelho segura o recibo com
+-- ACQUIRER_MISMATCH): o recibo só entra com uma reserva da credenciadora real. Numa transação só, com a conta
+-- travada primeiro: confere o segredo da reserva antiga (TF004), que ela está aberta e sem pagamento (TF007),
+-- libera a antiga (PAYMENT_CLAIM_RELEASED com released_via = 'reclaim' e a chave nova) e cria a nova na MESMA
+-- conta, com o saldo livre contado sem a antiga (TF003). A nova segue as regras de tchefood_claim_payment
+-- (segredo do aparelho, chave livre: TF009, conta aberta: TF002). Reenvio (a resposta se perdeu): antiga já
+-- liberada por esta troca e a nova gravada com os mesmos dados e o mesmo segredo = devolve a mesma troca.
+-- Devolve {old: {id, idempotency_key, status, release_audit_id}, new: {id, idempotency_key, status, amount_cents}}.
+CREATE OR REPLACE FUNCTION tchefood_reclaim_payment(
+    p_old_key VARCHAR, p_old_token TEXT, p_new_key VARCHAR, p_new_token TEXT,
+    p_method VARCHAR, p_acquirer VARCHAR, p_amount_cents BIGINT, p_staff UUID)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_old payment_claims%ROWTYPE;
+    v_new payment_claims%ROWTYPE;
+    v_order orders%ROWTYPE;
+    v_hash BYTEA;
+    v_balance BIGINT;
+    v_reserved BIGINT;
+    v_audit UUID;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
+    END IF;
+    IF p_old_key IS NULL OR p_new_key IS NULL OR p_new_key !~ '^[A-Za-z0-9_-]{1,50}$' OR p_new_key = p_old_key THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: chave da reserva inválida (a nova precisa ser outra chave).' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_method IS NULL OR p_method NOT IN ('CASH', 'CREDIT', 'DEBIT', 'PIX')
+       OR p_acquirer IS NULL OR p_acquirer NOT IN ('CASH_DESK', 'STONE', 'PAGBANK')
+       OR (p_method = 'CASH') <> (p_acquirer = 'CASH_DESK') THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: forma de pagamento ou credenciadora inválida para a reserva.' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_amount_cents IS NULL OR p_amount_cents <= 0 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: valor da reserva inválido. Nada foi cobrado.' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_new_token IS NULL OR p_new_token !~ '^[0-9a-f]{64}$' THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: segredo de liberação da reserva inválido (64 letras hex minúsculas). Nada foi cobrado.' USING ERRCODE = 'TF006';
+    END IF;
+    v_hash := sha256(convert_to(p_new_token, 'UTF8'));
+    IF p_staff IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_staff AND u.tenant_id = v_tenant AND u.active) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
+    END IF;
+    SELECT * INTO v_old FROM payment_claims WHERE tenant_id = v_tenant AND idempotency_key = p_old_key;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: reserva de pagamento não encontrada nesta loja.' USING ERRCODE = 'TF005';
+    END IF;
+    IF v_old.release_token_hash IS NULL OR p_old_token IS NULL
+       OR sha256(convert_to(p_old_token, 'UTF8')) <> v_old.release_token_hash THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: só o aparelho que pediu a reserva a troca por outra.' USING ERRCODE = 'TF004';
+    END IF;
+    -- Conta primeiro (a mesma trava de tchefood_claim_payment e do gatilho de payments), depois a reserva.
+    SELECT * INTO v_order FROM orders WHERE id = v_old.order_id AND tenant_id = v_tenant FOR UPDATE;
+    SELECT * INTO v_old FROM payment_claims WHERE id = v_old.id FOR UPDATE;
+    SELECT * INTO v_new FROM payment_claims WHERE tenant_id = v_tenant AND idempotency_key = p_new_key;
+    IF FOUND THEN
+        -- Reenvio da mesma troca: devolve o que já foi gravado. Qualquer outra coisa com a chave nova é chave em uso.
+        IF v_new.order_id = v_old.order_id AND v_new.method = p_method AND v_new.acquirer = p_acquirer AND v_new.amount_cents = p_amount_cents
+           AND v_new.release_token_hash = v_hash AND v_old.status = 'released'
+           AND EXISTS (SELECT 1 FROM audit_logs a WHERE a.id = v_old.release_audit_id AND a.metadata->>'released_via' = 'reclaim'
+                          AND a.metadata->>'new_idempotency_key' = p_new_key) THEN
+            RETURN jsonb_build_object(
+                'old', jsonb_build_object('id', v_old.id, 'idempotency_key', v_old.idempotency_key, 'status', v_old.status, 'release_audit_id', v_old.release_audit_id),
+                'new', jsonb_build_object('id', v_new.id, 'idempotency_key', v_new.idempotency_key, 'status', v_new.status, 'amount_cents', v_new.amount_cents));
+        END IF;
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % já reservou outro pagamento.', p_new_key USING ERRCODE = 'TF009';
+    END IF;
+    IF v_old.status <> 'open' OR EXISTS (SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = v_old.idempotency_key
+                                           AND p.order_id = v_old.order_id AND p.status = 'APPROVED') THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a reserva % não está aberta (%); não há o que trocar.', p_old_key,
+            CASE v_old.status WHEN 'released' THEN 'liberada' WHEN 'consumed' THEN 'já virou pagamento' ELSE 'já virou pagamento' END
+            USING ERRCODE = 'TF007';
+    END IF;
+    IF EXISTS (SELECT 1 FROM terminal_charges c WHERE c.idempotency_key = p_new_key) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % é de uma cobrança da Point.', p_new_key USING ERRCODE = 'TF009';
+    END IF;
+    IF EXISTS (SELECT 1 FROM payments p WHERE p.idempotency_key = p_new_key) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % já é de um pagamento gravado.', p_new_key USING ERRCODE = 'TF009';
+    END IF;
+    IF v_order.status NOT IN ('OPEN', 'PAYING') THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a conta já está %.', CASE v_order.status WHEN 'CLOSED' THEN 'fechada' ELSE 'cancelada' END USING ERRCODE = 'TF002';
+    END IF;
+    -- Saldo livre sem a reserva antiga (é ela que sai).
+    v_balance := round(v_order.remaining_balance * 100)::BIGINT;
+    v_reserved := tchefood_point_reserved_cents(v_tenant, v_old.order_id, p_old_key);
+    IF p_amount_cents > v_balance - v_reserved THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: R$ % passa do saldo livre da conta no servidor (R$ % livre; R$ % reservado na Point ou em outro pagamento).',
+            to_char(p_amount_cents / 100.0, 'FM999999990.00'), to_char(GREATEST(v_balance - v_reserved, 0) / 100.0, 'FM999999990.00'),
+            to_char(v_reserved / 100.0, 'FM999999990.00')
+            USING ERRCODE = 'TF003';
+    END IF;
+    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, amount_impact, reason, metadata)
+    VALUES (v_tenant, v_old.order_id, p_staff, 'PAYMENT_CLAIM_RELEASED', 0, 'troca da reserva pela credenciadora da maquininha',
+            jsonb_build_object('claim_id', v_old.id, 'idempotency_key', v_old.idempotency_key, 'amount_cents', v_old.amount_cents,
+                               'method', v_old.method, 'acquirer', v_old.acquirer, 'created_by', v_old.created_by,
+                               'claim_creator', v_old.created_by, 'released_via', 'reclaim',
+                               'new_idempotency_key', p_new_key, 'new_method', p_method, 'new_acquirer', p_acquirer, 'new_amount_cents', p_amount_cents,
+                               'by_manager', false, 'server_verified', true))
+    RETURNING id INTO v_audit;
+    UPDATE payment_claims
+       SET status = 'released', released_at = clock_timestamp(), released_by = p_staff,
+           release_reason = 'troca da reserva pela credenciadora da maquininha', release_audit_id = v_audit
+     WHERE id = v_old.id
+    RETURNING * INTO v_old;
+    -- O gatilho confere de novo a chave contra cobranças da Point e pagamentos, com a chave travada.
+    INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, status, created_by, release_token_hash)
+    VALUES (v_tenant, p_new_key, v_old.order_id, p_method, p_acquirer, p_amount_cents, 'open', p_staff, v_hash)
+    RETURNING * INTO v_new;
+    RETURN jsonb_build_object(
+        'old', jsonb_build_object('id', v_old.id, 'idempotency_key', v_old.idempotency_key, 'status', v_old.status, 'release_audit_id', v_old.release_audit_id),
+        'new', jsonb_build_object('id', v_new.id, 'idempotency_key', v_new.idempotency_key, 'status', v_new.status, 'amount_cents', v_new.amount_cents));
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
 -- 5. Liberar a reserva que não virou pagamento
 -- -----------------------------------------------------------------------------
 -- Pelo aparelho: a maquininha recusou ou o operador desistiu antes de receber. Só com o segredo de liberação que
@@ -750,9 +877,10 @@ $$;
 -- Reserva presa de aparelho que sumiu: PIN de gerente conferido aqui, com as regras de
 -- tchefood_authorize_manager e de tchefood_authorize_point_cancel (gerente ou dono ativo da loja, 3 PINs
 -- errados em 60 s bloqueiam, com a loja travada para tentativas simultâneas não passarem juntas) e motivo
--- com 10+ letras. Já liberada: devolve como está, sem conferir PIN nem gravar outro registro. Com pagamento
--- aprovado: TF007, sem registro. Antes de active_until + tchefood_claim_abandon_after(): TF011 (o aparelho que pediu
--- ainda pode estar cobrando), sem conferir PIN e sem registro; a mensagem traz a hora em que fica liberável. PIN errado ou bloqueado: NULL, nada é liberado e a falha fica em audit_logs
+-- com 10+ letras. Com pagamento aprovado: TF007, sem registro. Aberta e antes de active_until +
+-- tchefood_claim_abandon_after(): TF011 (o aparelho que pediu ainda pode estar cobrando), sem conferir PIN e sem
+-- registro. Já liberada: só depois do PIN conferido devolve como está, sem gravar outro registro (terceira revisão
+-- P2-1: sem isso, qualquer PIN "liberava" a reserva no aparelho); a mensagem traz a hora em que fica liberável. PIN errado ou bloqueado: NULL, nada é liberado e a falha fica em audit_logs
 -- (MANAGER_PIN_FAILED / MANAGER_PIN_LOCKOUT, que contam no bloqueio). Não há fonte externa a consultar: o
 -- comprovante da Stone/PagBank tem o próprio fluxo (NSU do papel).
 CREATE OR REPLACE FUNCTION tchefood_release_payment_claim_manager(p_key VARCHAR, p_staff UUID, p_manager_pin VARCHAR, p_reason TEXT)
@@ -786,10 +914,6 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || v_tenant::text));
     PERFORM 1 FROM orders o WHERE o.id = v_claim.order_id AND o.tenant_id = v_tenant FOR UPDATE;
     SELECT * INTO v_claim FROM payment_claims WHERE id = v_claim.id FOR UPDATE;
-    IF v_claim.status = 'released' THEN
-        RETURN jsonb_build_object('id', v_claim.id, 'idempotency_key', v_claim.idempotency_key, 'status', v_claim.status, 'amount_cents', v_claim.amount_cents,
-                                  'released_at', v_claim.released_at, 'release_audit_id', v_claim.release_audit_id);
-    END IF;
     IF v_claim.status = 'consumed' OR EXISTS (SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = v_claim.idempotency_key
                   AND p.order_id = v_claim.order_id AND p.status = 'APPROVED') THEN
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a reserva % já virou pagamento e não é liberada.', p_key USING ERRCODE = 'TF007';
@@ -797,7 +921,7 @@ BEGIN
     -- Auditoria r6 P0-02: reserva com o aparelho ainda cobrando (prazo renovado há pouco) não é liberada pelo
     -- gerente: a cobrança de cartão pode estar rodando. Antes do PIN (a recusa não gasta tentativa).
     v_releasable := v_claim.active_until + tchefood_claim_abandon_after();
-    IF clock_timestamp() < v_releasable THEN
+    IF v_claim.status = 'open' AND clock_timestamp() < v_releasable THEN
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a reserva % ainda está em andamento no aparelho que a pediu; o gerente pode liberá-la a partir de % (horário de Brasília).',
             p_key, to_char(v_releasable AT TIME ZONE 'America/Sao_Paulo', 'HH24:MI:SS')
             USING ERRCODE = 'TF011', DETAIL = 'releasable_at=' || to_char(v_releasable AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"');
@@ -822,6 +946,12 @@ BEGIN
                 jsonb_build_object('attempted_action', 'PAYMENT_CLAIM_RELEASED', 'idempotency_key', v_claim.idempotency_key), v_checked_at);
         RETURN NULL;
     END IF;
+    -- Terceira revisão (P2-1): a reserva já liberada só volta como está DEPOIS do PIN conferido (com PIN errado é
+    -- NULL e conta no bloqueio, como as outras), sem gravar outro registro.
+    IF v_claim.status = 'released' THEN
+        RETURN jsonb_build_object('id', v_claim.id, 'idempotency_key', v_claim.idempotency_key, 'status', v_claim.status, 'amount_cents', v_claim.amount_cents,
+                                  'released_at', v_claim.released_at, 'release_audit_id', v_claim.release_audit_id);
+    END IF;
     INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
     VALUES (v_tenant, v_claim.order_id, p_staff, v_manager.id, 'PAYMENT_CLAIM_RELEASED', 0, trim(p_reason),
             jsonb_build_object('claim_id', v_claim.id, 'idempotency_key', v_claim.idempotency_key, 'amount_cents', v_claim.amount_cents,
@@ -834,6 +964,95 @@ BEGIN
     RETURNING * INTO v_claim;
     RETURN jsonb_build_object('id', v_claim.id, 'idempotency_key', v_claim.idempotency_key, 'status', v_claim.status, 'amount_cents', v_claim.amount_cents,
                               'released_at', v_claim.released_at, 'release_audit_id', v_claim.release_audit_id);
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- 5c. Reserva liberada com o dinheiro já recebido: estornado/devolvido, com PIN de gerente
+-- -----------------------------------------------------------------------------
+-- A maquininha aprovou (ou o dinheiro entrou) numa reserva que foi liberada: o pagamento não entra (TF013) e o
+-- valor volta ao cliente. O aparelho registra "Estornei na maquininha / devolvi" com o PIN do gerente:
+-- CLAIM_RELEASED_REFUNDED, com o gerente conferido aqui (o aparelho não grava esse tipo direto:
+-- tchefood_guard_point_audit). Ordem: motivo (10+ letras) e p_metadata (só refund_kind 'card'|'cash', obrigatório,
+-- e payment_local_id, texto de até 100 letras, opcional; outra chave: TF006); operador da equipe ativa (TF004);
+-- trava do PIN da loja (antes de qualquer linha, regra da main #50); reserva desta loja (TF005) e liberada (TF007,
+-- antes do PIN: não gasta tentativa); bloqueio de 3 erros em 60 s pelo relógio de agora (MANAGER_PIN_LOCKOUT, NULL);
+-- PIN de gerente ou dono ativo (MANAGER_PIN_FAILED, NULL). Com o PIN certo, um registro por reserva: a segunda chamada
+-- devolve o mesmo id (sem gravar outro). Devolve o id do registro.
+CREATE OR REPLACE FUNCTION tchefood_authorize_claim_refunded(
+    p_key VARCHAR, p_staff UUID, p_manager_pin VARCHAR, p_reason TEXT, p_metadata JSONB)
+RETURNS UUID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_claim payment_claims%ROWTYPE;
+    v_manager staff_users%ROWTYPE;
+    v_meta JSONB := COALESCE(p_metadata, '{}'::jsonb);
+    v_failures INT;
+    v_checked_at TIMESTAMPTZ;
+    v_id UUID;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
+    END IF;
+    IF p_reason IS NULL OR length(trim(p_reason)) < 10 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: motivo obrigatório (mínimo 10 caracteres).' USING ERRCODE = 'TF006';
+    END IF;
+    IF jsonb_typeof(v_meta) <> 'object' THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: dados do estorno inválidos (refund_kind card ou cash; payment_local_id opcional).' USING ERRCODE = 'TF006';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_object_keys(v_meta) k WHERE k NOT IN ('refund_kind', 'payment_local_id'))
+       OR jsonb_typeof(v_meta->'refund_kind') IS DISTINCT FROM 'string' OR v_meta->>'refund_kind' NOT IN ('card', 'cash')
+       OR (v_meta ? 'payment_local_id' AND (jsonb_typeof(v_meta->'payment_local_id') <> 'string'
+                                              OR length(v_meta->>'payment_local_id') NOT BETWEEN 1 AND 100)) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: dados do estorno inválidos (refund_kind card ou cash; payment_local_id opcional).' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_staff IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_staff AND u.tenant_id = v_tenant AND u.active) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
+    END IF;
+    -- Trava do PIN da loja antes de qualquer trava de linha (a mesma das outras autorizações com PIN). Ela também
+    -- serializa as chamadas da mesma reserva: a segunda encontra o registro da primeira.
+    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || v_tenant::text));
+    SELECT * INTO v_claim FROM payment_claims WHERE tenant_id = v_tenant AND idempotency_key = p_key;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: reserva de pagamento não encontrada nesta loja.' USING ERRCODE = 'TF005';
+    END IF;
+    IF v_claim.status <> 'released' THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a reserva % não foi liberada (está %); não há estorno a registrar.', p_key,
+            CASE v_claim.status WHEN 'open' THEN 'aberta' ELSE 'paga' END USING ERRCODE = 'TF007';
+    END IF;
+    v_checked_at := clock_timestamp();
+    SELECT count(*) INTO v_failures FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.action_type = 'MANAGER_PIN_FAILED'
+       AND a.created_at >= v_checked_at - INTERVAL '60 seconds' AND a.created_at <= v_checked_at;
+    IF v_failures >= 3 THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata, created_at)
+        VALUES (v_tenant, v_claim.order_id, p_staff, 'MANAGER_PIN_LOCKOUT', 'PIN de gerente bloqueado por excesso de tentativas',
+                jsonb_build_object('attempted_action', 'CLAIM_RELEASED_REFUNDED', 'idempotency_key', p_key), v_checked_at);
+        RETURN NULL;
+    END IF;
+    SELECT * INTO v_manager FROM staff_users m
+     WHERE m.tenant_id = v_tenant AND m.pin_code = p_manager_pin AND m.active AND m.role IN ('MANAGER', 'OWNER');
+    IF NOT FOUND THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata, created_at)
+        VALUES (v_tenant, v_claim.order_id, p_staff, 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto',
+                jsonb_build_object('attempted_action', 'CLAIM_RELEASED_REFUNDED', 'idempotency_key', p_key), v_checked_at);
+        RETURN NULL;
+    END IF;
+    -- Um registro por reserva: o reenvio (resposta perdida) devolve o mesmo.
+    SELECT a.id INTO v_id FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.action_type = 'CLAIM_RELEASED_REFUNDED' AND a.metadata->>'claim_id' = v_claim.id::text
+     ORDER BY a.created_at LIMIT 1;
+    IF v_id IS NOT NULL THEN
+        RETURN v_id;
+    END IF;
+    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+    VALUES (v_tenant, v_claim.order_id, p_staff, v_manager.id, 'CLAIM_RELEASED_REFUNDED', 0, trim(p_reason),
+            v_meta || jsonb_build_object('claim_id', v_claim.id, 'idempotency_key', v_claim.idempotency_key, 'amount_cents', v_claim.amount_cents,
+                                         'method', v_claim.method, 'acquirer', v_claim.acquirer, 'release_audit_id', v_claim.release_audit_id,
+                                         'manager_name', v_manager.name, 'server_verified', true))
+    RETURNING id INTO v_id;
+    RETURN v_id;
 END;
 $$;
 
@@ -982,6 +1201,8 @@ BEGIN
         'tchefood_release_payment_claim(VARCHAR, UUID, TEXT, TEXT)',
         'tchefood_release_payment_claim_manager(VARCHAR, UUID, VARCHAR, TEXT)',
         'tchefood_touch_payment_claim(VARCHAR, UUID, TEXT)',
+        'tchefood_reclaim_payment(VARCHAR, TEXT, VARCHAR, TEXT, VARCHAR, VARCHAR, BIGINT, UUID)',
+        'tchefood_authorize_claim_refunded(VARCHAR, UUID, VARCHAR, TEXT, JSONB)',
         'tchefood_resolve_point_charge(UUID, UUID, VARCHAR, VARCHAR, JSONB, UUID, TEXT, JSONB)'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
@@ -996,7 +1217,9 @@ BEGIN
         'tchefood_claim_payment(VARCHAR, UUID, VARCHAR, VARCHAR, BIGINT, BIGINT, UUID, TEXT)',
         'tchefood_release_payment_claim(VARCHAR, UUID, TEXT, TEXT)',
         'tchefood_release_payment_claim_manager(VARCHAR, UUID, VARCHAR, TEXT)',
-        'tchefood_touch_payment_claim(VARCHAR, UUID, TEXT)'] LOOP
+        'tchefood_touch_payment_claim(VARCHAR, UUID, TEXT)',
+        'tchefood_reclaim_payment(VARCHAR, TEXT, VARCHAR, TEXT, VARCHAR, VARCHAR, BIGINT, UUID)',
+        'tchefood_authorize_claim_refunded(VARCHAR, UUID, VARCHAR, TEXT, JSONB)'] LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
             EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO authenticated', v_fn);
         END IF;

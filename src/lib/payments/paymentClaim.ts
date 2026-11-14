@@ -111,7 +111,7 @@ function parseObject(text: string): Record<string, unknown> | null {
 }
 
 type RpcOutcome =
-  | { kind: 'ok'; body: Record<string, unknown> | null }
+  | { kind: 'ok'; body: Record<string, unknown> | null; text: string }
   | { kind: 'offline' }
   | { kind: 'refused'; code: string | null; message: string };
 
@@ -123,7 +123,7 @@ async function callRpc(cfg: SyncConfig, fn: string, body: Record<string, unknown
   })(), deps);
   if (!out.done) return { kind: 'offline' };
   const { res, text } = out.value;
-  if (res.ok) return { kind: 'ok', body: parseObject(text) };
+  if (res.ok) return { kind: 'ok', body: parseObject(text), text };
   if (res.status >= 500 || res.status === 401 || res.status === 408 || res.status === 429) return { kind: 'offline' };
   // PostgREST: { code: "<SQLSTATE>", message, details, hint }.
   const err = parseObject(text);
@@ -195,8 +195,65 @@ export async function claimPayment(input: ClaimInput, deps: ClaimDeps = defaultC
   return { ok: true, claim: { id: b.id, idempotency_key: input.key, status: 'open', amount_cents: amountCents } };
 }
 
+export interface ReclaimInput {
+  oldKey: string;
+  oldToken: string;
+  newKey: string;
+  newToken: string;
+  method: ClaimMethod;
+  acquirer: ClaimAcquirer;
+  /** Em reais. */
+  amount: number;
+}
+
+/**
+ * Troca a reserva para a adquirente que a maquininha de fato usou (tchefood_reclaim_payment): a reserva
+ * antiga (chave + segredo) vira uma nova (chave + segredo novos, gravados no registro local ANTES). Só
+ * `{ ok: true }` libera registrar o pagamento com a chave nova. Nunca lança.
+ */
+export async function reclaimPayment(input: ReclaimInput, deps: ClaimDeps = defaultClaimDeps()): Promise<ClaimResult> {
+  const offline = (): ClaimResult => ({ ok: false, offline: true, error: CLAIM_OFFLINE_ERROR });
+  const amountCents = Math.round(input.amount * 100);
+  if (!Number.isSafeInteger(amountCents) || amountCents <= 0) return { ok: false, code: 'TF006', error: CLAIM_ERRORS.TF006! };
+  if (![input.oldToken, input.newToken].every((t) => /^[0-9a-f]{64}$/.test(t ?? ''))) return { ok: false, error: RELEASE_NEEDS_MANAGER };
+  try {
+    const staff = await deps.staff().catch(() => null);
+    if (!staff) return { ok: false, error: 'Entre com o seu PIN para registrar.' };
+    const session = await within(deps.config(), deps);
+    if (!session.done || !session.value) return offline();
+    const out = await callRpc(session.value, 'tchefood_reclaim_payment', {
+      p_old_key: input.oldKey,
+      p_old_token: input.oldToken,
+      p_new_key: input.newKey,
+      p_new_token: input.newToken,
+      p_method: input.method,
+      p_acquirer: input.acquirer,
+      p_amount_cents: amountCents,
+      p_staff: staff,
+    }, deps);
+    if (out.kind === 'offline') return offline();
+    if (out.kind === 'refused') {
+      const known = out.code ? CLAIM_ERRORS[out.code] : undefined;
+      return { ok: false, ...(out.code ? { code: out.code } : {}), error: known ?? `O servidor não trocou a reserva: ${out.message}` };
+    }
+    // Resposta: { old: {id, idempotency_key, status, release_audit_id}, new: {id, idempotency_key, status, amount_cents} }.
+    // Só a reserva nova (chave e valor pedidos, aberta) confirma; qualquer outra coisa não registra.
+    const oldPart = out.body?.old;
+    const n = out.body?.new;
+    const b = n !== null && typeof n === 'object' && !Array.isArray(n) ? (n as Record<string, unknown>) : null;
+    const oldOk = oldPart !== null && typeof oldPart === 'object' && (oldPart as Record<string, unknown>).idempotency_key === input.oldKey;
+    if (!b || !oldOk || typeof b.id !== 'string' || b.idempotency_key !== input.newKey || b.status !== 'open' || Number(b.amount_cents) !== amountCents) {
+      return { ok: false, error: 'O servidor não confirmou a troca da reserva. Nada foi registrado; tente de novo.' };
+    }
+    return { ok: true, claim: { id: b.id, idempotency_key: input.newKey, status: 'open', amount_cents: amountCents } };
+  } catch {
+    return offline();
+  }
+}
+
 export type ReleaseResult =
-  | { ok: true }
+  /** notFound: o servidor não tem a reserva (TF005). */
+  | { ok: true; notFound?: true }
   /** transient: sem resposta do servidor (vale tentar de novo); noToken: só o gerente libera (lista de reservas). */
   | { ok: false; transient: boolean; noToken?: true; error: string };
 
@@ -216,7 +273,8 @@ export async function releasePaymentClaim(key: string, reason: string, releaseTo
     const out = await callRpc(cfg, 'tchefood_release_payment_claim', { p_key: key, p_staff: staff, p_reason: text.slice(0, 500), p_release_token: releaseToken }, deps);
     if (out.kind === 'offline') return { ok: false, transient: true, error: CLAIM_OFFLINE_ERROR };
     // TF005: não há reserva com a chave (nada a liberar). TF007: já virou pagamento (não reserva mais à toa).
-    if (out.kind === 'refused' && (out.code === 'TF005' || out.code === 'TF007')) return { ok: true };
+    if (out.kind === 'refused' && out.code === 'TF005') return { ok: true, notFound: true };
+    if (out.kind === 'refused' && out.code === 'TF007') return { ok: true };
     if (out.kind === 'refused') return { ok: false, transient: false, error: `O servidor não liberou a reserva: ${out.message}` };
     return { ok: true };
   } catch (e) {
@@ -232,14 +290,25 @@ export const RELEASE_BACKOFF_MS = [1_000, 3_000];
  * Se ainda falhar, guarda a liberação pendente neste aparelho (o laço de sincronização tenta de novo) e a
  * reserva aparece na lista de reservas presas para o gerente. Sempre encerra o registro local da cobrança.
  */
-export async function releaseClaimAfterNoCharge(key: string, orderId: string, reason: string, releaseToken: string | null | undefined, deps: ClaimDeps = defaultClaimDeps()): Promise<ReleaseResult> {
+export async function releaseClaimAfterNoCharge(
+  key: string,
+  orderId: string,
+  reason: string,
+  releaseToken: string | null | undefined,
+  deps: ClaimDeps = defaultClaimDeps(),
+  opts: { unknownClaim?: boolean; nowMs?: number } = {},
+): Promise<ReleaseResult> {
   const sleep = deps.sleep ?? deps.timer;
   let out = await releasePaymentClaim(key, reason, releaseToken, deps);
   for (let i = 0; !out.ok && out.transient && i < RELEASE_BACKOFF_MS.length; i += 1) {
     await sleep(RELEASE_BACKOFF_MS[i]!);
     out = await releasePaymentClaim(key, reason, releaseToken, deps);
   }
-  if (out.ok) removePendingRelease(key);
+  if (out.ok && out.notFound && opts.unknownClaim) {
+    // A reserva pode ser gravada depois (a chamada que ficou sem resposta ainda pode chegar): fica pendente.
+    const now = opts.nowMs ?? Date.now();
+    addPendingRelease({ key, order_id: orderId, reason, release_token: releaseToken ?? null, last_error: null, unknown_claim: true, not_found_count: 1, not_found_first_at: now });
+  } else if (out.ok) removePendingRelease(key);
   // O segredo vai junto na pendência (a nova tentativa precisa dele); sem ele, ou com recusa definitiva do
   // servidor, a pendência para de tentar e mostra o caminho do gerente.
   else addPendingRelease({ key, order_id: orderId, reason, release_token: releaseToken ?? null, last_error: out.error, final: !out.transient });
@@ -248,6 +317,9 @@ export async function releaseClaimAfterNoCharge(key: string, orderId: string, re
 }
 
 const RETRY_EVERY_MS = 30_000;
+/** Reserva de resultado desconhecido: "não existe" 3 vezes, espaçadas por 2 min ou mais, encerra a pendência. */
+export const NOT_FOUND_READS = 3;
+export const NOT_FOUND_SPAN_MS = 120_000;
 let lastRetry = 0;
 
 /** Tenta de novo as liberações pendentes deste aparelho (abrir o app e laço de sincronização). */
@@ -260,7 +332,17 @@ export async function retryPendingClaimReleases(deps: ClaimDeps = defaultClaimDe
     // Sem o segredo, ou recusada de vez pelo servidor: não tenta mais; fica para o gerente na lista de reservas.
     if (!p.release_token || p.final) continue;
     const out = await releasePaymentClaim(p.key, p.reason, p.release_token, deps);
-    if (out.ok) {
+    if (out.ok && out.notFound && p.unknown_claim) {
+      // Ainda "não existe": só encerra depois de 3 respostas espaçadas por 2 min ou mais (r7 P2-F).
+      const count = (p.not_found_count ?? 0) + 1;
+      const first = p.not_found_first_at ?? nowMs;
+      if (count >= NOT_FOUND_READS && nowMs - first >= NOT_FOUND_SPAN_MS) {
+        removePendingRelease(p.key);
+        released += 1;
+      } else {
+        addPendingRelease({ key: p.key, order_id: p.order_id, reason: p.reason, release_token: p.release_token, last_error: null, not_found_count: count, not_found_first_at: first });
+      }
+    } else if (out.ok) {
       removePendingRelease(p.key);
       released += 1;
     } else {
@@ -271,7 +353,8 @@ export async function retryPendingClaimReleases(deps: ClaimDeps = defaultClaimDe
 }
 
 export type ManagerReleaseResult =
-  | { ok: true }
+  /** notFound: o servidor não tem a reserva (TF005): nada foi conferido lá; quem chama confere o PIN aqui. */
+  | { ok: true; notFound?: true }
   /** pin: PIN de gerente recusado ou bloqueado (a função devolveu NULL). active: cobrança ainda rodando (TF011). */
   | { ok: false; pin?: true; active?: true; error: string };
 
@@ -293,7 +376,7 @@ export async function releasePaymentClaimManager(key: string, managerPin: string
     }, deps);
     if (out.kind === 'offline') return { ok: false, error: CLAIM_OFFLINE_ERROR };
     if (out.kind === 'refused') {
-      if (out.code === 'TF005') return { ok: true };
+      if (out.code === 'TF005') return { ok: true, notFound: true };
       if (out.code === 'TF007') return { ok: false, error: 'Esta reserva já virou pagamento: não há o que liberar.' };
       // TF011 claim_active: a cobrança ainda está rodando em outro aparelho (a reserva tem prazo renovado).
       // O banco diz a partir de quando o gerente pode liberar (horário de Brasília): mostra isso quando vier.
@@ -341,5 +424,67 @@ export async function touchPaymentClaim(key: string, releaseToken: string | null
     return { ok: true, status, activeUntil: typeof out.body?.active_until === 'string' ? out.body.active_until : null };
   } catch (e) {
     return { ok: false, offline: true, error: (e as Error).message };
+  }
+}
+
+export type ClaimRefundedResult =
+  | { ok: true; auditId: string }
+  /**
+   * offline: sem resposta (a trava fica; tente de novo). pin: PIN recusado ou bloqueado (resposta NULL).
+   * notReleased (TF007): a reserva ainda está aberta (ou já virou pagamento). notFound (TF005): não existe.
+   */
+  | { ok: false; offline?: true; pin?: true; notReleased?: true; notFound?: true; error: string };
+
+export interface ClaimRefundedMetadata {
+  refund_kind: 'card' | 'cash';
+  /** Id local do pagamento retirado da conta (até 100 caracteres). */
+  payment_local_id?: string;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * "Estornei / devolvi" no servidor (tchefood_authorize_claim_refunded): PIN de gerente e motivo (10+)
+ * conferidos lá, que grava o audit_log e devolve o id dele (NULL = PIN errado ou bloqueado). Idempotente por
+ * chave com o PIN certo. Só reserva já liberada (TF007 se ainda aberta, TF005 se não existe).
+ */
+export async function authorizeClaimRefunded(
+  key: string,
+  managerPin: string,
+  reason: string,
+  metadata: ClaimRefundedMetadata,
+  deps: ClaimDeps = defaultClaimDeps(),
+): Promise<ClaimRefundedResult> {
+  if (reason.trim().length < MANAGER_RELEASE_MIN_REASON) return { ok: false, error: `Informe o motivo (mínimo ${MANAGER_RELEASE_MIN_REASON} caracteres).` };
+  if (!/^\d{4,8}$/.test(managerPin)) return { ok: false, pin: true, error: 'Digite o PIN do gerente.' };
+  const meta: ClaimRefundedMetadata = {
+    refund_kind: metadata.refund_kind,
+    ...(metadata.payment_local_id && metadata.payment_local_id.length <= 100 ? { payment_local_id: metadata.payment_local_id } : {}),
+  };
+  try {
+    const staff = await deps.staff().catch(() => null);
+    if (!staff) return { ok: false, error: 'Sessão expirada. Entre com o seu PIN.' };
+    const session = await within(deps.config(), deps);
+    if (!session.done || !session.value) return { ok: false, offline: true, error: CLAIM_OFFLINE_ERROR };
+    const out = await callRpc(session.value, 'tchefood_authorize_claim_refunded', {
+      p_key: key, p_staff: staff, p_manager_pin: managerPin, p_reason: reason.trim().slice(0, 500), p_metadata: meta,
+    }, deps);
+    if (out.kind === 'offline') return { ok: false, offline: true, error: CLAIM_OFFLINE_ERROR };
+    if (out.kind === 'refused') {
+      if (out.code === 'TF007') return { ok: false, notReleased: true, error: 'A reserva deste pagamento ainda está aberta no servidor: libere-a antes de confirmar o estorno.' };
+      if (out.code === 'TF005') return { ok: false, notFound: true, error: 'A reserva deste pagamento não foi encontrada no servidor.' };
+      return { ok: false, error: `O servidor não registrou o estorno: ${out.message}` };
+    }
+    let id: unknown = null;
+    try {
+      id = JSON.parse(out.text);
+    } catch {
+      id = null;
+    }
+    if (id === null) return { ok: false, pin: true, error: 'PIN de gerente incorreto ou bloqueado. Nada foi registrado.' };
+    if (typeof id !== 'string' || !UUID_RE.test(id)) return { ok: false, error: 'O servidor não confirmou o registro do estorno. Tente de novo.' };
+    return { ok: true, auditId: id };
+  } catch (e) {
+    return { ok: false, offline: true, error: (e as Error).message || CLAIM_OFFLINE_ERROR };
   }
 }

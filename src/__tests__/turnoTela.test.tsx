@@ -58,6 +58,14 @@ describe('Retaguarda: relógio reativo sem mudar os arrays', () => {
     expect(has(brl(70))).toBe(true);
   });
 
+  it('Conciliação: recusada de ontem não conta como recusada no turno', () => {
+    vi.setSystemTime(BRT('2026-11-11T10:00:00'));
+    const declined = (id: string, at: string) => ({ ...pay(id, 40, at), status: 'DECLINED' }) as Payment;
+    seed([], [declined('r-ontem', '2026-11-10T22:00:00'), declined('r-hoje', '2026-11-11T09:00:00')], []);
+    render(<Reconciliation />);
+    expect(screen.getByText('Transações recusadas no turno: 1')).toBeTruthy();
+  });
+
   it('Rateio: conta fechada às 10:01 entra às 10:02', () => {
     vi.setSystemTime(BRT('2026-11-11T10:00:00'));
     seed([ord('o2', '2026-11-11T10:01:00', 9)], [], [item('o2', 90)]);

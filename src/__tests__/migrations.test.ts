@@ -26,7 +26,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_mercado_pago.sql', 'schema_point_reserva.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_mercado_pago.sql', 'schema_point_reserva.sql', 'schema_pin_equipe_trava.sql', 'schema_pin_gerente_trava.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -70,8 +70,33 @@ describe('supabase/migrations', () => {
     // A conciliação refaz o resgate (tchefood_register_cashback_redeem) e o guarda dos audit_logs do cashback no servidor.
     expect(idx('schema_cashback_conciliacao.sql')).toBeGreaterThan(idx('schema_cashback_servidor.sql'));
     expect(idx('schema_cashback_conciliacao.sql')).toBeGreaterThan(idx('schema_desconto_uso_unico.sql'));
+    // A trava do PIN refaz tchefood_authorize_manager (versão do preço com PIN): vem depois de toda
+    // migration que a define, e usa a mesma chave da conciliação do cashback.
+    expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_preco_gerente.sql'));
+    expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_cashback_conciliacao.sql'));
+    const definesAuthorize = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes('CREATE OR REPLACE FUNCTION tchefood_authorize_manager('));
+    expect(definesAuthorize.at(-1)).toBe(files[idx('schema_pin_gerente_trava.sql')]);
+    // A conciliação do cashback também é refeita (mesma ordem de travas e mesmo relógio da janela).
+    const definesReconcile = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes('CREATE OR REPLACE FUNCTION tchefood_reconcile_cashback('));
+    expect(definesReconcile.at(-1)).toBe(files[idx('schema_pin_gerente_trava.sql')]);
+    // Versão depois da última já publicada na main (a do PIN da equipe, #53): uma migration com
+    // data anterior à última aplicada fica fora do `supabase db push` normal (P2-01 da rodada 3
+    // do GPT no PR #50).
+    expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_pin_equipe_trava.sql'));
+    // A trava do PIN da equipe refaz tchefood_check_pin, tchefood_save_staff e tchefood_start_store
+    // (versão de schema_equipe.sql) e usa a mesma chave da conciliação do cashback: é a última que as define.
+    expect(idx('schema_pin_equipe_trava.sql')).toBeGreaterThan(idx('schema_equipe.sql'));
+    expect(idx('schema_pin_equipe_trava.sql')).toBeGreaterThan(idx('schema_cashback_conciliacao.sql'));
+    for (const fn of ['tchefood_check_pin', 'tchefood_save_staff', 'tchefood_start_store']) {
+      const defines = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes(`CREATE OR REPLACE FUNCTION ${fn}(`));
+      expect(defines.at(-1), fn).toBe(files[idx('schema_pin_equipe_trava.sql')]);
+    }
     // A reserva da Point lê terminal_charges e soma com a regra de tchefood_open_terminal_charge.
     expect(idx('schema_point_reserva.sql')).toBeGreaterThan(idx('schema_mercado_pago.sql'));
+    // As migrations deste PR vêm depois da última já publicada na main (PIN do gerente, #50):
+    // data anterior à última aplicada fica fora do `supabase db push` normal.
+    expect(idx('schema_mercado_pago.sql')).toBeGreaterThan(idx('schema_pin_gerente_trava.sql'));
+    expect(idx('schema_point_reserva.sql')).toBe(files.length - 1);
   });
 
   it('permissões padrão do banco iguais às do app (src/lib/permissions.ts)', async () => {

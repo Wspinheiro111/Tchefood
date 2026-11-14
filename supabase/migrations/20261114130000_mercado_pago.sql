@@ -681,8 +681,9 @@ RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
     -- Auditoria r5: também o fim verificado da cobrança e a liberação da reserva de pagamento
     -- (tchefood_resolve_point_charge e tchefood_release_payment_claim*, db/schema_point_reserva.sql).
+    -- Segunda revisão: o estorno da reserva liberada com recibo (tchefood_authorize_claim_refunded).
     IF NEW.action_type IN ('POINT_CHARGE_CANCELED', 'POINT_KEY_BLOCKED', 'POINT_CHARGE_RECONCILE_AUTHORIZED',
-                           'POINT_CHARGE_RESOLVED', 'PAYMENT_CLAIM_RELEASED')
+                           'POINT_CHARGE_RESOLVED', 'PAYMENT_CLAIM_RELEASED', 'CLAIM_RELEASED_REFUNDED')
        AND current_user IN ('anon', 'authenticated') THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: registro da Point só é gravado pelo servidor.';
     END IF;

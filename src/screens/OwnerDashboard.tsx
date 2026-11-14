@@ -6,7 +6,7 @@ import { useDeliveryOrders, useDeliveryPolling } from '../lib/deliveryDemo';
 import { DELIVERY_CHANNEL_CATALOG } from '../../server/delivery/marketplace';
 import { getReviewHold } from '../lib/payments/reviewHolds';
 import { formatBRL } from '../lib/money';
-import { shiftStart } from '../lib/reports';
+import { brasiliaWeekday, shiftStartBrasilia } from '../lib/reports';
 import {
   cancellations,
   channelMix,
@@ -118,7 +118,7 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
         // Dependência de app: olha sempre o dia de hoje, não o período escolhido.
         channels: channelMix(ix, periodRanges('today', now).current),
         // Só avisa em loja que já usa o caixa; quem nunca abriu um não recebe o aviso todo dia.
-        cashOutside: cashSessions.length ? cashOutsideSessions(payments, cashSessions, shiftStart(now), now) : undefined,
+        cashOutside: cashSessions.length ? cashOutsideSessions(payments, cashSessions, shiftStartBrasilia(now), now) : undefined,
       }),
     [now, orders, tables, products, kegTaps, deliveryErrors, marketplace, cloud, rejected, outbox, syncStatus, ix, payments, cashSessions],
   );
@@ -422,7 +422,7 @@ function RankList({ title, rows, tone, empty }: { title: string; rows: Array<{ p
 function DayCard({ period, overview, now }: { period: DashboardPeriod; overview: ReturnType<typeof dayOverview>; now: Date }) {
   const goals = useOwnerSettings((s) => s.dailyGoals);
   const [editGoal, setEditGoal] = useState(false);
-  const weekday = shiftStart(now).getDay() as keyof typeof goals;
+  const weekday = brasiliaWeekday(shiftStartBrasilia(now)) as keyof typeof goals;
   const goal = period === 'today' ? goals[weekday] : null;
   const progress = goalProgress(overview.sales, goal);
   const compareLabel =

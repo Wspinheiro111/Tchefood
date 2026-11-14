@@ -10,7 +10,7 @@ import { getReviewHold, setReviewHold, subscribeReviewHolds, type ReviewHold, ho
 import { cardReceiptLines } from '../lib/receipts';
 import { requirePaymentClaim } from '../lib/payments/paymentClaim';
 import { startPaymentClaim, type ClaimHandle } from '../lib/payments/claimFlow';
-import { HOLD_BLOCKS_ALL, holdBlocksCash, HoldNotChargedButton, RefundedAtTerminalButton, StuckClaimsPanel, useOrderClaims } from '../components/StuckClaims';
+import { HOLD_BLOCKS_ALL, holdBlocksCash, HoldNotChargedButton, isRefundHold, RefundedAtTerminalButton, StuckClaimsPanel, useOrderClaims } from '../components/StuckClaims';
 import { formatTicketToken, ticketPrint } from '../lib/eventTickets';
 import { ProductSheet, type ProductDraft } from '../components/ProductSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
@@ -231,7 +231,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
     // Loja com Point: reserva no servidor, com a chave do pagamento, antes de receber (sem resposta, não recebe).
     const needsClaim = requirePaymentClaim(useTcheStore.getState());
     // Maquininha aprovou e a reserva foi liberada (ou não confirmada): nem dinheiro até resolver a trava.
-    if (holdBlocksCash(hold)) return toast.error(HOLD_BLOCKS_ALL);
+    if (holdBlocksCash(orderId)) return toast.error(HOLD_BLOCKS_ALL);
     if (method === 'CASH') {
       const given = round2(Number(cashGiven.replace(',', '.')) || 0);
       if (given > 0 && toCents(given) < toCents(amount)) return toast.error('Valor recebido menor que o total.');
@@ -271,7 +271,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
         // Aprovou, mas a reserva não é mais desta cobrança (ou não confirmada, ou outra adquirente): nunca
         // registra sozinho; trava para conferência.
         claim.settle();
-        setHold(setReviewHold({
+        void (setReviewHold({
           order_id: orderId, amount, reason: check.reason, code: check.code, method: req.method,
           acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
         }));
@@ -280,7 +280,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
       }
       if (result.status !== 'DECLINED') claim.settle();
       if (result.status === 'MANUAL_REVIEW') {
-        setHold(setReviewHold({
+        void (setReviewHold({
           order_id: orderId, amount, reason: result.reason, code: result.failure_code, method: req.method,
           acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
         }));
@@ -300,7 +300,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
       });
       if (!r.ok) {
         // A maquininha aprovou mas o registro falhou: trava a venda (nunca cobra de novo) e o gerente registra pelo comprovante.
-        setHold(setReviewHold({
+        void (setReviewHold({
           order_id: orderId, amount, reason: `Aprovado na maquininha, mas não registrado: ${r.error}`, code: 'REGISTER_FAILED', method: req.method,
           acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
         }));
@@ -372,12 +372,12 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
         <div className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
           <p className="mb-2 font-bold text-brasa">⚠️ {hold.reason}</p>
           <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de tentar de novo.</p>
-          {hold.code === 'CLAIM_RELEASED' ? (
-            <RefundedAtTerminalButton hold={hold} label="Balcão" size="md" onCleared={() => setHold(null)} />
+          {isRefundHold(hold) ? (
+            <RefundedAtTerminalButton hold={hold} label="Balcão" size="md" onCleared={() => setHold(getReviewHold(orderId))} />
           ) : (
             <div className="grid gap-2">
               <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
-              <HoldNotChargedButton hold={hold} label="Balcão" size="md" onCleared={() => setHold(null)} />
+              <HoldNotChargedButton hold={hold} label="Balcão" size="md" onCleared={() => setHold(getReviewHold(orderId))} />
             </div>
           )}
           <ConfirmReviewedChargeSheet
@@ -387,7 +387,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
             label="Balcão"
             onHoldChanged={setHold}
             onSuccess={(outcome) => {
-              setHold(null);
+              setHold(getReviewHold(orderId));
               // O comprovante TEF já saiu da maquininha: imprime só as fichas.
               if (outcome.closed) finish(null, null);
             }}

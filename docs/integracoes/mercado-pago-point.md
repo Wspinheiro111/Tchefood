@@ -134,6 +134,40 @@ liberado por tempo ou por declaração.
 
 "Cancelar cobrança" na espera da Point pede PIN de gerente e motivo.
 
+## Auditoria r6 (decisões do Will, 14/11/2026)
+
+**Toda loja na nuvem reserva antes de cobrar.** Com ou sem Point, o aparelho ligado à nuvem pede a reserva ao
+servidor (`tchefood_claim_payment`) antes de qualquer pagamento fora do Mercado Pago, sem olhar a lista de
+maquininhas salva no aparelho. Sem internet, recusa ou erro: não cobra. O aparelho gera um segredo de 64 hex,
+grava no aparelho antes de chamar e manda junto; o banco guarda só o sha256 (coluna que o aparelho não lê).
+Liberar sem PIN (`tchefood_release_payment_claim`) e renovar (`tchefood_touch_payment_claim`) exigem esse segredo;
+o UUID do operador não prova mais nada. Pagamento com a chave de uma reserva liberada é recusado (TF013).
+
+**Prazo de atividade.** A reserva tem `active_until` (90 s, relógio do banco), renovado a cada 20 s durante a
+cobrança e, depois dela, até o servidor consumir a reserva (supervisor no laço de sincronização, sobrevive a
+reinício). O gerente só libera (`tchefood_release_payment_claim_manager`, PIN) depois de 5 min sem renovação
+(`tchefood_claim_abandon_after`); antes disso recebe TF011 com o horário, sem gastar tentativa de PIN.
+
+**Se o gerente liberar com o pagamento ainda no aparelho** (aparelho sem internet por mais de 6,5 min): o
+aparelho tira o pagamento da conta, reabre a conta e mostra a trava "estorne na maquininha" / "devolva o dinheiro";
+a trava bloqueia qualquer forma de pagamento na conta e só sai com "Estornei / devolvi" e PIN de gerente conferido
+no servidor (`tchefood_authorize_claim_refunded`). O mesmo vale para pagamento recusado pelo servidor.
+Maquininha que responde com outra credenciadora: a reserva é trocada no servidor (`tchefood_reclaim_payment`)
+antes de registrar o comprovante.
+
+**Total da conta.** Desconto, cancelamento de item ou retirada da taxa que deixem o saldo abaixo do reservado são
+recusados (TF012).
+
+**Mercado Pago.** `external_reference` do pagamento diferente da chave da cobrança, ou id da ordem (`ORD…`)
+diferente, vai para revisão. O `order.id` numérico do `/v1/payments` é a merchant_order e não é comparado.
+Recusa/cancelamento/expiração/estorno só liberam a reserva com a ordem ecoando a referência e a maquininha;
+estorno na conferência exige o pagamento provando o estorno. 409 desconhecido na criação = resultado desconhecido.
+A busca por referência termina no máximo em "agora"; recusa da busca tem mensagem própria.
+
+**Ordem de publicação.** Primeiro as migrations (`20261114130000_mercado_pago.sql`, `20261114140000_point_reserva.sql`,
+depois das de 14/11 da main), depois a Edge Function `point-charge`, depois o app. Aparelho com app antigo recebe
+42883 nas funções de reserva trocadas e não cobra (falha fechada) até atualizar.
+
 ## Passo a passo para testar com uma Point Smart
 
 1. Conta Mercado Pago da loja + aplicação em <https://www.mercadopago.com.br/developers/panel/app>

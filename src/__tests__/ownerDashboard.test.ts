@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   cancellations,
   channelMix,
@@ -17,7 +17,16 @@ import { useOwnerSettings } from '../store/useOwnerSettings';
 import { useTcheStore } from '../store/useTcheStore';
 import type { AuditLog, CashbackLedgerEntry, DiningTable, LoyaltyCustomer, Order, OrderItem, Payment, Product } from '../types';
 
-// Segunda-feira, 9/11/2026, 20:06 no fuso do aparelho (o dia operacional começou às 05:00).
+// O painel conta o dia pelo calendário de Brasília. Os horários abaixo são montados
+// no fuso do processo, então ele fica em Brasília aqui; os outros fusos estão em
+// turnoCaixaPainel.test.ts.
+const ORIGINAL_TZ = process.env.TZ;
+process.env.TZ = 'America/Sao_Paulo';
+afterAll(() => {
+  process.env.TZ = ORIGINAL_TZ;
+});
+
+// Segunda-feira, 9/11/2026, 20:06 em Brasília (o dia operacional começou às 05:00).
 const NOW = new Date(2026, 10, 9, 20, 6);
 const at = (daysAgo: number, h: number, m = 0) => new Date(2026, 10, 9 - daysAgo, h, m).toISOString();
 

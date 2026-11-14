@@ -14,9 +14,15 @@
  *   6. saída sem fim conhecido (erro inesperado): o registro local fica, e a reserva aparece na lista com o
  *      aviso de que foi este aparelho.
  */
-import { PENDING_CHARGE_TTL_MS } from '../../store/useTcheStore';
+import { PENDING_CHARGE_TTL_MS, useTcheStore } from '../../store/useTcheStore';
+import type { ActionResult, AuditLog } from '../../types';
+import { uuid } from '../ids';
 import { beginLocalClaim, detachLocalClaim, endLocalClaim, generateReleaseToken, localClaim, settleLocalClaim } from './claimLedger';
-import { CLAIM_HEARTBEAT_MS, CLAIM_OFFLINE_ERROR, claimPayment, releaseClaimAfterNoCharge, touchPaymentClaim, type ClaimAcquirer, type ClaimInput, type ClaimResult } from './paymentClaim';
+import {
+  authorizeClaimRefunded, CLAIM_HEARTBEAT_MS, CLAIM_OFFLINE_ERROR, claimPayment, reclaimPayment, releaseClaimAfterNoCharge, releasePaymentClaim,
+  requirePaymentClaim, touchPaymentClaim, type ClaimAcquirer, type ClaimDeps, type ClaimInput, type ClaimResult,
+} from './paymentClaim';
+import { getReviewHoldByKey, reviewHoldKey, setReviewHold, type ReviewHold } from './reviewHolds';
 
 export const CLAIM_RELEASED_DURING_CHARGE = 'A reserva foi liberada pelo gerente durante a cobrança: confira e estorne na maquininha';
 export const CLAIM_RELEASED_BEFORE_PUSH = 'Reserva liberada pelo gerente antes do pagamento chegar ao servidor: confira e estorne';
@@ -76,7 +82,7 @@ export async function startPaymentClaim(
   if (!c.ok) {
     // Sem resposta: libera com o segredo (TF005 = nunca existiu, conta como liberada); sem rede, fica pendente.
     // Recusa do servidor: nada foi criado.
-    if (c.offline) void releaseClaimAfterNoCharge(input.key, input.orderId, 'Reserva sem resposta do servidor: nada foi recebido', token);
+    if (c.offline) void releaseClaimAfterNoCharge(input.key, input.orderId, 'Reserva sem resposta do servidor: nada foi recebido', token, undefined, { unknownClaim: true });
     else endLocalClaim(input.key);
     return { ok: false, error: c.error };
   }
@@ -146,6 +152,46 @@ export async function startPaymentClaim(
   };
 }
 
+export type ReclaimOutcome = { ok: true; key: string } | { ok: false; error: string };
+
+/**
+ * ACQUIRER_MISMATCH: troca a reserva para a adquirente real antes de registrar pelo comprovante. A chave e o
+ * segredo novos vão para o registro local (e a chave para a trava) ANTES da chamada; sem resposta, tenta de
+ * novo com os mesmos; ainda sem resposta, ficam guardados para a próxima tentativa. Falha: a trava fica.
+ */
+export async function reclaimForHold(hold: ReviewHold, method: ClaimInput['method'], acquirer: ClaimAcquirer): Promise<ReclaimOutcome> {
+  const oldKey = hold.idempotency_key;
+  const oldToken = oldKey ? localClaim(oldKey)?.release_token : null;
+  if (!oldKey || !oldToken) return { ok: false, error: 'Este aparelho não tem o código da reserva antiga: o gerente libera a reserva na lista e registra de novo.' };
+  const newKey = hold.reclaim_key ?? uuid();
+  const newToken = localClaim(newKey)?.release_token ?? generateReleaseToken();
+  beginLocalClaim(newKey, hold.order_id, newToken);
+  if (hold.reclaim_key !== newKey) setReviewHold({ ...hold, reclaim_key: newKey });
+  const input = { oldKey, oldToken, newKey, newToken, method, acquirer, amount: hold.amount };
+  let r = await reclaimPayment(input);
+  if (!r.ok && r.offline) r = await reclaimPayment(input);
+  if (r.ok) return { ok: true, key: newKey };
+  // Sem resposta, ou recusa (TF009…) em que a reserva nova pode existir no servidor: chave e segredo ficam para a
+  // próxima tentativa (mesma troca, idempotente). Só sai quando o servidor diz que a chave nova não existe.
+  detachLocalClaim(newKey);
+  if (!r.offline) {
+    const t = await touchPaymentClaim(newKey, newToken);
+    if (!t.ok && t.code === 'TF005') {
+      endLocalClaim(newKey);
+      const { reclaim_key: _drop, ...rest } = getReviewHoldByKey(reviewHoldKey(hold)) ?? hold;
+      void _drop;
+      setReviewHold(rest);
+    }
+  }
+  return { ok: false, error: r.error };
+}
+
+/** Depois de registrar com a chave nova: a reserva nova segue no laço até o servidor consumir; a antiga sai. */
+export function finishReclaim(oldKey: string | undefined, newKey: string): void {
+  settleLocalClaim(newKey);
+  if (oldKey) endLocalClaim(oldKey);
+}
+
 export type HoldClaimCheck = { ok: true } | { ok: false; released: boolean; error: string };
 
 /**
@@ -162,4 +208,43 @@ export async function checkHoldClaim(key: string | null | undefined): Promise<Ho
   if (t.ok) return { ok: true };
   if (t.code === 'TF005') return { ok: false, released: true, error: CLAIM_RELEASED_DURING_CHARGE };
   return { ok: false, released: false, error: CLAIM_TOUCH_UNAVAILABLE };
+}
+
+export const REFUND_NEEDS_MANAGER_RELEASE =
+  'Este aparelho não tem o código da reserva: o gerente libera a reserva na lista de reservas e confirma o estorno de novo.';
+
+/**
+ * "Estornei / devolvi" (CLAIM_RELEASED / PAYMENT_REJECTED). Ligado à nuvem: o servidor registra primeiro
+ * (tchefood_authorize_claim_refunded); a trava só sai com o id que ele devolve. Sem resposta, PIN recusado ou
+ * recusa: a trava fica. PAYMENT_REJECTED com a reserva ainda aberta (TF007): libera com o segredo deste
+ * aparelho e tenta de novo; sem o segredo, o gerente libera pela lista de reservas.
+ */
+export async function confirmClaimRefunded(
+  hold: ReviewHold,
+  auth: { managerPin: string; reason: string },
+  deps?: ClaimDeps,
+): Promise<ActionResult<AuditLog>> {
+  const store = useTcheStore.getState();
+  const holdKey = reviewHoldKey(hold);
+  if (!requirePaymentClaim(store)) return store.resolveRefundedClaimHold(hold.order_id, auth, holdKey);
+  const key = hold.idempotency_key;
+  if (!key) return { ok: false, error: 'Trava sem a chave da reserva: o gerente confere pela lista de reservas.' };
+  const paymentId = store.payments.find((p) => p.idempotency_key === key)?.id;
+  const meta = { refund_kind: hold.refund === 'CASH' ? ('cash' as const) : ('card' as const), ...(paymentId ? { payment_local_id: paymentId } : {}) };
+  let r = await authorizeClaimRefunded(key, auth.managerPin, auth.reason, meta, deps);
+  if (!r.ok && r.notReleased && hold.code === 'PAYMENT_REJECTED') {
+    const rel = await releasePaymentClaim(key, 'Pagamento recusado pelo servidor: estornado ou devolvido ao cliente', localClaim(key)?.release_token, deps);
+    if (!rel.ok) return { ok: false, error: rel.noToken ? REFUND_NEEDS_MANAGER_RELEASE : rel.error };
+    r = await authorizeClaimRefunded(key, auth.managerPin, auth.reason, meta, deps);
+  }
+  // O servidor não tem esta reserva (TF005): tira a trava só com o PIN e o motivo daqui (audit local marcado).
+  if (!r.ok && r.notFound) {
+    const local = useTcheStore.getState().resolveRefundedClaimHold(hold.order_id, auth, holdKey, { claimMissing: true });
+    if (local.ok) endLocalClaim(key);
+    return local;
+  }
+  if (!r.ok) return { ok: false, error: r.error };
+  const res = useTcheStore.getState().resolveRefundedClaimHold(hold.order_id, auth, holdKey, { auditId: r.auditId });
+  if (res.ok) endLocalClaim(key);
+  return res;
 }

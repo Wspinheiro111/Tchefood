@@ -4,8 +4,8 @@ import { Btn, Sheet, toast } from './ui';
 import { PinPad } from './PinPad';
 import { MIN_REASON_LENGTH, RECEIPT_CARD_BRANDS, useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
 import { PointReviewSheet } from './PointReviewSheet';
-import { setReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
-import { checkHoldClaim, CLAIM_RELEASED_DURING_CHARGE } from '../lib/payments/claimFlow';
+import { getReviewHoldByKey, reviewHoldKey, setReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
+import { checkHoldClaim, CLAIM_RELEASED_DURING_CHARGE, finishReclaim, reclaimForHold } from '../lib/payments/claimFlow';
 import { requirePaymentClaim } from '../lib/payments/paymentClaim';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { formatBRL } from '../lib/money';
@@ -81,26 +81,48 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
     if (!method || !acquirer) return setError('Informe a forma de pagamento e a maquininha do comprovante.');
     if (!reasonOk) return setError(`Informe o motivo (mínimo ${MIN_REASON_LENGTH} caracteres).`);
     // Aparelho ligado à nuvem: antes de registrar, a reserva desta cobrança ainda está no servidor?
-    if (requirePaymentClaim(useTcheStore.getState())) {
-      setChecking(true);
-      const check = await checkHoldClaim(hold.idempotency_key).finally(() => setChecking(false));
-      if (!check.ok) {
-        if (check.released) {
-          // Liberada pelo gerente: não registra; a trava passa a pedir o estorno.
-          const next = setReviewHold({ ...hold, reason: CLAIM_RELEASED_DURING_CHARGE, code: 'CLAIM_RELEASED' });
-          onHoldChanged?.(next);
-          toast.alert(`⚠️ ${CLAIM_RELEASED_DURING_CHARGE}`);
-          onClose();
-          return;
+    let registerKey: string | undefined;
+    const store = useTcheStore.getState();
+    if (requirePaymentClaim(store)) {
+      const current = getReviewHoldByKey(reviewHoldKey(hold)) ?? hold;
+      const released = () => {
+        // Liberada pelo gerente: não registra; a trava passa a pedir o estorno.
+        const next = setReviewHold({ ...current, reason: CLAIM_RELEASED_DURING_CHARGE, code: 'CLAIM_RELEASED' });
+        onHoldChanged?.(next);
+        toast.alert(`⚠️ ${CLAIM_RELEASED_DURING_CHARGE}`);
+        onClose();
+      };
+      if (current.code === 'ACQUIRER_MISMATCH') {
+        // A reserva é de outra adquirente: troca para a do comprovante e registra com a chave nova. O PIN do
+        // gerente é conferido antes da troca (a troca mexe no servidor).
+        const pinOk = store.verifyManagerPin({ managerPin: pinValue, reason }, { orderId: current.order_id, action: 'CHARGE_CONFIRMED_MANUALLY' });
+        if (!pinOk.ok) return refuse(pinOk.error);
+        setChecking(true);
+        try {
+          // Troca já pedida antes (reclaim_key): a antiga já está liberada pela troca; não confere a antiga,
+          // repete a mesma troca (mesma chave nova e segredo, idempotente).
+          if (!current.reclaim_key) {
+            const check = await checkHoldClaim(current.idempotency_key);
+            if (!check.ok) return check.released ? released() : refuse(check.error);
+          }
+          const re = await reclaimForHold(current, method, acquirer);
+          if (!re.ok) return refuse(re.error);
+          registerKey = re.key;
+        } finally {
+          setChecking(false);
         }
-        return refuse(check.error);
+      } else {
+        setChecking(true);
+        const check = await checkHoldClaim(current.idempotency_key).finally(() => setChecking(false));
+        if (!check.ok) return check.released ? released() : refuse(check.error);
       }
     }
     const res = useTcheStore.getState().confirmReviewedCharge(
-      { orderId: hold.order_id, nsu, authorization_code: authCode, card_brand: method === 'PIX' ? null : brand, method, acquirer },
+      { orderId: hold.order_id, nsu, authorization_code: authCode, card_brand: method === 'PIX' ? null : brand, method, acquirer, holdKey: reviewHoldKey(hold), ...(registerKey ? { registerKey } : {}) },
       { managerPin: pinValue, reason },
     );
     if (!res.ok) return refuse(res.error);
+    if (registerKey) finishReclaim(hold.idempotency_key, registerKey);
     toast.success(`✅ ${formatBRL(res.data.payment.amount)} registrado pelo comprovante · NSU ${res.data.payment.nsu}`);
     toast.alert('🔔 Registrado em audit_logs e alerta enviado ao WhatsApp do proprietário.');
     onSuccess(res.data);

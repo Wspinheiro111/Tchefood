@@ -317,6 +317,16 @@ export interface Payment {
   terminal_serial: string | null;
   idempotency_key: string | null;
   created_at: ISODateTime;
+  /**
+   * Só local: pagamento retirado da conta porque não entrou no servidor (reserva liberada antes de chegar,
+   * ou recusado). Fica com status REFUNDED e não sobe (o evento sai da fila).
+   */
+  withdrawn_reason?: string;
+  /**
+   * Só neste aparelho (não sobe): itens que este pagamento quitou na divisão por item. Retirar o pagamento
+   * (withdrawUnacceptedPayment) recalcula o "pago" dos itens pelos pagamentos aprovados que sobram.
+   */
+  paid_item_ids?: UUID[];
 }
 
 // ---------------------------------------------------------------------------
@@ -859,6 +869,11 @@ export interface SyncEvent {
    * Não vai para o banco.
    */
   depends_on_event_ids?: UUID[];
+  /**
+   * Mudança causada pelo registro deste pagamento (itens pagos, comanda fechada, mesa livre). Se o pagamento sair
+   * da conta sem entrar no servidor, essas mudanças saem da fila junto. Não vai para o banco.
+   */
+  caused_by_payment_id?: UUID;
 }
 
 export interface KegChangeSync {

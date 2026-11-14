@@ -73,6 +73,29 @@ export function nextShiftStart(start: Date, cutoffHour = SHIFT_CUTOFF_HOUR): Dat
 }
 
 /**
+ * Início do dia operacional `days` dias depois do que começou em `start` (negativo
+ * = antes), às 05:00 de Brasília. Conta em dias do calendário de Brasília, não em
+ * blocos de 24 h nem no fuso do aparelho.
+ */
+export function shiftStartDaysFrom(start: Date | number, days: number, cutoffHour = SHIFT_CUTOFF_HOUR): Date {
+  const t = typeof start === 'number' ? start : start.getTime();
+  // Meio do dia operacional pedido: longe das duas viradas mesmo com horário de verão.
+  return shiftStartBrasilia(new Date(t + days * 24 * 3600_000 + 12 * 3600_000), cutoffHour);
+}
+
+/** Dia da semana (0 = domingo) do instante `at` no calendário de Brasília. */
+export function brasiliaWeekday(at: Date): number {
+  const p = Object.fromEntries(SHIFT_CLOCK.formatToParts(at).map((x) => [x.type, x.value]));
+  return new Date(Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day))).getUTCDay();
+}
+
+/** Hora (0 a 23) do instante `at` no relógio de Brasília. */
+export function brasiliaHour(at: Date): number {
+  const p = Object.fromEntries(SHIFT_CLOCK.formatToParts(at).map((x) => [x.type, x.value]));
+  return Number(p.hour);
+}
+
+/**
  * Período do turno corrente: de `start` até agora (inclusive), nunca além do
  * início do turno seguinte. Registro com data no futuro não entra.
  */
@@ -187,6 +210,11 @@ export function reconciliation(payments: readonly Payment[], period: ShiftPeriod
   }
   // Linha do Mercado Pago só quando houve venda na Point (lojas sem Point veem o mesmo de antes).
   return rows.MERCADO_PAGO.count > 0 ? [rows.STONE, rows.PAGBANK, rows.MERCADO_PAGO, rows.CASH_DESK] : [rows.STONE, rows.PAGBANK, rows.CASH_DESK];
+}
+
+/** Transações recusadas dentro do período do turno [start, end), mesmo filtro da conciliação. */
+export function declinedInShift(payments: readonly Payment[], period: ShiftPeriod = currentShiftPeriod()): Payment[] {
+  return payments.filter((p) => p.status === 'DECLINED' && inShiftPeriod(p.created_at, period));
 }
 
 export interface WaiterRow {

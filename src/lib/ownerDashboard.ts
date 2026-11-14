@@ -3,12 +3,13 @@
  * ("Como está o dia?", "Dependo demais de um canal?", "O que vende e o que encalha?",
  * "Quanto cancelei?", "O cliente volta?"). Funções puras sobre o estado, em centavos.
  *
- * Dia operacional: começa às 05:00 (SHIFT_CUTOFF_HOUR), igual ao Dashboard do turno.
- * O turno da noite que passa da meia-noite conta no dia em que começou.
+ * Dia operacional: começa às 05:00 de Brasília (SHIFT_CUTOFF_HOUR, SHIFT_TIME_ZONE),
+ * igual ao Dashboard do turno, qualquer que seja o fuso do aparelho. O turno da
+ * noite que passa da meia-noite conta no dia em que começou.
  */
 import type { AuditLog, CashbackLedgerEntry, DiningTable, LoyaltyCustomer, Order, OrderItem, Payment, Product } from '../types';
 import { fromCents, toCents } from './money';
-import { shiftStart } from './reports';
+import { brasiliaHour, shiftStartBrasilia, shiftStartDaysFrom } from './reports';
 
 export type DashboardPeriod = 'today' | 'yesterday' | '7d' | '30d';
 
@@ -28,41 +29,42 @@ export interface Range {
   to: number;
 }
 
-function addDays(d: Date, days: number): Date {
-  // setDate respeita o horário de verão (se um dia voltar a existir) melhor que somar ms.
-  const x = new Date(d);
-  x.setDate(x.getDate() + days);
-  return x;
+/** Início do dia operacional `days` dias depois do que começou em `start` (negativo = antes), em ms. */
+const dayStartFrom = (start: Date | number, days: number): number => shiftStartDaysFrom(start, days).getTime();
+
+/** O mesmo ponto do dia operacional `days` dias depois (negativo = antes): mesma distância desde as 05:00. */
+function sameTimeDaysFrom(start: Date, now: Date, days: number): number {
+  return dayStartFrom(start, days) + (now.getTime() - start.getTime());
 }
 
 /** Período escolhido e o período de comparação (mesmo dia da semana passada, ou a janela anterior). */
 export function periodRanges(period: DashboardPeriod, now: Date = new Date()): { current: Range; previous: Range; days: number } {
-  const start = shiftStart(now);
+  const start = shiftStartBrasilia(now);
   const nowMs = now.getTime();
   switch (period) {
     case 'today':
       // Comparação justa: semana passada, mesmo dia, até a mesma hora.
       return {
         current: { from: start.getTime(), to: nowMs + 1 },
-        previous: { from: addDays(start, -7).getTime(), to: addDays(now, -7).getTime() + 1 },
+        previous: { from: dayStartFrom(start, -7), to: sameTimeDaysFrom(start, now, -7) + 1 },
         days: 1,
       };
     case 'yesterday':
       return {
-        current: { from: addDays(start, -1).getTime(), to: start.getTime() },
-        previous: { from: addDays(start, -8).getTime(), to: addDays(start, -7).getTime() },
+        current: { from: dayStartFrom(start, -1), to: start.getTime() },
+        previous: { from: dayStartFrom(start, -8), to: dayStartFrom(start, -7) },
         days: 1,
       };
     case '7d':
       return {
-        current: { from: addDays(start, -6).getTime(), to: nowMs + 1 },
-        previous: { from: addDays(start, -13).getTime(), to: addDays(now, -7).getTime() + 1 },
+        current: { from: dayStartFrom(start, -6), to: nowMs + 1 },
+        previous: { from: dayStartFrom(start, -13), to: sameTimeDaysFrom(start, now, -7) + 1 },
         days: 7,
       };
     case '30d':
       return {
-        current: { from: addDays(start, -29).getTime(), to: nowMs + 1 },
-        previous: { from: addDays(start, -59).getTime(), to: addDays(now, -30).getTime() + 1 },
+        current: { from: dayStartFrom(start, -29), to: nowMs + 1 },
+        previous: { from: dayStartFrom(start, -59), to: sameTimeDaysFrom(start, now, -30) + 1 },
         days: 30,
       };
   }
@@ -181,7 +183,7 @@ export function ordersCount(ix: DashboardIndex, r: Range): number {
 }
 
 export interface HourPoint {
-  /** Hora do relógio (5, 6, … 23, 0, … 4). */
+  /** Hora do relógio de Brasília (5, 6, … 23, 0, … 4). */
   hour: number;
   current: number;
   previous: number;
@@ -200,7 +202,7 @@ export function hourlySeries(ix: DashboardIndex, dayStart: number, prevDayStart:
   };
   for (const p of ix.approved) bucket(p.created_at, toCents(p.amount));
   for (const m of ix.input.marketplace) if (!m.canceled) bucket(m.created_at, m.total_cents);
-  const startHour = new Date(dayStart).getHours();
+  const startHour = brasiliaHour(new Date(dayStart));
   return cur.map((c, i) => ({ hour: (startHour + i) % 24, current: fromCents(c), previous: fromCents(prev[i]!) }));
 }
 
@@ -232,16 +234,16 @@ export function dayOverview(ix: DashboardIndex, period: DashboardPeriod, now: Da
   let lastHour: number | null = null;
   if (period === 'today') {
     lastHour = fromCents(salesCents(ix, { from: nowMs - HOUR_MS, to: nowMs + 1 }));
-    const lwStart = current.from - 7 * DAY_MS;
-    const lwFull = salesCents(ix, { from: lwStart, to: addDays(new Date(current.from), -6).getTime() });
+    const lwStart = dayStartFrom(current.from, -7);
+    const lwFull = salesCents(ix, { from: lwStart, to: dayStartFrom(current.from, -6) });
     if (lwFull > 0) projection = fromCents(sales + Math.max(0, lwFull - prev));
     // "Normal para este dia": média das semanas que tiveram venda naquele dia inteiro.
     const weeks: number[] = [];
     for (let w = 1; w <= 4; w++) {
-      const dayFrom = addDays(new Date(current.from), -7 * w).getTime();
-      const dayTo = addDays(new Date(current.from), -7 * w + 1).getTime();
+      const dayFrom = dayStartFrom(current.from, -7 * w);
+      const dayTo = dayStartFrom(current.from, -7 * w + 1);
       if (salesCents(ix, { from: dayFrom, to: dayTo }) === 0) continue;
-      weeks.push(salesCents(ix, { from: dayFrom, to: addDays(now, -7 * w).getTime() + 1 }));
+      weeks.push(salesCents(ix, { from: dayFrom, to: sameTimeDaysFrom(new Date(current.from), now, -7 * w) + 1 }));
     }
     if (weeks.length) normal = fromCents(Math.round(weeks.reduce((a, b) => a + b, 0) / weeks.length));
   }

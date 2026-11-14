@@ -59,7 +59,7 @@ describe('startPaymentClaim: segredo da reserva (P2-1)', () => {
   it('duas vezes sem resposta: não recebe e libera com o segredo (a reserva pode existir no servidor)', async () => {
     claimPayment.mockResolvedValue({ ok: false, offline: true, error: 'sem resposta' });
     expect(await startPaymentClaim(true, INPUT)).toEqual({ ok: false, error: 'sem resposta' });
-    expect(releaseClaimAfterNoCharge).toHaveBeenCalledWith('k-1', 'o1', 'Reserva sem resposta do servidor: nada foi recebido', tokenOf());
+    expect(releaseClaimAfterNoCharge).toHaveBeenCalledWith('k-1', 'o1', 'Reserva sem resposta do servidor: nada foi recebido', tokenOf(), undefined, { unknownClaim: true });
   });
 
   it('recusa do servidor: não tenta de novo, não libera e limpa o registro local; exceção conta como sem resposta', async () => {
