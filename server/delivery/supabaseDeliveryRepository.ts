@@ -1,5 +1,5 @@
 import { DeliveryConcurrencyError, type DeliveryOrderRecord, type DeliveryRepository } from "./deliveryInbox";
-import type { DeliveryChannelKey, DeliveryEvent } from "./marketplace";
+import { isSecureServiceUrl, type DeliveryChannelKey, type DeliveryEvent } from "./marketplace";
 
 // Persistência da caixa de entrada de delivery no Supabase, pelo PostgREST, com a chave service_role.
 // Só as funções de db/schema_delivery_servidor.sql são chamadas (o app não grava nessas tabelas).
@@ -33,7 +33,7 @@ export class SupabaseDeliveryRepository implements DeliveryRepository {
   private readonly timeoutMs: number;
 
   constructor(private readonly options: SupabaseDeliveryRepositoryOptions) {
-    if (!/^https?:\/\//.test(options.url)) throw new Error("SUPABASE_URL inválida.");
+    if (!isSecureServiceUrl(options.url)) throw new Error("SUPABASE_URL inválida: use https:// (http:// só para localhost).");
     if (!options.serviceRoleKey.trim()) throw new Error("Informe a SUPABASE_SERVICE_ROLE_KEY.");
     this.base = options.url.replace(/\/+$/, "");
     this.fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));

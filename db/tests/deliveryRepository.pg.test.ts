@@ -56,7 +56,7 @@ function setup() {
     baseUrl: sandbox.baseUrl,
     fetchImpl: sandbox.fetch,
   });
-  const repository = new SupabaseDeliveryRepository({ url: 'http://cloud.test', serviceRoleKey: 'service', channel: 'ifood', fetchImpl: serviceFetch() });
+  const repository = new SupabaseDeliveryRepository({ url: 'https://cloud.test', serviceRoleKey: 'service', channel: 'ifood', fetchImpl: serviceFetch() });
   const inbox = new DeliveryInbox({ adapters: [api], repository });
   return { sandbox, api, repository, inbox };
 }
@@ -307,7 +307,7 @@ function setup() {
   it('pedido de loja não ligada é recusado e fica sem ack', async () => {
     const sandbox = new IfoodSandbox(undefined, '99999999-9999-4999-8999-999999999999');
     const api = new IfoodMerchantApi({ credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret }, baseUrl: sandbox.baseUrl, fetchImpl: sandbox.fetch });
-    const repository = new SupabaseDeliveryRepository({ url: 'http://cloud.test', serviceRoleKey: 'service', channel: 'ifood', fetchImpl: serviceFetch() });
+    const repository = new SupabaseDeliveryRepository({ url: 'https://cloud.test', serviceRoleKey: 'service', channel: 'ifood', fetchImpl: serviceFetch() });
     const inbox = new DeliveryInbox({ adapters: [api], repository });
     // Pula os ids que o outro simulador já usou (a sequência é a mesma).
     for (let i = 0; i < 20; i += 1) sandbox.placeOrder({ items: ITEMS });

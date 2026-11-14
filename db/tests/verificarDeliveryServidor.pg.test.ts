@@ -2,8 +2,8 @@
  * Script de conferência do Supabase de verdade (db/verificar_delivery_servidor.sql).
  *
  * Monta um Postgres igual ao Supabase (db/schema.sql + supabase/migrations, mesmo applySchema de
- * deliveryRepository.pg.test.ts), roda o script e espera todas as linhas ok (menos o item opcional da
- * rodada 3). Depois estraga um privilégio de propósito e espera a linha correspondente falhar.
+ * deliveryRepository.pg.test.ts), roda o script e espera todas as linhas ok (hoje nenhum item é
+ * opcional). Depois estraga um privilégio de propósito e espera a linha correspondente falhar.
  *
  * Só roda com TCHEFOOD_PG=host:porta:usuario (ex.: /var/tmp/tfpg:5499:postgres).
  */
@@ -47,19 +47,17 @@ function conferir(antes?: string): Linha[] {
     });
 }
 
-const opcional = (l: Linha) => l.item.includes('(rodada 3)');
 
 (target ? describe : describe.skip)('conferência do Supabase do delivery (script só leitura)', () => {
   beforeAll(() => {
     applySchema(target!, DB);
   });
 
-  it('banco migrado: todas as linhas ok (menos o opcional da rodada 3)', () => {
+  it('banco migrado: todas as linhas ok (nenhum item opcional)', () => {
     const linhas = conferir();
     // Cobre funções, privilégios, SECURITY DEFINER, tabelas, RLS, colunas, CHECKs e triggers.
     expect(linhas.length).toBeGreaterThanOrEqual(40);
-    expect(linhas.filter((l) => !opcional(l) && l.ok !== 'sim')).toEqual([]);
-    for (const l of linhas.filter(opcional)) expect(['sim', 'ainda não (opcional)']).toContain(l.ok);
+    expect(linhas.filter((l) => l.ok !== 'sim')).toEqual([]);
     expect(linhas.map((l) => l.item)).toEqual(expect.arrayContaining([
       'quem executa public.tchefood_delivery_save_order',
       'quem executa public.tchefood_delivery_defer_detail',

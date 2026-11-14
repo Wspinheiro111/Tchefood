@@ -1,6 +1,7 @@
 import {
   clipDeliveryText,
   DeliveryMarketplaceError,
+  isSecureServiceUrl,
   type DeliveryAddress,
   type DeliveryCancellationReason,
   type DeliveryCourier,
@@ -142,6 +143,10 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
     }
     for (const id of options.merchantIds ?? []) {
       if (!ID_PATTERN.test(id)) throw new DeliveryMarketplaceError("ifood", "invalid_request", `merchantId inválido: ${id}`);
+    }
+    // Fora do simulador (https://sandbox.ifood.local), o token e o client_secret só vão por https:// (http:// só localhost).
+    if (options.baseUrl !== undefined && !isSecureServiceUrl(options.baseUrl)) {
+      throw new DeliveryMarketplaceError("ifood", "invalid_request", "IFOOD_BASE_URL inválida: use https:// (http:// só para localhost).");
     }
     this.baseUrl = (options.baseUrl ?? IFOOD_DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;

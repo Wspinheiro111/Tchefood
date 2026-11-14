@@ -451,3 +451,16 @@ export function mergeDeliveryStatus(current: DeliveryOrderStatus, incoming: Deli
   if (incoming === "unknown" || current === "cancelled") return current;
   return STATUS_RANK[incoming] > STATUS_RANK[current] ? incoming : current;
 }
+
+// Endereço de serviço que recebe segredo (chave service_role, token do iFood): https://; http:// só na própria máquina
+// (localhost ou 127.0.0.1, para teste local). O simulador do iFood usa https://sandbox.ifood.local.
+export function isSecureServiceUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol === "https:") return true;
+  return url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1");
+}

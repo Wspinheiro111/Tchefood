@@ -6,6 +6,7 @@ import { IfoodSandbox } from "./ifoodSandbox";
 import {
   createIfoodApiHandler,
   IfoodPoller,
+  SessionExpiredError,
   SupabaseCallerAuthorizer,
   SupabaseManagerApproval,
   type ApiRequest,
@@ -861,9 +862,115 @@ describe("servidor do iFood: prova de loja pelo Supabase", () => {
   });
 
   it("JWT recusado pelo Supabase ou resposta estranha não libera", async () => {
+    // JWT vencido (401/403) não libera: lança SessionExpiredError (a API responde 401, ver abaixo).
     const denied = new SupabaseCallerAuthorizer({ url: "https://x.supabase.co", anonKey: "anon", fetchImpl: async () => ({ ok: false, status: 401, text: async () => "" }) });
-    expect(await denied.canAccessOrder("t", "o")).toBe(false);
+    await expect(denied.canAccessOrder("t", "o")).rejects.toBeInstanceOf(SessionExpiredError);
     const weird = new SupabaseCallerAuthorizer({ url: "https://x.supabase.co", anonKey: "anon", fetchImpl: async () => ({ ok: true, status: 200, text: async () => "<html>" }) });
     expect(await weird.canAccessMerchant("t", "m")).toBe(false);
+  });
+});
+
+describe("servidor do iFood: limite de uso e cache", () => {
+  it("app em loop: passa de 30 requisições em 10 s, 429 sem chamar o iFood; a janela seguinte libera", async () => {
+    let clock = NOW;
+    const { sandbox, api, call } = setup({ now: () => clock });
+    const pauses = vi.spyOn(api, "listPauses");
+    const path = `/ifood/merchants/${sandbox.merchantId}/pauses`;
+    for (let i = 0; i < 30; i++) expect((await call("GET", path)).status).toBe(200);
+    const limited = await call("GET", path);
+    expect(limited).toEqual({ status: 429, body: { error: "Muitas requisições; aguarde alguns segundos.", code: "rate_limited" } });
+    expect(pauses).toHaveBeenCalledTimes(30);
+    // Outro aparelho (outro token) não paga pelo loop deste.
+    expect((await call("GET", path, undefined, "loja-b")).status).toBe(404);
+    clock = new Date(NOW.getTime() + 10_000);
+    expect((await call("GET", path)).status).toBe(200);
+  });
+
+  it("status da loja e motivos de cancelamento: cache de 10 s por loja/pedido; pausa e cancelamento limpam", async () => {
+    let clock = NOW;
+    const { sandbox, poller, api, inbox, call } = setup({ now: () => clock });
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const status = vi.spyOn(api, "getStoreStatus");
+    const reasons = vi.spyOn(inbox, "listCancellationReasons");
+    const statusPath = `/ifood/merchants/${sandbox.merchantId}/status`;
+    const reasonsPath = `/ifood/orders/${id}/cancellation-reasons`;
+    const first = await call("GET", statusPath);
+    expect((await call("GET", statusPath)).body).toEqual(first.body);
+    expect(status).toHaveBeenCalledTimes(1);
+    const firstReasons = await call("GET", reasonsPath);
+    expect((await call("GET", reasonsPath)).body).toEqual(firstReasons.body);
+    expect(reasons).toHaveBeenCalledTimes(1);
+    clock = new Date(NOW.getTime() + 10_000);
+    await call("GET", statusPath);
+    await call("GET", reasonsPath);
+    expect(status).toHaveBeenCalledTimes(2);
+    expect(reasons).toHaveBeenCalledTimes(2);
+    // Pausa: o status seguinte já vem do iFood (a tela não pode ver "aberta" por 10 s depois de pausar).
+    const created = await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás", minutes: 30, authorization: auth() });
+    expect(created.status).toBe(201);
+    expect(((await call("GET", statusPath)).body as { state: string }).state).toBe("closed");
+    // Cancelamento: confere o motivo no iFood (nunca no cache) e os motivos seguintes também vêm do iFood.
+    const cancelled = await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", authorization: auth() });
+    expect(cancelled.status).toBe(200);
+    expect(reasons).toHaveBeenCalledTimes(3);
+    await call("GET", reasonsPath);
+    expect(reasons).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("servidor do iFood: sessão vencida e banco fora do ar na prova de loja", () => {
+  const authorizerReplying = (status: number, text = "") =>
+    new SupabaseCallerAuthorizer({ url: "https://x.supabase.co", anonKey: "anon", fetchImpl: async () => ({ ok: status >= 200 && status < 300, status, text: async () => text }) });
+
+  it("401/403 do Supabase: 401 'Sessão vencida'; 5xx: 503; 200 vazio e 404 continuam 404 iguais", async () => {
+    const { sandbox, poller, api, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const handlerWith = (authorizer: TenantAuthorizer) => createIfoodApiHandler({ inbox, api, authorizer, approval: ALLOW_ALL, now: () => NOW });
+    const request = (path: string) => ({ method: "GET", path, headers: { authorization: "Bearer jwt" }, body: "" });
+    for (const status of [401, 403]) {
+      const handle = handlerWith(authorizerReplying(status));
+      expect(await handle(request(`/ifood/orders/${id}/cancellation-reasons`))).toEqual({ status: 401, body: { error: "Sessão vencida; entre de novo.", code: "session_expired" } });
+      expect((await handle(request(`/ifood/merchants/${sandbox.merchantId}/status`))).status).toBe(401);
+    }
+    for (const status of [500, 503]) {
+      const handle = handlerWith(authorizerReplying(status));
+      expect(await handle(request(`/ifood/orders/${id}/cancellation-reasons`))).toEqual({ status: 503, body: { error: "Banco indisponível; tente de novo.", code: "unavailable" } });
+      expect((await handle(request(`/ifood/merchants/${sandbox.merchantId}/status`))).status).toBe(503);
+    }
+    // Pedido inexistente e pedido de outra loja: a mesma resposta (sem oráculo).
+    const empty = await handlerWith(authorizerReplying(200, "[]"))(request(`/ifood/orders/${id}/cancellation-reasons`));
+    const notFound = await handlerWith(authorizerReplying(404, '{"message":"x"}'))(request(`/ifood/orders/${id}/cancellation-reasons`));
+    expect(empty).toEqual({ status: 404, body: { error: "Pedido não encontrado." } });
+    expect(notFound).toEqual(empty);
+  });
+});
+
+describe("servidor do iFood: caractere de controle nos textos", () => {
+  it.each([
+    ["NUL", "\u0000"],
+    ["C0", "\u0007"],
+    ["DEL", "\u007f"],
+    ["direção", "‮"],
+    ["isolamento de direção", "⁦"],
+  ])("%s em texto que vai ao iFood ou à auditoria: 400 antes do PIN e sem chamar o iFood", async (_name, bad) => {
+    const { sandbox, poller, call, manager } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    const invalid = { status: 400, body: { error: "Texto com caractere inválido." } };
+    expect(await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: `Falta${bad} de gás`, minutes: 30, authorization: auth() })).toEqual(invalid);
+    expect(await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás", minutes: 30, authorization: auth({ reason: `Motivo${bad} longo` }) })).toEqual(invalid);
+    expect(await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", details: `Sem${bad} gás`, authorization: auth() })).toEqual(invalid);
+    expect(await call("POST", `/ifood/orders/${id}/dispute`, { kind: "reject", reason: `Não${bad}`, disputeId: "d-1", authorization: auth() })).toEqual(invalid);
+    expect(manager.authorized).toHaveLength(0);
+    expect(sandbox.activeInterruptions()).toHaveLength(0);
+    expect(sandbox.lastEventCode(id)).toBe("PLC");
+  });
+
+  it("tab, quebra de linha e acento continuam valendo", async () => {
+    const { sandbox, call } = setup();
+    const created = await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás\tna cozinha\r\nção", minutes: 30, authorization: auth() });
+    expect(created.status).toBe(201);
   });
 });

@@ -28,6 +28,19 @@ iFood ──polling 30 s──> servidor (Node, 1 instância) ──service_role
 Todas exigem `Authorization: Bearer <JWT da sessão do app>`, menos `/health`. Corpo acima de 16 KB: 413
 `{error: "Corpo grande demais."}` com `connection: close` (o servidor para de ler, responde e só depois fecha a conexão).
 
+- Limite por aparelho (chave = o JWT, só na memória do processo): mais de 30 requisições em 10 s dá 429
+  `{error: "Muitas requisições; aguarde alguns segundos.", code: "rate_limited"}` antes da prova de loja e sem chamar o
+  iFood. A credencial do iFood é uma só para todas as lojas: um app em loop gastaria o limite de uso dela.
+- `GET .../status` da loja e `GET .../cancellation-reasons` do pedido ficam guardados 10 s por loja/pedido (só resposta
+  boa). Pausar ou retomar a loja limpa o status guardado dela; qualquer `POST` do pedido limpa os motivos guardados dele.
+  O `POST .../cancellation` confere o motivo direto no iFood, nunca no que está guardado.
+- Prova de loja: JWT recusado pelo Supabase (401/403, sessão vencida) dá 401 `{error: "Sessão vencida; entre de novo.",
+  code: "session_expired"}`; Supabase com 5xx dá 503 "Banco indisponível; tente de novo.". Pedido inexistente e pedido
+  de outra loja continuam com o mesmo 404.
+- Texto do corpo que vai ao iFood ou à auditoria (motivos, descrição da pausa, texto do cancelamento, resposta da
+  negociação) com caractere de controle (NUL e os outros abaixo de U+0020, menos tab e quebras de linha; DEL) ou marca
+  de direção do texto (U+202A a U+202E, U+2066 a U+2069): 400 "Texto com caractere inválido.", antes do PIN.
+
 Cancelar, responder negociação, pausar e retomar a loja são ações de gerente: o corpo leva também
 `authorization: {managerPin, performedBy, requestId, reason}` (PIN de gerente de 4 a 6 dígitos, UUID do operador,
 UUID gerado pelo app por tentativa e motivo com 5 caracteres ou mais). O servidor confere o PIN no banco
@@ -42,6 +55,10 @@ de novo com uma nova tentativa. Se a
 tentativa com esse id falhou antes de chegar ao iFood (banco fora do ar na reserva) ou o iFood recusou: 409
 `RETRY_WITH_NEW_ID` (nada foi enviado; a tela gera outro `requestId` e pede o PIN de novo). O que o gerente
 aprovou fica em `audit_logs.metadata.details`.
+
+`tchefood_delivery_authorize` é executável pelo próprio aparelho (`GRANT EXECUTE ... TO authenticated`): o app pode
+gravar uma autorização (com o PIN certo) sem passar pelo servidor. Por isso uma autorização em `audit_logs` sem o
+registro `DELIVERY_RESULT` correspondente (gravado só pelo servidor, com a service_role) não prova que algo foi ao iFood.
 
 Pausa e cancelamento com resultado incerto (tempo esgotado, iFood fora do ar ou resposta estranha depois de enviar):
 o status HTTP do erro (503/502) com `code: "uncertain"` e "pode ter sido aplicado; confira a lista de pausas (ou o pedido
@@ -116,7 +133,9 @@ SUPABASE_URL=https://<ref>.supabase.co SUPABASE_SERVICE_ROLE_KEY=... SUPABASE_AN
 CORS_ORIGINS=https://app.tchefood.com.br PORT=8787 npm run start:ifood
 ```
 
-- `IFOOD_BASE_URL` muda o endereço da API (padrão `https://merchant-api.ifood.com.br`).
+- `IFOOD_BASE_URL` muda o endereço da API (padrão `https://merchant-api.ifood.com.br`). Ela e a `SUPABASE_URL`
+  precisam ser `https://` (`http://` só para `localhost`/`127.0.0.1`); senão o servidor não sobe.
+- `PORT` ausente ou vazia: 8787. Valor que não é um número de 1 a 65535: o servidor não sobe e diz por quê.
 - `IFOOD_SANDBOX=1` sobe com o iFood simulado e gravação em memória (sem credenciais; qualquer token é aceito). Só
   para testar a tela; nunca em produção.
 - Antes: aplicar as migrations no Supabase (`supabase db push`) e cadastrar a loja em `delivery_integrations`
@@ -270,6 +289,6 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
   encontrado | ok` com funções `tchefood_delivery_*` e quem as executa, privilégios de `anon`/`authenticated` nas
   tabelas `delivery_*`, RLS e policies por loja, `SECURITY DEFINER` com `search_path`, colunas novas, CHECKs e os
   triggers de `audit_logs`. Linha com `NÃO` sai primeiro: não ligue o servidor antes de corrigir.
-  `ainda não (opcional)` só vale para `detail_pending (rodada 3)` e `detail_retry_at (rodada 3)`, enquanto essa
-  migration não estiver aplicada.
+  Hoje nenhum item é opcional: `ainda não (opcional)` não aparece (as colunas `detail_pending` e `detail_retry_at` são
+  obrigatórias, como as outras).
   O mesmo script roda num Postgres migrado em `db/tests/verificarDeliveryServidor.pg.test.ts`.

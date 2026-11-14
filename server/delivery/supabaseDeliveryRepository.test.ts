@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { isSecureServiceUrl } from "./marketplace";
 import { DeliveryRepositoryError, SupabaseDeliveryRepository, type RestFetch } from "./supabaseDeliveryRepository";
 
 describe("gravação no Supabase", () => {
@@ -50,5 +51,20 @@ describe("gravação no Supabase", () => {
     // Estado desconhecido não libera um segundo cancelamento: vira incerto.
     row = { ...base, cancellationRequest: { state: "???", reservedAt: "2026-11-14T15:00:00.000Z" } };
     expect((await repository.getOrder("ifood", "o1"))!.cancellationRequest?.state).toBe("uncertain");
+  });
+});
+
+describe("endereço do Supabase", () => {
+  it("exige https://, menos localhost/127.0.0.1 (a chave service_role não pode ir em texto aberto)", () => {
+    const make = (url: string) => () => new SupabaseDeliveryRepository({ url, serviceRoleKey: "s", channel: "ifood" });
+    expect(make("http://x.supabase.co")).toThrow("SUPABASE_URL inválida: use https:// (http:// só para localhost).");
+    expect(make("ftp://x.supabase.co")).toThrow(/SUPABASE_URL inválida/);
+    expect(make("x.supabase.co")).toThrow(/SUPABASE_URL inválida/);
+    expect(make("https://x.supabase.co")).not.toThrow();
+    expect(make("http://localhost:54321")).not.toThrow();
+    expect(make("http://127.0.0.1:54321")).not.toThrow();
+    // Nome que só começa com localhost não é a máquina local.
+    expect(isSecureServiceUrl("http://localhost.evil.com")).toBe(false);
+    expect(isSecureServiceUrl("http://127.0.0.1.evil.com")).toBe(false);
   });
 });

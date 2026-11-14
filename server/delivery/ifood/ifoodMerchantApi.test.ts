@@ -470,3 +470,15 @@ describe("iFood: conferência com a documentação oficial", () => {
     expect(IFOOD_PATHS.interruption("m1", "p1")).toBe("/merchant/v1.0/merchants/m1/interruptions/p1");
   });
 });
+
+describe("iFood: endereço da API (IFOOD_BASE_URL)", () => {
+  it("exige https://, menos localhost/127.0.0.1; o simulador continua valendo", () => {
+    const sandbox = new IfoodSandbox();
+    expect(() => makeApi(sandbox, { baseUrl: "http://merchant-api.ifood.com.br" })).toThrow("IFOOD_BASE_URL inválida: use https:// (http:// só para localhost).");
+    expect(() => makeApi(sandbox, { baseUrl: "merchant-api.ifood.com.br" })).toThrow(/IFOOD_BASE_URL inválida/);
+    expect(() => makeApi(sandbox, { baseUrl: "http://localhost:9000" })).not.toThrow();
+    expect(() => makeApi(sandbox, { baseUrl: "http://127.0.0.1:9000" })).not.toThrow();
+    expect(() => makeApi(sandbox)).not.toThrow();
+    expect(() => makeApi(sandbox, { baseUrl: undefined })).not.toThrow();
+  });
+});

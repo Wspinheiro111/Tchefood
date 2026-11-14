@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { MAX_BODY_BYTES, readBodyOrReject } from "./httpBody";
+import { MAX_BODY_BYTES, parsePort, readBodyOrReject } from "./httpBody";
 
 // Servidor HTTP de verdade (porta efêmera): o 413 precisa chegar ao app, não virar conexão derrubada.
 let server: Server | null = null;
@@ -37,5 +37,21 @@ describe("corpo da requisição do servidor do iFood", () => {
     const response = await fetch(`${base}/x`, { method: "POST", body: "a".repeat(MAX_BODY_BYTES) });
     expect(response.status).toBe(200);
     expect(await response.text()).toBe(`recebi ${MAX_BODY_BYTES}`);
+  });
+});
+
+describe("porta do servidor do iFood (PORT)", () => {
+  it("ausente ou vazia: 8787; número de 1 a 65535 vale", () => {
+    expect(parsePort(undefined)).toBe(8787);
+    expect(parsePort("")).toBe(8787);
+    expect(parsePort("  ")).toBe(8787);
+    expect(parsePort("3000")).toBe(3000);
+    expect(parsePort(" 65535 ")).toBe(65535);
+  });
+
+  it("inválida: erro claro (antes PORT= vazio virava 0, porta aleatória)", () => {
+    for (const raw of ["0", "-1", "65536", "abc", "80.5", "8787x", "0x50", "1e3"]) {
+      expect(() => parsePort(raw)).toThrow(`PORT inválida: "${raw.trim()}" (use um número de 1 a 65535).`);
+    }
   });
 });

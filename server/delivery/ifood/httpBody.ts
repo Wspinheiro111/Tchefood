@@ -32,3 +32,15 @@ export function readBodyOrReject(request: IncomingMessage, response: ServerRespo
     });
   });
 }
+
+export const DEFAULT_PORT = 8787;
+
+// Porta da API (variável PORT). Ausente ou vazia: 8787 (Number("") era 0, e o servidor subia numa porta aleatória).
+// Qualquer outra coisa que não seja um inteiro de 1 a 65535: erro com mensagem clara (o main.ts sai).
+export function parsePort(raw: string | undefined): number {
+  const value = raw?.trim() ?? "";
+  if (!value) return DEFAULT_PORT;
+  const port = /^\d{1,5}$/.test(value) ? Number(value) : NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`PORT inválida: "${value}" (use um número de 1 a 65535).`);
+  return port;
+}
