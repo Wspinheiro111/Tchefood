@@ -862,7 +862,7 @@ describe("servidor do iFood: prova de loja pelo Supabase", () => {
   });
 
   it("JWT recusado pelo Supabase ou resposta estranha não libera", async () => {
-    // JWT vencido (401/403) não libera: lança SessionExpiredError (a API responde 401, ver abaixo).
+    // JWT vencido (401) não libera: lança SessionExpiredError (a API responde 401, ver abaixo).
     const denied = new SupabaseCallerAuthorizer({ url: "https://x.supabase.co", anonKey: "anon", fetchImpl: async () => ({ ok: false, status: 401, text: async () => "" }) });
     await expect(denied.canAccessOrder("t", "o")).rejects.toBeInstanceOf(SessionExpiredError);
     const weird = new SupabaseCallerAuthorizer({ url: "https://x.supabase.co", anonKey: "anon", fetchImpl: async () => ({ ok: true, status: 200, text: async () => "<html>" }) });
@@ -917,24 +917,45 @@ describe("servidor do iFood: limite de uso e cache", () => {
     await call("GET", reasonsPath);
     expect(reasons).toHaveBeenCalledTimes(4);
   });
+
+  it("leitura do status que começou antes da pausa e terminou depois não volta para o cache", async () => {
+    const { sandbox, poller, api, call } = setup();
+    await poller.runOnce();
+    const statusPath = `/ifood/merchants/${sandbox.merchantId}/status`;
+    const real = api.getStoreStatus.bind(api);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const status = vi.spyOn(api, "getStoreStatus").mockImplementationOnce(async (merchant) => {
+      const before = await real(merchant); // lido antes da pausa ("aberta")
+      await gate;
+      return before;
+    });
+    const slow = call("GET", statusPath);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const created = await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás", minutes: 30, authorization: auth() });
+    expect(created.status).toBe(201);
+    release();
+    await slow;
+    expect(((await call("GET", statusPath)).body as { state: string }).state).toBe("closed");
+    expect(status).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("servidor do iFood: sessão vencida e banco fora do ar na prova de loja", () => {
   const authorizerReplying = (status: number, text = "") =>
     new SupabaseCallerAuthorizer({ url: "https://x.supabase.co", anonKey: "anon", fetchImpl: async () => ({ ok: status >= 200 && status < 300, status, text: async () => text }) });
 
-  it("401/403 do Supabase: 401 'Sessão vencida'; 5xx: 503; 200 vazio e 404 continuam 404 iguais", async () => {
+  it("401 do Supabase: 401 'Sessão vencida'; 403 e 5xx: 503; 200 vazio e 404 continuam 404 iguais", async () => {
     const { sandbox, poller, api, inbox } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
     await poller.runOnce();
     const handlerWith = (authorizer: TenantAuthorizer) => createIfoodApiHandler({ inbox, api, authorizer, approval: ALLOW_ALL, now: () => NOW });
     const request = (path: string) => ({ method: "GET", path, headers: { authorization: "Bearer jwt" }, body: "" });
-    for (const status of [401, 403]) {
-      const handle = handlerWith(authorizerReplying(status));
-      expect(await handle(request(`/ifood/orders/${id}/cancellation-reasons`))).toEqual({ status: 401, body: { error: "Sessão vencida; entre de novo.", code: "session_expired" } });
-      expect((await handle(request(`/ifood/merchants/${sandbox.merchantId}/status`))).status).toBe(401);
-    }
-    for (const status of [500, 503]) {
+    const expired = handlerWith(authorizerReplying(401));
+    expect(await expired(request(`/ifood/orders/${id}/cancellation-reasons`))).toEqual({ status: 401, body: { error: "Sessão vencida; entre de novo.", code: "session_expired" } });
+    expect((await expired(request(`/ifood/merchants/${sandbox.merchantId}/status`))).status).toBe(401);
+    // 403 com JWT válido é permissão faltando no Supabase (deploy), não sessão vencida: novo login não resolve.
+    for (const status of [403, 500, 503]) {
       const handle = handlerWith(authorizerReplying(status));
       expect(await handle(request(`/ifood/orders/${id}/cancellation-reasons`))).toEqual({ status: 503, body: { error: "Banco indisponível; tente de novo.", code: "unavailable" } });
       expect((await handle(request(`/ifood/merchants/${sandbox.merchantId}/status`))).status).toBe(503);

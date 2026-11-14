@@ -173,7 +173,7 @@ export class SupabaseCallerAuthorizer implements TenantAuthorizer {
   }
 
   // Sem resposta no prazo ou Supabase com 5xx: lança DeliveryRepositoryError (a API responde 503 sem chamar o iFood);
-  // JWT recusado (401/403): lança SessionExpiredError (401). Nunca libera.
+  // JWT recusado (401): lança SessionExpiredError (401). 403 (permissão faltando no Supabase) e 5xx: 503 com log. Nunca libera.
   private async visible(query: string, accessToken: string): Promise<boolean> {
     const response = await fetchWithDeadline(
       this.fetchImpl,
@@ -182,9 +182,10 @@ export class SupabaseCallerAuthorizer implements TenantAuthorizer {
       this.timeoutMs,
       "prova de loja",
     );
-    // JWT inválido/vencido: o PostgREST responde 401/403.
-    if (response.status === 401 || response.status === 403) throw new SessionExpiredError();
-    if (response.status >= 500) throw new DeliveryRepositoryError(`Supabase recusou a prova de loja (HTTP ${response.status}).`, response.status);
+    // JWT inválido/vencido: o PostgREST responde 401. 403 com JWT válido é grant faltando (deploy): novo login não
+    // resolve, então vai como banco indisponível (503, registrado no log) em vez de mandar o aparelho entrar de novo.
+    if (response.status === 401) throw new SessionExpiredError();
+    if (response.status === 403 || response.status >= 500) throw new DeliveryRepositoryError(`Supabase recusou a prova de loja (HTTP ${response.status}).`, response.status);
     // Qualquer outra recusa (ex.: 404) não libera, com a mesma resposta do pedido inexistente ou de outra loja.
     if (!response.ok) return false;
     try {
@@ -348,6 +349,12 @@ const MAX_TRACKED_KEYS = 5_000;
 
 class ExpiringMap<V> {
   private readonly entries = new Map<string, { value: V; expiresAt: number }>();
+  // Geração por chave: delete() avança, e uma leitura que começou antes não grava o valor velho depois (ver cached).
+  private readonly generations = new Map<string, number>();
+
+  generation(key: string): number {
+    return this.generations.get(key) ?? 0;
+  }
 
   get(key: string, now: number): V | undefined {
     const entry = this.entries.get(key);
@@ -373,6 +380,8 @@ class ExpiringMap<V> {
 
   delete(key: string): void {
     this.entries.delete(key);
+    if (this.generations.size >= MAX_TRACKED_KEYS) this.generations.clear();
+    this.generations.set(key, this.generation(key) + 1);
   }
 }
 
@@ -400,9 +409,11 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
   const cached = async <V>(cache: ExpiringMap<V>, key: string, load: () => Promise<V>): Promise<V> => {
     const hit = cache.get(key, now().getTime());
     if (hit !== undefined) return hit;
+    const generation = cache.generation(key);
     const value = await load();
     const at = now().getTime();
-    cache.set(key, value, at + cacheMs, at);
+    // Pausa/retomada (ou POST no pedido) no meio da leitura: o valor lido pode ser de antes; não guarda.
+    if (cache.generation(key) === generation) cache.set(key, value, at + cacheMs, at);
     return value;
   };
 

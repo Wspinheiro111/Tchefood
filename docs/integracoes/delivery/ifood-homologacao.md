@@ -34,8 +34,9 @@ Todas exigem `Authorization: Bearer <JWT da sessão do app>`, menos `/health`. C
 - `GET .../status` da loja e `GET .../cancellation-reasons` do pedido ficam guardados 10 s por loja/pedido (só resposta
   boa). Pausar ou retomar a loja limpa o status guardado dela; qualquer `POST` do pedido limpa os motivos guardados dele.
   O `POST .../cancellation` confere o motivo direto no iFood, nunca no que está guardado.
-- Prova de loja: JWT recusado pelo Supabase (401/403, sessão vencida) dá 401 `{error: "Sessão vencida; entre de novo.",
-  code: "session_expired"}`; Supabase com 5xx dá 503 "Banco indisponível; tente de novo.". Pedido inexistente e pedido
+- Prova de loja: JWT recusado pelo Supabase (401, sessão vencida) dá 401 `{error: "Sessão vencida; entre de novo.",
+  code: "session_expired"}`; Supabase com 403 (permissão faltando: confira os grants com `db/verificar_delivery_servidor.sql`)
+  ou 5xx dá 503 "Banco indisponível; tente de novo.". Pedido inexistente e pedido
   de outra loja continuam com o mesmo 404.
 - Texto do corpo que vai ao iFood ou à auditoria (motivos, descrição da pausa, texto do cancelamento, resposta da
   negociação) com caractere de controle (NUL e os outros abaixo de U+0020, menos tab e quebras de linha; DEL) ou marca
