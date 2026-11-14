@@ -74,6 +74,11 @@ describe('supabase/migrations', () => {
     // A conciliação do cashback também é refeita (mesma ordem de travas e mesmo relógio da janela).
     const definesReconcile = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes('CREATE OR REPLACE FUNCTION tchefood_reconcile_cashback('));
     expect(definesReconcile.at(-1)).toBe(files[idx('schema_pin_gerente_trava.sql')]);
+    // Versão depois da última já publicada na main (a do PIN da equipe, #53): uma migration com
+    // data anterior à última aplicada fica fora do `supabase db push` normal (P2-01 da rodada 3
+    // do GPT no PR #50).
+    expect(idx('schema_pin_gerente_trava.sql')).toBe(files.length - 1);
+    expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_pin_equipe_trava.sql'));
     // A trava do PIN da equipe refaz tchefood_check_pin, tchefood_save_staff e tchefood_start_store
     // (versão de schema_equipe.sql) e usa a mesma chave da conciliação do cashback: é a última que as define.
     expect(idx('schema_pin_equipe_trava.sql')).toBeGreaterThan(idx('schema_equipe.sql'));
