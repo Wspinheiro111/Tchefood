@@ -3825,12 +3825,21 @@ export const useTcheStore = create<TcheState>()(
           }
           const items = s.orderItems.filter((i) => i.order_id === orderId);
           if (items.some((i) => i.status === 'CANCELED')) return fail('Esta conta tem item cancelado. Ela não pode ser juntada sozinha: chame o suporte.');
+          // Só a conta que ocupava a mesa na hora da recusa (o banco diz qual em holder_order_id):
+          // se ela foi encerrada e outro cliente abriu a mesa depois, os itens iriam para a conta
+          // de outra pessoa (GPT, rodada 6 do PR #54).
+          const holder = /"holder_order_id"\s*:\s*"([0-9a-fA-F-]{36})"/.exec(rejected.message ?? '')?.[1]?.toLowerCase();
+          const gone = 'A conta que estava nesta mesa na hora da recusa não está mais aberta. Os itens não passam sozinhos para outra conta da mesa: confira com o cliente e chame o caixa.';
+          if (!holder) return fail('A recusa não diz qual conta estava na mesa. Os itens não passam sozinhos para outra conta: chame o caixa.');
+          const held = s.orders.find((o) => o.id.toLowerCase() === holder);
+          if (held && !EDITABLE_ORDER_STATUSES.includes(held.status)) return fail(gone);
           // A conta que ficou na mesa: aberta, da mesma mesa, e que a nuvem já tem (não é outra conta
           // deste aparelho esperando para subir).
           const targets = s.orders.filter(
             (o) => o.id !== orderId && o.table_id === order.table_id && EDITABLE_ORDER_STATUSES.includes(o.status)
               && !all.some((e) => e.table === 'orders' && e.op === 'INSERT' && e.row_id === o.id),
           );
+          if (targets.length === 1 && targets[0]!.id.toLowerCase() !== holder) return fail(gone);
           if (targets.length !== 1) return fail('A conta aberta desta mesa ainda não chegou a este aparelho. Toque em Sincronizar agora e tente de novo.');
           const target = targets[0]!;
           // CPF na nota: com um CPF em cada conta, os itens iriam para a nota de outra pessoa
@@ -3888,6 +3897,13 @@ export const useTcheStore = create<TcheState>()(
           const order = typeof orderId === 'string' ? s.orders.find((o) => o.id === orderId) : undefined;
           if (!order) return fail('A conta do item não está mais neste aparelho.');
           if (s.pendingCharges.some((c) => c.order_id === order.id)) return fail(CHARGE_LOCK_ERROR);
+          // Entrega própria: a entrega (endereço, taxa, entregador, acerto) é do pedido encerrado e
+          // acontece uma vez só. Um pedido novo sem entrega iria para a cozinha como pedido de senha,
+          // e uma entrega copiada cobraria a taxa e pagaria o entregador duas vezes (GPT, rodada 6
+          // do PR #54). O item fica na lista para ser lançado num pedido de entrega novo.
+          if (order.fulfillment_type === 'DELIVERY' || s.ownDeliveries.some((d) => d.order_id === order.id)) {
+            return fail('Pedido de entrega: o item não vai sozinho para um pedido novo, porque a entrega e a taxa ficam no pedido encerrado. Lance o item num pedido de entrega novo.');
+          }
           const table = s.tables.find((t) => t.id === order.table_id);
           if (!table) return fail('A mesa da conta não está neste aparelho.');
           const all = [...s.outbox, ...(s.syncRejected ?? []).map((r) => r.event)];
@@ -3949,6 +3965,9 @@ export const useTcheStore = create<TcheState>()(
           );
           const orderItems = [...s.orderItems.filter((i) => !(i.order_id === order.id && unsent.has(i.id))), ...moved];
           const opened = applyOrderTotals(fresh, orderItems, s.payments);
+          // A conta nova ocupa a mesa no próprio INSERT (trg_orders_reserve_table): nenhuma atualização
+          // da mesa sobe daqui, para a cópia deste aparelho não regravar nome, área ou capacidade
+          // mudados em outro aparelho (GPT, rodada 6 do PR #54). Aqui a mesa já mostra a conta nova.
           const points = table.kind === 'TABLE' || table.kind === 'CARD';
           const updatedTable: DiningTable = points ? { ...table, status: 'OCCUPIED', current_order_id: fresh.id, updated_at: ts } : table;
           set({
@@ -3959,7 +3978,6 @@ export const useTcheStore = create<TcheState>()(
             outbox: [
               ...s.outbox.filter((e) => !dropped.has(e.id)),
               syncEvent('orders', 'INSERT', fresh),
-              ...(points ? [syncEvent('dining_tables', 'UPDATE', updatedTable)] : []),
               ...moved.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
             ],
             syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)),

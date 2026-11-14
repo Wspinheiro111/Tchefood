@@ -4,7 +4,7 @@
  * aplica nada.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
-import { mergeCloudOrders, missingCatalog, parseCloudOrders, pendingOrderKeys, type CloudOrders } from '../lib/sync/orderPull';
+import { mergeCloudOrders, missingCatalog, missingModifiers, parseCloudOrders, pendingOrderKeys, type CloudOrders } from '../lib/sync/orderPull';
 import { useTcheStore, type CloudSession } from '../store/useTcheStore';
 import type { DiningTable, Order, OrderItem, OwnDelivery, Payment, SyncEvent } from '../types';
 
@@ -158,6 +158,17 @@ describe('mergeCloudOrders', () => {
     expect(missingCatalog(half, { productIds: ['p1'], tableIds: [T1] })).toBe(true);
     expect(missingCatalog(half, { productIds: ['p1', 'p2'], tableIds: [T1] })).toBe(false);
   });
+
+  it('missingModifiers: adicional que este aparelho não tem (GPT, rodada 6 do PR #54)', () => {
+    const c = cloud({ orders: [order(O1)], orderItems: [item('i1', O1, { modifier_option_ids: ['m1', 'm2'] })] });
+    expect(missingModifiers(c, ['m1'], null)).toBe(true);
+    expect(missingModifiers(c, ['m1', 'm2'], null)).toBe(false);
+    expect(missingModifiers(cloud({ orders: [order(O1)], orderItems: [item('i1', O1)] }), [], null)).toBe(false);
+    // Item lançado antes da última leitura dos cadastros que deu certo: o adicional foi apagado
+    // (ou o banco aceitou com PIN um que não reconhece). Não há o que esperar.
+    expect(missingModifiers(c, ['m1'], '2026-11-14T20:00:00.000Z')).toBe(false);
+    expect(missingModifiers(c, ['m1'], '2026-11-14T19:59:59.000Z')).toBe(true);
+  });
 });
 
 describe('parseCloudOrders', () => {
@@ -272,10 +283,33 @@ describe('moveRejectedOrderToTableOrder (mesa ocupada por outra conta)', () => {
     useTcheStore.setState({
       orders: [...st().orders, x],
       outbox: st().outbox.filter((e) => e.id !== insert.id),
-      syncRejected: [{ event: insert, status: 400, message: 'TCHEFOOD_MESA_OCUPADA: Mesa já está com outra conta aberta', rejected_at: NOW }],
+      syncRejected: [{ event: insert, status: 400, message: busy(free.id, O2), rejected_at: NOW }],
     });
     return { y, x, insert, free };
   }
+  // Como a recusa fica guardada: mensagem — detalhe do banco (quem ocupava a mesa).
+  const busy = (tableId: string, holder: string) =>
+    `TCHEFOOD_MESA_OCUPADA: Mesa já está com outra conta aberta — {"table_id": "${tableId}", "holder_order_id": "${holder}"}`;
+
+  it('a conta da mesa agora não é a que ocupava na hora da recusa: não move nada (GPT, rodada 6 do PR #54)', () => {
+    const { y, insert, free } = setup();
+    // X (a que ocupava) foi encerrada; Z, de outro cliente, abriu a mesa depois.
+    const X = '03030303-0303-4303-8303-030303030303';
+    useTcheStore.setState({ syncRejected: [{ event: insert, status: 400, message: busy(free.id, X), rejected_at: NOW }] });
+    const before = st().orderItems.filter((i) => i.order_id === y.id).length;
+    const r = st().moveRejectedOrderToTableOrder(insert.id);
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/não está mais aberta/) });
+    expect(st().orders.some((o) => o.id === y.id)).toBe(true);
+    expect(st().orderItems.filter((i) => i.order_id === y.id)).toHaveLength(before);
+    expect(st().orderItems.some((i) => i.order_id === O2)).toBe(false);
+    expect(st().syncRejected).toHaveLength(1);
+    // X encerrada e já neste aparelho, mesa ainda sem a conta nova: diz que X não está aberta.
+    useTcheStore.setState((s) => ({ orders: [...s.orders.filter((o) => o.id !== O2), order(X, { tenant_id: s.tenant.id, table_id: free.id, status: 'CLOSED' })] }));
+    expect(st().moveRejectedOrderToTableOrder(insert.id)).toMatchObject({ ok: false, error: expect.stringMatching(/não está mais aberta/) });
+    // Recusa sem o detalhe de quem ocupava: também não move.
+    useTcheStore.setState({ syncRejected: [{ event: insert, status: 400, message: 'TCHEFOOD_MESA_OCUPADA: Mesa já está com outra conta aberta', rejected_at: NOW }] });
+    expect(st().moveRejectedOrderToTableOrder(insert.id)).toMatchObject({ ok: false, error: expect.stringMatching(/não diz qual conta/) });
+  });
 
   it('recusa que não é de mesa ocupada não move nada', () => {
     const { insert } = setup();

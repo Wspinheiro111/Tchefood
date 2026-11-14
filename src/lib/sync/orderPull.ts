@@ -442,6 +442,21 @@ export function mergeCloudOrders(
   return { orders, orderItems, payments, ownDeliveries, tables, replaced: replaced.size };
 }
 
+/**
+ * Adicional que os itens das contas da nuvem usam e este aparelho não tem (GPT, rodada 6 do
+ * PR #54): pede a leitura dos cadastros antes de aplicar. Só conta item lançado depois da
+ * última leitura dos cadastros que deu certo (since): o adicional apagado na nuvem some do
+ * cadastro deste aparelho, e o banco aceita, com PIN de gerente, item com adicional que o
+ * cadastro não reconhece. Esses nunca chegam; depois de uma leitura que deu certo, a conta é
+ * aplicada (sem isso, a cada 10 s os cadastros seriam lidos de novo, e com a leitura deles
+ * falhando nenhuma conta desceria).
+ */
+export function missingModifiers(cloud: CloudOrders, knownOptionIds: Iterable<UUID>, since: string | null): boolean {
+  const known = new Set(knownOptionIds);
+  const after = since ? Date.parse(since) : Number.NEGATIVE_INFINITY;
+  return cloud.orderItems.some((i) => !(Date.parse(i.created_at) <= after) && i.modifier_option_ids.some((m) => !known.has(m)));
+}
+
 /** Produto ou mesa que as contas da nuvem usam e este aparelho ainda não tem (pede a leitura dos cadastros). */
 export function missingCatalog(cloud: CloudOrders, known: { productIds: Iterable<UUID>; tableIds: Iterable<UUID> }): boolean {
   const products = new Set(known.productIds);

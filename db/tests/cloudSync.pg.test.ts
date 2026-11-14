@@ -4284,6 +4284,126 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().pullStatus.last_error).toBeNull();
     });
 
+    it('a conta que ocupava a mesa na recusa foi encerrada e outro cliente abriu a mesa: os itens não passam para a conta nova (GPT, rodada 6 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(260);
+      await expectSynced('mesa 260');
+      const p = st().products.find((x) => x.id === productId)!;
+      const y = ok(st().openTable(mesa.id, 2, null));
+      ok(st().addToTray({ order_id: y.id, product_id: p.id, half_product_ids: [], quantity: 2, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(y.id));
+      // X ocupa a mesa em B; a conta de A é recusada com X como a que ocupava.
+      const x = await bOpens(mesa.id);
+      await bAddsItem(x);
+      await sync();
+      const rej = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === y.id)!;
+      expect(rej.message).toMatch(new RegExp(`holder_order_id.*${x}`));
+      // X paga tudo e fecha; Z, de outro cliente, abre a mesa; A lê as contas.
+      await bPaysCard(x, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${x}'`)));
+      expect(sql(`SELECT status FROM orders WHERE id = '${x}'`)).toBe('CLOSED');
+      const z = await bOpens(mesa.id);
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null } });
+      await syncOnce(fetchA());
+      expect(st().orders.find((o) => o.id === z)!.status).toBe('OPEN');
+      const itemsBefore = st().orderItems.filter((i) => i.order_id === y.id).map((i) => i.id).sort();
+      const outboxBefore = st().outbox.length;
+      // A transferência para Z é recusada, e nada muda.
+      const r = st().moveRejectedOrderToTableOrder(rej.event.id);
+      expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/não está mais aberta/) });
+      expect(st().orders.some((o) => o.id === y.id)).toBe(true);
+      expect(st().orderItems.filter((i) => i.order_id === y.id).map((i) => i.id).sort()).toEqual(itemsBefore);
+      expect(itemsBefore).toHaveLength(1);
+      expect(st().outbox).toHaveLength(outboxBefore);
+      expect(st().syncRejected.some((x2) => x2.event.id === rej.event.id)).toBe(true);
+      await sync();
+      expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${z}'`)).toBe('0');
+    });
+
+    it('conta com adicional que o aparelho não tem e leitura dos cadastros falhando: a foto não é aplicada até o adicional chegar (GPT, rodada 6 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(261);
+      await expectSynced('mesa 261');
+      // B cadastra um adicional novo e lança um item com ele.
+      const group = crypto.randomUUID();
+      const opt = crypto.randomUUID();
+      sql(`INSERT INTO modifier_groups (id, tenant_id, name) VALUES ('${group}', '${TENANT}', 'Extras 261'); INSERT INTO modifier_options (id, group_id, name, additional_price) VALUES ('${opt}', '${group}', 'Bacon 261', 4)`);
+      const x = await bOpens(mesa.id);
+      sql(`SET session_replication_role = replica; INSERT INTO order_items (id, order_id, product_id, waiter_id, quantity, unit_price, modifiers_unit_price, total_item_price, sector, status, origin, priced_at, created_at, modifier_option_ids)
+           VALUES ('${crypto.randomUUID()}', '${x}', '${productId}', '${cashierId()}', 1, 10, 4, 14, 'KITCHEN', 'PENDING', 'WAITER', now(), now(), ARRAY['${opt}']::uuid[])`);
+      const optionsDown: typeof fetchA = () => {
+        const inner = fetchA();
+        return (url, init) => (/\/rest\/v1\/modifier_options/.test(url) ? Promise.resolve(new Response('{"message":"falhou"}', { status: 500 })) : inner(url, init));
+      };
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null } });
+      await syncOnce(optionsDown());
+      expect(st().orders.some((o) => o.id === x)).toBe(false);
+      expect(st().pullStatus.last_error).toBeTruthy();
+      // Os cadastros voltam: a conta chega com o adicional conhecido.
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null, last_pull_at: null } });
+      await syncOnce(fetchA());
+      expect(st().modifierOptions.some((m) => m.id === opt)).toBe(true);
+      expect(st().orderItems.some((i) => i.order_id === x && i.modifier_option_ids.includes(opt))).toBe(true);
+      expect(st().pullStatus.last_error).toBeNull();
+    });
+
+    it('item recuperado numa conta nova da mesa não regrava nome, área e capacidade mudados em outro aparelho (GPT, rodada 6 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(262);
+      await expectSynced('mesa 262');
+      const p = st().products.find((x) => x.id === productId)!;
+      const add = (orderId: string) => {
+        ok(st().addToTray({ order_id: orderId, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+        ok(st().dispatchTray(orderId));
+      };
+      const order = ok(st().openTable(mesa.id, 2, null));
+      add(order.id);
+      await expectSynced('conta 262');
+      // A lança mais um item sem internet; B recebe tudo e muda o cadastro da mesa.
+      add(order.id);
+      await bPaysCard(order.id, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${order.id}'`)));
+      const ren = await rawB('PATCH', `dining_tables?id=eq.${mesa.id}`, { label: 'Mesa 262 jardim', area: 'Jardim', capacity: 8, updated_at: new Date().toISOString() });
+      expect(ren.status, ren.body).toBeLessThan(300);
+      await sync();
+      const late = st().syncRejected.find((r) => r.event.table === 'order_items' && /TCHEFOOD_CONTA_ENCERRADA/.test(r.message ?? ''))!;
+      expect(late).toBeTruthy();
+      expect(st().tables.find((t) => t.id === mesa.id)!.label).toBe('Mesa 262');
+      const fresh = ok(st().moveLateItemsToNewOrder(late.event.id));
+      expect(st().outbox.some((e) => e.table === 'dining_tables')).toBe(false);
+      await expectSynced('conta nova da mesa 262');
+      expect(sql(`SELECT label || ' | ' || area || ' | ' || capacity || ' | ' || status || ' | ' || current_order_id FROM dining_tables WHERE id = '${mesa.id}'`))
+        .toBe(`Mesa 262 jardim | Jardim | 8 | OCCUPIED | ${fresh.newOrderId}`);
+      expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${fresh.newOrderId}'`)).toBe('1');
+    });
+
+    it('item atrasado de pedido de entrega já encerrado: não vira pedido novo sem entrega; o item fica guardado (GPT, rodada 6 do PR #54)', async () => {
+      login(OWNER_PIN);
+      const zone = st().deliveryZones.find((z) => z.active) ?? ok(st().saveDeliveryZone({ name: 'Bairro 263', fee: 4, eta_minutes: 30, active: true }));
+      login(CASHIER_PIN);
+      const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
+      const delivery = { customerName: 'Lia', phone: '53 96666-5555', address: 'Rua das Pedras, 263', reference: '', zoneId: zone.id, changeFor: null, payOnDelivery: true };
+      const order = ok(st().createPickupOrder({ lines: [line], fulfillment: 'DELIVERY', customerName: 'Lia', delivery }));
+      await expectSynced('pedido de entrega 263');
+      // A lança mais um item sem internet; B recebe o pedido todo e o banco fecha.
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await bPaysCard(order.id, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${order.id}'`)));
+      expect(sql(`SELECT status FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED');
+      await sync();
+      const late = st().syncRejected.find((r) => r.event.table === 'order_items' && /TCHEFOOD_CONTA_ENCERRADA/.test(r.message ?? ''))!;
+      expect(late).toBeTruthy();
+      const ordersBefore = sql(`SELECT count(*) FROM orders WHERE tenant_id = '${TENANT}'`);
+      const deliveriesBefore = sql(`SELECT count(*) FROM own_deliveries WHERE tenant_id = '${TENANT}'`);
+      const r = st().moveLateItemsToNewOrder(late.event.id);
+      expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/Pedido de entrega/) });
+      expect(st().syncRejected.some((x) => x.event.id === late.event.id)).toBe(true);
+      expect(st().orderItems.some((i) => i.id === late.event.row_id && i.order_id === order.id)).toBe(true);
+      await sync();
+      expect(sql(`SELECT count(*) FROM orders WHERE tenant_id = '${TENANT}'`)).toBe(ordersBefore);
+      expect(sql(`SELECT count(*) FROM own_deliveries WHERE tenant_id = '${TENANT}'`)).toBe(deliveriesBefore);
+      expect(sql(`SELECT count(*) || ' ' || sum(delivery_fee) FROM own_deliveries WHERE order_id = '${order.id}'`)).toBe(`1 ${sql(`SELECT delivery_fee FROM own_deliveries WHERE order_id = '${order.id}'`)}`);
+    });
+
     it('a rodada de sincronização lê as contas a cada 10 s, com a fila vazia', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(46);

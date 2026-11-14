@@ -8,7 +8,7 @@ import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
-import { fetchCloudOrders, missingCatalog } from './orderPull';
+import { fetchCloudOrders, missingCatalog, missingModifiers } from './orderPull';
 
 const INTERVAL_MS = 5_000;
 /** Leitura dos cadastros da nuvem (só com a fila vazia: o que é daqui sobe antes). */
@@ -53,16 +53,21 @@ async function pullOrders(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh: boo
     let st = useTcheStore.getState();
     if (!st.cloud || st.tenant.id !== tenantId) return;
     const known = () => ({ productIds: useTcheStore.getState().products.map((p) => p.id), tableIds: useTcheStore.getState().tables.map((t) => t.id) });
-    if (!catalogFresh && missingCatalog(snapshot, known())) {
+    const options = () => {
+      const s = useTcheStore.getState();
+      return missingModifiers(snapshot, s.modifierOptions.map((m) => m.id), s.pullStatus?.last_pull_at ?? null);
+    };
+    if (!catalogFresh && (missingCatalog(snapshot, known()) || options())) {
       await pullCatalog(cfg, fetchFn);
       st = useTcheStore.getState();
       if (!st.cloud || st.tenant.id !== tenantId) return;
     }
     // Ainda falta produto ou mesa (a leitura dos cadastros falhou, ou ainda não tem o
-    // cadastro novo): a foto não é aplicada, o aparelho fica com a anterior e tenta de novo
-    // na próxima rodada (GPT, rodadas 1 e 2 do PR #54).
-    if (missingCatalog(snapshot, known())) {
-      st.setPullError('Não foi possível ler as contas da nuvem: falta o cadastro de um produto ou mesa usado nelas. Tentando de novo.', 'orders');
+    // cadastro novo), ou adicional lançado depois da última leitura dos cadastros que deu
+    // certo: a foto não é aplicada, o aparelho fica com a anterior e tenta de novo na próxima
+    // rodada (GPT, rodadas 1, 2 e 6 do PR #54).
+    if (missingCatalog(snapshot, known()) || options()) {
+      st.setPullError('Não foi possível ler as contas da nuvem: falta o cadastro de um produto, adicional ou mesa usado nelas. Tentando de novo.', 'orders');
       return;
     }
     // Uma mudança deste aparelho pode ter entrado na fila enquanto a leitura voltava: o
