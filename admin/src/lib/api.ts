@@ -273,6 +273,8 @@ export interface SubscriptionInput {
   contactEmail: string;
   notes: string;
   reason: string;
+  /** updated_at da assinatura quando o formulário abriu (null = loja ainda sem assinatura). O banco recusa se mudou. */
+  expectedUpdatedAt: string | null;
 }
 
 export interface DeviceAccountResult {
@@ -358,6 +360,7 @@ export function createAdminClient(cfg: AdminConfig, getToken: () => Promise<stri
         p_contact_email: blank(i.contactEmail),
         p_notes: blank(i.notes),
         p_reason: i.reason,
+        p_expected_updated_at: i.expectedUpdatedAt,
       }),
     createCharge: (tenantId, referenceMonth, amount, dueDate, paymentLink) =>
       rpc<string>('tchefood_admin_create_charge', {

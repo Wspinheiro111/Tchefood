@@ -91,7 +91,9 @@ export function randomPasswordFrom(getRandomValues: (a: Uint8Array) => Uint8Arra
 function sameAccount(user: AuthUser, tenantId: string, email: string): boolean {
   const meta = user.app_metadata ?? {};
   const tenant = typeof meta.tenant_id === 'string' && meta.tenant_id ? meta.tenant_id : null;
-  return (tenant === null || tenant === tenantId) && (user.email ?? '').toLowerCase() === email.toLowerCase();
+  // Só conta criada por esta função (sempre com o tenant_id da loja). Conta sem tenant_id (ex.: a de um
+  // admin da plataforma) nunca tem a senha trocada nem ganha tenant_id, mesmo com a reserva editada à mão.
+  return tenant === tenantId && (user.email ?? '').toLowerCase() === email.toLowerCase();
 }
 
 export async function handleDeviceAccount(input: unknown, deps: DeviceAccountDeps): Promise<HandlerResult> {

@@ -169,7 +169,7 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
 
     const input = {
       planId: 'bistro', monthlyPrice: '0.00', status: 'ACTIVE' as const, billingDay: 5, trialEndsOn: null,
-      contactName: 'Dono do Flip', contactPhone: '55999990000', contactEmail: '', notes: 'Piloto', reason: '',
+      contactName: 'Dono do Flip', contactPhone: '55999990000', contactEmail: '', notes: 'Piloto', reason: '', expectedUpdatedAt: null,
     };
     await rejects(admin().saveSubscription(HAND_TENANT, input), /motivo/);
     const sub = await admin().saveSubscription(HAND_TENANT, { ...input, reason: 'Piloto gratuito combinado' });
@@ -185,7 +185,10 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     await rejects(admin().createCharge(tenant, '2026-11-01', null, null, 'http://inseguro.com'), /https/);
     // Criada no dia 5 (antes do vencimento do dia 10).
     setToday('2026-11-05');
-    const chargeId = await admin().createCharge(tenant, '2026-11-14', null, null, 'https://www.asaas.com/i/abc');
+    // Loja em teste até 29/11: sem vencimento, venceria em 30/11 (dia seguinte ao fim do teste);
+    // aqui o vencimento é informado à mão (dia 10) para testar a cobrança vencida.
+    expect(sql(`SELECT tchefood_admin_due_date('2026-11-01', 10)`)).toBe('2026-11-10');
+    const chargeId = await admin().createCharge(tenant, '2026-11-14', null, '2026-11-10', 'https://www.asaas.com/i/abc');
     setToday('2026-11-14');
     let charge = (await admin().store(tenant)).charges[0]!;
     expect(charge).toMatchObject({ id: chargeId, reference_month: '2026-11-01', amount: 199, due_date: '2026-11-10', status: 'OPEN' });
@@ -264,7 +267,7 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
       planId: sub.plan_id, monthlyPrice: '199.00', billingDay: sub.billing_day, trialEndsOn: sub.trial_ends_on,
       contactName: sub.contact_name, contactPhone: sub.contact_phone, contactEmail: sub.contact_email ?? '', notes: '',
     };
-    await admin().saveSubscription(tenant, { ...base, status: 'SUSPENDED', reason: 'Atraso de janeiro' });
+    await admin().saveSubscription(tenant, { ...base, status: 'SUSPENDED', reason: 'Atraso de janeiro', expectedUpdatedAt: sub.updated_at });
     // A cobrança de dezembro (refeita no teste anterior) fica fora: cancelada.
     const decOpen = sql(`SELECT id FROM store_charges WHERE tenant_id = '${tenant}' AND reference_month = '2026-12-01' AND status = 'OPEN'`);
     await admin().cancelCharge(decOpen, 'Cortesia de dezembro');
@@ -276,7 +279,7 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     // Pagar janeiro com fevereiro vencido não reativa; pagar o último vencido reativa.
     expect(await admin().recordPayment(jan, '199.00', '2027-02-20', 'BOLETO', '00190000090')).toMatchObject({ subscription_status: 'SUSPENDED' });
     expect(await admin().recordPayment(feb, '199.00', '2027-02-20', 'BOLETO', '00190000091')).toMatchObject({ subscription_status: 'ACTIVE' });
-    await admin().saveSubscription(tenant, { ...base, status: 'CANCELLED', reason: 'Loja fechou' });
+    await admin().saveSubscription(tenant, { ...base, status: 'CANCELLED', reason: 'Loja fechou', expectedUpdatedAt: (await admin().store(tenant)).subscription!.updated_at });
     await rejects(admin().createCharge(tenant, '2027-03-01', null, null, null), /cancelada não gera cobrança/);
     setToday('2026-11-14');
   });

@@ -181,7 +181,8 @@ BEGIN
     -- escreve direto no histórico e nas cobranças.
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
         REVOKE TRUNCATE ON platform_admins, platform_plans, store_subscriptions, store_charges, platform_admin_audit FROM service_role;
-        REVOKE INSERT, UPDATE, DELETE ON platform_admin_audit, store_charges FROM service_role;
+        -- A Edge Function usa o service role só no Auth; tudo no banco passa pelas funções do painel.
+        REVOKE INSERT, UPDATE, DELETE ON platform_admins, platform_plans, store_subscriptions, platform_admin_audit, store_charges FROM service_role;
     END IF;
 END $$;
 
@@ -248,6 +249,11 @@ END;
 $$;
 
 -- Normaliza o CNPJ digitado: tira pontos, barra, traço e espaços, e passa letras para maiúsculas.
+-- Tira espaços, tabulações e quebras de linha das pontas (btrim só tira espaço). NULL continua NULL.
+CREATE OR REPLACE FUNCTION tchefood_admin_trim(p TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
+    SELECT regexp_replace(p, '^\s+|\s+$', '', 'g')
+$$;
+
 CREATE OR REPLACE FUNCTION tchefood_admin_clean_cnpj(p_cnpj TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
     SELECT upper(regexp_replace(COALESCE(p_cnpj, ''), '[^0-9A-Za-z]', '', 'g'))
 $$;
@@ -266,7 +272,8 @@ $$;
 -- at = quando o pedido foi aberto (contadores de 7 e 30 dias e "último pedido aberto");
 -- sold_at = quando virou venda concluída, ou NULL se ainda não concluiu ("última venda").
 -- Salão: só CLOSED conta como venda, no closed_at (fechamento pago; aberto ou pagando não conta).
--- Delivery: só 'concluded' conta, no last_event_at (o evento de conclusão é o último do pedido).
+-- Delivery: só 'concluded' conta, no horário do primeiro evento de conclusão recebido (eventos
+-- depois da conclusão mexem no last_event_at); sem o evento gravado, o last_event_at.
 DROP FUNCTION IF EXISTS tchefood_admin_sales(UUID);
 CREATE OR REPLACE FUNCTION tchefood_admin_sales(p_tenant UUID) RETURNS TABLE (at TIMESTAMPTZ, sold_at TIMESTAMPTZ) LANGUAGE sql STABLE
 SET search_path = public, pg_temp AS $$
@@ -275,7 +282,11 @@ SET search_path = public, pg_temp AS $$
       FROM orders o WHERE o.tenant_id = p_tenant AND o.status <> 'CANCELED'
     UNION ALL
     SELECT d.placed_at,
-           CASE WHEN d.status = 'concluded' THEN GREATEST(d.last_event_at, d.placed_at) END
+           CASE WHEN d.status = 'concluded' THEN GREATEST(COALESCE(
+               (SELECT min(e.event_created_at) FROM delivery_events e
+                 WHERE e.tenant_id = p_tenant AND e.channel = d.channel AND e.external_order_id = d.external_id
+                   AND e.signal = 'concluded'),
+               d.last_event_at), d.placed_at) END
       FROM delivery_orders d WHERE d.tenant_id = p_tenant AND d.status <> 'cancelled'
 $$;
 
@@ -292,7 +303,7 @@ $$;
 CREATE OR REPLACE FUNCTION tchefood_admin_log(p_admin UUID, p_tenant UUID, p_charge UUID, p_action TEXT, p_reason TEXT, p_details JSONB)
 RETURNS VOID LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
     INSERT INTO platform_admin_audit (admin_user_id, tenant_id, charge_id, action, reason, details)
-    VALUES (p_admin, p_tenant, p_charge, p_action, NULLIF(btrim(p_reason), ''), COALESCE(p_details, '{}'::jsonb));
+    VALUES (p_admin, p_tenant, p_charge, p_action, NULLIF(tchefood_admin_trim(p_reason), ''), COALESCE(p_details, '{}'::jsonb));
 $$;
 
 CREATE OR REPLACE FUNCTION tchefood_admin_clean_phone(p_phone TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
@@ -300,7 +311,7 @@ CREATE OR REPLACE FUNCTION tchefood_admin_clean_phone(p_phone TEXT) RETURNS TEXT
 $$;
 
 CREATE OR REPLACE FUNCTION tchefood_admin_check_email(p_email TEXT) RETURNS TEXT LANGUAGE plpgsql IMMUTABLE AS $$
-DECLARE v TEXT := lower(btrim(COALESCE(p_email, '')));
+DECLARE v TEXT := lower(tchefood_admin_trim(COALESCE(p_email, '')));
 BEGIN
     IF v = '' THEN RETURN NULL; END IF;
     IF length(v) > 200 OR v !~ '^[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$' THEN
@@ -317,7 +328,7 @@ BEGIN
     IF p_billing_day IS NULL OR p_billing_day < 1 OR p_billing_day > 28 THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: dia de cobrança entre 1 e 28';
     END IF;
-    IF length(btrim(COALESCE(p_contact_name, ''))) < 2 OR length(btrim(p_contact_name)) > 100 THEN
+    IF length(tchefood_admin_trim(COALESCE(p_contact_name, ''))) < 2 OR length(tchefood_admin_trim(p_contact_name)) > 100 THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o nome do contato da loja';
     END IF;
     -- DDD + número (10 ou 11 dígitos), ou o mesmo com o DDI 55 na frente (12 ou 13).
@@ -491,32 +502,36 @@ BEGIN
     v_admin := tchefood_admin_require();
     v_cnpj := tchefood_admin_clean_cnpj(p_cnpj);
     IF NOT tchefood_admin_cnpj_valid(v_cnpj) THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: CNPJ inválido'; END IF;
-    IF length(btrim(COALESCE(p_name, ''))) < 2 OR length(btrim(p_name)) > 150 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: nome da loja inválido'; END IF;
-    IF length(btrim(COALESCE(p_legal_name, ''))) < 2 OR length(btrim(p_legal_name)) > 200 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: razão social inválida'; END IF;
-    IF p_state IS NOT NULL AND upper(btrim(p_state)) !~ '^[A-Z]{2}$' THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: UF inválida'; END IF;
-    IF length(btrim(COALESCE(p_city, ''))) > 100 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: cidade com até 100 caracteres'; END IF;
+    IF length(tchefood_admin_trim(COALESCE(p_name, ''))) < 2 OR length(tchefood_admin_trim(p_name)) > 150 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: nome da loja inválido'; END IF;
+    IF length(tchefood_admin_trim(COALESCE(p_legal_name, ''))) < 2 OR length(tchefood_admin_trim(p_legal_name)) > 200 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: razão social inválida'; END IF;
+    IF p_state IS NOT NULL AND upper(tchefood_admin_trim(p_state)) <> ALL (ARRAY['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA',
+                                                                      'PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO']) THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: UF inválida';
+    END IF;
+    IF length(tchefood_admin_trim(COALESCE(p_city, ''))) > 100 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: cidade com até 100 caracteres'; END IF;
     IF p_trial_days IS NULL OR p_trial_days < 0 OR p_trial_days > 90 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: dias de teste entre 0 e 90'; END IF;
     PERFORM tchefood_admin_check_contact(p_billing_day, p_contact_name, p_contact_phone);
     SELECT * INTO v_plan FROM platform_plans WHERE id = p_plan_id AND active;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: plano inválido'; END IF;
     v_price := COALESCE(p_monthly_price, v_plan.monthly_price);
     IF v_price < 0 OR v_price > 100000 OR v_price <> round(v_price, 2) THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: preço inválido'; END IF;
-    IF EXISTS (SELECT 1 FROM tenants WHERE cnpj = v_cnpj) THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: já existe loja com este CNPJ'; END IF;
+    -- Compara normalizado: loja feita à mão no Supabase pode ter o CNPJ em minúsculas.
+    IF EXISTS (SELECT 1 FROM tenants WHERE tchefood_admin_clean_cnpj(cnpj) = v_cnpj) THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: já existe loja com este CNPJ'; END IF;
 
     INSERT INTO tenants (name, legal_name, cnpj, city, state)
-    VALUES (btrim(p_name), btrim(p_legal_name), v_cnpj, COALESCE(NULLIF(btrim(p_city), ''), 'Santo Ângelo'), COALESCE(upper(btrim(p_state)), 'RS'))
+    VALUES (tchefood_admin_trim(p_name), tchefood_admin_trim(p_legal_name), v_cnpj, COALESCE(NULLIF(tchefood_admin_trim(p_city), ''), 'Santo Ângelo'), COALESCE(upper(tchefood_admin_trim(p_state)), 'RS'))
     RETURNING id INTO v_id;
 
     INSERT INTO store_subscriptions (tenant_id, plan_id, monthly_price, status, billing_day, trial_ends_on,
                                      contact_name, contact_phone, contact_email, notes)
     VALUES (v_id, v_plan.id, v_price, CASE WHEN p_trial_days > 0 THEN 'TRIAL' ELSE 'ACTIVE' END, p_billing_day,
             CASE WHEN p_trial_days > 0 THEN tchefood_admin_today() + p_trial_days END,
-            btrim(COALESCE(p_contact_name, '')), tchefood_admin_clean_phone(p_contact_phone), tchefood_admin_check_email(p_contact_email),
-            NULLIF(btrim(p_notes), ''))
+            tchefood_admin_trim(COALESCE(p_contact_name, '')), tchefood_admin_clean_phone(p_contact_phone), tchefood_admin_check_email(p_contact_email),
+            NULLIF(tchefood_admin_trim(p_notes), ''))
     RETURNING * INTO v_s;
 
     PERFORM tchefood_admin_log(v_admin.user_id, v_id, NULL, 'STORE_CREATED', NULL,
-        jsonb_build_object('name', btrim(p_name), 'cnpj', v_cnpj, 'subscription', tchefood_admin_subscription_json(v_s)));
+        jsonb_build_object('name', tchefood_admin_trim(p_name), 'cnpj', v_cnpj, 'subscription', tchefood_admin_subscription_json(v_s)));
     RETURN v_id;
 EXCEPTION WHEN unique_violation THEN
     RAISE EXCEPTION 'TCHEFOOD_ADMIN: já existe loja com este CNPJ';
@@ -526,16 +541,20 @@ END;
 $$;
 
 -- Cria ou altera a assinatura (também para loja criada à mão no Supabase). Motivo obrigatório.
+-- p_expected_updated_at: o updated_at da assinatura quando o formulário abriu (NULL = loja sem
+-- assinatura). Se a assinatura mudou desde então (pagamento que ativou a loja, outra aba), recusa:
+-- o formulário aberto não desfaz o que mudou.
+DROP FUNCTION IF EXISTS tchefood_admin_save_subscription(UUID, TEXT, NUMERIC, TEXT, INT, DATE, TEXT, TEXT, TEXT, TEXT, TEXT);
 CREATE OR REPLACE FUNCTION tchefood_admin_save_subscription(
     p_tenant UUID, p_plan_id TEXT, p_monthly_price NUMERIC, p_status TEXT, p_billing_day INT, p_trial_ends_on DATE,
-    p_contact_name TEXT, p_contact_phone TEXT, p_contact_email TEXT, p_notes TEXT, p_reason TEXT
+    p_contact_name TEXT, p_contact_phone TEXT, p_contact_email TEXT, p_notes TEXT, p_reason TEXT, p_expected_updated_at TIMESTAMPTZ
 ) RETURNS JSONB
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_plan platform_plans%ROWTYPE; v_old store_subscriptions%ROWTYPE; v_new store_subscriptions%ROWTYPE;
         v_existed BOOLEAN;
 BEGIN
     v_admin := tchefood_admin_require();
-    IF length(btrim(COALESCE(p_reason, ''))) < 5 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o motivo da alteração'; END IF;
+    IF length(tchefood_admin_trim(COALESCE(p_reason, ''))) < 5 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o motivo da alteração'; END IF;
     PERFORM 1 FROM tenants WHERE id = p_tenant FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: loja não encontrada'; END IF;
     SELECT * INTO v_plan FROM platform_plans WHERE id = p_plan_id;
@@ -545,23 +564,30 @@ BEGIN
     END IF;
     IF p_status IS NULL OR p_status NOT IN ('TRIAL', 'ACTIVE', 'SUSPENDED', 'CANCELLED') THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: situação inválida'; END IF;
     IF p_status = 'TRIAL' AND p_trial_ends_on IS NULL THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: loja em teste precisa da data de fim do teste'; END IF;
+    IF p_status = 'TRIAL' AND p_trial_ends_on > tchefood_admin_today() + 90 THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: fim do teste em até 90 dias a partir de hoje';
+    END IF;
     PERFORM tchefood_admin_check_contact(p_billing_day, p_contact_name, p_contact_phone);
 
     SELECT * INTO v_old FROM store_subscriptions WHERE tenant_id = p_tenant FOR UPDATE;
     v_existed := FOUND;
+    IF v_existed IS DISTINCT FROM (p_expected_updated_at IS NOT NULL)
+       OR (v_existed AND v_old.updated_at IS DISTINCT FROM p_expected_updated_at) THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: a assinatura mudou enquanto o formulário estava aberto (pagamento ou outra aba). Reabra a loja e confira antes de salvar.';
+    END IF;
     IF v_existed THEN
         UPDATE store_subscriptions SET
             plan_id = v_plan.id, monthly_price = p_monthly_price, status = p_status, billing_day = p_billing_day,
             trial_ends_on = CASE WHEN p_status = 'TRIAL' THEN p_trial_ends_on ELSE COALESCE(p_trial_ends_on, v_old.trial_ends_on) END,
-            contact_name = btrim(COALESCE(p_contact_name, '')), contact_phone = tchefood_admin_clean_phone(p_contact_phone),
-            contact_email = tchefood_admin_check_email(p_contact_email), notes = NULLIF(btrim(p_notes), ''), updated_at = NOW()
+            contact_name = tchefood_admin_trim(COALESCE(p_contact_name, '')), contact_phone = tchefood_admin_clean_phone(p_contact_phone),
+            contact_email = tchefood_admin_check_email(p_contact_email), notes = NULLIF(tchefood_admin_trim(p_notes), ''), updated_at = NOW()
          WHERE tenant_id = p_tenant RETURNING * INTO v_new;
     ELSE
         INSERT INTO store_subscriptions (tenant_id, plan_id, monthly_price, status, billing_day, trial_ends_on,
                                          contact_name, contact_phone, contact_email, notes)
         VALUES (p_tenant, v_plan.id, p_monthly_price, p_status, p_billing_day, p_trial_ends_on,
-                btrim(COALESCE(p_contact_name, '')), tchefood_admin_clean_phone(p_contact_phone), tchefood_admin_check_email(p_contact_email),
-                NULLIF(btrim(p_notes), ''))
+                tchefood_admin_trim(COALESCE(p_contact_name, '')), tchefood_admin_clean_phone(p_contact_phone), tchefood_admin_check_email(p_contact_email),
+                NULLIF(tchefood_admin_trim(p_notes), ''))
         RETURNING * INTO v_new;
     END IF;
 
@@ -599,12 +625,14 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: valor da cobrança inválido';
     END IF;
     -- Sem vencimento informado: o dia de cobrança do mês, mas nunca antes de hoje (cobrança
-    -- criada no meio do mês não nasce vencida).
-    v_due := COALESCE(p_due_date, GREATEST(tchefood_admin_due_date(v_month, v_s.billing_day), tchefood_admin_today()));
-    IF v_due < v_month - 31 OR v_due > (v_month + INTERVAL '2 months')::date THEN
+    -- criada no meio do mês não nasce vencida) nem antes do fim do teste (igual ao lote).
+    -- Vencimento informado à mão: perto do mês da cobrança (pega ano digitado errado).
+    IF p_due_date IS NOT NULL AND (p_due_date < v_month - 31 OR p_due_date > (v_month + INTERVAL '2 months')::date) THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: vencimento longe do mês da cobrança';
     END IF;
-    v_link := NULLIF(btrim(COALESCE(p_payment_link, '')), '');
+    v_due := COALESCE(p_due_date, GREATEST(tchefood_admin_due_date(v_month, v_s.billing_day), tchefood_admin_today(),
+                                           CASE WHEN v_s.status = 'TRIAL' THEN v_s.trial_ends_on + 1 END));
+    v_link := NULLIF(tchefood_admin_trim(COALESCE(p_payment_link, '')), '');
     IF v_link IS NOT NULL AND (v_link !~ '^https://[^\s]+$' OR length(v_link) > 500) THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: link de pagamento precisa começar com https://';
     END IF;
@@ -634,7 +662,9 @@ BEGIN
     PERFORM tchefood_admin_check_month(v_month);
     FOR v_s IN SELECT * FROM store_subscriptions
                 WHERE monthly_price > 0
-                  AND (status = 'ACTIVE' OR (status = 'TRIAL' AND trial_ends_on < (v_month + INTERVAL '1 month')::date))
+                  -- Em teste: só a partir do mês seguinte ao fim do teste (o mês em que o teste
+                  -- termina não é cobrado; teste até 30/11 não paga novembro).
+                  AND (status = 'ACTIVE' OR (status = 'TRIAL' AND trial_ends_on < v_month))
                 ORDER BY tenant_id FOR UPDATE LOOP
         IF NOT EXISTS (SELECT 1 FROM store_charges WHERE tenant_id = v_s.tenant_id AND reference_month = v_month) THEN
             v_due := GREATEST(tchefood_admin_due_date(v_month, v_s.billing_day), tchefood_admin_today(),
@@ -662,7 +692,7 @@ DECLARE v_admin platform_admins%ROWTYPE; v_tenant UUID; v_c store_charges%ROWTYP
         v_ref TEXT; v_activated BOOLEAN := FALSE;
 BEGIN
     v_admin := tchefood_admin_require();
-    v_ref := btrim(COALESCE(p_reference, ''));
+    v_ref := tchefood_admin_trim(COALESCE(p_reference, ''));
     IF length(v_ref) < 4 OR length(v_ref) > 120 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe a referência do pagamento (id do Pix, nosso número, recibo)'; END IF;
     IF p_method IS NULL OR p_method NOT IN ('PIX', 'BOLETO', 'CARTAO', 'TRANSFERENCIA', 'DINHEIRO') THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: forma de pagamento inválida';
@@ -698,11 +728,11 @@ BEGIN
                              payment_reference = v_ref, paid_at = NOW(), paid_by = v_admin.user_id
      WHERE id = p_charge;
 
-    -- Em teste vira ativa no primeiro pagamento. Suspensa só volta a ativa se não sobrar outra
-    -- cobrança vencida em aberto (pagar outubro com novembro vencido não reativa).
-    IF v_s.status = 'TRIAL' OR (v_s.status = 'SUSPENDED' AND NOT EXISTS (
+    -- Em teste ou suspensa vira ativa ao pagar, mas só se não sobrar outra cobrança vencida em
+    -- aberto (pagar outubro com novembro vencido não ativa).
+    IF v_s.status IN ('TRIAL', 'SUSPENDED') AND NOT EXISTS (
            SELECT 1 FROM store_charges o WHERE o.tenant_id = v_tenant AND o.id <> p_charge AND o.status = 'OPEN'
-              AND o.due_date < tchefood_admin_today())) THEN
+              AND o.due_date < tchefood_admin_today()) THEN
         UPDATE store_subscriptions SET status = 'ACTIVE', updated_at = NOW() WHERE tenant_id = v_tenant;
         v_activated := TRUE;
     END IF;
@@ -723,13 +753,13 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_tenant UUID; v_c store_charges%ROWTYPE;
 BEGIN
     v_admin := tchefood_admin_require();
-    IF length(btrim(COALESCE(p_reason, ''))) < 5 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o motivo do cancelamento'; END IF;
+    IF length(tchefood_admin_trim(COALESCE(p_reason, ''))) < 5 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o motivo do cancelamento'; END IF;
     SELECT tenant_id INTO v_tenant FROM store_charges WHERE id = p_charge;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: cobrança não encontrada'; END IF;
     PERFORM 1 FROM store_subscriptions WHERE tenant_id = v_tenant FOR UPDATE;
     SELECT * INTO v_c FROM store_charges WHERE id = p_charge FOR UPDATE;
     IF v_c.status <> 'OPEN' THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: só cobrança em aberto é cancelada (esta está %)', v_c.status; END IF;
-    UPDATE store_charges SET status = 'CANCELLED', cancel_reason = btrim(p_reason), cancelled_at = NOW(), cancelled_by = v_admin.user_id
+    UPDATE store_charges SET status = 'CANCELLED', cancel_reason = tchefood_admin_trim(p_reason), cancelled_at = NOW(), cancelled_by = v_admin.user_id
      WHERE id = p_charge;
     PERFORM tchefood_admin_log(v_admin.user_id, v_tenant, p_charge, 'CHARGE_CANCELLED', p_reason,
         jsonb_build_object('reference_month', v_c.reference_month, 'amount', v_c.amount, 'due_date', v_c.due_date));
@@ -843,21 +873,22 @@ $$;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
-        REVOKE ALL ON FUNCTION tchefood_admin_charges_guard() FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_audit_guard() FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_today() FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_require() FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_cnpj_valid(TEXT) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_clean_cnpj(TEXT) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_due_date(DATE, INT) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_check_month(DATE) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_day_start(DATE) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_sales(UUID) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_log(UUID, UUID, UUID, TEXT, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_clean_phone(TEXT) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_check_email(TEXT) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_check_contact(INT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_admin_subscription_json(store_subscriptions) FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_admin_charges_guard() FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_audit_guard() FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_today() FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_require() FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_cnpj_valid(TEXT) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_clean_cnpj(TEXT) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_trim(TEXT) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_due_date(DATE, INT) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_check_month(DATE) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_day_start(DATE) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_sales(UUID) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_log(UUID, UUID, UUID, TEXT, TEXT, JSONB) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_clean_phone(TEXT) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_check_email(TEXT) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_check_contact(INT, TEXT, TEXT) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_subscription_json(store_subscriptions) FROM PUBLIC, anon, authenticated, service_role;
 
         REVOKE ALL ON FUNCTION tchefood_admin_me() FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_plans() FROM PUBLIC, anon;
@@ -866,7 +897,7 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_admin_store(UUID) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_charges_due(INT) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_create_store(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, NUMERIC, INT, INT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon;
-        REVOKE ALL ON FUNCTION tchefood_admin_save_subscription(UUID, TEXT, NUMERIC, TEXT, INT, DATE, TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon;
+        REVOKE ALL ON FUNCTION tchefood_admin_save_subscription(UUID, TEXT, NUMERIC, TEXT, INT, DATE, TEXT, TEXT, TEXT, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_create_charge(UUID, DATE, NUMERIC, DATE, TEXT) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_generate_month(DATE) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_record_payment(UUID, NUMERIC, DATE, TEXT, TEXT) FROM PUBLIC, anon;
@@ -882,7 +913,7 @@ BEGIN
         GRANT EXECUTE ON FUNCTION tchefood_admin_store(UUID) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_charges_due(INT) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_create_store(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, NUMERIC, INT, INT, TEXT, TEXT, TEXT, TEXT) TO authenticated;
-        GRANT EXECUTE ON FUNCTION tchefood_admin_save_subscription(UUID, TEXT, NUMERIC, TEXT, INT, DATE, TEXT, TEXT, TEXT, TEXT, TEXT) TO authenticated;
+        GRANT EXECUTE ON FUNCTION tchefood_admin_save_subscription(UUID, TEXT, NUMERIC, TEXT, INT, DATE, TEXT, TEXT, TEXT, TEXT, TEXT, TIMESTAMPTZ) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_create_charge(UUID, DATE, NUMERIC, DATE, TEXT) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_generate_month(DATE) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_record_payment(UUID, NUMERIC, DATE, TEXT, TEXT) TO authenticated;
