@@ -82,6 +82,32 @@ describe('startPaymentClaim: segredo da reserva (P2-1)', () => {
   });
 });
 
+describe('startPaymentClaim: resultado desconhecido (r8)', () => {
+  for (const [label, result] of [
+    ['2xx incompleto ou diferente', { ok: false, unknown: true, error: 'O servidor não confirmou a reserva deste pagamento.' }],
+    ['5xx / sem rede', { ok: false, offline: true, error: 'sem resposta' }],
+  ] as const) {
+    it(`${label}: tenta de novo com a mesma chave e segredo, não recebe e agenda a liberação com o segredo`, async () => {
+      claimPayment.mockReset().mockResolvedValue(result);
+      expect((await startPaymentClaim(true, INPUT)).ok).toBe(false);
+      expect(claimPayment).toHaveBeenCalledTimes(2);
+      const [a, b] = claimPayment.mock.calls.map((c) => c[0] as { key: string; releaseToken: string });
+      expect([b!.key, b!.releaseToken]).toEqual([a!.key, a!.releaseToken]);
+      expect(releaseClaimAfterNoCharge).toHaveBeenCalledWith('k-1', 'o1', expect.any(String), tokenOf(), undefined, { unknownClaim: true });
+      // O registro (chave + segredo) não é apagado aqui: a liberação agendada cuida dele.
+      expect(localClaim('k-1')).toMatchObject({ release_token: tokenOf() });
+    });
+  }
+
+  it('recusa definitiva (TF003): nada gravado no servidor, sai do registro e não agenda liberação', async () => {
+    claimPayment.mockReset().mockResolvedValue({ ok: false, code: 'TF003', error: 'saldo' });
+    expect((await startPaymentClaim(true, INPUT)).ok).toBe(false);
+    expect(claimPayment).toHaveBeenCalledTimes(1);
+    expect(localClaim('k-1')).toBeNull();
+    expect(releaseClaimAfterNoCharge).not.toHaveBeenCalled();
+  });
+});
+
 describe('startPaymentClaim: batimento', () => {
   it('renova a cada 20 s com o segredo e para no fim (settle, noCharge ou leave)', async () => {
     for (const end of ['settle', 'noCharge', 'leave'] as const) {

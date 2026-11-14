@@ -116,7 +116,16 @@ pela reserva nova e pelo gatilho de payments.
 Cobrança aprovada só deixa de reservar com o pagamento APROVADO do Mercado Pago dela ou quando a própria cobrança
 é estornada pela resolução verificada (auditoria r7 P0-01). Pagamento do Mercado Pago recusado (DECLINED) com a
 chave de uma cobrança só entra com a cobrança recusada, cancelada ou expirada; estornado (REFUNDED), só com a
-cobrança estornada. PENDING segue como antes.
+cobrança estornada. Pagamento PENDING do Mercado Pago não entra (auditoria r8: nada no app nem nas Edge Functions o
+grava; a cobrança em andamento fica em `terminal_charges`).
+
+**Chave conferida em todo status (auditoria r8 P1-01).** Fora do Mercado Pago, pagamento com a chave de uma cobrança
+da Point é recusado em qualquer status (TF009, `key_in_use`), com a conta e a chave travadas na mesma ordem da abertura
+da cobrança (as duas ao mesmo tempo esperam uma pela outra). Fora do Mercado Pago só entram aprovado e recusado:
+PENDING e REFUNDED são recusados (TF007; o aparelho só registra aprovado ou recusado, e o pagamento retirado no
+aparelho fica REFUNDED só nele, com o INSERT tirado da fila). O recusado com a chave de uma reserva é o registro da
+recusa daquela cobrança: entra com a reserva aberta ou já liberada (a recusa libera a reserva e o registro sobe
+depois), desde que seja da mesma conta, forma e credenciadora (TF010 se não for).
 
 Fim da reserva: o pagamento aprovado com a chave dela a consome de vez (`consumed`); recusa na maquininha ou
 desistência a libera (só quem pediu, sem PIN); reserva presa (aparelho fechou no meio, liberação sem rede) aparece
@@ -186,6 +195,10 @@ O que acontece fora dessa ordem:
   com a assinatura antiga dão 42883 (função não existe).
 - **App novo antes das migrations:** as funções de reserva não existem (42883); o caixa não cobra (falha fechada)
   até as migrations entrarem.
+- **App novo com a migration antiga da reserva:** o app só aceita a renovação da reserva
+  (`tchefood_touch_payment_claim`) que devolve a chave (`idempotency_key`) da própria reserva; a versão antiga da
+  função não a devolve, e toda renovação conta como sem resposta (a cobrança não registra depois de 90 s). Por isso a
+  migration `20261114140000_point_reserva.sql` entra antes de qualquer aparelho receber o app novo (passos 2 e 4).
 
 **Dinheiro do entregador** (`entrega-<id>`, sem reserva): o servidor só aceita esse pagamento com a entrega já
 `DELIVERED` lá (`tchefood_courier_cash_payment`). Na fila do aparelho, a marcação de entregue entra antes do acerto
@@ -215,6 +228,10 @@ O que acontece fora dessa ordem:
    CLI atual, que empacota arquivos fora de `supabase/functions`).
 6. No app, conecte a loja à nuvem, espere a maquininha aparecer, escolha **TEF POS Sem Fio** e a Point Smart
    no fechamento da conta.
+
+### Teste com a Point real
+
+Respostas reais conferidas com os parsers de produção: [`scripts/point-smoke.mjs`](../../scripts/point-smoke.mjs) (`node scripts/point-smoke.mjs --help`).
 
 ## Ainda não
 

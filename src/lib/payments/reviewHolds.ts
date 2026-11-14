@@ -79,21 +79,34 @@ function storage(): Storage | null {
   }
 }
 
+function read(key: string): ReviewHold[] | null {
+  try {
+    const st = storage();
+    if (!st) return null;
+    const raw = st.getItem(key);
+    const list = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(list) ? (list as ReviewHold[]).filter((h) => h && typeof h.order_id === 'string') : [];
+  } catch {
+    // Conteúdo corrompido ou leitura bloqueada: fica com a cópia em memória.
+    return null;
+  }
+}
+
+/**
+ * Atualiza a cópia em memória com o que está guardado agora (outra aba pode ter gravado uma trava). Toda
+ * mudança chama isto e grava no mesmo passo síncrono: nunca regrava a lista inteira a partir de uma cópia
+ * antiga desta aba.
+ */
 function load() {
+  const stored = read(STORAGE_KEY);
+  if (stored) {
+    memory.clear();
+    for (const h of stored) memory.set(reviewHoldKey(h), h);
+  }
   if (loaded) return;
   loaded = true;
-  const read = (key: string) => {
-    try {
-      const raw = storage()?.getItem(key);
-      const list = raw ? (JSON.parse(raw) as unknown) : [];
-      return Array.isArray(list) ? (list as ReviewHold[]).filter((h) => h && typeof h.order_id === 'string') : [];
-    } catch {
-      // Ignora conteúdo corrompido.
-      return [];
-    }
-  };
-  for (const h of read(STORAGE_KEY)) memory.set(reviewHoldKey(h), h);
-  const legacy = read(LEGACY_KEY);
+  listenOtherTabs();
+  const legacy = read(LEGACY_KEY) ?? [];
   for (const h of legacy) if (!memory.has(reviewHoldKey(h))) memory.set(reviewHoldKey(h), h);
   // A versão antiga só sai depois que a nova foi gravada (sem isso a trava se perderia ao reabrir o app).
   if (legacy.length > 0 && !persist()) return;
@@ -102,6 +115,18 @@ function load() {
   } catch {
     // Sem armazenamento.
   }
+}
+
+/** Outra aba mudou as travas: a tela desta aba se atualiza. */
+function listenOtherTabs() {
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+  window.addEventListener('storage', (e) => {
+    if (e.key !== STORAGE_KEY && e.key !== null) return;
+    const before = new Set([...memory.values()].map((h) => h.order_id));
+    load();
+    for (const h of memory.values()) before.add(h.order_id);
+    for (const orderId of before) notify(orderId);
+  });
 }
 
 /** true = gravado. */

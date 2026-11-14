@@ -46,7 +46,7 @@ function mpHold(orderId: string) {
 }
 
 const approved = (cents: number) => ({
-  kind: 'reply', reply: { status: 'APPROVED', nsu: '55667788', authorization_code: 'AB12CD', card_brand: 'VISA', last_four: '4321', terminal_serial: 'MP-SERIAL', amount_cents: cents, method: 'CREDIT' },
+  kind: 'reply', reply: { status: 'APPROVED', idempotency_key: KEY, nsu: '55667788', authorization_code: 'AB12CD', card_brand: 'VISA', last_four: '4321', terminal_serial: 'MP-SERIAL', amount_cents: cents, method: 'CREDIT' },
 });
 
 function fill(reason = 'Cliente mostrou a Point aprovada', operation = '') {
@@ -120,7 +120,7 @@ describe('ConfirmReviewedChargeSheet, ramo Mercado Pago', () => {
   it('DECLINED: tira a trava e avisa que o Mercado Pago confirmou que não foi cobrado', async () => {
     const id = openTable();
     const hold = mpHold(id);
-    reconcile.mockResolvedValue({ kind: 'reply', reply: { status: 'DECLINED', reason: 'Cancelada no Mercado Pago' } });
+    reconcile.mockResolvedValue({ kind: 'reply', reply: { idempotency_key: KEY, status: 'DECLINED', reason: 'Cancelada no Mercado Pago' } });
     const onReleased = vi.fn();
     render(<ConfirmReviewedChargeSheet open onClose={() => undefined} hold={hold} label="Mesa 1" onSuccess={() => undefined} onReleased={onReleased} />);
     fill();
@@ -132,10 +132,29 @@ describe('ConfirmReviewedChargeSheet, ramo Mercado Pago', () => {
     expect(st().payments.filter((p) => p.order_id === id)).toHaveLength(0);
   });
 
+  it.each([
+    ['DECLINED', { status: 'DECLINED', reason: 'Cancelada no Mercado Pago' }],
+    ['MANUAL_REVIEW', { status: 'MANUAL_REVIEW', code: 'X', reason: 'confira' }],
+    ['APPROVED', { status: 'APPROVED', nsu: '55667788', authorization_code: 'AB12CD', card_brand: 'VISA', last_four: '4321', terminal_serial: 'MP-SERIAL', method: 'CREDIT' }],
+  ])('%s de outra chave: não registra nem tira a trava', async (_n, reply) => {
+    const id = openTable();
+    const hold = mpHold(id);
+    const r = { ...reply, ...(reply.status === 'APPROVED' ? { amount_cents: Math.round(hold.amount * 100) } : {}), idempotency_key: 'outra-chave' };
+    reconcile.mockResolvedValue({ kind: 'reply', reply: r });
+    const onReleased = vi.fn();
+    render(<ConfirmReviewedChargeSheet open onClose={() => undefined} hold={hold} label="Mesa 1" onSuccess={() => undefined} onReleased={onReleased} />);
+    fill();
+    await pin();
+    expect(await screen.findByText(/respondeu sobre outra cobrança/)).toBeTruthy();
+    expect(onReleased).not.toHaveBeenCalled();
+    expect(getReviewHold(id)).not.toBeNull();
+    expect(st().payments.filter((p) => p.order_id === id)).toHaveLength(0);
+  });
+
   it('MANUAL_REVIEW: mostra o motivo e o procedimento, e a trava continua', async () => {
     const id = openTable();
     const hold = mpHold(id);
-    reconcile.mockResolvedValue({ kind: 'reply', reply: { status: 'MANUAL_REVIEW', code: 'NOT_FOUND_YET', reason: 'O Mercado Pago ainda não mostra esta cobrança.' } });
+    reconcile.mockResolvedValue({ kind: 'reply', reply: { idempotency_key: KEY, status: 'MANUAL_REVIEW', code: 'NOT_FOUND_YET', reason: 'O Mercado Pago ainda não mostra esta cobrança.' } });
     render(<ConfirmReviewedChargeSheet open onClose={() => undefined} hold={hold} label="Mesa 1" onSuccess={() => undefined} />);
     fill();
     await pin();

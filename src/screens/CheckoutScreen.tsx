@@ -100,13 +100,18 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       return;
     }
     let alive = true;
+    // Uma leitura por vez (a leitura pode levar até 15 s e a consulta é a cada 5 s): uma resposta antiga nunca
+    // chega depois de uma mais nova. Leitura de um efeito já desfeito (alive = false) não grava nada.
+    let reading = false;
     const read = async () => {
+      if (reading) return;
+      reading = true;
       try {
         const cfg = await freshCloudConfig();
         if (!cfg) throw new Error('sem sessão');
         const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
-        rememberServerReservation(orderId, r.reservedCents, r.claims ?? []);
         if (alive) {
+          rememberServerReservation(orderId, r.reservedCents, r.claims ?? []);
           setCloudReservation(r);
           setReservationRead('ok');
         }
@@ -117,6 +122,8 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
           setCloudReservation(null);
           setReservationRead('failed');
         }
+      } finally {
+        reading = false;
       }
     };
     void read();

@@ -71,12 +71,13 @@ export const POINT_POLL_MS = 2_000;
 export const POINT_REQUEST_TIMEOUT_MS = 15_000;
 
 /** Resposta da função point-charge (create, status, cancel e reconcile). */
+/** idempotency_key: a chave da cobrança de que o servidor fala (em toda resposta; quem usa confere com a sua). */
 export type ChargeReply =
   /** awaiting: a cobrança está gravada e nenhum envio saiu ainda (a consulta não manda; o create manda). */
-  | { status: 'PENDING'; awaiting?: true }
-  | { status: 'APPROVED'; nsu: string; authorization_code: string; card_brand: 'VISA' | 'MASTERCARD' | 'ELO'; last_four: string | null; terminal_serial: string; amount_cents: number; method: 'CREDIT' | 'DEBIT' }
-  | { status: 'DECLINED'; reason: string }
-  | { status: 'MANUAL_REVIEW'; reason: string; code: string };
+  | { status: 'PENDING'; idempotency_key: string; awaiting?: true }
+  | { status: 'APPROVED'; idempotency_key: string; nsu: string; authorization_code: string; card_brand: 'VISA' | 'MASTERCARD' | 'ELO'; last_four: string | null; terminal_serial: string; amount_cents: number; method: 'CREDIT' | 'DEBIT' }
+  | { status: 'DECLINED'; idempotency_key: string; reason: string }
+  | { status: 'MANUAL_REVIEW'; idempotency_key: string; reason: string; code: string };
 
 type Reply = ChargeReply;
 
@@ -115,26 +116,28 @@ export function parseChargeReply(text: string): ChargeReply | null {
 
 function parseReply(text: string): Reply | null {
   const body = parseObject(text);
-  if (!body) return null;
+  // Toda resposta diz de que cobrança fala: sem a chave, não prova nada.
+  if (!body || typeof body.idempotency_key !== 'string') return null;
+  const key = body.idempotency_key;
   switch (body.status) {
     case 'PENDING':
-      return body.awaiting_send === true ? { status: 'PENDING', awaiting: true } : { status: 'PENDING' };
+      return body.awaiting_send === true ? { status: 'PENDING', idempotency_key: key, awaiting: true } : { status: 'PENDING', idempotency_key: key };
     case 'DECLINED':
-      return { status: 'DECLINED', reason: typeof body.reason === 'string' ? body.reason : 'Transação recusada.' };
+      return { status: 'DECLINED', idempotency_key: key, reason: typeof body.reason === 'string' ? body.reason : 'Transação recusada.' };
     case 'MANUAL_REVIEW':
       return {
-        status: 'MANUAL_REVIEW',
+        status: 'MANUAL_REVIEW', idempotency_key: key,
         reason: typeof body.reason === 'string' ? body.reason : 'Confira no app do Mercado Pago antes de cobrar de novo.',
         code: typeof body.code === 'string' ? body.code : 'MANUAL_REVIEW',
       };
     case 'APPROVED': {
-      const { nsu, authorization_code, card_brand, last_four, terminal_serial, amount_cents, method } = body;
-      if (typeof nsu !== 'string' || typeof authorization_code !== 'string' || typeof card_brand !== 'string' || !BRANDS.has(card_brand)
+      const { idempotency_key, nsu, authorization_code, card_brand, last_four, terminal_serial, amount_cents, method } = body;
+      if (typeof idempotency_key !== 'string' || typeof nsu !== 'string' || typeof authorization_code !== 'string' || typeof card_brand !== 'string' || !BRANDS.has(card_brand)
         || typeof terminal_serial !== 'string' || typeof amount_cents !== 'number' || (method !== 'CREDIT' && method !== 'DEBIT')) {
         return null;
       }
       return {
-        status: 'APPROVED', nsu, authorization_code, card_brand: card_brand as 'VISA' | 'MASTERCARD' | 'ELO',
+        status: 'APPROVED', idempotency_key, nsu, authorization_code, card_brand: card_brand as 'VISA' | 'MASTERCARD' | 'ELO',
         last_four: typeof last_four === 'string' && /^\d{4}$/.test(last_four) ? last_four : null, terminal_serial, amount_cents, method,
       };
     }
@@ -235,6 +238,10 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
   }
 
   private toResult(reply: Reply, req: ChargeRequest): TerminalResult | null {
+    // Resposta sobre outra cobrança (outra chave) não decide esta: nem aprova, nem recusa, nem segue esperando.
+    if (reply.idempotency_key !== req.idempotency_key) {
+      return this.review('O Mercado Pago respondeu sobre outra cobrança. Confira no app do Mercado Pago antes de cobrar de novo.', 'KEY_MISMATCH');
+    }
     if (reply.status === 'PENDING') return null;
     if (reply.status === 'DECLINED') return { ...this.declined(reply.reason), server_confirmed: true } as TerminalResult;
     if (reply.status === 'MANUAL_REVIEW') return this.review(reply.reason, reply.code);

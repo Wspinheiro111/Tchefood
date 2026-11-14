@@ -107,11 +107,15 @@ async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getS
     const held = (syncRejected ?? []).map((r) => r.event);
     const result = await flushOutbox(events, cfg, fetchFn, 50, held);
     const st = useTcheStore.getState();
-    st.ackSyncedEvents(result.sent);
+    // Recusa da maquininha que o servidor não aceitou (TF010, sem dinheiro): sai da fila como os enviados, para
+    // não parar a conta; o aviso abaixo diz que foi descartada.
+    const dropped = result.dropped ?? [];
+    st.ackSyncedEvents([...result.sent, ...dropped.map((d) => d.eventId)]);
     // Recusados saem da fila (o resto continua subindo) e ficam na lista para revisão.
     st.rejectSyncEvents(result.rejected);
     const first = result.rejected[0];
     if (result.retryLater) st.setSyncError(result.retryLater, null);
+    else if (!first && dropped[0]) st.setSyncError(`O servidor não aceitou o registro de uma recusa da maquininha (nada foi cobrado); ele foi descartado: ${dropped[0].message}`, null);
     else if (first) {
       const more = result.rejected.length > 1 ? ` (+${result.rejected.length - 1})` : '';
       st.setSyncError(`Servidor recusou um evento${more} (HTTP ${first.status}): ${first.message}`, null);

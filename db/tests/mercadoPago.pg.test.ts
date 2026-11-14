@@ -1651,6 +1651,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
           const cents = claimCents ?? (status === 'APPROVED' ? Math.round(amount * 100) : null);
           sql(`BEGIN; ${cents === null ? '' : `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
                VALUES ('${TENANT}', '${id}', '${orderId}', 'CASH', 'CASH_DESK', ${cents}, '${STAFF}');`}
+               ${status === 'PENDING' ? '-- Pendente antigo (de antes da auditoria r8: fora do Mercado Pago, PENDING não entra mais).\n               SET LOCAL session_replication_role = replica;' : ''}
                INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
                VALUES ('${id}', '${orderId}', '${TENANT}', '${STAFF}', ${amount}, 'CASH', '${status}', 'CASH_DESK', '${id}'); COMMIT;`);
           return id;
@@ -1783,11 +1784,12 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         const key = charge({ order_id: order, amount_cents: 6000, paid_amount_cents: 6000 });
         const insert = (amount: number, status: string) => {
           const id = crypto.randomUUID();
-          // O aprovado nasce com a reserva dele (a loja tem Point).
-          sql(`${status === 'APPROVED' ? `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
+          // O aprovado nasce com a reserva dele (a loja tem Point). O pendente é antigo (de antes da auditoria r8).
+          sql(`BEGIN; ${status === 'APPROVED' ? `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
                VALUES ('${TENANT}', '${id}', '${order}', 'CASH', 'CASH_DESK', ${Math.round(amount * 100)}, '${STAFF}');` : ''}
+               ${status === 'PENDING' ? 'SET LOCAL session_replication_role = replica;' : ''}
                INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
-               VALUES ('${id}', '${order}', '${TENANT}', '${STAFF}', ${amount}, 'CASH', '${status}', 'CASH_DESK', '${id}');`);
+               VALUES ('${id}', '${order}', '${TENANT}', '${STAFF}', ${amount}, 'CASH', '${status}', 'CASH_DESK', '${id}'); COMMIT;`);
           return id;
         };
         // Dinheiro aprovado de R$ 40,00 (cabe) que troca a chave pela da cobrança: recusado.

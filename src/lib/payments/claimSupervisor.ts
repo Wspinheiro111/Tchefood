@@ -77,7 +77,9 @@ function defaultDeps(): SupervisorDeps {
         const cfg = await freshCloudConfig();
         if (!cfg) return null;
         const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
-        return new Set((r.claims ?? []).map((c) => c.idempotencyKey));
+        // Sem a lista (resposta sem claims, ou claims null): não prova que a reserva sumiu; não conta como ausência.
+        if (!Array.isArray(r.claims)) return null;
+        return new Set(r.claims.map((c) => c.idempotencyKey));
       } catch {
         return null;
       }
@@ -103,7 +105,29 @@ function holdFor(c: LocalClaim, paid: Payment, code: 'CLAIM_RELEASED' | 'PAYMENT
 }
 
 let lastRun = 0;
+/**
+ * Fase das reservas terminadas (renovação) e fase das leituras de reservas sem dono aqui: travas separadas, para
+ * uma leitura lenta não parar a renovação das terminadas. A leitura inteira (sessão, renovação do token e a
+ * chamada) tem prazo (STALE_READ_TIMEOUT_MS): vencido, conta como sem resposta e a trava sai.
+ */
 let running = false;
+let readingStale = false;
+
+/** Prazo de cada leitura de reservas abertas de uma conta (sessão + chamada). */
+export const STALE_READ_TIMEOUT_MS = 20_000;
+
+/** As reservas abertas da conta, ou null (sem resposta, resposta sem prova, ou prazo vencido). */
+async function openKeysWithin(deps: SupervisorDeps, orderId: string): Promise<ReadonlySet<string> | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), STALE_READ_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([deps.openClaimKeys(orderId).catch(() => null), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** Uma volta do supervisor. Devolve quantas reservas saíram do registro. */
 export async function superviseSettledClaims(deps: SupervisorDeps = defaultDeps(), nowMs = Date.now(), force = false): Promise<number> {
@@ -158,12 +182,18 @@ export async function superviseSettledClaims(deps: SupervisorDeps = defaultDeps(
       // já no servidor: sai do registro.
       drop(c.key);
     }
+  } finally {
+    running = false;
+  }
 
-    // Em andamento sem ninguém rodando aqui: lê sem renovar.
+  // Em andamento sem ninguém rodando aqui: lê sem renovar. Leitura da volta anterior ainda dentro do prazo: pula.
+  if (stale.length === 0 || readingStale) return pruned;
+  readingStale = true;
+  try {
     const byOrder = new Map<string, LocalClaim[]>();
     for (const c of stale) byOrder.set(c.order_id, [...(byOrder.get(c.order_id) ?? []), c]);
     for (const [orderId, list] of byOrder) {
-      const open = await deps.openClaimKeys(orderId);
+      const open = await openKeysWithin(deps, orderId);
       if (!open) continue;
       for (const c of list) {
         if (open.has(c.key)) {
@@ -175,7 +205,7 @@ export async function superviseSettledClaims(deps: SupervisorDeps = defaultDeps(
       }
     }
   } finally {
-    running = false;
+    readingStale = false;
   }
   return pruned;
 }
@@ -184,4 +214,5 @@ export async function superviseSettledClaims(deps: SupervisorDeps = defaultDeps(
 export function resetClaimSupervisor(): void {
   lastRun = 0;
   running = false;
+  readingStale = false;
 }

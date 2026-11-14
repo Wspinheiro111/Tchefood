@@ -1798,9 +1798,13 @@ describe('point-charge: leitura do pagamento', () => {
     expect(amountToCents(24.5)).toBe(2450);
     expect(amountToCents(0.1 + 0.2)).toBe(30);
     expect(amountToCents(10.005)).toBeNull();
-    expect(amountToCents('24.50')).toBeNull();
+    expect(amountToCents('24.50')).toBe(2450);
+    expect(amountToCents('24.5')).toBe(2450);
+    expect(amountToCents('24')).toBe(2400);
+    for (const bad of ['24.505', '-1', '1e3', ' 24.50', '24,50', '', '0', '0.00', '.5', '24.']) expect(amountToCents(bad)).toBeNull();
     expect(amountToCents(0)).toBeNull();
     expect(amountToCents(-1)).toBeNull();
+    expect(amountToCents(1e-9)).toBeNull();
   });
 
   it('parse do GET /v1/payments/{id}', () => {

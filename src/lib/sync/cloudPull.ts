@@ -467,10 +467,40 @@ export type CloudPointReservation = {
   claims?: CloudPaymentClaim[];
 };
 
-export async function fetchPointReservation(cfg: SyncConfig, fetchFn: FetchLike, orderId: string): Promise<CloudPointReservation> {
-  const res = await fetchFn(`${root(cfg)}/rpc/tchefood_point_reservation`, { method: 'POST', headers: headers(cfg), body: JSON.stringify({ p_order: orderId }) });
-  if (!res.ok) throw new Error(`Não foi possível ler a cobrança da Point desta conta: ${await readError(res)}`);
-  const body = JSON.parse((await res.text()) || 'null') as {
+/** Prazo da leitura da reserva: sem resposta nele, a leitura falha (quem chama trata como sem resposta). */
+export const POINT_RESERVATION_TIMEOUT_MS = 15_000;
+
+export async function fetchPointReservation(
+  cfg: SyncConfig,
+  fetchFn: FetchLike,
+  orderId: string,
+  timeoutMs = POINT_RESERVATION_TIMEOUT_MS,
+): Promise<CloudPointReservation> {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      ctrl?.abort();
+      reject(new Error('Não foi possível ler a cobrança da Point desta conta: o servidor não respondeu a tempo.'));
+    }, timeoutMs);
+  });
+  let text: string;
+  try {
+    // A corrida também cobre um fetch que ignora o sinal (a leitura nunca fica pendurada para sempre).
+    text = await Promise.race([
+      (async () => {
+        const r = await fetchFn(`${root(cfg)}/rpc/tchefood_point_reservation`, {
+          method: 'POST', headers: headers(cfg), body: JSON.stringify({ p_order: orderId }), ...(ctrl ? { signal: ctrl.signal } : {}),
+        });
+        if (!r.ok) throw new Error(`Não foi possível ler a cobrança da Point desta conta: ${await readError(r)}`);
+        return r.text();
+      })(),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  const body = JSON.parse(text || 'null') as {
     reserved_cents?: unknown; open_charges?: unknown; manual_review?: unknown; claims_cents?: unknown; point_cents?: unknown; charges?: unknown; claims?: unknown;
   } | null;
   const reserved = Number(body?.reserved_cents);

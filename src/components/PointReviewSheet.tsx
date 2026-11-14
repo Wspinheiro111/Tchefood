@@ -91,6 +91,10 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
     setBusy(false);
     if (out.kind !== 'reply') return fail(out.error);
     const reply = out.reply;
+    // Resposta sobre outra cobrança: não registra nem tira a trava (seja qual for o status).
+    if (reply.idempotency_key !== key) {
+      return fail('O Mercado Pago respondeu sobre outra cobrança. Nada foi registrado e a trava continua; confira com o gerente.');
+    }
     if (reply.status === 'MANUAL_REVIEW') {
       setPin('');
       setReview(reply.reason);
@@ -103,7 +107,7 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
       onClose();
       return;
     }
-    // APPROVED: confere com a cobrança mostrada antes de registrar.
+    // APPROVED: confere com a cobrança mostrada antes de registrar (o valor e a forma; a chave já conferida).
     if (reply.amount_cents !== Math.round(charge.amount * 100) || (charge.method && reply.method !== charge.method)) {
       return fail(`O Mercado Pago aprovou ${formatBRL(reply.amount_cents / 100)} (${METHOD_LABEL[reply.method]}), diferente desta cobrança. Nada foi registrado; confira com o gerente.`);
     }

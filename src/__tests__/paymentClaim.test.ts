@@ -15,13 +15,13 @@ const OK_BODY = JSON.stringify({ id: 'c1', idempotency_key: 'k-1', status: 'open
 
 type Call = { url: string; body: Record<string, unknown>; headers: Record<string, string> };
 
-function deps(reply: () => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>, over: Partial<ClaimDeps> = {}) {
+function deps(reply: (init: { body?: string }) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>, over: Partial<ClaimDeps> = {}) {
   const calls: Call[] = [];
   const d: ClaimDeps = {
     config: async () => cfg,
     fetch: async (url, init) => {
       calls.push({ url, body: JSON.parse(init.body ?? '{}') as Record<string, unknown>, headers: init.headers });
-      return reply();
+      return reply(init);
     },
     prepareOrder: async () => ({ ok: true, balance_cents: 8000 }),
     staff: async () => 'staff-1',
@@ -32,6 +32,11 @@ function deps(reply: () => Promise<{ ok: boolean; status: number; text: () => Pr
   return { d, calls };
 }
 const reply = (status: number, body: string) => async () => ({ ok: status >= 200 && status < 300, status, text: async () => body });
+/** Resposta do banco à liberação: a reserva desta chave, liberada. */
+const released = async (init: { body?: string }) => ({
+  ok: true, status: 200,
+  text: async () => JSON.stringify({ status: 'released', idempotency_key: (JSON.parse(init.body ?? '{}') as { p_key?: string }).p_key }),
+});
 
 beforeEach(() => resetClaimLedger());
 
@@ -132,9 +137,40 @@ describe('claimPayment (tchefood_claim_payment)', () => {
   });
 });
 
+describe('r8: resultado desconhecido × recusa definitiva', () => {
+  it('claimPayment: 2xx vazio, incompleto, com outra chave ou outro valor, e recusa sem código = unknown; TF003 = definitiva', async () => {
+    for (const body of ['{}', 'null', 'não-json', JSON.stringify({ id: 'c1', status: 'open', amount_cents: 2550 }),
+      JSON.stringify({ id: 'c1', idempotency_key: 'k-x', status: 'open', amount_cents: 2550 }),
+      JSON.stringify({ id: 'c1', idempotency_key: 'k-1', status: 'open', amount_cents: 2549 }),
+      JSON.stringify({ id: 'c1', idempotency_key: 'k-1', status: 'released', amount_cents: 2550 })]) {
+      expect(await claimPayment(INPUT, deps(reply(200, body)).d)).toMatchObject({ ok: false, unknown: true });
+    }
+    expect(await claimPayment(INPUT, deps(reply(400, '{"message":"sem código"}')).d)).toMatchObject({ ok: false, unknown: true });
+    expect(await claimPayment(INPUT, deps(reply(500, 'erro')).d)).toMatchObject({ ok: false, offline: true });
+    const tf003 = await claimPayment(INPUT, deps(reply(400, '{"code":"TF003","message":"x"}')).d);
+    expect(tf003).toEqual({ ok: false, code: 'TF003', error: CLAIM_ERRORS.TF003 });
+  });
+
+  it('touch: incompleto ou recusa sem código = unknown (sem código: não tira do registro)', async () => {
+    expect(await touchPaymentClaim('k-1', TOKEN, deps(reply(200, '{}')).d)).toMatchObject({ ok: false, unknown: true });
+    expect(await touchPaymentClaim('k-1', TOKEN, deps(reply(400, '{"message":"x"}')).d)).toMatchObject({ ok: false, unknown: true });
+    const r = await touchPaymentClaim('k-1', TOKEN, deps(reply(400, '{"code":"TF005","message":"x"}')).d);
+    expect(r).toMatchObject({ ok: false, code: 'TF005' });
+    expect(r).not.toHaveProperty('unknown');
+  });
+
+  it('reserva de resultado desconhecido: liberação sem rede fica pendente como desconhecida (TF005 depois não encerra na hora)', async () => {
+    beginLocalClaim('k-u', 'o1', TOKEN);
+    await releaseClaimAfterNoCharge('k-u', 'o1', 'Reserva sem resposta', TOKEN, deps(reply(503, ''), { sleep: async () => undefined }).d, { unknownClaim: true, nowMs: 0 });
+    expect(pendingRelease('k-u')).toMatchObject({ unknown_claim: true, release_token: TOKEN, final: false });
+    await retryPendingClaimReleases(deps(reply(400, '{"code":"TF005","message":"x"}')).d, 1_000, true);
+    expect(pendingRelease('k-u')).toMatchObject({ unknown_claim: true, not_found_count: 1 });
+  });
+});
+
 describe('releasePaymentClaim (tchefood_release_payment_claim)', () => {
   it('libera com a chave, o operador e o motivo', async () => {
-    const { d, calls } = deps(reply(200, '{"status":"released"}'));
+    const { d, calls } = deps(reply(200, '{"status":"released","idempotency_key":"k-1"}'));
     expect(await releasePaymentClaim('k-1', 'Maquininha recusou: saldo insuficiente', 'tok-1', d)).toEqual({ ok: true });
     expect(calls[0]!.url).toBe('https://x.supabase.co/rest/v1/rpc/tchefood_release_payment_claim');
     expect(calls[0]!.body).toEqual({ p_key: 'k-1', p_staff: 'staff-1', p_reason: 'Maquininha recusou: saldo insuficiente', p_release_token: 'tok-1' });
@@ -176,12 +212,12 @@ describe('reconcilePointCharge (ação reconcile da point-charge)', () => {
   }
 
   it('manda a ação reconcile para a point-charge com o ID da operação quando digitado', async () => {
-    const { d, calls } = rdeps(200, JSON.stringify({ status: 'DECLINED', reason: 'cancelada no MP' }));
-    expect(await reconcilePointCharge({ ...RC, operation_id: ' 123456 ' }, d)).toEqual({ kind: 'reply', reply: { status: 'DECLINED', reason: 'cancelada no MP' } });
+    const { d, calls } = rdeps(200, JSON.stringify({ status: 'DECLINED', idempotency_key: RC.idempotency_key, reason: 'cancelada no MP' }));
+    expect(await reconcilePointCharge({ ...RC, operation_id: ' 123456 ' }, d)).toEqual({ kind: 'reply', reply: { status: 'DECLINED', idempotency_key: RC.idempotency_key, reason: 'cancelada no MP' } });
     expect(calls[0]!.url).toBe('https://x.supabase.co/functions/v1/point-charge');
     expect(calls[0]!.body).toEqual({ action: 'reconcile', ...RC, operation_id: '123456' });
-    const noOp = rdeps(200, JSON.stringify({ status: 'MANUAL_REVIEW', code: 'NOT_FOUND_YET', reason: 'não achou' }));
-    expect(await reconcilePointCharge(RC, noOp.d)).toEqual({ kind: 'reply', reply: { status: 'MANUAL_REVIEW', code: 'NOT_FOUND_YET', reason: 'não achou' } });
+    const noOp = rdeps(200, JSON.stringify({ status: 'MANUAL_REVIEW', idempotency_key: RC.idempotency_key, code: 'NOT_FOUND_YET', reason: 'não achou' }));
+    expect(await reconcilePointCharge(RC, noOp.d)).toEqual({ kind: 'reply', reply: { status: 'MANUAL_REVIEW', idempotency_key: RC.idempotency_key, code: 'NOT_FOUND_YET', reason: 'não achou' } });
     expect('operation_id' in noOp.calls[0]!.body).toBe(false);
   });
 
@@ -198,7 +234,7 @@ describe('reconcilePointCharge (ação reconcile da point-charge)', () => {
   });
 
   it('APPROVED traz os dados do Mercado Pago validados', async () => {
-    const body = { status: 'APPROVED', nsu: '998877', authorization_code: 'A1B2C3', card_brand: 'VISA', last_four: '1234', terminal_serial: 'MP-1', amount_cents: 3000, method: 'CREDIT' };
+    const body = { status: 'APPROVED', idempotency_key: RC.idempotency_key, nsu: '998877', authorization_code: 'A1B2C3', card_brand: 'VISA', last_four: '1234', terminal_serial: 'MP-1', amount_cents: 3000, method: 'CREDIT' };
     expect(await reconcilePointCharge(RC, rdeps(200, JSON.stringify(body)).d)).toEqual({ kind: 'reply', reply: body });
     expect((await reconcilePointCharge(RC, rdeps(200, JSON.stringify({ ...body, nsu: 1 })).d)).kind).toBe('error');
   });
@@ -235,7 +271,7 @@ describe('liberação depois de nada cobrado (releaseClaimAfterNoCharge)', () =>
 
   it('a segunda tentativa libera: sem pendência; recusa do servidor não repete', async () => {
     let n = 0;
-    const flaky = deps(async () => { n += 1; if (n === 1) throw new Error('rede'); return { ok: true, status: 200, text: async () => '{}' }; }, { sleep: async () => undefined });
+    const flaky = deps(async () => { n += 1; if (n === 1) throw new Error('rede'); return released({ body: '{"p_key":"k-2"}' }); }, { sleep: async () => undefined });
     expect(await releaseClaimAfterNoCharge('k-2', 'o1', 'recusou', 'tok-k-2', flaky.d)).toEqual({ ok: true });
     expect(pendingReleases()).toEqual([]);
     const refused = deps(reply(400, '{"code":"TF004","message":"x"}'), { sleep: async () => undefined });
@@ -251,7 +287,7 @@ describe('liberação depois de nada cobrado (releaseClaimAfterNoCharge)', () =>
     await releaseClaimAfterNoCharge('k-9', 'o1', 'recusou', 'tok-9', offline.d);
     expect(pendingRelease('k-8')).toMatchObject({ final: true, last_error: 'O servidor não liberou a reserva: só o aparelho que pediu a reserva libera sem PIN' });
     expect(pendingRelease('k-9')).toMatchObject({ final: false });
-    const ok = deps(reply(200, '{}'));
+    const ok = deps(released);
     expect(await retryPendingClaimReleases(ok.d, 3_000_000, true)).toBe(1);
     expect(ok.calls.map((c) => c.body.p_key)).toEqual(['k-9']);
     expect(pendingRelease('k-8')).not.toBeNull();
@@ -261,7 +297,7 @@ describe('liberação depois de nada cobrado (releaseClaimAfterNoCharge)', () =>
     const offline = deps(async () => { throw new Error('rede'); }, { sleep: async () => undefined });
     await releaseClaimAfterNoCharge('k-4', 'o1', 'recusou', 'tok-k-4', offline.d);
     expect(pendingRelease('k-4')).not.toBeNull();
-    const ok = deps(reply(200, '{}'));
+    const ok = deps(released);
     expect(await retryPendingClaimReleases(ok.d, 1_000_000, true)).toBe(1);
     expect(ok.calls[0]!.body).toEqual({ p_key: 'k-4', p_staff: 'staff-1', p_reason: 'recusou', p_release_token: 'tok-k-4' });
     expect(pendingReleases()).toEqual([]);
@@ -278,7 +314,7 @@ describe('liberação depois de nada cobrado (releaseClaimAfterNoCharge)', () =>
     expect(await releaseClaimAfterNoCharge('k-7', 'o1', 'recusou', null, none.d)).toMatchObject({ ok: false, noToken: true });
     expect(none.calls).toHaveLength(0);
     expect(pendingRelease('k-7')).toMatchObject({ release_token: null, last_error: RELEASE_NEEDS_MANAGER });
-    const ok = deps(reply(200, '{}'));
+    const ok = deps(released);
     expect(await retryPendingClaimReleases(ok.d, 2_000_000, true)).toBe(1);
     expect(ok.calls.map((c) => c.body.p_key)).toEqual(['k-6']);
     expect(ok.calls[0]!.body.p_release_token).toBe('segredo-6');
@@ -334,11 +370,13 @@ describe('fetchPointReservation: reservas abertas (claims)', () => {
 
 describe('prazo da reserva (r6 P0-02)', () => {
   it('touchPaymentClaim renova pela RPC e devolve released/consumed sem lançar', async () => {
-    const { d, calls } = deps(reply(200, '{"status":"open","active_until":"2026-11-14T10:01:30Z"}'));
+    const { d, calls } = deps(reply(200, '{"idempotency_key":"k-1","status":"open","active_until":"2026-11-14T10:01:30Z"}'));
     expect(await touchPaymentClaim('k-1', 'tok-1', d)).toEqual({ ok: true, status: 'open', activeUntil: '2026-11-14T10:01:30Z' });
     expect(calls[0]!.url).toBe('https://x.supabase.co/rest/v1/rpc/tchefood_touch_payment_claim');
     expect(calls[0]!.body).toEqual({ p_key: 'k-1', p_staff: 'staff-1', p_release_token: 'tok-1' });
-    expect(await touchPaymentClaim('k-1', 'tok-1', deps(reply(200, '{"status":"released","active_until":null}')).d)).toEqual({ ok: true, status: 'released', activeUntil: null });
+    expect(await touchPaymentClaim('k-1', 'tok-1', deps(reply(200, '{"idempotency_key":"k-1","status":"released","active_until":null}')).d)).toEqual({ ok: true, status: 'released', activeUntil: null });
+    // Sem a chave na resposta (ou com outra): desconhecida, não renova.
+    expect(await touchPaymentClaim('k-1', 'tok-1', deps(reply(200, '{"status":"open","active_until":"2026-11-14T10:01:30Z"}')).d)).toMatchObject({ ok: false, unknown: true });
     expect((await touchPaymentClaim('k-1', 'tok-1', deps(async () => { throw new Error('rede'); }).d)).ok).toBe(false);
     expect((await touchPaymentClaim('k-1', 'tok-1', deps(reply(200, '{"status":"x"}')).d)).ok).toBe(false);
     // Sem o segredo: não chama o servidor (a reserva envelhece).

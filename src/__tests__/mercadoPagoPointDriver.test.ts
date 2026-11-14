@@ -252,7 +252,7 @@ describe('MercadoPagoPointDriver', () => {
   });
 
   it('auditoria r2 P1-01: encerrar antes do prazo leva o PIN do gerente e o motivo ao servidor', async () => {
-    const h = harness((action) => (action === 'cancel' ? { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } } : pending));
+    const h = harness((action) => (action === 'cancel' ? { status: 200, body: { status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'cancelada' } } : pending));
     const p = h.driver.charge(REQ);
     h.driver.abort(REQ.request_id, { manager_pin: '9999', reason: 'cliente desistiu' });
     expect((await p).status).toBe('DECLINED');
@@ -261,7 +261,7 @@ describe('MercadoPagoPointDriver', () => {
   });
 
   it('auditoria r2 P1-01: sem autorização do gerente o encerramento antecipado não acontece (segue até o prazo)', async () => {
-    const h = harness((action) => (action === 'cancel' ? { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } } : pending));
+    const h = harness((action) => (action === 'cancel' ? { status: 200, body: { status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'cancelada' } } : pending));
     const p = h.driver.charge(REQ);
     h.driver.abort(REQ.request_id);
     await p;
@@ -271,7 +271,7 @@ describe('MercadoPagoPointDriver', () => {
   });
 
   it('auditoria r2 P1-01: PIN recusado (403) desfaz o pedido e a cobrança segue até o prazo', async () => {
-    const h = harness((action, n) => (action === 'cancel' ? (n === 1 ? { status: 403, body: { error: 'manager_denied', message: 'PIN errado' } } : { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } }) : pending));
+    const h = harness((action, n) => (action === 'cancel' ? (n === 1 ? { status: 403, body: { error: 'manager_denied', message: 'PIN errado' } } : { status: 200, body: { status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'cancelada' } }) : pending));
     const p = h.driver.charge(REQ);
     h.driver.abort(REQ.request_id, { manager_pin: '0000', reason: 'cliente desistiu' });
     expect((await p).status).toBe('DECLINED');
@@ -324,7 +324,7 @@ describe('MercadoPagoPointDriver', () => {
   });
 
   it('encerramento por prazo cedo demais no servidor (409) segue consultando e tenta de novo', async () => {
-    const { driver, counts } = harness((action, n) => (action === 'cancel' ? (n < 3 ? { status: 409, body: { error: 'too_early', message: 'cedo' } } : { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } }) : pending));
+    const { driver, counts } = harness((action, n) => (action === 'cancel' ? (n < 3 ? { status: 409, body: { error: 'too_early', message: 'cedo' } } : { status: 200, body: { status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'cancelada' } }) : pending));
     expect((await driver.charge(REQ)).status).toBe('DECLINED');
     expect(counts.cancel).toBe(3);
   });
@@ -350,7 +350,7 @@ describe('MercadoPagoPointDriver', () => {
     // A cobrança foi gravada no servidor 40 s depois do primeiro envio do app: o prazo dele vence 40 s depois.
     const early = Math.ceil(40_000 / 2_000);
     const { driver, counts } = harness((action, n) => (action === 'cancel'
-      ? (n <= early ? { status: 409, body: { error: 'too_early', message: 'cedo' } } : { status: 200, body: { status: 'DECLINED', reason: 'cancelada' } })
+      ? (n <= early ? { status: 409, body: { error: 'too_early', message: 'cedo' } } : { status: 200, body: { status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'cancelada' } })
       : pending));
     const r = await driver.charge(REQ);
     expect(r.status).toBe('DECLINED');
@@ -388,7 +388,7 @@ describe('MercadoPagoPointDriver', () => {
   });
 
   it('revisão manual do servidor chega com o código', async () => {
-    const { driver } = harness((action) => (action === 'create' ? pending : { status: 200, body: { status: 'MANUAL_REVIEW', reason: 'confira', code: 'PAID_AMOUNT_MISMATCH' } }));
+    const { driver } = harness((action) => (action === 'create' ? pending : { status: 200, body: { status: 'MANUAL_REVIEW', idempotency_key: REQ.idempotency_key, reason: 'confira', code: 'PAID_AMOUNT_MISMATCH' } }));
     expect(await driver.charge(REQ)).toMatchObject({ status: 'MANUAL_REVIEW', failure_code: 'PAID_AMOUNT_MISMATCH', reason: 'confira' });
   });
 });

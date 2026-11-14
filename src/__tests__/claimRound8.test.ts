@@ -170,7 +170,7 @@ describe('P1-B: pagamento aprovado aqui que o servidor não aceitou sai da conta
     setReviewHold({ order_id: id, amount: 5, reason: 'recusado', code: 'PAYMENT_REJECTED', refund: 'TERMINAL', idempotency_key: 'k-rej2' });
     beginLocalClaim('k-rej2', id, NEW_TOKEN);
     settleLocalClaim('k-rej2');
-    const seq: Array<[number, string]> = [[400, '{"code":"TF007","message":"aberta"}'], [200, '{}'], [200, JSON.stringify(AUDIT)]];
+    const seq: Array<[number, string]> = [[400, '{"code":"TF007","message":"aberta"}'], [200, '{"status":"released","idempotency_key":"k-rej2"}'], [200, JSON.stringify(AUDIT)]];
     const calls: string[] = [];
     const d = rpcDeps(200, '', {
       fetch: async (url, init) => {
@@ -211,7 +211,8 @@ describe('P1-C: comprovante de outra adquirente troca a reserva antes de registr
       reply({ id: 'c2', idempotency_key: 'k-new', status: 'open', amount_cents: amountCents }, { id: 'c1', idempotency_key: 'k-x', status: 'released' }),
       JSON.stringify({ id: 'c2', idempotency_key: 'k-new', status: 'open', amount_cents: amountCents }),
       'null',
-    ]) expect((await reclaimPayment(input, rpcDeps(200, bad).d)).ok).toBe(false);
+    ]) expect(await reclaimPayment(input, rpcDeps(200, bad).d)).toMatchObject({ ok: false, unknown: true });
+    expect(await reclaimPayment(input, rpcDeps(400, '{"message":"sem código"}').d)).toMatchObject({ ok: false, unknown: true });
     // Sem rede: offline (nova tentativa com a mesma chave e o mesmo segredo).
     expect(await reclaimPayment(input, rpcDeps(503, '').d)).toMatchObject({ ok: false, offline: true });
     // Recusa: código do servidor.
@@ -254,7 +255,13 @@ describe('P1-C: reclaimForHold (registro local da chave nova)', () => {
     const hold = holds.setReviewHold({ order_id: 'o9', amount: 10, reason: 'r', code: 'ACQUIRER_MISMATCH', idempotency_key: 'k-old' });
 
     let seen: unknown = null;
-    reclaim.mockImplementation(async (input: { newKey: string }) => { seen = ledger.localClaim(input.newKey); return { ok: false, offline: true, error: 'rede' }; });
+    // Sem resposta, e depois resposta que não prova nada (2xx incompleto): as duas guardam chave e segredo.
+    let n = 0;
+    reclaim.mockImplementation(async (input: { newKey: string }) => {
+      seen = ledger.localClaim(input.newKey);
+      n += 1;
+      return n === 1 ? { ok: false, offline: true, error: 'rede' } : { ok: false, unknown: true, error: 'incompleto' };
+    });
     expect((await reclaimForHold(hold, 'CREDIT', 'PAGBANK')).ok).toBe(false);
     expect(reclaim).toHaveBeenCalledTimes(2);
     const first = reclaim.mock.calls[0]![0] as { newKey: string; newToken: string; oldToken: string };
@@ -400,7 +407,7 @@ describe('P2-F: reserva de resultado desconhecido que "não existe" (TF005)', ()
     await releaseClaimAfterNoCharge('k-u2', 'o1', 'Reserva sem resposta do servidor', OLD_TOKEN, rpcDeps(400, '{"code":"TF005","message":"x"}').d, { unknownClaim: true, nowMs: 0 });
     await retryPendingClaimReleases(rpcDeps(503, '').d, 30_000, true);
     expect(pendingRelease('k-u2')).toMatchObject({ unknown_claim: true, not_found_count: 1 });
-    await retryPendingClaimReleases(rpcDeps(200, '{}').d, 60_000, true);
+    await retryPendingClaimReleases(rpcDeps(200, '{"status":"released","idempotency_key":"k-u2"}').d, 60_000, true);
     expect(pendingRelease('k-u2')).toBeNull();
   });
 

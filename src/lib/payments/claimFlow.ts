@@ -77,12 +77,14 @@ export async function startPaymentClaim(
     }
   };
   let c = await attempt();
-  // Sem resposta: o servidor pode ter criado a reserva. A mesma chave e o mesmo segredo devolvem a mesma reserva.
-  if (!c.ok && c.offline) c = await attempt();
+  // Sem resposta (ou resposta que não prova nada): o servidor pode ter criado a reserva. A mesma chave e o
+  // mesmo segredo devolvem a mesma reserva.
+  const unknown = (r: ClaimResult) => !r.ok && Boolean(r.offline || r.unknown);
+  if (unknown(c)) c = await attempt();
   if (!c.ok) {
-    // Sem resposta: libera com o segredo (TF005 = nunca existiu, conta como liberada); sem rede, fica pendente.
-    // Recusa do servidor: nada foi criado.
-    if (c.offline) void releaseClaimAfterNoCharge(input.key, input.orderId, 'Reserva sem resposta do servidor: nada foi recebido', token, undefined, { unknownClaim: true });
+    // Resultado desconhecido: não recebe; libera com o segredo (TF005 só encerra depois de 3 leituras espaçadas
+    // por 2 min; sem rede, fica pendente). Só a recusa com código do servidor (nada gravado) tira o registro.
+    if (unknown(c)) void releaseClaimAfterNoCharge(input.key, input.orderId, 'Reserva sem resposta do servidor: nada foi recebido', token, undefined, { unknownClaim: true });
     else endLocalClaim(input.key);
     return { ok: false, ...(c.code ? { code: c.code } : {}), error: c.error };
   }
@@ -144,6 +146,13 @@ export async function startPaymentClaim(
           lastOkTouchAt = now();
           return { ok: true };
         }
+        // Recusa definitiva (com código) não ganha o prazo: TF005 = a reserva não existe mais no servidor
+        // (como em checkHoldClaim); outro código (TF004 segredo errado, TF006…) não confirma a reserva.
+        if (t.code === 'TF005') {
+          markReleased();
+          return { ok: false, code: 'CLAIM_RELEASED', reason: CLAIM_RELEASED_DURING_CHARGE };
+        }
+        if (t.code) return { ok: false, code: 'CLAIM_UNCONFIRMED', reason: CLAIM_UNCONFIRMED };
         // Sem resposta agora: dentro do prazo da reserva, o servidor ainda a segura; passou do prazo, não registra.
         if (now() - lastOkTouchAt >= CLAIM_LEASE_MS) return { ok: false, code: 'CLAIM_UNCONFIRMED', reason: CLAIM_UNCONFIRMED };
         return { ok: true };
@@ -169,12 +178,13 @@ export async function reclaimForHold(hold: ReviewHold, method: ClaimInput['metho
   if (hold.reclaim_key !== newKey) setReviewHold({ ...hold, reclaim_key: newKey });
   const input = { oldKey, oldToken, newKey, newToken, method, acquirer, amount: hold.amount };
   let r = await reclaimPayment(input);
-  if (!r.ok && r.offline) r = await reclaimPayment(input);
+  const unknownOutcome = (x: ClaimResult) => !x.ok && Boolean(x.offline || x.unknown);
+  if (unknownOutcome(r)) r = await reclaimPayment(input);
   if (r.ok) return { ok: true, key: newKey };
   // Sem resposta, ou recusa (TF009…) em que a reserva nova pode existir no servidor: chave e segredo ficam para a
   // próxima tentativa (mesma troca, idempotente). Só sai quando o servidor diz que a chave nova não existe.
   detachLocalClaim(newKey);
-  if (!r.offline) {
+  if (!unknownOutcome(r)) {
     const t = await touchPaymentClaim(newKey, newToken);
     if (!t.ok && t.code === 'TF005') {
       endLocalClaim(newKey);
@@ -232,6 +242,7 @@ export async function confirmClaimRefunded(
   const paymentId = store.payments.find((p) => p.idempotency_key === key)?.id;
   const meta = { refund_kind: hold.refund === 'CASH' ? ('cash' as const) : ('card' as const), ...(paymentId ? { payment_local_id: paymentId } : {}) };
   let r = await authorizeClaimRefunded(key, auth.managerPin, auth.reason, meta, deps);
+  // TF007 claim_consumed (já virou pagamento) não passa por aqui: não libera nem tenta de novo, só avisa.
   if (!r.ok && r.notReleased && hold.code === 'PAYMENT_REJECTED') {
     const rel = await releasePaymentClaim(key, 'Pagamento recusado pelo servidor: estornado ou devolvido ao cliente', localClaim(key)?.release_token, deps);
     if (!rel.ok) return { ok: false, error: rel.noToken ? REFUND_NEEDS_MANAGER_RELEASE : rel.error };

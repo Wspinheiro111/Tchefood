@@ -75,28 +75,46 @@ function storage(): Storage | null {
   }
 }
 
+const emptyLedger = (): Ledger => ({ inFlight: [], pendingReleases: [] });
+
+/**
+ * O registro como está guardado agora. Lido do armazenamento a cada uso (não de uma cópia desta aba): outra aba
+ * pode ter gravado uma reserva no meio. Sem armazenamento: a cópia em memória desta aba.
+ */
 function load(): Ledger {
-  if (ledger) return ledger;
-  ledger = { inFlight: [], pendingReleases: [] };
+  const st = storage();
+  if (!st) return (ledger ??= emptyLedger());
   try {
-    const raw = storage()?.getItem(STORAGE_KEY);
+    const raw = st.getItem(STORAGE_KEY);
+    const out = emptyLedger();
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<Ledger>;
-      ledger.inFlight = Array.isArray(parsed.inFlight) ? parsed.inFlight : [];
-      ledger.pendingReleases = Array.isArray(parsed.pendingReleases) ? parsed.pendingReleases : [];
+      out.inFlight = Array.isArray(parsed.inFlight) ? parsed.inFlight : [];
+      out.pendingReleases = Array.isArray(parsed.pendingReleases) ? parsed.pendingReleases : [];
     }
+    ledger = out;
+    return out;
   } catch {
-    // Conteúdo corrompido: começa vazio (o servidor ainda lista as reservas abertas).
+    // Conteúdo corrompido ou leitura bloqueada: a cópia em memória (o servidor ainda lista as reservas abertas).
+    return (ledger ??= emptyLedger());
   }
-  return ledger;
 }
 
-function persist() {
+/**
+ * Lê, muda uma entrada e grava, no mesmo passo síncrono: nunca regrava o registro inteiro a partir de uma cópia
+ * antiga desta aba (duas abas abertas não apagam o segredo uma da outra). Síncrono de propósito: a reserva é
+ * gravada antes da chamada ao servidor, e navigator.locks só existe assíncrono.
+ */
+function mutate<T>(change: (l: Ledger) => T): T {
+  const l = load();
+  const out = change(l);
+  ledger = l;
   try {
-    storage()?.setItem(STORAGE_KEY, JSON.stringify(load()));
+    storage()?.setItem(STORAGE_KEY, JSON.stringify(l));
   } catch {
     // Sem armazenamento: fica em memória enquanto o app estiver aberto.
   }
+  return out;
 }
 
 /**
@@ -104,18 +122,18 @@ function persist() {
  * resposta se perder, o aparelho ainda consegue liberar a reserva que o servidor criou.
  */
 export function beginLocalClaim(key: string, orderId: string, releaseToken: string | null = null, terms?: ClaimTerms): void {
-  const l = load();
   active.add(key);
-  l.inFlight = [...l.inFlight.filter((c) => c.key !== key), { key, order_id: orderId, started_at: new Date().toISOString(), release_token: releaseToken, state: 'charging', ...(terms ? { terms } : {}) }];
-  persist();
+  mutate((l) => {
+    l.inFlight = [...l.inFlight.filter((c) => c.key !== key), { key, order_id: orderId, started_at: new Date().toISOString(), release_token: releaseToken, state: 'charging', ...(terms ? { terms } : {}) }];
+  });
 }
 
 /** Fim conhecido (pago ou em conferência): o registro fica, com o segredo, até o servidor consumir ou liberar. */
 export function settleLocalClaim(key: string): void {
-  const l = load();
   active.delete(key);
-  l.inFlight = l.inFlight.map((c) => (c.key === key ? { ...c, state: 'settled' as const } : c));
-  persist();
+  mutate((l) => {
+    l.inFlight = l.inFlight.map((c) => (c.key === key ? { ...c, state: 'settled' as const } : c));
+  });
 }
 
 /** Todos os registros de reserva deste aparelho. */
@@ -127,18 +145,18 @@ export function inFlightClaims(): LocalClaim[] {
  * Leitura do servidor sem a reserva (`nowMs`) ou com ela (null, zera a contagem). Devolve a contagem atual.
  */
 export function markClaimAbsent(key: string, nowMs: number | null): { count: number; firstAt: number } | null {
-  const l = load();
-  let out: { count: number; firstAt: number } | null = null;
-  l.inFlight = l.inFlight.map((c) => {
-    if (c.key !== key) return c;
-    if (nowMs === null) return { ...c, absent_count: 0, absent_first_at: undefined };
-    const count = (c.absent_count ?? 0) + 1;
-    const firstAt = c.absent_first_at ?? nowMs;
-    out = { count, firstAt };
-    return { ...c, absent_count: count, absent_first_at: firstAt };
+  return mutate((l) => {
+    let out: { count: number; firstAt: number } | null = null;
+    l.inFlight = l.inFlight.map((c) => {
+      if (c.key !== key) return c;
+      if (nowMs === null) return { ...c, absent_count: 0, absent_first_at: undefined };
+      const count = (c.absent_count ?? 0) + 1;
+      const firstAt = c.absent_first_at ?? nowMs;
+      out = { count, firstAt };
+      return { ...c, absent_count: count, absent_first_at: firstAt };
+    });
+    return out as { count: number; firstAt: number } | null;
   });
-  persist();
-  return out;
 }
 
 /** Reservas terminadas aqui que aguardam o servidor (batimento e limpeza pelo laço de sincronização). */
@@ -148,10 +166,10 @@ export function settledClaims(): LocalClaim[] {
 
 /** A cobrança terminou (com qualquer resultado já tratado pela tela). */
 export function endLocalClaim(key: string): void {
-  const l = load();
   active.delete(key);
-  l.inFlight = l.inFlight.filter((c) => c.key !== key);
-  persist();
+  mutate((l) => {
+    l.inFlight = l.inFlight.filter((c) => c.key !== key);
+  });
 }
 
 /**
@@ -175,25 +193,25 @@ export function localClaim(key: string): LocalClaim | null {
 export function addPendingRelease(
   p: Omit<PendingRelease, 'created_at' | 'last_error' | 'release_token' | 'final'> & { last_error?: string | null; release_token?: string | null; final?: boolean },
 ): void {
-  const l = load();
-  const prev = l.pendingReleases.find((r) => r.key === p.key);
-  l.pendingReleases = [
-    ...l.pendingReleases.filter((r) => r.key !== p.key),
-    {
-      key: p.key, order_id: p.order_id, reason: p.reason, created_at: prev?.created_at ?? new Date().toISOString(), last_error: p.last_error ?? null,
-      release_token: p.release_token ?? prev?.release_token ?? null,
-      final: Boolean(p.final),
-      ...((p.unknown_claim ?? prev?.unknown_claim) ? { unknown_claim: true } : {}),
-      ...(p.not_found_count !== undefined ? { not_found_count: p.not_found_count, not_found_first_at: p.not_found_first_at } : prev?.not_found_count !== undefined ? { not_found_count: prev.not_found_count, not_found_first_at: prev.not_found_first_at } : {}),
-    },
-  ];
-  persist();
+  mutate((l) => {
+    const prev = l.pendingReleases.find((r) => r.key === p.key);
+    l.pendingReleases = [
+      ...l.pendingReleases.filter((r) => r.key !== p.key),
+      {
+        key: p.key, order_id: p.order_id, reason: p.reason, created_at: prev?.created_at ?? new Date().toISOString(), last_error: p.last_error ?? null,
+        release_token: p.release_token ?? prev?.release_token ?? null,
+        final: Boolean(p.final),
+        ...((p.unknown_claim ?? prev?.unknown_claim) ? { unknown_claim: true } : {}),
+        ...(p.not_found_count !== undefined ? { not_found_count: p.not_found_count, not_found_first_at: p.not_found_first_at } : prev?.not_found_count !== undefined ? { not_found_count: prev.not_found_count, not_found_first_at: prev.not_found_first_at } : {}),
+      },
+    ];
+  });
 }
 
 export function removePendingRelease(key: string): void {
-  const l = load();
-  l.pendingReleases = l.pendingReleases.filter((r) => r.key !== key);
-  persist();
+  mutate((l) => {
+    l.pendingReleases = l.pendingReleases.filter((r) => r.key !== key);
+  });
 }
 
 export function pendingReleases(): PendingRelease[] {
@@ -207,6 +225,9 @@ export function pendingRelease(key: string): PendingRelease | null {
 /** Só para testes. */
 export function resetClaimLedger(): void {
   active.clear();
-  ledger = { inFlight: [], pendingReleases: [] };
-  persist();
+  ledger = emptyLedger();
+  mutate((l) => {
+    l.inFlight = [];
+    l.pendingReleases = [];
+  });
 }

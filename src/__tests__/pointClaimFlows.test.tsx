@@ -52,7 +52,7 @@ const { chargePickupOrder } = await import('../lib/pickupCharge');
 const st = () => useTcheStore.getState();
 const MP_TERMINAL: PosTerminal = { id: 'mp-term', tenant_id: 'x', name: 'Point Salão', serial_number: 'MP-SERIAL', acquirer: 'MERCADO_PAGO', mode: 'TEF_POS_WIRELESS', online: true, battery_level: 90 };
 const CLAIM_OK = (key: string, cents: number) => ({ ok: true, claim: { id: 'c1', idempotency_key: key, status: 'open', amount_cents: cents } });
-const NO_RESERVATION = { reservedCents: 0, openCharges: 0, manualReview: false, charges: [] };
+const NO_RESERVATION = { reservedCents: 0, openCharges: 0, manualReview: false, charges: [], claims: [] };
 
 function fakeDriver(acquirer: 'STONE' | 'PAGBANK' | 'MERCADO_PAGO', result: TerminalResult | Promise<TerminalResult>) {
   const d = {
@@ -257,6 +257,20 @@ describe('caixa da mesa (CheckoutScreen) numa loja com Point', () => {
     expect(claimPayment).toHaveBeenLastCalledWith(expect.objectContaining({ key: 'k-sem-reserva', method: 'CREDIT', acquirer: 'STONE', amount, orderId: id }));
     expect(localClaim('k-sem-reserva')).toMatchObject({ state: 'settled' });
     expect(getReviewHold(id)).toBeNull();
+  });
+
+  it('TF009 e leitura das reservas sem a lista (claims ausente): não é leitura; a trava não vira estorno (auditoria 1 P3-3)', async () => {
+    const id = openTable();
+    withPoint();
+    const amount = st().orders.find((o) => o.id === id)!.remaining_balance;
+    setReviewHold({ order_id: id, amount, reason: 'Aprovado na maquininha, mas não registrado', code: 'REGISTER_FAILED', method: 'CREDIT', acquirer: 'STONE', terminal_id: null, terminal_serial: 'S1', idempotency_key: 'k-sem-lista' });
+    claimPayment.mockResolvedValue({ ok: false, code: 'TF009', error: 'A chave deste pagamento já está em uso por outra cobrança.' });
+    fetchPointReservation.mockResolvedValue({ reservedCents: 0, openCharges: 0, manualReview: false, charges: [] });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    expect(await screen.findByText(/Não consegui ler as reservas desta conta no servidor/)).toBeTruthy();
+    expect(getReviewHold(id)).toMatchObject({ code: 'REGISTER_FAILED' });
+    expect(payments(id)).toHaveLength(0);
   });
 
   it('TF009 na reserva nova com a chave da trava: liberada no servidor vira estorno; aberta sem o código, só o gerente libera', async () => {

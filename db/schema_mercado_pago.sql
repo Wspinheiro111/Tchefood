@@ -360,7 +360,9 @@ END $$;
 -- Chamada pela Edge Function (service role) antes de qualquer pedido ao Mercado Pago. Mesmas
 -- regras de tchefood_authorize_manager: gerente ou dono ativo da loja, motivo com 5+ letras,
 -- 3 PINs errados em 60 s bloqueiam (com a loja travada: tentativas simultâneas não passam juntas).
--- A cobrança fica travada (FOR UPDATE) da leitura à gravação, então o resultado é um destes:
+-- A cobrança fica travada (FOR UPDATE) da leitura à gravação; antes dela, depois da trava do PIN, a conta da cobrança
+-- (FOR UPDATE, auditoria interna F4: a ordem de tchefood_register_payment e do gatilho do Mercado Pago; na ordem
+-- inversa o registro em audit_logs esperava a conta e o pagamento esperava a cobrança, 40P01). O resultado é um destes:
 --   * autorização aplicada: grava UM audit_log POINT_CHARGE_CANCELED e marca a cobrança; devolve o id;
 --   * já autorizada: devolve o id do audit_log da primeira autorização, sem conferir PIN nem gravar outro;
 --   * não se aplica (cobrança em estado final): TF007, sem audit_log;
@@ -382,10 +384,13 @@ BEGIN
     -- (cobrança travada, esperando o PIN) e outra com PIN na mesma conta (PIN na mão, gravando o registro que aponta
     -- para a conta) esperavam uma pela outra.
     PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || p_tenant::text));
-    SELECT * INTO v_charge FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant FOR UPDATE;
+    -- Auditoria interna F4: a conta da cobrança antes da cobrança (a conta da cobrança não muda).
+    SELECT c.order_id INTO v_order FROM terminal_charges c WHERE c.idempotency_key = p_key AND c.tenant_id = p_tenant;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
     END IF;
+    PERFORM 1 FROM orders o WHERE o.id = v_order AND o.tenant_id = p_tenant FOR UPDATE;
+    SELECT * INTO v_charge FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant FOR UPDATE;
     IF NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_performed_by AND u.tenant_id = p_tenant AND u.active) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
     END IF;
@@ -464,10 +469,16 @@ BEGIN
     -- (cobrança travada, esperando o PIN) e outra com PIN na mesma conta (PIN na mão, gravando o registro que aponta
     -- para a conta) esperavam uma pela outra.
     PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || p_tenant::text));
-    SELECT * INTO v_charge FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant FOR UPDATE;
+    -- Auditoria interna F4: depois da trava do PIN, a conta da cobrança (FOR UPDATE) e só então a cobrança, na
+    -- ordem de tchefood_register_payment (conta) e do gatilho do Mercado Pago (cobrança FOR SHARE). Com a cobrança
+    -- travada primeiro, o registro em audit_logs (FOR KEY SHARE na conta) esperava o pagamento, que esperava a
+    -- cobrança (40P01). A conta da cobrança não muda (gatilho de terminal_charges).
+    SELECT c.order_id INTO v_order FROM terminal_charges c WHERE c.idempotency_key = p_key AND c.tenant_id = p_tenant;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
     END IF;
+    PERFORM 1 FROM orders o WHERE o.id = v_order AND o.tenant_id = p_tenant FOR UPDATE;
+    SELECT * INTO v_charge FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant FOR UPDATE;
     IF p_staff IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_staff AND u.tenant_id = p_tenant AND u.active) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
     END IF;
@@ -729,9 +740,14 @@ BEGIN
     IF NEW.acquirer::text <> 'MERCADO_PAGO' THEN
         RETURN NEW;
     END IF;
+    -- Auditoria interna F4: a conta antes da cobrança (FOR SHARE abaixo), em todo caminho que grava o pagamento, na
+    -- ordem de tchefood_register_payment, do fim verificado (tchefood_resolve_point_charge) e do pedido de
+    -- conferência (tchefood_authorize_point_reconcile). Este gatilho roda antes de trg_payments_point_reservation
+    -- (ordem dos nomes), que é quem travava a conta no INSERT direto.
+    PERFORM 1 FROM orders o WHERE o.id = NEW.order_id AND o.tenant_id = NEW.tenant_id FOR UPDATE;
     -- Auditoria r7 P0-01: pagamento do Mercado Pago recusado ou estornado só entra (ou só vira isso) com a
     -- chave de uma cobrança da Point quando a própria cobrança no servidor diz o mesmo: DECLINED só com a
-    -- cobrança recusada, cancelada ou expirada; REFUNDED só com a cobrança estornada. PENDING passa com a cobrança.
+    -- cobrança recusada, cancelada ou expirada; REFUNDED só com a cobrança estornada. PENDING não entra (r8).
     -- Revisão r8 (F1): pagamento do Mercado Pago só existe para uma cobrança da Point. Sem a cobrança com a chave
     -- nesta loja, qualquer status é recusado (PENDING também): senão ele ocuparia a chave (única em payments) antes
     -- de a cobrança nascer, e o pagamento aprovado dela nunca entraria.
@@ -745,15 +761,21 @@ BEGIN
          WHERE c.idempotency_key = NEW.idempotency_key AND c.tenant_id = NEW.tenant_id
          FOR SHARE;
         IF NOT FOUND THEN
-            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento do Mercado Pago sem a cobrança da Point no servidor (chave %).', NEW.idempotency_key;
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento do Mercado Pago sem a cobrança da Point no servidor (chave %).', NEW.idempotency_key
+                USING ERRCODE = 'TF005';
         END IF;
-        IF NEW.status = 'PENDING'
-           OR (NEW.status = 'DECLINED' AND v_charge.status IN ('rejected', 'cancelled', 'expired'))
+        -- Auditoria r8 (a verificar 1): nada no app nem nas Edge Functions grava pagamento PENDING do Mercado Pago (o
+        -- aparelho só registra aprovado ou recusado; a cobrança em andamento vive em terminal_charges). Recusado.
+        IF NEW.status = 'PENDING' THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento pendente do Mercado Pago não é gravado (a cobrança em andamento fica na cobrança da Point, chave %).', NEW.idempotency_key
+                USING ERRCODE = 'TF007';
+        END IF;
+        IF (NEW.status = 'DECLINED' AND v_charge.status IN ('rejected', 'cancelled', 'expired'))
            OR (NEW.status = 'REFUNDED' AND v_charge.status = 'refunded') THEN
             RETURN NEW;
         END IF;
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento do Mercado Pago "%" com a cobrança "%" no servidor (chave %): não confere. Recusado ou estornado só com a cobrança resolvida no servidor.',
-            NEW.status, v_charge.status, NEW.idempotency_key;
+            NEW.status, v_charge.status, NEW.idempotency_key USING ERRCODE = 'TF007';
     END IF;
     -- FOR SHARE (auditoria r5 P1-01): o estorno verificado (tchefood_resolve_point_charge) trava a mesma
     -- cobrança antes de conferir que ela não tem pagamento. Pagamento e estorno juntos esperam um pelo outro:
@@ -763,10 +785,10 @@ BEGIN
      WHERE c.idempotency_key = NEW.idempotency_key AND c.tenant_id = NEW.tenant_id
      FOR SHARE;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: Mercado Pago aprovado sem a cobrança no servidor (chave %).', NEW.idempotency_key;
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: Mercado Pago aprovado sem a cobrança no servidor (chave %).', NEW.idempotency_key USING ERRCODE = 'TF005';
     END IF;
     IF v_charge.status <> 'approved' THEN
-        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a cobrança do Mercado Pago está "%" no servidor, não aprovada.', v_charge.status;
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a cobrança do Mercado Pago está "%" no servidor, não aprovada.', v_charge.status USING ERRCODE = 'TF007';
     END IF;
     IF v_charge.order_id <> NEW.order_id
        OR v_charge.terminal_id IS DISTINCT FROM NEW.terminal_id
@@ -778,7 +800,8 @@ BEGIN
        OR v_charge.external_terminal_id IS DISTINCT FROM NEW.terminal_serial
        OR v_charge.card_brand IS DISTINCT FROM NEW.card_brand::text
        OR NEW.acquirer_cnpj IS DISTINCT FROM '10573521000191' THEN
-        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o pagamento não confere com a cobrança aprovada no Mercado Pago (conta, maquininha, forma, valor, bandeira, CNPJ da credenciadora ou comprovante).';
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o pagamento não confere com a cobrança aprovada no Mercado Pago (conta, maquininha, forma, valor, bandeira, CNPJ da credenciadora ou comprovante).'
+            USING ERRCODE = 'TF006';
     END IF;
     RETURN NEW;
 END;

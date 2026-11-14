@@ -339,7 +339,7 @@ function patchedNothing(req: SyncRequest, body: string): boolean {
   }
 }
 
-export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{
+export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{
   ok: boolean;
   status: number;
   text: () => Promise<string>;
@@ -357,6 +357,12 @@ export interface FlushResult {
   retryLater: string | null;
   /** 4xx: o servidor recusou estes eventos. O envio seguiu com os demais. */
   rejected: SyncRejection[];
+  /**
+   * Recusado que não move dinheiro e não deve parar a conta: o registro de uma recusa da maquininha (DECLINED,
+   * fora do Mercado Pago) que o servidor recusou com TF010 (não bate com a reserva da chave). Sai da fila (quem
+   * chama confirma como os enviados) e não segura os eventos seguintes da conta.
+   */
+  dropped?: SyncRejection[];
 }
 
 /**
@@ -451,6 +457,7 @@ export async function flushOutbox(
 ): Promise<FlushResult> {
   const sent: string[] = [];
   const rejected: SyncRejection[] = [];
+  const dropped: SyncRejection[] = [];
   const blocked = new Set(held.flatMap(recordKeys));
   // Eventos que ainda não subiram: recusados guardados e toda a fila, até cada um ser aceito
   // nesta rodada. Quem depende de um deles (depends_on_event_ids) espera, também quando a
@@ -518,9 +525,29 @@ export async function flushOutbox(
     if (res.status >= 500 || res.status === 408 || res.status === 429) {
       return { sent, retryLater: `Nuvem indisponível (HTTP ${res.status}).`, rejected };
     }
+    if (isDroppableDeclined(event, text)) {
+      dropped.push({ eventId: event.id, status: res.status, message: describeError(text, res.status) });
+      unsent.delete(event.id);
+      continue;
+    }
     reject(event, res.status, describeError(text, res.status));
   }
-  return { sent, retryLater: null, rejected };
+  return { sent, retryLater: null, rejected, ...(dropped.length > 0 ? { dropped } : {}) };
+}
+
+/**
+ * Registro de recusa da maquininha (INSERT de pagamento DECLINED fora do Mercado Pago) recusado com TF010: não
+ * move dinheiro e nada depende dele; ficar guardado pararia a conta inteira. Qualquer outro caso (outro código,
+ * outro status, UPDATE, Mercado Pago) segue recusado e visível.
+ */
+function isDroppableDeclined(event: SyncEvent, body: string): boolean {
+  if (event.table !== 'payments' || event.op !== 'INSERT') return false;
+  if (event.payload.status !== 'DECLINED' || event.payload.acquirer === 'MERCADO_PAGO') return false;
+  try {
+    return (JSON.parse(body) as { code?: unknown }).code === 'TF010';
+  } catch {
+    return false;
+  }
 }
 
 function isNullResponse(body: string): boolean {

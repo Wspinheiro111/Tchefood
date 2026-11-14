@@ -238,15 +238,23 @@ export function useOrderClaims(orderId: string): { claims: CloudPaymentClaim[]; 
       return;
     }
     let alive = true;
+    // Uma leitura por vez (até 15 s cada, consulta a cada 5 s): uma resposta antiga nunca sobrescreve uma mais
+    // nova. Leitura de um efeito já desfeito não grava nada.
+    let reading = false;
     const read = async () => {
+      if (reading) return;
+      reading = true;
       try {
         const cfg = await freshCloudConfig();
         if (!cfg) return;
         const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
+        if (!alive) return;
         rememberServerReservation(orderId, r.reservedCents, r.claims ?? []);
-        if (alive) setClaims(r.claims ?? []);
+        setClaims(r.claims ?? []);
       } catch {
         // Sem leitura: fica a última lista (o servidor ainda recusa o que passar da reserva).
+      } finally {
+        reading = false;
       }
     };
     void read();

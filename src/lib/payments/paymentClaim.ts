@@ -50,8 +50,12 @@ export interface PaymentClaim {
 
 export type ClaimResult =
   | { ok: true; claim: PaymentClaim }
-  /** offline: sem rede, sem sessão ou sem resposta no prazo. code: SQLSTATE da recusa do banco, quando houve. */
-  | { ok: false; offline?: true; code?: string; error: string };
+  /**
+   * offline: sem rede, sem sessão ou sem resposta no prazo. code: SQLSTATE da recusa do banco (recusa
+   * definitiva: nada foi gravado). unknown: a chamada pode ter gravado a reserva (2xx incompleto ou com outra
+   * chave/valor, recusa sem código): como offline, guarda chave e segredo e agenda a liberação.
+   */
+  | { ok: false; offline?: true; unknown?: true; code?: string; error: string };
 
 export interface ClaimDeps {
   /** Sessão da nuvem com token válido (useCloudSync.freshCloudConfig); null = sem sessão. */
@@ -113,15 +117,21 @@ function parseObject(text: string): Record<string, unknown> | null {
 type RpcOutcome =
   | { kind: 'ok'; body: Record<string, unknown> | null; text: string }
   | { kind: 'offline' }
-  | { kind: 'refused'; code: string | null; message: string };
+  /** details: o DETAIL do PostgreSQL (ex.: TF007 claim_open / claim_consumed), quando vem. */
+  | { kind: 'refused'; code: string | null; message: string; details?: string | null };
 
 /** POST numa RPC do PostgREST com prazo. Rede, prazo, 401, 408, 429 e 5xx = sem resposta do servidor. */
 async function callRpc(cfg: SyncConfig, fn: string, body: Record<string, unknown>, deps: ClaimDeps): Promise<RpcOutcome> {
+  // Prazo vencido: cancela o pedido (não fica rodando por trás; o resultado já é tratado como sem resposta).
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
   const out = await within((async () => {
-    const res = await deps.fetch(rpcUrl(cfg, fn), { method: 'POST', headers: rpcHeaders(cfg), body: JSON.stringify(body) });
+    const res = await deps.fetch(rpcUrl(cfg, fn), { method: 'POST', headers: rpcHeaders(cfg), body: JSON.stringify(body), ...(ctrl ? { signal: ctrl.signal } : {}) });
     return { res, text: await res.text() };
   })(), deps);
-  if (!out.done) return { kind: 'offline' };
+  if (!out.done) {
+    ctrl?.abort();
+    return { kind: 'offline' };
+  }
   const { res, text } = out.value;
   if (res.ok) return { kind: 'ok', body: parseObject(text), text };
   if (res.status >= 500 || res.status === 401 || res.status === 408 || res.status === 429) return { kind: 'offline' };
@@ -131,6 +141,7 @@ async function callRpc(cfg: SyncConfig, fn: string, body: Record<string, unknown
     kind: 'refused',
     code: err && typeof err.code === 'string' ? err.code : null,
     message: err && typeof err.message === 'string' ? err.message : `HTTP ${res.status}`,
+    details: err && typeof err.details === 'string' ? err.details : null,
   };
 }
 
@@ -184,13 +195,16 @@ export async function claimPayment(input: ClaimInput, deps: ClaimDeps = defaultC
   }, deps);
   if (out.kind === 'offline') return offline();
   if (out.kind === 'refused') {
-    const known = out.code ? CLAIM_ERRORS[out.code] : undefined;
-    return { ok: false, ...(out.code ? { code: out.code } : {}), error: known ?? `O servidor recusou a reserva: ${out.message}. Nada foi recebido.` };
+    // Só recusa com código (SQLSTATE) é definitiva; sem código, não se sabe se o servidor gravou.
+    if (!out.code) return { ok: false, unknown: true, error: `O servidor não confirmou a reserva (${out.message}). Nada foi recebido; tente de novo.` };
+    const known = CLAIM_ERRORS[out.code];
+    return { ok: false, code: out.code, error: known ?? `O servidor recusou a reserva: ${out.message}. Nada foi recebido.` };
   }
   const b = out.body;
-  // Só a reserva desta chave, aberta e com este valor, libera.
+  // Só a reserva desta chave, aberta e com este valor, libera. Resposta incompleta ou diferente: resultado
+  // desconhecido (o servidor pode ter gravado).
   if (!b || typeof b.id !== 'string' || b.idempotency_key !== input.key || b.status !== 'open' || Number(b.amount_cents) !== amountCents) {
-    return { ok: false, error: 'O servidor não confirmou a reserva deste pagamento. Nada foi recebido; tente de novo.' };
+    return { ok: false, unknown: true, error: 'O servidor não confirmou a reserva deste pagamento. Nada foi recebido; tente de novo.' };
   }
   return { ok: true, claim: { id: b.id, idempotency_key: input.key, status: 'open', amount_cents: amountCents } };
 }
@@ -233,8 +247,9 @@ export async function reclaimPayment(input: ReclaimInput, deps: ClaimDeps = defa
     }, deps);
     if (out.kind === 'offline') return offline();
     if (out.kind === 'refused') {
-      const known = out.code ? CLAIM_ERRORS[out.code] : undefined;
-      return { ok: false, ...(out.code ? { code: out.code } : {}), error: known ?? `O servidor não trocou a reserva: ${out.message}` };
+      if (!out.code) return { ok: false, unknown: true, error: `O servidor não confirmou a troca da reserva (${out.message}). Nada foi registrado; tente de novo.` };
+      const known = CLAIM_ERRORS[out.code];
+      return { ok: false, code: out.code, error: known ?? `O servidor não trocou a reserva: ${out.message}` };
     }
     // Resposta: { old: {id, idempotency_key, status, release_audit_id}, new: {id, idempotency_key, status, amount_cents} }.
     // Só a reserva nova (chave e valor pedidos, aberta) confirma; qualquer outra coisa não registra.
@@ -243,7 +258,7 @@ export async function reclaimPayment(input: ReclaimInput, deps: ClaimDeps = defa
     const b = n !== null && typeof n === 'object' && !Array.isArray(n) ? (n as Record<string, unknown>) : null;
     const oldOk = oldPart !== null && typeof oldPart === 'object' && (oldPart as Record<string, unknown>).idempotency_key === input.oldKey;
     if (!b || !oldOk || typeof b.id !== 'string' || b.idempotency_key !== input.newKey || b.status !== 'open' || Number(b.amount_cents) !== amountCents) {
-      return { ok: false, error: 'O servidor não confirmou a troca da reserva. Nada foi registrado; tente de novo.' };
+      return { ok: false, unknown: true, error: 'O servidor não confirmou a troca da reserva. Nada foi registrado; tente de novo.' };
     }
     return { ok: true, claim: { id: b.id, idempotency_key: input.newKey, status: 'open', amount_cents: amountCents } };
   } catch {
@@ -275,7 +290,14 @@ export async function releasePaymentClaim(key: string, reason: string, releaseTo
     // TF005: não há reserva com a chave (nada a liberar). TF007: já virou pagamento (não reserva mais à toa).
     if (out.kind === 'refused' && out.code === 'TF005') return { ok: true, notFound: true };
     if (out.kind === 'refused' && out.code === 'TF007') return { ok: true };
+    // Recusa sem SQLSTATE (HTML de portal, proxy): não prova nada; fica com o segredo e tenta de novo.
+    if (out.kind === 'refused' && !out.code) return { ok: false, transient: true, error: 'O servidor não confirmou a liberação da reserva. Tentando de novo.' };
     if (out.kind === 'refused') return { ok: false, transient: false, error: `O servidor não liberou a reserva: ${out.message}` };
+    // 2xx só prova a liberação desta reserva com status 'released' e a mesma chave. Outra resposta (vazia,
+    // HTML de portal, outra reserva, outro status) não prova nada: fica com o segredo e tenta de novo.
+    if (out.body?.status !== 'released' || out.body?.idempotency_key !== key) {
+      return { ok: false, transient: true, error: 'O servidor não confirmou a liberação da reserva. Tentando de novo.' };
+    }
     return { ok: true };
   } catch (e) {
     return { ok: false, transient: true, error: (e as Error).message };
@@ -287,7 +309,7 @@ export const RELEASE_BACKOFF_MS = [1_000, 3_000];
 
 /**
  * Nada foi cobrado (maquininha recusou, dinheiro não registrado): libera a reserva, com novas tentativas.
- * Se ainda falhar, guarda a liberação pendente neste aparelho (o laço de sincronização tenta de novo) e a
+ * A liberação pendente é gravada antes da primeira tentativa e sai quando o servidor confirma. Se ainda falhar, guarda a liberação pendente neste aparelho (o laço de sincronização tenta de novo) e a
  * reserva aparece na lista de reservas presas para o gerente. Sempre encerra o registro local da cobrança.
  */
 export async function releaseClaimAfterNoCharge(
@@ -299,6 +321,9 @@ export async function releaseClaimAfterNoCharge(
   opts: { unknownClaim?: boolean; nowMs?: number } = {},
 ): Promise<ReleaseResult> {
   const sleep = deps.sleep ?? deps.timer;
+  // A pendência (com o segredo) é gravada ANTES da primeira tentativa: se o app cair no meio das tentativas
+  // (até ~35 s), a liberação continua depois de reabrir, pelo laço de sincronização.
+  addPendingRelease({ key, order_id: orderId, reason, release_token: releaseToken ?? null, last_error: null, ...(opts.unknownClaim ? { unknown_claim: true } : {}) });
   let out = await releasePaymentClaim(key, reason, releaseToken, deps);
   for (let i = 0; !out.ok && out.transient && i < RELEASE_BACKOFF_MS.length; i += 1) {
     await sleep(RELEASE_BACKOFF_MS[i]!);
@@ -311,7 +336,7 @@ export async function releaseClaimAfterNoCharge(
   } else if (out.ok) removePendingRelease(key);
   // O segredo vai junto na pendência (a nova tentativa precisa dele); sem ele, ou com recusa definitiva do
   // servidor, a pendência para de tentar e mostra o caminho do gerente.
-  else addPendingRelease({ key, order_id: orderId, reason, release_token: releaseToken ?? null, last_error: out.error, final: !out.transient });
+  else addPendingRelease({ key, order_id: orderId, reason, release_token: releaseToken ?? null, last_error: out.error, final: !out.transient, ...(opts.unknownClaim ? { unknown_claim: true } : {}) });
   endLocalClaim(key);
   return out;
 }
@@ -386,8 +411,12 @@ export async function releasePaymentClaimManager(key: string, managerPin: string
       }
       return { ok: false, error: `O servidor não liberou a reserva: ${out.message}` };
     }
-    if (!out.body) return { ok: false, pin: true, error: 'PIN de gerente incorreto ou bloqueado. Nada foi liberado.' };
-    if (out.body.status !== 'released') return { ok: false, error: 'O servidor não confirmou a liberação.' };
+    // Só o JSON null literal é a resposta de PIN errado ou bloqueado; corpo vazio, HTML ou outro lixo é falha
+    // de comunicação (não convida a digitar o PIN de novo).
+    if (out.text.trim() === 'null') return { ok: false, pin: true, error: 'PIN de gerente incorreto ou bloqueado. Nada foi liberado.' };
+    if (!out.body || out.body.status !== 'released' || out.body.idempotency_key !== key) {
+      return { ok: false, error: 'O servidor não confirmou a liberação desta reserva. Nada foi tirado daqui; tente de novo.' };
+    }
     removePendingRelease(key);
     endLocalClaim(key);
     return { ok: true };
@@ -401,8 +430,11 @@ export const CLAIM_HEARTBEAT_MS = 20_000;
 
 export type TouchResult =
   | { ok: true; status: 'open' | 'released' | 'consumed'; activeUntil: string | null }
-  /** offline: sem resposta (vale tentar de novo). code: SQLSTATE da recusa (TF004 segredo errado, TF005 não existe). */
-  | { ok: false; offline?: true; code?: string; error: string };
+  /**
+   * offline: sem resposta (vale tentar de novo). code: SQLSTATE da recusa (TF004 segredo errado, TF005 não existe).
+   * unknown: resposta incompleta ou recusa sem código (não prova nada; quem chama trata como sem resposta).
+   */
+  | { ok: false; offline?: true; unknown?: true; code?: string; error: string };
 
 /**
  * Renova o prazo da reserva (a cobrança desta chave continua rodando aqui). Devolve 'released' quando o gerente
@@ -418,9 +450,16 @@ export async function touchPaymentClaim(key: string, releaseToken: string | null
     if (!session.done || !session.value) return { ok: false, offline: true, error: CLAIM_OFFLINE_ERROR };
     const out = await callRpc(session.value, 'tchefood_touch_payment_claim', { p_key: key, p_staff: staff, p_release_token: releaseToken }, deps);
     if (out.kind === 'offline') return { ok: false, offline: true, error: CLAIM_OFFLINE_ERROR };
-    if (out.kind === 'refused') return { ok: false, ...(out.code ? { code: out.code } : {}), error: `O servidor recusou a renovação da reserva: ${out.message}` };
+    if (out.kind === 'refused') {
+      if (!out.code) return { ok: false, unknown: true, error: `O servidor não confirmou a renovação da reserva: ${out.message}` };
+      return { ok: false, code: out.code, error: `O servidor recusou a renovação da reserva: ${out.message}` };
+    }
     const status = out.body?.status;
-    if (status !== 'open' && status !== 'released' && status !== 'consumed') return { ok: false, error: 'Resposta incompleta do servidor.' };
+    if (status !== 'open' && status !== 'released' && status !== 'consumed') return { ok: false, unknown: true, error: 'Resposta incompleta do servidor.' };
+    // Resposta de outra reserva (ou sem a chave) não renova esta: o banco devolve {idempotency_key, status, active_until}.
+    if (out.body?.idempotency_key !== key) {
+      return { ok: false, unknown: true, error: 'O servidor respondeu sobre outra reserva.' };
+    }
     return { ok: true, status, activeUntil: typeof out.body?.active_until === 'string' ? out.body.active_until : null };
   } catch (e) {
     return { ok: false, offline: true, error: (e as Error).message };
@@ -431,15 +470,20 @@ export type ClaimRefundedResult =
   | { ok: true; auditId: string }
   /**
    * offline: sem resposta (a trava fica; tente de novo). pin: PIN recusado ou bloqueado (resposta NULL).
-   * notReleased (TF007): a reserva ainda está aberta (ou já virou pagamento). notFound (TF005): não existe.
+   * notReleased (TF007 claim_open, ou TF007 sem DETAIL): a reserva ainda está aberta. consumed (TF007
+   * claim_consumed): a reserva já virou pagamento no servidor. notFound (TF005): não existe.
    */
-  | { ok: false; offline?: true; pin?: true; notReleased?: true; notFound?: true; error: string };
+  | { ok: false; offline?: true; pin?: true; notReleased?: true; consumed?: true; notFound?: true; error: string };
 
 export interface ClaimRefundedMetadata {
   refund_kind: 'card' | 'cash';
   /** Id local do pagamento retirado da conta (até 100 caracteres). */
   payment_local_id?: string;
 }
+
+/** TF007 claim_consumed no "Estornei / devolvi": o pagamento desta reserva já entrou no servidor. */
+export const CLAIM_CONSUMED_NO_REFUND =
+  'Esta reserva já virou pagamento no servidor (o pagamento entrou): não há estorno a confirmar aqui. Confira a conta com o gerente.';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -471,15 +515,17 @@ export async function authorizeClaimRefunded(
     }, deps);
     if (out.kind === 'offline') return { ok: false, offline: true, error: CLAIM_OFFLINE_ERROR };
     if (out.kind === 'refused') {
+      if (out.code === 'TF007' && out.details === 'claim_consumed') return { ok: false, consumed: true, error: CLAIM_CONSUMED_NO_REFUND };
       if (out.code === 'TF007') return { ok: false, notReleased: true, error: 'A reserva deste pagamento ainda está aberta no servidor: libere-a antes de confirmar o estorno.' };
       if (out.code === 'TF005') return { ok: false, notFound: true, error: 'A reserva deste pagamento não foi encontrada no servidor.' };
       return { ok: false, error: `O servidor não registrou o estorno: ${out.message}` };
     }
-    let id: unknown = null;
+    let id: unknown;
     try {
       id = JSON.parse(out.text);
     } catch {
-      id = null;
+      // Corpo vazio ou HTML: falha de comunicação, não PIN errado.
+      return { ok: false, error: 'O servidor não confirmou o registro do estorno. Tente de novo.' };
     }
     if (id === null) return { ok: false, pin: true, error: 'PIN de gerente incorreto ou bloqueado. Nada foi registrado.' };
     if (typeof id !== 'string' || !UUID_RE.test(id)) return { ok: false, error: 'O servidor não confirmou o registro do estorno. Tente de novo.' };

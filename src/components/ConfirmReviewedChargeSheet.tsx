@@ -54,7 +54,9 @@ async function openClaimKeysOf(orderId: string): Promise<Set<string> | null> {
     const cfg = await freshCloudConfig();
     if (!cfg) return null;
     const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
-    return new Set((r.claims ?? []).map((c) => c.idempotencyKey));
+    // Sem a lista de reservas na resposta: não é leitura (não prova que a reserva não está aberta).
+    if (!Array.isArray(r.claims)) return null;
+    return new Set(r.claims.map((c) => c.idempotencyKey));
   } catch {
     return null;
   }

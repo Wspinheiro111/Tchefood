@@ -20,10 +20,18 @@ function asText(value: unknown): string | null {
 }
 
 /** transaction_amount vem como número (ex.: 24.5). Só aceita valores com até 2 casas exatas. */
+// A doc do GET /v1/payments/{id} mostra transaction_amount como texto ("24.50"); a resposta real costuma vir como
+// número. Aceita os dois, mas o texto só no formato decimal estrito (até 2 casas, sem sinal, expoente ou espaço).
 export function amountToCents(value: unknown): number | null {
+  if (typeof value === 'string') {
+    if (!/^\d{1,9}(\.\d{1,2})?$/.test(value)) return null;
+    const [int, frac = ''] = value.split('.');
+    const cents = Number(int) * 100 + Number(frac.padEnd(2, '0'));
+    return cents > 0 && Number.isSafeInteger(cents) ? cents : null;
+  }
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
   const cents = Math.round(value * 100);
-  if (Math.abs(cents - value * 100) > 1e-6 || !Number.isSafeInteger(cents)) return null;
+  if (cents <= 0 || Math.abs(cents - value * 100) > 1e-6 || !Number.isSafeInteger(cents)) return null;
   return cents;
 }
 
