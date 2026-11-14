@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { suggestedDeviceEmail as uiSuggestedDeviceEmail } from '../../../admin/src/lib/format';
-import { handleDeviceAccount, randomPasswordFrom, suggestedDeviceEmail, type AuthUser, type DeviceAccountDeps, type RpcResult } from '../admin-device-account/handler.ts';
+import { deviceAccountEnv, handleDeviceAccount, MISSING_ENV_MESSAGE, randomPasswordFrom, suggestedDeviceEmail, type AuthUser, type DeviceAccountDeps, type RpcResult } from '../admin-device-account/handler.ts';
 
 const TENANT = '11111111-1111-4111-8111-111111111111';
 const USER = '33333333-3333-4333-8333-333333333333';
@@ -204,6 +204,77 @@ describe('admin-device-account', () => {
     const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'create', email: 'outro@loja.com' }, f.deps);
     expect(r).toMatchObject({ status: 200, body: { user_id: USER, email: EMAIL } });
     expect(f.calls.some((c) => c.includes('p_replace_user_id'))).toBe(false);
+    // O e-mail digitado é ignorado: a resposta traz o e-mail reservado, que é o que vale no Auth.
+    expect(r.body.email).toBe(EMAIL);
+    expect(r.body.email).not.toBe('outro@loja.com');
+    expect(f.users.get(USER)!.email).toBe(EMAIL);
+    expect(f.calls.some((c) => c.startsWith('createUser'))).toBe(false);
+  });
+
+  it('erro do Auth depois de escrever (troca ou criação): avisa que a senha pode ter mudado e qual botão gera outra', async () => {
+    // Troca de senha (loja pronta).
+    const reset = fake({ deviceStatus: 'READY' });
+    reset.users.set(USER, { id: USER, email: EMAIL, app_metadata: { tenant_id: TENANT } });
+    reset.deps.auth.updateUserById = async () => ({ error: { message: 'Gateway Timeout' } });
+    const rr = await handleDeviceAccount({ tenant_id: TENANT, action: 'reset_password' }, reset.deps);
+    expect(rr.status).toBe(502);
+    expect(rr.body.message).toMatch(/pode já ter mudado/);
+    expect(rr.body.message).toMatch(/"Trocar senha" para gerar uma senha nova/);
+    expect(rr.body.password).toBeUndefined();
+    expect(reset.db.opId).toBeNull();
+    // Retomada de criação pendente com a conta já no Auth.
+    const resume = fake({ deviceStatus: 'PENDING' });
+    resume.users.set(USER, { id: USER, email: EMAIL, app_metadata: { tenant_id: TENANT } });
+    resume.deps.auth.updateUserById = async () => ({ error: { message: 'Gateway Timeout' } });
+    const rc = await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, resume.deps);
+    expect(rc.status).toBe(502);
+    expect(rc.body.message).toMatch(/pode já ter mudado/);
+    expect(rc.body.message).toMatch(/"Criar conta do aparelho"/);
+    // Criação que falhou com erro genérico: a conta pode ter sido criada.
+    const created = await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, fake({ createError: 'upstream timeout' }).deps);
+    expect(created.status).toBe(502);
+    expect(created.body.message).toMatch(/pode ter sido criada/);
+    expect(created.body.message).toMatch(/"Criar conta do aparelho" para gerar uma senha nova/);
+    // Conta pronta apagada à mão: "Trocar senha" recria, e a falha manda usar "Trocar senha" de novo.
+    const gone = await handleDeviceAccount({ tenant_id: TENANT, action: 'reset_password' }, fake({ deviceStatus: 'READY', createError: 'upstream timeout' }).deps);
+    expect(gone.status).toBe(502);
+    expect(gone.body.message).toMatch(/"Trocar senha"/);
+  });
+
+  it('falha ao confirmar na retomada (conta já existia): não diz que a conta "foi criada"', async () => {
+    const f = fake({ deviceStatus: 'PENDING', confirmError: true });
+    f.users.set(USER, { id: USER, email: EMAIL, app_metadata: { tenant_id: TENANT } });
+    const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps);
+    expect(r.status).toBe(500);
+    expect(r.body.message).not.toMatch(/A conta foi criada/);
+    expect(r.body.message).toMatch(/já existia/);
+    expect(r.body.message).toMatch(/"Criar conta do aparelho"/);
+    expect(r.body.password).toBeUndefined();
+    // Conta criada agora: a mensagem continua dizendo que foi criada.
+    const novo = await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, fake({ confirmError: true }).deps);
+    expect(novo.body.message).toMatch(/A conta foi criada/);
+  });
+
+  it('loja pronta com a conta apagada à mão e o e-mail já usado por outra conta do Auth: 409 com o que fazer no Auth', async () => {
+    const f = fake({ deviceStatus: 'READY', createError: 'A user with this email address has already been registered' });
+    const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'reset_password' }, f.deps);
+    expect(r.status).toBe(409);
+    expect(r.body.message).toMatch(/Apague ou troque o e-mail dessa outra conta no Supabase Auth/);
+    expect(r.body.message).toContain(EMAIL);
+    expect(r.body.message).toMatch(/"Trocar senha"/);
+    expect(r.body.message).not.toMatch(/Digite outro e-mail|Criar conta do aparelho/);
+    expect(f.calls.some((c) => c.startsWith('updateUserById'))).toBe(false);
+    expect(f.db.opId).toBeNull();
+  });
+
+  it('variáveis de ambiente: sem alguma delas não há configuração (index.ts responde 500 com CORS)', () => {
+    const full: Record<string, string> = { SUPABASE_URL: 'https://x.supabase.co', SUPABASE_ANON_KEY: 'anon', SUPABASE_SERVICE_ROLE_KEY: 'service' };
+    expect(deviceAccountEnv((n) => full[n])).toEqual({ url: 'https://x.supabase.co', anonKey: 'anon', serviceRoleKey: 'service' });
+    for (const name of Object.keys(full)) {
+      expect(deviceAccountEnv((n) => (n === name ? undefined : full[n]))).toBeNull();
+      expect(deviceAccountEnv((n) => (n === name ? '' : full[n]))).toBeNull();
+    }
+    expect(MISSING_ENV_MESSAGE).toBe('Função sem configuração no Supabase (variáveis de ambiente).');
   });
 
   it('duas trocas de senha ao mesmo tempo: uma só responde com senha, e é a que vale no Auth', async () => {

@@ -234,9 +234,36 @@ export function daysBetween(a: string, b: string): number {
   return Math.round((pb - pa) / 86_400_000);
 }
 
+/** Soma dias a uma data "AAAA-MM-DD" (data pura, sem fuso). */
+export function addDays(iso: string, days: number): string {
+  const d = new Date(Date.UTC(Number(iso.slice(0, 4)), Number(iso.slice(5, 7)) - 1, Number(iso.slice(8, 10)) + days));
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Tamanho de um texto como o banco mede: length() do Postgres depois de aparar as pontas, que
+ * conta caracteres (pontos de código), não as unidades UTF-16 do .length (um emoji conta 1).
+ */
+export function textLength(s: string): number {
+  return [...s.trim()].length;
+}
+
+/** "Rótulo: de min a max caracteres." quando o texto aparado sai dos limites; null quando serve. */
+export function lengthError(rotulo: string, s: string, min: number, max: number): string | null {
+  const n = textLength(s);
+  return n < min || n > max ? `${rotulo}: de ${min} a ${max} caracteres.` : null;
+}
+
 /** Nome do contato: de 2 a 100 caracteres depois de aparar as pontas (igual ao banco). */
 export const CONTACT_NAME_MAX = 100;
 export function contactNameError(nome: string): string | null {
-  const n = nome.trim().length;
-  return n < 2 || n > CONTACT_NAME_MAX ? `Contato: de 2 a ${CONTACT_NAME_MAX} caracteres.` : null;
+  return lengthError('Contato', nome, 2, CONTACT_NAME_MAX);
 }
+
+/** Nome da loja (2 a 150) e razão social (2 a 200), como o banco confere. */
+export function storeNamesError(nome: string, razao: string): string | null {
+  return lengthError('Nome da loja', nome, 2, 150) ?? lengthError('Razão social', razao, 2, 200);
+}
+
+/** Teto da mensalidade e do valor de uma cobrança no banco (R$ 100.000,00), em centavos. */
+export const MAX_AMOUNT_CENTS = 10_000_000;

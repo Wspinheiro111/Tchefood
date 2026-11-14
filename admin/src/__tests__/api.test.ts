@@ -21,7 +21,7 @@ describe('cliente do painel', () => {
   it('login por senha guarda o vencimento do token; erro 400 vira mensagem de senha', async () => {
     const ok = fakeFetch([{ status: 200, body: { access_token: 'a', refresh_token: 'r', expires_in: 3600 } }]);
     const s = await signIn(CFG, ' Will@X.com ', 'pw', ok.fetch, 1000);
-    expect(s).toEqual({ accessToken: 'a', refreshToken: 'r', expiresAt: 1000 + 3_600_000, email: 'will@x.com' });
+    expect(s).toEqual({ accessToken: 'a', refreshToken: 'r', expiresAt: 1000 + 3_600_000, email: 'will@x.com', url: 'https://x.supabase.co' });
     expect(ok.calls[0]!.url).toBe('https://x.supabase.co/auth/v1/token?grant_type=password');
     expect(ok.calls[0]!.headers.apikey).toBe('anon-key');
     expect(ok.calls[0]!.body).toEqual({ email: 'Will@X.com', password: 'pw' });

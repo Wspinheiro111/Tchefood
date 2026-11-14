@@ -2,12 +2,14 @@ import { useState } from 'react';
 import { MessageCircle } from 'lucide-react';
 import type { AdminClient, DueCharge } from '../lib/api';
 import { chargeMessage, dateBr, formatPhone, money, monthBr, monthStart, whatsappLink } from '../lib/format';
-import { Aviso, Erro, Selo, errorText, useLoad } from './ui';
+import { Aviso, Erro, Selo, errorText, useLoad, useOnVisible } from './ui';
 
 // As listas usam a data do servidor (atraso e janela de 3 dias): today nas dependências faz
 // a tela reler quando o dia muda com o painel aberto.
 export default function Charges({ client, today, onOpenStore }: { client: AdminClient; today: string; onOpenStore: (id: string) => void }) {
   const { data, error, reload } = useLoad<DueCharge[]>(() => client.chargesDue(3), [client, today]);
+  // Aba que volta a ficar visível relê a lista (pagamento registrado em outra aba, por exemplo).
+  useOnVisible(reload);
   const [gerando, setGerando] = useState(false);
   const [aviso, setAviso] = useState<string | null>(null);
   const [erro, setErro] = useState<string | null>(null);
@@ -17,13 +19,23 @@ export default function Charges({ client, today, onOpenStore }: { client: AdminC
   async function gerar(ref: string) {
     setErro(null);
     setAviso(null);
-    // O lote do banco cobra as lojas ativas com mensalidade e as em teste cujo teste terminou
-    // antes do primeiro dia do mês da cobrança.
-    if (!window.confirm(`Gerar a cobrança de ${monthBr(ref)} para as lojas ativas com mensalidade e as em teste que terminaram antes de ${monthBr(ref)}, que ainda não têm?`)) return;
+    // O lote do banco (tchefood_admin_generate_month): lojas ativas ou em teste com mensalidade,
+    // em qualquer situação pula o mês ainda dentro do teste e o mês de antes de a loja entrar, e
+    // gera de novo a cobrança cancelada junto com uma assinatura que voltou.
+    if (
+      !window.confirm(
+        `Gerar a cobrança de ${monthBr(ref)} para as lojas ativas ou em teste com mensalidade que ainda não têm? Ficam de fora as lojas com ${monthBr(ref)} ainda dentro do teste e as que entraram depois desse mês. Cobrança cancelada junto com uma assinatura que voltou é gerada de novo.`,
+      )
+    )
+      return;
     setGerando(true);
     try {
       const n = await client.generateMonth(ref);
-      setAviso(n === 0 ? `Nenhuma cobrança nova: as lojas ativas com mensalidade e as em teste que terminaram antes de ${monthBr(ref)} já têm a de ${monthBr(ref)}.` : `${n} cobrança(s) de ${monthBr(ref)} criada(s).`);
+      setAviso(
+        n === 0
+          ? `Nenhuma cobrança nova: as lojas que entram no lote já têm a de ${monthBr(ref)} (lojas com o mês ainda dentro do teste ou que entraram depois dele ficam de fora).`
+          : `${n} cobrança(s) de ${monthBr(ref)} criada(s). Lojas com o mês ainda dentro do teste ou que entraram depois dele ficaram de fora.`,
+      );
       reload();
     } catch (e) {
       setErro(errorText(e));

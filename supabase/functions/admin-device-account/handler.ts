@@ -52,6 +52,26 @@ export interface HandlerResult {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL = /^[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
 
+export interface DeviceAccountEnv {
+  url: string;
+  anonKey: string;
+  serviceRoleKey: string;
+}
+
+/**
+ * Lê as variáveis da função. Sem alguma delas devolve null: index.ts responde 500 com CORS em vez de
+ * quebrar antes do handler (o Deno responderia 500 sem CORS e o navegador veria só "erro de rede").
+ */
+export function deviceAccountEnv(get: (name: string) => string | undefined): DeviceAccountEnv | null {
+  const url = get('SUPABASE_URL');
+  const anonKey = get('SUPABASE_ANON_KEY');
+  const serviceRoleKey = get('SUPABASE_SERVICE_ROLE_KEY');
+  if (!url || !anonKey || !serviceRoleKey) return null;
+  return { url, anonKey, serviceRoleKey };
+}
+
+export const MISSING_ENV_MESSAGE = 'Função sem configuração no Supabase (variáveis de ambiente).';
+
 function fail(status: number, message: string): HandlerResult {
   return { status, body: { message } };
 }
@@ -174,14 +194,24 @@ async function withLock(
     if (existing.failed) return fail(502, 'Não foi possível consultar a conta no Supabase Auth. Tente de novo.');
   }
   const userId = r.user_id;
+  // Reserva pendente cuja conta já existe no Auth: o e-mail digitado é ignorado (a conta mantém o
+  // e-mail reservado) e a resposta traz em "email" o e-mail que vale de fato.
   const accountEmail = r.email;
   const password = deps.randomPassword();
   const appMetadata = { tenant_id: tenantId };
+  // Botão do painel para tentar de novo: loja pronta só mostra "Trocar senha"; pendente, "Criar conta do aparelho".
+  const retry = action === 'reset_password' ? '"Trocar senha"' : '"Criar conta do aparelho"';
+  // A escrita no Auth pode ter passado mesmo com erro (ex.: tempo esgotado na volta): a senha antiga
+  // pode já não valer e a nova se perdeu, então a mensagem manda gerar outra.
+  const updateFailed = () => fail(502, `Não foi possível confirmar a troca de senha no Supabase Auth; a senha pode já ter mudado. Toque de novo em ${retry} para gerar uma senha nova.`);
+  // A conta já existia no Auth (retomada): na falha ao confirmar, não dizer que ela "foi criada".
+  let accountExisted = false;
 
   if (existing.user) {
     if (!sameAccount(existing.user, tenantId, accountEmail)) return fail(409, 'A conta reservada não confere com esta loja. Nada foi alterado.');
+    accountExisted = true;
     const upd = await deps.auth.updateUserById(userId, { password, app_metadata: appMetadata });
-    if (upd.error) return fail(502, 'Não foi possível trocar a senha no Supabase Auth. Tente de novo.');
+    if (upd.error) return updateFailed();
   } else {
     // Conta pronta que sumiu do Auth (apagada à mão): "Trocar senha" recria com o mesmo id e
     // e-mail reservados pelo banco, para a loja não ficar sem saída pelo painel.
@@ -191,15 +221,19 @@ async function withLock(
         // A conta com este id pode ter sido criada por uma tentativa anterior que caiu: confere.
         const again = await lookup(userId);
         if (again.user && sameAccount(again.user, tenantId, accountEmail)) {
+          accountExisted = true;
           const upd = await deps.auth.updateUserById(userId, { password, app_metadata: appMetadata });
-          if (upd.error) return fail(502, 'Não foi possível trocar a senha no Supabase Auth. Tente de novo.');
+          if (upd.error) return updateFailed();
+        } else if (action === 'reset_password') {
+          // Loja pronta: o painel não deixa trocar o e-mail, então o caminho é liberar o e-mail no Auth.
+          return fail(409, `Já existe outra conta com o e-mail ${accountEmail} no Supabase Auth (a conta do aparelho foi apagada de lá). Apague ou troque o e-mail dessa outra conta no Supabase Auth e toque de novo em "Trocar senha".`);
         } else {
           return fail(409, 'Já existe outra conta com este e-mail no Supabase Auth. Digite outro e-mail e toque em "Criar conta do aparelho" de novo.');
         }
       } else if (/invalid|format/i.test(created.error.message)) {
         return fail(400, 'O Supabase Auth recusou este e-mail. Digite outro.');
       } else {
-        return fail(502, 'Não foi possível criar a conta no Supabase Auth. Tente de novo.');
+        return fail(502, `Não foi possível confirmar a criação da conta no Supabase Auth; ela pode ter sido criada mesmo assim. Toque de novo em ${retry} para gerar uma senha nova.`);
       }
     }
   }
@@ -215,7 +249,9 @@ async function withLock(
   if (confirm.error) {
     return fail(500, action === 'reset_password'
       ? 'A senha foi trocada no Supabase Auth, mas o painel não registrou. Toque de novo em "Trocar senha" (gera outra senha) antes de configurar o aparelho.'
-      : 'A conta foi criada, mas o painel não registrou. Toque de novo em "Criar conta" para concluir (gera uma senha nova).');
+      : accountExisted
+        ? 'A senha da conta (que já existia no Supabase Auth) foi trocada, mas o painel não registrou. Toque de novo em "Criar conta do aparelho" para concluir (gera uma senha nova).'
+        : 'A conta foi criada, mas o painel não registrou. Toque de novo em "Criar conta do aparelho" para concluir (gera uma senha nova).');
   }
   return { status: 200, body: { user_id: userId, email: accountEmail, password } };
 }

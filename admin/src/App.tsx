@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { LogOut } from 'lucide-react';
 import iconUrl from './assets/icon.png';
 import type { AdminClient, AdminConfig, Me, Session } from './lib/api';
-import { loadConfig, loadSession, saveSession, sessionClient, type SessionClient } from './lib/session';
+import { loadConfig, loadSession, saveSession, sessionClient, sessionMatches, type SessionClient } from './lib/session';
 import Login from './components/Login';
 import Overview from './components/Overview';
 import Stores from './components/Stores';
@@ -14,9 +14,10 @@ type Aba = 'visao' | 'lojas' | 'cobrancas';
 
 export default function App() {
   const [cfg, setCfg] = useState<AdminConfig>(loadConfig);
-  const [session, setSession] = useState<Session | null>(loadSession);
+  // Sessão guardada de outro projeto (endereço do Supabase mudou) não é usada.
+  const [session, setSession] = useState<Session | null>(() => loadSession(cfg));
 
-  const client = useMemo(() => (session ? sessionClient(cfg, session, () => setSession(null)) : null), [cfg, session]);
+  const client = useMemo(() => (session && sessionMatches(session, cfg) ? sessionClient(cfg, session, () => setSession(null)) : null), [cfg, session]);
   // Cliente trocado: o anterior é descartado (a renovação que ainda estiver no ar não grava a
   // sessão). Descarta só na troca, não na limpeza do efeito: o StrictMode do React refaz o
   // efeito com o mesmo cliente, que tem de continuar valendo.
@@ -117,7 +118,7 @@ function Painel({ client, email, onLogout }: { client: AdminClient; email: strin
       </header>
       <main className="mx-auto max-w-6xl space-y-4 px-4 py-6">
         {me.error && !me.data ? (
-          <Erro>{me.error} Esta conta não é da equipe do Tchê Food (ou o painel ainda não foi instalado no banco).</Erro>
+          <ErroEntrada texto={me.error} status={me.errorStatus} onRetry={me.reload} />
         ) : !me.data ? (
           <p className="text-sm text-slate-500">Carregando…</p>
         ) : aba === 'visao' ? (
@@ -130,6 +131,27 @@ function Painel({ client, email, onLogout }: { client: AdminClient; email: strin
           <Stores client={client} today={me.data.today} onOpenStore={setLoja} />
         )}
       </main>
+    </div>
+  );
+}
+
+/**
+ * Falha ao ler quem entrou. 403 = o banco recusou a conta; 404 = a função do painel não existe
+ * no projeto (PostgREST PGRST202). Sem conexão ou servidor fora do ar não diz nada da conta:
+ * avisa e oferece tentar de novo.
+ */
+function ErroEntrada({ texto, status, onRetry }: { texto: string; status: number | null; onRetry: () => void }) {
+  if (status === 403) return <Erro>{texto} Esta conta não é da equipe do Tchê Food (ou o painel ainda não foi instalado no banco).</Erro>;
+  if (status === 404) return <Erro>{texto} O painel ainda não foi instalado no banco deste projeto (a função tchefood_admin_me não existe).</Erro>;
+  const conexao = status === 0 || (status !== null && status >= 500);
+  return (
+    <div className="space-y-2">
+      <Erro>
+        {conexao
+          ? `Não foi possível falar com o servidor agora (sem conexão ou servidor fora do ar). Confira a internet e tente de novo.${status ? ` Detalhe: ${texto}` : ''}`
+          : texto}
+      </Erro>
+      <button type="button" className="btn-secundario" onClick={onRetry}>Tentar de novo</button>
     </div>
   );
 }

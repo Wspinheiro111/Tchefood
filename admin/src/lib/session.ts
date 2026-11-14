@@ -1,4 +1,4 @@
-import { AdminApiError, createAdminClient, refreshSession, signOut, type AdminClient, type AdminConfig, type FetchLike, type Session } from './api';
+import { AdminApiError, createAdminClient, normalizeUrl, refreshSession, signOut, type AdminClient, type AdminConfig, type FetchLike, type Session } from './api';
 
 /** Endereço e chave pública do Supabase: do build ou digitados na tela de entrada. */
 const CONFIG_KEY = 'tchefood-admin-config';
@@ -47,8 +47,22 @@ export function saveConfig(cfg: AdminConfig): void {
   write(() => localStorage, CONFIG_KEY, cfg);
 }
 
-export function loadSession(): Session | null {
-  return read<Session>(() => sessionStorage, SESSION_KEY);
+/** A sessão vale só para o projeto que a emitiu. */
+export function sessionMatches(s: Session, cfg: AdminConfig): boolean {
+  return typeof s.url === 'string' && s.url !== '' && s.url === normalizeUrl(cfg.url);
+}
+
+/**
+ * Sessão guardada nesta aba, se for do projeto configurado agora. De outro projeto (endereço
+ * trocado no build ou na tela de entrada) ou sem o endereço (sessão antiga): apaga e pede login,
+ * para os tokens de um projeto nunca irem para o servidor de outro.
+ */
+export function loadSession(cfg: AdminConfig): Session | null {
+  const s = read<Session>(() => sessionStorage, SESSION_KEY);
+  if (!s) return null;
+  if (sessionMatches(s, cfg)) return s;
+  saveSession(null);
+  return null;
 }
 
 export function saveSession(s: Session | null): void {
@@ -83,6 +97,11 @@ export function sessionClient(cfg: AdminConfig, initial: Session, onExpired: () 
   };
   const getToken = async () => {
     if (disposed) throw closed();
+    // Sessão de outro projeto: não manda o token para este servidor.
+    if (!sessionMatches(session, cfg)) {
+      expire();
+      throw closed();
+    }
     if (session.expiresAt - Date.now() > 60_000) return session.accessToken;
     pending ??= refreshSession(cfg, session, fetchFn)
       .then((s) => {
@@ -109,7 +128,7 @@ export function sessionClient(cfg: AdminConfig, initial: Session, onExpired: () 
     logout: async () => {
       disposed = true;
       saveSession(null);
-      await signOut(cfg, session.accessToken, fetchFn);
+      if (sessionMatches(session, cfg)) await signOut(cfg, session.accessToken, fetchFn);
     },
   };
   // 401 em qualquer chamada: sessão encerrada no servidor.

@@ -21,6 +21,8 @@ export interface Session {
   /** Quando o token vence (ms desde 1970). */
   expiresAt: number;
   email: string;
+  /** Endereço do projeto Supabase que emitiu os tokens (normalizado). A sessão só vale para ele. */
+  url: string;
 }
 
 export class AdminApiError extends Error {
@@ -62,11 +64,11 @@ function errorMessage(body: unknown, fallback: string): string {
   return fallback;
 }
 
-function sessionFrom(body: unknown, email: string, now: number): Session {
+function sessionFrom(body: unknown, email: string, url: string, now: number): Session {
   const b = (body ?? {}) as Record<string, unknown>;
   if (typeof b.access_token !== 'string' || typeof b.refresh_token !== 'string') throw new AdminApiError('Resposta de login inválida.', 500);
   const expiresIn = typeof b.expires_in === 'number' ? b.expires_in : 3600;
-  return { accessToken: b.access_token, refreshToken: b.refresh_token, expiresAt: now + expiresIn * 1000, email };
+  return { accessToken: b.access_token, refreshToken: b.refresh_token, expiresAt: now + expiresIn * 1000, email, url: normalizeUrl(url) };
 }
 
 export async function signIn(cfg: AdminConfig, email: string, password: string, fetchFn: FetchLike, now = Date.now()): Promise<Session> {
@@ -84,7 +86,7 @@ export async function signIn(cfg: AdminConfig, email: string, password: string, 
     throw new AdminApiError('Sem conexão com o servidor. Confira a internet e o endereço do Supabase e tente de novo.', 0);
   }
   if (!res.ok) throw new AdminApiError(res.status === 400 ? 'E-mail ou senha incorretos.' : errorMessage(body, 'Não foi possível entrar.'), res.status);
-  return sessionFrom(body, email.trim().toLowerCase(), now);
+  return sessionFrom(body, email.trim().toLowerCase(), cfg.url, now);
 }
 
 /**
@@ -108,7 +110,7 @@ export async function refreshSession(cfg: AdminConfig, session: Session, fetchFn
   if (res.status === 400 || res.status === 401) throw new AdminApiError('Sessão expirada. Entre de novo.', 401);
   if (!res.ok) throw new AdminApiError('O servidor não renovou a sessão agora. Tente de novo em instantes.', 503);
   try {
-    return sessionFrom(body, session.email, now);
+    return sessionFrom(body, session.email, session.url, now);
   } catch {
     throw new AdminApiError('Resposta inválida ao renovar a sessão. Tente de novo.', 503);
   }

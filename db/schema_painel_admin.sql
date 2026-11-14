@@ -621,6 +621,8 @@ BEGIN
             -- Fora do teste, a data só pode ser mantida ou antecipada (não estica o teste de quem já paga).
             trial_ends_on = CASE WHEN p_status = 'TRIAL' THEN p_trial_ends_on
                                  WHEN v_old.trial_ends_on IS NULL THEN NULL
+                                 -- Tirada do teste à mão: o teste acaba hoje (o lote cobra a partir do mês que vem).
+                                 WHEN v_old.status = 'TRIAL' THEN LEAST(COALESCE(p_trial_ends_on, v_old.trial_ends_on), v_old.trial_ends_on, tchefood_admin_today())
                                  ELSE LEAST(COALESCE(p_trial_ends_on, v_old.trial_ends_on), v_old.trial_ends_on) END,
             contact_name = tchefood_admin_trim(COALESCE(p_contact_name, '')), contact_phone = tchefood_admin_clean_phone(p_contact_phone),
             contact_email = tchefood_admin_check_email(p_contact_email), notes = NULLIF(tchefood_admin_trim(p_notes), ''), updated_at = NOW()
@@ -777,8 +779,9 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: esta cobrança já foi paga com outros dados';
     END IF;
     IF v_c.status <> 'OPEN' THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: cobrança cancelada não recebe pagamento'; END IF;
-    IF p_paid_on < (v_c.reference_month - INTERVAL '31 days')::date THEN
-        RAISE EXCEPTION 'TCHEFOOD_ADMIN: data do pagamento muito antes do mês da cobrança';
+    -- Até 3 meses antes do mês (pagamento adiantado de mais de um mês de uma vez).
+    IF p_paid_on < (v_c.reference_month - INTERVAL '3 months')::date THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: data do pagamento muito antes do mês da cobrança (até 3 meses antes)';
     END IF;
     IF p_paid_amount IS NULL OR p_paid_amount <> v_c.amount THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: valor pago (%) diferente do valor da cobrança (%)', p_paid_amount, v_c.amount;

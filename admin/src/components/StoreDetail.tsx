@@ -2,14 +2,17 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { ArrowLeft, Copy, KeyRound, MessageCircle } from 'lucide-react';
 import { AdminApiError, type AdminClient, type Charge, type DeviceAccountResult, type PaymentMethod, type Plan, type StoreDetail as Detail, type SubscriptionStatus } from '../lib/api';
 import {
-  CONTACT_NAME_MAX, METHOD_LABEL, STATUS_LABEL, chargeMessage, contactNameError, dateBr, dateTimeBr, daysBetween, formatCnpj, formatPhone, money, monthBr, monthStart,
-  moneyInputError, parseMoneyInput, priceInput, suggestedDeviceEmail, toCents, validMonthInput, validPhone, whatsappLink,
+  MAX_AMOUNT_CENTS, METHOD_LABEL, STATUS_LABEL, addDays, chargeMessage, contactNameError, dateBr, dateTimeBr, daysBetween, formatCnpj, formatPhone, money, monthBr,
+  monthStart, moneyInputError, parseMoneyInput, priceInput, suggestedDeviceEmail, textLength, toCents, validMonthInput, validPhone, whatsappLink,
 } from '../lib/format';
-import { Aviso, Campo, Erro, Numero, Selo, errorText, useLoad } from './ui';
+import { Aviso, Campo, Erro, Numero, Selo, errorText, useLoad, useOnVisible } from './ui';
 
 export default function StoreDetail({ client, tenantId, today, onBack }: { client: AdminClient; tenantId: string; today: string; onBack: () => void }) {
   const { data, error, reload } = useLoad<Detail>(() => client.store(tenantId), [client, tenantId, today]);
   const plans = useLoad<Plan[]>(() => client.plans(), [client]);
+  // Aba que volta a ficar visível relê a loja: o que outra aba ou outra pessoa mudou aparece
+  // (formulários abertos não são apagados; cada um trata a loja relida).
+  useOnVisible(reload);
 
   return (
     <div className="space-y-4">
@@ -77,6 +80,7 @@ const ACTION_LABEL: Record<string, string> = {
 
 // Mesmos limites do banco (db/schema_painel_admin.sql), medidos depois de aparar as pontas.
 const MOTIVO_MIN = 5;
+const TRIAL_MAX_DAYS = 90;
 function paymentLinkError(link: string): string | null {
   const l = link.trim();
   if (!l) return null;
@@ -123,6 +127,29 @@ function SubscriptionForm({ client, detail, plans, today, onChanged }: { client:
     setErro(null);
   };
   const set = (k: keyof typeof f) => (e: { target: { value: string } }) => setF({ ...f, [k]: e.target.value });
+  // O fim do teste só é editável com a situação "Em teste". Nas outras o banco só mantém ou
+  // antecipa a data guardada (assinatura nova fora do teste fica sem data): vai a data guardada.
+  const emTeste = f.status === 'TRIAL';
+  // Saindo do teste à mão, o teste termina hoje (o banco grava o menor entre a data guardada e
+  // hoje): o lote cobra a partir do mês seguinte ao fim.
+  const saindoDoTeste = s?.status === 'TRIAL' && !emTeste;
+  const guardado = s?.trial_ends_on ?? null;
+  const fimGuardado = saindoDoTeste && guardado && guardado > today ? today : guardado;
+  // Cobranças já criadas não mudam com a assinatura: avisa antes de salvar.
+  const abertas = detail.charges.filter((c) => c.status === 'OPEN');
+  const precoNovo = parseMoneyInput(f.price);
+  const mudouValor = !!s && precoNovo !== null && toCents(precoNovo) !== toCents(s.monthly_price);
+  const mudouDia = !!s && Number(f.billingDay) !== s.billing_day;
+  const abertasDoMes = abertas.filter((c) => c.reference_month >= monthStart(today));
+  const avisoCobrancas =
+    (mudouValor || mudouDia) && abertasDoMes.length > 0
+      ? `${abertasDoMes.length === 1 ? 'A cobrança em aberto' : 'As cobranças em aberto'} de ${abertasDoMes.map((c) => monthBr(c.reference_month)).join(', ')} ${abertasDoMes.length === 1 ? 'continua' : 'continuam'} com ${mudouValor && mudouDia ? 'o valor e o vencimento' : mudouValor ? 'o valor' : 'o vencimento'} de antes. Para mudar, cancele e crie de novo.`
+      : null;
+  const abertasNoTeste = emTeste && s?.status !== 'TRIAL' && f.trialEndsOn ? abertas.filter((c) => c.reference_month <= f.trialEndsOn) : [];
+  const avisoTeste =
+    abertasNoTeste.length > 0
+      ? `${abertasNoTeste.length === 1 ? 'A cobrança em aberto' : 'As cobranças em aberto'} de ${abertasNoTeste.map((c) => monthBr(c.reference_month)).join(', ')} ${abertasNoTeste.length === 1 ? 'fica' : 'ficam'} em aberto: voltar ao teste não cancela cobrança já criada. Se for cortesia, cancele.`
+      : null;
   // Trocar o plano põe o preço do plano novo na mensalidade (dá para editar depois).
   const setPlano = (e: { target: { value: string } }) => {
     const p = plans.find((x) => x.id === e.target.value);
@@ -134,16 +161,21 @@ function SubscriptionForm({ client, detail, plans, today, onChanged }: { client:
     setErro(null);
     const price = parseMoneyInput(f.price || (plans.find((p) => p.id === f.planId)?.monthly_price.toFixed(2) ?? ''));
     if (price === null) return setErro(moneyInputError(f.price, 'Mensalidade inválida (ex.: 199,90).'));
+    if (toCents(price) > MAX_AMOUNT_CENTS) return setErro('Mensalidade até R$ 100.000,00.');
     if (!validPhone(f.contactPhone)) return setErro('WhatsApp inválido: use DDD + número, com 10 ou 11 dígitos (ex.: (55) 99653-8255), com ou sem o 55 na frente.');
     const contato = contactNameError(f.contactName);
     if (contato) return setErro(contato);
-    if (f.reason.trim().length < MOTIVO_MIN) return setErro(`Informe o motivo da alteração (pelo menos ${MOTIVO_MIN} letras).`);
+    if (emTeste) {
+      if (!f.trialEndsOn) return setErro('Loja em teste precisa da data de fim do teste.');
+      if (daysBetween(today, f.trialEndsOn) > TRIAL_MAX_DAYS) return setErro(`Fim do teste em até ${TRIAL_MAX_DAYS} dias a partir de hoje (até ${dateBr(addDays(today, TRIAL_MAX_DAYS))}).`);
+    }
+    if (textLength(f.reason) < MOTIVO_MIN) return setErro(`Informe o motivo da alteração (pelo menos ${MOTIVO_MIN} letras).`);
     // Cancelar a assinatura também cancela, no banco, as cobranças em aberto dos meses seguintes.
     if (f.status === 'CANCELLED' && s?.status !== 'CANCELLED' && !window.confirm(`Cancelar a assinatura? As cobranças em aberto de meses depois de ${monthBr(monthStart(today))} também vão ser canceladas; as de ${monthBr(monthStart(today))} e de antes continuam em aberto.`)) return;
     setEnviando(true);
     try {
       await client.saveSubscription(detail.tenant_id, {
-        planId: f.planId, monthlyPrice: price, status: f.status, billingDay: Number(f.billingDay), trialEndsOn: f.trialEndsOn || null,
+        planId: f.planId, monthlyPrice: price, status: f.status, billingDay: Number(f.billingDay), trialEndsOn: emTeste ? f.trialEndsOn : fimGuardado,
         contactName: f.contactName, contactPhone: f.contactPhone, contactEmail: f.contactEmail, notes: f.notes, reason: f.reason,
         expectedUpdatedAt: base,
       });
@@ -223,13 +255,31 @@ function SubscriptionForm({ client, detail, plans, today, onChanged }: { client:
           </select>
         </Campo>
         <Campo rotulo="Dia de vencimento (1 a 28)"><input className="campo" type="number" min={1} max={28} value={f.billingDay} onChange={set('billingDay')} /></Campo>
-        <Campo rotulo="Fim do teste"><input className="campo" type="date" value={f.trialEndsOn} onChange={set('trialEndsOn')} /></Campo>
-        <Campo rotulo="Contato"><input className="campo" aria-label="Contato" minLength={2} maxLength={CONTACT_NAME_MAX} value={f.contactName} onChange={set('contactName')} /></Campo>
+        {emTeste ? (
+          <Campo rotulo="Fim do teste" dica={`Até ${TRIAL_MAX_DAYS} dias a partir de hoje.`}>
+            <input className="campo" aria-label="Fim do teste" type="date" max={addDays(today, TRIAL_MAX_DAYS)} value={f.trialEndsOn} onChange={set('trialEndsOn')} required />
+          </Campo>
+        ) : (
+          fimGuardado && (
+            <div className="text-sm" data-testid="fim-teste-leitura">
+              <span className="rotulo">Fim do teste</span>
+              <p>{dateBr(fimGuardado)}</p>
+              <p className="mt-1 text-xs text-slate-500">
+                {saindoDoTeste
+                  ? `Saindo do teste, ele termina em ${dateBr(fimGuardado)}${fimGuardado === today ? ' (hoje)' : ''}: o lote cobra a partir de ${monthBr(monthStart(fimGuardado, 1))}.`
+                  : 'Os meses até essa data não entram no lote de cobranças.'}
+              </p>
+            </div>
+          )
+        )}
+        <Campo rotulo="Contato"><input className="campo" aria-label="Contato" minLength={2} value={f.contactName} onChange={set('contactName')} /></Campo>
         <Campo rotulo="WhatsApp (com DDD)"><input className="campo" aria-label="WhatsApp" inputMode="tel" value={f.contactPhone} onChange={set('contactPhone')} /></Campo>
         <Campo rotulo="E-mail"><input className="campo" value={f.contactEmail} onChange={set('contactEmail')} /></Campo>
         <Campo rotulo="Observações"><input className="campo" value={f.notes} onChange={set('notes')} /></Campo>
       </div>
       <Campo rotulo="Motivo da alteração (obrigatório)"><input className="campo" aria-label="Motivo" minLength={MOTIVO_MIN} value={f.reason} onChange={set('reason')} placeholder="ex.: cliente pediu para trocar o vencimento" /></Campo>
+      {avisoCobrancas && <Aviso>{avisoCobrancas}</Aviso>}
+      {avisoTeste && <Aviso>{avisoTeste}</Aviso>}
       <Erro>{erro}</Erro>
       <div className="flex gap-2">
         <button type="submit" className="btn-primario" disabled={enviando}>{enviando ? 'Salvando…' : 'Salvar'}</button>
@@ -247,6 +297,19 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
   const [enviando, setEnviando] = useState(false);
   const [copia, setCopia] = useState<'ok' | 'erro' | null>(null);
   const pronta = s.device_status === 'READY';
+  // Senha na tela e a loja relida (outra aba, aba que voltou a ficar visível) mostra no histórico
+  // outra senha gerada depois desta (troca feita em outra aba ou por outra pessoa): a da tela não
+  // vale mais e sai. "marca" = a entrada mais nova de senha gerada antes desta; a desta é uma só.
+  const [marca, setMarca] = useState<number | null>(null);
+  const [aviso, setAviso] = useState<string | null>(null);
+  useEffect(() => {
+    if (!res) return;
+    if (passwordEntriesAfter(detail, marca) > 1) {
+      setRes(null);
+      setCopia(null);
+      setAviso('Outra senha foi gerada para o aparelho depois desta (em outra aba ou por outra pessoa): a senha que estava aqui não vale mais.');
+    }
+  }, [detail]);
 
   async function copiar(senha: string) {
     setCopia(null);
@@ -266,19 +329,16 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
     setRes(null);
     setCopia(null);
     setErro(null);
+    setAviso(null);
+    const antes = newestPasswordEntry(detail);
     setEnviando(true);
     try {
       const r = await client.deviceAccount(detail.tenant_id, action, action === 'create' ? email : undefined);
+      setMarca(antes);
       setRes({ ...r, action });
       onChanged();
     } catch (e) {
-      // Sem conexão: a ação pode ter chegado ao servidor e só a resposta (com a senha, que não
-      // fica guardada em lugar nenhum) se perdeu.
-      setErro(
-        e instanceof AdminApiError && e.status === 0
-          ? `Sem conexão com o servidor. Se ${action === 'create' ? 'a conta foi criada' : 'a senha foi trocada'}, a senha nova se perdeu (ela só aparece uma vez): use "Trocar senha" para gerar outra.`
-          : errorText(e),
-      );
+      setErro(deviceAccountError(e, action));
       // Relê a loja: os botões passam a refletir o estado real (ex.: 409 "já tem conta").
       onChanged();
     } finally {
@@ -316,6 +376,7 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
           )}
         </div>
       )}
+      {aviso && <Aviso>{aviso}</Aviso>}
       <Erro>{erro}</Erro>
       <div className="flex gap-2">
         {pronta ? (
@@ -330,6 +391,39 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
       </div>
     </section>
   );
+}
+
+const PASSWORD_ACTIONS = new Set(['DEVICE_ACCOUNT_CREATED', 'DEVICE_PASSWORD_RESET']);
+const auditTime = (a: { created_at: string }) => {
+  const t = Date.parse(a.created_at);
+  return Number.isNaN(t) ? 0 : t;
+};
+
+/** Hora (ms) da entrada mais nova de senha gerada no histórico da loja; null se não há. */
+function newestPasswordEntry(detail: Detail): number | null {
+  const ts = detail.audit.filter((a) => PASSWORD_ACTIONS.has(a.action)).map(auditTime);
+  return ts.length ? Math.max(...ts) : null;
+}
+
+/** Quantas senhas geradas o histórico mostra depois de `marca` (null = todas). */
+function passwordEntriesAfter(detail: Detail, marca: number | null): number {
+  return detail.audit.filter((a) => PASSWORD_ACTIONS.has(a.action) && (marca === null || auditTime(a) > marca)).length;
+}
+
+/**
+ * Erro da conta do aparelho. Recusa clara (400, 401, 403, 409) mantém a mensagem do servidor.
+ * Falha depois de o pedido sair (sem conexão, 5xx, 502/504/546 do gateway, ou a função dizendo
+ * que a escrita no Auth pode ter passado): a senha pode já ter mudado e a nova, que só aparece
+ * uma vez, se perdeu. Nunca diz que nada mudou.
+ */
+function deviceAccountError(e: unknown, action: 'create' | 'reset_password'): string {
+  const status = e instanceof AdminApiError ? e.status : null;
+  const texto = errorText(e);
+  if (status === 400 || status === 401 || status === 403 || status === 409) return texto;
+  const talvez = status === 0 || (status !== null && status >= 500) || /pode já ter mudado|pode ter (sido|passado|mudado)/i.test(texto);
+  if (!talvez) return texto;
+  const oQue = action === 'create' ? 'A conta pode ter sido criada e a senha pode já valer' : 'A senha pode já ter mudado';
+  return `Não deu para confirmar com o servidor (${texto}). ${oQue}: a senha nova se perdeu (ela só aparece uma vez). Use "Trocar senha" para gerar outra${action === 'create' ? ' (se o botão ainda for "Criar conta do aparelho", toque nele de novo)' : ''}.`;
 }
 
 function ChargesSection({ client, detail, today, onChanged }: { client: AdminClient; detail: Detail; today: string; onChanged: () => void }) {
@@ -347,6 +441,18 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
   const [erro, setErro] = useState<string | null>(null);
   const [enviando, setEnviando] = useState(false);
   const [pagando, setPagando] = useState<string | null>(null);
+  const [fechado, setFechado] = useState<string | null>(null);
+  // A loja relida mostra a cobrança do formulário de pagamento já paga ou cancelada (o pagamento
+  // entrou e só a resposta se perdeu, ou outra aba deu baixa): o formulário fecha.
+  useEffect(() => {
+    if (!pagando) return;
+    const c = detail.charges.find((x) => x.id === pagando);
+    if (c && c.status === 'OPEN') return;
+    setPagando(null);
+    setFechado(c ? `A cobrança de ${monthBr(c.reference_month)} já está ${STATUS_LABEL[c.status]?.toLowerCase() ?? c.status}: o formulário de pagamento foi fechado.` : 'A cobrança não está mais na lista: o formulário de pagamento foi fechado.');
+  }, [detail]);
+  // Loja em cortesia (mensalidade zero): a cobrança precisa de um valor digitado.
+  const cortesia = toCents(s.monthly_price) === 0;
 
   async function criar(ev: FormEvent) {
     ev.preventDefault();
@@ -354,6 +460,9 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
     if (!validMonthInput(mes)) return setErro('Mês inválido: use AAAA-MM (ex.: 2026-11).');
     const amount = valor.trim() ? parseMoneyInput(valor) : null;
     if (valor.trim() && amount === null) return setErro(moneyInputError(valor, 'Valor inválido (ex.: 199,90).'));
+    if (amount === null && cortesia) return setErro('Loja em cortesia (mensalidade R$ 0,00): informe o valor da cobrança, maior que zero.');
+    if (amount !== null && toCents(amount) <= 0) return setErro('O valor da cobrança precisa ser maior que zero.');
+    if (amount !== null && toCents(amount) > MAX_AMOUNT_CENTS) return setErro('Cobrança até R$ 100.000,00.');
     const erroLink = paymentLinkError(link);
     if (erroLink) return setErro(erroLink);
     setEnviando(true);
@@ -378,7 +487,7 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
     const motivo = window.prompt(`Motivo para cancelar a cobrança de ${monthBr(c.reference_month)} (${money(c.amount)}):`);
     if (motivo === null) return;
     setErro(null);
-    if (motivo.trim().length < MOTIVO_MIN) return setErro(`Informe o motivo do cancelamento (pelo menos ${MOTIVO_MIN} letras).`);
+    if (textLength(motivo) < MOTIVO_MIN) return setErro(`Informe o motivo do cancelamento (pelo menos ${MOTIVO_MIN} letras).`);
     setCancelando(c.id);
     try {
       await client.cancelCharge(c.id, motivo);
@@ -407,12 +516,13 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
               }}
               required
             /></Campo>
-          <Campo rotulo="Valor" dica={`Vazio = ${money(s.monthly_price)}`}><input className="campo" aria-label="Valor" inputMode="decimal" value={valor} onChange={(e) => setValor(e.target.value)} /></Campo>
+          <Campo rotulo="Valor" dica={cortesia ? 'Loja em cortesia: informe o valor.' : `Vazio = ${money(s.monthly_price)}`}><input className="campo" aria-label="Valor" inputMode="decimal" value={valor} onChange={(e) => setValor(e.target.value)} /></Campo>
           <Campo rotulo="Vencimento" dica={`Vazio = dia ${s.billing_day}, nunca antes de hoje nem antes do fim do teste.`}><input className="campo" type="date" value={vence} onChange={(e) => setVence(e.target.value)} /></Campo>
-          <Campo rotulo="Link do boleto/Pix (Asaas)"><input className="campo" aria-label="Link do boleto/Pix (Asaas)" placeholder="https://…" maxLength={500} value={link} onChange={(e) => setLink(e.target.value)} /></Campo>
+          <Campo rotulo="Link do boleto/Pix (Asaas)"><input className="campo" aria-label="Link do boleto/Pix (Asaas)" placeholder="https://…" value={link} onChange={(e) => setLink(e.target.value)} /></Campo>
           <button type="submit" className="btn-primario sm:mt-5" disabled={enviando}>Criar cobrança</button>
         </form>
       )}
+      {fechado && <Aviso>{fechado}</Aviso>}
       <Erro>{erro}</Erro>
       {detail.charges.length === 0 ? (
         <p className="text-sm text-slate-500">Nenhuma cobrança ainda.</p>
@@ -456,13 +566,16 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
                           ) : (
                             <span className="text-xs text-amber-700">WhatsApp do contato inválido: corrija na assinatura.</span>
                           )}
-                          <button type="button" className="btn-verde" disabled={cancelando === c.id} onClick={() => setPagando(c.id)}>Registrar pagamento</button>
+                          <button type="button" className="btn-verde" disabled={cancelando === c.id} onClick={() => {
+                              setFechado(null);
+                              setPagando(c.id);
+                            }}>Registrar pagamento</button>
                           <button type="button" className="btn-secundario" disabled={cancelando !== null} onClick={() => cancelar(c)}>
                             {cancelando === c.id ? 'Cancelando…' : 'Cancelar'}
                           </button>
                         </div>
                       )}
-                      {pagando === c.id && (
+                      {pagando === c.id && c.status === 'OPEN' && (
                         <PaymentForm
                           client={client}
                           charge={c}
@@ -504,8 +617,10 @@ function PaymentForm({ client, charge, today, onDone, onCancel, onFailed }: { cl
     const pago = parseMoneyInput(valor);
     if (pago === null) return setErro(moneyInputError(valor, 'Valor inválido.'));
     if (toCents(pago) !== toCents(charge.amount)) return setErro(`O valor pago precisa ser o da cobrança (${money(charge.amount)}). Valor diferente: cancele e crie outra cobrança.`);
+    if (!data) return setErro('Informe a data do pagamento.');
     const r = ref.trim();
-    if (r.length < REF_MIN || r.length > REF_MAX) return setErro(`Referência do comprovante: de ${REF_MIN} a ${REF_MAX} caracteres (id do Pix, nosso número, nº do recibo).`);
+    const n = textLength(r);
+    if (n < REF_MIN || n > REF_MAX) return setErro(`Referência do comprovante: de ${REF_MIN} a ${REF_MAX} caracteres (id do Pix, nosso número, nº do recibo).`);
     setEnviando(true);
     try {
       await client.recordPayment(charge.id, pago, data, forma, r);
@@ -524,7 +639,7 @@ function PaymentForm({ client, charge, today, onDone, onCancel, onFailed }: { cl
     <form onSubmit={salvar} className="space-y-2 rounded-lg border border-borda p-3 text-left">
       <div className="grid gap-2 sm:grid-cols-2">
         <Campo rotulo="Valor pago"><input className="campo" aria-label="Valor pago" value={valor} onChange={(e) => setValor(e.target.value)} /></Campo>
-        <Campo rotulo="Data do pagamento"><input className="campo" type="date" max={today} value={data} onChange={(e) => setData(e.target.value)} /></Campo>
+        <Campo rotulo="Data do pagamento"><input className="campo" aria-label="Data do pagamento" type="date" max={today} value={data} onChange={(e) => setData(e.target.value)} required /></Campo>
         <Campo rotulo="Forma">
           <select className="campo" value={forma} onChange={(e) => setForma(e.target.value as PaymentMethod)}>
             {Object.entries(METHOD_LABEL).map(([k, v]) => (
@@ -533,7 +648,7 @@ function PaymentForm({ client, charge, today, onDone, onCancel, onFailed }: { cl
           </select>
         </Campo>
         <Campo rotulo="Referência do comprovante" dica="id do Pix (E2E), nosso número, nº do recibo">
-          <input className="campo" aria-label="Referência do comprovante" minLength={REF_MIN} maxLength={REF_MAX} value={ref} onChange={(e) => setRef(e.target.value)} required />
+          <input className="campo" aria-label="Referência do comprovante" minLength={REF_MIN} value={ref} onChange={(e) => setRef(e.target.value)} required />
         </Campo>
       </div>
       <Erro>{erro}</Erro>

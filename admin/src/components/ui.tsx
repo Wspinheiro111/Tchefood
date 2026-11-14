@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { AdminApiError } from '../lib/api';
 import { STATUS_LABEL } from '../lib/format';
 
@@ -8,10 +8,16 @@ export function errorText(e: unknown): string {
   return 'Erro inesperado.';
 }
 
-/** Carrega dados com recarregar; erro aparece na tela. */
-export function useLoad<T>(load: () => Promise<T>, deps: unknown[]): { data: T | null; error: string | null; loading: boolean; reload: () => void } {
+/**
+ * Carrega dados com recarregar; erro aparece na tela. errorStatus é o status HTTP do erro
+ * (0 = sem conexão; null quando o erro não veio do servidor).
+ */
+export function useLoad<T>(
+  load: () => Promise<T>,
+  deps: unknown[],
+): { data: T | null; error: string | null; errorStatus: number | null; loading: boolean; reload: () => void } {
   const [data, setData] = useState<T | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ text: string; status: number | null } | null>(null);
   const [loading, setLoading] = useState(true);
   const [tick, setTick] = useState(0);
   const run = useCallback(load, deps);
@@ -24,13 +30,29 @@ export function useLoad<T>(load: () => Promise<T>, deps: unknown[]): { data: T |
         setData(d);
         setError(null);
       })
-      .catch((e: unknown) => alive && setError(errorText(e)))
+      .catch((e: unknown) => alive && setError({ text: errorText(e), status: e instanceof AdminApiError ? e.status : null }))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
     };
   }, [run, tick]);
-  return { data, error, loading, reload: () => setTick((t) => t + 1) };
+  return { data, error: error?.text ?? null, errorStatus: error?.status ?? null, loading, reload: () => setTick((t) => t + 1) };
+}
+
+/**
+ * Chama onVisible quando a aba volta a ficar visível (a tela aberta em outra aba ou esquecida
+ * no fundo relê o que mostra). A função mais recente é a chamada.
+ */
+export function useOnVisible(onVisible: () => void): void {
+  const ref = useRef(onVisible);
+  ref.current = onVisible;
+  useEffect(() => {
+    const h = () => {
+      if (document.visibilityState === 'visible') ref.current();
+    };
+    document.addEventListener('visibilitychange', h);
+    return () => document.removeEventListener('visibilitychange', h);
+  }, []);
 }
 
 export function Erro({ children }: { children: ReactNode }) {

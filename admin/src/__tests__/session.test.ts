@@ -45,7 +45,7 @@ function manualFetch() {
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 const tokenCalls = (calls: Pending[]) => calls.filter((c) => c.url.includes('/auth/v1/token'));
-const nearExpiry = (): Session => ({ accessToken: 'velho', refreshToken: 'r1', expiresAt: Date.now() + 30_000, email: 'will@x.com' });
+const nearExpiry = (): Session => ({ accessToken: 'velho', refreshToken: 'r1', expiresAt: Date.now() + 30_000, email: 'will@x.com', url: CFG.url });
 const NEW_TOKEN = { status: 200, body: { access_token: 'novo', refresh_token: 'r2', expires_in: 3600 } };
 
 beforeEach(() => {
@@ -71,7 +71,7 @@ describe('sessão do painel', () => {
     expect(rpcs.every((x) => x.headers.Authorization === 'Bearer novo')).toBe(true);
     rpcs.forEach((x) => x.resolve({ status: 200, body: [] }));
     await Promise.all([a, b]);
-    expect(loadSession()?.refreshToken).toBe('r2');
+    expect(loadSession(CFG)?.refreshToken).toBe('r2');
     expect(expired).not.toHaveBeenCalled();
   });
 
@@ -85,7 +85,7 @@ describe('sessão do painel', () => {
     tokenCalls(f.calls)[0]!.resolve({ status: 400, body: { error: 'invalid_grant' } });
     await expect(a).rejects.toMatchObject({ status: 401 });
     expect(expired).toHaveBeenCalledTimes(1);
-    expect(loadSession()).toBeNull();
+    expect(loadSession(CFG)).toBeNull();
   });
 
   it('queda de rede ou 503 na renovação mantém a sessão (erro que dá para repetir)', async () => {
@@ -102,7 +102,7 @@ describe('sessão do painel', () => {
     tokenCalls(f.calls)[1]!.resolve({ status: 503, body: null });
     await expect(b).rejects.toMatchObject({ status: 503 });
     expect(expired).not.toHaveBeenCalled();
-    expect(loadSession()?.refreshToken).toBe('r1');
+    expect(loadSession(CFG)?.refreshToken).toBe('r1');
     // Depois volta: a próxima chamada renova e segue.
     const d = c.me();
     await flush();
@@ -115,7 +115,7 @@ describe('sessão do painel', () => {
   it('queda de rede numa chamada (token válido) não encerra a sessão', async () => {
     const f = manualFetch();
     const expired = vi.fn();
-    const fresh: Session = { accessToken: 'a', refreshToken: 'r1', expiresAt: Date.now() + 3_600_000, email: 'will@x.com' };
+    const fresh: Session = { accessToken: 'a', refreshToken: 'r1', expiresAt: Date.now() + 3_600_000, email: 'will@x.com', url: CFG.url };
     saveSession(fresh);
     const c = sessionClient(CFG, fresh, expired, f.fetch);
     const a = c.me();
@@ -123,7 +123,7 @@ describe('sessão do painel', () => {
     f.calls.at(-1)!.resolve('network');
     await expect(a).rejects.toMatchObject({ status: 0, message: 'Sem conexão com o servidor. Confira se a ação foi registrada antes de repetir.' });
     expect(expired).not.toHaveBeenCalled();
-    expect(loadSession()?.refreshToken).toBe('r1');
+    expect(loadSession(CFG)?.refreshToken).toBe('r1');
   });
 
   it('sair durante a renovação: a resposta que chega depois não devolve a sessão', async () => {
@@ -141,7 +141,7 @@ describe('sessão do painel', () => {
     await logout;
     tokenCalls(f.calls)[0]!.resolve(NEW_TOKEN);
     expect(await a).toBeInstanceOf(AdminApiError);
-    expect(loadSession()).toBeNull();
+    expect(loadSession(CFG)).toBeNull();
     expect(expired).not.toHaveBeenCalled();
     expect(f.calls.filter((x) => x.url.includes('/rest/v1/rpc/'))).toHaveLength(0);
   });
@@ -180,5 +180,40 @@ describe('sessão do painel', () => {
     expect(hostOf('https://abc.supabase.co/')).toBe('abc.supabase.co');
     expect(hostOf('')).toBe('');
     expect(hostOf('nada')).toBe('');
+  });
+});
+
+describe('sessão presa ao projeto', () => {
+  it('sessão de outro projeto (ou sem endereço) não é carregada e é apagada', () => {
+    saveSession({ ...nearExpiry(), url: 'https://outro.supabase.co' });
+    expect(loadSession(CFG)).toBeNull();
+    expect(sessionStorage.getItem('tchefood-admin-session')).toBeNull();
+
+    const { url: _sem, ...antiga } = nearExpiry();
+    sessionStorage.setItem('tchefood-admin-session', JSON.stringify(antiga));
+    expect(loadSession(CFG)).toBeNull();
+
+    // Mesmo projeto, com barra no fim do endereço configurado: vale.
+    saveSession(nearExpiry());
+    expect(loadSession({ ...CFG, url: `${CFG.url}/` })?.refreshToken).toBe('r1');
+  });
+
+  it('cliente com sessão de outro projeto não manda o token para este servidor', async () => {
+    const f = manualFetch();
+    const expired = vi.fn();
+    const outra: Session = { accessToken: 'tok-outro', refreshToken: 'r', expiresAt: Date.now() + 3_600_000, email: 'will@x.com', url: 'https://outro.supabase.co' };
+    const c = sessionClient(CFG, outra, expired, f.fetch);
+    await expect(c.me()).rejects.toMatchObject({ status: 401 });
+    expect(f.calls).toHaveLength(0);
+    expect(expired).toHaveBeenCalledTimes(1);
+  });
+
+  it('o login e a renovação guardam o endereço do projeto na sessão', async () => {
+    const f = manualFetch();
+    const s = nearExpiry();
+    const p = refreshSession({ ...CFG, url: `${CFG.url}/` }, s, f.fetch);
+    await flush();
+    f.calls[0]!.resolve(NEW_TOKEN);
+    expect((await p).url).toBe(CFG.url);
   });
 });

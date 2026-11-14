@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  chargeMessage, cleanCnpj, cnpjMatches, dateBr, daysBetween, formatCnpj, formatPhone, money, moneyInputError, monthBr, monthStart, parseMoneyInput, priceInput,
+  addDays, chargeMessage, cleanCnpj, cnpjMatches, contactNameError, lengthError, storeNamesError, textLength, dateBr, daysBetween, formatCnpj, formatPhone, money, moneyInputError, monthBr, monthStart, parseMoneyInput, priceInput,
   suggestedDeviceEmail, toCents, trialDetail, validCnpj, validMonthInput, validPhone, whatsappLink,
 } from '../lib/format';
 
@@ -110,5 +110,25 @@ describe('formatação do painel', () => {
     const before = chargeMessage({ ...base, daysLate: 0, paymentLink: null }, '2026-11-08');
     expect(before).toContain('vence em 10/11/2026');
     expect(before).toContain('chave Pix');
+  });
+});
+
+describe('tamanho dos textos como o banco mede', () => {
+  it('conta pontos de código depois de aparar (emoji = 1), como length() do Postgres', () => {
+    expect(textLength('  🍕🍕 ')).toBe(2);
+    expect('🍕🍕'.length).toBe(4);
+    expect(textLength('\u00a0abc\ufeff')).toBe(3);
+    expect(lengthError('Referência', '🍕'.repeat(120), 4, 120)).toBeNull();
+    expect(lengthError('Referência', '🍕'.repeat(121), 4, 120)).toBe('Referência: de 4 a 120 caracteres.');
+    expect(contactNameError('😀'.repeat(100))).toBeNull();
+    expect(contactNameError('😀'.repeat(101))).toBe('Contato: de 2 a 100 caracteres.');
+    expect(storeNamesError('F', 'Flip Ltda')).toBe('Nome da loja: de 2 a 150 caracteres.');
+    expect(storeNamesError('Flip', 'x'.repeat(201))).toBe('Razão social: de 2 a 200 caracteres.');
+    expect(storeNamesError('🍕'.repeat(150), '🍕'.repeat(200))).toBeNull();
+  });
+
+  it('addDays soma dias numa data pura', () => {
+    expect(addDays('2026-11-14', 90)).toBe('2027-02-12');
+    expect(addDays('2026-12-31', 1)).toBe('2027-01-01');
   });
 });

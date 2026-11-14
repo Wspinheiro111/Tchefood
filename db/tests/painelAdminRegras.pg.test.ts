@@ -618,4 +618,117 @@ const subInput = async (tenant: string, over: Partial<SubscriptionInput> = {}): 
       setToday('2026-11-14');
     });
   });
+
+  describe('revisão interna 3', () => {
+    const cancelAll = (...ts: string[]) => {
+      for (const t of ts) sql(`UPDATE store_subscriptions SET status = 'CANCELLED' WHERE tenant_id = '${t}'`);
+    };
+    const decRows = (t: string) =>
+      sql(`SELECT COALESCE(string_agg(status || ':' || cancelled_with_subscription, ',' ORDER BY created_at, id), '')
+             FROM store_charges WHERE tenant_id = '${t}' AND reference_month = '2026-12-01'`);
+    const trialOf = async (t: string) => (await admin().store(t)).subscription!.trial_ends_on;
+
+    it('loja cancelada que volta: o lote refaz o mês cancelado junto com a assinatura, não o cancelado pelo admin', async () => {
+      setToday('2026-11-14');
+      const back = await admin().createStore(store());
+      const courtesy = await admin().createStore(store());
+      await admin().generateMonth('2026-12-01');
+      expect(decRows(back)).toBe('OPEN:false');
+      expect(decRows(courtesy)).toBe('OPEN:false');
+
+      // Cortesia: o admin cancela dezembro desta loja.
+      const decCourtesy = sql(`SELECT id FROM store_charges WHERE tenant_id = '${courtesy}' AND reference_month = '2026-12-01'`);
+      await admin().cancelCharge(decCourtesy, 'Cortesia de dezembro');
+
+      for (const round of [1, 2]) {
+        for (const t of [back, courtesy]) {
+          expect(await admin().saveSubscription(t, await subInput(t, { status: 'CANCELLED', reason: `Loja pediu para sair ${round}` }))).toMatchObject({ status: 'CANCELLED' });
+        }
+        expect(decRows(back)).toBe(Array(round).fill('CANCELLED:true').join(','));
+        for (const t of [back, courtesy]) {
+          expect(await admin().saveSubscription(t, await subInput(t, { status: 'ACTIVE', reason: `Loja voltou ${round}` }))).toMatchObject({ status: 'ACTIVE' });
+        }
+        await admin().generateMonth('2026-12-01');
+        // Lote de novo no mesmo dia: não duplica.
+        await admin().generateMonth('2026-12-01');
+        expect(decRows(back)).toBe([...Array(round).fill('CANCELLED:true'), 'OPEN:false'].join(','));
+        expect(chargeOf(back, '2026-12-01')).toBe('2026-12-10');
+        expect(sql(`SELECT count(*) FROM store_charges WHERE tenant_id = '${back}' AND reference_month = '2026-12-01' AND status = 'OPEN'`)).toBe('1');
+        // Cancelada pelo admin: o lote não desfaz a cortesia.
+        expect(decRows(courtesy)).toBe('CANCELLED:false');
+        expect(chargeOf(courtesy, '2026-12-01')).toBe('nenhuma');
+      }
+      cancelAll(back, courtesy);
+    });
+
+    it('assinatura fora do teste: fim do teste em até 90 dias; não nasce, não estica, só antecipa', async () => {
+      setToday('2026-11-14');
+      // Ativa sem data de teste: data de ano errado recusada; data válida não é gravada.
+      const active = await admin().createStore(store());
+      expect(await trialOf(active)).toBeNull();
+      await rejects(admin().saveSubscription(active, await subInput(active, { status: 'ACTIVE', trialEndsOn: '2036-11-30' })), /fim do teste em até 90 dias/);
+      expect(await trialOf(active)).toBeNull();
+      expect((await admin().saveSubscription(active, await subInput(active, { trialEndsOn: '2026-12-20' }))).trial_ends_on).toBeNull();
+      expect(await trialOf(active)).toBeNull();
+
+      // Tirada do teste à mão: o teste acaba hoje.
+      const manual = await admin().createStore(store({ trialDays: 36 }));
+      expect(await admin().saveSubscription(manual, await subInput(manual, { status: 'ACTIVE' }))).toMatchObject({ status: 'ACTIVE', trial_ends_on: '2026-11-14' });
+
+      // Ativa com teste até 20/12 (virou ativa pelo pagamento adiantado, que não mexe na data):
+      // mais tarde fica 20/12; sem data fica 20/12; mais cedo é aceito.
+      const paid = await admin().createStore(store({ trialDays: 36 }));
+      expect(await trialOf(paid)).toBe('2026-12-20');
+      sql(`UPDATE store_subscriptions SET status = 'ACTIVE' WHERE tenant_id = '${paid}'`);
+      await rejects(admin().saveSubscription(paid, await subInput(paid, { trialEndsOn: '2036-11-30' })), /fim do teste em até 90 dias/);
+      expect((await admin().saveSubscription(paid, await subInput(paid, { trialEndsOn: '2027-01-10' }))).trial_ends_on).toBe('2026-12-20');
+      expect((await admin().saveSubscription(paid, await subInput(paid, { trialEndsOn: null }))).trial_ends_on).toBe('2026-12-20');
+      expect((await admin().saveSubscription(paid, await subInput(paid, { trialEndsOn: '2026-12-01' }))).trial_ends_on).toBe('2026-12-01');
+      expect((await admin().saveSubscription(paid, await subInput(paid, { trialEndsOn: '2026-12-20' }))).trial_ends_on).toBe('2026-12-01');
+
+      // Assinatura nova fora do teste: a data informada não é gravada.
+      const hand = '99999999-9999-4999-8999-999999999999';
+      sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${hand}', 'Nova Ativa', 'Nova Ativa Ltda', '${cnpj(9300)}');`);
+      const input: SubscriptionInput = {
+        planId: 'bistro', monthlyPrice: '99.00', status: 'ACTIVE', billingDay: 5, trialEndsOn: '2026-12-20',
+        contactName: 'Dono', contactPhone: '55999990000', contactEmail: '', notes: '', reason: 'Assinatura nova', expectedUpdatedAt: null,
+      };
+      expect(await admin().saveSubscription(hand, input)).toMatchObject({ status: 'ACTIVE', trial_ends_on: null });
+      expect(sql(`SELECT COALESCE(trial_ends_on::text, 'null') FROM store_subscriptions WHERE tenant_id = '${hand}'`)).toBe('null');
+      cancelAll(active, manual, paid, hand);
+    });
+
+    it('pagamento adiantado de mais de um mês: aceito até 3 meses antes do mês da cobrança', async () => {
+      setToday('2027-01-05');
+      const t = await admin().createStore(store({ trialDays: 0, billingDay: 10 }));
+      sql(`UPDATE store_subscriptions SET created_at = '2026-11-01' WHERE tenant_id = '${t}'`);
+      const feb = await admin().createCharge(t, '2027-02-01', null, null, null);
+      // Pix de 15/12 que pagou janeiro e fevereiro juntos.
+      await rejects(admin().recordPayment(feb, '199.00', '2026-10-31', 'PIX', 'E2E-ANTIGO-1'), /muito antes do mês/);
+      expect(await admin().recordPayment(feb, '199.00', '2026-12-15', 'PIX', 'E2E-ADIANTADO-1')).toMatchObject({ subscription_status: 'ACTIVE' });
+      setToday('2026-11-14');
+      cancelAll(t);
+    });
+
+    it('cobrança avulsa sem vencimento de loja ativa ainda no teste: dia seguinte ao fim do teste, nunca depois de hoje + 91', async () => {
+      setToday('2026-11-14');
+      const t = await admin().createStore(store({ trialDays: 36, billingDay: 10 }));
+      sql(`UPDATE store_subscriptions SET status = 'ACTIVE' WHERE tenant_id = '${t}'`); // pagou adiantado
+      // Tentativa de esticar o teste (ano digitado errado), aceita ou recusada: o vencimento não passa de hoje + 91.
+      await admin().saveSubscription(t, await subInput(t, { trialEndsOn: '2036-11-30' })).catch(() => null);
+      const dec = await admin().createCharge(t, '2026-12-01', null, null, null);
+      const due = sql(`SELECT due_date FROM store_charges WHERE id = '${dec}'`);
+      expect(due).toBe('2026-12-21');
+      expect(due <= '2027-02-13').toBe(true);
+
+      // Teste no limite (hoje + 90 = 12/02/2027): o vencimento é hoje + 91, não mais.
+      const edge = await admin().createStore(store({ trialDays: 90, billingDay: 10 }));
+      expect(await trialOf(edge)).toBe('2027-02-12');
+      sql(`UPDATE store_subscriptions SET status = 'ACTIVE' WHERE tenant_id = '${edge}'`); // pagou adiantado
+      await admin().saveSubscription(edge, await subInput(edge, { trialEndsOn: '2036-11-30' })).catch(() => null);
+      const decEdge = await admin().createCharge(edge, '2026-12-01', null, null, null);
+      expect(sql(`SELECT due_date FROM store_charges WHERE id = '${decEdge}'`)).toBe('2027-02-13');
+      cancelAll(t, edge);
+    });
+  });
 });

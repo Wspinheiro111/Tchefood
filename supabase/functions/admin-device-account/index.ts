@@ -10,7 +10,7 @@
 // handler.ts. Variáveis: SUPABASE_URL, SUPABASE_ANON_KEY e SUPABASE_SERVICE_ROLE_KEY (já
 // injetadas pelo Supabase).
 import { createClient } from 'npm:@supabase/supabase-js@2.45.4';
-import { handleDeviceAccount, randomPasswordFrom } from './handler.ts';
+import { deviceAccountEnv, handleDeviceAccount, MISSING_ENV_MESSAGE, randomPasswordFrom } from './handler.ts';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -35,14 +35,20 @@ Deno.serve(async (req: Request) => {
     return json({ message: 'JSON inválido.' }, 400);
   }
 
-  const url = Deno.env.get('SUPABASE_URL')!;
-  const asCaller = createClient(url, Deno.env.get('SUPABASE_ANON_KEY')!, {
-    global: { headers: { Authorization: authHeader } },
-    auth: { persistSession: false },
-  });
-  const service = createClient(url, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!, { auth: { persistSession: false } });
+  // Sem as variáveis, responde aqui (com CORS) em vez de deixar o createClient quebrar fora do try.
+  const env = deviceAccountEnv((name) => Deno.env.get(name));
+  if (!env) {
+    console.error('[admin-device-account] faltam SUPABASE_URL, SUPABASE_ANON_KEY ou SUPABASE_SERVICE_ROLE_KEY');
+    return json({ message: MISSING_ENV_MESSAGE }, 500);
+  }
 
   try {
+    // Dentro do try: um valor inválido (ex.: URL malformada) cai no 500 com CORS lá embaixo.
+    const asCaller = createClient(env.url, env.anonKey, {
+      global: { headers: { Authorization: authHeader } },
+      auth: { persistSession: false },
+    });
+    const service = createClient(env.url, env.serviceRoleKey, { auth: { persistSession: false } });
     const result = await handleDeviceAccount(input, {
       rpc: async (fn, args) => {
         const { data, error } = await asCaller.rpc(fn, args);
