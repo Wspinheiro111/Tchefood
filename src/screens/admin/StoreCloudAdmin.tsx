@@ -722,6 +722,27 @@ function RejectedTableTaken({ eventId }: { eventId: string }) {
   );
 }
 
+/** Item lançado numa conta que outro aparelho já encerrou: vai para uma conta nova da mesa. */
+function RejectedLateItem({ eventId }: { eventId: string }) {
+  const move = useTcheStore((s) => s.moveLateItemsToNewOrder);
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2">
+      <Btn
+        onClick={() => {
+          if (!window.confirm('A conta já foi encerrada em outro aparelho. Abrir uma conta nova da mesma mesa com os itens que não entraram nela?')) return;
+          const r = move(eventId);
+          if (r.ok) {
+            toast.success(`${r.data.items} item(ns) numa conta nova da mesa.`);
+            void syncOnce();
+          } else toast.error(r.error);
+        }}
+      >
+        Abrir conta nova da mesa com os itens
+      </Btn>
+    </span>
+  );
+}
+
 /** Item recusado por preço diferente do cadastro: o gerente aceita com PIN e motivo. */
 function RejectedItemPrice({ eventId }: { eventId: string }) {
   const approve = useTcheStore((s) => s.approveRejectedItemPrice);
@@ -822,6 +843,7 @@ function CloudStatus() {
                 {needsManagerPin(r.event) && <RejectedAuthPin eventId={r.event.id} />}
                 {isRejectedItemPrice(r) && <RejectedItemPrice eventId={r.event.id} />}
                 {r.event.table === 'orders' && r.event.op === 'INSERT' && /TCHEFOOD_MESA_OCUPADA/.test(r.message ?? '') && <RejectedTableTaken eventId={r.event.id} />}
+                {r.event.table === 'order_items' && r.event.op === 'INSERT' && /TCHEFOOD_CONTA_ENCERRADA/.test(r.message ?? '') && <RejectedLateItem eventId={r.event.id} />}
                 {r.event.table === 'orders' && cloudDiscountOf(r.message) !== null && (
                   <AdoptCloudDiscount eventId={r.event.id} value={cloudDiscountOf(r.message)!} />
                 )}

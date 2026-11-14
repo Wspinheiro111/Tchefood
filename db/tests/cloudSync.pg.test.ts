@@ -3987,6 +3987,66 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().orderItems.filter((i) => i.order_id === order.id).every((i) => i.is_paid)).toBe(true);
     });
 
+    it('item lançado em A depois de B receber a conta toda: recusado, e vai para uma conta nova da mesa (Codex no PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(50);
+      await expectSynced('mesa 50');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      const add = (orderId: string) => {
+        ok(st().addToTray({ order_id: orderId, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+        ok(st().dispatchTray(orderId));
+      };
+      add(order.id);
+      await expectSynced('conta 50');
+      // A lança mais um item sem internet; B recebe a conta toda e o banco fecha.
+      add(order.id);
+      await bPaysCard(order.id, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${order.id}'`)));
+      expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 0.00');
+      const rejected = await sync();
+      expect(rejected).toHaveLength(1);
+      const rej = st().syncRejected.find((r) => r.event.table === 'order_items' && r.event.op === 'INSERT')!;
+      expect(rej.message).toMatch(/TCHEFOOD_CONTA_ENCERRADA/);
+      // A conta encerrada não muda: nada a dever, mesa livre, um item só.
+      expect(sql(`SELECT status || ' ' || remaining_balance || ' ' || (SELECT count(*) FROM order_items WHERE order_id = '${order.id}') FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 0.00 1');
+      expect(sql(`SELECT status FROM dining_tables WHERE id = '${mesa.id}'`)).toBe('FREE');
+      // Reenvio de um item que já entrou (resposta perdida) continua aceito, sem mudar nada.
+      const first = sql(`SELECT id FROM order_items WHERE order_id = '${order.id}'`);
+      sql(`INSERT INTO order_items SELECT * FROM order_items WHERE id = '${first}' ON CONFLICT (id) DO NOTHING`);
+      // O gerente abre a conta nova da mesa com o item que não entrou.
+      const moved = ok(st().moveLateItemsToNewOrder(rej.event.id));
+      expect(moved.items).toBe(1);
+      expect(st().syncRejected).toHaveLength(0);
+      await expectSynced('conta nova da mesa');
+      expect(sql(`SELECT status || ' ' || (remaining_balance > 0) || ' ' || (SELECT count(*) FROM order_items WHERE order_id = '${moved.newOrderId}') FROM orders WHERE id = '${moved.newOrderId}'`)).toBe('OPEN true 1');
+      expect(sql(`SELECT status || ' ' || current_order_id FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(`OCCUPIED ${moved.newOrderId}`);
+      ok(await pullA());
+      expect(st().orders.find((o) => o.id === order.id)!.status).toBe('CLOSED');
+      expect(st().tables.find((t) => t.id === mesa.id)!.current_order_id).toBe(moved.newOrderId);
+      expect(st().orders.find((o) => o.id === moved.newOrderId)!.remaining_balance)
+        .toBe(Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${moved.newOrderId}'`)));
+    });
+
+    it('atualização de cozinha de A com a cópia velha do item não desmarca o item pago em B (Codex no PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(51);
+      await expectSynced('mesa 51');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await expectSynced('conta 51');
+      const item = st().orderItems.find((i) => i.order_id === order.id)!;
+      // B paga esse item (pagamento por item): no banco ele fica pago; A ainda tem a cópia não paga.
+      sql(`UPDATE order_items SET is_paid = TRUE WHERE id = '${item.id}'`);
+      expect(st().orderItems.find((i) => i.id === item.id)!.is_paid).toBe(false);
+      ok(st().advanceItems([item.id]));
+      await expectSynced('cozinha de A');
+      expect(sql(`SELECT is_paid || ' ' || status FROM order_items WHERE id = '${item.id}'`)).toBe(`true ${st().orderItems.find((i) => i.id === item.id)!.status}`);
+      ok(await pullA());
+      expect(st().orderItems.find((i) => i.id === item.id)!.is_paid).toBe(true);
+    });
+
     it('a rodada de sincronização lê as contas a cada 10 s, com a fila vazia', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(46);

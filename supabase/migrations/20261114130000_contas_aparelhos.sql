@@ -29,6 +29,9 @@
 --     liberava a mesa quando o evento da mesa chegava; agora que a mesa desce para todos
 --     os aparelhos, ela não pode ficar ocupada por uma conta encerrada. As mesas que já
 --     estão assim são liberadas ao aplicar este arquivo.
+--  5. Item novo não entra em conta já encerrada em outro aparelho (TCHEFOOD_CONTA_ENCERRADA):
+--     o aparelho passa os itens para uma conta nova da mesa.
+--  6. Item pago não volta a "não pago" por uma atualização velha de outro aparelho.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -207,6 +210,60 @@ UPDATE dining_tables t SET status = 'FREE', current_order_id = NULL, updated_at 
  WHERE t.current_order_id IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = t.current_order_id AND o.status IN ('OPEN', 'PAYING'));
 
+-- -----------------------------------------------------------------------------
+-- 5. Item novo não entra em conta já encerrada
+-- -----------------------------------------------------------------------------
+-- Com a conta aberta em dois aparelhos, A pode lançar um item enquanto B recebe a conta
+-- toda: o item de A chegaria depois do fechamento, refaria o saldo e a conta ficaria
+-- fechada devendo, com a mesa livre (Codex no PR #54). A conta é travada antes da
+-- conferência (o pagamento que fecha a conta trava a mesma linha), então o item ou entra
+-- antes do fechamento ou é recusado. O aparelho passa os itens recusados para uma conta
+-- nova da mesa (Retaguarda › Nuvem › recusados). O reenvio de um item que já entrou (a
+-- resposta se perdeu) não é recusado: a linha já existe e nada muda no saldo.
+CREATE OR REPLACE FUNCTION tchefood_item_order_open_guard()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_status VARCHAR;
+BEGIN
+    IF EXISTS (SELECT 1 FROM order_items WHERE id = NEW.id) THEN
+        RETURN NEW;
+    END IF;
+    SELECT status INTO v_status FROM orders WHERE id = NEW.order_id FOR UPDATE;
+    IF v_status IN ('CLOSED', 'CANCELED') THEN
+        RAISE EXCEPTION 'TCHEFOOD_CONTA_ENCERRADA: a conta % já foi % em outro aparelho; o item não entra nela.',
+            NEW.order_id, CASE v_status WHEN 'CLOSED' THEN 'fechada' ELSE 'cancelada' END
+            USING DETAIL = json_build_object('order_id', NEW.order_id, 'status', v_status)::text;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+-- O nome com 000 roda antes dos outros gatilhos BEFORE INSERT de order_items (ordem alfabética):
+-- a conta fica travada antes de qualquer outra conferência do item.
+DROP TRIGGER IF EXISTS trg_order_items_000_order_open ON order_items;
+CREATE TRIGGER trg_order_items_000_order_open BEFORE INSERT ON order_items
+    FOR EACH ROW EXECUTE FUNCTION tchefood_item_order_open_guard();
+
+-- -----------------------------------------------------------------------------
+-- 6. Item pago não volta a "não pago"
+-- -----------------------------------------------------------------------------
+-- A atualização de cozinha de um aparelho manda o item inteiro, com o is_paid da cópia
+-- dele. Se outro aparelho recebeu esse item antes de a cópia chegar, o is_paid = false
+-- velho desmarcaria o pagamento por item (Codex no PR #54). Nenhum caminho do app nem do
+-- banco desmarca um item pago (estorno é pelo pagamento), então o item fica pago e o resto
+-- da linha (situação na cozinha) passa: a atualização não é recusada.
+CREATE OR REPLACE FUNCTION tchefood_item_paid_stays()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.is_paid AND NOT NEW.is_paid THEN
+        RAISE NOTICE 'TCHEFOOD_ITEM_PAGO: o item % já está pago e continua pago (atualização velha).', OLD.id;
+        NEW.is_paid := TRUE;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_order_items_paid_stays ON order_items;
+CREATE TRIGGER trg_order_items_paid_stays BEFORE UPDATE OF is_paid ON order_items
+    FOR EACH ROW EXECUTE FUNCTION tchefood_item_paid_stays();
+
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
@@ -216,5 +273,7 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_order_table_free_guard() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_order_reserve_table() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_table_occupancy_guard() FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_item_order_open_guard() FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_item_paid_stays() FROM PUBLIC, anon, authenticated;
     END IF;
 END $$;
