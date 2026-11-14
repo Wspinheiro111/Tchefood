@@ -10,8 +10,9 @@
  */
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { beforeAll, describe, expect, it } from 'vitest';
-import { DeliveryConcurrencyError, DeliveryInbox } from '../../server/delivery/deliveryInbox';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { DETAIL_RECOVERED_REASON, DeliveryConcurrencyError, DeliveryInbox, ORDER_DETAIL_MAX_FAILURES } from '../../server/delivery/deliveryInbox';
+import { DeliveryMarketplaceError } from '../../server/delivery/marketplace';
 import { IfoodMerchantApi } from '../../server/delivery/ifood/ifoodMerchantApi';
 import { IfoodSandbox } from '../../server/delivery/ifood/ifoodSandbox';
 import { SupabaseDeliveryRepository, type RestFetch } from '../../server/delivery/supabaseDeliveryRepository';
@@ -127,6 +128,76 @@ function setup() {
     record.order = { ...record.order, totals: { ...record.order.totals, orderCents: 1 } };
     await repository.saveOrder(record);
     expect(sql(`SELECT tenant_id || '|' || total_amount FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${TENANT}|77.00`);
+  });
+
+  it(`pedido mínimo depois de ${ORDER_DETAIL_MAX_FAILURES} respostas 404 recupera itens, pagamentos, total e isTest sem duplicar eventos`, async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS, isTest: true });
+    const realGetOrder = api.getOrder.bind(api);
+    const expected = await realGetOrder(id);
+    let calls = 0;
+    vi.spyOn(api, 'getOrder').mockImplementation(async (orderId) => {
+      calls += 1;
+      if (calls <= ORDER_DETAIL_MAX_FAILURES + 1) throw new DeliveryMarketplaceError('ifood', 'not_found', 'Pedido não encontrado no iFood.', 404);
+      return realGetOrder(orderId);
+    });
+    for (let cycle = 1; cycle <= ORDER_DETAIL_MAX_FAILURES; cycle += 1) await inbox.runChannel(api);
+    // Primeiro: pedido mínimo, para revisão, sem itens nem valores e marcado sem detalhe.
+    expect(sql(`SELECT detail_pending || '|' || needs_review || '|' || total_amount || '|' || jsonb_array_length(payload->'items') || '|' || (payload->>'isTest') FROM delivery_orders WHERE external_id = '${id}'`))
+      .toBe('true|true|0.00|0|false');
+    expect((await repository.listDetailPending('ifood', 20)).map((r) => r.order.externalId)).toContain(id);
+    expect((await repository.getOrder('ifood', id))!.detailPending).toBe(true);
+
+    await inbox.performAction('ifood', id, 'confirm');
+    await inbox.runChannel(api);
+    expect(sql(`SELECT detail_pending || '|' || status || '|' || total_amount || '|' || display_id || '|' || (payload->>'isTest') || '|' || needs_review FROM delivery_orders WHERE external_id = '${id}'`))
+      .toBe(`false|confirmed|${(expected.totals.orderCents / 100).toFixed(2)}|${expected.displayId}|true|true`);
+    const record = (await repository.getOrder('ifood', id))!;
+    expect(record.order.items).toEqual(expected.items);
+    expect(record.order.payments).toEqual(expected.payments);
+    expect(record.order.totals).toEqual(expected.totals);
+    expect(record.reviewReasons).toContain(DETAIL_RECOVERED_REASON);
+    expect((await repository.listDetailPending('ifood', 20)).map((r) => r.order.externalId)).not.toContain(id);
+    // PLC e CFM, uma vez cada.
+    expect(sql(`SELECT string_agg(raw_code, ',' ORDER BY event_created_at) FROM delivery_events WHERE external_order_id = '${id}'`)).toBe('PLC,CFM');
+    await inbox.runChannel(api);
+    expect(sql(`SELECT count(*) FROM delivery_events WHERE external_order_id = '${id}'`)).toBe('2');
+  });
+
+  it('o detalhe só troca uma vez, de pendente para completo, na mesma loja; gravação com versão velha não troca', async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    const realGetOrder = api.getOrder.bind(api);
+    const spy = vi.spyOn(api, 'getOrder').mockRejectedValue(new DeliveryMarketplaceError('ifood', 'invalid_response', 'Valor inválido no iFood: total.subTotal.'));
+    await inbox.runChannel(api);
+    spy.mockRestore();
+    const minimal = (await repository.getOrder('ifood', id))!;
+    expect(minimal.detailPending).toBe(true);
+    const detail = await realGetOrder(id);
+    const total = (detail.totals.orderCents / 100).toFixed(2);
+
+    // Ainda pendente: o pedido do app não muda.
+    await repository.saveOrder({ ...minimal, order: { ...detail, status: minimal.order.status } });
+    expect(sql(`SELECT total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe('0.00|true');
+    const current = (await repository.getOrder('ifood', id))!;
+    // Versão velha com o detalhe: conflito, nada muda.
+    await expect(repository.saveOrder({ ...minimal, detailPending: false, order: { ...detail, status: minimal.order.status } })).rejects.toBeInstanceOf(DeliveryConcurrencyError);
+    expect(sql(`SELECT total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe('0.00|true');
+    // Detalhe de outra loja do app: recusado.
+    await expect(repository.saveOrder({ ...current, detailPending: false, order: { ...detail, merchantExternalId: OTHER_MERCHANT, status: current.order.status } }))
+      .rejects.toThrow(/outra loja/);
+    expect(sql(`SELECT tenant_id || '|' || total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${TENANT}|0.00|true`);
+    // Mesma loja, versão atual: troca uma vez.
+    const version = await repository.saveOrder({ ...current, detailPending: false, order: { ...detail, status: current.order.status } });
+    expect(sql(`SELECT tenant_id || '|' || total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${TENANT}|${total}|false`);
+    // Depois disso o pedido do app é imutável de novo e detail_pending não volta para TRUE.
+    const done = (await repository.getOrder('ifood', id))!;
+    expect(done.version).toBe(version);
+    await repository.saveOrder({ ...done, detailPending: true, order: { ...done.order, totals: { ...done.order.totals, orderCents: 1 } } });
+    expect(sql(`SELECT total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${total}|false`);
+    const again = (await repository.getOrder('ifood', id))!;
+    await repository.saveOrder({ ...again, detailPending: false, order: { ...again.order, totals: { ...again.order.totals, orderCents: 1 } } });
+    expect(sql(`SELECT total_amount || '|' || detail_pending FROM delivery_orders WHERE external_id = '${id}'`)).toBe(`${total}|false`);
   });
 
   it('merchantId com espaço ou caractere fora do padrão não entra em delivery_integrations', () => {

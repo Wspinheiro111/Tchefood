@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  DETAIL_RECOVERED_REASON,
   DeliveryConcurrencyError,
   DeliveryInbox,
   DeliverySentNotSavedError,
@@ -932,7 +933,9 @@ describe("caixa de entrada de delivery", () => {
     expect(await repository.getOrder("ifood", id)).toBeNull();
     const [last] = await inbox.runCycle();
     expect(last).toMatchObject({ acknowledged: 1, newOrders: [id] });
-    expect(getOrder).toHaveBeenCalledTimes(ORDER_DETAIL_MAX_FAILURES);
+    // Mais uma: a tentativa de recuperar o detalhe, no mesmo ciclo, depois do ack.
+    expect(getOrder).toHaveBeenCalledTimes(ORDER_DETAIL_MAX_FAILURES + 1);
+    expect((await repository.getOrder("ifood", id))!.detailPending).toBe(true);
     const record = (await repository.getOrder("ifood", id))!;
     expect(record.reviewReasons.join(" ")).toMatch(/Detalhe do pedido ilegível no iFood \(Pedido não encontrado no iFood\.\)/);
   });
@@ -944,6 +947,177 @@ describe("caixa de entrada de delivery", () => {
     for (let cycle = 0; cycle < ORDER_DETAIL_MAX_FAILURES + 2; cycle += 1) await inbox.runCycle();
     expect(await repository.getOrder("ifood", id)).toBeNull();
     expect(sandbox.pendingEventCount()).toBe(1);
+  });
+
+  it(`pedido mínimo depois de ${ORDER_DETAIL_MAX_FAILURES} respostas 404: entra para revisão e depois recupera o detalhe sem perder o estado`, async () => {
+    const announced: DeliveryOrderRecord[] = [];
+    const onNewOrder = vi.fn((record: DeliveryOrderRecord) => {
+      announced.push(structuredClone(record));
+    });
+    const { sandbox, api, repository, inbox } = setup({ onNewOrder });
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS, isTest: true });
+    const realGetOrder = api.getOrder.bind(api);
+    const expected = await realGetOrder(id);
+    // 404 nas 10 tentativas do primeiro evento e também na primeira recuperação (mesmo ciclo); depois o detalhe vem.
+    let calls = 0;
+    const getOrder = vi.spyOn(api, "getOrder").mockImplementation(async (orderId) => {
+      calls += 1;
+      if (calls <= ORDER_DETAIL_MAX_FAILURES + 1) throw new DeliveryMarketplaceError("ifood", "not_found", "Pedido não encontrado no iFood.", 404);
+      return realGetOrder(orderId);
+    });
+    for (let cycle = 1; cycle <= ORDER_DETAIL_MAX_FAILURES; cycle += 1) await inbox.runCycle();
+    expect(getOrder).toHaveBeenCalledTimes(ORDER_DETAIL_MAX_FAILURES + 1);
+    // Primeiro: pedido mínimo, para revisão, marcado sem detalhe (não vira venda nem NFC-e).
+    let record = (await repository.getOrder("ifood", id))!;
+    expect(record).toMatchObject({ detailPending: true, needsReview: true, newOrderNotified: true, order: { items: [], payments: [], isTest: false } });
+    expect(record.order.totals.orderCents).toBe(0);
+    expect(onNewOrder).toHaveBeenCalledOnce();
+    expect(announced[0]).toMatchObject({ detailPending: true, needsReview: true });
+
+    // O pedido anda antes da recuperação: confirmado e com pedido de cancelamento da loja esperando o app.
+    await inbox.performAction("ifood", id, "confirm");
+    await inbox.runCycle();
+    // Ciclo acima: CFM aplicado e a recuperação (chamada 12) já trouxe o detalhe.
+    record = (await repository.getOrder("ifood", id))!;
+    expect(record.detailPending).toBe(false);
+    expect(record.order.status).toBe("confirmed");
+    expect(record.order.items).toEqual(expected.items);
+    expect(record.order.payments).toEqual(expected.payments);
+    expect(record.order.totals).toEqual(expected.totals);
+    expect(record.order.totals.orderCents).toBeGreaterThan(0);
+    expect(record.order.isTest).toBe(true);
+    expect(record.order.customer).toEqual(expected.customer);
+    expect(record.order.displayId).toBe(expected.displayId);
+    expect(record.needsReview).toBe(true);
+    expect(record.newOrderNotified).toBe(true);
+    expect(record.reviewReasons).toContain(DETAIL_RECOVERED_REASON);
+    // A pendência do pedido mínimo fica no histórico de conferência.
+    expect(record.reviewReasons.join(" ")).toMatch(/Detalhe do pedido ilegível no iFood/);
+    expect(onNewOrder).toHaveBeenCalledOnce();
+    expect(sandbox.pendingEventCount()).toBe(0);
+
+    // Recuperado, não busca de novo nem duplica nada.
+    const [reasonCode] = await inbox.listCancellationReasons("ifood", id);
+    await inbox.requestCancellation("ifood", id, reasonCode!);
+    const callsBefore = getOrder.mock.calls.length;
+    const [report] = await inbox.runCycle();
+    expect(report).toMatchObject({ duplicates: 0, newOrders: [], error: null });
+    expect(getOrder.mock.calls.length).toBe(callsBefore);
+    record = (await repository.getOrder("ifood", id))!;
+    expect(record).toMatchObject({ detailPending: false, cancellationPending: true, order: { status: "confirmed", isTest: true } });
+    expect(record.reviewReasons.filter((reason) => reason === DETAIL_RECOVERED_REASON)).toHaveLength(1);
+  });
+
+  it("recuperação preserva cancelamento, negociação, pendências e status já processados", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS });
+    const realGetOrder = api.getOrder.bind(api);
+    let broken = true;
+    vi.spyOn(api, "getOrder").mockImplementation(async (orderId) => {
+      if (broken) throw new DeliveryMarketplaceError("ifood", "invalid_response", "Valor inválido no iFood: total.subTotal.");
+      return realGetOrder(orderId);
+    });
+    await inbox.runCycle();
+    await inbox.performAction("ifood", id, "confirm");
+    await inbox.runCycle();
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    await inbox.requestCancellation("ifood", id, reason!);
+    await inbox.runCycle();
+    sandbox.openDispute(id);
+    await inbox.runCycle();
+    const before = (await repository.getOrder("ifood", id))!;
+    expect(before).toMatchObject({ detailPending: true, cancellationPending: true, order: { status: "confirmed" } });
+    expect(before.dispute).not.toBeNull();
+
+    broken = false;
+    await inbox.runCycle();
+    const after = (await repository.getOrder("ifood", id))!;
+    expect(after.detailPending).toBe(false);
+    expect(after.order.items.length).toBeGreaterThan(0);
+    // O detalhe do iFood diz "placed": o status gravado pelos eventos não volta.
+    expect(after.order.status).toBe("confirmed");
+    expect(after.cancellationPending).toBe(true);
+    expect(after.cancellationRequest).toEqual(before.cancellationRequest);
+    expect(after.dispute).toEqual(before.dispute);
+    expect(after.lastEventAt).toBe(before.lastEventAt);
+    expect(after.lastCancellationEventAt).toBe(before.lastCancellationEventAt);
+    expect(after.reviewReasons).toEqual([...before.reviewReasons, DETAIL_RECOVERED_REASON]);
+    expect(after.version).toBe(before.version + 1);
+  });
+
+  it("recuperação respeita a versão: gravação concorrente no meio não é sobrescrita", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    const realGetOrder = api.getOrder.bind(api);
+    let broken = true;
+    vi.spyOn(api, "getOrder").mockImplementation(async (orderId) => {
+      if (broken) throw new DeliveryMarketplaceError("ifood", "invalid_response", "Valor inválido no iFood: total.subTotal.");
+      return realGetOrder(orderId);
+    });
+    await inbox.runCycle();
+    broken = false;
+    const save = repository.saveOrder.bind(repository);
+    let raced = false;
+    vi.spyOn(repository, "saveOrder").mockImplementation(async (record) => {
+      if (!raced && !record.detailPending) {
+        // Outro processo (ação da tela) grava o pedido entre a leitura e a gravação da recuperação.
+        raced = true;
+        const other = (await repository.getOrder("ifood", id))!;
+        other.cancellationPending = true;
+        other.reviewReasons.push("gravação concorrente");
+        await save(other);
+      }
+      return save(record);
+    });
+    await inbox.runCycle();
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(raced).toBe(true);
+    expect(record.detailPending).toBe(false);
+    expect(record.order.items.length).toBeGreaterThan(0);
+    expect(record.cancellationPending).toBe(true);
+    expect(record.reviewReasons).toContain("gravação concorrente");
+    expect(record.reviewReasons).toContain(DETAIL_RECOVERED_REASON);
+  });
+
+  it("falha na recuperação (app ou banco) deixa o pedido mínimo e não atrapalha o ack dos outros eventos", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const minimal = sandbox.placeOrder({ items: ITEMS });
+    const realGetOrder = api.getOrder.bind(api);
+    let failure: DeliveryMarketplaceError | null = new DeliveryMarketplaceError("ifood", "invalid_response", "Valor inválido no iFood: total.subTotal.");
+    vi.spyOn(api, "getOrder").mockImplementation(async (orderId) => {
+      if (orderId === minimal && failure) throw failure;
+      return realGetOrder(orderId);
+    });
+    await inbox.runCycle();
+    for (const code of ["unavailable", "not_found", "rate_limited"] as const) {
+      failure = new DeliveryMarketplaceError("ifood", code, `falha ${code}`);
+      const other = sandbox.placeOrder({ items: ITEMS });
+      const [report] = await inbox.runCycle();
+      expect(report).toMatchObject({ acknowledged: 1, deferred: 0, newOrders: [other], error: null });
+      expect((await repository.getOrder("ifood", minimal))!.detailPending).toBe(true);
+    }
+    // Banco fora do ar na lista de pendentes: o ciclo segue.
+    vi.spyOn(repository, "listDetailPending").mockRejectedValueOnce(new Error("banco fora do ar"));
+    const other = sandbox.placeOrder({ items: ITEMS });
+    const [report] = await inbox.runCycle();
+    expect(report).toMatchObject({ acknowledged: 1, newOrders: [other], error: null });
+    // Polling fora do ar: nem tenta recuperar.
+    failure = null;
+    vi.spyOn(api, "pollEvents").mockRejectedValueOnce(new DeliveryMarketplaceError("ifood", "unavailable", "iFood fora do ar"));
+    await inbox.runCycle();
+    expect((await repository.getOrder("ifood", minimal))!.detailPending).toBe(true);
+    await inbox.runCycle();
+    expect((await repository.getOrder("ifood", minimal))!.detailPending).toBe(false);
+  });
+
+  it("pedido com detalhe completo nunca fica pendente; registro antigo sem o campo conta como completo", async () => {
+    const { sandbox, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    expect((await repository.getOrder("ifood", id))!.detailPending).toBe(false);
+    expect(await repository.listDetailPending("ifood", 20)).toEqual([]);
   });
 
   it("detalhe sem merchant.id: vale a loja do evento", async () => {

@@ -86,6 +86,12 @@ export class SupabaseDeliveryRepository implements DeliveryRepository {
     return rows.map(toRecord);
   }
 
+  async listDetailPending(channel: DeliveryChannelKey, limit: number): Promise<DeliveryOrderRecord[]> {
+    const rows = await this.rpc("tchefood_delivery_list_detail_pending", { p_channel: channel, p_limit: limit });
+    if (!Array.isArray(rows)) throw new DeliveryRepositoryError("Lista de pedidos sem detalhe inválida.");
+    return rows.map(toRecord);
+  }
+
   private async rpc(fn: string, args: Record<string, unknown>): Promise<unknown> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -154,6 +160,8 @@ function toRecord(raw: unknown): DeliveryOrderRecord {
     order: row.order as DeliveryOrderRecord["order"],
     cancellationPending: row.cancellationPending === true,
     cancellationRequest: cancellationRequest(row.cancellationRequest),
+    // Registro gravado antes da coluna existir: tem detalhe.
+    detailPending: row.detailPending === true,
     needsReview: row.needsReview === true,
     reviewReasons: Array.isArray(row.reviewReasons) ? row.reviewReasons.filter((reason): reason is string => typeof reason === "string") : [],
     newOrderNotified: row.newOrderNotified === true,

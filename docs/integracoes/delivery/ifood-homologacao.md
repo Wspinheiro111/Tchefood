@@ -180,7 +180,15 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
 - Confirmar, iniciar preparo, pronto e despachar valem para qualquer sessão da loja. Cancelar, negociação, pausar e
   retomar exigem o PIN de gerente (ver "API do servidor"); a tela que pede o PIN entra com o item 5.
 - Não há bloqueio automático de consulta/atualização 8 h depois da entrega (o servidor só consulta o detalhe no
-  primeiro evento do pedido).
+  primeiro evento do pedido e, no pedido mínimo abaixo, até recuperá-lo).
+- Pedido mínimo: quando o detalhe do iFood vem ilegível, ou é recusado (403/404) em 10 ciclos seguidos, o pedido entra
+  sem itens nem valores, para conferência, com `detailPending = true` (coluna `delivery_orders.detail_pending`). A cada
+  ciclo, depois do ack, o servidor busca de novo o detalhe de até 20 desses pedidos (mais antigos primeiro); vindo
+  legível, grava itens, valores, pagamentos, cliente, endereço e `isTest` sem mexer no status nem no que os eventos já
+  fizeram, troca para `detailPending = false` (uma vez só; o banco só aceita trocar o pedido e o total nessa
+  passagem, na mesma loja do app) e deixa a pendência "Detalhe do pedido recuperado do app: confira itens e valores.".
+  Até a recuperação, pedido com `detailPending = true` não pode virar venda nem NFC-e (a guarda do item 5 usa esse
+  campo).
 - Erro 5xx do iFood numa ação da tela volta para a tela (não há nova tentativa automática); no polling o próximo ciclo
   já tenta de novo. A doc de boas práticas recomenda nova tentativa automática: avaliar na homologação.
 - Todas as lojas vão num único `x-polling-merchants`. A doc fala em usar o header a partir de 100 lojas e torná-lo

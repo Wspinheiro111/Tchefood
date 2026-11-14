@@ -19,6 +19,11 @@ ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS dispute JSONB;
 -- Pedido de cancelamento da loja reservado antes da chamada ao app ({state, reservedAt, code}; ver
 -- DeliveryCancellationRequest em server/delivery/deliveryInbox.ts). NULL = nenhum.
 ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS cancellation_request JSONB;
+-- Pedido gravado sem o detalhe do app (detalhe ilegível ou recusado em todos os ciclos: o pedido mínimo de
+-- server/delivery/deliveryInbox.ts, sem itens nem valores). O servidor tenta buscar o detalhe de novo a cada ciclo;
+-- até lá o pedido não pode virar venda nem NFC-e. Só vai de TRUE para FALSE, uma vez (ver tchefood_delivery_save_order).
+ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS detail_pending BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_delivery_orders_detail_pending ON delivery_orders (channel, placed_at) WHERE detail_pending;
 ALTER TABLE delivery_orders DROP CONSTRAINT IF EXISTS delivery_orders_version_positive;
 ALTER TABLE delivery_orders ADD CONSTRAINT delivery_orders_version_positive CHECK (version >= 1);
 -- merchantId do iFood cadastrado à mão: só letras, números e hífen (o polling ignora, com aviso no log, um id
@@ -63,6 +68,7 @@ LANGUAGE sql STABLE SET search_path = public AS $$
         'order', o.payload || jsonb_build_object('status', o.status::text),
         'cancellationPending', o.cancellation_pending,
         'cancellationRequest', o.cancellation_request,
+        'detailPending', o.detail_pending,
         'needsReview', o.needs_review,
         'reviewReasons', to_jsonb(o.review_reasons),
         'newOrderNotified', o.new_order_notified,
@@ -93,6 +99,17 @@ LANGUAGE sql STABLE SET search_path = public AS $$
              LIMIT LEAST(GREATEST(COALESCE(p_limit, 200), 1), 500)) q
 $$;
 
+-- Pedidos ainda sem o detalhe do app, mais antigos primeiro (o servidor tenta buscar o detalhe de novo).
+CREATE OR REPLACE FUNCTION tchefood_delivery_list_detail_pending(p_channel delivery_channel, p_limit INTEGER)
+RETURNS JSONB
+LANGUAGE sql STABLE SET search_path = public AS $$
+    SELECT COALESCE(jsonb_agg(tchefood_delivery_record_json(q) ORDER BY q.placed_at, q.external_id), '[]'::jsonb)
+      FROM (SELECT * FROM delivery_orders o
+             WHERE o.channel = p_channel AND o.detail_pending
+             ORDER BY o.placed_at, o.external_id
+             LIMIT LEAST(GREATEST(COALESCE(p_limit, 20), 1), 100)) q
+$$;
+
 CREATE OR REPLACE FUNCTION tchefood_delivery_has_event(p_channel delivery_channel, p_external_event_id VARCHAR)
 RETURNS BOOLEAN
 LANGUAGE sql STABLE SET search_path = public AS $$
@@ -110,6 +127,10 @@ DECLARE
     v_tenant UUID;
     v_version INTEGER;
     v_total NUMERIC;
+    v_row delivery_orders%ROWTYPE;
+    -- Gravação que traz o detalhe recuperado do app (detailPending FALSE explícito). Sem a chave, nada muda.
+    v_detail_done BOOLEAN := p_record ? 'detailPending' AND jsonb_typeof(p_record->'detailPending') = 'boolean'
+                             AND NOT (p_record->>'detailPending')::BOOLEAN;
 BEGIN
     IF v_order IS NULL OR jsonb_typeof(v_order) <> 'object' OR v_external IS NULL OR v_external = ''
        OR v_order->>'channel' IS DISTINCT FROM p_channel::text THEN
@@ -134,7 +155,7 @@ BEGIN
         END IF;
         INSERT INTO delivery_orders (tenant_id, channel, external_id, display_id, status, cancellation_pending, needs_review,
                                      review_reasons, new_order_notified, last_cancellation_event_at, total_amount, payload,
-                                     placed_at, last_event_at, updated_at, dispute, cancellation_request, version)
+                                     placed_at, last_event_at, updated_at, dispute, cancellation_request, detail_pending, version)
         VALUES (v_tenant, p_channel, v_external, left(COALESCE(v_order->>'displayId', ''), 20),
                 (v_order->>'status')::delivery_order_status,
                 COALESCE((p_record->>'cancellationPending')::BOOLEAN, FALSE),
@@ -144,15 +165,33 @@ BEGIN
                 (p_record->>'lastCancellationEventAt')::TIMESTAMPTZ,
                 v_total / 100, v_order - 'status',
                 (v_order->>'createdAt')::TIMESTAMPTZ, (p_record->>'lastEventAt')::TIMESTAMPTZ, NOW(),
-                NULLIF(p_record->'dispute', 'null'::jsonb), NULLIF(p_record->'cancellationRequest', 'null'::jsonb), 1)
+                NULLIF(p_record->'dispute', 'null'::jsonb), NULLIF(p_record->'cancellationRequest', 'null'::jsonb),
+                COALESCE(jsonb_typeof(p_record->'detailPending') = 'boolean' AND (p_record->>'detailPending')::BOOLEAN, FALSE), 1)
         ON CONFLICT (channel, external_id) DO NOTHING
         RETURNING version INTO v_version;
         RETURN v_version;
     END IF;
 
     -- O dono (tenant), o total e o pedido do app não mudam depois de gravados: o detalhe do pedido é imutável.
+    -- Exceção única: o pedido mínimo (detail_pending) recebe o detalhe recuperado do app, uma vez, na gravação
+    -- que manda detailPending FALSE. A loja do app (merchantId) tem que ser a mesma; outra loja é recusada.
+    SELECT * INTO v_row FROM delivery_orders
+     WHERE channel = p_channel AND external_id = v_external AND version = p_expected_version
+       FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+    IF v_row.detail_pending AND v_detail_done
+       AND v_order->>'merchantExternalId' IS DISTINCT FROM v_row.payload->>'merchantExternalId' THEN
+        RAISE EXCEPTION 'Detalhe do pedido % é de outra loja do app.', v_external USING ERRCODE = '42501';
+    END IF;
     UPDATE delivery_orders
-       SET status = (v_order->>'status')::delivery_order_status,
+       SET payload = CASE WHEN v_row.detail_pending AND v_detail_done THEN v_order - 'status' ELSE payload END,
+           total_amount = CASE WHEN v_row.detail_pending AND v_detail_done THEN v_total / 100 ELSE total_amount END,
+           display_id = CASE WHEN v_row.detail_pending AND v_detail_done
+                             THEN left(COALESCE(v_order->>'displayId', ''), 20) ELSE display_id END,
+           detail_pending = v_row.detail_pending AND NOT v_detail_done,
+           status = (v_order->>'status')::delivery_order_status,
            cancellation_pending = COALESCE((p_record->>'cancellationPending')::BOOLEAN, FALSE),
            needs_review = COALESCE((p_record->>'needsReview')::BOOLEAN, FALSE),
            review_reasons = ARRAY(SELECT jsonb_array_elements_text(COALESCE(p_record->'reviewReasons', '[]'::jsonb))),
@@ -404,6 +443,7 @@ BEGIN
         'tchefood_delivery_record_json(delivery_orders)',
         'tchefood_delivery_get_order(delivery_channel, VARCHAR)',
         'tchefood_delivery_list_orders(delivery_channel, INTEGER)',
+        'tchefood_delivery_list_detail_pending(delivery_channel, INTEGER)',
         'tchefood_delivery_has_event(delivery_channel, VARCHAR)',
         'tchefood_delivery_save_order(delivery_channel, INTEGER, JSONB)',
         'tchefood_delivery_record_event(JSONB)',

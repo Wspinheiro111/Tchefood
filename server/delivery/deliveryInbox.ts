@@ -27,6 +27,9 @@ export type DeliveryOrderRecord = {
   // Pedido de cancelamento da loja reservado antes da chamada ao app (null = nenhum). Não trava as outras ações
   // (isso é cancellationPending); só impede um segundo pedido de cancelamento.
   cancellationRequest: DeliveryCancellationRequest | null;
+  // Pedido gravado sem o detalhe do app (pedido mínimo: sem itens nem valores). O servidor tenta buscar o detalhe de
+  // novo a cada ciclo; até lá o pedido não pode virar venda nem NFC-e. Só vai de true para false, uma vez.
+  detailPending: boolean;
   // Precisa de olho humano: avisos do pedido, status desconhecido, ação recusada pelo app.
   needsReview: boolean;
   reviewReasons: string[];
@@ -114,6 +117,8 @@ export interface DeliveryRepository {
   // = DeliveryConcurrencyError, sem gravar nada.
   saveOrder(record: DeliveryOrderRecord): Promise<number>;
   listOrders(): Promise<DeliveryOrderRecord[]>;
+  // Pedidos do app ainda sem o detalhe (detailPending), mais antigos primeiro, no máximo limit.
+  listDetailPending(channel: DeliveryChannelKey, limit: number): Promise<DeliveryOrderRecord[]>;
 }
 
 export class InMemoryDeliveryRepository implements DeliveryRepository {
@@ -147,6 +152,14 @@ export class InMemoryDeliveryRepository implements DeliveryRepository {
       .map((record) => structuredClone(record))
       .sort((a, b) => b.order.createdAt.localeCompare(a.order.createdAt));
   }
+
+  async listDetailPending(channel: DeliveryChannelKey, limit: number): Promise<DeliveryOrderRecord[]> {
+    return [...this.orders.values()]
+      .filter((record) => record.order.channel === channel && record.detailPending)
+      .sort((a, b) => a.order.createdAt.localeCompare(b.order.createdAt))
+      .slice(0, limit)
+      .map((record) => structuredClone(record));
+  }
 }
 
 export type DeliveryCycleReport = {
@@ -179,6 +192,11 @@ export const DEFINITE_FAILURES: readonly string[] = ["invalid_request", "not_fou
 // Falhas temporárias (fora do ar, limite de uso, tempo esgotado) não contam: só adiam.
 export const ORDER_DETAIL_MAX_FAILURES = 10;
 const PERSISTENT_DETAIL_FAILURES: readonly string[] = ["auth_failed", "not_found", "invalid_request"];
+
+// Pedidos mínimos (detailPending) cujo detalhe é buscado de novo a cada ciclo, depois do ack: poucos, para não
+// atrasar o próximo polling nem gastar o limite de uso do app.
+export const DETAIL_RECOVERY_BATCH = 20;
+export const DETAIL_RECOVERED_REASON = "Detalhe do pedido recuperado do app: confira itens e valores.";
 
 export class DeliveryInbox {
   private readonly adapters = new Map<DeliveryChannelKey, DeliveryMarketplaceAdapter>();
@@ -218,8 +236,10 @@ export class DeliveryInbox {
     };
     if (this.running.has(adapter.channel)) return report;
     this.running.add(adapter.channel);
+    let polled = false;
     try {
       const events = await adapter.pollEvents();
+      polled = true;
       report.received = events.length;
       // Ordem cronológica: PLC antes de CFM do mesmo pedido.
       const ordered = [...events].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -256,6 +276,10 @@ export class DeliveryInbox {
       }
     } catch (error) {
       report.error = describe(error);
+    }
+    try {
+      // Depois do ack (não atrasa a confirmação dos eventos). Com o app fora do ar (polling falhou) não tenta.
+      if (polled) await this.recoverPendingDetails(adapter);
     } finally {
       this.running.delete(adapter.channel);
     }
@@ -565,6 +589,7 @@ export class DeliveryInbox {
         order,
         cancellationPending: false,
         cancellationRequest: null,
+        detailPending: fetched.reason !== null,
         needsReview: order.warnings.length > 0,
         reviewReasons: [...order.warnings],
         newOrderNotified: false,
@@ -607,6 +632,61 @@ export class DeliveryInbox {
     await repository.recordEvent(event);
     this.detailFailures.delete(`${event.channel}:${event.externalOrderId}`);
     return announce ? "new_order" : "updated";
+  }
+
+  // Pedido mínimo (detailPending): busca o detalhe no app de novo e, se vier legível, grava itens, valores, cliente,
+  // pagamentos etc. sem mexer no que os eventos já fizeram (status, cancelamento, negociação, pendências, aviso).
+  // Qualquer falha (app, banco, conflito de versão esgotado) deixa o pedido como está para o próximo ciclo e nunca
+  // derruba o ciclo.
+  private async recoverPendingDetails(adapter: DeliveryMarketplaceAdapter): Promise<void> {
+    const channel = adapter.channel;
+    let pending: DeliveryOrderRecord[];
+    try {
+      pending = await this.options.repository.listDetailPending(channel, DETAIL_RECOVERY_BATCH);
+    } catch {
+      return;
+    }
+    for (const candidate of pending) {
+      const externalId = candidate.order.externalId;
+      let detail: DeliveryOrder;
+      try {
+        detail = await adapter.getOrder(externalId);
+      } catch {
+        continue;
+      }
+      if (detail.channel !== channel || detail.externalId !== externalId) continue;
+      let recovered = false;
+      let saved: DeliveryOrderRecord;
+      try {
+        saved = await this.updateOrder(channel, externalId, (latest) => {
+          if (!latest.detailPending) return false;
+          const merchant = detail.merchantExternalId || latest.order.merchantExternalId;
+          if (merchant !== latest.order.merchantExternalId) {
+            // O banco recusa a troca de loja; a pendência fica para a conferência humana.
+            const reason = `O detalhe do pedido veio de outra loja do ${DELIVERY_CHANNEL_CATALOG[channel].label}: confira pelo Portal do Parceiro.`;
+            if (latest.reviewReasons.includes(reason)) return false;
+            flag(latest, reason);
+            return true;
+          }
+          // Cancelamento só vale pelo evento do app (que também zera reservas e negociação).
+          const status = detail.status === "cancelled" ? latest.order.status : mergeDeliveryStatus(latest.order.status, detail.status);
+          latest.order = { ...structuredClone(detail), channel, externalId, merchantExternalId: merchant, status };
+          for (const warning of detail.warnings) flag(latest, warning);
+          flag(latest, DETAIL_RECOVERED_REASON);
+          latest.detailPending = false;
+          recovered = true;
+          return true;
+        });
+      } catch {
+        continue;
+      }
+      if (!recovered) continue;
+      try {
+        await this.options.onOrderUpdated?.(saved);
+      } catch {
+        // Aviso de atualização é melhor esforço: o pedido recuperado já está gravado e marcado para conferência.
+      }
+    }
   }
 
   // Detalhe de um pedido que o PDV ainda não conhece. Devolve o pedido do app ou, quando o detalhe não tem
