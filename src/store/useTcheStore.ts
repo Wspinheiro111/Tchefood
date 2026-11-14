@@ -313,7 +313,15 @@ export interface PullStatus {
   cloud_staff_unknown: number;
   /** Última leitura das contas e mesas da nuvem (src/lib/sync/orderPull.ts). Ausente nas versões antigas. */
   last_orders_pull_at?: string | null;
+  /**
+   * De qual leitura é last_error: a leitura que dá certo limpa só o erro dela (a das contas não
+   * apaga a falha dos cadastros, e vice-versa). Ausente nas versões antigas (= cadastros).
+   */
+  last_error_source?: PullSource | null;
 }
+
+/** Leitura da nuvem: cadastros (cloudPull.ts) ou contas e mesas (orderPull.ts). */
+export type PullSource = 'catalog' | 'orders';
 
 export const EMPTY_PULL_STATUS: PullStatus = { last_pull_at: null, last_error: null, cloud_staff_unknown: 0 };
 
@@ -523,7 +531,7 @@ interface Actions {
    * serem cobrados; a conta encerrada fica como o banco mandar.
    */
   moveLateItemsToNewOrder: (eventId: UUID) => ActionResult<{ newOrderId: UUID; items: number }>;
-  setPullError: (message: string) => void;
+  setPullError: (message: string, source?: PullSource) => void;
   ackSyncedEvents: (eventIds: UUID[]) => void;
   setSyncError: (message: string | null, blockedEventId: UUID | null) => void;
   /** Tira da fila os eventos recusados pela nuvem e guarda em syncRejected. */
@@ -3755,7 +3763,13 @@ export const useTcheStore = create<TcheState>()(
               : {}),
             // Desativado em outro aparelho: sai da sessão aqui também.
             currentUserId: currentStillActive ? state.currentUserId : null,
-            pullStatus: { ...(state.pullStatus ?? EMPTY_PULL_STATUS), last_pull_at: nowISO(), last_error: null, cloud_staff_unknown: team.unknown },
+            pullStatus: {
+              ...(state.pullStatus ?? EMPTY_PULL_STATUS),
+              last_pull_at: nowISO(),
+              // O erro da leitura das contas continua até ela dar certo.
+              ...(state.pullStatus?.last_error_source === 'orders' ? {} : { last_error: null, last_error_source: null }),
+              cloud_staff_unknown: team.unknown,
+            },
           });
           return { ok: true, data: { unknownStaff: team.unknown } };
         },
@@ -3777,7 +3791,12 @@ export const useTcheStore = create<TcheState>()(
             payments: merged.payments,
             ownDeliveries: merged.ownDeliveries,
             tables: merged.tables,
-            pullStatus: { ...(state.pullStatus ?? EMPTY_PULL_STATUS), last_orders_pull_at: nowISO() },
+            pullStatus: {
+              ...(state.pullStatus ?? EMPTY_PULL_STATUS),
+              last_orders_pull_at: nowISO(),
+              // Limpa só o erro desta leitura: a falha dos cadastros continua aparecendo.
+              ...(state.pullStatus?.last_error_source === 'orders' ? { last_error: null, last_error_source: null } : {}),
+            },
           });
           return { ok: true, data: { replaced: merged.replaced } };
         },
@@ -3814,6 +3833,11 @@ export const useTcheStore = create<TcheState>()(
           );
           if (targets.length !== 1) return fail('A conta aberta desta mesa ainda não chegou a este aparelho. Toque em Sincronizar agora e tente de novo.');
           const target = targets[0]!;
+          // CPF na nota: com um CPF em cada conta, os itens iriam para a nota de outra pessoa
+          // (GPT, rodada 1 do PR #54). Fica para o caixa resolver com o cliente.
+          if (order.customer_cpf && target.customer_cpf && order.customer_cpf !== target.customer_cpf) {
+            return fail('As duas contas desta mesa têm CPF diferente na nota. Elas não podem ser juntadas sozinhas: chame o caixa.');
+          }
           // Ids novos: os itens nunca chegaram à nuvem (estavam atrás da conta recusada), mas um id
           // repetido seria ignorado pelo banco e o item ficaria fora da conta.
           const newId = new Map(items.map((i) => [i.id, uuid()]));
@@ -3824,7 +3848,14 @@ export const useTcheStore = create<TcheState>()(
             is_paid: false,
             combo_parent_item_id: i.combo_parent_item_id ? (newId.get(i.combo_parent_item_id) ?? i.combo_parent_item_id) : null,
           }));
-          const dropped = new Set(touching.map((e) => e.id));
+          // A mudança da mesa que estava na fila (ocupação e, junto, nome ou lugar mudados aqui)
+          // continua subindo, agora apontando para a conta que ficou: só a ligação com a conta
+          // recusada sai (GPT, rodada 1 do PR #54). O resto (a conta e os itens dela) sai da fila.
+          const retarget = (e: SyncEvent): SyncEvent =>
+            e.table === 'dining_tables' && e.payload.current_order_id === orderId
+              ? { ...e, payload: { ...e.payload, current_order_id: target.id, status: e.payload.status === 'FREE' ? 'OCCUPIED' : e.payload.status } }
+              : e;
+          const dropped = new Set(touching.filter((e) => e.table !== 'dining_tables').map((e) => e.id));
           const orderItems = [...s.orderItems.filter((i) => i.order_id !== orderId), ...moved];
           const recalculated = applyOrderTotals(target, orderItems, s.payments);
           set({
@@ -3837,8 +3868,8 @@ export const useTcheStore = create<TcheState>()(
                 ? { ...t, current_order_id: target.id, status: t.status === 'FREE' ? 'OCCUPIED' : t.status }
                 : t,
             ),
-            outbox: [...s.outbox.filter((e) => !dropped.has(e.id)), ...moved.map((i) => itemEvent('INSERT', i, s.kegTapProducts))],
-            syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)),
+            outbox: [...s.outbox.filter((e) => !dropped.has(e.id)).map(retarget), ...moved.map((i) => itemEvent('INSERT', i, s.kegTapProducts))],
+            syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)).map((r) => ({ ...r, event: retarget(r.event) })),
           });
           return { ok: true, data: { targetOrderId: target.id, items: moved.length } };
         },
@@ -3881,7 +3912,9 @@ export const useTcheStore = create<TcheState>()(
             opened_by_user_id: user.id,
             status: 'OPEN',
             customer_count: Math.max(1, order.customer_count),
-            customer_cpf: order.customer_cpf,
+            // Sem CPF: a conta encerrada pode ser de outro cliente da mesa (ou ter recebido os
+            // itens de outra conta), e o CPF dela iria para a nota errada.
+            customer_cpf: null,
             subtotal_items: 0,
             charge_service_fee: true,
             service_fee_pct: tenant.default_service_fee_pct,
@@ -3949,7 +3982,8 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: { added: staff.filter((u) => !before.has(u.id)).length } };
         },
 
-        setPullError: (message) => set((s) => ({ pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), last_error: message } })),
+        setPullError: (message, source = 'catalog') =>
+          set((s) => ({ pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), last_error: message, last_error_source: source } })),
 
         ackSyncedEvents: (eventIds) => {
           if (eventIds.length === 0) return;

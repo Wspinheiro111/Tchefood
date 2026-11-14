@@ -4113,6 +4113,177 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(sql(`SELECT charge_service_fee || ' ' || (service_fee_amount > 0) FROM orders WHERE id = '${order.id}'`)).toBe('true true');
     });
 
+    it('mesa com conta aberta não fica livre por evento velho que só troca a situação (GPT, rodada 1 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(54);
+      await expectSynced('mesa 54');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      await expectSynced('conta 54');
+      for (const status of ['FREE', 'DIRTY']) {
+        const stale = await rawB('PATCH', `dining_tables?id=eq.${mesa.id}`, { status, current_order_id: order.id, label: 'Mesa 54 janela' });
+        expect(stale.status, stale.body).toBeLessThan(300);
+        expect(sql(`SELECT status || ' ' || current_order_id || ' ' || label FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(`OCCUPIED ${order.id} Mesa 54 janela`);
+      }
+      // Situação de mesa ocupada (aguardando a conta) continua passando.
+      expect((await rawB('PATCH', `dining_tables?id=eq.${mesa.id}`, { status: 'WAITING_BILL', current_order_id: order.id })).status).toBeLessThan(300);
+      expect(sql(`SELECT status FROM dining_tables WHERE id = '${mesa.id}'`)).toBe('WAITING_BILL');
+    });
+
+    it('conta não troca de mesa por UPDATE nem por upsert (GPT, rodada 2 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const [m1, m2] = [tableNo(55), tableNo(56)];
+      await expectSynced('mesas 55 e 56');
+      const x = ok(st().openTable(m1.id, 2, null));
+      await expectSynced('conta 55');
+      const y = await bOpens(m2.id);
+      const patch = await rawB('PATCH', `orders?id=eq.${y}`, { table_id: m1.id });
+      expect(patch.status).toBeGreaterThanOrEqual(400);
+      expect(patch.body).toMatch(/TCHEFOOD_MESA_TROCA/);
+      const row = JSON.parse(sql(`SELECT row_to_json(o) FROM orders o WHERE id = '${y}'`));
+      const res = await fetchB()(`http://cloud.test/rest/v1/orders?on_conflict=id`, {
+        method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ ...row, table_id: m1.id }),
+      });
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(sql(`SELECT table_id FROM orders WHERE id = '${y}'`)).toBe(m2.id);
+      expect(sql(`SELECT current_order_id FROM dining_tables WHERE id = '${m1.id}'`)).toBe(x.id);
+      expect(sql(`SELECT current_order_id FROM dining_tables WHERE id = '${m2.id}'`)).toBe(y);
+      // O reenvio da mesma conta, com a mesma mesa, passa.
+      expect((await rawB('PATCH', `orders?id=eq.${y}`, { table_id: m2.id, customer_count: 3 })).status).toBeLessThan(300);
+    });
+
+    it('a leitura das contas só traz a loja do token, mesmo pedindo id de outra loja; anon não lê (GPT, rodada 2 do PR #54)', async () => {
+      const TENANT_B = '33333333-3333-4333-8333-333333333333';
+      const [tb, ob, ib, pb] = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+      sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT_B}', 'Outra loja', 'Outra loja Ltda', '33444555000181') ON CONFLICT (id) DO NOTHING;
+           SET session_replication_role = replica;
+           INSERT INTO dining_tables (id, tenant_id, number, label, status, current_order_id) VALUES ('${tb}', '${TENANT_B}', 901, 'Mesa B', 'OCCUPIED', '${ob}');
+           INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id, status) VALUES ('${ob}', '${TENANT_B}', '${tb}', '${crypto.randomUUID()}', 'OPEN');
+           INSERT INTO order_items (id, order_id, product_id, waiter_id, unit_price, total_item_price, sector) VALUES ('${ib}', '${ob}', '${productId}', '${crypto.randomUUID()}', 9, 9, 'KITCHEN');
+           INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, acquirer) VALUES ('${pb}', '${ob}', '${TENANT_B}', '${crypto.randomUUID()}', 9, 'CASH', 'CASH_DESK');`);
+      const fetchOther = () => postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT_B, sub: 'device-other' }, emulatorLog);
+      const mine = await fetchCloudOrders(cfgA(), TENANT, fetchA(), [ob]);
+      expect(mine.orders.some((o) => o.id === ob)).toBe(false);
+      expect(mine.orderItems.some((i) => i.id === ib)).toBe(false);
+      expect(mine.payments.some((p) => p.id === pb)).toBe(false);
+      expect(mine.tables.some((t) => t.id === tb)).toBe(false);
+      expect(mine.orders.length).toBeGreaterThan(0);
+      const theirs = await fetchCloudOrders(cfgA(), TENANT_B, fetchOther());
+      expect(theirs.orders.map((o) => o.id)).toEqual([ob]);
+      expect(theirs.orderItems.map((i) => i.id)).toEqual([ib]);
+      expect(theirs.payments.map((p) => p.id)).toEqual([pb]);
+      expect(theirs.tables.map((t) => t.id)).toEqual([tb]);
+      // O token de uma loja lendo como se fosse a outra: a resposta não bate e nada é aceito.
+      await expect(fetchCloudOrders(cfgA(), TENANT, fetchOther())).rejects.toThrow(/não é da loja deste aparelho/);
+      expect(sql(`SELECT has_function_privilege('anon', 'tchefood_pull_orders(jsonb)', 'EXECUTE')`)).toBe('f');
+      expect(sql(`SELECT has_function_privilege('authenticated', 'tchefood_pull_orders(jsonb)', 'EXECUTE')`)).toBe('t');
+    });
+
+    it('evento de outro registro parado na fila não segura as contas: o fechamento feito em B desce (GPT, rodada 1 do PR #54)', async () => {
+      forgetPinFailures();
+      login(CASHIER_PIN);
+      const mesa = tableNo(57);
+      await expectSynced('mesa 57');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await expectSynced('conta 57');
+      // Um cadastro na fila que a nuvem não aceita agora (HTTP 503, nova tentativa depois).
+      const cat = st().categories[0]!;
+      useTcheStore.setState((s) => ({ outbox: [...s.outbox, { id: crypto.randomUUID(), table: 'categories', op: 'UPDATE', row_id: cat.id, payload: { ...cat }, created_at: new Date().toISOString() }] }));
+      const flaky: typeof fetchA = () => {
+        const inner = fetchA();
+        return (url, init) => (/\/rest\/v1\/categories/.test(url) ? Promise.resolve(new Response('{}', { status: 503 })) : inner(url, init));
+      };
+      await bPaysCard(order.id, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${order.id}'`)));
+      expect(sql(`SELECT status FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED');
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null } });
+      await syncOnce(flaky());
+      expect(st().outbox.some((e) => e.table === 'categories')).toBe(true);
+      expect(st().orders.find((o) => o.id === order.id)!.status).toBe('CLOSED');
+      expect(st().payments.filter((x) => x.order_id === order.id)).toHaveLength(1);
+      expect(st().tables.find((t) => t.id === mesa.id)).toMatchObject({ status: 'FREE', current_order_id: null });
+      useTcheStore.setState((s) => ({ outbox: s.outbox.filter((e) => e.table !== 'categories') }));
+    });
+
+    it('junção com a conta da mesa: CPF diferente não junta; a mudança da mesa na fila sobe; conta fechada antes da junção vai para uma conta nova (GPT, rodada 1 do PR #54)', async () => {
+      forgetPinFailures();
+      login(CASHIER_PIN);
+      const mesa = tableNo(58);
+      await expectSynced('mesa 58');
+      const p = st().products.find((x) => x.id === productId)!;
+      const line = { product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector };
+      const y = ok(st().openTable(mesa.id, 2, '52998224725'));
+      ok(st().addToTray({ ...line, order_id: y.id }));
+      ok(st().dispatchTray(y.id));
+      // Enquanto a conta de A espera, o dono troca o nome da mesa (o evento leva a ligação com a conta).
+      login(OWNER_PIN);
+      ok(st().saveTable({ ...st().tables.find((t) => t.id === mesa.id)!, label: 'Mesa 58 varanda' }));
+      login(CASHIER_PIN);
+      const x = await bOpens(mesa.id);
+      sql(`UPDATE orders SET customer_cpf = '11144477735' WHERE id = '${x}'`);
+      await bAddsItem(x);
+      await sync();
+      const rej = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === y.id)!;
+      expect(rej.message).toMatch(/TCHEFOOD_MESA_OCUPADA/);
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null } });
+      await syncOnce(fetchA());
+      expect(st().orders.find((o) => o.id === x)!.customer_cpf).toBe('11144477735');
+      // CPF diferente nas duas contas: não junta, e nada muda.
+      const outboxBefore = st().outbox.length;
+      expect(st().moveRejectedOrderToTableOrder(rej.event.id).ok).toBe(false);
+      expect(st().outbox).toHaveLength(outboxBefore);
+      expect(st().orders.some((o) => o.id === y.id)).toBe(true);
+      // Sem CPF na conta da mesa, junta. B fecha a conta da mesa logo antes de os itens subirem.
+      sql(`UPDATE orders SET customer_cpf = NULL WHERE id = '${x}'`);
+      useTcheStore.setState((s) => ({ orders: s.orders.map((o) => (o.id === x ? { ...o, customer_cpf: null } : o)) }));
+      ok(st().moveRejectedOrderToTableOrder(rej.event.id));
+      await bPaysCard(x, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${x}'`)));
+      expect(sql(`SELECT status FROM orders WHERE id = '${x}'`)).toBe('CLOSED');
+      await sync();
+      // O nome novo da mesa subiu; o item foi recusado na conta fechada (que não ficou devendo).
+      expect(sql(`SELECT label FROM dining_tables WHERE id = '${mesa.id}'`)).toBe('Mesa 58 varanda');
+      expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${x}'`)).toBe('CLOSED 0.00');
+      const late = st().syncRejected.find((r) => r.event.table === 'order_items' && /TCHEFOOD_CONTA_ENCERRADA/.test(r.message ?? ''))!;
+      expect(late).toBeTruthy();
+      // O item vai para uma conta nova da mesa, sem o CPF de ninguém, e é cobrado lá.
+      const fresh = ok(st().moveLateItemsToNewOrder(late.event.id));
+      await expectSynced('conta nova da mesa 58');
+      expect(sql(`SELECT status || ' ' || (remaining_balance > 0) || ' ' || COALESCE(customer_cpf, '-') FROM orders WHERE id = '${fresh.newOrderId}'`)).toBe('OPEN true -');
+      expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${fresh.newOrderId}'`)).toBe('1');
+      expect(sql(`SELECT current_order_id FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(fresh.newOrderId);
+    });
+
+    it('conta com produto que o aparelho não tem e leitura dos cadastros falhando: a foto não é aplicada até o cadastro chegar (GPT, rodadas 1 e 2 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(259);
+      await expectSynced('mesa 259');
+      // B cadastra um produto e abre a mesa com ele.
+      const prod = crypto.randomUUID();
+      const cat = st().categories[0]!.id;
+      sql(`INSERT INTO products (id, tenant_id, category_id, code, name, price, sector) VALUES ('${prod}', '${TENANT}', '${cat}', 'NOVO-259', 'Prato novo 259', 21.5, 'KITCHEN')`);
+      const x = await bOpens(mesa.id);
+      const r = await rawB('POST', 'order_items', {
+        id: crypto.randomUUID(), order_id: x, product_id: prod, waiter_id: cashierId(), quantity: 1, unit_price: 21.5, modifiers_unit_price: 0,
+        sector: 'KITCHEN', status: 'PENDING', origin: 'WAITER', priced_at: new Date().toISOString(), created_at: new Date().toISOString(),
+      });
+      expect(r.status, r.body).toBeLessThan(300);
+      const catalogDown: typeof fetchA = () => {
+        const inner = fetchA();
+        return (url, init) => (/\/rest\/v1\/products/.test(url) ? Promise.resolve(new Response('{"message":"falhou"}', { status: 500 })) : inner(url, init));
+      };
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null } });
+      await syncOnce(catalogDown());
+      expect(st().orders.some((o) => o.id === x)).toBe(false);
+      expect(st().pullStatus.last_error).toBeTruthy();
+      // O cadastro volta: a conta chega com o produto, e o erro some.
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null, last_pull_at: null } });
+      await syncOnce(fetchA());
+      expect(st().products.some((p) => p.id === prod)).toBe(true);
+      expect(st().orderItems.some((i) => i.order_id === x && i.product_id === prod)).toBe(true);
+      expect(st().pullStatus.last_error).toBeNull();
+    });
+
     it('a rodada de sincronização lê as contas a cada 10 s, com a fila vazia', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(46);

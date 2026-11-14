@@ -35,6 +35,8 @@
 --  7. Item na cozinha não volta atrás (pronto/entregue) por uma atualização velha.
 --  8. Os 10% retirados com PIN de gerente em outro aparelho não voltam por uma cópia velha
 --     da conta: só a reativação registrada (SERVICE_FEE_RESTORED) traz a taxa de volta.
+--  9. A conta não troca de mesa por UPDATE (o app não tem troca de mesa): a trava de uma conta
+--     por mesa vale no INSERT e não pode ser contornada depois.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -166,9 +168,13 @@ BEGIN
     IF NEW.current_order_id IS NOT DISTINCT FROM OLD.current_order_id THEN
         -- Mesma conta: só a situação muda (ocupada, aguardando a conta). Conta já encerrada
         -- não deixa a mesa ocupada de novo.
+        -- Com a conta aberta, a mesa só fica numa situação de mesa ocupada (ocupada, aguardando
+        -- a conta, pagando): um evento velho que só troca a situação para livre ou suja, com a
+        -- mesma conta, não libera a mesa (GPT, rodada 1 do PR #54).
         IF NEW.current_order_id IS NOT NULL AND NEW.status IS DISTINCT FROM OLD.status
-           AND NOT EXISTS (SELECT 1 FROM orders WHERE id = NEW.current_order_id AND status IN ('OPEN', 'PAYING')) THEN
-            RAISE NOTICE 'TCHEFOOD_MESA: conta % já encerrada; a situação da mesa % fica como está.', NEW.current_order_id, OLD.id;
+           AND (NEW.status NOT IN ('OCCUPIED', 'WAITING_BILL', 'PAYING')
+                OR NOT EXISTS (SELECT 1 FROM orders WHERE id = NEW.current_order_id AND status IN ('OPEN', 'PAYING'))) THEN
+            RAISE NOTICE 'TCHEFOOD_MESA: a mesa % aponta para a conta % e a situação % não vale para ela; a situação fica como está.', OLD.id, NEW.current_order_id, NEW.status;
             NEW.status := OLD.status;
             NEW.updated_at := OLD.updated_at;
         END IF;
@@ -341,6 +347,28 @@ DROP TRIGGER IF EXISTS trg_orders_000_fee_stays ON orders;
 CREATE TRIGGER trg_orders_000_fee_stays BEFORE UPDATE OF charge_service_fee ON orders
     FOR EACH ROW EXECUTE FUNCTION tchefood_order_fee_stays();
 
+-- -----------------------------------------------------------------------------
+-- 9. A conta não troca de mesa
+-- -----------------------------------------------------------------------------
+-- A trava de uma conta aberta por mesa (seção 2) confere a mesa no INSERT. Um UPDATE (ou
+-- upsert) que mudasse table_id levaria uma conta para a mesa de outra sem passar pela trava,
+-- e a mesa antiga continuaria apontando para ela (GPT, rodada 2 do PR #54). O app não troca
+-- conta de mesa (a conta nasce na mesa e fica nela), então a troca é recusada; o reenvio com
+-- a mesma mesa passa.
+CREATE OR REPLACE FUNCTION tchefood_order_table_stays()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.table_id IS DISTINCT FROM OLD.table_id THEN
+        RAISE EXCEPTION 'TCHEFOOD_MESA_TROCA: a conta % é da mesa % e não muda de mesa.', OLD.id, OLD.table_id
+            USING DETAIL = json_build_object('order_id', OLD.id, 'table_id', OLD.table_id)::text;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_orders_000_table_stays ON orders;
+CREATE TRIGGER trg_orders_000_table_stays BEFORE UPDATE OF table_id ON orders
+    FOR EACH ROW EXECUTE FUNCTION tchefood_order_table_stays();
+
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
@@ -354,5 +382,6 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_item_paid_stays() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_item_progress_stays() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_order_fee_stays() FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_order_table_stays() FROM PUBLIC, anon, authenticated;
     END IF;
 END $$;

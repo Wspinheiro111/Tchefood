@@ -153,6 +153,10 @@ describe('mergeCloudOrders', () => {
     expect(missingCatalog(c, { productIds: ['p1'], tableIds: [T1] })).toBe(false);
     expect(missingCatalog(c, { productIds: [], tableIds: [T1] })).toBe(true);
     expect(missingCatalog(c, { productIds: ['p1'], tableIds: [] })).toBe(true);
+    // Meio a meio: o sabor da outra metade também precisa do cadastro.
+    const half = cloud({ orders: [order(O1)], orderItems: [item('i1', O1, { half_product_ids: ['p1', 'p2'] })] });
+    expect(missingCatalog(half, { productIds: ['p1'], tableIds: [T1] })).toBe(true);
+    expect(missingCatalog(half, { productIds: ['p1', 'p2'], tableIds: [T1] })).toBe(false);
   });
 });
 
@@ -173,6 +177,13 @@ describe('parseCloudOrders', () => {
     expect(r.orderItems[0]).toMatchObject({ quantity: 1, half_product_ids: [] });
     expect(r.payments[0]!.amount).toBe(10);
     expect(r.ownDeliveries[0]).toMatchObject({ order_id: O1, delivery_fee: 5, pay_on_delivery: true });
+    expect(r.orderItems[0]).toMatchObject({ status: 'PENDING', sector: 'KITCHEN', origin: 'WAITER', weight_source: null });
+    expect(r.payments[0]).toMatchObject({ method: 'CREDIT', status: 'APPROVED', acquirer: 'STONE' });
+    const all = parseCloudOrders({ ...body(), orders: [{ ...body().orders[0], fulfillment_type: 'DELIVERY' }],
+      order_items: [{ ...body().order_items[0], status: 'DELIVERED', sector: 'NONE', origin: 'KIOSK', weight_source: 'SCALE' }],
+      payments: [{ ...body().payments[0], method: 'CASH', status: 'REFUNDED', acquirer: 'CASH_DESK' }] }, TEN);
+    expect(all.orders[0]!.fulfillment_type).toBe('DELIVERY');
+    expect(all.orderItems[0]).toMatchObject({ status: 'DELIVERED', sector: 'NONE', origin: 'KIOSK', weight_source: 'SCALE' });
     expect(r.server_now).toBe('2026-11-14T20:00:00.123Z');
   });
 
@@ -191,6 +202,15 @@ describe('parseCloudOrders', () => {
       ['entrega de outra loja', (b) => ({ ...b, own_deliveries: [{ ...b.own_deliveries[0], tenant_id: 'outra' }] })],
       ['entrega com situação desconhecida', (b) => ({ ...b, own_deliveries: [{ ...b.own_deliveries[0], status: 'LOST' }] })],
       ['duas entregas na conta', (b) => ({ ...b, own_deliveries: [b.own_deliveries[0], { ...b.own_deliveries[0], id: 'd2' }] })],
+      ['situação de item desconhecida', (b) => ({ ...b, order_items: [{ ...b.order_items[0], status: 'UNKNOWN' }] })],
+      ['setor desconhecido', (b) => ({ ...b, order_items: [{ ...b.order_items[0], sector: 'PIZZA' }] })],
+      ['origem desconhecida', (b) => ({ ...b, order_items: [{ ...b.order_items[0], origin: 'ROBO' }] })],
+      ['pesagem desconhecida', (b) => ({ ...b, order_items: [{ ...b.order_items[0], weight_source: 'OLHO' }] })],
+      ['situação de pagamento desconhecida', (b) => ({ ...b, payments: [{ ...b.payments[0], status: 'APPROVADD' }] })],
+      ['forma de pagamento desconhecida', (b) => ({ ...b, payments: [{ ...b.payments[0], method: 'CHEQUE' }] })],
+      ['adquirente desconhecida', (b) => ({ ...b, payments: [{ ...b.payments[0], acquirer: 'OUTRA' }] })],
+      ['tipo de pedido desconhecido', (b) => ({ ...b, orders: [{ ...b.orders[0], fulfillment_type: 'DRONE' }] })],
+      ['valor que não é texto', (b) => ({ ...b, payments: [{ ...b.payments[0], method: 1 }] })],
     ];
     for (const [name, f] of cases) expect(() => parseCloudOrders(f(body()), TEN), name).toThrow(/Não foi possível ler as contas da nuvem/);
   });
@@ -223,6 +243,17 @@ describe('applyCloudOrders no store', () => {
     expect(r.ok).toBe(true);
     expect(st().orders.some((o) => o.id === opened.data.id)).toBe(true);
     expect(st().tables.find((t) => t.id === free.id)).toMatchObject({ status: 'OCCUPIED', current_order_id: opened.data.id });
+  });
+
+  it('a leitura das contas que dá certo limpa só o erro dela, não o dos cadastros (GPT, rodada 1 do PR #54)', () => {
+    const tenantId = st().tenant.id;
+    useTcheStore.setState({ cloud: session(tenantId), outbox: [], syncRejected: [] });
+    st().setPullError('Não foi possível ler as contas da nuvem: HTTP 500', 'orders');
+    expect(st().applyCloudOrders(cloud({ tenant_id: tenantId })).ok).toBe(true);
+    expect(st().pullStatus).toMatchObject({ last_error: null, last_error_source: null });
+    st().setPullError('Cadastros: HTTP 500', 'catalog');
+    expect(st().applyCloudOrders(cloud({ tenant_id: tenantId })).ok).toBe(true);
+    expect(st().pullStatus).toMatchObject({ last_error: 'Cadastros: HTTP 500', last_error_source: 'catalog' });
   });
 });
 
@@ -261,6 +292,25 @@ describe('moveRejectedOrderToTableOrder (mesa ocupada por outra conta)', () => {
     expect(st().syncRejected).toHaveLength(1);
   });
 
+  it('CPF diferente nas duas contas: não junta (GPT, rodada 1 do PR #54); sem CPF na conta da mesa, junta', () => {
+    const { y, insert } = setup();
+    useTcheStore.setState((s) => ({ orders: s.orders.map((o) => (o.id === y.id ? { ...o, customer_cpf: '52998224725' } : o.id === O2 ? { ...o, customer_cpf: '11144477735' } : o)) }));
+    const r = st().moveRejectedOrderToTableOrder(insert.id);
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/CPF diferente/) });
+    expect(st().orders.some((o) => o.id === y.id)).toBe(true);
+    useTcheStore.setState((s) => ({ orders: s.orders.map((o) => (o.id === O2 ? { ...o, customer_cpf: null } : o)) }));
+    expect(st().moveRejectedOrderToTableOrder(insert.id).ok).toBe(true);
+  });
+
+  it('a mudança da mesa que estava na fila continua, apontando para a conta da mesa (GPT, rodada 1 do PR #54)', () => {
+    const { insert, free } = setup();
+    const tableEvent = st().outbox.find((e) => e.table === 'dining_tables' && e.row_id === free.id)!;
+    useTcheStore.setState((s) => ({ outbox: s.outbox.map((e) => (e.id === tableEvent.id ? { ...e, payload: { ...e.payload, label: 'Mesa da varanda' } } : e)) }));
+    expect(st().moveRejectedOrderToTableOrder(insert.id).ok).toBe(true);
+    const kept = st().outbox.find((e) => e.id === tableEvent.id)!;
+    expect(kept.payload).toMatchObject({ current_order_id: O2, label: 'Mesa da varanda', status: 'OCCUPIED' });
+  });
+
   it('sem a conta da mesa vinda da nuvem neste aparelho: pede para sincronizar', () => {
     const { insert } = setup();
     useTcheStore.setState({ orders: st().orders.filter((o) => o.id !== O2) });
@@ -283,21 +333,11 @@ describe('moveRejectedOrderToTableOrder (mesa ocupada por outra conta)', () => {
     expect(moved.length).toBe(oldIds.length);
     expect(moved.some((i) => oldIds.includes(i.id))).toBe(false);
     expect(st().outbox.every((e) => e.row_id !== y.id && e.payload.order_id !== y.id && e.payload.current_order_id !== y.id)).toBe(true);
+    // A atualização da mesa continua na fila, agora com a conta que ficou.
+    expect(st().outbox.some((e) => e.table === 'dining_tables' && e.payload.current_order_id === O2)).toBe(true);
     expect(st().outbox.filter((e) => e.table === 'order_items' && e.op === 'INSERT' && e.payload.order_id === O2)).toHaveLength(moved.length);
     expect(st().syncRejected).toHaveLength(0);
     expect(st().tables.find((t) => t.id === free.id)!.current_order_id).toBe(O2);
   });
 });
 
-describe('onlyHeldLeft (contas descem com a fila só segurada atrás de recusa)', () => {
-  it('só eventos de registro recusado: segurados; um evento livre: não', async () => {
-    const { onlyHeldLeft } = await import('../lib/sync/supabaseSync');
-    const rejected = ev('orders', O1, {}, { op: 'INSERT' });
-    const child = ev('order_items', 'i1', { order_id: O1 }, { op: 'INSERT' });
-    const table = ev('dining_tables', T1, { current_order_id: O1 });
-    expect(onlyHeldLeft([child, table], [rejected])).toBe(true);
-    expect(onlyHeldLeft([child, ev('orders', O2)], [rejected])).toBe(false);
-    expect(onlyHeldLeft([child], [])).toBe(false);
-    expect(onlyHeldLeft([], [])).toBe(true);
-  });
-});

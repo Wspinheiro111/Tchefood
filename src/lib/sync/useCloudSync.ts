@@ -6,7 +6,7 @@
  */
 import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
-import { flushOutbox, needsRefresh, onlyHeldLeft, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
+import { flushOutbox, needsRefresh, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
 import { fetchCloudOrders, missingCatalog } from './orderPull';
 
@@ -32,10 +32,10 @@ async function pullCatalog(cfg: SyncConfig, fetchFn: FetchLike): Promise<boolean
     // Trocou de loja ou desconectou enquanto lia: descarta.
     if (!st.cloud || st.tenant.id !== tenantId) return false;
     const r = st.applyCloudSnapshot(snapshot);
-    if (!r.ok) st.setPullError(r.error);
+    if (!r.ok) st.setPullError(r.error, 'catalog');
     return r.ok;
   } catch (e) {
-    useTcheStore.getState().setPullError((e as Error).message);
+    useTcheStore.getState().setPullError((e as Error).message, 'catalog');
     return false;
   }
 }
@@ -52,17 +52,25 @@ async function pullOrders(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh: boo
     const snapshot = await fetchCloudOrders(cfg, tenantId, fetchFn, openHere);
     let st = useTcheStore.getState();
     if (!st.cloud || st.tenant.id !== tenantId) return;
-    if (!catalogFresh && missingCatalog(snapshot, { productIds: st.products.map((p) => p.id), tableIds: st.tables.map((t) => t.id) })) {
+    const known = () => ({ productIds: useTcheStore.getState().products.map((p) => p.id), tableIds: useTcheStore.getState().tables.map((t) => t.id) });
+    if (!catalogFresh && missingCatalog(snapshot, known())) {
       await pullCatalog(cfg, fetchFn);
       st = useTcheStore.getState();
       if (!st.cloud || st.tenant.id !== tenantId) return;
     }
+    // Ainda falta produto ou mesa (a leitura dos cadastros falhou, ou ainda não tem o
+    // cadastro novo): a foto não é aplicada, o aparelho fica com a anterior e tenta de novo
+    // na próxima rodada (GPT, rodadas 1 e 2 do PR #54).
+    if (missingCatalog(snapshot, known())) {
+      st.setPullError('Não foi possível ler as contas da nuvem: falta o cadastro de um produto ou mesa usado nelas. Tentando de novo.', 'orders');
+      return;
+    }
     // Uma mudança deste aparelho pode ter entrado na fila enquanto a leitura voltava: o
     // store confere a fila de agora e deixa essa conta como está.
     const r = st.applyCloudOrders(snapshot);
-    if (!r.ok) st.setPullError(r.error);
+    if (!r.ok) st.setPullError(r.error, 'orders');
   } catch (e) {
-    useTcheStore.getState().setPullError((e as Error).message);
+    useTcheStore.getState().setPullError((e as Error).message, 'orders');
   }
 }
 
@@ -124,17 +132,15 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
       const more = result.rejected.length > 1 ? ` (+${result.rejected.length - 1})` : '';
       st.setSyncError(`Servidor recusou um evento${more} (HTTP ${first.status}): ${first.message}`, null);
     }
-    // Fila zerou nesta rodada: lê a nuvem agora, se estava na hora.
+    // Cadastros: só com a fila zerada nesta rodada (o que é daqui sobe antes).
+    // Contas e mesas: na hora certa, mesmo com a fila cheia, segurada atrás de uma recusa ou
+    // esperando uma nova tentativa. A junção deixa como está a conta (e a mesa) com evento
+    // pendente; as outras descem. Sem isso, um evento de outro registro parado na fila
+    // escondia o fechamento e os pagamentos feitos em outro aparelho (GPT, rodada 1 do PR #54),
+    // e a conta que ficou na mesa nunca chegava para resolver a recusa de mesa ocupada (Codex).
     const after = useTcheStore.getState();
-    if (wantsPull && after.outbox.length === 0 && !result.retryLater) await pullOnce(cfg, fetchFn, due);
-    // Sobrou só o que está segurado atrás de um recusado: as contas continuam descendo (a
-    // junção deixa como está a conta com evento pendente). Sem isso, a conta que ficou na
-    // mesa nunca chegaria para resolver a recusa de mesa ocupada (Codex no PR #54) e nenhuma
-    // conta de outro aparelho desceria enquanto houvesse uma recusa.
-    else if (due.orders && !result.retryLater && after.outbox.length > 0
-      && onlyHeldLeft(after.outbox, (after.syncRejected ?? []).map((r) => r.event))) {
-      await pullOnce(cfg, fetchFn, { catalog: false, orders: true });
-    }
+    const catalog = due.catalog && after.outbox.length === 0 && !result.retryLater;
+    if (catalog || due.orders) await pullOnce(cfg, fetchFn, { catalog, orders: due.orders });
   } finally {
     running = false;
   }

@@ -19,7 +19,23 @@
  * pedido é pago na entrega para preparar antes do pagamento); a entrega com mudança daqui
  * pendente fica como está.
  */
-import type { DiningTable, Order, OrderItem, OwnDelivery, Payment, SyncEvent, UUID } from '../../types';
+import type {
+  AcquirerType,
+  DiningTable,
+  FulfillmentType,
+  ItemStatus,
+  Order,
+  OrderItem,
+  OrderItemOrigin,
+  OwnDelivery,
+  Payment,
+  PaymentMethod,
+  PaymentStatus,
+  ProductionSector,
+  SyncEvent,
+  UUID,
+  WeightSource,
+} from '../../types';
 import { recordKeys, type FetchLike, type SyncConfig } from './supabaseSync';
 
 /** Ocupação da mesa como está na nuvem (o cadastro da mesa vem pela leitura dos cadastros). */
@@ -37,6 +53,26 @@ export interface CloudOrders {
 }
 
 const DELIVERY_STATUSES: ReadonlyArray<OwnDelivery['status']> = ['PREPARING', 'READY', 'OUT', 'DELIVERED', 'CANCELED'];
+// Valores aceitos de cada campo de situação/tipo. O Record obriga a atualizar a lista quando
+// o tipo ganha um valor novo (senão a leitura recusaria um valor válido, ou aceitaria um inválido).
+const ITEM_STATUS: Record<ItemStatus, true> = { PENDING: true, PREPARING: true, READY: true, DELIVERED: true, CANCELED: true };
+const SECTOR: Record<ProductionSector, true> = { KITCHEN: true, BAR: true, GRILL: true, DESSERT: true, NONE: true };
+const ORIGIN: Record<OrderItemOrigin, true> = { WAITER: true, SMARTPOS: true, QRCODE_TABLE: true, KIOSK: true };
+const WEIGHT_SOURCE: Record<WeightSource, true> = { SCALE: true, MANUAL: true };
+const PAYMENT_METHOD: Record<PaymentMethod, true> = { CREDIT: true, DEBIT: true, PIX: true, VOUCHER: true, CASH: true };
+const PAYMENT_STATUS: Record<PaymentStatus, true> = { PENDING: true, APPROVED: true, DECLINED: true, REFUNDED: true };
+const ACQUIRER: Record<AcquirerType, true> = { STONE: true, PAGBANK: true, MOCK: true, CASH_DESK: true };
+const FULFILLMENT: Record<FulfillmentType, true> = { DINE_IN: true, TAKEOUT: true, DELIVERY: true };
+
+/** Valor de uma lista fechada; qualquer outro recusa a leitura inteira. */
+function oneOf<T extends string>(v: unknown, allowed: Record<T, true>, what: string): T {
+  if (typeof v !== 'string' || !Object.prototype.hasOwnProperty.call(allowed, v)) bad(`valor desconhecido em ${what}`);
+  return v as T;
+}
+
+function oneOfOrNull<T extends string>(v: unknown, allowed: Record<T, true>, what: string): T | null {
+  return v === null || v === undefined ? null : oneOf(v, allowed, what);
+}
 const ORDER_STATUSES: ReadonlyArray<Order['status']> = ['OPEN', 'PAYING', 'CLOSED', 'CANCELED'];
 const TABLE_STATUSES: ReadonlyArray<DiningTable['status']> = ['FREE', 'OCCUPIED', 'WAITING_BILL', 'PAYING', 'DIRTY'];
 
@@ -105,7 +141,7 @@ function toOrder(r: Row): Order {
     closed_at: isoOrNull(r.closed_at, 'orders.closed_at'),
     pickup_number: numOrNull(r.pickup_number, 'orders.pickup_number'),
     pickup_name: strOrNull(r.pickup_name),
-    fulfillment_type: (strOrNull(r.fulfillment_type) as Order['fulfillment_type']) ?? null,
+    fulfillment_type: oneOfOrNull(r.fulfillment_type, FULFILLMENT, 'orders.fulfillment_type'),
   };
 }
 
@@ -121,10 +157,10 @@ function toItem(r: Row): OrderItem {
     total_item_price: num(r.total_item_price, 'order_items.total_item_price'),
     meat_doneness: strOrNull(r.meat_doneness),
     notes: strOrNull(r.notes),
-    sector: str(r.sector, 'order_items.sector') as OrderItem['sector'],
-    status: str(r.status, 'order_items.status') as OrderItem['status'],
+    sector: oneOf(r.sector, SECTOR, 'order_items.sector'),
+    status: oneOf(r.status, ITEM_STATUS, 'order_items.status'),
     is_paid: r.is_paid === true,
-    origin: str(r.origin, 'order_items.origin') as OrderItem['origin'],
+    origin: oneOf(r.origin, ORIGIN, 'order_items.origin'),
     created_at: iso(r.created_at, 'order_items.created_at'),
     prepared_at: isoOrNull(r.prepared_at, 'order_items.prepared_at'),
     canceled_at: isoOrNull(r.canceled_at, 'order_items.canceled_at'),
@@ -132,7 +168,7 @@ function toItem(r: Row): OrderItem {
     cancel_reason: strOrNull(r.cancel_reason),
     weight_gross_grams: numOrNull(r.weight_gross_grams, 'order_items.weight_gross_grams'),
     weight_tare_grams: numOrNull(r.weight_tare_grams, 'order_items.weight_tare_grams'),
-    weight_source: (strOrNull(r.weight_source) as OrderItem['weight_source']) ?? null,
+    weight_source: oneOfOrNull(r.weight_source, WEIGHT_SOURCE, 'order_items.weight_source'),
     keg_volume_ml: numOrNull(r.keg_volume_ml, 'order_items.keg_volume_ml'),
     combo_parent_item_id: strOrNull(r.combo_parent_item_id),
     priced_at: isoOrNull(r.priced_at, 'order_items.priced_at'),
@@ -150,9 +186,9 @@ function toPayment(r: Row): Payment {
     terminal_id: strOrNull(r.terminal_id),
     amount: num(r.amount, 'payments.amount'),
     tip_amount: num(r.tip_amount, 'payments.tip_amount'),
-    method: str(r.method, 'payments.method') as Payment['method'],
-    status: str(r.status, 'payments.status') as Payment['status'],
-    acquirer: str(r.acquirer, 'payments.acquirer') as Payment['acquirer'],
+    method: oneOf(r.method, PAYMENT_METHOD, 'payments.method'),
+    status: oneOf(r.status, PAYMENT_STATUS, 'payments.status'),
+    acquirer: oneOf(r.acquirer, ACQUIRER, 'payments.acquirer'),
     acquirer_cnpj: strOrNull(r.acquirer_cnpj),
     card_brand: strOrNull(r.card_brand),
     nsu: strOrNull(r.nsu),
@@ -410,5 +446,8 @@ export function mergeCloudOrders(
 export function missingCatalog(cloud: CloudOrders, known: { productIds: Iterable<UUID>; tableIds: Iterable<UUID> }): boolean {
   const products = new Set(known.productIds);
   const tables = new Set(known.tableIds);
-  return cloud.orderItems.some((i) => !products.has(i.product_id)) || cloud.orders.some((o) => !tables.has(o.table_id));
+  return (
+    cloud.orderItems.some((i) => !products.has(i.product_id) || i.half_product_ids.some((h) => !products.has(h)))
+    || cloud.orders.some((o) => !tables.has(o.table_id))
+  );
 }

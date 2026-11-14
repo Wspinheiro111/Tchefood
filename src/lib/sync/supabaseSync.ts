@@ -431,26 +431,6 @@ export function recordKeys(event: SyncEvent): string[] {
 }
 
 /**
- * A fila só tem eventos segurados atrás de recusados (a mesma regra de flushOutbox: registro
- * de um recusado, ou de um segurado, ou que espera um evento que não subiu). Uma rodada de
- * envio não sobe nenhum deles até alguém resolver a recusa.
- */
-export function onlyHeldLeft(events: readonly SyncEvent[], held: readonly SyncEvent[]): boolean {
-  if (held.length === 0) return events.length === 0;
-  const blocked = new Set(held.flatMap(recordKeys));
-  const unsent = new Set([...held, ...events].map((e) => e.id));
-  for (const event of serverOrder([...events])) {
-    const keys = recordKeys(event);
-    if (keys.some((k) => blocked.has(k)) || (event.depends_on_event_ids ?? []).some((id) => unsent.has(id))) {
-      for (const k of keys) blocked.add(k);
-      continue;
-    }
-    return false;
-  }
-  return true;
-}
-
-/**
  * Envia a fila em ordem até acabar, até um erro de rede/servidor, ou até `limit` envios
  * (eventos segurados não contam).
  * Um evento recusado (4xx) não para o envio: vai para `rejected` e o próximo segue.
