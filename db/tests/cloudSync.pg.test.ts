@@ -12,19 +12,24 @@
 import { spawn } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, migratePersisted, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
+import { afterEach, beforeAll, describe, expect, it, vi, beforeEach } from 'vitest';
+
+import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, migratePersisted, REJECTED_ORDER_ONLY_CPF, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
 import { availableCashback, cashbackOrphanCents } from '../../src/lib/loyalty';
 import type { CashbackLedgerEntry } from '../../src/types';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
 import { fetchCashbackPending, fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, reconcileCashback } from '../../src/lib/sync/cloudPull';
 import { fetchCloudOrders } from '../../src/lib/sync/orderPull';
 import { runReconcileDecision } from '../../src/lib/cashbackReconcile';
-import { syncOnce } from '../../src/lib/sync/useCloudSync';
+import { resetPullLoopForTests, syncOnce } from '../../src/lib/sync/useCloudSync';
 import { useArStore } from '../../src/store/useArStore';
 import { sampleNfeXml } from '../../src/data/sampleNfe';
 import { setReviewHold } from '../../src/lib/payments/reviewHolds';
 import { createSupabaseLikeDb, pgTargetFromEnv, postgrestFetch, psql, psqlFile, type EmulatorLog, type PgTarget } from './postgrestEmulator';
+
+// A espera depois de falha da leitura das contas fica na memória do módulo: cada teste começa sem
+// ela, como um aparelho que acabou de abrir o app (auditoria interna, rodada 8 do PR #54).
+beforeEach(() => resetPullLoopForTests());
 
 const target = pgTargetFromEnv();
 const DB = 'tchefood_cloud_sync_test';
@@ -197,8 +202,11 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     vi.useRealTimers();
     await expectSynced('cancelamento, desconto e 10%');
     expect(sql(`SELECT charge_service_fee FROM orders WHERE id = '${order.id}'`)).toBe('t');
+    // A remoção antiga não é reaproveitada: com a reativação por último, a conta fica com os
+    // 10% (cópia velha aceita sem tirar a taxa; auditoria interna, rodada 8 do PR #54).
     const reuse = await raw('PATCH', `orders?id=eq.${order.id}`, { charge_service_fee: false }, 'return=representation');
-    expect(reuse.body).toMatch(/SERVICE_FEE_REMOVED sem PIN/);
+    expect(reuse.status, reuse.body).toBeLessThan(300);
+    expect(sql(`SELECT charge_service_fee FROM orders WHERE id = '${order.id}'`)).toBe('t');
     payCash(order.id);
     await expectSynced('pagamento');
     const local = st().orders.find((o) => o.id === order.id)!;
@@ -3369,20 +3377,28 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     ok(st().dispatchOwnDeliveries([d1!.id, d2!.id], courier.id));
     for (const d of [d1!, d2!]) ok(st().setOwnDeliveryStatus(d.id, 'DELIVERED'));
     await expectSynced('rota e entregue');
-    // Voltar de etapa direto pelo token do aparelho: recusado.
+    // Voltar de etapa direto pelo token do aparelho (cópia velha): a entrega fica como está
+    // (auditoria interna, rodada 8 do PR #54; antes era recusado e travava a entrega no aparelho).
     const back = await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, { status: 'PREPARING' });
-    expect(back.status).toBeGreaterThanOrEqual(400);
+    expect(back.status, back.body).toBeLessThan(300);
+    expect(sql(`SELECT status FROM own_deliveries WHERE id = '${d1!.id}'`)).toBe('DELIVERED');
     // Entrega para um pedido que não é de entrega: recusada.
     const takeout = ok(st().createPickupOrder({ lines: [line], fulfillment: 'TAKEOUT', customerName: 'Ana' }));
     await expectSynced('senha para levar');
     const forged = await raw('POST', 'own_deliveries', { ...d1!, id: crypto.randomUUID(), order_id: takeout.id, status: 'PREPARING', courier_id: null, courier_fee: null, out_at: null, delivered_at: null });
     expect(forged.status).toBeGreaterThanOrEqual(400);
 
-    const settlement = ok(st().settleCourier(courier.id, { payFromDrawer: true, auth: MANAGER }));
+    // Loja na nuvem: o acerto é gravado pela nuvem (tchefood_settle_courier) e a sangria do ganho
+    // é uma sangria comum, criada depois (auditoria interna, rodada 8 do PR #54).
+    const deviceFetch = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }, emulatorLog);
+    const settlement = ok(await st().settleCourierOnline(courier.id, { payFromDrawer: true, auth: MANAGER, fetchFn: deviceFetch }));
+    expect(sql(`SELECT count(*) FROM own_deliveries WHERE settlement_id = '${settlement.id}'`)).toBe('2');
+    expect(st().outbox.some((e) => e.table === 'courier_settlements' || e.table === 'own_deliveries')).toBe(false);
     await expectSynced('acerto com o entregador');
     expect(sql(`SELECT status FROM orders WHERE id = '${onDelivery.id}'`)).toBe('CLOSED');
-    expect(sql(`SELECT count(*) FROM own_deliveries WHERE settlement_id = '${settlement.id}'`)).toBe('2');
-    expect(sql(`SELECT m.type || ' ' || m.amount || ' ' || (m.authorized_by_manager_id IS NOT NULL) FROM courier_settlements s JOIN cash_movements m ON m.id = s.cash_movement_id WHERE s.id = '${settlement.id}'`)).toBe('WITHDRAWAL 10.00 true');
+    expect(sql(`SELECT cash_movement_id IS NULL FROM courier_settlements WHERE id = '${settlement.id}'`)).toBe('t');
+    const movementId = st().auditLogs.find((l) => (l.metadata as Record<string, unknown> | null)?.courier_settlement_id === settlement.id)!.metadata!.movement_id as string;
+    expect(sql(`SELECT m.type || ' ' || m.amount || ' ' || (m.authorized_by_manager_id IS NOT NULL) FROM cash_movements m WHERE m.id = '${movementId}'`)).toBe('WITHDRAWAL 10.00 true');
     expect(sql(`SELECT cash_collected FROM courier_settlements WHERE id = '${settlement.id}'`)).toBe(onDelivery.total_amount.toFixed(2));
     // Entrega acertada não muda; acerto não se altera; reenvios iguais passam.
     const settled = st().ownDeliveries.find((d) => d.id === d1!.id)!;
@@ -3390,9 +3406,10 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await raw('PATCH', `courier_settlements?id=eq.${settlement.id}`, { cash_collected: 0 })).status).toBeGreaterThanOrEqual(400);
     expect((await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, settled)).status).toBeLessThan(300);
     expect((await raw('POST', 'courier_settlements?on_conflict=id', settlement, 'resolution=ignore-duplicates,return=minimal')).status).toBeLessThan(300);
-    // Acerto apontando para uma sangria de outro valor: recusado.
-    const wrong = await raw('POST', 'courier_settlements', { ...settlement, id: crypto.randomUUID(), courier_fees: 99 });
+    // Acerto gravado direto na tabela, sem a função: recusado.
+    const wrong = await raw('POST', 'courier_settlements', { ...settlement, id: crypto.randomUUID() });
     expect(wrong.status).toBeGreaterThanOrEqual(400);
+    expect(wrong.body).toMatch(/TCHEFOOD_ENTREGA_ACERTO_ONLINE/);
   });
 
   it('avaliação: só de conta paga, uma por conta, somente inserção', async () => {
@@ -3894,6 +3911,28 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().orders.find((o) => o.id === x)!.total_amount).toBe(after);
     });
 
+    it('junção da conta recusada com a mesa aguardando conta na nuvem: a mesa não volta para ocupada (auditoria interna, rodada 8 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(274);
+      await expectSynced('mesa 274');
+      const y = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: y.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(y.id));
+      const x = await bOpens(mesa.id);
+      await bAddsItem(x);
+      // B pede a conta: na nuvem a mesa fica aguardando conta, com a conta de B.
+      expect((await rawB('PATCH', `dining_tables?id=eq.${mesa.id}`, { status: 'WAITING_BILL', current_order_id: x })).status).toBeLessThan(300);
+      await sync();
+      const rej = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === y.id)!;
+      expect(rej.message).toMatch(/TCHEFOOD_MESA_OCUPADA/);
+      ok(await pullA());
+      ok(st().moveRejectedOrderToTableOrder(rej.event.id));
+      await expectSynced('itens passados para a conta aguardando conta');
+      expect(sql(`SELECT status || ' ' || current_order_id FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(`WAITING_BILL ${x}`);
+      expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${x}'`)).toBe('2');
+    });
+
     it('duas contas sobem antes da atualização da mesa de cada aparelho: a primeira já ocupa a mesa e a segunda é recusada (Codex no PR #54)', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(47);
@@ -4160,8 +4199,18 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
            INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id, status) VALUES ('${ob}', '${TENANT_B}', '${tb}', '${crypto.randomUUID()}', 'OPEN');
            INSERT INTO order_items (id, order_id, product_id, waiter_id, unit_price, total_item_price, sector) VALUES ('${ib}', '${ob}', '${productId}', '${crypto.randomUUID()}', 9, 9, 'KITCHEN');
            INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, acquirer) VALUES ('${pb}', '${ob}', '${TENANT_B}', '${crypto.randomUUID()}', 9, 'CASH', 'CASH_DESK');`);
+      // Caixas: o aberto da outra loja não desce aqui; desta loja, o fechado há mais de 24 h fica de fora.
+      const [cb, cRecent, cOld, u] = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+      sql(`SET session_replication_role = replica;
+           INSERT INTO cash_sessions (id, tenant_id, opened_by_user_id, opening_float, status) VALUES ('${cb}', '${TENANT_B}', '${u}', 50, 'OPEN');
+           INSERT INTO cash_sessions (id, tenant_id, opened_by_user_id, opened_at, opening_float, status, closed_by_user_id, closed_at, counted_cash)
+                VALUES ('${cRecent}', '${TENANT}', '${u}', now() - interval '5 hours', 50, 'CLOSED', '${u}', now() - interval '4 hours', 50),
+                       ('${cOld}', '${TENANT}', '${u}', now() - interval '30 hours', 50, 'CLOSED', '${u}', now() - interval '26 hours', 50);`);
       const fetchOther = () => postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT_B, sub: 'device-other' }, emulatorLog);
       const mine = await fetchCloudOrders(cfgA(), TENANT, fetchA(), [ob]);
+      expect(mine.cashSessions.some((c) => c.id === cb)).toBe(false);
+      expect(mine.cashSessions.find((c) => c.id === cRecent)).toMatchObject({ tenant_id: TENANT, status: 'CLOSED' });
+      expect(mine.cashSessions.some((c) => c.id === cOld)).toBe(false);
       expect(mine.orders.some((o) => o.id === ob)).toBe(false);
       expect(mine.orderItems.some((i) => i.id === ib)).toBe(false);
       expect(mine.payments.some((p) => p.id === pb)).toBe(false);
@@ -4172,6 +4221,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(theirs.orderItems.map((i) => i.id)).toEqual([ib]);
       expect(theirs.payments.map((p) => p.id)).toEqual([pb]);
       expect(theirs.tables.map((t) => t.id)).toEqual([tb]);
+      expect(theirs.cashSessions).toEqual([expect.objectContaining({ id: cb, tenant_id: TENANT_B, status: 'OPEN', closed_at: null })]);
       // O token de uma loja lendo como se fosse a outra: a resposta não bate e nada é aceito.
       await expect(fetchCloudOrders(cfgA(), TENANT, fetchOther())).rejects.toThrow(/não é da loja deste aparelho/);
       expect(sql(`SELECT has_function_privilege('anon', 'tchefood_pull_orders(jsonb)', 'EXECUTE')`)).toBe('f');
@@ -4234,10 +4284,17 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().moveRejectedOrderToTableOrder(rej.event.id).ok).toBe(false);
       expect(st().outbox).toHaveLength(outboxBefore);
       expect(st().orders.some((o) => o.id === y.id)).toBe(true);
-      // Sem CPF na conta da mesa, junta. B fecha a conta da mesa logo antes de os itens subirem.
+      // Sem CPF na conta da mesa e com CPF só na recusada: sem a confirmação do operador, não
+      // junta e nada muda (GPT, rodada 7 do PR #54). Com dropCpf, junta sem o CPF. B fecha a
+      // conta da mesa logo antes de os itens subirem.
       sql(`UPDATE orders SET customer_cpf = NULL WHERE id = '${x}'`);
       useTcheStore.setState((s) => ({ orders: s.orders.map((o) => (o.id === x ? { ...o, customer_cpf: null } : o)) }));
-      ok(st().moveRejectedOrderToTableOrder(rej.event.id));
+      const onlyCpf = st().moveRejectedOrderToTableOrder(rej.event.id);
+      expect(onlyCpf.ok).toBe(false);
+      expect(!onlyCpf.ok && onlyCpf.error.startsWith(REJECTED_ORDER_ONLY_CPF)).toBe(true);
+      expect(st().outbox).toHaveLength(outboxBefore);
+      expect(st().orders.some((o) => o.id === y.id)).toBe(true);
+      ok(st().moveRejectedOrderToTableOrder(rej.event.id, { dropCpf: true }));
       await bPaysCard(x, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${x}'`)));
       expect(sql(`SELECT status FROM orders WHERE id = '${x}'`)).toBe('CLOSED');
       await sync();
@@ -4278,6 +4335,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().pullStatus.last_error).toBeTruthy();
       // O cadastro volta: a conta chega com o produto, e o erro some.
       useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null, last_pull_at: null } });
+      resetPullLoopForTests(); // passou a espera depois da falha
       await syncOnce(fetchA());
       expect(st().products.some((p) => p.id === prod)).toBe(true);
       expect(st().orderItems.some((i) => i.order_id === x && i.product_id === prod)).toBe(true);
@@ -4340,6 +4398,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().pullStatus.last_error).toBeTruthy();
       // Os cadastros voltam: a conta chega com o adicional conhecido.
       useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null, last_pull_at: null } });
+      resetPullLoopForTests(); // passou a espera depois da falha
       await syncOnce(fetchA());
       expect(st().modifierOptions.some((m) => m.id === opt)).toBe(true);
       expect(st().orderItems.some((i) => i.order_id === x && i.modifier_option_ids.includes(opt))).toBe(true);
@@ -4404,6 +4463,279 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(sql(`SELECT count(*) || ' ' || sum(delivery_fee) FROM own_deliveries WHERE order_id = '${order.id}'`)).toBe(`1 ${sql(`SELECT delivery_fee FROM own_deliveries WHERE order_id = '${order.id}'`)}`);
     });
 
+    it('só a conta recusada tem CPF: a junção não acontece sem a confirmação do operador; com ela, os itens passam e a conta da mesa fica sem CPF (GPT, rodada 7 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(270);
+      await expectSynced('mesa 270');
+      const p = st().products.find((x) => x.id === productId)!;
+      // A abre Y com o CPF do cliente sem internet; B abre X, sem CPF, antes de A subir.
+      const y = ok(st().openTable(mesa.id, 2, '52998224725'));
+      ok(st().addToTray({ order_id: y.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(y.id));
+      const x = await bOpens(mesa.id);
+      await bAddsItem(x);
+      await sync();
+      const rej = st().syncRejected.find((r) => r.event.table === 'orders' && r.event.row_id === y.id)!;
+      expect(rej.message).toMatch(/TCHEFOOD_MESA_OCUPADA/);
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null } });
+      await syncOnce(fetchA());
+      expect(st().orders.find((o) => o.id === x)!.customer_cpf).toBeNull();
+      // Sem a confirmação: recusa com a mensagem do CPF, e nada muda.
+      const itemsBefore = st().orderItems.filter((i) => i.order_id === y.id).map((i) => i.id).sort();
+      const outboxBefore = st().outbox.map((e) => e.id);
+      const r = st().moveRejectedOrderToTableOrder(rej.event.id);
+      expect(r.ok).toBe(false);
+      expect(!r.ok && r.error.startsWith(REJECTED_ORDER_ONLY_CPF)).toBe(true);
+      expect(!r.ok && r.error).not.toMatch(/52998224725/);
+      expect(st().orders.find((o) => o.id === y.id)!.customer_cpf).toBe('52998224725');
+      expect(st().orderItems.filter((i) => i.order_id === y.id).map((i) => i.id).sort()).toEqual(itemsBefore);
+      expect(itemsBefore).toHaveLength(1);
+      expect(st().outbox.map((e) => e.id)).toEqual(outboxBefore);
+      expect(st().syncRejected.some((x2) => x2.event.id === rej.event.id)).toBe(true);
+      // O operador confirma passar os itens sem o CPF.
+      const moved = ok(st().moveRejectedOrderToTableOrder(rej.event.id, { dropCpf: true }));
+      expect(moved).toEqual({ targetOrderId: x, items: 1 });
+      expect(st().orders.some((o) => o.id === y.id)).toBe(false);
+      await expectSynced('itens passados para a conta da mesa 270');
+      expect(sql(`SELECT count(*) || ' ' || COALESCE((SELECT customer_cpf FROM orders WHERE id = '${x}'), '-') FROM order_items WHERE order_id = '${x}'`)).toBe('2 -');
+      expect(sql(`SELECT count(*) FROM orders WHERE id = '${y.id}'`)).toBe('0');
+      ok(await pullA());
+      expect(st().orders.find((o) => o.id === x)!.customer_cpf).toBeNull();
+    });
+
+    /** fetchA que conta as leituras de modifier_options (e, com down, as faz falhar). */
+    const countingOptions = (counter: { n: number }, down = false): ReturnType<typeof fetchA> => {
+      const inner = fetchA();
+      return (url, init) => {
+        if (/\/rest\/v1\/modifier_options/.test(url)) {
+          counter.n++;
+          if (down) return Promise.resolve(new Response('{"message":"falhou"}', { status: 500 }));
+        }
+        return inner(url, init);
+      };
+    };
+    /** Rodada só das contas: a leitura dos cadastros pelo relógio (60 s) não está na hora. */
+    const ordersRound = async (fetchFn: ReturnType<typeof fetchA>) => {
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_pull_at: new Date().toISOString(), last_orders_pull_at: null } });
+      // Cada rodada aqui vem depois da espera de falha e do limite de uma leitura dos cadastros
+      // por minuto (testados em src/__tests__/pullLoop.test.ts).
+      resetPullLoopForTests();
+      await syncOnce(fetchFn);
+    };
+    const insertItemWith = (orderId: string, optionId: string, createdAt = 'now()') => {
+      const id = crypto.randomUUID();
+      sql(`SET session_replication_role = replica; INSERT INTO order_items (id, order_id, product_id, waiter_id, quantity, unit_price, modifiers_unit_price, total_item_price, sector, status, origin, priced_at, created_at, modifier_option_ids)
+           VALUES ('${id}', '${orderId}', '${productId}', '${cashierId()}', 1, 10, 4, 14, 'KITCHEN', 'PENDING', 'WAITER', now(), ${createdAt}, ARRAY['${optionId}']::uuid[])`);
+      return id;
+    };
+
+    it('adicional novo em item com horário anterior à última leitura dos cadastros: a leitura é pedida mesmo assim e, se falhar, a foto não é aplicada (GPT, rodada 7 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(271);
+      await expectSynced('mesa 271');
+      // A lê os cadastros, e dá certo.
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_pull_at: null, last_orders_pull_at: null } });
+      await syncOnce(fetchA());
+      expect(st().pullStatus.last_error).toBeNull();
+      const lastPull = st().pullStatus.last_pull_at!;
+      expect(lastPull).toBeTruthy();
+      // B cadastra um adicional novo e lança um item com ele, com o horário uma hora antes da
+      // leitura de A (relógio de outro aparelho, ou lançamento sem internet que subiu depois).
+      const group = crypto.randomUUID();
+      const opt = crypto.randomUUID();
+      sql(`INSERT INTO modifier_groups (id, tenant_id, name) VALUES ('${group}', '${TENANT}', 'Extras 271'); INSERT INTO modifier_options (id, group_id, name, additional_price) VALUES ('${opt}', '${group}', 'Bacon 271', 4)`);
+      const x = await bOpens(mesa.id);
+      const item = insertItemWith(x, opt, `now() - interval '1 hour'`);
+      expect(sql(`SELECT created_at < '${lastPull}'::timestamptz FROM order_items WHERE id = '${item}'`)).toBe('t');
+      // Leitura dos adicionais falhando: A tenta ler os cadastros e não aplica a foto.
+      const down = { n: 0 };
+      await ordersRound(countingOptions(down, true));
+      expect(down.n).toBeGreaterThan(0);
+      expect(st().orders.some((o) => o.id === x)).toBe(false);
+      expect(st().orderItems.some((i) => i.id === item)).toBe(false);
+      expect(st().pullStatus.last_error).toBeTruthy();
+      // A leitura volta: a conta chega com o adicional conhecido.
+      const up = { n: 0 };
+      await ordersRound(countingOptions(up));
+      expect(up.n).toBeGreaterThan(0);
+      expect(st().modifierOptions.some((m) => m.id === opt)).toBe(true);
+      expect(st().orderItems.some((i) => i.id === item && i.order_id === x && i.modifier_option_ids.includes(opt))).toBe(true);
+      expect(st().pullStatus.last_error).toBeNull();
+    });
+
+    it('adicional que continua faltando depois de uma leitura dos cadastros que deu certo não pede outra leitura a cada rodada; um adicional novo pede (GPT, rodada 7 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(272);
+      await expectSynced('mesa 272');
+      // Item com adicional que não existe no cadastro da nuvem (apagado, ou aceito com PIN de gerente).
+      const ghost = crypto.randomUUID();
+      const x = await bOpens(mesa.id);
+      const item = insertItemWith(x, ghost);
+      expect(sql(`SELECT count(*) FROM modifier_options WHERE id = '${ghost}'`)).toBe('0');
+      // Primeira rodada: lê os cadastros uma vez, o adicional continua faltando, e a foto é aplicada.
+      const first = { n: 0 };
+      await ordersRound(countingOptions(first));
+      expect(first.n).toBe(1);
+      expect(st().orderItems.some((i) => i.id === item && i.order_id === x)).toBe(true);
+      expect(st().pullStatus.last_error).toBeNull();
+      // Duas rodadas seguintes: nenhuma leitura dos cadastros por causa dele.
+      const next = { n: 0 };
+      await ordersRound(countingOptions(next));
+      await ordersRound(countingOptions(next));
+      expect(next.n).toBe(0);
+      expect(st().orders.some((o) => o.id === x)).toBe(true);
+      expect(st().pullStatus.last_error).toBeNull();
+      // Outro adicional desconhecido na mesma conta: pede uma leitura, e depois sossega.
+      const ghost2 = crypto.randomUUID();
+      const item2 = insertItemWith(x, ghost2);
+      const again = { n: 0 };
+      await ordersRound(countingOptions(again));
+      expect(again.n).toBe(1);
+      expect(st().orderItems.some((i) => i.id === item2 && i.order_id === x)).toBe(true);
+      const after = { n: 0 };
+      await ordersRound(countingOptions(after));
+      expect(after.n).toBe(0);
+      expect(st().pullStatus.last_error).toBeNull();
+    });
+
+    it('componente de combo atrasado com o combo já na conta encerrada: não passa sozinho para uma conta nova (GPT, rodada 7 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(273);
+      await expectSynced('mesa 273');
+      const combo = st().products.find((x) => x.code === '501' && x.is_combo)!;
+      expect(combo).toBeTruthy();
+      const groups = st().productModifierGroups.filter((l) => l.product_id === combo.id).map((l) => l.group_id);
+      const mods = groups.map((g) => st().modifierOptions.find((o) => o.group_id === g && o.component_product_id)!)
+        .map((o) => ({ group_id: o.group_id, option_id: o.id, name: o.name, additional_price: o.additional_price }));
+      expect(mods).toHaveLength(2);
+      const order = ok(st().openTable(mesa.id, 1, null));
+      await expectSynced('conta 273');
+      ok(st().addToTray({ order_id: order.id, product_id: combo.id, half_product_ids: [], quantity: 1, unit_price: combo.price, modifiers: mods, modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: combo.sector }));
+      const sent = ok(st().dispatchTray(order.id)).items;
+      expect(sent).toHaveLength(3);
+      const child = sent[2]!;
+      expect(child.combo_parent_item_id).toBe(sent[0]!.id);
+      // O combo e um componente sobem; o outro componente fica sem internet.
+      const childEv = st().outbox.find((e) => e.table === 'order_items' && e.row_id === child.id)!;
+      useTcheStore.setState((s) => ({ outbox: s.outbox.filter((e) => e.id !== childEv.id) }));
+      await expectSynced('combo com um componente');
+      expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${order.id}'`)).toBe('2');
+      // B recebe a conta toda e o banco fecha; o componente atrasado sobe e é recusado.
+      await bPaysCard(order.id, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${order.id}'`)));
+      expect(sql(`SELECT status FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED');
+      useTcheStore.setState((s) => ({ outbox: [...s.outbox, childEv] }));
+      const rejected = await sync();
+      expect(rejected).toHaveLength(1);
+      const late = st().syncRejected.find((r) => r.event.row_id === child.id)!;
+      expect(late.message).toMatch(/TCHEFOOD_CONTA_ENCERRADA/);
+      const ordersBefore = sql(`SELECT count(*) FROM orders WHERE tenant_id = '${TENANT}'`);
+      const outboxBefore = st().outbox.map((e) => e.id);
+      const localOrders = st().orders.length;
+      // A recuperação recusa, e nada muda.
+      const r = st().moveLateItemsToNewOrder(late.event.id);
+      expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/Item de combo/) });
+      expect(st().orders).toHaveLength(localOrders);
+      expect(st().outbox.map((e) => e.id)).toEqual(outboxBefore);
+      expect(st().syncRejected.some((x) => x.event.id === late.event.id)).toBe(true);
+      expect(st().orderItems.find((i) => i.id === child.id)).toMatchObject({ order_id: order.id, combo_parent_item_id: sent[0]!.id });
+      await sync();
+      expect(sql(`SELECT count(*) FROM orders WHERE tenant_id = '${TENANT}'`)).toBe(ordersBefore);
+      expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${order.id}'`)).toBe('2');
+      expect(sql(`SELECT status || ' ' || (current_order_id IS NULL) FROM dining_tables WHERE id = '${mesa.id}'`)).toBe('FREE true');
+    });
+
+    it('cópia velha de B sobre o item que A cancelou: aceita, e o item continua cancelado (auditoria interna, rodada 8 do PR #54)', async () => {
+      forgetPinFailures();
+      login(CASHIER_PIN);
+      const mesa = tableNo(280);
+      await expectSynced('mesa 280');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await expectSynced('conta 280');
+      const item = st().orderItems.find((i) => i.order_id === order.id)!;
+      const staleCopy = { ...item };
+      ok(st().cancelOrderItem(item.id, MANAGER));
+      await expectSynced('cancelamento em A');
+      expect(sql(`SELECT status FROM order_items WHERE id = '${item.id}'`)).toBe('CANCELED');
+      // B ainda tem a cópia de antes do cancelamento e manda o item inteiro (cozinha: em preparo).
+      const stale = await rawB('PATCH', `order_items?id=eq.${item.id}`, {
+        status: 'PREPARING', is_paid: false, canceled_at: null, canceled_by_user_id: null, cancel_reason: null,
+        notes: 'sem cebola', quantity: staleCopy.quantity, unit_price: staleCopy.unit_price,
+      });
+      expect(stale.status, stale.body).toBeLessThan(300);
+      expect(sql(`SELECT status || ' ' || (canceled_at IS NOT NULL) || ' ' || (canceled_by_user_id IS NOT NULL) || ' ' || (cancel_reason IS NOT NULL) || ' ' || is_paid || ' ' || notes FROM order_items WHERE id = '${item.id}'`))
+        .toBe('CANCELED true true true false sem cebola');
+      expect(Number(sql(`SELECT subtotal_items FROM orders WHERE id = '${order.id}'`))).toBe(0);
+    });
+
+    it('cópia velha de B sem os 10% depois da reativação em A: a taxa fica; a remoção registrada continua valendo (auditoria interna, rodada 8 do PR #54)', async () => {
+      forgetPinFailures();
+      login(CASHIER_PIN);
+      const mesa = tableNo(281);
+      await expectSynced('mesa 281');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await expectSynced('conta 281');
+      ok(st().removeServiceFee(order.id, MANAGER));
+      await expectSynced('10% retirados em A');
+      ok(st().restoreServiceFee(order.id));
+      await expectSynced('10% reativados em A');
+      expect(sql(`SELECT charge_service_fee || ' ' || (service_fee_amount > 0) FROM orders WHERE id = '${order.id}'`)).toBe('true true');
+      // B ainda tem a cópia sem os 10% (de antes da reativação) e muda só o número de pessoas.
+      const stale = await rawB('PATCH', `orders?id=eq.${order.id}`, { customer_count: 4, charge_service_fee: false, service_fee_pct: 10 });
+      expect(stale.status, stale.body).toBeLessThan(300);
+      expect(sql(`SELECT charge_service_fee || ' ' || (service_fee_amount > 0) || ' ' || customer_count FROM orders WHERE id = '${order.id}'`)).toBe('true true 4');
+      // A remoção de verdade (registro SERVICE_FEE_REMOVED antes da conta) continua tirando a taxa.
+      ok(st().removeServiceFee(order.id, MANAGER));
+      await expectSynced('10% retirados de novo em A');
+      expect(sql(`SELECT charge_service_fee || ' ' || service_fee_amount FROM orders WHERE id = '${order.id}'`)).toBe('false 0.00');
+    });
+
+    it('conta apontando para mesa de outra loja é recusada (auditoria interna, rodada 8 do PR #54)', async () => {
+      const TENANT_B = '33333333-3333-4333-8333-333333333333';
+      const tb = crypto.randomUUID();
+      sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT_B}', 'Outra loja', 'Outra loja Ltda', '33444555000181') ON CONFLICT (id) DO NOTHING;
+           INSERT INTO dining_tables (id, tenant_id, number, label, status) VALUES ('${tb}', '${TENANT_B}', 982, 'Mesa da outra loja', 'FREE');`);
+      for (const status of ['OPEN', 'CLOSED']) {
+        const id = crypto.randomUUID();
+        const r = await rawB('POST', 'orders', {
+          id, tenant_id: TENANT, table_id: tb, opened_by_user_id: cashierId(), status, customer_count: 1, customer_cpf: null,
+          charge_service_fee: true, service_fee_pct: 10, discount_amount: 0, opened_at: new Date().toISOString(), closed_at: status === 'CLOSED' ? new Date().toISOString() : null,
+        });
+        expect(r.status, `${status}: ${r.body}`).toBeGreaterThanOrEqual(400);
+        expect(r.body).toMatch(/TCHEFOOD_MESA_OUTRA_LOJA/);
+        expect(sql(`SELECT count(*) FROM orders WHERE id = '${id}'`)).toBe('0');
+      }
+      expect(sql(`SELECT status || ' ' || (current_order_id IS NULL) FROM dining_tables WHERE id = '${tb}'`)).toBe('FREE true');
+      // A mesa da própria loja continua abrindo.
+      login(CASHIER_PIN);
+      const mesa = tableNo(282);
+      await expectSynced('mesa 282');
+      const x = await bOpens(mesa.id);
+      expect(sql(`SELECT current_order_id FROM dining_tables WHERE id = '${mesa.id}'`)).toBe(x);
+    });
+
+    it('leitura das contas com id que não é UUID na lista do aparelho: ignora o id e lê o resto (auditoria interna, rodada 8 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(283);
+      await expectSynced('mesa 283');
+      const x = await bOpens(mesa.id);
+      const r = await raw('POST', 'rpc/tchefood_pull_orders', { p_order_ids: ['nao-e-uuid', 42, { id: x }, '', x] }, 'return=representation');
+      expect(r.status, r.body).toBe(200);
+      expect((JSON.parse(r.body) as { orders: { id: string }[] }).orders.some((o) => o.id === x)).toBe(true);
+      // Conta encerrada há mais de 24 h pedida pelo id ao lado de um id inválido continua descendo.
+      sql(`SET session_replication_role = replica; UPDATE orders SET status = 'CLOSED', opened_at = now() - interval '3 days', closed_at = now() - interval '2 days' WHERE id = '${x}';
+           UPDATE dining_tables SET status = 'FREE', current_order_id = NULL WHERE id = '${mesa.id}';`);
+      const old = await raw('POST', 'rpc/tchefood_pull_orders', { p_order_ids: ['zzz', x] }, 'return=representation');
+      expect(old.status, old.body).toBe(200);
+      expect((JSON.parse(old.body) as { orders: { id: string; status: string }[] }).orders.find((o) => o.id === x)).toMatchObject({ status: 'CLOSED' });
+      expect(sql(`SELECT count(*) FROM pg_indexes WHERE tablename = 'orders' AND indexname = 'idx_orders_tenant_recent'`)).toBe('1');
+    });
+
     it('a rodada de sincronização lê as contas a cada 10 s, com a fila vazia', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(46);
@@ -4413,6 +4745,254 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       await syncOnce(fetchA());
       expect(st().pullStatus.last_error).toBeNull();
       expect(st().tables.find((t) => t.id === mesa.id)!.current_order_id).toBe(x);
+    });
+
+    it('cópia velha de B sem o CPF da nota: a conta fica com o CPF e o resto da linha passa; troca por outro CPF passa (auditoria interna, rodada 8 do PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(300);
+      await expectSynced('mesa 300');
+      const order = ok(st().openTable(mesa.id, 2, '52998224725'));
+      await expectSynced('conta 300 com CPF');
+      expect(sql(`SELECT customer_cpf FROM orders WHERE id = '${order.id}'`)).toBe('52998224725');
+      // B tem a cópia de antes do CPF e muda só o número de pessoas: manda a linha inteira.
+      for (const cpf of [null, '', '  ']) {
+        const stale = await rawB('PATCH', `orders?id=eq.${order.id}`, { customer_count: 3, customer_cpf: cpf, charge_service_fee: true, service_fee_pct: 10 });
+        expect(stale.status, stale.body).toBeLessThan(300);
+        expect(sql(`SELECT customer_cpf || ' ' || customer_count FROM orders WHERE id = '${order.id}'`)).toBe('52998224725 3');
+      }
+      // Troca por outro CPF (não vazio) continua passando: nada no app troca o CPF da conta, então
+      // uma troca que chega é uma correção de propósito, não uma cópia velha.
+      const change = await rawB('PATCH', `orders?id=eq.${order.id}`, { customer_cpf: '11144477735' });
+      expect(change.status, change.body).toBeLessThan(300);
+      expect(sql(`SELECT customer_cpf FROM orders WHERE id = '${order.id}'`)).toBe('11144477735');
+      // Conta sem CPF continua sem: o gatilho não inventa CPF.
+      const other = tableNo(301);
+      await expectSynced('mesa 301');
+      const plain = ok(st().openTable(other.id, 2, null));
+      await expectSynced('conta 301 sem CPF');
+      expect((await rawB('PATCH', `orders?id=eq.${plain.id}`, { customer_count: 4, customer_cpf: null })).status).toBeLessThan(300);
+      expect(sql(`SELECT COALESCE(customer_cpf, 'sem') || ' ' || customer_count FROM orders WHERE id = '${plain.id}'`)).toBe('sem 4');
+    });
+
+    it('cancelamento de chopp trava a conta antes do barril, na mesma ordem do lançamento (sem deadlock; auditoria interna, rodada 8 do PR #54)', async () => {
+      vi.useRealTimers();
+      login(OWNER_PIN);
+      const chopp = ok(st().saveProduct({
+        category_id: categoryId, code: '9302', name: 'Chopp 300 ml', description: null, price: 12, sector: 'BAR', available: true, active: true,
+        requires_meat_doneness: false, allows_half_and_half: false, ncm: '22030000', cfop: '5102', csosn_cst: '102', unit: 'UN',
+        cost_price: 0, stock_quantity: 0, barcode: null,
+      }));
+      const mesa = tableNo(302);
+      await expectSynced('chopp e mesa 302');
+      const tap = crypto.randomUUID();
+      sql(`INSERT INTO keg_taps (id, tenant_id, tap_number, beer_name, total_capacity_ml, billed_volume_ml, wasted_foam_ml, keg_cost, tapped_at)
+           VALUES ('${tap}', '${TENANT}', 302, 'Chopp Pilsen 50L', 50000, 0, 0, 480, now() - interval '1 hour');
+           INSERT INTO keg_tap_products (tap_id, product_id, pour_ml) VALUES ('${tap}', '${chopp.id}', 300);`);
+      const orderId = await bOpens(mesa.id);
+      const item = crypto.randomUUID();
+      const price = Number(sql(`SELECT tchefood_sale_price('${chopp.id}', now())`));
+      const ins = await rawB('POST', 'order_items', {
+        id: item, order_id: orderId, product_id: chopp.id, waiter_id: cashierId(), quantity: 1, unit_price: price, modifiers_unit_price: 0,
+        sector: 'BAR', status: 'PENDING', origin: 'WAITER', priced_at: new Date().toISOString(), created_at: new Date().toISOString(),
+      });
+      expect(ins.status, ins.body).toBeLessThan(300);
+      expect(sql(`SELECT billed_volume_ml FROM keg_taps WHERE id = '${tap}'`)).toBe('300');
+
+      // O lançamento trava a conta (trg_order_items_000_order_open) e depois o barril
+      // (trg_order_items_keg). O cancelamento tem que travar na mesma ordem: com o barril preso
+      // por outra transação, o cancelamento que espera pelo barril já está com a conta travada.
+      // Antes, ele esperava pelo barril sem a conta e só travava a conta depois (no recálculo):
+      // barril → conta contra conta → barril de um lançamento ao mesmo tempo = deadlock.
+      const holder = await holdLock(`SELECT 1 FROM keg_taps WHERE id = '${tap}' FOR UPDATE;`,
+        `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = 'tchefood_holder' AND state = 'idle in transaction')`);
+      let cancel: Promise<string> | null = null;
+      try {
+        cancel = pinSession(`UPDATE order_items SET status = 'CANCELED', cancel_reason = 'Teste da ordem das travas', canceled_by_user_id = '${cashierId()}',
+            canceled_at = now() WHERE id = '${item}'; ROLLBACK;`, 'tchefood_keg_cancel');
+        await waitFor(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = 'tchefood_keg_cancel' AND wait_event_type = 'Lock')`);
+        const probe = psql(target!, `SELECT 1 FROM orders WHERE id = '${orderId}' FOR UPDATE NOWAIT;`, DB);
+        expect(probe.ok, 'a conta deveria estar travada pelo cancelamento que espera o barril').toBe(false);
+        expect(probe.sqlstate).toBe('55P03');
+      } finally {
+        await holder.release();
+        if (cancel) await cancel;
+      }
+      // O cancelamento de teste foi desfeito (ROLLBACK): nada mudou no item nem no barril.
+      expect(sql(`SELECT status FROM order_items WHERE id = '${item}'`)).toBe('PENDING');
+      expect(sql(`SELECT billed_volume_ml FROM keg_taps WHERE id = '${tap}'`)).toBe('300');
+    }, 30_000);
+
+    it('acerto com o entregador pela nuvem: a mesma entrega não é acertada duas vezes e nada sai da gaveta pelo segundo (auditoria interna, rodada 8 do PR #54)', async () => {
+      forgetPinFailures();
+      login(OWNER_PIN);
+      const zone = st().deliveryZones.find((z) => z.active) ?? ok(st().saveDeliveryZone({ name: 'Bairro 290', fee: 4, eta_minutes: 30, active: true }));
+      const courier = ok(st().saveCourier({ name: 'Tito', phone: '53999990290', fee_per_delivery: 7, active: true }));
+      login(CASHIER_PIN);
+      const session = st().cashSessions.find((c) => c.status === 'OPEN') ?? ok(st().openCashSession(50));
+      const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
+      const delivered = async (address: string) => {
+        const order = ok(st().createPickupOrder({
+          lines: [line], fulfillment: 'DELIVERY', customerName: 'Rosa',
+          delivery: { customerName: 'Rosa', phone: '53 98888-0290', address, reference: '', zoneId: zone.id, changeFor: null, payOnDelivery: false },
+        }));
+        payCash(order.id);
+        const d = st().ownDeliveries.find((x) => x.order_id === order.id)!;
+        ok(st().setOwnDeliveryStatus(d.id, 'READY'));
+        ok(st().dispatchOwnDeliveries([d.id], courier.id));
+        ok(st().setOwnDeliveryStatus(d.id, 'DELIVERED'));
+        await expectSynced(`entrega ${address}`);
+        return d;
+      };
+      const d = await delivered('Rua 290, 10');
+      const rpc = (fetchFn: ReturnType<typeof fetchB>, args: Record<string, unknown>) =>
+        fetchFn('http://cloud.test/rest/v1/rpc/tchefood_settle_courier', { method: 'POST', headers: {}, body: JSON.stringify(args) })
+          .then(async (r) => ({ status: r.status, body: await r.text() }));
+      const terms = (id: string, deliveryIds: string[], fees = 7) => ({
+        p_id: id, p_courier: courier.id, p_delivery_ids: deliveryIds, p_cash_collected: 0, p_courier_fees: fees, p_staff: cashierId(),
+      });
+      const withdrawals = () => sql(`SELECT count(*) FROM cash_movements WHERE session_id = '${session.id}' AND type = 'WITHDRAWAL'`);
+
+      // Acerto gravado direto na tabela, sem a função: recusado, e a entrega não entra em acerto por UPDATE.
+      const direct = await rawB('POST', 'courier_settlements', {
+        id: crypto.randomUUID(), tenant_id: TENANT, courier_id: courier.id, deliveries: 1, cash_collected: 0, courier_fees: 7,
+        cash_movement_id: null, delivery_ids: [d.id], settled_by_user_id: cashierId(), created_at: new Date().toISOString(),
+      });
+      expect(direct.status).toBeGreaterThanOrEqual(400);
+      expect(direct.body).toMatch(/TCHEFOOD_ENTREGA_ACERTO_ONLINE/);
+      // Entrega de outra loja (o token da outra loja não vê as entregas desta): recusado, nada muda.
+      const OTHER = '55555555-5555-4555-8555-555555555555';
+      sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${OTHER}', 'Outra', 'Outra Ltda', '11222333000262') ON CONFLICT DO NOTHING;`);
+      const cross = await rpc(postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: OTHER, sub: 'device-c' }, emulatorLog), terms(crypto.randomUUID(), [d.id]));
+      expect(cross.status, cross.body).toBeGreaterThanOrEqual(400);
+      expect(sql(`SELECT settlement_id IS NULL FROM own_deliveries WHERE id = '${d.id}'`)).toBe('t');
+      // Ganho que não é a soma das entregas: recusado.
+      const inflated = await rpc(fetchB(), terms(crypto.randomUUID(), [d.id], 70));
+      expect(inflated.status).toBeGreaterThanOrEqual(400);
+      expect(inflated.body).toMatch(/não é a soma/);
+
+      // B acerta primeiro pela função (pago por fora): a entrega fica marcada com o acerto de B.
+      const settlementB = crypto.randomUUID();
+      const byB = await rpc(fetchB(), terms(settlementB, [d.id]));
+      expect(byB.status, byB.body).toBe(200);
+      expect(JSON.parse(byB.body)).toMatchObject({ id: settlementB, cash_movement_id: null, delivery_ids: [d.id] });
+      expect(sql(`SELECT settlement_id FROM own_deliveries WHERE id = '${d.id}'`)).toBe(settlementB);
+      // A mesma chamada de novo (resposta perdida): devolve o mesmo acerto; o reenvio igual pela tabela também passa.
+      const resent = await rpc(fetchB(), terms(settlementB, [d.id]));
+      expect(resent.status, resent.body).toBe(200);
+      expect(JSON.parse(resent.body)).toMatchObject({ id: settlementB });
+      expect(sql(`SELECT count(*) FROM courier_settlements WHERE id = '${settlementB}'`)).toBe('1');
+      const row = JSON.parse(resent.body) as Record<string, unknown>;
+      expect((await raw('POST', 'courier_settlements?on_conflict=id', row, 'resolution=ignore-duplicates,return=minimal')).status).toBeLessThan(300);
+      // Mesmo id com outros termos: recusado.
+      expect((await rpc(fetchB(), terms(settlementB, [d.id], 0))).body).toMatch(/outro acerto com este id/);
+
+      // A ainda vê a entrega sem acerto (não leu a nuvem): a nuvem recusa e nada sai da gaveta.
+      const before = withdrawals();
+      const auditsBefore = st().auditLogs.length;
+      const deviceFetch = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }, emulatorLog);
+      expect(st().ownDeliveries.find((x) => x.id === d.id)!.settlement_id).toBeNull();
+      const refused = await st().settleCourierOnline(courier.id, { payFromDrawer: true, auth: MANAGER, fetchFn: deviceFetch });
+      expect(refused).toMatchObject({ ok: false, error: expect.stringMatching(/já foi acertada com o entregador.*Nada saiu da gaveta/) });
+      expect((refused as { error: string }).error).not.toMatch(/TCHEFOOD_/);
+      expect(st().outbox).toEqual([]);
+      expect(st().auditLogs.length).toBe(auditsBefore);
+      expect(withdrawals()).toBe(before);
+      const detail = emulatorLog.filter((l) => l.path === 'rpc/tchefood_settle_courier').at(-1)!;
+      expect(detail.message).toMatch(/TCHEFOOD_ENTREGA_JA_ACERTADA/);
+
+      // Leitura da nuvem: a entrega acertada em B chega a A; a nova entrega é acertada por A,
+      // e a sangria do ganho sobe depois, como sangria comum.
+      await pullA();
+      expect(st().ownDeliveries.find((x) => x.id === d.id)!.settlement_id).toBe(settlementB);
+      const d2 = await delivered('Rua 290, 12');
+      const settlementA = ok(await st().settleCourierOnline(courier.id, { payFromDrawer: true, auth: MANAGER, fetchFn: deviceFetch }));
+      expect(settlementA.delivery_ids).toEqual([d2.id]);
+      expect(sql(`SELECT settlement_id FROM own_deliveries WHERE id = '${d2.id}'`)).toBe(settlementA.id);
+      expect(st().outbox.map((e) => e.table)).toEqual(['audit_logs', 'cash_movements']);
+      await expectSynced('sangria do acerto de A');
+      expect(withdrawals()).toBe(String(Number(before) + 1));
+      expect(sql(`SELECT cash_movement_id IS NULL FROM courier_settlements WHERE id = '${settlementA.id}'`)).toBe('t');
+      expect(sql(`SELECT m.amount FROM audit_logs a JOIN cash_movements m ON m.id::text = a.metadata->>'movement_id'
+                   WHERE a.action_type = 'CASH_WITHDRAWAL' AND a.metadata->>'courier_settlement_id' = '${settlementA.id}'`)).toBe('7.00');
+    });
+
+    it('acerto pela nuvem: a mesma chamada ao mesmo tempo devolve o mesmo acerto, e outra chamada da mesma entrega é recusada com o acerto em DETAIL (auditoria interna, rodada 8 do PR #54)', async () => {
+      login(OWNER_PIN);
+      const zone = st().deliveryZones.find((z) => z.active)!;
+      const courier = st().couriers.find((c) => c.phone === '53999990290')!;
+      login(CASHIER_PIN);
+      const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
+      const order = ok(st().createPickupOrder({
+        lines: [line], fulfillment: 'DELIVERY', customerName: 'Rosa',
+        delivery: { customerName: 'Rosa', phone: '53 98888-0290', address: 'Rua 291, 1', reference: '', zoneId: zone.id, changeFor: null, payOnDelivery: false },
+      }));
+      payCash(order.id);
+      const d = st().ownDeliveries.find((x) => x.order_id === order.id)!;
+      ok(st().setOwnDeliveryStatus(d.id, 'READY'));
+      ok(st().dispatchOwnDeliveries([d.id], courier.id));
+      ok(st().setOwnDeliveryStatus(d.id, 'DELIVERED'));
+      await expectSynced('entrega 291');
+      const id = crypto.randomUUID();
+      const call = (pid: string) => `SELECT set_config('request.jwt.claims', '{"role":"authenticated","tenant_id":"${TENANT}","sub":"device"}', true);
+        SET LOCAL ROLE authenticated;
+        SELECT tchefood_settle_courier('${pid}', '${courier.id}', ARRAY['${d.id}']::uuid[], 0, 7, '${cashierId()}')->>'id';`;
+      // A primeira chamada segura a trava da entrega; a repetida espera e, ao entrar, devolve o acerto gravado.
+      const hold = (pid: string) => new Promise<{ code: number | null; out: string }>((resolve) => {
+        const [host, port, user] = [target!.host, String(target!.port), target!.user];
+        const p = spawn('psql', ['-h', host, '-p', port, '-U', user, '-d', DB, '-X', '-q', '-t', '-A', '-v', 'ON_ERROR_STOP=1']);
+        p.stdin.end(`BEGIN;\n${call(pid)}\nSELECT pg_sleep(1);\nCOMMIT;\n`);
+        let out = '';
+        p.stdout.on('data', (b) => (out += String(b)));
+        p.stderr.on('data', (b) => (out += String(b)));
+        p.on('close', (code) => resolve({ code, out }));
+      });
+      const first = hold(id);
+      await new Promise((r) => setTimeout(r, 300));
+      const [retry, other] = await Promise.all([hold(id), hold(crypto.randomUUID())]);
+      const done = await first;
+      expect(done.code, done.out).toBe(0);
+      expect(retry.code, retry.out).toBe(0);
+      expect(retry.out).toContain(id);
+      expect(other.code).not.toBe(0);
+      expect(other.out).toMatch(/TCHEFOOD_ENTREGA_JA_ACERTADA/);
+      expect(other.out).toContain(`"settlement_id" : "${id}"`);
+      expect(sql(`SELECT count(*) FROM courier_settlements WHERE delivery_ids @> ARRAY['${d.id}']::uuid[]`)).toBe('1');
+    });
+
+    it('cópia velha da entrega mandada por outro aparelho não volta a entrega atrás nem troca o entregador, e não trava a fila (auditoria interna, rodada 8 do PR #54)', async () => {
+      login(OWNER_PIN);
+      const zone = st().deliveryZones.find((z) => z.active)!;
+      const courier = st().couriers.find((c) => c.phone === '53999990290')!;
+      const other = ok(st().saveCourier({ name: 'Lia', phone: '53999990291', fee_per_delivery: 9, active: true }));
+      login(CASHIER_PIN);
+      const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
+      const order = ok(st().createPickupOrder({
+        lines: [line], fulfillment: 'DELIVERY', customerName: 'Rosa',
+        delivery: { customerName: 'Rosa', phone: '53 98888-0290', address: 'Rua 292, 1', reference: '', zoneId: zone.id, changeFor: null, payOnDelivery: false },
+      }));
+      payCash(order.id);
+      const d = st().ownDeliveries.find((x) => x.order_id === order.id)!;
+      ok(st().setOwnDeliveryStatus(d.id, 'READY'));
+      const ready = st().ownDeliveries.find((x) => x.id === d.id)!;
+      ok(st().dispatchOwnDeliveries([d.id], courier.id));
+      await expectSynced('entrega 292 saiu');
+      const out = st().ownDeliveries.find((x) => x.id === d.id)!;
+      // B (que não viu a saída com Tito) manda a entrega saindo com Lia, e depois a cópia de "pronto".
+      const byB = await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { ...out, courier_id: other.id, courier_fee: 9, out_at: new Date().toISOString() });
+      expect(byB.status, byB.body).toBeLessThan(300);
+      const stale = await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, ready);
+      expect(stale.status, stale.body).toBeLessThan(300);
+      expect(sql(`SELECT status || ' ' || courier_id || ' ' || courier_fee FROM own_deliveries WHERE id = '${d.id}'`)).toBe(`OUT ${courier.id} 7.00`);
+      // A etapa seguinte de verdade continua andando, com o entregador que saiu.
+      const deliveredByB = await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { ...out, courier_id: other.id, courier_fee: 9, status: 'DELIVERED', delivered_at: new Date().toISOString() });
+      expect(deliveredByB.status, deliveredByB.body).toBeLessThan(300);
+      expect(sql(`SELECT status || ' ' || courier_id || ' ' || courier_fee FROM own_deliveries WHERE id = '${d.id}'`)).toBe(`DELIVERED ${courier.id} 7.00`);
+      // As travas continuam: cancelar a entregue, ou mudar o endereço, é recusado.
+      expect((await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { status: 'CANCELED' })).status).toBeGreaterThanOrEqual(400);
+      expect((await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { address: 'Rua 292, 99' })).status).toBeGreaterThanOrEqual(400);
+      // Entrega só entra em acerto pela função.
+      const sid = crypto.randomUUID();
+      expect((await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { settlement_id: sid })).body).toMatch(/TCHEFOOD_ENTREGA_ACERTO_ONLINE/);
     });
   });
 

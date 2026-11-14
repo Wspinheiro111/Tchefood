@@ -444,7 +444,10 @@ export type AuditActionType =
   | 'CASH_WITHDRAWAL'
   | 'CASH_CLOSE_DIFFERENCE'
   // Item com preço diferente do cadastro aceito com PIN de gerente (db/schema_preco_gerente.sql)
-  | 'PRICE_OVERRIDE';
+  | 'PRICE_OVERRIDE'
+  // Conta de itens atrasados descartada com mesa ocupada por outro cliente (auditoria interna,
+  // rodada 8 do PR #54): sem PIN de gerente, só o registro dos itens que saíram do aparelho.
+  | 'LATE_ITEMS_DISCARDED';
 
 export interface AuditLog {
   id: UUID;
@@ -665,6 +668,12 @@ export interface CourierSettlement {
   courier_fees: number;
   /** Sangria do caixa que pagou o entregador (null = pago por fora). */
   cash_movement_id: UUID | null;
+  /**
+   * Entregas deste acerto. O banco trava e marca as entregas na gravação do acerto e
+   * recusa o acerto se alguma já foi acertada (outro aparelho). Ausente nos acertos
+   * gravados antes desta versão (auditoria interna, rodada 8 do PR #54).
+   */
+  delivery_ids?: UUID[];
   settled_by_user_id: UUID;
   created_at: ISODateTime;
 }

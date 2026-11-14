@@ -11,7 +11,7 @@ import { CASH_ROLES, selectCurrentUser, useTcheStore } from '../store/useTcheSto
 import { useTerminalBus } from '../lib/payments/drivers';
 import { formatBRL } from '../lib/money';
 import { shiftStartBrasilia } from '../lib/reports';
-import { cashOutsideSessions, cashSummary, closingDifference, closingReceiptLines, parseMoneyInput, validCashAmount } from '../lib/cashRegister';
+import { cashOutsideSessions, cashSummary, type CashRange, closingDifference, closingReceiptLines, parseMoneyInput, validCashAmount } from '../lib/cashRegister';
 import type { CashSession } from '../types';
 
 const SUPPLY_REASONS = ['Troco do banco', 'Troco trazido pelo gerente', 'Reforço de troco'];
@@ -49,9 +49,13 @@ function printClosing(session: CashSession) {
   });
 }
 
+const NO_RANGES: CashRange[] = [];
+
 export function CashRegisterScreen() {
   const user = useTcheStore(selectCurrentUser);
   const sessions = useTcheStore((s) => s.cashSessions);
+  // Caixas abertos em outros aparelhos (só o horário, lido da nuvem): o dinheiro recebido neles não é alarme.
+  const cloudCashRanges = useTcheStore((s) => s.cloudCashRanges ?? NO_RANGES);
   const movements = useTcheStore((s) => s.cashMovements);
   const payments = useTcheStore((s) => s.payments);
   const staff = useTcheStore((s) => s.staff);
@@ -83,7 +87,7 @@ export function CashRegisterScreen() {
   const open = sessions.find((c) => c.status === 'OPEN') ?? null;
   const isManager = user?.role === 'MANAGER' || user?.role === 'OWNER';
   const summary = useMemo(() => (open ? cashSummary(open, payments, movements, now) : null), [open, payments, movements, now]);
-  const outside = useMemo(() => cashOutsideSessions(payments, sessions, shiftStartBrasilia(now), now), [payments, sessions, now]);
+  const outside = useMemo(() => cashOutsideSessions(payments, sessions, shiftStartBrasilia(now), now, cloudCashRanges), [payments, sessions, now, cloudCashRanges]);
   const name = (id: string | null) => (id ? staff.find((u) => u.id === id)?.name ?? '?' : '-');
   const history = sessions.filter((c) => c.status === 'CLOSED').slice(0, 10);
 

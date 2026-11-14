@@ -163,7 +163,8 @@ export function postgrestFetch(t: PgTarget, db: string, claims: Record<string, u
       const args = Object.keys(body).map((k) => {
         const ty = types[names.indexOf(k)]!;
         const v = body[k];
-        const val = v === null ? `NULL::${ty}` : ty === 'jsonb' || ty === 'json' ? `${lit(JSON.stringify(v))}::${ty}` : `${lit(typeof v === 'string' ? v : JSON.stringify(v))}::${ty}`;
+        // Lista JSON num argumento de array (ex.: uuid[]), como o PostgREST converte.
+        const val = v === null ? `NULL::${ty}` : ty.endsWith('[]') && Array.isArray(v) ? `${lit(`{${v.map((x) => JSON.stringify(String(x))).join(',')}}`)}::${ty}` : ty === 'jsonb' || ty === 'json' ? `${lit(JSON.stringify(v))}::${ty}` : `${lit(typeof v === 'string' ? v : JSON.stringify(v))}::${ty}`;
         return `${ident(k)} => ${val}`;
       });
       const r = run(`SELECT to_jsonb(public.${ident(fn)}(${args.join(', ')}));`);

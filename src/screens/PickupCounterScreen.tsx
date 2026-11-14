@@ -231,7 +231,7 @@ function OrderBuilder({ onCheckout }: { onCheckout: (orderId: string) => void })
         <PickupQueue onCharge={onCheckout} />
       </div>
 
-      <aside className="h-fit rounded-2xl border-2 border-ouro/60 bg-surface p-3 lg:sticky lg:top-[72px]">
+      <aside className="h-fit rounded-2xl border-2 border-ouro/60 bg-surface p-3 lg:sticky lg:top-[calc(var(--equipe-topo,56px)+16px)]">
         <div className="mb-2 grid grid-cols-3 gap-2">
           {(['TAKEOUT', 'DINE_IN', 'DELIVERY'] as FulfillmentType[]).map((f) => (
             <button key={f} onClick={() => setFulfillment(f)} className={`flex min-h-touch items-center justify-center gap-1.5 rounded-xl text-sm font-black ${fulfillment === f ? 'bg-brasa text-white' : 'bg-base text-slate-700'}`}>

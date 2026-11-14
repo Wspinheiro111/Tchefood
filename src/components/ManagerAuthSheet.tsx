@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ShieldAlert } from 'lucide-react';
 import { Btn, Sheet, toast } from './ui';
 import { PinPad } from './PinPad';
@@ -14,7 +14,8 @@ interface Props<T> {
   title: string;
   summary: ReactNode;
   confirmLabel: string;
-  onSubmit: (managerPin: string, reason: string) => ActionResult<T>;
+  /** Pode ser assíncrono (ex.: acerto do entregador confirmado pela nuvem): o botão espera a resposta. */
+  onSubmit: (managerPin: string, reason: string) => ActionResult<T> | Promise<ActionResult<T>>;
   onSuccess: (data: T) => void;
   /** Mensagem depois de autorizado (padrão: alerta anti-fraude enviado ao proprietário). */
   successMessage?: string;
@@ -30,12 +31,18 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
   const [pin, setPin] = useState('');
   const [reason, setReason] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  // Trava síncrona: o toque duplo (ou o último dígito e o botão no mesmo instante) chega antes de
+  // a tela redesenhar com busy, e mandaria o acerto duas vezes (auditoria interna, rodada 8 do PR #54).
+  const busyRef = useRef(false);
 
   useEffect(() => {
     if (open) {
       setPin('');
       setReason('');
       setError(null);
+      setBusy(false);
+      busyRef.current = false;
     }
   }, [open]);
 
@@ -46,7 +53,27 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
       setError(`Informe o motivo (mínimo ${MIN_REASON_LENGTH} caracteres) antes do PIN.`);
       return;
     }
-    const res = onSubmit(pinValue, reason);
+    // Conferido antes de chamar onSubmit: com a confirmação ainda esperando, nada sai de novo.
+    if (busyRef.current) return;
+    busyRef.current = true;
+    let out: ActionResult<T> | Promise<ActionResult<T>>;
+    try {
+      out = onSubmit(pinValue, reason);
+    } catch (e) {
+      busyRef.current = false;
+      throw e;
+    }
+    if (out instanceof Promise) {
+      setBusy(true);
+      void out.then(finish, (e: unknown) => finish({ ok: false, error: (e as Error).message }));
+      return;
+    }
+    finish(out);
+  };
+
+  const finish = (res: ActionResult<T>) => {
+    busyRef.current = false;
+    setBusy(false);
     if (!res.ok) {
       setError(res.error);
       setPin('');
@@ -70,7 +97,7 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
         </span>
       }
       footer={
-        <Btn block size="lg" disabled={pin.length !== 4 || !reasonOk} onClick={() => submit()}>
+        <Btn block size="lg" disabled={busy || pin.length !== 4 || !reasonOk} onClick={() => submit()}>
           {confirmLabel}
         </Btn>
       }
@@ -98,7 +125,7 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
       />
 
       <p className="mb-2 text-center text-sm font-semibold text-slate-700">PIN do Gerente</p>
-      <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => reasonOk && submit(v)} error={Boolean(error)} compact />
+      <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => reasonOk && !busy && submit(v)} error={Boolean(error)} compact />
       {error && <p className="mt-3 rounded-lg bg-brasa/20 p-2 text-center text-sm font-semibold text-rose-700">{error}</p>}
     </Sheet>
   );

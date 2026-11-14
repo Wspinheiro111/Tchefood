@@ -283,6 +283,7 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   CASH_WITHDRAWAL: 'Sangria do caixa',
   CASH_CLOSE_DIFFERENCE: 'Caixa fechado com diferença',
   PRICE_OVERRIDE: 'Preço diferente do cadastro aceito pelo gerente',
+  LATE_ITEMS_DISCARDED: 'Conta de itens atrasados descartada (mesa de outro cliente)',
 };
 
 /** Texto do alerta enviado ao WhatsApp do proprietário. */

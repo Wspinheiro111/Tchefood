@@ -50,6 +50,27 @@ describe('caixa — funções puras', () => {
     expect(r).toEqual({ amount: 28, count: 2 });
   });
 
+  it('dinheiro recebido no caixa aberto em outro aparelho (horário vindo da nuvem) não é alarme', () => {
+    const payments = [pay(10, '2026-11-10T13:00:00Z'), pay(25, '2026-11-10T15:00:00Z'), pay(3, '2026-11-10T09:00:00Z')];
+    const since = new Date('2026-11-10T08:00:00Z');
+    const now = new Date('2026-11-10T16:00:00Z');
+    // Este aparelho nunca abriu caixa; o caixa da loja foi aberto no aparelho A às 12h e segue aberto.
+    expect(cashOutsideSessions(payments, [], since, now)).toEqual({ amount: 38, count: 3 });
+    const fromA = [{ id: 'sA', opened_at: '2026-11-10T12:00:00.000Z', closed_at: null }];
+    expect(cashOutsideSessions(payments, [], since, now, fromA)).toEqual({ amount: 3, count: 1 });
+    // Caixa de A já fechado às 14h: o pagamento das 15h continua fora.
+    const closedA = [{ id: 'sA', opened_at: '2026-11-10T12:00:00.000Z', closed_at: '2026-11-10T14:00:00.000Z' }];
+    expect(cashOutsideSessions(payments, [], since, now, closedA)).toEqual({ amount: 28, count: 2 });
+  });
+
+  it('o caixa deste aparelho vale mais que a cópia da nuvem do mesmo caixa', () => {
+    // Fechado aqui às 14h, a nuvem ainda não recebeu o fechamento e mostra o caixa aberto.
+    const closed = { ...session, status: 'CLOSED' as const, closed_at: '2026-11-10T14:00:00Z' };
+    const stale = [{ id: 's1', opened_at: '2026-11-10T12:00:00.000Z', closed_at: null }];
+    const r = cashOutsideSessions([pay(25, '2026-11-10T15:00:00Z')], [closed], new Date('2026-11-10T08:00:00Z'), new Date('2026-11-10T16:00:00Z'), stale);
+    expect(r).toEqual({ amount: 25, count: 1 });
+  });
+
   it('lê valor digitado em reais', () => {
     expect(parseMoneyInput('1.234,56')).toBe(1234.56);
     expect(parseMoneyInput('R$ 50')).toBe(50);

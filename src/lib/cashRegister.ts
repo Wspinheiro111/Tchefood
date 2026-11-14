@@ -57,12 +57,28 @@ export function closingDifference(counted: number, expected: number): number {
   return fromCents(toCents(counted) - toCents(expected));
 }
 
+/** Horário de um caixa (aberto: closed_at null). Os caixas de outros aparelhos descem da nuvem só com isto. */
+export type CashRange = Pick<CashSession, 'id' | 'opened_at' | 'closed_at'>;
+
 /**
  * Dinheiro recebido sem caixa aberto desde `since`: não entra em nenhum fechamento,
  * então aparece para o gerente (aviso no Painel do dono e na tela do Caixa).
+ *
+ * `cloudRanges`: horários dos caixas da loja lidos da nuvem (tchefood_pull_orders). A loja tem
+ * um caixa aberto por vez, aberto num aparelho só; o pagamento em dinheiro feito em outro
+ * aparelho durante esse caixa desce para este e não é alarme. Um caixa que este aparelho
+ * tem vale pela versão daqui (o fechamento feito aqui pode ainda não ter subido).
  */
-export function cashOutsideSessions(payments: readonly Payment[], sessions: readonly CashSession[], since: Date, now: Date = new Date()): { amount: number; count: number } {
-  const ranges = sessions.map((s) => [new Date(s.opened_at).getTime(), s.closed_at ? new Date(s.closed_at).getTime() : now.getTime()] as const);
+export function cashOutsideSessions(
+  payments: readonly Payment[],
+  sessions: readonly CashSession[],
+  since: Date,
+  now: Date = new Date(),
+  cloudRanges: readonly CashRange[] = [],
+): { amount: number; count: number } {
+  const localIds = new Set(sessions.map((s) => s.id));
+  const all: CashRange[] = [...sessions, ...cloudRanges.filter((r) => !localIds.has(r.id))];
+  const ranges = all.map((s) => [new Date(s.opened_at).getTime(), s.closed_at ? new Date(s.closed_at).getTime() : now.getTime()] as const);
   const outside = cashPaymentsIn(payments, since.getTime(), now.getTime()).filter((p) => {
     const t = new Date(p.created_at).getTime();
     return !ranges.some(([a, b]) => t >= a && t <= b);
