@@ -115,6 +115,14 @@ supabase functions deploy emit-nfce
 - `tipo_integracao: 1` só com prova da maquininha (CNPJ da credenciadora Stone/PagBank coerente com o adquirente do pagamento + código de autorização); sem prova, `2`. Pix da maquininha sai `2`, como no Tchê Vendas.
 - Banco: transições inválidas (ex.: autorizada → rejeitada), DELETE e alteração de nota autorizada são barrados por trigger.
 
+**Telas (loja ligada à nuvem).** A conta fecha com a NFC-e **pendente e sem chave**; nada fiscal é montado no aparelho. Quando tudo da conta subiu (nenhum evento dela na fila nem recusado), a sincronização chama a `emit-nfce` com o `order_id` (até 3 contas por rodada) e grava só o que o servidor respondeu (`src/lib/sync/nfceEmission.ts`): chave, protocolo, número, série, data de emissão e QR Code assinado, conferidos antes de ir para a tela. "Autorizada" só com chave + protocolo; em processamento ou contingência o aparelho consulta de novo (10 s, 20 s, 40 s… até 5 min); rejeitada, inválida (ex.: token não configurado) ou em conflito para e mostra a mensagem, e o botão "Emitir / consultar agora" da tela da NFC-e tenta de novo. O DANFE da bobina só imprime com o QR Code da SEFAZ para aquela chave (há também o link do DANFE da Focus). Sem nuvem (demonstração) a nota continua simulada e a tela diz isso.
+
+**Configurar a loja (homologação).** Token Focus no banco, fora do alcance do aparelho (só a service role lê):
+```sql
+UPDATE tenants SET focus_nfe_token = '<token de homologação da Focus>' WHERE id = '<tenant_id>';
+```
+CNPJ, IE, regime tributário, certificado A1 e CSC ficam no cadastro da empresa no painel da Focus (a Focus assina a nota e o QR Code). `FOCUS_AMBIENTE` fica sem valor (homologação) até a loja ter certificado e CSC de produção.
+
 ## Banco de dados
 `db/schema_purchases.sql` (rodar depois do `schema.sql`): `suppliers`, `purchase_invoices` (`UNIQUE (tenant_id, access_key)`), `purchase_invoice_items`, `stock_movements` (somente inserção), `supplier_product_links` e as colunas `cost_price`, `stock_quantity`, `barcode` em `products`.
 

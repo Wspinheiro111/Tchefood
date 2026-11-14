@@ -752,6 +752,41 @@ export interface TrayItem {
   weight?: { gross_grams: number; tare_grams: number; source: WeightSource } | null;
 }
 
+/** Situação do documento NFC-e no servidor (nfce_documents.status, emit-nfce). */
+export type NfceCloudStatus = 'processing' | 'authorized' | 'rejected' | 'contingency' | 'cancelled';
+
+/** Resultado da última chamada à emit-nfce que não trouxe documento. */
+export type NfceCallProblem = 'invalid' | 'not_found' | 'conflict' | 'error' | 'network';
+
+/**
+ * NFC-e real de uma comanda, como a Edge Function emit-nfce respondeu. Tudo o que é
+ * fiscal (chave, protocolo, número, QR Code) vem do servidor; o aparelho só guarda.
+ */
+export interface NfceCloudRecord {
+  order_id: UUID;
+  /** Status do documento no servidor; null enquanto não houve documento. */
+  status: NfceCloudStatus | null;
+  environment: 'homologacao' | 'producao' | null;
+  access_key: string | null;
+  protocol: string | null;
+  number: number | null;
+  series: string | null;
+  /** QR Code assinado da SEFAZ para esta chave (já conferido). */
+  qrcode_url: string | null;
+  /** Caminho do DANFE na Focus (relativo ao ambiente). */
+  danfe_path: string | null;
+  /** data_emissao enviada à SEFAZ. */
+  issued_at: ISODateTime | null;
+  message: string | null;
+  /** null = a última chamada trouxe o documento; senão, o que deu errado nela. */
+  problem: NfceCallProblem | null;
+  /** Chamadas feitas pelo aparelho (para o intervalo entre consultas). */
+  attempts: number;
+  /** Próxima chamada automática; null = só pelo botão. */
+  next_attempt_at: ISODateTime | null;
+  updated_at: ISODateTime;
+}
+
 /** Evento da fila offline-first, pronto para ser enviado ao Supabase. */
 export interface SyncEvent {
   id: UUID;

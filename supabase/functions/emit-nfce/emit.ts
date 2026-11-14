@@ -43,6 +43,8 @@ export interface NfceDocumentRow {
   sefaz_message: string | null;
   offline_contingency: boolean;
   transmissions: number;
+  /** data_emissao do payload transmitido (lido de payload->>data_emissao); a tela imprime no DANFE. */
+  issued_at: string | null;
 }
 
 export type NewNfceDocument = Pick<NfceDocumentRow, 'tenant_id' | 'order_id' | 'reference' | 'environment' | 'payload_hash'> & {
@@ -107,6 +109,8 @@ export interface EmitResponse {
     series: string | null;
     qrcode_url: string | null;
     danfe_path: string | null;
+    /** data_emissao enviada à SEFAZ (null antes da primeira transmissão). */
+    issued_at: string | null;
     message: string | null;
   };
 }
@@ -137,6 +141,7 @@ function respond(doc: NfceDocumentRow, message?: string | null): EmitResponse {
       series: doc.series,
       qrcode_url: doc.qrcode_url,
       danfe_path: doc.danfe_path,
+      issued_at: doc.issued_at,
       message: message ?? doc.sefaz_message,
     },
   };
@@ -157,6 +162,7 @@ function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict
       series: null,
       qrcode_url: null,
       danfe_path: null,
+      issued_at: null,
       message,
     },
   };

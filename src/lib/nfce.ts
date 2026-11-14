@@ -322,3 +322,42 @@ export function buildNfce(params: {
     payload,
   };
 }
+
+/** O que o servidor (emit-nfce) devolveu de uma NFC-e real; ver NfceCloudRecord em types.ts. */
+export interface ServerNfceFields {
+  status: 'processing' | 'authorized' | 'rejected' | 'contingency' | 'cancelled' | null;
+  access_key: string | null;
+  protocol: string | null;
+  number: number | null;
+  series: string | null;
+  qrcode_url: string | null;
+  issued_at: string | null;
+}
+
+/**
+ * DANFE da NFC-e real: itens, valores e pagamentos da comanda (os mesmos que o servidor
+ * leu do banco) com chave, protocolo, número, série, data de emissão e QR Code do
+ * servidor. Nada fiscal é calculado aqui. Só para autorizada (com protocolo) ou
+ * contingência, e só com QR Code da SEFAZ para esta chave; senão null (não imprime).
+ */
+export function serverNfceDocument(local: NfceDocument, server: ServerNfceFields): NfceDocument | null {
+  const authorized = server.status === 'authorized';
+  if (!authorized && server.status !== 'contingency') return null;
+  const key = server.access_key;
+  if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key) || !server.issued_at) return null;
+  if (authorized && !server.protocol) return null;
+  const parsed = parseAccessKey(key);
+  return {
+    ...local,
+    access_key: key,
+    protocol: authorized ? server.protocol! : '',
+    issued_at: server.issued_at,
+    qr_url: server.qrcode_url!,
+    payload: {
+      ...local.payload,
+      data_emissao: server.issued_at,
+      numero: server.number ?? parsed.numero,
+      serie: server.series ? Number(server.series) : parsed.serie,
+    },
+  };
+}

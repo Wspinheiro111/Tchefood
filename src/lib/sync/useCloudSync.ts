@@ -7,6 +7,7 @@ import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
+import { dueNfceOrders, requestNfceEmission } from './nfceEmission';
 
 const INTERVAL_MS = 5_000;
 /** Leitura dos cadastros da nuvem (só com a fila vazia: o que é daqui sobe antes). */
@@ -35,6 +36,20 @@ async function pullOnce(cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
 }
 
 /**
+ * NFC-e real: pede/consulta na emit-nfce as comandas fechadas que já subiram inteiras
+ * (no máximo 3 por rodada). A resposta só é gravada se o aparelho ainda é da mesma loja.
+ */
+async function emitDueNfce(cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
+  const tenantId = useTcheStore.getState().tenant.id;
+  for (const orderId of dueNfceOrders(useTcheStore.getState(), Date.now())) {
+    const outcome = await requestNfceEmission(cfg, orderId, fetchFn);
+    const st = useTcheStore.getState();
+    if (!st.cloud || st.tenant.id !== tenantId) return;
+    st.applyNfceOutcome(orderId, outcome);
+  }
+}
+
+/**
  * Uma rodada: envia a fila e, com ela vazia, lê os cadastros da nuvem quando passou
  * um minuto da última leitura (ou sempre, com forcePull). Exportada para o botão
  * "Sincronizar agora" e para testes.
@@ -45,7 +60,8 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
   const session = state.cloud;
   if (!session) return;
   const wantsPull = opts.forcePull === true || pullDue(state.pullStatus?.last_pull_at, Date.now());
-  if (state.outbox.length === 0 && !wantsPull) return;
+  const wantsNfce = dueNfceOrders(state, Date.now(), 1).length > 0;
+  if (state.outbox.length === 0 && !wantsPull && !wantsNfce) return;
   running = true;
   try {
     let token = session.access_token;
@@ -66,7 +82,8 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
     const cfg: SyncConfig = { url: session.url, anonKey: session.anon_key, accessToken: token };
     const { outbox: events, syncRejected } = useTcheStore.getState();
     if (events.length === 0) {
-      await pullOnce(cfg, fetchFn);
+      if (wantsPull) await pullOnce(cfg, fetchFn);
+      await emitDueNfce(cfg, fetchFn);
       return;
     }
     const held = (syncRejected ?? []).map((r) => r.event);
@@ -83,6 +100,8 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
     }
     // Fila zerou nesta rodada: lê a nuvem agora, se estava na hora.
     if (wantsPull && useTcheStore.getState().outbox.length === 0 && !result.retryLater) await pullOnce(cfg, fetchFn);
+    // Conta que acabou de subir inteira já pede a NFC-e nesta rodada.
+    if (!result.retryLater) await emitDueNfce(cfg, fetchFn);
   } finally {
     running = false;
   }

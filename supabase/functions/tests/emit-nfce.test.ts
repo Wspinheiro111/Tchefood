@@ -170,14 +170,15 @@ class MemoryRepo implements NfceRepository {
   async getDocument() {
     return this.doc ? { ...this.doc } : null;
   }
-  async insertProcessing(d: { tenant_id: string; order_id: string; reference: string; environment: 'homologacao' | 'producao'; payload_hash: string | null }) {
+  async insertProcessing(d: { tenant_id: string; order_id: string; reference: string; environment: 'homologacao' | 'producao'; payload_hash: string | null; payload: unknown }) {
     if (this.doc) return null;
-    this.doc = { id: 'd1', ...d, status: 'processing', access_key: null, protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, xml_path: null, sefaz_status: null, sefaz_message: null, offline_contingency: false, transmissions: 1 };
+    const { payload, ...rest } = d;
+    this.doc = { id: 'd1', ...rest, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null, status: 'processing', access_key: null, protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, xml_path: null, sefaz_status: null, sefaz_message: null, offline_contingency: false, transmissions: 1 };
     return { ...this.doc };
   }
-  async claimRejected(id: string, expectedTransmissions: number, payloadHash: string) {
+  async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown = {}) {
     if (!this.doc || this.doc.id !== id || this.doc.status !== 'rejected' || this.doc.transmissions !== expectedTransmissions) return null;
-    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1 };
+    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
     return { ...this.doc };
   }
   async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
@@ -212,6 +213,17 @@ describe('emitNfce', () => {
     const second = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
     expect(second.body.authorized).toBe(true);
     expect(calls).toHaveLength(1);
+  });
+
+  it('devolve a data de emissão transmitida (a tela imprime no DANFE)', async () => {
+    const repo = new MemoryRepo(source());
+    const { focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const now = () => new Date('2026-11-14T13:00:00Z');
+    const r = await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex, now }, { tenantId: TENANT, orderId: ORDER });
+    expect(r.body.issued_at).toBe(fiscalIssuedAt(now()));
+    expect(r.body.issued_at).toMatch(/-03:00$/);
+    const missing = await emitNfce({ repo: new MemoryRepo(source({ tenant: { ...source().tenant, focus_nfe_token: null } })), environment: 'homologacao', focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(missing.body).toMatchObject({ status: 'invalid', issued_at: null });
   });
 
   it('falha de rede NÃO vira contingência nem sucesso; a próxima chamada só consulta', async () => {
