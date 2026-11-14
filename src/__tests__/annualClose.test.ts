@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { defaultYear, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
-import { br, code, escapeHtml, expensesDoc, fileName, inventoryDoc, periodLabel, revenueDoc, toCsv, toPrintableHtml, type ReportDoc } from '../lib/annualCloseExport';
+import { br, code, escapeHtml, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, revenueDoc, toCsv, toPrintableHtml, type ReportDoc } from '../lib/annualCloseExport';
 import type { FeeRule } from '../lib/cardFees';
 import type { CashMovement, CashSession, CourierSettlement, OwnDelivery, Payment, Product, PurchaseInvoice, StockMovement, Supplier } from '../types';
 
@@ -343,5 +343,40 @@ describe('revisão do Codex', () => {
     expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).rows[0]!.amount).toBe(80);
     expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, yearPeriod(2026)).rows[0]!.amount).toBe(0);
     expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).purchases[0]!.date).toBe('2025-12-31T15:00:00.000Z');
+  });
+});
+
+describe('3b. venda na maquininha sem taxa cadastrada (situação de repasse desconhecida)', () => {
+  const now = new Date('2026-11-14T12:00:00-03:00');
+  const base = { period: periodLabel('open', P), store: { name: 'Loja', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+  const open = (payments: Payment[]) => openPositionsAt({ payments, feeRules: [], ownDeliveries: [], courierSettlements: [], couriers: [], orders: [] }, P, now);
+
+  it('venda de dezembro do ano anterior sem taxa aparece no relatório e na exportação do ano escolhido', () => {
+    const r = open([pay({ amount: 123.45, method: 'CREDIT', acquirer: 'STONE', created_at: '2024-12-20T20:00:00-03:00' })]);
+    expect([r.cardWithoutRule, r.cardWithoutRuleCount]).toEqual([123.45, 1]);
+    expect([r.cardWithoutRulePriorYears, r.cardWithoutRulePriorYearsCount]).toEqual([123.45, 1]);
+    expect(r.cardReceivablesNet).toBe(0);
+    const csv = toCsv(openDoc(r, base));
+    expect(csv).toContain('SITUAÇÃO DE REPASSE DESCONHECIDA: 1 venda(s)');
+    expect(csv).toContain('R$ 123,45 (0 deste ano, R$ 0,00; 1 de anos anteriores, R$ 123,45)');
+    expect(csv).toContain('pode já ter sido recebido');
+  });
+
+  it('venda depois da posição não conta; a do próprio ano conta; simulador e recusada ficam fora', () => {
+    const r = open([
+      pay({ amount: 70, acquirer: 'PAGBANK', created_at: '2025-12-20T20:00:00-03:00' }), // do ano: conta
+      pay({ amount: 30, created_at: '2024-12-20T20:00:00-03:00' }), // ano anterior: conta
+      pay({ amount: 500, created_at: '2026-01-01T00:00:00-03:00' }), // já é depois da posição
+      pay({ amount: 40, acquirer: 'MOCK', created_at: '2025-06-01T20:00:00-03:00' }), // simulador
+      pay({ amount: 60, status: 'DECLINED', created_at: '2025-06-01T20:00:00-03:00' }),
+    ]);
+    expect([r.cardWithoutRule, r.cardWithoutRuleCount]).toEqual([100, 2]);
+    expect([r.cardWithoutRulePriorYears, r.cardWithoutRulePriorYearsCount]).toEqual([30, 1]);
+    expect(toCsv(openDoc(r, base))).toContain('R$ 100,00 (1 deste ano, R$ 70,00; 1 de anos anteriores, R$ 30,00)');
+
+    const soDoAno = open([pay({ amount: 70, created_at: '2025-12-31T23:59:00-03:00' }), pay({ amount: 500, created_at: '2026-01-01T00:00:00-03:00' })]);
+    expect([soDoAno.cardWithoutRule, soDoAno.cardWithoutRuleCount, soDoAno.cardWithoutRulePriorYearsCount]).toEqual([70, 1, 0]);
+    expect(toCsv(openDoc(soDoAno, base))).toContain('R$ 70,00 (todas deste ano)');
+    expect(toCsv(openDoc(open([]), base))).not.toContain('SITUAÇÃO DE REPASSE DESCONHECIDA');
   });
 });

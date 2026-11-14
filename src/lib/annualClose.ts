@@ -544,9 +544,17 @@ export interface OpenPositionsReport {
   /** Vendas na maquininha até 31/12 com repasse previsto para depois (pela taxa cadastrada). */
   cardReceivables: CardReceivableRow[];
   cardReceivablesNet: number;
-  /** Vendido na maquininha sem taxa cadastrada: não dá para saber quando cai. */
+  /**
+   * Situação de repasse desconhecida: venda na maquininha (Stone/PagBank) até a posição
+   * sem taxa cadastrada, de qualquer ano (venda de dezembro do ano anterior pode cair
+   * depois da virada). Sem o prazo não dá para saber se já caiu ou ainda está a receber;
+   * não entra no A receber. Total, incluindo os anos anteriores.
+   */
   cardWithoutRule: number;
   cardWithoutRuleCount: number;
+  /** Parte de cardWithoutRule/cardWithoutRuleCount com venda de anos anteriores ao escolhido. */
+  cardWithoutRulePriorYears: number;
+  cardWithoutRulePriorYearsCount: number;
   /** Entregas feitas até 31/12 e ainda não acertadas com o entregador naquela data. */
   courierPayables: CourierPayableRow[];
   courierPayablesTotal: number;
@@ -574,6 +582,8 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
   const card = new Map<string, { acquirer: string; method: PaymentMethod; gross: number; fee: number; count: number }>();
   let noRuleC = 0;
   let noRuleCount = 0;
+  let noRulePriorC = 0;
+  let noRulePriorCount = 0;
   let invalidDates = 0;
   for (const pay of input.payments) {
     if (pay.status !== 'APPROVED' || pay.method === 'CASH') continue;
@@ -582,10 +592,17 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
     if (t === null || t >= cutoff) continue;
     const rule = ruleFor(pay, input.feeRules);
     if (!rule) {
-      if ((pay.acquirer === 'STONE' || pay.acquirer === 'PAGBANK') && t >= p.from) {
+      // Simulador (MOCK) e caixa (CASH_DESK) não têm repasse. Venda de anos anteriores
+      // também conta: sem o prazo não dá para saber se caiu antes da posição.
+      if (pay.acquirer === 'STONE' || pay.acquirer === 'PAGBANK') {
         // Mesmo critério do faturamento: valor da venda, sem a gorjeta.
-        noRuleC += toCents(pay.amount);
+        const c = toCents(pay.amount);
+        noRuleC += c;
         noRuleCount += 1;
+        if (t < p.from) {
+          noRulePriorC += c;
+          noRulePriorCount += 1;
+        }
       }
       continue;
     }
@@ -653,6 +670,8 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
     cardReceivablesNet: fromCents(cardReceivables.reduce((a, r) => a + toCents(r.net), 0)),
     cardWithoutRule: fromCents(noRuleC),
     cardWithoutRuleCount: noRuleCount,
+    cardWithoutRulePriorYears: fromCents(noRulePriorC),
+    cardWithoutRulePriorYearsCount: noRulePriorCount,
     courierPayables,
     courierPayablesTotal: fromCents(courierPayables.reduce((a, r) => a + toCents(r.amount), 0)),
     cutoff,

@@ -6,6 +6,7 @@
  */
 import type { ExpensesReport, InventoryReport, OpenPositionsReport, RevenueReport, YearPeriod } from './annualClose';
 import { brasiliaDate, METHOD_LABEL } from './annualClose';
+import { fromCents, toCents } from './money';
 import { parseIsoInstant } from './reports';
 
 export type AnnualReportKind = 'inventory' | 'revenue' | 'open' | 'expenses';
@@ -148,6 +149,20 @@ export function revenueDoc(r: RevenueReport, base: Omit<ReportDoc, 'title' | 'ta
   };
 }
 
+/** Aviso das vendas sem taxa cadastrada: situação de repasse desconhecida, não um a receber. */
+function noRuleNote(r: OpenPositionsReport): string[] {
+  if (r.cardWithoutRuleCount <= 0) return [];
+  const thisYearCount = r.cardWithoutRuleCount - r.cardWithoutRulePriorYearsCount;
+  const thisYear = fromCents(toCents(r.cardWithoutRule) - toCents(r.cardWithoutRulePriorYears));
+  const split =
+    r.cardWithoutRulePriorYearsCount > 0
+      ? ` (${thisYearCount} deste ano, R$ ${br(thisYear)}; ${r.cardWithoutRulePriorYearsCount} de anos anteriores, R$ ${br(r.cardWithoutRulePriorYears)})`
+      : ' (todas deste ano)';
+  return [
+    `SITUAÇÃO DE REPASSE DESCONHECIDA: ${r.cardWithoutRuleCount} venda(s) na maquininha até a posição sem taxa cadastrada, R$ ${br(r.cardWithoutRule)}${split}. Sem o prazo não dá para saber se o repasse já caiu ou ainda está a receber: o valor pode já ter sido recebido e NÃO está somado no A receber. Confira com a agenda da adquirente ou cadastre a taxa.`,
+  ];
+}
+
 export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 'tables' | 'notes'>, extraNotes: string[] = []): ReportDoc {
   return {
     ...base,
@@ -156,7 +171,7 @@ export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 
       'A RECEBER de maquininha: vendas até a posição com repasse previsto para depois dela, pelo prazo e taxa cadastrados (estimativa; feriado não conta; confira com a agenda da adquirente).',
       'Estorno feito na maquininha NÃO chega ao Tchê Food: venda estornada ainda aparece aqui como a receber. Confira com a agenda da adquirente.',
       'A RECEBER de entregador: dinheiro de entregas pagas na entrega feitas até a posição e ainda não acertadas.',
-      ...(r.cardWithoutRuleCount > 0 ? [`${r.cardWithoutRuleCount} venda(s) no ano na maquininha (R$ ${br(r.cardWithoutRule)}) sem taxa cadastrada: não dá para saber se já caíram.`] : []),
+      ...noRuleNote(r),
       'NÃO registrados no Tchê Food (informe pelo seu controle): contas a pagar de fornecedores (boletos/duplicatas), fiado e convênios de clientes, repasses pendentes dos apps de delivery.',
       ...invalid(r.invalidDates, 'entrega(s)'),
       ...extraNotes,
