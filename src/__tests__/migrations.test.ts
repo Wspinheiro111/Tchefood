@@ -11,6 +11,11 @@ const COPY_HEADER = /^-- Cópia de db\/([a-z_]+\.sql) /;
 describe('supabase/migrations', () => {
   const files = readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
 
+  it('cada migration tem versão (prefixo de data e hora) própria: o Supabase não aplica duas com a mesma', () => {
+    const versions = files.map((f) => f.split('_')[0]);
+    expect(versions.filter((v, i) => versions.indexOf(v) !== i)).toEqual([]);
+  });
+
   it('cada arquivo de db/ aplicado depois do schema.sql tem a sua migration, igual ao original', () => {
     const copies = new Map<string, string>();
     for (const f of files) {
@@ -21,7 +26,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_pin_equipe_trava.sql', 'schema_pin_gerente_trava.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_mercado_pago.sql', 'schema_point_reserva.sql', 'schema_pin_equipe_trava.sql', 'schema_pin_gerente_trava.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -77,7 +82,6 @@ describe('supabase/migrations', () => {
     // Versão depois da última já publicada na main (a do PIN da equipe, #53): uma migration com
     // data anterior à última aplicada fica fora do `supabase db push` normal (P2-01 da rodada 3
     // do GPT no PR #50).
-    expect(idx('schema_pin_gerente_trava.sql')).toBe(files.length - 1);
     expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_pin_equipe_trava.sql'));
     // A trava do PIN da equipe refaz tchefood_check_pin, tchefood_save_staff e tchefood_start_store
     // (versão de schema_equipe.sql) e usa a mesma chave da conciliação do cashback: é a última que as define.
@@ -87,6 +91,12 @@ describe('supabase/migrations', () => {
       const defines = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes(`CREATE OR REPLACE FUNCTION ${fn}(`));
       expect(defines.at(-1), fn).toBe(files[idx('schema_pin_equipe_trava.sql')]);
     }
+    // A reserva da Point lê terminal_charges e soma com a regra de tchefood_open_terminal_charge.
+    expect(idx('schema_point_reserva.sql')).toBeGreaterThan(idx('schema_mercado_pago.sql'));
+    // As migrations deste PR vêm depois da última já publicada na main (PIN do gerente, #50):
+    // data anterior à última aplicada fica fora do `supabase db push` normal.
+    expect(idx('schema_mercado_pago.sql')).toBeGreaterThan(idx('schema_pin_gerente_trava.sql'));
+    expect(idx('schema_point_reserva.sql')).toBe(files.length - 1);
   });
 
   it('permissões padrão do banco iguais às do app (src/lib/permissions.ts)', async () => {

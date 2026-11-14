@@ -120,6 +120,8 @@ const NEVER_UPLOAD: Partial<Record<SyncEvent['table'], ReadonlyArray<string>>> =
   // O banco calcula o esperado e a diferença no fechamento e liga o gerente pela
   // autorização gravada; o valor do aparelho nunca vale.
   cash_sessions: ['expected_cash', 'difference', 'closing_authorized_by_manager_id'],
+  // Só do aparelho: itens quitados por este pagamento e motivo da retirada local.
+  payments: ['paid_item_ids', 'withdrawn_reason'],
 };
 
 export function sanitizePayload(event: SyncEvent): Record<string, unknown> {
@@ -537,8 +539,15 @@ function isUuidResponse(body: string): boolean {
 
 function describeError(body: string, status: number): string {
   try {
-    const j = JSON.parse(body) as { message?: string; details?: string; hint?: string };
-    return [j.message, j.details].filter(Boolean).join(' — ') || `HTTP ${status}`;
+    const j = JSON.parse(body) as { code?: string; message?: string; details?: string; hint?: string };
+    // TF010 claim_required: pagamento sem a reserva do servidor numa loja com Point (db/schema_point_reserva.sql).
+    // TF012 reserved_exceeds_balance: desconto, cancelamento ou cashback deixaria o total abaixo do reservado.
+    const lead = j.code === 'TF010'
+      ? 'Esta loja tem a Point: o pagamento precisa da reserva no servidor.'
+      : j.code === 'TF012'
+        ? 'Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total.'
+        : undefined;
+    return [lead, j.message, j.details].filter(Boolean).join(' — ') || `HTTP ${status}`;
   } catch {
     return body.slice(0, 200) || `HTTP ${status}`;
   }

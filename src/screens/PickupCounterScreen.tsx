@@ -6,7 +6,8 @@ import { computeItemTotal, formatBRL, round2 } from '../lib/money';
 import { FULFILLMENT_LABEL, formatPickupNumber, kioskStage, kioskTableIds, brasiliaDate, type KioskStage } from '../lib/kiosk';
 import { chargePickupOrder, finishPaidPickup, printPickupKitchen, printPickupReceipt } from '../lib/pickupCharge';
 import { useTerminalBus, type Chassis } from '../lib/payments/drivers';
-import { clearReviewHold, getReviewHold } from '../lib/payments/reviewHolds';
+import { getReviewHold, subscribeReviewHolds } from '../lib/payments/reviewHolds';
+import { HoldNotChargedButton, isRefundHold, RefundedAtTerminalButton, StuckClaimsPanel, useOrderClaims } from '../components/StuckClaims';
 import { ProductSheet } from '../components/ProductSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
@@ -374,6 +375,10 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
   const [cashGiven, setCashGiven] = useState('');
   const [busy, setBusy] = useState(false);
   const [hold, setHold] = useState(() => getReviewHold(orderId));
+  // Trava criada fora da tela (reserva liberada antes do pagamento chegar ao servidor): aparece na hora.
+  useEffect(() => subscribeReviewHolds((id) => {
+    if (id === orderId) setHold(getReviewHold(orderId));
+  }), [orderId]);
   const [voidOpen, setVoidOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const cashRef = useRef<HTMLInputElement>(null);
@@ -396,6 +401,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
+  const { claims, refresh: refreshClaims } = useOrderClaims(orderId);
 
   if (!order) return null;
   const number = formatPickupNumber(order.pickup_number);
@@ -471,6 +477,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
         <div className="mt-2 flex justify-between border-t border-slate-200 pt-2 text-xl font-black"><span>Total</span><span className="tabular-nums text-brasa">{formatBRL(order.remaining_balance)}</span></div>
       </div>
 
+      <StuckClaimsPanel claims={claims} excludeKeys={[hold?.idempotency_key]} label={`Senha ${number}`} onReleased={refreshClaims} />
       <div className="mb-3 grid grid-cols-4 gap-2">
         {METHODS.map((m) => (
           <button key={m.key} onClick={() => setMethod(m.key)} className={`flex min-h-touch-lg flex-col items-center justify-center gap-1 rounded-xl text-sm font-bold ${method === m.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}>
@@ -492,17 +499,22 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
         <div className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
           <p className="mb-2 font-bold text-brasa">⚠️ {hold.reason}</p>
           <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de receber de novo, em qualquer forma de pagamento. Se a maquininha mostra a transação aprovada, não cobre de novo: guarde o comprovante e chame o gerente.</p>
-          <div className="grid gap-2">
-            <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
-            <Btn variant="secondary" block onClick={() => { clearReviewHold(orderId); setHold(null); }}>Conferi no extrato: não foi cobrado</Btn>
-          </div>
+          {isRefundHold(hold) ? (
+            <RefundedAtTerminalButton hold={hold} label={`Senha ${number}`} size="md" onCleared={() => setHold(getReviewHold(orderId))} />
+          ) : (
+            <div className="grid gap-2">
+              <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
+              <HoldNotChargedButton hold={hold} label={`Senha ${number}`} size="md" onCleared={() => setHold(getReviewHold(orderId))} />
+            </div>
+          )}
           <ConfirmReviewedChargeSheet
             open={confirmOpen}
             onClose={() => setConfirmOpen(false)}
             hold={hold}
             label={`Senha ${number}`}
+            onHoldChanged={setHold}
             onSuccess={(outcome) => {
-              setHold(null);
+              setHold(getReviewHold(orderId));
               // O comprovante TEF já saiu da maquininha: imprime a senha e manda para a cozinha.
               if (outcome.closed) finishPaidPickup(orderId, chassis, null, null);
             }}

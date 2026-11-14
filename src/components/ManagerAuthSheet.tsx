@@ -14,7 +14,8 @@ interface Props<T> {
   title: string;
   summary: ReactNode;
   confirmLabel: string;
-  onSubmit: (managerPin: string, reason: string) => ActionResult<T>;
+  /** Pode ser assíncrono (conferência no servidor): enquanto espera, o botão fica bloqueado. */
+  onSubmit: (managerPin: string, reason: string) => ActionResult<T> | Promise<ActionResult<T>>;
   onSuccess: (data: T) => void;
   /** Mensagem depois de autorizado (padrão: alerta anti-fraude enviado ao proprietário). */
   successMessage?: string;
@@ -30,6 +31,7 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
   const [pin, setPin] = useState('');
   const [reason, setReason] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -46,7 +48,22 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
       setError(`Informe o motivo (mínimo ${MIN_REASON_LENGTH} caracteres) antes do PIN.`);
       return;
     }
-    const res = onSubmit(pinValue, reason);
+    if (busy) return;
+    const out = onSubmit(pinValue, reason);
+    if (out instanceof Promise) {
+      setBusy(true);
+      void out
+        .catch((e: unknown): ActionResult<T> => ({ ok: false, error: e instanceof Error ? e.message : String(e) }))
+        .then((res) => {
+          setBusy(false);
+          finish(res);
+        });
+      return;
+    }
+    finish(out);
+  };
+
+  const finish = (res: ActionResult<T>) => {
     if (!res.ok) {
       setError(res.error);
       setPin('');
@@ -70,7 +87,7 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
         </span>
       }
       footer={
-        <Btn block size="lg" disabled={pin.length !== 4 || !reasonOk} onClick={() => submit()}>
+        <Btn block size="lg" disabled={busy || pin.length !== 4 || !reasonOk} onClick={() => submit()}>
           {confirmLabel}
         </Btn>
       }

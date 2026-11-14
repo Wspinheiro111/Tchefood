@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { DELIVERY_FEE_CODE, migratePersisted, useTcheStore, type PickupLine } from '../store/useTcheStore';
 import { normalizePhone, routeUrl, settlementPreview, validateDeliveryInput, type DeliveryAddressInput } from '../lib/ownDelivery';
 import { cashSummary } from '../lib/cashRegister';
+import { flushOutbox } from '../lib/sync/supabaseSync';
 import { stableUuid } from '../lib/ids';
 import type { DeliveryZone } from '../types';
 
@@ -107,6 +108,34 @@ describe('entrega própria — fluxo', () => {
     });
     expect(r.ok).toBe(true);
     expect(st().setOwnDeliveryStatus(d.id, 'READY').ok).toBe(true);
+  });
+
+  it('acerto: o pagamento entrega-<id> vem depois do DELIVERED na fila e espera por ele (recusado segura o pagamento)', async () => {
+    asCashier();
+    const o = deliveryOrder();
+    const d = deliveryOf(o.id);
+    const courier = st().couriers[0]!;
+    expect(st().setOwnDeliveryStatus(d.id, 'READY').ok).toBe(true);
+    expect(st().dispatchOwnDeliveries([d.id], courier.id).ok).toBe(true);
+    expect(st().setOwnDeliveryStatus(d.id, 'DELIVERED').ok).toBe(true);
+    const s = st().settleCourier(courier.id, { payFromDrawer: false, auth: null });
+    if (!s.ok) throw new Error(s.error);
+    const q = st().outbox;
+    const delivered = q.findIndex((e) => e.table === 'own_deliveries' && e.row_id === d.id && e.payload.status === 'DELIVERED');
+    const pay = q.findIndex((e) => e.table === 'payments' && e.payload.idempotency_key === `entrega-${d.id}`);
+    expect(delivered).toBeGreaterThanOrEqual(0);
+    expect(delivered).toBeLessThan(pay);
+    expect(q[pay]!.depends_on_event_ids).toContain(q[delivered]!.id);
+    // DELIVERED recusado pelo servidor: o pagamento (e o fechamento da conta) não sobem antes dele.
+    const sent: string[] = [];
+    const res = await flushOutbox(q, { url: 'https://x.supabase.co/', anonKey: 'a', accessToken: 'j' }, async (url, init) => {
+      const body = init.body ?? '';
+      const isDelivered = url.includes('own_deliveries') && body.includes('"DELIVERED"');
+      if (!isDelivered) sent.push(url);
+      return { ok: !isDelivered, status: isDelivered ? 400 : 200, text: async () => (isDelivered ? '{"message":"x"}' : init.method === 'PATCH' ? '[{"id":"x"}]' : '') };
+    }, 500);
+    expect(res.rejected.map((r) => r.eventId)).toContain(q[delivered]!.id);
+    expect(sent.some((u) => u.includes('tchefood_register_payment'))).toBe(false);
   });
 
   it('pronto → saiu com o entregador → entregue → acerto: o dinheiro entra no caixa e o ganho sai em sangria', () => {

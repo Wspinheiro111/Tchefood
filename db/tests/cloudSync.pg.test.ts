@@ -23,6 +23,7 @@ import { syncOnce } from '../../src/lib/sync/useCloudSync';
 import { useArStore } from '../../src/store/useArStore';
 import { sampleNfeXml } from '../../src/data/sampleNfe';
 import { setReviewHold } from '../../src/lib/payments/reviewHolds';
+import { beginLocalClaim, generateReleaseToken } from '../../src/lib/payments/claimLedger';
 import { createSupabaseLikeDb, pgTargetFromEnv, postgrestFetch, psql, psqlFile, type EmulatorLog, type PgTarget } from './postgrestEmulator';
 
 const target = pgTargetFromEnv();
@@ -80,13 +81,30 @@ function ok<T>(r: { ok: true; data: T } | { ok: false; error: string }): T {
   return r.data;
 }
 
-function payCash(orderId: string) {
+/**
+ * Auditoria r7 P1-01: toda loja na nuvem exige a reserva no servidor antes de receber (TF010 sem ela). Como o caixa
+ * faz (claimFlow): o registro local da reserva com o segredo e tchefood_claim_payment com o token do aparelho e o
+ * saldo que o servidor tem. A conta que o servidor ainda não tem (ou com menos saldo que o cobrado) sobe antes.
+ */
+async function claimHere(orderId: string, key: string, method: string, acquirer: string, amount: number) {
+  const cents = Math.round(amount * 100);
+  const serverBalance = () => sql(`SELECT COALESCE((SELECT round(remaining_balance * 100)::bigint FROM orders WHERE id = '${orderId}'), -1)`);
+  if (Number(serverBalance()) < cents) await sync();
+  const token = generateReleaseToken();
+  beginLocalClaim(key, orderId, token);
+  sql(`BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}","sub":"device"}', true);
+       SELECT tchefood_claim_payment('${key}', '${orderId}', '${method}', '${acquirer}', ${cents}, ${serverBalance()}, '${st().currentUserId}', '${token}'); COMMIT;`);
+}
+
+async function payCash(orderId: string) {
   const o = st().orders.find((x) => x.id === orderId)!;
+  const key = `k-${crypto.randomUUID()}`;
+  await claimHere(orderId, key, 'CASH', 'CASH_DESK', o.remaining_balance);
   return ok(
     st().registerPayment({
       orderId, amount: o.remaining_balance, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
       acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null,
-      idempotency_key: `k-${Math.random()}`, item_ids: [],
+      idempotency_key: key, item_ids: [],
     }),
   );
 }
@@ -198,7 +216,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(sql(`SELECT charge_service_fee FROM orders WHERE id = '${order.id}'`)).toBe('t');
     const reuse = await raw('PATCH', `orders?id=eq.${order.id}`, { charge_service_fee: false }, 'return=representation');
     expect(reuse.body).toMatch(/SERVICE_FEE_REMOVED sem PIN/);
-    payCash(order.id);
+    await payCash(order.id);
     await expectSynced('pagamento');
     const local = st().orders.find((o) => o.id === order.id)!;
     expect(local.status).toBe('CLOSED');
@@ -244,7 +262,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     login(CASHIER_PIN);
     const first = ok(st().openTable(mesa.id, 1, null));
     launch(first.id, 2);
-    payCash(first.id);
+    await payCash(first.id);
     ok(st().earnCashback(first.id, { phone: '55999887766', name: 'Cliente', cpf: null, optIn: true }));
     await expectSynced('cashback ganho');
 
@@ -262,7 +280,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       (Math.round((Number(sql(`SELECT amount FROM cashback_ledger WHERE order_id = '${first.id}' AND entry_type = 'EARN'`)) - redeemed.amount) * 100) / 100).toFixed(2),
     );
     expect(sql(`SELECT metadata->>'server_verified' FROM audit_logs WHERE order_id = '${second.id}' AND action_type = 'CASHBACK_REDEEMED'`)).toBe('true');
-    payCash(second.id);
+    await payCash(second.id);
     await expectSynced('conta com cashback paga');
     expect(sql(`SELECT discount_amount FROM orders WHERE id = '${second.id}'`)).toBe(redeemed.amount.toFixed(2));
     expect(sql(`SELECT status FROM orders WHERE id = '${second.id}'`)).toBe('CLOSED');
@@ -520,7 +538,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await raw('PATCH', `orders?id=eq.${order!.id}`, { discount_amount: 2 })).status).toBe(400);
     expect(sql(`SELECT discount_amount || ' ' || discount_auth_seq FROM orders WHERE id = '${order!.id}'`)).toBe(`5.00 ${swapSeq}`);
     // O pagamento do valor que o aparelho calcula (com R$ 5 de desconto) entra e fecha a conta.
-    payCash(order!.id);
+    await payCash(order!.id);
     await expectSynced('pagamento com o desconto trocado');
     expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 0.00');
 
@@ -557,7 +575,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     await expectSynced('consumo novo');
     const after = st().orders.find((o) => o.id === order!.id)!;
     expect(sql(`SELECT discount_amount || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe(`${after.discount_amount.toFixed(2)} ${after.remaining_balance.toFixed(2)}`);
-    payCash(order!.id);
+    await payCash(order!.id);
     await expectSynced('pagamento depois do cancelamento');
     expect(sql(`SELECT status FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED');
   });
@@ -846,7 +864,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(ok(st().adoptCloudDiscount(conflict.event.id))).toBe(7);
     await expectSynced('conta com o desconto da nuvem');
     expect(st().orders.find((o) => o.id === order!.id)!.remaining_balance.toFixed(2)).toBe(sql(`SELECT remaining_balance FROM orders WHERE id = '${order!.id}'`));
-    payCash(order!.id);
+    await payCash(order!.id);
     await expectSynced('pagamento depois do conflito');
     expect(sql(`SELECT status || ' ' || discount_amount FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 7.00');
   });
@@ -964,7 +982,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     sql(`UPDATE orders SET discount_amount = 5 WHERE id = '${order!.id}';`);
     // Sem internet: vai para o pagamento, recebe e fecha com o desconto daqui.
     ok(st().startCheckout(order!.id));
-    payCash(order!.id);
+    await payCash(order!.id);
     const closed = st().orders.find((o) => o.id === order!.id)!;
     expect(closed.status).toBe('CLOSED');
     expect(await sync()).toHaveLength(1);
@@ -1023,7 +1041,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
                   FROM audit_logs WHERE order_id = '${order!.id}' AND action_type = 'DISCOUNT_APPLIED' ORDER BY server_seq DESC LIMIT 1`))
       .toBe(`7→6 ${original.id}`);
     expect(sql(`SELECT count(*) FROM audit_logs WHERE id = '${original.id}'`)).toBe('0');
-    payCash(order!.id);
+    await payCash(order!.id);
     await expectSynced('pagamento com o desconto reautorizado');
     expect(sql(`SELECT status || ' ' || discount_amount || ' ' || remaining_balance FROM orders WHERE id = '${order!.id}'`)).toBe('CLOSED 6.00 0.00');
   });
@@ -1535,7 +1553,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect(cents(sql(`SELECT cashback_balance FROM loyalty_customers WHERE id = '${c.id}'`))).toBe(cents(st().loyaltyCustomers.find((x) => x.id === c.id)!.cashback_balance));
     // Cobrança pelo valor que a nuvem reconhece: R$ 20, e a conta fecha nos dois lados.
     ok(st().startCheckout(order.id));
-    payCash(order.id);
+    await payCash(order.id);
     await expectSynced('pagamento sem o cashback');
     expect(sql(`SELECT status || ' ' || paid_amount FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 20.00');
     setCashbackClock(null);
@@ -2262,7 +2280,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
   it('balcão (Ficha Rápida) com fichas e retirada', async () => {
     login(CASHIER_PIN);
     const order = ok(st().createCounterSale([{ product_id: productId, quantity: 2, modifiers: [], meat_doneness: null }]));
-    payCash(order.id);
+    await payCash(order.id);
     const tickets = ok(st().issueEventTickets(order.id));
     ok(st().redeemEventTicket(tickets[0]!.barcode_token));
     await expectSynced('ficha de balcão');
@@ -2272,7 +2290,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     login(CASHIER_PIN);
     const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
     const order = ok(st().createPickupOrder({ lines: [line], fulfillment: 'TAKEOUT', customerName: 'Ana' }));
-    payCash(order.id);
+    await payCash(order.id);
     await expectSynced('pedido com senha');
     expect(sql(`SELECT pickup_number IS NOT NULL FROM orders WHERE id = '${order.id}'`)).toBe('t');
   });
@@ -2752,6 +2770,8 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       order_id: order.id, amount, reason: 'Queda no meio da cobrança', code: 'WRAPPER_EXCEPTION', method: 'CREDIT', acquirer: 'STONE',
       terminal_id: null, terminal_serial: 'STONE-01', idempotency_key: `hold-${order.id}`,
     });
+    // A cobrança de cartão começou com a reserva feita no servidor (auditoria r7 P1-01: toda loja exige).
+    await claimHere(order.id, `hold-${order.id}`, 'CREDIT', 'STONE', amount);
     const pay = ok(st().confirmReviewedCharge({ orderId: order.id, nsu: '004512', authorization_code: 'A1B2C3', card_brand: 'VISA' }, MANAGER));
     await expectSynced('cobrança incerta');
     expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED 0.00');
@@ -3157,6 +3177,13 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       terminal_serial: 'STONE-01', idempotency_key: crypto.randomUUID(), created_at: new Date().toISOString(), ...over,
     });
     const rpc = (p: Record<string, unknown>) => raw('POST', 'rpc/tchefood_register_payment', { p_payment: p });
+    // Auditoria r7 P1-01: pagamento aprovado só entra com a reserva aberta que confere com ele.
+    const claimed = async <T extends Record<string, unknown>>(p: T): Promise<T> => {
+      await claimHere(order.id, String(p.idempotency_key), String(p.method), String(p.acquirer), Number(p.amount));
+      return p;
+    };
+    // Sem a reserva, o pagamento certo é recusado (TF010).
+    expect((await rpc(pay({}))).body).toMatch(/precisa da reserva no servidor/);
 
     // Gravar direto em payments: sem permissão.
     expect((await raw('POST', 'payments', pay({}))).status).toBe(403);
@@ -3167,7 +3194,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await rpc(pay({ method: 'CASH', acquirer: 'STONE', nsu: null }))).body).toMatch(/caixa/);
     expect((await rpc(pay({ amount: 99999 }))).body).toMatch(/passa do saldo/);
     // Pagamento parcial com cartão; reenvio do mesmo id não duplica; o mesmo NSU não paga de novo.
-    const first = pay({});
+    const first = await claimed(pay({}));
     expect((await rpc(first)).status).toBe(200);
     expect((await rpc(first)).status).toBe(200);
     expect(sql(`SELECT count(*) FROM payments WHERE id = '${first.id}'`)).toBe('1');
@@ -3175,7 +3202,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     // Hora do comprovante forjada (3 dias atrás) não escapa da trava: vale também a hora em que o servidor registrou.
     expect((await rpc(pay({ created_at: new Date(Date.now() - 3 * 86400_000).toISOString() }))).body).toMatch(/já pagou outra conta/);
     // Dois envios simultâneos do mesmo pagamento: os dois voltam 200 e só um registro entra.
-    const twin = pay({ nsu: '556677', amount: 1 });
+    const twin = await claimed(pay({ nsu: '556677', amount: 1 }));
     const both = await Promise.all([rpc(twin), rpc(twin)]);
     expect(both.map((r) => r.status)).toEqual([200, 200]);
     expect(sql(`SELECT count(*) FROM payments WHERE id = '${twin.id}'`)).toBe('1');
@@ -3188,7 +3215,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     // (o saldo é refeito com a taxa nova, não pelo valor gravado antes).
     const fee = Number(sql(`SELECT service_fee_amount FROM orders WHERE id = '${order.id}'`));
     expect(fee).toBeGreaterThan(0);
-    expect((await rpc(cash(Math.round((Number(left) - fee) * 100) / 100))).status).toBe(200);
+    expect((await rpc(await claimed(cash(Math.round((Number(left) - fee) * 100) / 100)))).status).toBe(200);
     expect((await raw('PATCH', `orders?id=eq.${order.id}`, { status: 'CLOSED' })).body).toMatch(/ainda deve/);
     const auth = await raw('POST', 'rpc/tchefood_authorize_manager', {
       p_order_id: order.id, p_action_type: 'SERVICE_FEE_REMOVED', p_manager_pin: MANAGER_PIN, p_performed_by: st().currentUserId,
@@ -3317,7 +3344,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     ok(st().dispatchTray(order.id));
     ok(st().startCheckout(order.id));
     const paid = st().orders.find((o) => o.id === order.id)!.remaining_balance;
-    payCash(order.id);
+    await payCash(order.id);
     const wd = ok(st().addCashWithdrawal(50, { managerPin: MANAGER_PIN, reason: 'Depósito no banco' }));
     await expectSynced('venda em dinheiro e sangria');
     expect(sql(`SELECT authorized_by_manager_id IS NOT NULL FROM cash_movements WHERE id = '${wd.id}'`)).toBe('t');
@@ -3358,7 +3385,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     const delivery = { customerName: 'Maria', phone: '53 98888-7777', address: 'Rua XV de Novembro, 10', reference: '', zoneId: zone.id, changeFor: null };
     const onDelivery = ok(st().createPickupOrder({ lines: [line], fulfillment: 'DELIVERY', customerName: 'Maria', delivery: { ...delivery, payOnDelivery: true } }));
     const paidNow = ok(st().createPickupOrder({ lines: [line], fulfillment: 'DELIVERY', customerName: 'Maria', delivery: { ...delivery, payOnDelivery: false } }));
-    payCash(paidNow.id);
+    await payCash(paidNow.id);
     await expectSynced('pedidos de entrega');
     expect(sql(`SELECT count(*) FROM order_items i JOIN products p ON p.id = i.product_id WHERE p.code = 'TAXA-ENTREGA' AND i.order_id IN ('${onDelivery.id}', '${paidNow.id}')`)).toBe('2');
     // A taxa confere com a entrega: nenhum alerta de preço.
@@ -3398,7 +3425,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     login(CASHIER_PIN);
     const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
     const order = ok(st().createPickupOrder({ lines: [line], fulfillment: 'TAKEOUT', customerName: 'Ana' }));
-    payCash(order.id);
+    await payCash(order.id);
     const review = ok(st().addReview(order.id, 4, 'Muito bom', 'COUNTER'));
     await expectSynced('avaliação');
     expect(sql(`SELECT score || ' ' || comment FROM reviews WHERE order_id = '${order.id}'`)).toBe('4 Muito bom');
@@ -3432,7 +3459,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     ok(st().dispatchTray(order.id));
     await expectSynced('cartão aberto e lançado');
     expect(sql(`SELECT status FROM dining_tables WHERE id = '${cards[1]!.id}'`)).toBe('OCCUPIED');
-    payCash(order.id);
+    await payCash(order.id);
     await expectSynced('cartão pago');
     expect(sql(`SELECT o.status || ' ' || t.status || ' ' || (t.current_order_id IS NULL) FROM orders o JOIN dining_tables t ON t.id = o.table_id WHERE o.id = '${order.id}'`)).toBe('CLOSED FREE true');
     expect(st().tables.find((t) => t.id === cards[1]!.id)!.status).toBe('FREE');

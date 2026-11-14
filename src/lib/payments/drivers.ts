@@ -21,13 +21,21 @@ import {
   type PlugPagRawResult,
 } from './terminalGuard';
 import { UniversalEscPosBuilder } from '../../services/printer/escposBuilder';
+import { MercadoPagoPointDriver } from './mercadoPagoPointDriver';
 
-export const ACQUIRER_CNPJ: Record<'STONE' | 'PAGBANK', string> = {
+export const ACQUIRER_CNPJ: Record<'STONE' | 'PAGBANK' | 'MERCADO_PAGO', string> = {
   STONE: '16501555000157',
   PAGBANK: '08561701000101',
+  MERCADO_PAGO: '10573521000191', // Mercado Pago Instituição de Pagamento Ltda.
 };
 
 export type CardBrand = 'VISA' | 'MASTERCARD' | 'ELO' | 'PIX';
+
+/** Autorização do gerente para encerrar uma cobrança antes do prazo (conferida no servidor). */
+export interface ManagerAbort {
+  manager_pin: string;
+  reason: string;
+}
 
 export interface ChargeRequest {
   request_id: string;
@@ -59,6 +67,11 @@ export interface TerminalDeclined {
   reason: string;
   terminal_serial: string;
   terminal_id: string | null;
+  /**
+   * Point (Mercado Pago): true só quando a recusa veio do servidor (point-charge respondeu DECLINED). Recusa
+   * local (nada foi mandado) não vira pagamento recusado com a chave da cobrança.
+   */
+  server_confirmed?: true;
 }
 
 /**
@@ -85,8 +98,8 @@ export interface IPaymentTerminalDriver {
   charge(req: ChargeRequest): Promise<TerminalResult>;
   /** Imprime texto puro na bobina térmica de 58mm (32 colunas). */
   print(lines: string[]): Promise<void>;
-  /** Cancela uma cobrança pendente no terminal. */
-  abort(requestId: string): void;
+  /** Cancela uma cobrança pendente no terminal (Mercado Pago: só com a autorização do gerente). */
+  abort(requestId: string, auth?: ManagerAbort): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,5 +506,20 @@ export function createDriver(params: { terminal: PosTerminal | null; chassis: Ch
   const acquirer = params.terminal?.acquirer ?? params.chassis;
   if (acquirer === 'PAGBANK') return new PagBankPlugPagDriver(params.mode, params.terminal);
   if (acquirer === 'STONE') return new StonePosDriver(params.mode, params.terminal);
+  if (acquirer === 'MERCADO_PAGO') {
+    // A Point é comandada pela nuvem (Edge Function point-charge). Import tardio: o módulo da nuvem lê o store.
+    return new MercadoPagoPointDriver(params.mode, params.terminal, {
+      config: async () => (await import('../sync/useCloudSync')).freshCloudConfig(),
+      fetch: (url, init) => fetch(url, init),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      // Relógio monotônico: ajuste da hora do aparelho no meio da cobrança não encurta nem estica os prazos.
+      now: () => (typeof performance !== 'undefined' ? performance.now() : Date.now()),
+      timer: (ms) => new Promise((r) => setTimeout(r, ms)),
+      operator: async () => (await import('../../store/useTcheStore')).useTcheStore.getState().currentUserId,
+      // A conta precisa estar no servidor como aqui: espera a sincronização em andamento, sobe a fila e só
+      // libera sem nenhum evento da conta pendente ou recusado. O saldo daqui vai para o servidor conferir.
+      prepareOrder: async (orderId) => (await import('../sync/useCloudSync')).ensureOrderSynced(orderId),
+    });
+  }
   return new MockTerminalDriver(params.chassis, params.mode, params.terminal);
 }

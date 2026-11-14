@@ -1,0 +1,1958 @@
+/**
+ * Auditoria r5 no banco de verdade (db/schema_point_reserva.sql e db/schema_mercado_pago.sql):
+ *  - P0-01: na loja com Point, o pagamento fora dela pede antes a reserva no servidor (payment_claims,
+ *    tchefood_claim_payment). Reserva e cobrança da Point somam numa reserva única, nos dois sentidos,
+ *    com a conta travada; o pagamento com a chave da reserva a consome; a liberação deixa registro.
+ *  - P1-01: a cobrança da Point em revisão manual (e a aprovada sem pagamento que foi estornada) só termina
+ *    pelo fim verificado no Mercado Pago (tchefood_resolve_point_charge), com a conferência pedida com PIN
+ *    de gerente (tchefood_authorize_point_reconcile). O UPDATE direto continua recusado.
+ *  - Revisão P1-B/P2-A/P3: na loja com Point o próprio banco exige a reserva do pagamento aprovado fora dela (TF010),
+ *    sem confiar na lista de maquininhas do aparelho; única exceção, conferida no banco, o dinheiro do entregador.
+ *    Sem PIN só quem pediu a reserva a libera (TF004). A reserva paga fica "consumed" para sempre (TF007).
+ *  - Auditoria r6 P0-01/P0-02: a reserva vale em qualquer loja da nuvem (com ou sem Point); tem prazo de atividade
+ *    (active_until) que o aparelho que a pediu renova, e o gerente só a libera depois do prazo vencido mais a espera
+ *    (TF011 antes).
+ *
+ * Só roda com TCHEFOOD_PG=host:porta:usuario (ex.: /var/tmp/tfpg:5499:postgres).
+ */
+import { spawn } from 'node:child_process';
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { beforeAll, describe, expect, it } from 'vitest';
+import { createSupabaseLikeDb, pgTargetFromEnv, psql, psqlFile, type PgTarget, type PsqlResult } from './postgrestEmulator';
+
+const target = pgTargetFromEnv();
+const DB = 'tchefood_payment_claims_test';
+const ROOT = join(__dirname, '..', '..');
+const TENANT = '11111111-1111-4111-8111-111111111111';
+const OTHER = '99999999-9999-4999-8999-999999999999';
+// Loja só para os PINs errados: o bloqueio por tentativas é por loja e não pode atrapalhar os outros testes.
+const PIN_TENANT = '12121212-1212-4212-8212-121212121212';
+const STAFF = '22222222-2222-4222-8222-222222222222';
+const STAFF_B = '23232323-2323-4323-8323-232323232323';
+const MANAGER = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const INACTIVE = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const OTHER_STAFF = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const PIN_STAFF = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
+const PIN_MANAGER = 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2';
+const TABLE = '33333333-3333-4333-8333-333333333333';
+const OTHER_TABLE = '34343434-3434-4434-8434-343434343434';
+const PIN_TABLE = '35353535-3535-4535-8535-353535353535';
+const TERMINAL = '55555555-5555-4555-8555-555555555555';
+const STONE_TERMINAL = '66666666-6666-4666-8666-666666666666';
+const PIN_TERMINAL = '67676767-6767-4767-8767-676767676767';
+const MP_ID = 'NEWLAND_N950__N950NCB801293324';
+const MANAGER_PIN = '8642';
+const PIN_MANAGER_PIN = '4321';
+const STONE_CNPJ = '16501555000157';
+// Loja que começa sem Point (para ver o banco passar a exigir a reserva quando a Point chega).
+const LATE_TENANT = '14141414-1414-4414-8414-141414141414';
+const LATE_STAFF = 'c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3';
+const LATE_TABLE = '36363636-3636-4636-8636-363636363636';
+// Entrega própria (senha paga na entrega): mesa técnica do totem, bairro e entregador da loja.
+const KIOSK_TABLE = '37373737-3737-4737-8737-373737373737';
+const ZONE = '38383838-3838-4838-8838-383838383838';
+const COURIER = '39393939-3939-4939-8939-393939393939';
+
+function applySchema(t: PgTarget, db: string): void {
+  createSupabaseLikeDb(t, db);
+  psqlFile(t, join(ROOT, 'db', 'schema.sql'), db);
+  const dir = join(ROOT, 'supabase', 'migrations');
+  for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) psqlFile(t, join(dir, f), db);
+}
+
+function sql(q: string): string {
+  const r = psql(target!, q, DB);
+  if (!r.ok) throw new Error(r.message ?? 'sql');
+  return r.out;
+}
+
+/** Roda como o aparelho (papel authenticated com o tenant no JWT). */
+function asDevice(q: string, tenant = TENANT): PsqlResult {
+  return psql(target!, `BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${tenant}"}', true); ${q}; COMMIT;`, DB);
+}
+function asRole(role: string, q: string): PsqlResult {
+  return psql(target!, `BEGIN; SET LOCAL ROLE ${role}; ${q}; COMMIT;`, DB);
+}
+const last = (r: PsqlResult) => r.out.split('\n').pop() ?? '';
+const json = <T = Record<string, unknown>>(r: PsqlResult): T => {
+  if (!r.ok) throw new Error(r.message ?? 'json');
+  return JSON.parse(last(r)) as T;
+};
+
+const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Uma sessão psql de verdade, com a entrada aberta. */
+function session() {
+  const child = spawn('psql', ['-h', target!.host, '-p', target!.port, '-U', target!.user, '-d', DB, '-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1']);
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d) => { out += String(d); });
+  child.stderr.on('data', (d) => { err += String(d); });
+  const done = new Promise<string>((resolve, reject) => {
+    child.on('close', (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(err || `psql saiu com ${code}`))));
+  });
+  done.catch(() => undefined);
+  return { send: (text: string) => child.stdin.write(`${text}\n`), end: (text = '') => child.stdin.end(`${text}\n`), output: () => out, done };
+}
+
+async function until(what: string, check: () => boolean, ms = 15_000): Promise<void> {
+  const start = Date.now();
+  while (!check()) {
+    if (Date.now() - start > ms) throw new Error(`Não aconteceu em ${ms} ms: ${what}`);
+    await pause(25);
+  }
+}
+
+function waiting(): number {
+  return Number(sql(`SELECT count(*) FROM pg_stat_activity WHERE datname = '${DB}' AND wait_event_type = 'Lock'`));
+}
+
+let lastOverlap = 0;
+
+/**
+ * Disputa pela MESMA linha, na ordem dada (mesmo método de mercadoPago.pg.test.ts): uma sessão trava a linha,
+ * cada comando entra numa sessão própria e só o seguinte entra depois que o banco mostra o anterior parado na
+ * trava. Com todos esperando, a trava é solta e eles passam na ordem de chegada.
+ */
+async function contend(lock: string, queries: string[]): Promise<string[]> {
+  const before = waiting();
+  const holder = session();
+  holder.send(`BEGIN; ${lock}; SELECT 'held';`);
+  await until('trava da linha', () => holder.output().includes('held'));
+  const runs: Promise<string>[] = [];
+  try {
+    for (let i = 0; i < queries.length; i += 1) {
+      const s = session();
+      s.end(queries[i]);
+      runs.push(s.done);
+      await until(`sessão ${i + 1} esperando a linha`, () => waiting() === before + i + 1);
+    }
+    lastOverlap = waiting() - before;
+  } finally {
+    holder.end('COMMIT;');
+  }
+  await holder.done;
+  return (await Promise.all(runs)).map((out) => out.split('\n').pop() ?? '');
+}
+
+/** Roda q e devolve 'ok' ou 'recusado <SQLSTATE>: <mensagem>' (a sessão não cai). */
+const tryFn = `CREATE FUNCTION pg_temp.t(q text) RETURNS text LANGUAGE plpgsql AS $f$ BEGIN EXECUTE q; RETURN 'ok'; EXCEPTION WHEN others THEN RETURN 'recusado ' || SQLSTATE || ': ' || SQLERRM; END $f$;`;
+const deviceQ = (q: string, tenant = TENANT) =>
+  `${tryFn} BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${tenant}"}', true);
+   SELECT pg_temp.t($q$${q}$q$); COMMIT;`;
+const ownerQ = (q: string) => `${tryFn} SELECT pg_temp.t($q$${q}$q$);`;
+
+let seq = 0;
+/** Conta de verdade com saldo `balance` (um item, sem 10%): aceita vários pagamentos e fecha no zero. */
+function withItems(balance: number, tenant = TENANT, table = TABLE, staff = STAFF): string {
+  seq += 1;
+  const id = `f0f0f0f0-0000-4000-8000-${String(seq).padStart(12, '0')}`;
+  sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${id}', '${tenant}', '${table}', '${staff}');
+       BEGIN; SET LOCAL session_replication_role = replica;
+       INSERT INTO order_items (order_id, product_id, waiter_id, quantity, unit_price, total_item_price, sector)
+       VALUES ('${id}', gen_random_uuid(), '${staff}', 1, ${balance}, ${balance}, 'NONE');
+       UPDATE orders SET charge_service_fee = false, subtotal_items = ${balance}, total_amount = ${balance}, paid_amount = 0, remaining_balance = ${balance} WHERE id = '${id}';
+       COMMIT;`);
+  return id;
+}
+const bal = (order: string) => Number(sql(`SELECT round(remaining_balance * 100)::bigint FROM orders WHERE id = '${order}'`));
+const key = (label: string) => `${label}-${crypto.randomUUID().slice(0, 8)}`;
+
+/** Segredo de liberação que o aparelho gera para cada chave antes de pedir a reserva (64 hex minúsculas). */
+const newToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('hex');
+const tokens = new Map<string, string>();
+const tokenFor = (k: string) => {
+  if (!tokens.has(k)) tokens.set(k, newToken());
+  return tokens.get(k)!;
+};
+const claimed = new Set<string>();
+/** Segredo de uma reserva criada pelos testes, como literal SQL (NULL se a chave nunca virou reserva por aqui). */
+const tok = (k: string) => (claimed.has(k) ? `'${tokens.get(k)}'` : 'NULL');
+const claimQ = (k: string, order: string, method: string, acquirer: string, cents: number, expected: number | string, staff = STAFF, token: string = `'${tokenFor(k)}'`) =>
+  `SELECT tchefood_claim_payment('${k}', '${order}', '${method}', '${acquirer}', ${cents}, ${expected}, '${staff}', ${token})`;
+const claim = (k: string, order: string, method: string, acquirer: string, cents: number, expected?: number | string, staff = STAFF, tenant = TENANT) => {
+  const r = asDevice(claimQ(k, order, method, acquirer, cents, expected ?? bal(order), staff), tenant);
+  if (r.ok) claimed.add(k);
+  return r;
+};
+const cash = (k: string, order: string, cents: number, expected?: number) => claim(k, order, 'CASH', 'CASH_DESK', cents, expected);
+const stoneClaim = (k: string, order: string, cents: number, expected?: number) => claim(k, order, 'CREDIT', 'STONE', cents, expected);
+
+const openPointQ = (k: string, order: string, cents: number, expected: number) =>
+  `SELECT tchefood_open_terminal_charge('${TENANT}', '${k}', '${order}', '${TERMINAL}', '${MP_ID}', 'CREDIT', ${cents}, '${STAFF}', ${expected})`;
+const openPoint = (k: string, order: string, cents: number, expected?: number) => psql(target!, `${openPointQ(k, order, cents, expected ?? bal(order))};`, DB);
+
+const payment = (order: string, amount: number, over: Record<string, unknown> = {}) => JSON.stringify({
+  id: crypto.randomUUID(), order_id: order, tenant_id: TENANT, waiter_id: STAFF, terminal_id: null, amount, tip_amount: 0,
+  method: 'CASH', status: 'APPROVED', acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null,
+  terminal_serial: null, idempotency_key: crypto.randomUUID(), created_at: new Date().toISOString(), ...over,
+});
+const stonePayment = (order: string, amount: number, over: Record<string, unknown> = {}) => payment(order, amount, {
+  method: 'CREDIT', acquirer: 'STONE', acquirer_cnpj: STONE_CNPJ, terminal_id: STONE_TERMINAL, terminal_serial: 'STONE-01',
+  card_brand: 'VISA', nsu: `R${crypto.randomUUID().slice(0, 8)}`, authorization_code: 'A12345', ...over,
+});
+const registerQ = (j: string) => `SELECT tchefood_register_payment('${j}'::jsonb)`;
+/** Pagamento do aparelho sem reserva (o aparelho com a lista de maquininhas velha, ou a loja sem Point). */
+const register = (j: string, tenant = TENANT) => asDevice(registerQ(j), tenant);
+/**
+ * O caminho do aparelho na loja com Point: a reserva (tchefood_claim_payment, saldo que o aparelho viu) e o
+ * pagamento com a chave dela, num comando só (reserva recusada = nada gravado).
+ */
+const payQ = (j: string, expected: number) => {
+  const p = JSON.parse(j) as { idempotency_key: string; order_id: string; method: string; acquirer: string; amount: number; waiter_id: string };
+  return `WITH c AS MATERIALIZED (SELECT ${claimQ(p.idempotency_key, p.order_id, p.method, p.acquirer, Math.round(p.amount * 100), expected, p.waiter_id).replace(/^SELECT /, '')} AS r)
+          SELECT tchefood_register_payment('${j}'::jsonb) FROM c`;
+};
+const pay = (j: string, tenant = TENANT) => asDevice(payQ(j, bal((JSON.parse(j) as { order_id: string }).order_id)), tenant);
+/** Reserva gravada direto (dono do banco), sem a conferência de saldo de tchefood_claim_payment. */
+/**
+ * Prazo de atividade vencido há `ago` (o aparelho parou de renovar). Só para montar o cenário: o gatilho não deixa
+ * mudar active_until fora da renovação, então vai sem os gatilhos (session_replication_role = replica).
+ */
+const idle = (k: string, ago = '5 minutes 1 second') =>
+  sql(`BEGIN; SET LOCAL session_replication_role = replica;
+       UPDATE payment_claims SET active_until = clock_timestamp() - INTERVAL '${ago}' WHERE idempotency_key = '${k}'; COMMIT;`);
+const rawClaim = (k: string, order: string, method: string, acquirer: string, cents: number, staff = STAFF, tenant = TENANT) =>
+  sql(`INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
+       VALUES ('${tenant}', '${k}', '${order}', '${method}', '${acquirer}', ${cents}, '${staff}') RETURNING id;`);
+
+type Reservation = { reserved_cents: number; point_cents: number; claims_cents: number; open_charges: number; manual_review: boolean;
+  charges: { idempotency_key: string; status: string; amount_cents: number; raw_status_detail: string | null; has_payment: boolean }[];
+  claims: { idempotency_key: string; amount_cents: number; method: string; acquirer: string; created_at: string; created_by: string; created_by_name: string | null;
+    active_until: string; releasable_at: string }[] };
+const reservation = (order: string, tenant = TENANT) => json<Reservation>(asDevice(`SELECT tchefood_point_reservation('${order}')`, tenant));
+const claimField = (k: string, expr: string) => sql(`SELECT ${expr} FROM payment_claims WHERE idempotency_key = '${k}'`);
+const audits = (action: string, metaKey: string, value: string) =>
+  Number(sql(`SELECT count(*) FROM audit_logs WHERE action_type = '${action}' AND metadata->>'${metaKey}' = '${value}'`));
+
+/** Cobrança da Point gravada direto (como a Edge Function grava), no estado pedido. */
+function charge(order: string, status: string, cents = 1000, over: Record<string, string | number | null> = {}): { key: string; id: string } {
+  const k = key('ch');
+  const receipt: Record<string, string | number> = status === 'approved'
+    ? { external_payment_id: `P${seq}${k.slice(-4)}`, paid_amount_cents: cents, card_brand: 'VISA', authorization_code: 'AUT1' } : {};
+  const row: Record<string, string | number | null> = {
+    tenant_id: TENANT, idempotency_key: k, order_id: order, terminal_id: TERMINAL, provider: 'mercado_pago_point',
+    external_terminal_id: MP_ID, method: 'CREDIT', amount_cents: cents, status, external_order_id: `ORD-${k}`, ...receipt, ...over,
+  };
+  const cols = Object.keys(row);
+  const vals = cols.map((c) => (row[c] === null ? 'NULL' : typeof row[c] === 'number' ? String(row[c]) : `'${row[c]}'`));
+  const id = sql(`INSERT INTO terminal_charges (${cols.join(', ')}) VALUES (${vals.join(', ')}) RETURNING id;`);
+  return { key: k, id };
+}
+const chargeField = (id: string, expr: string) => sql(`SELECT ${expr} FROM terminal_charges WHERE id = '${id}'`);
+
+/** Pagamento do Mercado Pago igual à cobrança aprovada (gravado direto, como no outro teste). */
+function mpPayment(id: string, status = 'APPROVED', paymentId: string = crypto.randomUUID()): PsqlResult {
+  const c = sql(`SELECT order_id || '|' || amount_cents || '|' || COALESCE(external_payment_id, '') || '|' || COALESCE(authorization_code, '') || '|' || idempotency_key FROM terminal_charges WHERE id = '${id}'`).split('|');
+  return psql(target!, `INSERT INTO payments (id, order_id, tenant_id, waiter_id, terminal_id, amount, method, status, acquirer, acquirer_cnpj, card_brand, nsu, authorization_code, terminal_serial, idempotency_key)
+                        VALUES ('${paymentId}', '${c[0]}', '${TENANT}', '${STAFF}', '${TERMINAL}', ${Number(c[1]) / 100}, 'CREDIT', '${status}', 'MERCADO_PAGO', '10573521000191', 'VISA', NULLIF('${c[2]}', ''), NULLIF('${c[3]}', ''), '${MP_ID}', '${c[4]}');`, DB);
+}
+
+/** Pedido de conferência com PIN de gerente (como a Edge Function faz antes de ler o Mercado Pago). */
+const reconcile = (k: string, pin = MANAGER_PIN, tenant = TENANT, staff = STAFF, reason = 'conferir no Mercado Pago') =>
+  psql(target!, `SELECT tchefood_authorize_point_reconcile('${tenant}', '${k}', '${staff}', '${pin}', '${reason}');`, DB);
+const authorized = (k: string) => {
+  const r = reconcile(k);
+  expect(r.out, r.message ?? '').toMatch(/^[0-9a-f-]{36}$/);
+  return r.out;
+};
+const resolveQ = (id: string, from: string, to: string, patch: string, evidence: string, reason = 'conferido no Mercado Pago', staff = STAFF, tenant = TENANT) =>
+  `SELECT status FROM tchefood_resolve_point_charge('${tenant}', '${id}', '${from}', '${to}', '${patch}'::jsonb, '${staff}', '${reason}', '${evidence}'::jsonb)`;
+const resolve = (id: string, from: string, to: string, patch = '{}', evidence?: string) =>
+  psql(target!, `${resolveQ(id, from, to, patch, evidence ?? `{"authorization_audit_id":"${authorized(sql(`SELECT idempotency_key FROM terminal_charges WHERE id = '${id}'`))}","operation_id":"op-1","mp_status":"x"}`)};`, DB);
+const receiptPatch = (cents: number, nsu = `N${crypto.randomUUID().slice(0, 6)}`) =>
+  `{"external_payment_id":"${nsu}","paid_amount_cents":${cents},"card_brand":"VISA","authorization_code":"AUTR1","raw_status":"processed","raw_status_detail":"accredited"}`;
+
+describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da Point no banco real', () => {
+  beforeAll(() => {
+    applySchema(target!, DB);
+    sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT}', 'Loja', 'Loja Ltda', '11222333000181'), ('${OTHER}', 'Outra', 'Outra Ltda', '11444777000161'),
+                ('${PIN_TENANT}', 'Loja do PIN', 'Loja do PIN Ltda', '11555666000172');
+         INSERT INTO staff_users (id, tenant_id, name, role, pin_code) VALUES ('${STAFF}', '${TENANT}', 'Caixa', 'CASHIER', '5162'),
+                ('${STAFF_B}', '${TENANT}', 'Caixa 2', 'CASHIER', '5163'),
+                ('${MANAGER}', '${TENANT}', 'Gerente', 'MANAGER', '${MANAGER_PIN}'), ('${OTHER_STAFF}', '${OTHER}', 'Caixa da outra', 'CASHIER', '5162'),
+                ('${PIN_STAFF}', '${PIN_TENANT}', 'Caixa do PIN', 'CASHIER', '5164'), ('${PIN_MANAGER}', '${PIN_TENANT}', 'Gerente do PIN', 'MANAGER', '${PIN_MANAGER_PIN}');
+         INSERT INTO staff_users (id, tenant_id, name, role, pin_code, active) VALUES ('${INACTIVE}', '${TENANT}', 'Saiu', 'CASHIER', '7777', false);
+         INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${LATE_TENANT}', 'Loja sem Point', 'Loja sem Point Ltda', '11666777000183');
+         INSERT INTO staff_users (id, tenant_id, name, role, pin_code) VALUES ('${LATE_STAFF}', '${LATE_TENANT}', 'Caixa da loja nova', 'CASHIER', '5165');
+         INSERT INTO dining_tables (id, tenant_id, number, label) VALUES ('${LATE_TABLE}', '${LATE_TENANT}', 1, 'Mesa 1');
+         INSERT INTO dining_tables (id, tenant_id, number, label, kind) VALUES ('${KIOSK_TABLE}', '${TENANT}', 950, 'Totem', 'KIOSK');
+         INSERT INTO delivery_zones (id, tenant_id, name, fee, eta_minutes) VALUES ('${ZONE}', '${TENANT}', 'Centro', 5, 30);
+         INSERT INTO couriers (id, tenant_id, name, fee_per_delivery) VALUES ('${COURIER}', '${TENANT}', 'Entregador', 4);
+         INSERT INTO dining_tables (id, tenant_id, number, label) VALUES ('${TABLE}', '${TENANT}', 1, 'Mesa 1'), ('${OTHER_TABLE}', '${OTHER}', 1, 'Mesa 1'),
+                ('${PIN_TABLE}', '${PIN_TENANT}', 1, 'Mesa 1');
+         INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${TERMINAL}', '${TENANT}', 'Point Smart', '${MP_ID}', 'MERCADO_PAGO'),
+                ('${STONE_TERMINAL}', '${TENANT}', 'Stone 01', 'STONE-01', 'STONE'), ('${PIN_TERMINAL}', '${PIN_TENANT}', 'Point do PIN', 'PIN-POINT', 'MERCADO_PAGO');`);
+  }, 120_000);
+
+  describe('A2: tchefood_claim_payment', () => {
+    it('reserva dinheiro: devolve {id, idempotency_key, status, amount_cents}; a reserva aparece na leitura e soma com a Point', () => {
+      const order = withItems(100);
+      const k = key('cash');
+      const r = json(cash(k, order, 6000));
+      // O segredo de liberação é do aparelho: nunca volta na resposta; o banco guarda só o sha256 dele.
+      expect(Object.keys(r).sort()).toEqual(['amount_cents', 'id', 'idempotency_key', 'status']);
+      expect(r).toMatchObject({ idempotency_key: k, status: 'open', amount_cents: 6000 });
+      expect(claimField(k, `encode(release_token_hash, 'hex') = encode(sha256(convert_to('${tokens.get(k)}', 'UTF8')), 'hex')`)).toBe('t');
+      expect(json(cash(k, order, 6000))).toEqual(r);
+      expect(claimField(k, `tenant_id || '|' || order_id || '|' || method || '|' || acquirer || '|' || created_by`)).toBe(`${TENANT}|${order}|CASH|CASH_DESK|${STAFF}`);
+      const read = reservation(order);
+      expect(read).toMatchObject({ reserved_cents: 6000, point_cents: 0, claims_cents: 6000, open_charges: 0, manual_review: false, charges: [] });
+      // Revisão: a leitura lista as reservas abertas (quem pediu, quando, forma e credenciadora).
+      expect(read.claims).toEqual([{ idempotency_key: k, amount_cents: 6000, method: 'CASH', acquirer: 'CASH_DESK',
+        created_at: read.claims[0].created_at, created_by: STAFF, created_by_name: 'Caixa',
+        active_until: read.claims[0].active_until, releasable_at: read.claims[0].releasable_at }]);
+      // r6: prazo de atividade de 90 s desde a reserva; liberável pelo gerente 5 min depois do prazo.
+      expect(Date.parse(read.claims[0].active_until) - Date.parse(read.claims[0].created_at)).toBeGreaterThanOrEqual(90_000);
+      expect(Date.parse(read.claims[0].active_until) - Date.parse(read.claims[0].created_at)).toBeLessThan(95_000);
+      expect(Date.parse(read.claims[0].releasable_at) - Date.parse(read.claims[0].active_until)).toBe(300_000);
+      expect(Date.parse(read.claims[0].created_at)).toBe(Date.parse(claimField(k, `to_jsonb(created_at) #>> '{}'`)));
+      // A Point vê os R$ 40,00 livres (o saldo da conta não mudou: a reserva não é pagamento).
+      expect(openPoint(key('pt'), order, 4001)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      const pk = key('pt');
+      expect(openPoint(pk, order, 4000).ok).toBe(true);
+      const after = reservation(order);
+      expect(after).toMatchObject({ reserved_cents: 10000, point_cents: 4000, claims_cents: 6000, open_charges: 1 });
+      expect(after.charges).toEqual([{ idempotency_key: pk, status: 'creating', amount_cents: 4000, raw_status_detail: null, has_payment: false }]);
+      // E outra reserva não passa da reserva única.
+      expect(cash(key('cash'), order, 1)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+    });
+
+    it('segredo gerado pelo aparelho: reenvio com o mesmo segredo devolve a reserva; com outro, TF009 sem dizer mais nada', () => {
+      const order = withItems(100);
+      const k = key('ctok');
+      const first = json(cash(k, order, 2000));
+      // Mesmo segredo (a resposta da primeira chamada se perdeu): a mesma reserva, sem criar outra.
+      expect(json(cash(k, order, 2000))).toEqual(first);
+      // Outro segredo com os mesmos dados: a mesma recusa (e mensagem) de chave já usada com outros dados.
+      const other = asDevice(claimQ(k, order, 'CASH', 'CASH_DESK', 2000, bal(order), STAFF, `'${newToken()}'`));
+      const otherData = cash(k, order, 2001);
+      expect(other).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      expect(otherData).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      expect(other.message).toBe(otherData.message);
+      expect(other.message).not.toMatch(/segredo/i);
+      expect(Number(sql(`SELECT count(*) FROM payment_claims WHERE idempotency_key = '${k}'`))).toBe(1);
+      expect(claimField(k, `encode(release_token_hash, 'hex') = encode(sha256(convert_to('${tokens.get(k)}', 'UTF8')), 'hex')`)).toBe('t');
+      // Renovação e liberação com o segredo do aparelho funcionam; com outro, TF004.
+      expect(asDevice(`SELECT tchefood_touch_payment_claim('${k}', '${STAFF}', '${newToken()}')`)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(json<{ status: string }>(asDevice(`SELECT tchefood_touch_payment_claim('${k}', '${STAFF}', ${tok(k)})`)).status).toBe('open');
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', '${newToken()}', 'desistiu')`)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(json<{ status: string }>(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'desistiu')`)).status).toBe('released');
+      // Reserva gravada sem segredo (fora da função): reenvio com qualquer segredo é TF009.
+      const raw = key('ctok-raw');
+      rawClaim(raw, order, 'CASH', 'CASH_DESK', 100);
+      expect(asDevice(claimQ(raw, order, 'CASH', 'CASH_DESK', 100, bal(order)))).toMatchObject({ ok: false, sqlstate: 'TF009' });
+    });
+
+    it('assinatura antiga de 7 argumentos não existe mais (42883 para aparelho antigo)', () => {
+      const order = withItems(10);
+      expect(asDevice(`SELECT tchefood_claim_payment('${key('old')}', '${order}', 'CASH', 'CASH_DESK', 100, 1000, '${STAFF}')`)).toMatchObject({ ok: false, sqlstate: '42883' });
+      expect(sql(`SELECT count(*) FROM pg_proc WHERE proname = 'tchefood_claim_payment'`)).toBe('1');
+    });
+
+    it('reenvio da mesma chave devolve a mesma reserva sem reconferir o saldo; outros dados com a mesma chave: TF009', () => {
+      const order = withItems(100);
+      const k = key('re');
+      const first = json(stoneClaim(k, order, 3000, 10000));
+      // Saldo muda de verdade (dinheiro de R$ 20,00 com outra chave): o reenvio com o saldo antigo devolve a mesma.
+      expect(pay(payment(order, 20)).ok).toBe(true);
+      expect(bal(order)).toBe(8000);
+      expect(json(stoneClaim(k, order, 3000, 10000))).toEqual(first);
+      expect(Number(sql(`SELECT count(*) FROM payment_claims WHERE idempotency_key = '${k}'`))).toBe(1);
+      for (const [label, r] of [
+        ['valor', stoneClaim(k, order, 3001, 8000)],
+        ['forma', claim(k, order, 'DEBIT', 'STONE', 3000, 8000)],
+        ['credenciadora', claim(k, order, 'CREDIT', 'PAGBANK', 3000, 8000)],
+        ['conta', stoneClaim(k, withItems(100), 3000, 10000)],
+      ] as const) {
+        expect(r, label).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      }
+    });
+
+    it('dados inválidos: TF006, nada gravado', () => {
+      const order = withItems(100);
+      const cases: [string, string][] = [
+        ['chave nula', `SELECT tchefood_claim_payment(NULL, '${order}', 'CASH', 'CASH_DESK', 100, 10000, '${STAFF}', '${newToken()}')`],
+        ['chave com espaço', claimQ('a b', order, 'CASH', 'CASH_DESK', 100, 10000)],
+        ['chave longa', claimQ('x'.repeat(51), order, 'CASH', 'CASH_DESK', 100, 10000)],
+        ['conta nula', `SELECT tchefood_claim_payment('k-null-order', NULL, 'CASH', 'CASH_DESK', 100, 10000, '${STAFF}', '${newToken()}')`],
+        // Segredo do aparelho: exatamente 64 letras hex minúsculas.
+        ['segredo nulo', claimQ('k-tok-1', order, 'CASH', 'CASH_DESK', 100, 10000, STAFF, 'NULL')],
+        ['segredo vazio', claimQ('k-tok-2', order, 'CASH', 'CASH_DESK', 100, 10000, STAFF, `''`)],
+        ['segredo curto', claimQ('k-tok-3', order, 'CASH', 'CASH_DESK', 100, 10000, STAFF, `'${'a'.repeat(63)}'`)],
+        ['segredo longo', claimQ('k-tok-4', order, 'CASH', 'CASH_DESK', 100, 10000, STAFF, `'${'a'.repeat(65)}'`)],
+        ['segredo maiúsculo', claimQ('k-tok-5', order, 'CASH', 'CASH_DESK', 100, 10000, STAFF, `'${'A'.repeat(64)}'`)],
+        ['segredo não hex', claimQ('k-tok-6', order, 'CASH', 'CASH_DESK', 100, 10000, STAFF, `'${'g'.repeat(64)}'`)],
+        ['segredo com quebra de linha', claimQ('k-tok-7', order, 'CASH', 'CASH_DESK', 100, 10000, STAFF, `'${'a'.repeat(64)}' || chr(10)`)],
+        ['dinheiro na Stone', claimQ('k-inv-1', order, 'CASH', 'STONE', 100, 10000)],
+        ['cartão no caixa', claimQ('k-inv-2', order, 'CREDIT', 'CASH_DESK', 100, 10000)],
+        ['vale', claimQ('k-inv-3', order, 'VOUCHER', 'STONE', 100, 10000)],
+        ['Mercado Pago', claimQ('k-inv-4', order, 'CREDIT', 'MERCADO_PAGO', 100, 10000)],
+        ['forma nula', claimQ('k-inv-5', order, 'NULL', 'CASH_DESK', 100, 10000).replace(`'NULL'`, 'NULL')],
+        ['valor zero', claimQ('k-inv-6', order, 'CASH', 'CASH_DESK', 0, 10000)],
+        ['valor negativo', claimQ('k-inv-7', order, 'CASH', 'CASH_DESK', -1, 10000)],
+        ['valor nulo', claimQ('k-inv-8', order, 'CASH', 'CASH_DESK', 'NULL' as unknown as number, 10000)],
+        ['saldo nulo', claimQ('k-inv-9', order, 'CASH', 'CASH_DESK', 100, 'NULL')],
+        ['saldo negativo', claimQ('k-inv-10', order, 'CASH', 'CASH_DESK', 100, -1)],
+      ];
+      for (const [label, q] of cases) expect(asDevice(q), label).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(sql(`SELECT count(*) FROM payment_claims WHERE order_id = '${order}'`)).toBe('0');
+    });
+
+    it.each([
+      ['sem operador', 'NULL'],
+      ['operador inativo', `'${INACTIVE}'`],
+      ['operador de outra loja', `'${OTHER_STAFF}'`],
+      ['id que não existe', `'12345678-1234-4234-8234-123456789012'`],
+    ])('%s: TF004 e nada gravado', (_label, who) => {
+      const order = withItems(100);
+      const r = asDevice(`SELECT tchefood_claim_payment('k-who', '${order}', 'CASH', 'CASH_DESK', 100, 10000, ${who}, '${newToken()}')`);
+      expect(r).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(sql(`SELECT count(*) FROM payment_claims WHERE idempotency_key = 'k-who'`)).toBe('0');
+    });
+
+    it('conta que não está no servidor ou é de outra loja (TF001), encerrada (TF002), saldo diferente (TF008), acima do livre (TF003)', () => {
+      expect(cash(key('c'), '12345678-1234-4234-8234-123456789012', 100, 0)).toMatchObject({ ok: false, sqlstate: 'TF001' });
+      const otherOrder = withItems(100, OTHER, OTHER_TABLE, OTHER_STAFF);
+      expect(cash(key('c'), otherOrder, 100, 10000)).toMatchObject({ ok: false, sqlstate: 'TF001' });
+      const closed = withItems(50);
+      expect(pay(payment(closed, 50)).ok).toBe(true);
+      expect(sql(`SELECT status FROM orders WHERE id = '${closed}'`)).toBe('CLOSED');
+      expect(cash(key('c'), closed, 100, 0)).toMatchObject({ ok: false, sqlstate: 'TF002' });
+      const order = withItems(100);
+      for (const expected of [9999, 10001, 0]) {
+        const r = cash(key('c'), order, 100, expected);
+        expect(r, String(expected)).toMatchObject({ ok: false, sqlstate: 'TF008' });
+        expect(r.message).toContain('Nada foi cobrado');
+      }
+      // Saldo diferente vem antes do "passa do saldo".
+      expect(cash(key('c'), order, 20000, 9999)).toMatchObject({ ok: false, sqlstate: 'TF008' });
+      expect(cash(key('c'), order, 10001, 10000)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      // Cobrança da Point em revisão manual reserva para a reserva de pagamento também.
+      charge(order, 'manual_review', 7000);
+      const over = cash(key('c'), order, 3001, 10000);
+      expect(over).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      expect(over.message).toContain('R$ 30.00 livre; R$ 70.00 reservado');
+      expect(cash(key('c'), order, 3000, 10000).ok).toBe(true);
+      expect(sql(`SELECT count(*) FROM payment_claims WHERE order_id = '${otherOrder}'`)).toBe('0');
+      // Na conta fechada, só a reserva consumida pelo pagamento que a fechou.
+      expect(sql(`SELECT string_agg(status, ',') FROM payment_claims WHERE order_id = '${closed}'`)).toBe('consumed');
+    });
+
+    it('TF009 key_in_use: chave de cobrança da Point não vira reserva, nem a de reserva vira cobrança (criação e bloqueio); chave de pagamento gravado também não', () => {
+      const order = withItems(100);
+      const pk = key('pt');
+      expect(openPoint(pk, order, 1000).ok).toBe(true);
+      expect(cash(pk, order, 1000, 10000)).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      const ck = key('cl');
+      expect(cash(ck, order, 1000, 10000).ok).toBe(true);
+      expect(openPoint(ck, order, 1000)).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      const block = psql(target!, `SELECT tchefood_block_point_key('${TENANT}', '${ck}', '${order}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 1000, '${STAFF}');`, DB);
+      expect(block).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      // Gravando direto (fora das funções), o gatilho recusa igual.
+      const direct = psql(target!, `INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status)
+                                    VALUES ('${TENANT}', '${ck}', '${order}', '${TERMINAL}', 'mercado_pago_point', '${MP_ID}', 'CREDIT', 1000, 'creating');`, DB);
+      expect(direct).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      const directClaim = psql(target!, `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
+                                         VALUES ('${TENANT}', '${pk}', '${order}', 'CASH', 'CASH_DESK', 100, '${STAFF}');`, DB);
+      expect(directClaim).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = '${ck}'`)).toBe('0');
+      // Pagamento já gravado com a chave sem reserva (pagamento antigo, de antes da auditoria r7 exigir a reserva em
+      // toda loja; gravado sem os gatilhos só para montar o cenário): a chave não vira reserva.
+      const otherOrder = withItems(100, OTHER, OTHER_TABLE, OTHER_STAFF);
+      const paid = JSON.parse(payment(otherOrder, 10, { tenant_id: OTHER, waiter_id: OTHER_STAFF })) as { id: string; idempotency_key: string };
+      sql(`BEGIN; SET LOCAL session_replication_role = replica;
+           INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+           VALUES ('${paid.id}', '${otherOrder}', '${OTHER}', '${OTHER_STAFF}', 10, 'CASH', 'APPROVED', 'CASH_DESK', '${paid.idempotency_key}'); COMMIT;`);
+      const again = claim(paid.idempotency_key, otherOrder, 'CASH', 'CASH_DESK', 100, undefined, OTHER_STAFF, OTHER);
+      expect(again).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      expect(again.message).toContain('já é de um pagamento gravado');
+    });
+
+    it('permissões: anon não chama, token sem loja não reserva, o aparelho só lê as reservas da própria loja e não grava nem altera nenhuma', () => {
+      const order = withItems(100);
+      const k = key('perm');
+      expect(asRole('anon', claimQ(k, order, 'CASH', 'CASH_DESK', 100, 10000))).toMatchObject({ ok: false, sqlstate: '42501' });
+      for (const fn of [`tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'motivo')`, `tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'motivo longo o bastante')`,
+        `tchefood_touch_payment_claim('${k}', '${STAFF}', NULL)`]) {
+        expect(asRole('anon', `SELECT ${fn}`), fn).toMatchObject({ ok: false, sqlstate: '42501' });
+      }
+      const noTenant = asRole('authenticated', claimQ(k, order, 'CASH', 'CASH_DESK', 100, 10000));
+      expect(noTenant.ok).toBe(false);
+      expect(noTenant.message).toContain('TCHEFOOD_AUTH');
+      expect(cash(k, order, 100).ok).toBe(true);
+      expect(asDevice(`SELECT count(*) FROM payment_claims WHERE idempotency_key = '${k}'`).out).toContain('1');
+      expect(asDevice(`SELECT count(*) FROM payment_claims WHERE idempotency_key = '${k}'`, OTHER).out).toContain('0');
+      for (const q of [
+        `UPDATE payment_claims SET amount_cents = 1 WHERE idempotency_key = '${k}'`,
+        `DELETE FROM payment_claims WHERE idempotency_key = '${k}'`,
+        `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by) VALUES ('${TENANT}', 'forjada', '${order}', 'CASH', 'CASH_DESK', 100, '${STAFF}')`,
+      ]) {
+        expect(asDevice(q), q).toMatchObject({ ok: false, sqlstate: '42501' });
+      }
+      // A loja do token manda: outra loja não reserva na conta desta (a conta "não está no servidor" para ela).
+      expect(asDevice(claimQ(key('x'), order, 'CASH', 'CASH_DESK', 100, 10000, OTHER_STAFF), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF001' });
+      // A service role executa (sem loja no token, cai na conferência da loja).
+      const svc = asRole('service_role', claimQ(key('x'), order, 'CASH', 'CASH_DESK', 100, 10000));
+      expect(svc.message).toContain('TCHEFOOD_AUTH');
+      // O aparelho não grava os registros do servidor em audit_logs.
+      for (const action of ['PAYMENT_CLAIM_RELEASED', 'POINT_CHARGE_RESOLVED', 'POINT_CHARGE_RECONCILE_AUTHORIZED']) {
+        const forged = asDevice(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+                                 VALUES ('${TENANT}', '${order}', '${STAFF}', '${action}', 'forjado', '{}'::jsonb)`);
+        expect(forged.ok, action).toBe(false);
+      }
+    });
+  });
+
+  describe('A4: o pagamento com a chave da reserva a consome', () => {
+    it('dinheiro reservado e pago com a mesma chave: entra, consome a reserva (a Point passa a ver o saldo novo)', () => {
+      const order = withItems(100);
+      const k = key('cash');
+      expect(cash(k, order, 6000).ok).toBe(true);
+      // Sem a reserva da própria chave, R$ 60,00 não caberiam (R$ 60,00 reservados de R$ 100,00 deixam R$ 40,00).
+      const own = register(payment(order, 60, { idempotency_key: k }));
+      expect(own.ok, own.message ?? '').toBe(true);
+      expect(bal(order)).toBe(4000);
+      expect(reservation(order)).toMatchObject({ reserved_cents: 0, claims_cents: 0, claims: [] });
+      // Revisão P3: a reserva paga fica "consumed", com o pagamento dela.
+      expect(claimField(k, `status || '|' || (consumed_payment_id = (SELECT id FROM payments WHERE idempotency_key = '${k}')) || '|' || (consumed_at IS NOT NULL)`))
+        .toBe('consumed|true|true');
+      expect(openPoint(key('pt'), order, 4001)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      expect(openPoint(key('pt'), order, 4000).ok).toBe(true);
+    });
+
+    it('Stone reservada e paga com a mesma chave: entra e consome; valor menor que a reserva também consome tudo', () => {
+      const order = withItems(100);
+      const k = key('stone');
+      expect(stoneClaim(k, order, 5000).ok).toBe(true);
+      expect(cash(key('cash'), order, 5000).ok).toBe(true); // a outra metade, reservada por outro aparelho
+      const r = register(stonePayment(order, 49.99, { idempotency_key: k }));
+      expect(r.ok, r.message ?? '').toBe(true);
+      expect(reservation(order)).toMatchObject({ claims_cents: 5000, reserved_cents: 5000 });
+      expect(bal(order)).toBe(5001);
+    });
+
+    it('pagamento maior que a reserva é recusado e a reserva continua inteira', () => {
+      const order = withItems(100);
+      const k = key('big');
+      expect(cash(k, order, 3000).ok).toBe(true);
+      const r = register(payment(order, 30.01, { idempotency_key: k }));
+      expect(r.ok).toBe(false);
+      expect(r.message).toContain('passa do valor reservado para este pagamento (R$ 30.00)');
+      expect(reservation(order).claims_cents).toBe(3000);
+      expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${order}'`)).toBe('0');
+      // Direto no banco, também.
+      const direct = psql(target!, `INSERT INTO payments (order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+                                    VALUES ('${order}', '${TENANT}', '${STAFF}', 31, 'CASH', 'APPROVED', 'CASH_DESK', '${k}');`, DB);
+      expect(direct.message).toContain('passa do valor reservado');
+    });
+
+    it('pagamento com a chave da reserva de OUTRA conta é recusado (INSERT e UPDATE), e as duas reservas continuam', () => {
+      const a = withItems(100);
+      const b = withItems(100);
+      const k = key('other');
+      expect(cash(k, a, 1000).ok).toBe(true);
+      const r = register(payment(b, 10, { idempotency_key: k }));
+      expect(r.ok).toBe(false);
+      expect(r.message).toContain(`a chave ${k} é da reserva de pagamento de outra conta`);
+      expect(r.sqlstate).toBe('TF010');
+      // Pagamento aprovado da conta B (com a reserva dele) que troca a chave pela da reserva da conta A: recusado.
+      const id = crypto.randomUUID();
+      rawClaim(id, b, 'CASH', 'CASH_DESK', 1000);
+      sql(`INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+           VALUES ('${id}', '${b}', '${TENANT}', '${STAFF}', 10, 'CASH', 'APPROVED', 'CASH_DESK', '${id}');`);
+      // Revisão r8 (F2): o pagamento gravado não muda de chave.
+      const swap = psql(target!, `UPDATE payments SET idempotency_key = '${k}' WHERE id = '${id}';`, DB);
+      expect(swap).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      expect(swap.message).toContain('o pagamento gravado não muda de chave, de conta nem de loja');
+      expect(reservation(a).claims_cents).toBe(1000);
+    });
+
+    it('chave de cobrança da Point continua recusada em pagamento que não é do Mercado Pago', () => {
+      const order = withItems(100);
+      const pk = key('pt');
+      expect(openPoint(pk, order, 1000).ok).toBe(true);
+      for (const j of [payment(order, 10, { idempotency_key: pk }), stonePayment(order, 10, { idempotency_key: pk })]) {
+        const r = register(j);
+        expect(r.ok).toBe(false);
+        expect(r.message).toContain('é de uma cobrança da Point');
+      }
+      expect(reservation(order).point_cents).toBe(1000);
+    });
+
+    it('reserva liberada: não cobre mais pagamento nenhum; o pagamento com a chave dela é recusado (TF013)', () => {
+      const order = withItems(100);
+      const k = key('rel');
+      expect(cash(k, order, 6000).ok).toBe(true);
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'cliente desistiu')`).ok).toBe(true);
+      expect(cash(key('c2'), order, 7000).ok).toBe(true); // a liberada não reserva mais
+      for (const amount of [30.01, 30, 1]) {
+        const r = register(payment(order, amount, { idempotency_key: k }));
+        expect(r, String(amount)).toMatchObject({ ok: false, sqlstate: 'TF013' });
+        expect(r.message, String(amount)).toContain('a reserva deste pagamento foi liberada pelo gerente; o valor não pode entrar: confira e devolva ao cliente');
+      }
+      expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${order}'`)).toBe('0');
+      expect(claimField(k, 'status')).toBe('released');
+      // Com uma reserva nova (outra chave), os R$ 30,00 livres entram.
+      expect(pay(payment(order, 30)).ok).toBe(true);
+    });
+  });
+
+  describe('A3: liberar a reserva', () => {
+    it('libera uma vez (um registro), de novo devolve como está; liberada não reserva; motivo, operador e chave conferidos', () => {
+      const order = withItems(100);
+      const k = key('rel');
+      const created = json(cash(k, order, 6000));
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'ab')`)).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, NULL)`)).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${INACTIVE}', ${tok(k)}, 'desistiu')`)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${OTHER_STAFF}', ${tok(k)}, 'desistiu')`)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(asDevice(`SELECT tchefood_release_payment_claim('nao-existe', '${STAFF}', NULL, 'desistiu')`)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      // Outra loja não acha a reserva desta.
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${OTHER_STAFF}', ${tok(k)}, 'desistiu')`, OTHER)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(claimField(k, 'status')).toBe('open');
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+      // Auditoria r6: sem PIN, só o aparelho com o segredo da reserva libera; sem ele (ou com outro), TF004.
+      for (const t of ['NULL', `'${'0'.repeat(64)}'`, `'${tokens.get(k)!.toUpperCase()}'`]) {
+        const notMine = asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${t}, 'maquininha recusou')`);
+        expect(notMine, t).toMatchObject({ ok: false, sqlstate: 'TF004' });
+        expect(notMine.message, t).toContain('só o aparelho que pediu a reserva libera sem PIN');
+      }
+      expect(claimField(k, 'status')).toBe('open');
+      const first = json(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, '  maquininha recusou  ')`));
+      expect(first).toMatchObject({ id: created.id, idempotency_key: k, status: 'released', amount_cents: 6000 });
+      expect(claimField(k, `released_by || '|' || release_reason || '|' || (release_audit_id = '${first.release_audit_id}')`)).toBe(`${STAFF}|maquininha recusou|true`);
+      expect(sql(`SELECT performed_by_user_id || '|' || order_id || '|' || reason || '|' || (authorized_by_manager_id IS NULL) FROM audit_logs WHERE id = '${first.release_audit_id}'`))
+        .toBe(`${STAFF}|${order}|maquininha recusou|true`);
+      // Já liberada: o reenvio com o segredo devolve como está (de qualquer operador da loja); sem o segredo, TF004.
+      expect(json(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF_B}', ${tok(k)}, 'outro motivo')`))).toEqual(first);
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF_B}', NULL, 'outro motivo')`)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      const again = json(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'outro motivo')`));
+      expect(again).toEqual(first);
+      expect(json(asDevice(`SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'reserva presa do aparelho')`))).toEqual(first);
+      // Terceira revisão P2-1: já liberada, com PIN errado, NULL e a falha conta no bloqueio (desfeito no fim para não
+      // sujar as tentativas da loja); nunca a reserva "liberada" com qualquer PIN.
+      const wrong = sql(`BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);
+        SELECT COALESCE(tchefood_release_payment_claim_manager('${k}', '${STAFF}', '0000', 'reserva presa do aparelho')::text, 'null');
+        RESET ROLE;
+        SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED' AND metadata->>'idempotency_key' = '${k}';
+        ROLLBACK;`).split('\n').filter((l) => l !== '' && l !== 'SET').slice(-2);
+      expect(wrong).toEqual(['null', '1']);
+      expect(claimField(k, `status || '|' || release_audit_id`)).toBe(`released|${first.release_audit_id}`);
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(1);
+      expect(reservation(order)).toMatchObject({ reserved_cents: 0, claims_cents: 0 });
+      // Reenvio da reserva com a mesma chave devolve a liberada (o aparelho não cobra com ela).
+      expect(json(cash(k, order, 6000))).toMatchObject({ id: created.id, status: 'released' });
+    });
+
+    it('depois do pagamento: TF007 (aparelho e gerente), sem registro, e a reserva fica consumida', () => {
+      const order = withItems(100);
+      const k = key('paid');
+      expect(cash(k, order, 2000).ok).toBe(true);
+      expect(register(payment(order, 20, { idempotency_key: k })).ok).toBe(true);
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'desistiu')`)).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      expect(asDevice(`SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'reserva presa do aparelho')`)).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      expect(claimField(k, 'status')).toBe('consumed');
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+    });
+
+    it('gerente: PIN certo libera com o gerente no registro, também a reserva pedida por outro operador; motivo curto TF006', () => {
+      const order = withItems(100);
+      const k = key('mgr');
+      expect(claim(k, order, 'CASH', 'CASH_DESK', 2000, undefined, STAFF_B).ok).toBe(true);
+      idle(k); // o aparelho que pediu parou de renovar
+      expect(asDevice(`SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'curto')`)).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(asDevice(`SELECT tchefood_release_payment_claim_manager('${k}', '${INACTIVE}', '${MANAGER_PIN}', 'reserva presa do aparelho')`)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      const r = json(asDevice(`SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'aparelho do caixa quebrou')`));
+      expect(r).toMatchObject({ status: 'released', idempotency_key: k });
+      expect(sql(`SELECT authorized_by_manager_id || '|' || (metadata->>'by_manager') FROM audit_logs WHERE id = '${r.release_audit_id}'`)).toBe(`${MANAGER}|true`);
+    });
+
+    it('gerente: PIN errado devolve NULL, nada é liberado e só a falha fica registrada; 3 falhas bloqueiam até o PIN certo', () => {
+      const order = withItems(100, PIN_TENANT, PIN_TABLE, PIN_STAFF);
+      const k = key('pin');
+      expect(asDevice(claimQ(k, order, 'CASH', 'CASH_DESK', 2000, 10000, PIN_STAFF), PIN_TENANT).ok).toBe(true);
+      idle(k);
+      const release = (pin: string) => asDevice(`SELECT COALESCE(tchefood_release_payment_claim_manager('${k}', '${PIN_STAFF}', '${pin}', 'aparelho do caixa quebrou')::text, 'NULL')`, PIN_TENANT);
+      for (const pin of ['0000', '5164', '']) { // errado, PIN do próprio caixa (não é gerente), vazio
+        const r = release(pin);
+        expect(r.ok, pin).toBe(true);
+        expect(last(r), pin).toBe('NULL');
+      }
+      expect(claimField(k, 'status')).toBe('open');
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+      expect(Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${PIN_TENANT}' AND action_type = 'MANAGER_PIN_FAILED' AND metadata->>'idempotency_key' = '${k}'`))).toBe(3);
+      // Bloqueado: nem o PIN certo libera.
+      expect(last(release(PIN_MANAGER_PIN))).toBe('NULL');
+      expect(Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${PIN_TENANT}' AND action_type = 'MANAGER_PIN_LOCKOUT'`))).toBe(1);
+      expect(claimField(k, 'status')).toBe('open');
+      expect(reservation(order, PIN_TENANT).claims_cents).toBe(2000);
+      // A conferência da Point da mesma loja também fica bloqueada (mesmo contador).
+      const ch = sql(`INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status)
+                      VALUES ('${PIN_TENANT}', '${key('pinch')}', '${order}', '${PIN_TERMINAL}', 'mercado_pago_point', 'PIN-POINT', 'CREDIT', 100, 'manual_review') RETURNING idempotency_key;`);
+      const rec = reconcile(ch, PIN_MANAGER_PIN, PIN_TENANT, PIN_STAFF);
+      expect(rec.ok).toBe(true);
+      expect(rec.out).toBe('');
+      expect(Number(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'POINT_CHARGE_RECONCILE_AUTHORIZED' AND metadata->>'idempotency_key' = '${ch}'`))).toBe(0);
+    });
+
+    it('o gatilho: liberar sem o registro, mudar dados da reserva ou reabrir a liberada é recusado (nem o dono do banco passa)', () => {
+      const order = withItems(100);
+      const k = key('trg');
+      expect(cash(k, order, 1000).ok).toBe(true);
+      const upd = (set: string) => psql(target!, `UPDATE payment_claims SET ${set} WHERE idempotency_key = '${k}';`, DB);
+      expect(upd(`status = 'released', released_at = NOW(), released_by = '${STAFF}', release_reason = 'sem registro', release_audit_id = (SELECT id FROM audit_logs LIMIT 1)`).message)
+        .toContain('só é liberada com motivo e registro');
+      expect(upd(`status = 'released'`).ok).toBe(false);
+      for (const set of [`amount_cents = 1`, `order_id = '${withItems(10)}'`, `method = 'PIX', acquirer = 'STONE'`, `acquirer = 'PAGBANK', method = 'DEBIT'`,
+        `created_by = '${STAFF_B}'`, `idempotency_key = 'outra-chave'`, `created_at = NOW() - INTERVAL '1 day'`]) {
+        expect(upd(set).message, set).toContain('não mudam');
+      }
+      expect(json(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'desistiu')`)).status).toBe('released');
+      expect(upd(`status = 'open', released_at = NULL, released_by = NULL, release_reason = NULL, release_audit_id = NULL`).message).toContain('já foi liberada');
+      expect(upd(`release_reason = 'outro'`).message).toContain('já foi liberada');
+      // Nasce aberta.
+      const born = psql(target!, `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by, status, released_at, released_by, release_reason, release_audit_id)
+                                  VALUES ('${TENANT}', '${key('born')}', '${order}', 'CASH', 'CASH_DESK', 100, '${STAFF}', 'released', NOW(), '${STAFF}', 'x', (SELECT id FROM audit_logs LIMIT 1));`, DB);
+      expect(born).toMatchObject({ ok: false, sqlstate: 'TF006' });
+    });
+  });
+
+  describe('A4 em duas sessões de verdade (conta travada)', () => {
+    const lockOrder = (order: string) => `SELECT 1 FROM orders WHERE id = '${order}' FOR UPDATE`;
+
+    it('(1) dinheiro reservado primeiro: a Point que esperava a conta, pelo saldo cheio, é recusada; o resto cabe', async () => {
+      for (const [cents, ok] of [[10000, false], [4001, false], [4000, true]] as const) {
+        const order = withItems(100);
+        const ck = key('c1');
+        const pk = key('p1');
+        const [c, p] = await contend(lockOrder(order), [deviceQ(claimQ(ck, order, 'CASH', 'CASH_DESK', 6000, 10000)), ownerQ(openPointQ(pk, order, cents, 10000))]);
+        expect(lastOverlap, pk).toBe(2);
+        expect(c, pk).toBe('ok');
+        if (ok) expect(p, pk).toBe('ok');
+        else expect(p, pk).toMatch(/^recusado TF003: .*passa do saldo da conta no servidor \(R\$ 40\.00 livre\)/);
+        expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = '${pk}'`), pk).toBe(ok ? '1' : '0');
+        expect(reservation(order).reserved_cents, pk).toBe(ok ? 10000 : 6000);
+      }
+    }, 60_000);
+
+    it('(2) Point aberta primeiro: a reserva que esperava a conta é recusada (TF003) e nada é gravado', async () => {
+      for (const [method, acquirer] of [['CASH', 'CASH_DESK'], ['CREDIT', 'STONE'], ['PIX', 'PAGBANK']] as const) {
+        const order = withItems(100);
+        const ck = key('c2');
+        const pk = key('p2');
+        const [p, c] = await contend(lockOrder(order), [ownerQ(openPointQ(pk, order, 10000, 10000)), deviceQ(claimQ(ck, order, method, acquirer, 10000, 10000))]);
+        expect(lastOverlap, method).toBe(2);
+        expect(p, method).toBe('ok');
+        expect(c, method).toMatch(/^recusado TF003: .*R\$ 0\.00 livre; R\$ 100\.00 reservado/);
+        expect(sql(`SELECT count(*) FROM payment_claims WHERE idempotency_key = '${ck}'`), method).toBe('0');
+      }
+    }, 60_000);
+
+    it('(3) duas reservas pelo saldo inteiro, Stone no aparelho A e dinheiro no aparelho B, nas duas ordens: só uma passa', async () => {
+      for (const stoneFirst of [true, false]) {
+        const order = withItems(100);
+        const sk = key('sA');
+        const ck = key('cB');
+        const stoneQ = deviceQ(claimQ(sk, order, 'CREDIT', 'STONE', 10000, 10000, STAFF));
+        const cashQ = deviceQ(claimQ(ck, order, 'CASH', 'CASH_DESK', 10000, 10000, STAFF_B));
+        const out = await contend(lockOrder(order), stoneFirst ? [stoneQ, cashQ] : [cashQ, stoneQ]);
+        expect(lastOverlap).toBe(2);
+        expect(out[0]).toBe('ok');
+        expect(out[1]).toMatch(/^recusado TF003: /);
+        expect(Number(sql(`SELECT count(*) FROM payment_claims WHERE order_id = '${order}'`))).toBe(1);
+        expect(reservation(order).claims_cents).toBe(10000);
+        // O vencedor paga com a própria chave; o outro pagamento não entra.
+        const winner = stoneFirst ? sk : ck;
+        const paid = stoneFirst ? register(stonePayment(order, 100, { idempotency_key: sk })) : register(payment(order, 100, { idempotency_key: ck }));
+        expect(paid.ok, paid.message ?? winner).toBe(true);
+        expect(sql(`SELECT remaining_balance || '|' || status FROM orders WHERE id = '${order}'`)).toBe('0.00|CLOSED');
+      }
+    }, 60_000);
+
+    it('reserva e pagamento sem reserva ao mesmo tempo, nas duas ordens: o segundo vê o primeiro', async () => {
+      // Reserva primeiro: o dinheiro de R$ 100,00 (outra chave) é recusado pela reserva.
+      let order = withItems(100);
+      let [c, p] = await contend(lockOrder(order), [deviceQ(claimQ(key('c'), order, 'CASH', 'CASH_DESK', 5000, 10000)), deviceQ(payQ(payment(order, 100), 10000))]);
+      expect(lastOverlap).toBe(2);
+      expect(c).toBe('ok');
+      // O pagamento (com a reserva dele, no mesmo comando) é recusado já na reserva, e nada dele é gravado.
+      expect(p).toMatch(/^recusado TF003: .*R\$ 100\.00 passa do saldo livre da conta no servidor \(R\$ 50\.00 livre; R\$ 50\.00 reservado/);
+      expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${order}'`)).toBe('0');
+      expect(reservation(order).claims_cents).toBe(5000);
+      // Pagamento primeiro: a reserva preparada com o saldo antigo recebe TF008 (sincroniza e tenta de novo).
+      order = withItems(100);
+      [p, c] = await contend(lockOrder(order), [deviceQ(payQ(payment(order, 60), 10000)), deviceQ(claimQ(key('c'), order, 'CASH', 'CASH_DESK', 5000, 10000))]);
+      expect(lastOverlap).toBe(2);
+      expect(p).toBe('ok');
+      expect(c).toMatch(/^recusado TF008: /);
+      expect(cash(key('c'), order, 4001)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+    }, 60_000);
+
+    it('liberação e pagamento da mesma reserva ao mesmo tempo, nas duas ordens: nunca as duas coisas', async () => {
+      // Liberação primeiro: o pagamento com a chave dela é recusado (TF013: a reserva liberada não cobre nada).
+      let order = withItems(100);
+      let k = key('rp');
+      expect(cash(k, order, 6000).ok).toBe(true);
+      expect(cash(key('o'), order, 4000).ok).toBe(true);
+      let [r, p] = await contend(lockOrder(order), [
+        deviceQ(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'desistiu')`), deviceQ(registerQ(payment(order, 60, { idempotency_key: k })))]);
+      expect(lastOverlap).toBe(2);
+      expect(r).toBe('ok');
+      expect(p).toMatch(/^recusado TF013: .*foi liberada pelo gerente/);
+      expect(claimField(k, 'status')).toBe('released');
+      expect(reservation(order)).toMatchObject({ claims_cents: 4000, reserved_cents: 4000 });
+      expect(bal(order)).toBe(10000);
+      // Pagamento primeiro: a liberação encontra o pagamento (TF007) e não grava registro.
+      order = withItems(100);
+      k = key('pr');
+      expect(cash(k, order, 6000).ok).toBe(true);
+      [p, r] = await contend(lockOrder(order), [
+        deviceQ(registerQ(payment(order, 60, { idempotency_key: k }))), deviceQ(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'desistiu')`)]);
+      expect(lastOverlap).toBe(2);
+      expect(p).toBe('ok');
+      expect(r).toMatch(/^recusado TF007: /);
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+      expect(claimField(k, 'status')).toBe('consumed');
+    }, 60_000);
+  });
+
+  describe('A5: fim verificado da cobrança da Point', () => {
+    const ends = ['approved', 'rejected', 'cancelled', 'expired', 'refunded'] as const;
+
+    it.each(ends)('revisão manual → %s: o UPDATE direto é recusado; a função grava uma vez, com UM registro; a segunda chamada não grava nada', (to) => {
+      const order = withItems(100);
+      const c = charge(order, 'manual_review', 3000, { raw_status_detail: 'PROVIDER_STATUS_UNCERTAIN' });
+      const direct = to === 'approved'
+        ? `status = 'approved', external_payment_id = '1', paid_amount_cents = 3000, card_brand = 'VISA', authorization_code = 'A'`
+        : `status = '${to}'`;
+      const d = psql(target!, `UPDATE terminal_charges SET ${direct} WHERE id = '${c.id}';`, DB);
+      expect(d.ok).toBe(false);
+      expect(d.message).toContain(`só passa de "manual_review" para "${to}" com a confirmação do Mercado Pago`);
+      // Nem com a marca ligada à mão (id qualquer, ou o registro de outra cobrança).
+      const other = charge(order, 'manual_review', 100);
+      expect(resolve(other.id, 'manual_review', 'rejected').ok).toBe(true);
+      const otherAudit = sql(`SELECT id FROM audit_logs WHERE action_type = 'POINT_CHARGE_RESOLVED' AND metadata->>'charge_id' = '${other.id}'`);
+      for (const flag of [crypto.randomUUID(), otherAudit, 'on']) {
+        const forged = psql(target!, `BEGIN; SELECT set_config('tchefood.point_resolution', '${flag}', true); UPDATE terminal_charges SET ${direct} WHERE id = '${c.id}'; COMMIT;`, DB);
+        expect(forged.ok, flag).toBe(false);
+      }
+      expect(reservation(order).point_cents).toBe(3000);
+      const patch = to === 'approved' ? receiptPatch(3000) : `{"raw_status":"${to}","raw_status_detail":"by_mp"}`;
+      const auth = authorized(c.key);
+      const evidence = `{"authorization_audit_id":"${auth}","operation_id":"op-${to}","order_status":"${to}"}`;
+      const r = psql(target!, `${resolveQ(c.id, 'manual_review', to, patch, evidence)};`, DB);
+      expect(r.out, r.message ?? '').toBe(to);
+      const audit = sql(`SELECT performed_by_user_id || '|' || order_id || '|' || (metadata->>'from') || '|' || (metadata->>'to') || '|' || (metadata->'evidence'->>'operation_id') || '|' || reason
+                         FROM audit_logs WHERE action_type = 'POINT_CHARGE_RESOLVED' AND metadata->>'charge_id' = '${c.id}'`);
+      expect(audit).toBe(`${STAFF}|${order}|manual_review|${to}|op-${to}|conferido no Mercado Pago`);
+      // Segunda chamada (mesmo pedido, ou outra autorização): devolve a linha como está e não grava nada.
+      expect(psql(target!, `${resolveQ(c.id, 'manual_review', to, patch, evidence)};`, DB).out).toBe(to);
+      expect(psql(target!, `${resolveQ(c.id, 'manual_review', 'rejected', '{}', `{"authorization_audit_id":"${crypto.randomUUID()}","operation_id":"x"}`)};`, DB).out).toBe(to);
+      expect(audits('POINT_CHARGE_RESOLVED', 'charge_id', c.id)).toBe(1);
+      // Aprovada continua reservando até o pagamento dela; as outras liberam.
+      expect(reservation(order).point_cents).toBe(to === 'approved' ? 3000 : 0);
+      if (to === 'approved') {
+        expect(chargeField(c.id, `raw_status || '|' || raw_status_detail || '|' || authorization_code || '|' || external_order_id`)).toBe(`processed|accredited|AUTR1|ORD-${c.key}`);
+        const mp = mpPayment(c.id);
+        expect(mp.ok, mp.message ?? '').toBe(true);
+        expect(reservation(order).point_cents).toBe(0);
+      }
+      // Estado final não muda mais por fora (nem de volta para a revisão manual).
+      expect(psql(target!, `UPDATE terminal_charges SET status = 'manual_review' WHERE id = '${c.id}';`, DB).ok).toBe(false);
+    });
+
+    it('revisão manual também não volta para criando, na fila ou na maquininha (sairia dela em dois passos)', () => {
+      const c = charge(withItems(100), 'manual_review');
+      for (const to of ['creating', 'pending', 'at_terminal']) {
+        const r = psql(target!, `UPDATE terminal_charges SET status = '${to}' WHERE id = '${c.id}';`, DB);
+        expect(r.message, to).toContain('está em revisão manual e só sai dela');
+      }
+      // Ficar em revisão, mudando o que o Mercado Pago disse, continua podendo (a consulta grava o detalhe).
+      expect(psql(target!, `UPDATE terminal_charges SET raw_status_detail = 'ORDER_ID_CHANGED' WHERE id = '${c.id}';`, DB).ok).toBe(true);
+      expect(chargeField(c.id, 'status')).toBe('manual_review');
+    });
+
+    it('aprovada sem pagamento → estornada: o UPDATE direto é recusado; a função libera a reserva; com o pagamento do Mercado Pago gravado, TF007', () => {
+      const order = withItems(100);
+      const c = charge(order, 'approved', 2500);
+      expect(psql(target!, `UPDATE terminal_charges SET status = 'refunded' WHERE id = '${c.id}';`, DB).message)
+        .toContain('só passa de "approved" para "refunded" com a confirmação do Mercado Pago');
+      expect(reservation(order).point_cents).toBe(2500);
+      // O comprovante não muda no estorno.
+      expect(resolve(c.id, 'approved', 'refunded', '{"authorization_code":"X"}')).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(resolve(c.id, 'approved', 'refunded', '{"raw_status":"refunded","raw_status_detail":"refunded"}').out).toBe('refunded');
+      expect(chargeField(c.id, `status || '|' || raw_status || '|' || authorization_code`)).toBe('refunded|refunded|AUT1');
+      expect(audits('POINT_CHARGE_RESOLVED', 'charge_id', c.id)).toBe(1);
+      expect(reservation(order).point_cents).toBe(0);
+      // O pagamento do Mercado Pago de uma cobrança estornada não entra.
+      expect(mpPayment(c.id).message).toContain('não aprovada');
+      // Com o pagamento já gravado: TF007 e nada muda.
+      const paid = charge(order, 'approved', 1000);
+      expect(mpPayment(paid.id).ok).toBe(true);
+      expect(resolve(paid.id, 'approved', 'refunded')).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      expect(chargeField(paid.id, 'status')).toBe('approved');
+      expect(audits('POINT_CHARGE_RESOLVED', 'charge_id', paid.id)).toBe(0);
+    });
+
+    it('aprovada pelo ID da operação, sem ordem do Mercado Pago (external_order_id NULL): grava e o pagamento dela entra', () => {
+      const order = withItems(100);
+      const c = charge(order, 'manual_review', 1500, { external_order_id: null, raw_status: 'dispatch_unknown', raw_status_detail: 'DISPATCH_UNKNOWN' });
+      expect(resolve(c.id, 'manual_review', 'approved', receiptPatch(1500, 'OP777')).out).toBe('approved');
+      expect(chargeField(c.id, `(external_order_id IS NULL) || '|' || external_payment_id`)).toBe('true|OP777');
+      expect(mpPayment(c.id).ok).toBe(true);
+    });
+
+    it('transição que não é fim verificado, campos fora da lista, motivo, operador, evidência e autorização conferidos', () => {
+      const order = withItems(100);
+      const mr = charge(order, 'manual_review');
+      const ap = charge(order, 'approved');
+      const pend = charge(order, 'pending');
+      const auth = authorized(mr.key);
+      const ev = `{"authorization_audit_id":"${auth}","operation_id":"op"}`;
+      const call = (id: string, from: string, to: string, patch = '{}', evidence = ev, reason = 'conferido no Mercado Pago', staff = STAFF) =>
+        psql(target!, `${resolveQ(id, from, to, patch, evidence, reason, staff)};`, DB);
+      for (const [id, from, to] of [[pend.id, 'pending', 'rejected'], [ap.id, 'approved', 'rejected'], [mr.id, 'manual_review', 'pending'], [mr.id, 'manual_review', 'manual_review'], [ap.id, 'rejected', 'approved']]) {
+        expect(call(id!, from!, to!), `${from}→${to}`).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      }
+      for (const patch of ['{"status":"approved"}', '{"external_order_id":"ORD-X"}', '{"cancel_reason":"void"}', '{"amount_cents":1}', '[1]']) {
+        expect(call(mr.id, 'manual_review', 'rejected', patch), patch).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      }
+      expect(call(mr.id, 'manual_review', 'rejected', '{}', ev, 'curto')).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(call(mr.id, 'manual_review', 'rejected', '{}', ev, 'conferido no Mercado Pago', INACTIVE)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      for (const evidence of ['{}', '{"operation_id":"op"}', `{"authorization_audit_id":"${auth}"}`, '{"authorization_audit_id":"nao-e-uuid","operation_id":"op"}',
+        `{"authorization_audit_id":"${crypto.randomUUID()}","operation_id":"op"}`]) {
+        expect(call(mr.id, 'manual_review', 'rejected', '{}', evidence), evidence).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      }
+      expect(psql(target!, `SELECT tchefood_resolve_point_charge('${TENANT}', '${mr.id}', 'manual_review', 'rejected', '{}'::jsonb, '${STAFF}', 'conferido no Mercado Pago', NULL);`, DB))
+        .toMatchObject({ ok: false, sqlstate: 'TF006' });
+      // Autorização de OUTRA cobrança não vale para esta.
+      const other = charge(order, 'manual_review');
+      expect(call(other.id, 'manual_review', 'rejected')).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      // Cobrança de outra loja / que não existe: TF005.
+      expect(psql(target!, `${resolveQ(mr.id, 'manual_review', 'rejected', '{}', ev, 'conferido no Mercado Pago', OTHER_STAFF, OTHER)};`, DB)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(call(crypto.randomUUID(), 'manual_review', 'rejected')).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      // Aprovada sem comprovante completo: o gatilho recusa e o registro é desfeito junto.
+      expect(call(mr.id, 'manual_review', 'approved', '{"external_payment_id":"1"}').message).toContain('comprovante completo');
+      expect(audits('POINT_CHARGE_RESOLVED', 'charge_id', mr.id)).toBe(0);
+      expect(chargeField(mr.id, 'status')).toBe('manual_review');
+      // A autorização vale para um fim só: usada aqui, não serve para o estorno da mesma cobrança depois.
+      expect(call(mr.id, 'manual_review', 'approved', receiptPatch(1000)).out).toBe('approved');
+      expect(call(mr.id, 'approved', 'refunded')).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      expect(chargeField(mr.id, 'status')).toBe('approved');
+    });
+
+    it('permissões: o aparelho e anon não chamam o fim verificado nem a conferência; a service role chama', () => {
+      const c = charge(withItems(100), 'manual_review');
+      const auth = authorized(c.key);
+      const q = resolveQ(c.id, 'manual_review', 'rejected', '{}', `{"authorization_audit_id":"${auth}","operation_id":"op"}`);
+      expect(asDevice(q)).toMatchObject({ ok: false, sqlstate: '42501' });
+      expect(asRole('anon', q)).toMatchObject({ ok: false, sqlstate: '42501' });
+      const rq = `SELECT tchefood_authorize_point_reconcile('${TENANT}', '${c.key}', '${STAFF}', '${MANAGER_PIN}', 'conferir no Mercado Pago')`;
+      expect(asDevice(rq)).toMatchObject({ ok: false, sqlstate: '42501' });
+      expect(asRole('anon', rq)).toMatchObject({ ok: false, sqlstate: '42501' });
+      // O aparelho também não altera a cobrança direto (sem UPDATE em terminal_charges).
+      expect(asDevice(`UPDATE terminal_charges SET status = 'rejected' WHERE id = '${c.id}'`)).toMatchObject({ ok: false, sqlstate: '42501' });
+      const svc = asRole('service_role', q);
+      expect(last(svc), svc.message ?? '').toBe('rejected');
+      expect(audits('POINT_CHARGE_RESOLVED', 'charge_id', c.id)).toBe(1);
+      for (const fn of ['tchefood_point_reserved_cents(UUID, UUID, VARCHAR)', 'tchefood_point_charges_reserved_cents(UUID, UUID, VARCHAR)',
+        'tchefood_payment_claims_reserved_cents(UUID, UUID, VARCHAR)', 'tchefood_resolve_point_charge(UUID, UUID, VARCHAR, VARCHAR, JSONB, UUID, TEXT, JSONB)',
+        'tchefood_authorize_point_reconcile(UUID, VARCHAR, UUID, VARCHAR, TEXT)']) {
+        expect(sql(`SELECT has_function_privilege('authenticated', '${fn}', 'EXECUTE') || '|' || has_function_privilege('anon', '${fn}', 'EXECUTE') || '|' || has_function_privilege('service_role', '${fn}', 'EXECUTE')`), fn).toBe('false|false|true');
+      }
+      for (const fn of ['tchefood_claim_payment(VARCHAR, UUID, VARCHAR, VARCHAR, BIGINT, BIGINT, UUID, TEXT)', 'tchefood_release_payment_claim(VARCHAR, UUID, TEXT, TEXT)',
+        'tchefood_release_payment_claim_manager(VARCHAR, UUID, VARCHAR, TEXT)', 'tchefood_point_reservation(UUID)', 'tchefood_touch_payment_claim(VARCHAR, UUID, TEXT)']) {
+        expect(sql(`SELECT has_function_privilege('authenticated', '${fn}', 'EXECUTE') || '|' || has_function_privilege('anon', '${fn}', 'EXECUTE') || '|' || has_function_privilege('service_role', '${fn}', 'EXECUTE')`), fn).toBe('true|false|true');
+      }
+    });
+
+    it('tchefood_authorize_point_reconcile: registra o pedido com o gerente e não muda a cobrança; TF005, TF004, TF006, TF007', () => {
+      const order = withItems(100);
+      const c = charge(order, 'manual_review');
+      const before = chargeField(c.id, 'to_jsonb(terminal_charges.*)::text');
+      const id = authorized(c.key);
+      expect(chargeField(c.id, 'to_jsonb(terminal_charges.*)::text')).toBe(before);
+      expect(sql(`SELECT performed_by_user_id || '|' || authorized_by_manager_id || '|' || order_id || '|' || (metadata->>'idempotency_key') || '|' || reason FROM audit_logs WHERE id = '${id}'`))
+        .toBe(`${STAFF}|${MANAGER}|${order}|${c.key}|conferir no Mercado Pago`);
+      expect(authorized(charge(order, 'approved').key)).toMatch(/^[0-9a-f-]{36}$/);
+      expect(reconcile('nao-existe')).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(reconcile(c.key, MANAGER_PIN, OTHER, OTHER_STAFF)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(reconcile(c.key, MANAGER_PIN, TENANT, INACTIVE)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(reconcile(c.key, MANAGER_PIN, TENANT, STAFF, 'curto')).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      for (const status of ['pending', 'creating', 'at_terminal', 'rejected', 'cancelled', 'expired', 'refunded']) {
+        expect(reconcile(charge(order, status).key), status).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      }
+    });
+
+    it('estorno verificado e pagamento do Mercado Pago da mesma cobrança ao mesmo tempo, nas duas ordens: nunca os dois', async () => {
+      const lockCharge = (id: string) => `SELECT 1 FROM terminal_charges WHERE id = '${id}' FOR UPDATE`;
+      const payQ = (id: string) => {
+        const c = sql(`SELECT order_id || '|' || amount_cents || '|' || external_payment_id || '|' || authorization_code || '|' || idempotency_key FROM terminal_charges WHERE id = '${id}'`).split('|');
+        return ownerQ(`INSERT INTO payments (order_id, tenant_id, waiter_id, terminal_id, amount, method, status, acquirer, acquirer_cnpj, card_brand, nsu, authorization_code, terminal_serial, idempotency_key)
+                       VALUES ('${c[0]}', '${TENANT}', '${STAFF}', '${TERMINAL}', ${Number(c[1]) / 100}, 'CREDIT', 'APPROVED', 'MERCADO_PAGO', '10573521000191', 'VISA', '${c[2]}', '${c[3]}', '${MP_ID}', '${c[4]}')`);
+      };
+      const refundQ = (id: string, k: string) => ownerQ(resolveQ(id, 'approved', 'refunded', '{}', `{"authorization_audit_id":"${authorized(k)}","operation_id":"op"}`));
+      // Estorno primeiro: o pagamento que esperava encontra a cobrança estornada.
+      let c = charge(withItems(100), 'approved', 2000);
+      let [r, p] = await contend(lockCharge(c.id), [refundQ(c.id, c.key), payQ(c.id)]);
+      expect(lastOverlap).toBe(2);
+      expect(r).toBe('ok');
+      expect(p).toMatch(/^recusado P0001: .*não aprovada/);
+      expect(chargeField(c.id, 'status')).toBe('refunded');
+      expect(sql(`SELECT count(*) FROM payments WHERE idempotency_key = '${c.key}'`)).toBe('0');
+      // Pagamento primeiro: o estorno que esperava encontra o pagamento (TF007) e não grava registro.
+      c = charge(withItems(100), 'approved', 2000);
+      [p, r] = await contend(lockCharge(c.id), [payQ(c.id), refundQ(c.id, c.key)]);
+      expect(lastOverlap).toBe(2);
+      expect(p).toBe('ok');
+      expect(r).toMatch(/^recusado TF007: /);
+      expect(chargeField(c.id, 'status')).toBe('approved');
+      expect(audits('POINT_CHARGE_RESOLVED', 'charge_id', c.id)).toBe(0);
+    }, 60_000);
+
+    it('a leitura lista as cobranças que reservam, com o detalhe da revisão e se há pagamento com a chave', () => {
+      const order = withItems(100);
+      const mr = charge(order, 'manual_review', 1000, { raw_status_detail: 'DISPATCH_UNKNOWN', external_order_id: null });
+      const ap = charge(order, 'approved', 2000);
+      charge(order, 'rejected', 500);
+      const paid = charge(order, 'approved', 700);
+      expect(mpPayment(paid.id).ok).toBe(true);
+      const ck = key('cl');
+      expect(cash(ck, order, 300).ok).toBe(true);
+      const r = reservation(order);
+      expect(r).toMatchObject({ reserved_cents: 3300, point_cents: 3000, claims_cents: 300, open_charges: 2, manual_review: true });
+      expect(r.charges).toEqual([
+        { idempotency_key: mr.key, status: 'manual_review', amount_cents: 1000, raw_status_detail: 'DISPATCH_UNKNOWN', has_payment: false },
+        { idempotency_key: ap.key, status: 'approved', amount_cents: 2000, raw_status_detail: null, has_payment: false },
+      ]);
+      expect(r.claims.map((x) => x.idempotency_key)).toEqual([ck]);
+    });
+  });
+
+  describe('revisão P1-B, P2-A e P3: o banco exige a reserva na loja com Point; a reserva paga é final', () => {
+    const lockOrder = (order: string) => `SELECT 1 FROM orders WHERE id = '${order}' FOR UPDATE`;
+    const needsClaim = /o pagamento precisa da reserva no servidor antes de receber/;
+    const paymentId = (k: string) => sql(`SELECT id FROM payments WHERE idempotency_key = '${k}'`);
+
+    /** Senha de entrega (mesa do totem, entrega própria) com saldo `balance`, andando até `upTo`. */
+    function deliveryOrder(balance: number, opts: { payOnDelivery?: boolean; upTo?: 'OUT' | 'DELIVERED' } = {}): { order: string; id: string } {
+      seq += 1;
+      const order = `f1f1f1f1-0000-4000-8000-${String(seq).padStart(12, '0')}`;
+      const id = crypto.randomUUID();
+      sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id, status, charge_service_fee, fulfillment_type)
+           VALUES ('${order}', '${TENANT}', '${KIOSK_TABLE}', '${STAFF}', 'PAYING', false, 'DELIVERY');
+           BEGIN; SET LOCAL session_replication_role = replica;
+           INSERT INTO order_items (order_id, product_id, waiter_id, quantity, unit_price, total_item_price, sector)
+           VALUES ('${order}', gen_random_uuid(), '${STAFF}', 1, ${balance}, ${balance}, 'NONE');
+           UPDATE orders SET subtotal_items = ${balance}, total_amount = ${balance}, paid_amount = 0, remaining_balance = ${balance} WHERE id = '${order}';
+           COMMIT;
+           INSERT INTO own_deliveries (id, tenant_id, order_id, customer_name, customer_phone, address, zone_id, zone_name, delivery_fee, pay_on_delivery)
+           VALUES ('${id}', '${TENANT}', '${order}', 'Cliente', '51999998888', 'Rua A, 100', '${ZONE}', 'Centro', 5, ${opts.payOnDelivery ?? true});
+           UPDATE own_deliveries SET status = 'READY' WHERE id = '${id}';
+           UPDATE own_deliveries SET status = 'OUT', courier_id = '${COURIER}', courier_fee = 4, out_at = NOW() WHERE id = '${id}';
+           ${(opts.upTo ?? 'DELIVERED') === 'DELIVERED' ? `UPDATE own_deliveries SET status = 'DELIVERED', delivered_at = NOW() WHERE id = '${id}';` : ''}`);
+      return { order, id };
+    }
+
+    it('aparelho com a lista de maquininhas velha (sem reserva): dinheiro na loja com Point é recusado (TF010) e nada é gravado; Stone, Pix, INSERT e UPDATE diretos também', () => {
+      const order = withItems(100);
+      const attempts = [
+        ['dinheiro', payment(order, 10)],
+        ['Stone', stonePayment(order, 10)],
+        ['Pix', payment(order, 10, { method: 'PIX', acquirer: 'STONE', acquirer_cnpj: STONE_CNPJ, nsu: `PX${seq}` })],
+      ] as const;
+      for (const [label, j] of attempts) {
+        const r = register(j);
+        expect(r, label).toMatchObject({ ok: false, sqlstate: 'TF010' });
+        expect(r.message, label).toMatch(needsClaim);
+        expect(r.message, label).toContain('Nada foi gravado');
+      }
+      expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${order}'`)).toBe('0');
+      expect(bal(order)).toBe(10000);
+      // Fora do aparelho (dono do banco), igual: INSERT aprovado, e pendente que vira aprovado.
+      const id = crypto.randomUUID();
+      const direct = psql(target!, `INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+                                    VALUES ('${id}', '${order}', '${TENANT}', '${STAFF}', 10, 'CASH', 'APPROVED', 'CASH_DESK', '${id}');`, DB);
+      expect(direct).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      sql(`INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+           VALUES ('${id}', '${order}', '${TENANT}', '${STAFF}', 10, 'CASH', 'PENDING', 'CASH_DESK', '${id}');`);
+      expect(psql(target!, `UPDATE payments SET status = 'APPROVED' WHERE id = '${id}';`, DB)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      expect(sql(`SELECT status FROM payments WHERE id = '${id}'`)).toBe('PENDING');
+      // Com a reserva (o aparelho atualizado), o mesmo dinheiro entra.
+      const ok = pay(payment(order, 10));
+      expect(ok.ok, ok.message ?? '').toBe(true);
+      expect(bal(order)).toBe(9000);
+      // As funções novas de conferência não são do aparelho.
+      for (const fn of ['tchefood_courier_cash_payment(payments)', 'tchefood_payment_claim_consume()']) {
+        expect(sql(`SELECT has_function_privilege('authenticated', '${fn}', 'EXECUTE') || '|' || has_function_privilege('anon', '${fn}', 'EXECUTE')`), fn).toBe('false|false');
+      }
+    });
+
+    it('reserva com outra forma ou credenciadora não cobre o pagamento (TF010) e continua aberta; a leitura lista as reservas abertas', () => {
+      const order = withItems(100);
+      const ck = key('cash');
+      const sk = key('stone');
+      expect(cash(ck, order, 5000).ok).toBe(true);
+      expect(claim(sk, order, 'CREDIT', 'STONE', 3000, undefined, STAFF_B).ok).toBe(true);
+      const wrongAcquirer = register(stonePayment(order, 10, { idempotency_key: ck }));
+      expect(wrongAcquirer).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      expect(wrongAcquirer.message).toContain('o pagamento (CREDIT na STONE) não é o que foi reservado (CASH na CASH_DESK)');
+      const wrongMethod = register(stonePayment(order, 10, { idempotency_key: sk, method: 'DEBIT' }));
+      expect(wrongMethod).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      expect(wrongMethod.message).toContain('(DEBIT na STONE) não é o que foi reservado (CREDIT na STONE)');
+      expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${order}'`)).toBe('0');
+      const read = reservation(order);
+      expect(read).toMatchObject({ claims_cents: 8000, reserved_cents: 8000 });
+      expect(read.claims.map(({ idempotency_key, amount_cents, method, acquirer, created_by, created_by_name }) => ({ idempotency_key, amount_cents, method, acquirer, created_by, created_by_name })))
+        .toEqual([
+          { idempotency_key: ck, amount_cents: 5000, method: 'CASH', acquirer: 'CASH_DESK', created_by: STAFF, created_by_name: 'Caixa' },
+          { idempotency_key: sk, amount_cents: 3000, method: 'CREDIT', acquirer: 'STONE', created_by: STAFF_B, created_by_name: 'Caixa 2' },
+        ]);
+      // A certa entra; consumida ou liberada sai da lista.
+      expect(register(stonePayment(order, 30, { idempotency_key: sk })).ok).toBe(true);
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${ck}', '${STAFF}', ${tok(ck)}, 'cliente desistiu')`).ok).toBe(true);
+      expect(reservation(order)).toMatchObject({ claims_cents: 0, claims: [] });
+    });
+
+    it('auditoria r7 P1-01: loja sem Point também exige a reserva (TF010): Stone, PagBank, dinheiro e Pix manual sem reserva são recusados; com a reserva certa entram', () => {
+      expect(sql(`SELECT count(*) FROM pos_terminals WHERE tenant_id = '${LATE_TENANT}'`)).toBe('0');
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE tenant_id = '${LATE_TENANT}'`)).toBe('0');
+      const order = withItems(100, LATE_TENANT, LATE_TABLE, LATE_STAFF);
+      const late = { tenant_id: LATE_TENANT, waiter_id: LATE_STAFF };
+      const card = (amount: number, over: Record<string, unknown>) => stonePayment(order, amount, { ...late, terminal_id: null, ...over });
+      const kinds: [string, (amount: number) => string][] = [
+        ['Stone', (a) => card(a, {})],
+        ['PagBank', (a) => card(a, { acquirer: 'PAGBANK', acquirer_cnpj: '08561701000101', terminal_serial: 'PAG-01' })],
+        ['dinheiro', (a) => payment(order, a, late)],
+        ['Pix manual', (a) => card(a, { method: 'PIX', card_brand: 'PIX' })],
+      ];
+      for (const [label, make] of kinds) {
+        // O aparelho antigo (tchefood_register_payment / fila de sincronização sem reserva): TF010, nada gravado.
+        const j = make(10);
+        const r = register(j, LATE_TENANT);
+        expect(r, label).toMatchObject({ ok: false, sqlstate: 'TF010' });
+        expect(r.message, label).toMatch(/o pagamento precisa da reserva no servidor antes de receber/);
+        expect(sql(`SELECT count(*) FROM payments WHERE id = '${(JSON.parse(j) as { id: string }).id}'`), label).toBe('0');
+        // Com a reserva que confere (mesma conta, forma, credenciadora e até o valor), entra.
+        const ok = pay(make(10), LATE_TENANT);
+        expect(ok.ok, `${label}: ${ok.message ?? ''}`).toBe(true);
+      }
+      // INSERT direto (dono do banco), sem reserva: recusado igual.
+      const id = crypto.randomUUID();
+      expect(psql(target!, `INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+                            VALUES ('${id}', '${order}', '${LATE_TENANT}', '${LATE_STAFF}', 10, 'CASH', 'APPROVED', 'CASH_DESK', '${id}');`, DB))
+        .toMatchObject({ ok: false, sqlstate: 'TF010' });
+      expect(bal(order)).toBe(6000);
+    });
+
+    it('dinheiro do entregador (senha paga na entrega): entra sem reserva só com a entrega conferida no banco; o prefixo "entrega-" sozinho não libera nada', () => {
+      const ok = deliveryOrder(100);
+      const r = register(payment(ok.order, 100, { idempotency_key: `entrega-${ok.id}` }));
+      expect(r.ok, r.message ?? '').toBe(true);
+      expect(sql(`SELECT remaining_balance || '|' || status FROM orders WHERE id = '${ok.order}'`)).toBe('0.00|CLOSED');
+      const refused: [string, string][] = [];
+      // Só o prefixo, com um id que não é de entrega nenhuma.
+      const plain = withItems(100);
+      refused.push(['prefixo sem entrega', payment(plain, 10, { idempotency_key: `entrega-${crypto.randomUUID()}` })]);
+      // Entrega de verdade, mas de OUTRA conta.
+      const elsewhere = deliveryOrder(100);
+      refused.push(['entrega de outra conta', payment(plain, 10, { idempotency_key: `entrega-${elsewhere.id}` })]);
+      // Entrega já paga no pedido (não é paga na entrega).
+      const prepaid = deliveryOrder(100, { payOnDelivery: false });
+      refused.push(['entrega não paga na entrega', payment(prepaid.order, 10, { idempotency_key: `entrega-${prepaid.id}` })]);
+      // Entrega que ainda não foi entregue.
+      const out = deliveryOrder(100, { upTo: 'OUT' });
+      refused.push(['entrega ainda na rua', payment(out.order, 10, { idempotency_key: `entrega-${out.id}` })]);
+      // Cartão com a chave da entrega (o acerto do entregador é só dinheiro no caixa).
+      const card = deliveryOrder(100);
+      refused.push(['cartão com a chave da entrega', stonePayment(card.order, 10, { idempotency_key: `entrega-${card.id}` })]);
+      for (const [label, j] of refused) {
+        const x = register(j);
+        expect(x, label).toMatchObject({ ok: false, sqlstate: 'TF010' });
+        expect(x.message, label).toMatch(needsClaim);
+      }
+      for (const o of [plain, elsewhere.order, prepaid.order, out.order, card.order]) {
+        expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${o}'`), o).toBe('0');
+      }
+      // O dinheiro do entregador continua respeitando a cobrança da Point em andamento na conta.
+      const busy = deliveryOrder(100);
+      expect(openPoint(key('pt'), busy.order, 6000).ok).toBe(true);
+      const over = register(payment(busy.order, 100, { idempotency_key: `entrega-${busy.id}` }));
+      expect(over.message).toContain('R$ 60.00 reservado). Livre para este pagamento: R$ 40.00');
+      expect(register(payment(busy.order, 40, { idempotency_key: `entrega-${busy.id}` })).ok).toBe(true);
+    });
+
+    it('reserva paga é final: estorno do pagamento não a reabre nem a faz reservar; liberar dá TF007; o UPDATE direto é recusado', () => {
+      const order = withItems(100);
+      const k = key('fin');
+      expect(cash(k, order, 3000).ok).toBe(true);
+      expect(register(payment(order, 30, { idempotency_key: k })).ok).toBe(true);
+      const pid = paymentId(k);
+      expect(claimField(k, `status || '|' || consumed_payment_id`)).toBe(`consumed|${pid}`);
+      // O pagamento é estornado depois: a reserva continua consumida e não reserva nada.
+      sql(`UPDATE payments SET status = 'REFUNDED' WHERE id = '${pid}';`);
+      expect(bal(order)).toBe(10000);
+      expect(claimField(k, 'status')).toBe('consumed');
+      expect(reservation(order)).toMatchObject({ reserved_cents: 0, claims_cents: 0, claims: [] });
+      // Os R$ 100,00 inteiros cabem de novo numa reserva nova (liberada logo em seguida).
+      const full = key('full');
+      expect(cash(full, order, 10000).ok).toBe(true);
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${full}', '${STAFF}', ${tok(full)}, 'só conferindo')`).ok).toBe(true);
+      // Liberar a reserva consumida: TF007, sem registro (aparelho de quem pediu e gerente).
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'desistiu')`)).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      expect(asDevice(`SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'reserva presa do aparelho')`)).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+      // Nem o dono do banco reabre ou mexe na consumida.
+      const upd = (set: string) => psql(target!, `UPDATE payment_claims SET ${set} WHERE idempotency_key = '${k}';`, DB);
+      for (const set of [`status = 'open', consumed_payment_id = NULL, consumed_at = NULL`, `consumed_at = NOW()`,
+        `status = 'released', consumed_payment_id = NULL, consumed_at = NULL, released_at = NOW(), released_by = '${STAFF}', release_reason = 'x', release_audit_id = (SELECT id FROM audit_logs LIMIT 1)`]) {
+        const x = upd(set);
+        expect(x, set).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        expect(x.message, set).toContain('já virou pagamento e não muda mais');
+      }
+      // Consumir à mão, com um pagamento que não é o dela: recusado. Nascer consumida: recusado.
+      const k2 = key('fin2');
+      rawClaim(k2, order, 'CASH', 'CASH_DESK', 100);
+      expect(psql(target!, `UPDATE payment_claims SET status = 'consumed', consumed_payment_id = '${pid}', consumed_at = NOW() WHERE idempotency_key = '${k2}';`, DB).message)
+        .toContain('só é consumida pelo pagamento aprovado dela');
+      const born = psql(target!, `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by, status, consumed_payment_id, consumed_at)
+                                  VALUES ('${TENANT}', '${key('born')}', '${order}', 'CASH', 'CASH_DESK', 100, '${STAFF}', 'consumed', '${pid}', NOW());`, DB);
+      expect(born).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      // O próprio pagamento estornado volta a aprovado (correção): a reserva consumida por ele ainda o cobre, até o valor dela.
+      expect(psql(target!, `UPDATE payments SET status = 'APPROVED', amount = 30.01 WHERE id = '${pid}';`, DB)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      const back = psql(target!, `UPDATE payments SET status = 'APPROVED' WHERE id = '${pid}';`, DB);
+      expect(back.ok, back.message ?? '').toBe(true);
+      expect(claimField(k, `status || '|' || consumed_payment_id`)).toBe(`consumed|${pid}`);
+      expect(bal(order)).toBe(7000);
+    });
+
+    it('aparelho com a lista velha e aparelho com reserva na mesma conta, ao mesmo tempo, nas duas ordens: o sem reserva nunca entra', async () => {
+      for (const staleFirst of [true, false]) {
+        const order = withItems(100);
+        const stale = deviceQ(registerQ(payment(order, 10)));
+        const claimed = deviceQ(payQ(payment(order, 60), 10000));
+        const out = await contend(lockOrder(order), staleFirst ? [stale, claimed] : [claimed, stale]);
+        expect(lastOverlap).toBe(2);
+        const [s0, s1] = staleFirst ? out : [out[1], out[0]];
+        expect(s0, `lista velha ${staleFirst ? 'primeiro' : 'depois'}`).toMatch(/^recusado TF010: .*precisa da reserva no servidor/);
+        expect(s1).toBe('ok');
+        expect(sql(`SELECT count(*) || '|' || COALESCE(sum(amount), 0) FROM payments WHERE order_id = '${order}'`)).toBe('1|60.00');
+        expect(sql(`SELECT remaining_balance || '|' || status FROM orders WHERE id = '${order}'`)).toBe('40.00|OPEN');
+      }
+    }, 60_000);
+
+    it('pagamento consumindo a reserva e liberação pelo gerente ao mesmo tempo, nas duas ordens: nunca os dois', async () => {
+      for (const payFirst of [true, false]) {
+        const order = withItems(100);
+        const k = key('race');
+        expect(claim(k, order, 'CASH', 'CASH_DESK', 5000, undefined, STAFF_B).ok).toBe(true);
+        idle(k); // aparelho que pediu sumido: o gerente pode liberar
+        const payment50 = deviceQ(registerQ(payment(order, 50, { idempotency_key: k })));
+        const release = deviceQ(`SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'reserva presa do aparelho')`);
+        const [a, b] = await contend(lockOrder(order), payFirst ? [payment50, release] : [release, payment50]);
+        expect(lastOverlap).toBe(2);
+        const [p, r] = payFirst ? [a, b] : [b, a];
+        if (payFirst) {
+          expect(p).toBe('ok');
+          expect(r).toMatch(/^recusado TF007: /);
+          expect(claimField(k, 'status')).toBe('consumed');
+          expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+          expect(bal(order)).toBe(5000);
+        } else {
+          expect(r).toBe('ok');
+          expect(p).toMatch(/^recusado TF013: /);
+          expect(claimField(k, 'status')).toBe('released');
+          expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(1);
+          expect(bal(order)).toBe(10000);
+        }
+      }
+    }, 60_000);
+  });
+
+  describe('auditoria r6: reserva em qualquer loja da nuvem e prazo de atividade', () => {
+    const lockOrder = (order: string) => `SELECT 1 FROM orders WHERE id = '${order}' FOR UPDATE`;
+    const touchQ = (k: string, staff = STAFF, token = tok(k)) => `SELECT tchefood_touch_payment_claim('${k}', '${staff}', ${token})`;
+    const touch = (k: string, staff = STAFF, tenant = TENANT, token = tok(k)) => asDevice(touchQ(k, staff, token), tenant);
+    const managerQ = (k: string) => `SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'aparelho do caixa sumiu')`;
+    const activeUntil = (k: string) => Date.parse(claimField(k, `to_jsonb(active_until) #>> '{}'`));
+    const dbNow = () => Date.parse(sql(`SELECT to_jsonb(clock_timestamp()) #>> '{}'`));
+
+    it('P0-01: loja sem Point também reserva; o pagamento com a reserva a consome; sem reserva é recusado (r7, TF010); a reserva soma no saldo livre', () => {
+      const order = withItems(100, OTHER, OTHER_TABLE, OTHER_STAFF);
+      const other = (amount: number, over: Record<string, unknown> = {}) => payment(order, amount, { tenant_id: OTHER, waiter_id: OTHER_STAFF, ...over });
+      const k = key('np');
+      const c = json(claim(k, order, 'CASH', 'CASH_DESK', 6000, undefined, OTHER_STAFF, OTHER));
+      expect(c).toMatchObject({ idempotency_key: k, status: 'open', amount_cents: 6000 });
+      expect(reservation(order, OTHER)).toMatchObject({ reserved_cents: 6000, claims_cents: 6000, point_cents: 0 });
+      // A reserva soma: outra reserva não passa do livre.
+      expect(claim(key('np'), order, 'CASH', 'CASH_DESK', 4001, undefined, OTHER_STAFF, OTHER)).toMatchObject({ ok: false, sqlstate: 'TF003' });
+      // A forma reservada vale também aqui; acima do reservado, também recusado.
+      expect(register(stonePayment(order, 10, { tenant_id: OTHER, waiter_id: OTHER_STAFF, idempotency_key: k, terminal_id: null }), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      expect(register(other(60.01, { idempotency_key: k }), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      const own = register(other(60, { idempotency_key: k }), OTHER);
+      expect(own.ok, own.message ?? '').toBe(true);
+      expect(claimField(k, 'status')).toBe('consumed');
+      expect(reservation(order, OTHER)).toMatchObject({ reserved_cents: 0, claims_cents: 0, claims: [] });
+      // Sem reserva, a loja sem Point também é recusada (auditoria r7 P1-01: TF010 em toda loja).
+      expect(register(other(10), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      const paid = pay(other(10), OTHER);
+      expect(paid.ok, paid.message ?? '').toBe(true);
+      // Reserva liberada: o pagamento com a chave dela é recusado também na loja sem Point (segunda revisão, item 1: TF013).
+      const rk = key('np');
+      expect(claim(rk, order, 'CASH', 'CASH_DESK', 1000, undefined, OTHER_STAFF, OTHER).ok).toBe(true);
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${rk}', '${OTHER_STAFF}', ${tok(rk)}, 'desistiu')`, OTHER).ok).toBe(true);
+      expect(register(other(10, { idempotency_key: rk }), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF013' });
+      expect(claimField(rk, 'status')).toBe('released');
+      expect(bal(order)).toBe(3000);
+    });
+
+    it('falsificação (aceite do GPT): operador B, ativo na mesma loja, manda o UUID de A sem o segredo, ou com segredo errado: recusado, reserva aberta, sem registro', () => {
+      const order = withItems(100);
+      const k = key('spoof');
+      // A (STAFF) pede a reserva; B (STAFF_B) lê a lista da conta (chave e created_by de A estão nela).
+      expect(cash(k, order, 3000).ok).toBe(true);
+      const seen = reservation(order).claims.find((c) => c.idempotency_key === k)!;
+      expect(seen.created_by).toBe(STAFF);
+      expect(Object.keys(seen)).not.toContain('release_token_hash');
+      const other = key('spoof2');
+      expect(cash(other, order, 1000).ok).toBe(true);
+      for (const [label, t] of [['sem segredo', 'NULL'], ['vazio', `''`], ['segredo inventado', `'${'a'.repeat(64)}'`], ['segredo de outra reserva', tok(other)],
+        ['sha256 em vez do segredo', `'${claimField(k, `encode(release_token_hash, 'hex')`)}'`]] as const) {
+        for (const staff of [seen.created_by, STAFF_B]) {
+          const r = asDevice(`SELECT tchefood_release_payment_claim('${k}', '${staff}', ${t}, 'liberando a reserva do outro')`);
+          expect(r, `${label} / ${staff}`).toMatchObject({ ok: false, sqlstate: 'TF004' });
+        }
+      }
+      expect(claimField(k, 'status')).toBe('open');
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+      expect(reservation(order).claims_cents).toBe(4000);
+      // O aparelho não lê o sha256 (nem com select *), nem pela leitura da conta.
+      expect(asDevice(`SELECT release_token_hash FROM payment_claims WHERE idempotency_key = '${k}'`)).toMatchObject({ ok: false, sqlstate: '42501' });
+      expect(asDevice(`SELECT * FROM payment_claims WHERE idempotency_key = '${k}'`)).toMatchObject({ ok: false, sqlstate: '42501' });
+      expect(asDevice(`SELECT count(*) FROM payment_claims WHERE idempotency_key = '${k}'`).out).toContain('1');
+      expect(asDevice(`SELECT tchefood_point_reservation('${order}')::text`).out).not.toContain(claimField(k, `encode(release_token_hash, 'hex')`));
+      // O segredo não muda (nem pelo dono do banco).
+      expect(psql(target!, `UPDATE payment_claims SET release_token_hash = sha256('x'::bytea) WHERE idempotency_key = '${k}';`, DB).message).toContain('não mudam');
+      // Com o segredo certo, B (o operador que está no aparelho de A agora) libera; o registro diz como e de quem era.
+      const ok = json<{ status: string; release_audit_id: string }>(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF_B}', ${tok(k)}, 'maquininha recusou')`));
+      expect(ok.status).toBe('released');
+      expect(sql(`SELECT performed_by_user_id || '|' || (metadata->>'released_via') || '|' || (metadata->>'claim_creator') || '|' || (metadata->>'by_manager') FROM audit_logs WHERE id = '${ok.release_audit_id}'`))
+        .toBe(`${STAFF_B}|release_token|${STAFF}|false`);
+      // A reserva gravada sem segredo (fora de tchefood_claim_payment) só sai pelo gerente.
+      const raw = key('raw');
+      rawClaim(raw, order, 'CASH', 'CASH_DESK', 100);
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${raw}', '${STAFF}', NULL, 'desistiu')`)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      // A assinatura antiga (sem o segredo) não existe mais.
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${raw}', '${STAFF}', 'desistiu')`)).toMatchObject({ ok: false, sqlstate: '42883' });
+    });
+
+    it('P0-02: o prazo nasce no relógio do banco (nunca o da linha) e só a renovação o muda; o dono do banco não muda à mão', () => {
+      const order = withItems(100);
+      const k = key('lease');
+      const before = dbNow();
+      expect(cash(k, order, 1000).ok).toBe(true);
+      const au = activeUntil(k);
+      expect(au - before).toBeGreaterThanOrEqual(89_000);
+      expect(au - before).toBeLessThan(95_000);
+      // Gravada direto com prazo forjado: o gatilho troca pelo do banco.
+      const fk = key('forged');
+      sql(`INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by, active_until)
+           VALUES ('${TENANT}', '${fk}', '${order}', 'CASH', 'CASH_DESK', 100, '${STAFF}', NOW() + INTERVAL '10 days');`);
+      expect(activeUntil(fk) - dbNow()).toBeLessThan(95_000);
+      // UPDATE direto do prazo: recusado (para frente, para trás, e com a marca de outra reserva).
+      const otherId = claimField(fk, 'id');
+      for (const q of [`UPDATE payment_claims SET active_until = active_until + INTERVAL '1 hour' WHERE idempotency_key = '${k}'`,
+        `UPDATE payment_claims SET active_until = NOW() - INTERVAL '1 hour' WHERE idempotency_key = '${k}'`,
+        `BEGIN; SELECT set_config('tchefood.claim_touch', '${otherId}', true); UPDATE payment_claims SET active_until = active_until + INTERVAL '1 hour' WHERE idempotency_key = '${k}'; COMMIT`]) {
+        const r = psql(target!, `${q};`, DB);
+        expect(r.ok, q).toBe(false);
+        expect(r.message, q).toContain('só é renovado pelo aparelho que a pediu');
+      }
+      expect(activeUntil(k)).toBe(au);
+    });
+
+    it('P0-02: tchefood_touch_payment_claim renova só com o segredo da reserva; liberada ou consumida devolve o estado sem mudar nada', () => {
+      const order = withItems(100);
+      const k = key('touch');
+      expect(cash(k, order, 2000).ok).toBe(true);
+      idle(k, '30 seconds');
+      const stale = activeUntil(k);
+      const r = json<{ status: string; active_until: string }>(touch(k));
+      expect(Object.keys(r).sort()).toEqual(['active_until', 'status']);
+      expect(r.status).toBe('open');
+      expect(Date.parse(r.active_until)).toBe(activeUntil(k));
+      expect(activeUntil(k) - dbNow()).toBeGreaterThan(85_000);
+      expect(activeUntil(k)).toBeGreaterThan(stale);
+      // Falsificação: B com o UUID de A (ou o próprio), sem o segredo ou com outro: TF004 e o prazo não muda.
+      const other = key('touch2');
+      expect(cash(other, order, 1000).ok).toBe(true);
+      idle(k, '30 seconds');
+      const held = activeUntil(k);
+      for (const [label, t] of [['sem segredo', 'NULL'], ['segredo inventado', `'${'b'.repeat(64)}'`], ['segredo de outra reserva', tok(other)]] as const) {
+        for (const staff of [STAFF, STAFF_B]) {
+          const x = touch(k, staff, TENANT, t);
+          expect(x, `${label} / ${staff}`).toMatchObject({ ok: false, sqlstate: 'TF004' });
+          expect(x.message, label).toContain('só o aparelho que pediu a reserva renova o prazo dela');
+        }
+      }
+      expect(activeUntil(k)).toBe(held);
+      // Com o segredo, renova (qualquer operador ativo no aparelho que o tem).
+      expect(json(touch(k, STAFF_B)).status).toBe('open');
+      expect(activeUntil(k)).toBeGreaterThan(held);
+      // Operador inativo (TF004), outra loja (TF005), chave que não existe (TF005), anon (42501), assinatura antiga (42883).
+      expect(touch(k, INACTIVE)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(touch(k, OTHER_STAFF, OTHER)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(asDevice(`SELECT tchefood_touch_payment_claim('${k}', '${STAFF}')`)).toMatchObject({ ok: false, sqlstate: '42883' });
+      // A reserva gravada sem segredo não é renovada pelo aparelho.
+      const raw = key('touchraw');
+      rawClaim(raw, order, 'CASH', 'CASH_DESK', 100);
+      expect(touch(raw)).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(touch('nao-existe')).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(asRole('anon', touchQ(k))).toMatchObject({ ok: false, sqlstate: '42501' });
+      // Liberada: devolve o estado, sem renovar.
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'cliente desistiu')`).ok).toBe(true);
+      const frozen = activeUntil(k);
+      expect(json(touch(k))).toEqual({ status: 'released', active_until: claimField(k, `to_jsonb(active_until) #>> '{}'`) });
+      expect(activeUntil(k)).toBe(frozen);
+      // O estado só é contado a quem tem o segredo.
+      expect(touch(k, STAFF, TENANT, 'NULL')).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      // Consumida: idem.
+      const pk = key('touchpaid');
+      expect(cash(pk, order, 1000).ok).toBe(true);
+      expect(register(payment(order, 10, { idempotency_key: pk })).ok).toBe(true);
+      const paid = activeUntil(pk);
+      expect(json(touch(pk)).status).toBe('consumed');
+      expect(activeUntil(pk)).toBe(paid);
+    });
+
+    it('P0-02: o gerente não libera a reserva em andamento (TF011, sem gastar PIN, com a hora em que fica liberável); depois do prazo + 5 min libera; quem pediu libera a qualquer hora', () => {
+      const order = withItems(100);
+      const k = key('act');
+      expect(claim(k, order, 'CASH', 'CASH_DESK', 3000, undefined, STAFF_B).ok).toBe(true);
+      const failuresBefore = Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'`));
+      const check = (pin = MANAGER_PIN) => asDevice(`SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${pin}', 'aparelho do caixa sumiu')`);
+      for (const [label, ago] of [['recém-pedida', null], ['prazo vencido há 4 min', '4 minutes'], ['quase liberável', '4 minutes 55 seconds']] as const) {
+        if (ago) idle(k, ago);
+        for (const pin of [MANAGER_PIN, '0000']) {
+          const r = check(pin);
+          expect(r, label).toMatchObject({ ok: false, sqlstate: 'TF011' });
+          expect(r.message, label).toMatch(new RegExp(`a reserva ${k} ainda está em andamento no aparelho que a pediu; o gerente pode liberá-la a partir de \\d{2}:\\d{2}:\\d{2} \\(horário de Brasília\\)`));
+        }
+      }
+      // A hora da mensagem é active_until + 5 min, no horário de Brasília; o DETAIL traz o instante exato.
+      const expected = sql(`SELECT to_char((active_until + INTERVAL '5 minutes') AT TIME ZONE 'America/Sao_Paulo', 'HH24:MI:SS') FROM payment_claims WHERE idempotency_key = '${k}'`);
+      expect(check().message).toContain(`a partir de ${expected}`);
+      const detail = asDevice(`CREATE FUNCTION pg_temp.d() RETURNS text LANGUAGE plpgsql AS $f$ DECLARE v text; BEGIN PERFORM tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'aparelho do caixa sumiu'); RETURN 'passou'; EXCEPTION WHEN others THEN GET STACKED DIAGNOSTICS v = PG_EXCEPTION_DETAIL; RETURN SQLSTATE || '|' || v; END $f$; SELECT pg_temp.d()`);
+      const [code, d] = last(detail).split('|');
+      expect(code).toBe('TF011');
+      expect(Date.parse(d.replace('releasable_at=', ''))).toBe(Date.parse(reservation(order).claims[0].releasable_at));
+      // Nenhuma recusa gastou tentativa de PIN nem gravou registro.
+      expect(Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'`))).toBe(failuresBefore);
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+      expect(claimField(k, 'status')).toBe('open');
+      // Prazo + 5 min passados: o gerente libera.
+      idle(k, '5 minutes 1 second');
+      const released = json(check());
+      expect(released).toMatchObject({ status: 'released', idempotency_key: k });
+      // Quem pediu libera a qualquer hora (reserva recém-pedida, em andamento).
+      const own = key('own');
+      expect(cash(own, order, 1000).ok).toBe(true);
+      expect(json(asDevice(`SELECT tchefood_release_payment_claim('${own}', '${STAFF}', ${tok(own)}, 'maquininha recusou')`)).status).toBe('released');
+      // A renovação depois do abandono traz a reserva de volta para "em andamento".
+      const back = key('back');
+      expect(cash(back, order, 1000).ok).toBe(true);
+      idle(back);
+      expect(json(touch(back)).status).toBe('open');
+      expect(asDevice(managerQ(back))).toMatchObject({ ok: false, sqlstate: 'TF011' });
+    });
+
+    it('P0-02: renovação e liberação pelo gerente ao mesmo tempo (reserva abandonada), nas duas ordens: renovada na frente = gerente recusado; gerente na frente = a renovação só fica sabendo', async () => {
+      for (const touchFirst of [true, false]) {
+        const order = withItems(100);
+        const k = key('rt');
+        expect(cash(k, order, 2000).ok).toBe(true);
+        idle(k);
+        const t = deviceQ(touchQ(k));
+        const m = deviceQ(managerQ(k));
+        const out = await contend(lockOrder(order), touchFirst ? [t, m] : [m, t]);
+        expect(lastOverlap).toBe(2);
+        const [tr, mr] = touchFirst ? out : [out[1], out[0]];
+        expect(tr).toBe('ok');
+        if (touchFirst) {
+          expect(mr).toMatch(/^recusado TF011: /);
+          expect(claimField(k, 'status')).toBe('open');
+          expect(activeUntil(k) - dbNow()).toBeGreaterThan(80_000);
+          expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+        } else {
+          expect(mr).toBe('ok');
+          expect(claimField(k, 'status')).toBe('released');
+          expect(json(touch(k)).status).toBe('released');
+          expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(1);
+        }
+      }
+    }, 60_000);
+
+    it('P0-02: liberação pelo gerente e pagamento da reserva em andamento ao mesmo tempo, nas duas ordens: o gerente nunca passa e o pagamento entra', async () => {
+      for (const managerFirst of [true, false]) {
+        const order = withItems(100);
+        const k = key('rp');
+        expect(cash(k, order, 4000).ok).toBe(true);
+        const m = deviceQ(managerQ(k));
+        const pq = deviceQ(registerQ(payment(order, 40, { idempotency_key: k })));
+        const out = await contend(lockOrder(order), managerFirst ? [m, pq] : [pq, m]);
+        expect(lastOverlap).toBe(2);
+        const [mr, pr] = managerFirst ? out : [out[1], out[0]];
+        expect(pr).toBe('ok');
+        expect(mr).toMatch(managerFirst ? /^recusado TF011: / : /^recusado TF007: /);
+        expect(claimField(k, 'status')).toBe('consumed');
+        expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', k)).toBe(0);
+        expect(bal(order)).toBe(6000);
+      }
+    }, 60_000);
+  });
+
+  describe('revisão do banco: trava do PIN antes das linhas, relógio da janela e saldo abaixo do reservado', () => {
+    const pinLock = `SELECT pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || '${TENANT}'))`;
+    const releaseManagerQ = (k: string) => `SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', 'aparelho sumiu, liberando')`;
+    const cancelQ = (k: string) => `SELECT tchefood_authorize_point_cancel('${TENANT}', '${k}', '${STAFF}', '${MANAGER_PIN}', 'cliente desistiu')`;
+    const reconcileAuthQ = (k: string) => `SELECT tchefood_authorize_point_reconcile('${TENANT}', '${k}', '${STAFF}', '${MANAGER_PIN}', 'conferido no app do Mercado Pago')`;
+
+    it('F1: PIN na mão de outra sessão; liberação pelo gerente e encerramento da Point na MESMA conta: sem deadlock (40P01)', async () => {
+      for (const second of ['cancel', 'reconcile'] as const) {
+        const order = withItems(100);
+        const ck = key('dl-claim');
+        rawClaim(ck, order, 'CASH', 'CASH_DESK', 2000);
+        idle(ck);
+        const ch = charge(order, second === 'cancel' ? 'pending' : 'manual_review', 3000);
+        // A autorização da Point entra primeiro na fila do PIN; antes da correção, a liberação já tinha a conta
+        // travada e a Point, com o PIN, esperava a conta para gravar o registro: 40P01.
+        const [pointOut, releaseOut] = await contend(pinLock, [ownerQ(second === 'cancel' ? cancelQ(ch.key) : reconcileAuthQ(ch.key)), deviceQ(releaseManagerQ(ck))]);
+        expect(lastOverlap, second).toBe(2);
+        expect(pointOut, second).toBe('ok');
+        expect(releaseOut, second).toBe('ok');
+        expect(claimField(ck, 'status'), second).toBe('released');
+        if (second === 'cancel') expect(chargeField(ch.id, 'cancel_reason')).toBe('operator');
+      }
+    }, 60_000);
+
+    it('F1: a trava do PIN vem antes da trava da conta (liberação pelo gerente espera o PIN sem travar a conta)', async () => {
+      const order = withItems(100);
+      const ck = key('dl-order');
+      rawClaim(ck, order, 'CASH', 'CASH_DESK', 2000);
+      idle(ck);
+      const holder = session();
+      holder.send(`BEGIN; ${pinLock}; SELECT 'held';`);
+      await until('PIN travado', () => holder.output().includes('held'));
+      const s1 = session();
+      s1.end(deviceQ(releaseManagerQ(ck)));
+      await until('liberação esperando o PIN', () => waiting() >= 1);
+      // A conta não ficou travada pela liberação parada no PIN.
+      expect(sql(`SELECT count(*) FROM (SELECT 1 FROM orders WHERE id = '${order}' FOR UPDATE NOWAIT) x`)).toBe('1');
+      holder.end('COMMIT;');
+      await holder.done;
+      expect((await s1.done).split('\n').pop()).toBe('ok');
+    }, 30_000);
+
+    // Três falhas de 59,5 s atrás (pelo início da transação) e 1 s de espera: pelo relógio de agora elas já saíram
+    // da janela de 60 s (NOW() ainda as contaria e bloquearia). Tudo desfeito no fim (ROLLBACK).
+    const windowCheck = (call: string, device: boolean) => {
+      const out = sql(`BEGIN;
+        INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata, created_at)
+          SELECT '${TENANT}', '${STAFF}', 'MANAGER_PIN_FAILED', 'teste da janela', '{}'::jsonb, now() - INTERVAL '59.5 seconds' FROM generate_series(1, 3);
+        SELECT pg_sleep(1);
+        ${device ? `SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);` : ''}
+        SELECT COALESCE((${call})::text, 'null');
+        RESET ROLE;
+        SELECT string_agg(action_type || '|' || (created_at > now() + INTERVAL '0.9 seconds')::text, ',' ORDER BY created_at)
+          FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type IN ('MANAGER_PIN_FAILED', 'MANAGER_PIN_LOCKOUT') AND created_at > now() - INTERVAL '1 second';
+        ROLLBACK;`).split('\n').filter((l) => l !== '' && l !== 'SET');
+      return out.slice(-2);
+    };
+
+    it('F3: janela de 60 s pelo relógio de agora e falha gravada com esse horário, nas três funções com PIN', () => {
+      const order = withItems(100);
+      const ck = key('win');
+      rawClaim(ck, order, 'CASH', 'CASH_DESK', 1000);
+      idle(ck);
+      const pending = charge(order, 'pending', 1000);
+      const review = charge(order, 'manual_review', 1000);
+      for (const [label, call, device] of [
+        ['liberação pelo gerente', releaseManagerQ(ck).replace(MANAGER_PIN, '0000').replace(/^SELECT /, ''), true],
+        ['encerramento da Point', cancelQ(pending.key).replace(MANAGER_PIN, '0000').replace(/^SELECT /, ''), false],
+        ['conferência da Point', reconcileAuthQ(review.key).replace(MANAGER_PIN, '0000').replace(/^SELECT /, ''), false],
+      ] as const) {
+        // PIN errado, fora do bloqueio: devolve null e grava UMA falha com o horário de agora (não o do início).
+        expect(windowCheck(call, device), label).toEqual(['null', 'MANAGER_PIN_FAILED|true']);
+      }
+      expect(claimField(ck, 'status')).toBe('open');
+    });
+
+    // Conta de R$ 100,00 + item de R$ 50,00 (R$ 150,00), para o cancelamento do item reduzir o total.
+    const withExtraItem = () => {
+      const order = withItems(100);
+      const item = sql(`BEGIN; SET LOCAL session_replication_role = replica;
+        INSERT INTO order_items (order_id, product_id, waiter_id, quantity, unit_price, total_item_price, sector)
+        VALUES ('${order}', gen_random_uuid(), '${STAFF}', 1, 50, 50, 'NONE') RETURNING id;
+        UPDATE orders SET subtotal_items = 150, total_amount = 150, remaining_balance = 150 WHERE id = '${order}';
+        COMMIT;`).split('\n').find((l) => /^[0-9a-f-]{36}$/.test(l))!;
+      expect(bal(order)).toBe(15000);
+      return { order, item };
+    };
+    const cancelItem = (order: string, item: string) => psql(target!, `BEGIN;
+      UPDATE order_items SET status = 'CANCELED', cancel_reason = 'cliente desistiu', canceled_by_user_id = '${STAFF}', canceled_at = now() WHERE id = '${item}';
+      INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, reason, metadata)
+      VALUES ('${TENANT}', '${order}', '${STAFF}', '${MANAGER}', 'ITEM_CANCELED', 'cliente desistiu', jsonb_build_object('item_id', '${item}'));
+      COMMIT;`, DB);
+
+    it('F2 (reproduzido): item cancelado com dinheiro reservado e Point aprovada sem pagamento: TF012, nada muda', () => {
+      const { order, item } = withExtraItem();
+      // R$ 60,00 em dinheiro reservado + R$ 50,00 da Point aprovada (sem pagamento ainda) = R$ 110,00 reservados.
+      const ck = key('f2-cash');
+      expect(cash(ck, order, 6000, 15000).ok).toBe(true);
+      const ch = charge(order, 'approved', 5000);
+      // Cancelar o item de R$ 50,00 deixaria R$ 100,00 de saldo para R$ 110,00 já recebidos.
+      const r = cancelItem(order, item);
+      expect(r).toMatchObject({ ok: false, sqlstate: 'TF012' });
+      expect(r.message).toContain('há R$ 110.00 reservado em cobrança desta comanda; conclua ou libere antes de reduzir o total');
+      expect(bal(order)).toBe(15000);
+      expect(sql(`SELECT status FROM order_items WHERE id = '${item}'`)).toBe('PENDING');
+      // Os dois pagamentos já recebidos entram (o saldo não caiu abaixo deles).
+      expect(mpPayment(ch.id).ok).toBe(true);
+      expect(pay(payment(order, 60, { idempotency_key: ck })).ok).toBe(true);
+      expect(bal(order)).toBe(4000);
+      // Sem nada reservado, a redução volta a valer como antes.
+      expect(cancelItem(order, item).ok).toBe(true);
+      expect(bal(order)).toBe(0);
+    });
+
+    it('F2: desconto e 10% retirado também não passam do reservado; redução que cabe passa', () => {
+      const order = withItems(100);
+      const ck = key('f2-disc');
+      expect(cash(ck, order, 8000).ok).toBe(true);
+      // Desconto (recálculo pelo gatilho de flags): R$ 30,00 deixaria R$ 70,00 para R$ 80,00 reservados.
+      const disc = (v: number) => psql(target!, `BEGIN; SET LOCAL session_replication_role = origin;
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, reason, metadata)
+        VALUES ('${TENANT}', '${order}', '${STAFF}', '${MANAGER}', 'DISCOUNT_APPLIED', 'desconto teste', jsonb_build_object('discount_before', 0, 'discount_after', ${v}));
+        UPDATE orders SET discount_amount = ${v} WHERE id = '${order}'; COMMIT;`, DB);
+      const refused = disc(30);
+      expect(refused, refused.message ?? undefined).toMatchObject({ ok: false, sqlstate: 'TF012' });
+      expect(bal(order)).toBe(10000);
+      const fits = disc(20);
+      expect(fits, fits.message ?? undefined).toMatchObject({ ok: true });
+      expect(bal(order)).toBe(8000);
+      // Liberada a reserva, nada mais segura o total.
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${ck}', '${STAFF}', ${tok(ck)}, 'desistiu')`).ok).toBe(true);
+    });
+  });
+
+  describe('segunda revisão independente: reserva liberada, troca de reserva e soma da Point', () => {
+    const OTHER_MANAGER = 'c4c4c4c4-c4c4-4c4c-8c4c-c4c4c4c4c4c4';
+    const OTHER_PIN = '7531';
+
+    it('item 1 (reproduzido): loja sem Point, reserva liberada pelo gerente, pagamento com a mesma chave: TF013, nada gravado', () => {
+      sql(`INSERT INTO staff_users (id, tenant_id, name, role, pin_code) VALUES ('${OTHER_MANAGER}', '${OTHER}', 'Gerente da outra', 'MANAGER', '${OTHER_PIN}') ON CONFLICT (id) DO NOTHING;`);
+      expect(sql(`SELECT count(*) FROM pos_terminals WHERE tenant_id = '${OTHER}' AND acquirer::text = 'MERCADO_PAGO'`)).toBe('0');
+      const order = withItems(100, OTHER, OTHER_TABLE, OTHER_STAFF);
+      const k = key('i1');
+      expect(claim(k, order, 'CASH', 'CASH_DESK', 4000, undefined, OTHER_STAFF, OTHER).ok).toBe(true);
+      idle(k);
+      const rel = json<{ status: string }>(asDevice(`SELECT tchefood_release_payment_claim_manager('${k}', '${OTHER_STAFF}', '${OTHER_PIN}', 'aparelho sumiu com a reserva')`, OTHER));
+      expect(rel.status).toBe('released');
+      for (const amount of [40, 10]) {
+        const r = register(payment(order, amount, { tenant_id: OTHER, waiter_id: OTHER_STAFF, idempotency_key: k }), OTHER);
+        expect(r, String(amount)).toMatchObject({ ok: false, sqlstate: 'TF013' });
+        expect(r.message).toContain('a reserva deste pagamento foi liberada pelo gerente; o valor não pode entrar: confira e devolva ao cliente');
+      }
+      expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${order}'`)).toBe('0');
+      // Reserva aberta na loja sem Point: conta, forma, credenciadora e valor conferidos como na loja com Point.
+      const ok = key('i1-open');
+      expect(claim(ok, order, 'CASH', 'CASH_DESK', 3000, undefined, OTHER_STAFF, OTHER).ok).toBe(true);
+      const other = withItems(100, OTHER, OTHER_TABLE, OTHER_STAFF);
+      expect(register(payment(other, 30, { tenant_id: OTHER, waiter_id: OTHER_STAFF, idempotency_key: ok }), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      expect(register(payment(order, 30.01, { tenant_id: OTHER, waiter_id: OTHER_STAFF, idempotency_key: ok }), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      expect(register(payment(order, 30, { tenant_id: OTHER, waiter_id: OTHER_STAFF, idempotency_key: ok, method: 'PIX', acquirer: 'STONE', acquirer_cnpj: STONE_CNPJ, nsu: 'PX1' }), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      const paid = register(payment(order, 30, { tenant_id: OTHER, waiter_id: OTHER_STAFF, idempotency_key: ok }), OTHER);
+      expect(paid.ok, paid.message ?? '').toBe(true);
+      expect(claimField(ok, 'status')).toBe('consumed');
+    });
+
+    const reclaimQ = (oldK: string, oldT: string, newK: string, newT: string, method: string, acquirer: string, cents: number, staff = STAFF) =>
+      `SELECT tchefood_reclaim_payment('${oldK}', ${oldT}, '${newK}', ${newT}, '${method}', '${acquirer}', ${cents}, '${staff}')`;
+
+    it('item 2: troca a reserva pela credenciadora da maquininha, numa transação só; o recibo entra com a nova', () => {
+      const order = withItems(100);
+      const oldK = key('rc-old');
+      expect(stoneClaim(oldK, order, 6000).ok).toBe(true);
+      expect(cash(key('rc-other'), order, 3000).ok).toBe(true); // R$ 10,00 livres além da reserva antiga
+      const newK = key('rc-new');
+      const newT = tokenFor(newK);
+      const out = json<{ old: { status: string; release_audit_id: string }; new: { idempotency_key: string; status: string; amount_cents: number } }>(
+        asDevice(reclaimQ(oldK, tok(oldK), newK, `'${newT}'`, 'CREDIT', 'PAGBANK', 6000, STAFF_B)));
+      claimed.add(newK);
+      expect(out.old.status).toBe('released');
+      expect(out.new).toMatchObject({ idempotency_key: newK, status: 'open', amount_cents: 6000 });
+      expect(claimField(newK, `order_id || '|' || method || '|' || acquirer || '|' || created_by`)).toBe(`${order}|CREDIT|PAGBANK|${STAFF_B}`);
+      expect(claimField(newK, `encode(release_token_hash, 'hex') = encode(sha256(convert_to('${newT}', 'UTF8')), 'hex')`)).toBe('t');
+      expect(sql(`SELECT metadata->>'released_via' || '|' || (metadata->>'new_idempotency_key') || '|' || (metadata->>'new_acquirer') FROM audit_logs WHERE id = '${out.old.release_audit_id}'`))
+        .toBe(`reclaim|${newK}|PAGBANK`);
+      expect(reservation(order)).toMatchObject({ claims_cents: 9000 });
+      // Reenvio (resposta perdida): a mesma troca, sem nada novo.
+      expect(json(asDevice(reclaimQ(oldK, tok(oldK), newK, `'${newT}'`, 'CREDIT', 'PAGBANK', 6000, STAFF_B)))).toEqual(out);
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', oldK)).toBe(1);
+      // O recibo da PagBank entra com a chave nova; com a antiga, TF013.
+      expect(register(stonePayment(order, 60, { idempotency_key: oldK })).sqlstate).toBe('TF013');
+      const r = register(stonePayment(order, 60, { idempotency_key: newK, acquirer: 'PAGBANK', terminal_id: null, acquirer_cnpj: '08561701000101' }));
+      expect(r.ok, r.message ?? '').toBe(true);
+      expect(claimField(newK, 'status')).toBe('consumed');
+    });
+
+    it('item 2: segredo errado, antiga não aberta, valor acima do livre, chave nova em uso: nada muda', () => {
+      const order = withItems(100);
+      const oldK = key('rc-x');
+      expect(cash(oldK, order, 5000).ok).toBe(true);
+      const busy = key('rc-busy');
+      expect(cash(busy, order, 3000).ok).toBe(true);
+      const before = sql(`SELECT count(*) FROM payment_claims WHERE order_id = '${order}'`);
+      const fresh = () => key('rc-n');
+      const t = () => `'${newToken()}'`;
+      for (const [label, q, code] of [
+        ['sem segredo', reclaimQ(oldK, 'NULL', fresh(), t(), 'CREDIT', 'STONE', 5000), 'TF004'],
+        ['segredo inventado', reclaimQ(oldK, `'${'d'.repeat(64)}'`, fresh(), t(), 'CREDIT', 'STONE', 5000), 'TF004'],
+        ['segredo de outra reserva', reclaimQ(oldK, tok(busy), fresh(), t(), 'CREDIT', 'STONE', 5000), 'TF004'],
+        ['acima do livre (R$ 70,00 livres sem a antiga)', reclaimQ(oldK, tok(oldK), fresh(), t(), 'CREDIT', 'STONE', 7001), 'TF003'],
+        ['chave nova em uso', reclaimQ(oldK, tok(oldK), busy, t(), 'CREDIT', 'STONE', 5000), 'TF009'],
+        ['chave nova = antiga', reclaimQ(oldK, tok(oldK), oldK, t(), 'CREDIT', 'STONE', 5000), 'TF006'],
+        ['segredo novo inválido', reclaimQ(oldK, tok(oldK), fresh(), `'${'A'.repeat(64)}'`, 'CREDIT', 'STONE', 5000), 'TF006'],
+        ['dinheiro na Stone', reclaimQ(oldK, tok(oldK), fresh(), t(), 'CASH', 'STONE', 5000), 'TF006'],
+        ['operador de fora', reclaimQ(oldK, tok(oldK), fresh(), t(), 'CREDIT', 'STONE', 5000, INACTIVE), 'TF004'],
+        ['antiga não existe', reclaimQ(key('nada'), tok(oldK), fresh(), t(), 'CREDIT', 'STONE', 5000), 'TF005'],
+      ] as const) {
+        expect(asDevice(q), label).toMatchObject({ ok: false, sqlstate: code });
+      }
+      expect(claimField(oldK, 'status')).toBe('open');
+      expect(sql(`SELECT count(*) FROM payment_claims WHERE order_id = '${order}'`)).toBe(before);
+      expect(audits('PAYMENT_CLAIM_RELEASED', 'idempotency_key', oldK)).toBe(0);
+      // Exatamente o livre passa (R$ 70,00 sem a antiga).
+      const ok = fresh();
+      expect(asDevice(reclaimQ(oldK, tok(oldK), ok, t(), 'CREDIT', 'STONE', 7000)).ok).toBe(true);
+      // Antiga já liberada (por outra troca) ou consumida: TF007.
+      expect(asDevice(reclaimQ(oldK, tok(oldK), fresh(), t(), 'CREDIT', 'STONE', 1000))).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      expect(pay(payment(order, 30, { idempotency_key: busy })).ok).toBe(true);
+      expect(asDevice(reclaimQ(busy, tok(busy), fresh(), t(), 'CREDIT', 'STONE', 1000))).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      // Só o aparelho (authenticated/service_role) chama.
+      expect(asRole('anon', reclaimQ(oldK, tok(oldK), fresh(), t(), 'CREDIT', 'STONE', 1000))).toMatchObject({ ok: false, sqlstate: '42501' });
+    });
+
+    it('auditoria r7 P0-01: cobrança aprovada só deixa de reservar com o pagamento APROVADO do Mercado Pago ou com o estorno resolvido', () => {
+      const order = withItems(100);
+      const ch = charge(order, 'approved', 10000);
+      // Cobrança aprovada sem pagamento: os R$ 100 continuam reservados.
+      expect(reservation(order).point_cents).toBe(10000);
+      // DECLINED (ou REFUNDED) do Mercado Pago com a chave da cobrança ainda aprovada: recusado, nada liberado.
+      for (const status of ['DECLINED', 'REFUNDED'] as const) {
+        const r = mpPayment(ch.id, status);
+        expect(r.ok, status).toBe(false);
+        expect(r.message, status).toContain('não confere');
+        expect(reservation(order).point_cents, status).toBe(10000);
+      }
+      // PENDING continua como antes: entra e não libera.
+      const pendingId = crypto.randomUUID();
+      expect(mpPayment(ch.id, 'PENDING', pendingId).ok).toBe(true);
+      expect(reservation(order).point_cents).toBe(10000);
+      expect(Number(sql(`SELECT tchefood_point_reserved_cents('${TENANT}', '${order}', NULL)`))).toBe(10000);
+      // PENDING que vira DECLINED com a cobrança aprovada: recusado também.
+      expect(psql(target!, `UPDATE payments SET status = 'DECLINED' WHERE id = '${pendingId}';`, DB).message).toContain('não confere');
+      sql(`DELETE FROM payments WHERE id = '${pendingId}';`);
+      // Stone ou dinheiro para os mesmos R$ 100: recusado (a reserva não deixa, e sem reserva é TF010).
+      expect(stoneClaim(key('r7s'), order, 10000).ok).toBe(false);
+      expect(cash(key('r7c'), order, 10000).ok).toBe(false);
+      expect(register(stonePayment(order, 100))).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      expect(register(payment(order, 100))).toMatchObject({ ok: false, sqlstate: 'TF010' });
+      expect(reservation(order).point_cents).toBe(10000);
+      // O pagamento APROVADO do Mercado Pago que confere com a cobrança consome a reserva.
+      const approvedId = crypto.randomUUID();
+      expect(mpPayment(ch.id, 'APPROVED', approvedId).ok).toBe(true);
+      expect(reservation(order).point_cents).toBe(0);
+      // E não vira estornado enquanto a cobrança no servidor está aprovada.
+      expect(psql(target!, `UPDATE payments SET status = 'REFUNDED' WHERE id = '${approvedId}';`, DB).message).toContain('não confere');
+      expect(reservation(order).point_cents).toBe(0);
+
+      // Estorno confirmado pela resolução (tchefood_resolve_point_charge) libera a cobrança aprovada sem pagamento.
+      const order2 = withItems(100);
+      const ch2 = charge(order2, 'approved', 10000);
+      expect(reservation(order2).point_cents).toBe(10000);
+      expect(resolve(ch2.id, 'approved', 'refunded', '{"raw_status":"refunded","raw_status_detail":"refunded"}').out).toBe('refunded');
+      expect(reservation(order2).point_cents).toBe(0);
+      expect(reservation(order2).charges).toHaveLength(0);
+      // Com a cobrança estornada, o REFUNDED do Mercado Pago com a chave dela entra; DECLINED não.
+      expect(mpPayment(ch2.id, 'DECLINED').ok).toBe(false);
+      expect(mpPayment(ch2.id, 'REFUNDED').ok).toBe(true);
+      // Cobrança recusada: DECLINED entra, REFUNDED não.
+      const ch3 = charge(order2, 'rejected', 1000);
+      expect(mpPayment(ch3.id, 'REFUNDED').ok).toBe(false);
+      expect(mpPayment(ch3.id, 'DECLINED').ok).toBe(true);
+      // Os R$ 100 liberados pelo estorno voltam a poder ser recebidos por outro meio.
+      expect(stoneClaim(key('r7l'), order2, 10000).ok).toBe(true);
+    });
+  });
+
+  describe('revisão r8: chave do Mercado Pago sem cobrança e pagamento que troca de chave', () => {
+    /** Pagamento do Mercado Pago com uma chave qualquer (sem cobrança), no status pedido. */
+    const mpBare = (order: string, k: string, status: string) =>
+      psql(target!, `INSERT INTO payments (order_id, tenant_id, waiter_id, terminal_id, amount, method, status, acquirer, acquirer_cnpj, terminal_serial, idempotency_key)
+                     VALUES ('${order}', '${TENANT}', '${STAFF}', '${TERMINAL}', 10, 'CREDIT', '${status}', 'MERCADO_PAGO', '10573521000191', '${MP_ID}', '${k}');`, DB);
+
+    it('F1: pagamento do Mercado Pago sem a cobrança da chave é recusado (PENDING e DECLINED); chave com pagamento gravado não vira cobrança (TF009)', () => {
+      const order = withItems(100);
+      const k = key('f1');
+      for (const status of ['PENDING', 'DECLINED', 'REFUNDED'] as const) {
+        const r = mpBare(order, k, status);
+        expect(r.ok, status).toBe(false);
+        expect(r.message, status).toContain('sem a cobrança da Point no servidor');
+      }
+      expect(sql(`SELECT count(*) FROM payments WHERE idempotency_key = '${k}'`)).toBe('0');
+      // A cobrança com a chave ainda livre nasce normalmente e o aprovado dela entra.
+      expect(openPoint(k, order, 1000).ok).toBe(true);
+      // Pagamento gravado antes (de antes desta regra; montado sem os gatilhos): a chave dele não vira cobrança.
+      const used = key('f1u');
+      sql(`BEGIN; SET LOCAL session_replication_role = replica;
+           INSERT INTO payments (order_id, tenant_id, waiter_id, terminal_id, amount, method, status, acquirer, idempotency_key)
+           VALUES ('${order}', '${TENANT}', '${STAFF}', '${TERMINAL}', 10, 'CREDIT', 'DECLINED', 'MERCADO_PAGO', '${used}'); COMMIT;`);
+      const again = openPoint(used, order, 1000);
+      expect(again).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      expect(again.message).toContain('já é de um pagamento gravado');
+      const direct = psql(target!, `INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status)
+                                    VALUES ('${TENANT}', '${used}', '${order}', '${TERMINAL}', 'mercado_pago_point', '${MP_ID}', 'CREDIT', 1000, 'creating');`, DB);
+      expect(direct).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = '${used}'`)).toBe('0');
+    });
+
+    it('F1: has_payment da leitura só conta o APROVADO do Mercado Pago (o PENDING não esconde a conferência)', () => {
+      const order = withItems(100);
+      const ch = charge(order, 'manual_review', 2000);
+      expect(mpPayment(ch.id, 'PENDING').ok).toBe(true);
+      const read = reservation(order);
+      expect(read.point_cents).toBe(2000);
+      expect(read.charges.find((c) => c.idempotency_key === ch.key)).toMatchObject({ status: 'manual_review', has_payment: false });
+    });
+
+    it('F2: pagamento aprovado que consumiu a reserva dele não muda de chave, de conta nem de loja (TF007); a outra reserva aberta continua', () => {
+      const order = withItems(100);
+      const a = key('f2a');
+      expect(pay(payment(order, 30, { idempotency_key: a })).ok).toBe(true);
+      expect(claimField(a, 'status')).toBe('consumed');
+      const b = key('f2b');
+      expect(cash(b, order, 3000).ok).toBe(true);
+      const id = sql(`SELECT id FROM payments WHERE idempotency_key = '${a}'`);
+      for (const set of [`idempotency_key = '${b}'`, `order_id = '${withItems(100)}'`, `tenant_id = '${OTHER}'`]) {
+        const r = psql(target!, `UPDATE payments SET ${set} WHERE id = '${id}';`, DB);
+        expect(r, set).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        expect(r.message, set).toContain('o pagamento gravado não muda de chave, de conta nem de loja');
+      }
+      expect(sql(`SELECT idempotency_key || '|' || order_id FROM payments WHERE id = '${id}'`)).toBe(`${a}|${order}`);
+      expect(claimField(b, 'status')).toBe('open');
+      expect(reservation(order)).toMatchObject({ claims_cents: 3000 });
+      // Outro campo do pagamento continua podendo mudar.
+      expect(psql(target!, `UPDATE payments SET tip_amount = 2 WHERE id = '${id}';`, DB).ok).toBe(true);
+      expect(sql(`SELECT has_function_privilege('authenticated', 'tchefood_payment_identity_guard()', 'EXECUTE')`)).toBe('f');
+    });
+  });
+
+  describe('tchefood_authorize_claim_refunded: estorno da reserva liberada com PIN de gerente', () => {
+    const refundQ = (k: string, pin = MANAGER_PIN, reason = 'estornei na maquininha Stone', meta = `'{"refund_kind":"card","payment_local_id":"pay-local-1"}'::jsonb`, staff = STAFF) =>
+      `SELECT COALESCE(tchefood_authorize_claim_refunded('${k}', '${staff}', '${pin}', '${reason}', ${meta})::text, 'null')`;
+    const released = (order: string) => {
+      const k = key('crr');
+      expect(cash(k, order, 2000).ok).toBe(true);
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, 'desistiu')`).ok).toBe(true);
+      return k;
+    };
+    /** Roda como o aparelho numa transação desfeita no fim (falhas de PIN não sujam a loja para os outros testes). */
+    const inRollback = (pre: string, q: string, post: string) =>
+      sql(`BEGIN; ${pre}
+           SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);
+           ${q}; RESET ROLE; ${post}; ROLLBACK;`).split('\n').filter((l) => l !== '' && l !== 'SET').slice(-2);
+
+    it('PIN certo: grava CLAIM_RELEASED_REFUNDED com o gerente e os dados da reserva; a segunda chamada devolve o mesmo id', () => {
+      const order = withItems(100);
+      const k = released(order);
+      const id = last(asDevice(refundQ(k)));
+      expect(id).toMatch(/^[0-9a-f-]{36}$/);
+      expect(sql(`SELECT order_id || '|' || performed_by_user_id || '|' || authorized_by_manager_id || '|' || reason || '|' || amount_impact FROM audit_logs WHERE id = '${id}'`))
+        .toBe(`${order}|${STAFF}|${MANAGER}|estornei na maquininha Stone|0.00`);
+      const meta = JSON.parse(sql(`SELECT metadata::text FROM audit_logs WHERE id = '${id}'`)) as Record<string, unknown>;
+      expect(meta).toMatchObject({ idempotency_key: k, amount_cents: 2000, method: 'CASH', acquirer: 'CASH_DESK', refund_kind: 'card', payment_local_id: 'pay-local-1',
+        claim_id: claimField(k, 'id'), release_audit_id: claimField(k, 'release_audit_id'), manager_name: 'Gerente', server_verified: true });
+      expect(last(asDevice(refundQ(k, MANAGER_PIN, 'outro motivo qualquer', `'{"refund_kind":"cash"}'::jsonb`)))).toBe(id);
+      expect(audits('CLAIM_RELEASED_REFUNDED', 'idempotency_key', k)).toBe(1);
+      // payment_local_id é opcional.
+      const k2 = released(order);
+      expect(last(asDevice(refundQ(k2, MANAGER_PIN, 'devolvi o dinheiro ao cliente', `'{"refund_kind":"cash"}'::jsonb`)))).toMatch(/^[0-9a-f-]{36}$/);
+    });
+
+    it('reserva não liberada (aberta ou paga), de outra loja ou inexistente; motivo curto, metadata fora da lista, operador de fora: recusado antes do PIN', () => {
+      const order = withItems(100);
+      const open = key('crr-open');
+      expect(cash(open, order, 1000).ok).toBe(true);
+      const paid = key('crr-paid');
+      expect(pay(payment(order, 10, { idempotency_key: paid })).ok).toBe(true);
+      const k = released(order);
+      const failuresBefore = Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'`));
+      for (const [label, q, code] of [
+        ['aberta', refundQ(open), 'TF007'],
+        ['paga', refundQ(paid), 'TF007'],
+        ['inexistente', refundQ(key('nada')), 'TF005'],
+        ['motivo curto', refundQ(k, MANAGER_PIN, 'estornei'), 'TF006'],
+        ['sem refund_kind', refundQ(k, MANAGER_PIN, undefined, `'{}'::jsonb`), 'TF006'],
+        ['metadata nula', refundQ(k, MANAGER_PIN, undefined, 'NULL'), 'TF006'],
+        ['refund_kind inválido', refundQ(k, MANAGER_PIN, undefined, `'{"refund_kind":"pix"}'::jsonb`), 'TF006'],
+        ['chave fora da lista', refundQ(k, MANAGER_PIN, undefined, `'{"refund_kind":"card","server_verified":true}'::jsonb`), 'TF006'],
+        ['payment_local_id número', refundQ(k, MANAGER_PIN, undefined, `'{"refund_kind":"card","payment_local_id":5}'::jsonb`), 'TF006'],
+        ['metadata não objeto', refundQ(k, MANAGER_PIN, undefined, `'[1]'::jsonb`), 'TF006'],
+        ['operador inativo', refundQ(k, MANAGER_PIN, undefined, undefined, INACTIVE), 'TF004'],
+      ] as const) {
+        expect(asDevice(q), label).toMatchObject({ ok: false, sqlstate: code });
+      }
+      // Reserva de outra loja: não encontrada.
+      expect(asDevice(refundQ(k, MANAGER_PIN, undefined, undefined, OTHER_STAFF), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'`))).toBe(failuresBefore);
+      expect(audits('CLAIM_RELEASED_REFUNDED', 'idempotency_key', k)).toBe(0);
+    });
+
+    it('PIN errado: NULL e uma falha gravada com o horário de agora; com 3 falhas em 60 s, bloqueado mesmo com o PIN certo', () => {
+      const order = withItems(100);
+      const k = released(order);
+      const count = `SELECT string_agg(action_type, ',' ORDER BY created_at) FROM audit_logs WHERE tenant_id = '${TENANT}' AND metadata->>'idempotency_key' = '${k}' AND action_type <> 'PAYMENT_CLAIM_RELEASED'`;
+      expect(inRollback('', refundQ(k, '0000'), count)).toEqual(['null', 'MANAGER_PIN_FAILED']);
+      const three = `INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata)
+                     SELECT '${TENANT}', '${STAFF}', 'MANAGER_PIN_FAILED', 'teste do bloqueio', '{}'::jsonb FROM generate_series(1, 3);`;
+      expect(inRollback(three, refundQ(k), count)).toEqual(['null', 'MANAGER_PIN_LOCKOUT']);
+      expect(audits('CLAIM_RELEASED_REFUNDED', 'idempotency_key', k)).toBe(0);
+    });
+
+    it('o aparelho não grava CLAIM_RELEASED_REFUNDED direto (com ou sem gerente); anon não chama a função', () => {
+      const order = withItems(100);
+      const k = released(order);
+      for (const manager of ['NULL', `'${MANAGER}'`]) {
+        const r = asDevice(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, reason, metadata)
+                            VALUES ('${TENANT}', '${order}', '${STAFF}', ${manager}, 'CLAIM_RELEASED_REFUNDED', 'forjado pelo aparelho', jsonb_build_object('idempotency_key', '${k}'))`);
+        expect(r.ok, manager).toBe(false);
+      }
+      expect(audits('CLAIM_RELEASED_REFUNDED', 'idempotency_key', k)).toBe(0);
+      expect(asRole('anon', refundQ(k))).toMatchObject({ ok: false, sqlstate: '42501' });
+      expect(sql(`SELECT has_function_privilege('authenticated', 'tchefood_authorize_claim_refunded(VARCHAR, UUID, VARCHAR, TEXT, JSONB)', 'EXECUTE')`)).toBe('t');
+    });
+  });
+
+  it('as duas migrations rodam de novo sem erro', () => {
+    const dir = join(ROOT, 'supabase', 'migrations');
+    for (const f of readdirSync(dir).filter((x) => x.includes('mercado_pago') || x.includes('point_reserva')).sort()) {
+      expect(() => psqlFile(target!, join(dir, f), DB), f).not.toThrow();
+    }
+    const order = withItems(100);
+    expect(cash(key('mig'), order, 1000).ok).toBe(true);
+    expect(reservation(order).claims_cents).toBe(1000);
+  });
+});

@@ -23,7 +23,7 @@ export type ItemStatus = 'PENDING' | 'PREPARING' | 'READY' | 'DELIVERED' | 'CANC
 export type ProductionSector = 'KITCHEN' | 'BAR' | 'GRILL' | 'DESSERT' | 'NONE';
 export type PaymentMethod = 'CREDIT' | 'DEBIT' | 'PIX' | 'VOUCHER' | 'CASH';
 export type PaymentStatus = 'PENDING' | 'APPROVED' | 'DECLINED' | 'REFUNDED';
-export type AcquirerType = 'STONE' | 'PAGBANK' | 'MOCK' | 'CASH_DESK';
+export type AcquirerType = 'STONE' | 'PAGBANK' | 'MERCADO_PAGO' | 'MOCK' | 'CASH_DESK';
 export type OperationMode = 'SMARTPOS_EMBEDDED' | 'TEF_POS_WIRELESS';
 
 /** Valores aceitos em order_items.origin (VARCHAR(20)). */
@@ -317,6 +317,16 @@ export interface Payment {
   terminal_serial: string | null;
   idempotency_key: string | null;
   created_at: ISODateTime;
+  /**
+   * Só local: pagamento retirado da conta porque não entrou no servidor (reserva liberada antes de chegar,
+   * ou recusado). Fica com status REFUNDED e não sobe (o evento sai da fila).
+   */
+  withdrawn_reason?: string;
+  /**
+   * Só neste aparelho (não sobe): itens que este pagamento quitou na divisão por item. Retirar o pagamento
+   * (withdrawUnacceptedPayment) recalcula o "pago" dos itens pelos pagamentos aprovados que sobram.
+   */
+  paid_item_ids?: UUID[];
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +454,10 @@ export type AuditActionType =
   | 'CASH_WITHDRAWAL'
   | 'CASH_CLOSE_DIFFERENCE'
   // Item com preço diferente do cadastro aceito com PIN de gerente (db/schema_preco_gerente.sql)
-  | 'PRICE_OVERRIDE';
+  | 'PRICE_OVERRIDE'
+  // Reserva liberada pelo gerente com a maquininha aprovada: o caixa estornou na maquininha (só local;
+  // o servidor ainda não aceita este tipo em audit_logs).
+  | 'CLAIM_RELEASED_REFUNDED';
 
 export interface AuditLog {
   id: UUID;
@@ -856,6 +869,11 @@ export interface SyncEvent {
    * Não vai para o banco.
    */
   depends_on_event_ids?: UUID[];
+  /**
+   * Mudança causada pelo registro deste pagamento (itens pagos, comanda fechada, mesa livre). Se o pagamento sair
+   * da conta sem entrar no servidor, essas mudanças saem da fila junto. Não vai para o banco.
+   */
+  caused_by_payment_id?: UUID;
 }
 
 export interface KegChangeSync {
