@@ -186,3 +186,22 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
 - Todas as lojas vão num único `x-polling-merchants`. A doc fala em usar o header a partir de 100 lojas e torná-lo
   obrigatório acima de 500, sem dizer o teto por requisição; com muitas lojas pode ser preciso dividir em lotes.
 - Não foi testado contra o iFood de verdade: depende das credenciais de teste do Portal do Desenvolvedor.
+
+## Guarda para o item 5
+
+- `server/delivery/deliverySaleGuard.ts` diz se um pedido do app pode virar venda, produção (cozinha/KDS) ou NFC-e.
+  `deliverySaleBlockers(registro)` devolve os motivos que impedem (lista vazia = pode): pedido de teste do app,
+  pedido gravado sem o detalhe (`detailPending`), pedido cancelado, cancelamento em análise no app.
+  `needsReview` sozinho não bloqueia (junta avisos de naturezas diferentes; travar por ele pararia pedido bom): sai
+  como aviso em `deliverySaleWarnings(registro)`, para a tela mostrar e pedir conferência. Ainda não está ligada em
+  nada: a tela do item 5 chama a guarda antes de lançar a venda, mandar para a produção ou emitir a nota.
+- `newOrderNotified` não prova que alguém foi avisado: o servidor marca o campo depois de tentar o aviso, e o
+  `main.ts` não passa `onNewOrder` para a caixa de entrada, então hoje ele fica verdadeiro sem aviso nenhum. O
+  alerta/KDS do item 5 não pode depender desse campo para saber se o pedido já tocou na loja.
+- Conferência do Supabase de verdade: depois de aplicar as migrations, cole `db/verificar_delivery_servidor.sql`
+  inteiro no SQL Editor e rode. É só leitura (consultas no catálogo) e volta uma tabela `item | esperado |
+  encontrado | ok` com funções `tchefood_delivery_*` e quem as executa, privilégios de `anon`/`authenticated` nas
+  tabelas `delivery_*`, RLS e policies por loja, `SECURITY DEFINER` com `search_path`, colunas novas, CHECKs e os
+  triggers de `audit_logs`. Linha com `NÃO` sai primeiro: não ligue o servidor antes de corrigir.
+  `ainda não (opcional)` só vale para `detail_pending (rodada 3)`, enquanto essa migration não estiver aplicada.
+  O mesmo script roda num Postgres migrado em `db/tests/verificarDeliveryServidor.pg.test.ts`.
