@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import iconUrl from '../assets/icon.png';
-import { normalizeUrl, signIn, type AdminConfig, type Session } from '../lib/api';
+import { hostOf, normalizeUrl, signIn, type AdminConfig, type Session } from '../lib/api';
 import { browserFetch, saveConfig } from '../lib/session';
 import { Campo, Erro, errorText } from './ui';
 
@@ -67,6 +67,16 @@ export default function Login({ cfg, onLogin }: { cfg: AdminConfig; onLogin: (cf
             Trocar o projeto do Supabase
           </button>
         )}
+        {/* Sempre à vista: quem digita a senha confere para qual servidor ela vai. */}
+        <p className="text-xs text-slate-600" data-testid="host-senha">
+          {hostOf(url) ? (
+            <>
+              A senha vai para <strong className="break-all">{hostOf(url)}</strong>.
+            </>
+          ) : (
+            'Endereço do Supabase não informado.'
+          )}
+        </p>
         <Erro>{erro}</Erro>
         <button type="submit" className="btn-primario w-full" disabled={enviando}>
           {enviando ? 'Entrando…' : 'Entrar'}

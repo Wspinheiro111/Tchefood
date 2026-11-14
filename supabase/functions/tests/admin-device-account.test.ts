@@ -10,27 +10,56 @@ interface Fake {
   deps: DeviceAccountDeps;
   calls: string[];
   users: Map<string, AuthUser & { password?: string }>;
+  db: FakeDb;
 }
 
-function fake(opts: { deviceStatus?: 'PENDING' | 'READY' | null; storeError?: RpcResult['error']; subscription?: boolean; confirmError?: boolean; createError?: string } = {}): Fake {
+/** Estado da assinatura no banco, compartilhável entre duas chamadas ao mesmo tempo. */
+interface FakeDb {
+  deviceStatus: 'PENDING' | 'READY' | null;
+  reservation: { user_id: string; email: string };
+  opId: string | null;
+}
+
+function fake(opts: {
+  deviceStatus?: 'PENDING' | 'READY' | null; storeError?: RpcResult['error']; subscription?: boolean; confirmError?: boolean; createError?: string;
+  db?: FakeDb; users?: Map<string, AuthUser & { password?: string }>; beforeAuthWrite?: () => Promise<void>;
+} = {}): Fake {
   const calls: string[] = [];
-  const users = new Map<string, AuthUser & { password?: string }>();
-  let reservation = { user_id: USER, email: EMAIL, status: 'PENDING' };
+  const users = opts.users ?? new Map<string, AuthUser & { password?: string }>();
+  const db: FakeDb = opts.db ?? { deviceStatus: opts.deviceStatus ?? null, reservation: { user_id: USER, email: EMAIL }, opId: null };
+  let ops = 0;
+  let passwords = 0;
   const deps: DeviceAccountDeps = {
     rpc: async (fn, args) => {
       calls.push(`${fn} ${JSON.stringify(args)}`);
       if (fn === 'tchefood_admin_store') {
         if (opts.storeError) return { data: null, error: opts.storeError };
-        return { data: { cnpj: '11444777000161', subscription: opts.subscription === false ? null : { device_status: opts.deviceStatus ?? null } }, error: null };
+        return { data: { cnpj: '11444777000161', subscription: opts.subscription === false ? null : { device_status: db.deviceStatus } }, error: null };
+      }
+      if (fn === 'tchefood_admin_device_lock') {
+        if (db.opId !== null && db.opId !== args.p_op) return { data: null, error: { message: 'TCHEFOOD_ADMIN: outra operação na conta do aparelho desta loja está em andamento', code: '55P03' } };
+        db.opId = String(args.p_op);
+        return { data: '', error: null };
+      }
+      if (fn === 'tchefood_admin_device_unlock') {
+        if (db.opId === args.p_op) db.opId = null;
+        return { data: '', error: null };
       }
       if (fn === 'tchefood_admin_reserve_device') {
         if (args.p_replace_user_id) {
-          if (args.p_replace_user_id !== reservation.user_id) return { data: null, error: { message: 'TCHEFOOD_ADMIN: a reserva da conta do aparelho mudou' } };
-          reservation = { user_id: USER2, email: String(args.p_email), status: 'PENDING' };
+          if (args.p_replace_user_id !== db.reservation.user_id || db.deviceStatus !== 'PENDING') return { data: null, error: { message: 'TCHEFOOD_ADMIN: a reserva da conta do aparelho mudou' } };
+          db.reservation = { user_id: USER2, email: String(args.p_email) };
         }
-        return { data: reservation, error: null };
+        db.deviceStatus ??= 'PENDING';
+        return { data: { ...db.reservation, status: db.deviceStatus }, error: null };
       }
-      if (fn === 'tchefood_admin_confirm_device') return opts.confirmError ? { data: null, error: { message: 'x' } } : { data: '', error: null };
+      if (fn === 'tchefood_admin_confirm_device') {
+        if (opts.confirmError) return { data: null, error: { message: 'x' } };
+        if (db.opId !== args.p_op) return { data: null, error: { message: 'TCHEFOOD_ADMIN: outra operação assumiu a conta do aparelho', code: '55P03' } };
+        db.deviceStatus = 'READY';
+        db.opId = null;
+        return { data: '', error: null };
+      }
       throw new Error(fn);
     },
     auth: {
@@ -40,21 +69,24 @@ function fake(opts: { deviceStatus?: 'PENDING' | 'READY' | null; storeError?: Rp
         return u ? { user: u, error: null } : { user: null, error: { message: 'User not found', status: 404 } };
       },
       createUser: async (a) => {
+        await opts.beforeAuthWrite?.();
         calls.push(`createUser ${a.id} ${a.email} ${JSON.stringify(a.app_metadata)} ${a.email_confirm}`);
         if (opts.createError) return { error: { message: opts.createError } };
         users.set(a.id, { id: a.id, email: a.email, app_metadata: a.app_metadata, password: a.password });
         return { error: null };
       },
       updateUserById: async (id, a) => {
+        await opts.beforeAuthWrite?.();
         calls.push(`updateUserById ${id} ${JSON.stringify(a.app_metadata)}`);
         const u = users.get(id)!;
         users.set(id, { ...u, app_metadata: a.app_metadata, password: a.password });
         return { error: null };
       },
     },
-    randomPassword: () => 'SenhaForte123456789x',
+    randomPassword: () => (passwords++ === 0 ? 'SenhaForte123456789x' : `SenhaOutra${passwords}`.padEnd(20, 'z')),
+    newOpId: () => `op-${++ops}-${Math.random().toString(36).slice(2)}`,
   };
-  return { deps, calls, users };
+  return { deps, calls, users, db };
 }
 
 describe('admin-device-account', () => {
@@ -64,11 +96,13 @@ describe('admin-device-account', () => {
     expect(r).toEqual({ status: 200, body: { user_id: USER, email: EMAIL, password: 'SenhaForte123456789x' } });
     expect(f.calls).toEqual([
       `tchefood_admin_store {"p_tenant":"${TENANT}"}`,
+      expect.stringMatching(/^tchefood_admin_device_lock /),
       `tchefood_admin_reserve_device {"p_tenant":"${TENANT}","p_email":"${EMAIL}"}`,
       `getUserById ${USER}`,
       `createUser ${USER} ${EMAIL} {"tenant_id":"${TENANT}"} true`,
-      `tchefood_admin_confirm_device {"p_tenant":"${TENANT}","p_user_id":"${USER}","p_action":"CREATED"}`,
+      expect.stringMatching(new RegExp(`^tchefood_admin_confirm_device \\{"p_tenant":"${TENANT}","p_user_id":"${USER}","p_action":"CREATED","p_op":"op-1-`)),
     ]);
+    expect(f.db).toMatchObject({ deviceStatus: 'READY', opId: null });
   });
 
   it('quem não é admin (ou token de loja) não chega no Auth', async () => {
@@ -118,9 +152,12 @@ describe('admin-device-account', () => {
     const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'reset_password' }, f.deps);
     expect(r.status).toBe(200);
     expect(f.calls.at(-1)).toContain('"p_action":"PASSWORD_RESET"');
+    // Conta pronta apagada à mão no Auth: recria com o mesmo id e e-mail da reserva.
     const gone = fake({ deviceStatus: 'READY' });
-    expect((await handleDeviceAccount({ tenant_id: TENANT, action: 'reset_password' }, gone.deps)).status).toBe(409);
-    expect(gone.calls.some((c) => c.startsWith('createUser'))).toBe(false);
+    const rg = await handleDeviceAccount({ tenant_id: TENANT, action: 'reset_password' }, gone.deps);
+    expect(rg.status).toBe(200);
+    expect(gone.calls.some((c) => c.startsWith(`createUser ${USER} ${EMAIL} {"tenant_id":"${TENANT}"}`))).toBe(true);
+    expect(gone.users.get(USER)!.password).toBe(rg.body.password);
   });
 
   it('e-mail já usado no Auth e falha ao confirmar viram mensagens claras', async () => {
@@ -157,5 +194,71 @@ describe('admin-device-account', () => {
     const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'create', email: 'outro@loja.com' }, f.deps);
     expect(r).toMatchObject({ status: 200, body: { user_id: USER, email: EMAIL } });
     expect(f.calls.some((c) => c.includes('p_replace_user_id'))).toBe(false);
+  });
+
+  it('duas trocas de senha ao mesmo tempo: uma só responde com senha, e é a que vale no Auth', async () => {
+    const db: FakeDb = { deviceStatus: 'READY', reservation: { user_id: USER, email: EMAIL }, opId: null };
+    const users = new Map<string, AuthUser & { password?: string }>([[USER, { id: USER, email: EMAIL, app_metadata: { tenant_id: TENANT } }]]);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const a = fake({ db, users, beforeAuthWrite: () => gate });
+    const b = fake({ db, users, beforeAuthWrite: () => gate });
+    b.deps.randomPassword = () => 'SenhaDoSegundoAdmin1';
+    const pa = handleDeviceAccount({ tenant_id: TENANT, action: 'reset_password' }, a.deps);
+    const pb = handleDeviceAccount({ tenant_id: TENANT, action: 'reset_password' }, b.deps);
+    await new Promise((r) => setTimeout(r, 0));
+    release();
+    const results = await Promise.all([pa, pb]);
+    const ok = results.filter((r) => r.status === 200);
+    expect(ok).toHaveLength(1);
+    expect(results.filter((r) => r.status === 409)).toHaveLength(1);
+    expect(users.get(USER)!.password).toBe(ok[0].body.password);
+    expect(db.opId).toBeNull();
+  });
+
+  it('falha no meio devolve a vez: a próxima tentativa não fica travada', async () => {
+    const f = fake({ createError: 'boom' });
+    expect((await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps)).status).toBe(502);
+    expect(f.db.opId).toBeNull();
+    expect(f.calls.at(-1)).toMatch(/^tchefood_admin_device_unlock /);
+  });
+
+  it('outra operação terminou antes da vez: "criar" não troca a senha de conta que ficou pronta', async () => {
+    const f = fake({ deviceStatus: 'PENDING' });
+    f.users.set(USER, { id: USER, email: EMAIL, app_metadata: { tenant_id: TENANT } });
+    const rpc = f.deps.rpc;
+    f.deps.rpc = async (fn, args) => {
+      const r = await rpc(fn, args);
+      if (fn === 'tchefood_admin_store') f.db.deviceStatus = 'READY'; // a outra confirmou entre o passo 1 e a vez
+      return r;
+    };
+    const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps);
+    expect(r.status).toBe(409);
+    expect(f.calls.some((c) => c.startsWith('updateUserById'))).toBe(false);
+    expect(f.db.opId).toBeNull();
+  });
+
+  it('criação anterior que caiu já criou a conta: "e-mail já usado" do Auth não engana, troca a senha da nossa conta', async () => {
+    const f = fake({ deviceStatus: 'PENDING' });
+    let first = true;
+    const get = f.deps.auth.getUserById;
+    f.deps.auth.getUserById = async (id) => {
+      if (first) { first = false; return { user: null, error: { message: 'User not found', status: 404 } }; }
+      return get(id);
+    };
+    f.users.set(USER, { id: USER, email: EMAIL, app_metadata: { tenant_id: TENANT } });
+    f.deps.auth.createUser = async () => ({ error: { message: 'A user with this email address has already been registered' } });
+    const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps);
+    expect(r.status).toBe(200);
+    expect(f.users.get(USER)!.password).toBe(r.body.password);
+  });
+
+  it('token vencido no PostgREST vira 401 e e-mail de outra loja vira 409', async () => {
+    expect((await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, fake({ storeError: { message: 'JWT expired', code: 'PGRST301' } }).deps)).status).toBe(401);
+    const f = fake();
+    const rpc = f.deps.rpc;
+    f.deps.rpc = async (fn, args) => (fn === 'tchefood_admin_reserve_device' ? { data: null, error: { message: 'TCHEFOOD_ADMIN: este e-mail já é de outra loja' } } : rpc(fn, args));
+    expect((await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps)).status).toBe(409);
+    expect(f.db.opId).toBeNull();
   });
 });

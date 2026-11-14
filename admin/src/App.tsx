@@ -17,6 +17,8 @@ export default function App() {
   const [session, setSession] = useState<Session | null>(loadSession);
 
   const client = useMemo(() => (session ? sessionClient(cfg, session, () => setSession(null)) : null), [cfg, session]);
+  // Cliente trocado ou descartado: a renovação que ainda estiver no ar não grava a sessão.
+  useEffect(() => () => client?.dispose(), [client]);
 
   if (!session || !client) {
     return (
@@ -35,7 +37,8 @@ export default function App() {
       client={client}
       email={session.email}
       onLogout={() => {
-        saveSession(null);
+        // Sai no servidor (revoga o refresh token) sem esperar: se falhar, sai da tela mesmo assim.
+        void client.logout();
         setSession(null);
       }}
     />

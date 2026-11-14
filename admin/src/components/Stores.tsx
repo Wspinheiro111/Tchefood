@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Plus } from 'lucide-react';
 import type { AdminClient, StoreRow } from '../lib/api';
-import { dateBr, dateTimeBr, formatCnpj, money, onlyDigits } from '../lib/format';
+import { cnpjMatches, dateBr, dateTimeBr, formatCnpj, money } from '../lib/format';
 import NewStoreForm from './NewStoreForm';
 import { Erro, Selo, useLoad } from './ui';
 
@@ -15,13 +15,12 @@ export default function Stores({ client, today, onOpenStore }: { client: AdminCl
 
   const lista = useMemo(() => {
     const q = busca.trim().toLowerCase();
-    const qd = onlyDigits(q);
     return (data ?? []).filter((r) => {
       if (filtro === 'sem' && r.subscription) return false;
       if (filtro === 'vencidas' && r.overdue_count === 0) return false;
       if (['TRIAL', 'ACTIVE', 'SUSPENDED', 'CANCELLED'].includes(filtro) && r.subscription?.status !== filtro) return false;
       if (!q) return true;
-      return r.name.toLowerCase().includes(q) || r.legal_name.toLowerCase().includes(q) || (qd.length >= 3 && r.cnpj.includes(qd)) || (r.city ?? '').toLowerCase().includes(q);
+      return r.name.toLowerCase().includes(q) || r.legal_name.toLowerCase().includes(q) || cnpjMatches(r.cnpj, busca) || (r.city ?? '').toLowerCase().includes(q);
     });
   }, [data, filtro, busca]);
 

@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS store_subscriptions (
     trial_ends_on DATE,
     contact_name VARCHAR(100) NOT NULL CHECK (length(btrim(contact_name)) >= 2),
     -- Só dígitos, com DDD (e DDI 55 opcional): vira o link do WhatsApp.
-    contact_phone VARCHAR(13) NOT NULL CHECK (contact_phone ~ '^[0-9]{10,13}$'),
+    contact_phone VARCHAR(13) NOT NULL CHECK (contact_phone ~ '^(55)?[1-9][0-9]{9,10}$'),
     contact_email VARCHAR(200),
     notes TEXT,
     -- Conta do Supabase Auth do aparelho (criada pela função admin-device-account).
@@ -66,10 +66,15 @@ CREATE TABLE IF NOT EXISTS store_subscriptions (
     device_user_id UUID UNIQUE,
     device_email VARCHAR(200) UNIQUE,
     device_status VARCHAR(10) CHECK (device_status IN ('PENDING', 'READY')),
+    -- Operação em andamento na conta do aparelho (criar ou trocar senha): uma por vez por
+    -- loja, para duas chamadas ao mesmo tempo não devolverem duas senhas diferentes.
+    device_op_id UUID,
+    device_op_started_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CHECK (status <> 'TRIAL' OR trial_ends_on IS NOT NULL),
-    CHECK ((device_user_id IS NULL) = (device_status IS NULL) AND (device_user_id IS NULL) = (device_email IS NULL))
+    CHECK ((device_user_id IS NULL) = (device_status IS NULL) AND (device_user_id IS NULL) = (device_email IS NULL)),
+    CHECK ((device_op_id IS NULL) = (device_op_started_at IS NULL))
 );
 
 CREATE TABLE IF NOT EXISTS store_charges (
@@ -100,7 +105,10 @@ CREATE TABLE IF NOT EXISTS store_charges (
 -- Uma cobrança por loja e mês (a cancelada não conta: pode ser refeita).
 CREATE UNIQUE INDEX IF NOT EXISTS store_charges_one_per_month ON store_charges (tenant_id, reference_month) WHERE status <> 'CANCELLED';
 -- A mesma referência de pagamento não paga duas cobranças.
-CREATE UNIQUE INDEX IF NOT EXISTS store_charges_payment_reference ON store_charges (payment_method, lower(payment_reference)) WHERE status = 'PAID';
+-- Um comprovante quita uma cobrança só, qualquer que seja a forma registrada (o mesmo E2E
+-- de Pix lançado como TRANSFERENCIA em outra cobrança também é recusado).
+DROP INDEX IF EXISTS store_charges_payment_reference;
+CREATE UNIQUE INDEX IF NOT EXISTS store_charges_payment_reference_once ON store_charges (lower(payment_reference)) WHERE status = 'PAID';
 CREATE INDEX IF NOT EXISTS store_charges_open_due ON store_charges (due_date) WHERE status = 'OPEN';
 
 CREATE TABLE IF NOT EXISTS platform_admin_audit (
@@ -120,7 +128,7 @@ CREATE INDEX IF NOT EXISTS platform_admin_audit_tenant ON platform_admin_audit (
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION tchefood_admin_charges_guard() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    IF TG_OP = 'DELETE' THEN
+    IF TG_OP IN ('DELETE', 'TRUNCATE') THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: cobrança não é apagada; cancele com motivo' USING ERRCODE = '42501';
     END IF;
     IF OLD.status <> 'OPEN' THEN
@@ -137,6 +145,13 @@ $$;
 DROP TRIGGER IF EXISTS trg_store_charges_guard ON store_charges;
 CREATE TRIGGER trg_store_charges_guard BEFORE UPDATE OR DELETE ON store_charges
     FOR EACH ROW EXECUTE FUNCTION tchefood_admin_charges_guard();
+-- TRUNCATE não passa pelo gatilho por linha: trava à parte (cobranças e assinaturas).
+DROP TRIGGER IF EXISTS trg_store_charges_truncate ON store_charges;
+CREATE TRIGGER trg_store_charges_truncate BEFORE TRUNCATE ON store_charges
+    FOR EACH STATEMENT EXECUTE FUNCTION tchefood_admin_charges_guard();
+DROP TRIGGER IF EXISTS trg_store_subscriptions_truncate ON store_subscriptions;
+CREATE TRIGGER trg_store_subscriptions_truncate BEFORE TRUNCATE ON store_subscriptions
+    FOR EACH STATEMENT EXECUTE FUNCTION tchefood_admin_charges_guard();
 
 CREATE OR REPLACE FUNCTION tchefood_admin_audit_guard() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
@@ -162,7 +177,17 @@ BEGIN
         REVOKE ALL ON platform_admins, platform_plans, store_subscriptions, store_charges, platform_admin_audit
             FROM PUBLIC, anon, authenticated;
     END IF;
+    -- A service role (usada só para o Auth na função admin-device-account) não esvazia nem
+    -- escreve direto no histórico e nas cobranças.
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        REVOKE TRUNCATE ON platform_admins, platform_plans, store_subscriptions, store_charges, platform_admin_audit FROM service_role;
+        REVOKE INSERT, UPDATE, DELETE ON platform_admin_audit, store_charges FROM service_role;
+    END IF;
 END $$;
+
+-- Uso da loja no painel (última venda e pedidos nos últimos dias, por loja).
+CREATE INDEX IF NOT EXISTS idx_orders_tenant_opened ON orders (tenant_id, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_delivery_orders_tenant_placed ON delivery_orders (tenant_id, placed_at DESC);
 
 -- -----------------------------------------------------------------------------
 -- Apoio
@@ -175,7 +200,7 @@ $$;
 
 -- Quem chama precisa ser admin ativo, com token sem loja.
 CREATE OR REPLACE FUNCTION tchefood_admin_require() RETURNS platform_admins
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_claims JSONB; v_sub TEXT; v_admin platform_admins%ROWTYPE;
 BEGIN
     BEGIN
@@ -203,20 +228,28 @@ BEGIN
 END;
 $$;
 
--- CNPJ com os dois dígitos verificadores (só dígitos, 14, não repetidos).
+-- CNPJ com os dois dígitos verificadores, numérico ou alfanumérico (Receita Federal,
+-- IN RFB 2.229/2024): 12 posições de 0-9 ou A-Z e 2 dígitos verificadores numéricos. O valor
+-- de cada posição é o código ASCII menos 48 (0-9 valem 0-9, A vale 17, ..., Z vale 42).
+-- Espera o valor já normalizado (sem pontuação, letras maiúsculas).
 CREATE OR REPLACE FUNCTION tchefood_admin_cnpj_valid(p_cnpj TEXT) RETURNS BOOLEAN LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE w1 INT[] := ARRAY[5,4,3,2,9,8,7,6,5,4,3,2]; w2 INT[] := ARRAY[6,5,4,3,2,9,8,7,6,5,4,3,2];
         s INT; d1 INT; d2 INT; i INT;
 BEGIN
-    IF p_cnpj IS NULL OR p_cnpj !~ '^[0-9]{14}$' OR p_cnpj ~ '^(.)\1{13}$' THEN RETURN FALSE; END IF;
+    IF p_cnpj IS NULL OR p_cnpj !~ '^[0-9A-Z]{12}[0-9]{2}$' OR p_cnpj ~ '^(.)\1{13}$' THEN RETURN FALSE; END IF;
     s := 0;
-    FOR i IN 1..12 LOOP s := s + substr(p_cnpj, i, 1)::int * w1[i]; END LOOP;
+    FOR i IN 1..12 LOOP s := s + (ascii(substr(p_cnpj, i, 1)) - 48) * w1[i]; END LOOP;
     d1 := CASE WHEN s % 11 < 2 THEN 0 ELSE 11 - s % 11 END;
     s := 0;
-    FOR i IN 1..13 LOOP s := s + substr(p_cnpj, i, 1)::int * w2[i]; END LOOP;
+    FOR i IN 1..13 LOOP s := s + (ascii(substr(p_cnpj, i, 1)) - 48) * w2[i]; END LOOP;
     d2 := CASE WHEN s % 11 < 2 THEN 0 ELSE 11 - s % 11 END;
     RETURN substr(p_cnpj, 13, 1)::int = d1 AND substr(p_cnpj, 14, 1)::int = d2;
 END;
+$$;
+
+-- Normaliza o CNPJ digitado: tira pontos, barra, traço e espaços, e passa letras para maiúsculas.
+CREATE OR REPLACE FUNCTION tchefood_admin_clean_cnpj(p_cnpj TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
+    SELECT upper(regexp_replace(COALESCE(p_cnpj, ''), '[^0-9A-Za-z]', '', 'g'))
 $$;
 
 -- Vencimento de um mês: o dia de cobrança da loja dentro do mês de referência.
@@ -224,8 +257,32 @@ CREATE OR REPLACE FUNCTION tchefood_admin_due_date(p_month DATE, p_billing_day I
     SELECT (date_trunc('month', p_month)::date + (p_billing_day - 1))
 $$;
 
+-- Início de um dia de São Paulo, como instante (para as janelas de 7 e 30 dias do painel).
+CREATE OR REPLACE FUNCTION tchefood_admin_day_start(p_day DATE) RETURNS TIMESTAMPTZ LANGUAGE sql STABLE AS $$
+    SELECT (p_day::timestamp AT TIME ZONE 'America/Sao_Paulo')
+$$;
+
+-- Vendas da loja para os indicadores de uso: pedidos do salão/balcão não cancelados e pedidos
+-- de delivery (iFood) não cancelados.
+CREATE OR REPLACE FUNCTION tchefood_admin_sales(p_tenant UUID) RETURNS TABLE (at TIMESTAMPTZ) LANGUAGE sql STABLE
+SET search_path = public, pg_temp AS $$
+    SELECT o.opened_at FROM orders o WHERE o.tenant_id = p_tenant AND o.status <> 'CANCELED'
+    UNION ALL
+    SELECT d.placed_at FROM delivery_orders d WHERE d.tenant_id = p_tenant AND d.status <> 'cancelled'
+$$;
+
+-- Mês de cobrança aceito: de 12 meses atrás até o mês que vem (evita 1990 por engano).
+CREATE OR REPLACE FUNCTION tchefood_admin_check_month(p_month DATE) RETURNS VOID LANGUAGE plpgsql STABLE AS $$
+DECLARE v_now DATE := date_trunc('month', tchefood_admin_today())::date;
+BEGIN
+    IF p_month IS NULL OR p_month < (v_now - INTERVAL '12 months')::date OR p_month > (v_now + INTERVAL '1 month')::date THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: mês da cobrança fora do período aceito (até 12 meses atrás ou o mês que vem)';
+    END IF;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION tchefood_admin_log(p_admin UUID, p_tenant UUID, p_charge UUID, p_action TEXT, p_reason TEXT, p_details JSONB)
-RETURNS VOID LANGUAGE sql SECURITY DEFINER SET search_path = public AS $$
+RETURNS VOID LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
     INSERT INTO platform_admin_audit (admin_user_id, tenant_id, charge_id, action, reason, details)
     VALUES (p_admin, p_tenant, p_charge, p_action, NULLIF(btrim(p_reason), ''), COALESCE(p_details, '{}'::jsonb));
 $$;
@@ -255,8 +312,9 @@ BEGIN
     IF length(btrim(COALESCE(p_contact_name, ''))) < 2 OR length(btrim(p_contact_name)) > 100 THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o nome do contato da loja';
     END IF;
-    IF tchefood_admin_clean_phone(p_contact_phone) !~ '^[0-9]{10,13}$' THEN
-        RAISE EXCEPTION 'TCHEFOOD_ADMIN: telefone do contato com DDD (10 a 13 dígitos)';
+    -- DDD + número (10 ou 11 dígitos), ou o mesmo com o DDI 55 na frente (12 ou 13).
+    IF tchefood_admin_clean_phone(p_contact_phone) !~ '^(55)?[1-9][0-9]{9,10}$' THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: telefone do contato com DDD (10 ou 11 dígitos, ou 55 + DDD + número)';
     END IF;
 END;
 $$;
@@ -274,7 +332,7 @@ $$;
 -- Leitura
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION tchefood_admin_me() RETURNS JSONB
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE;
 BEGIN
     v_admin := tchefood_admin_require();
@@ -283,7 +341,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION tchefood_admin_plans() RETURNS JSONB
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
     PERFORM tchefood_admin_require();
     RETURN COALESCE((SELECT jsonb_agg(jsonb_build_object('id', p.id, 'name', p.name, 'monthly_price', p.monthly_price, 'active', p.active)
@@ -292,7 +350,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION tchefood_admin_overview() RETURNS JSONB
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_today DATE; v_month DATE;
 BEGIN
     PERFORM tchefood_admin_require();
@@ -313,13 +371,16 @@ BEGIN
         'overdue_amount', (SELECT COALESCE(sum(amount), 0) FROM store_charges WHERE status = 'OPEN' AND due_date < v_today),
         'overdue_count', (SELECT count(*) FROM store_charges WHERE status = 'OPEN' AND due_date < v_today),
         'received_this_month', (SELECT COALESCE(sum(paid_amount), 0) FROM store_charges WHERE status = 'PAID' AND paid_on >= v_month AND paid_on <= v_today),
-        'trials_ending_7d', (SELECT count(*) FROM store_subscriptions WHERE status = 'TRIAL' AND trial_ends_on <= v_today + 7));
+        -- Testes que terminam de hoje até daqui a 7 dias; os que já terminaram contam à parte.
+        'trials_ending_7d', (SELECT count(*) FROM store_subscriptions
+                              WHERE status = 'TRIAL' AND trial_ends_on >= v_today AND trial_ends_on <= v_today + 7),
+        'trials_expired', (SELECT count(*) FROM store_subscriptions WHERE status = 'TRIAL' AND trial_ends_on < v_today));
 END;
 $$;
 
 -- Lojas, com as que ainda não têm assinatura (criadas à mão no Supabase, como a do piloto).
 CREATE OR REPLACE FUNCTION tchefood_admin_stores() RETURNS JSONB
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_today DATE;
 BEGIN
     PERFORM tchefood_admin_require();
@@ -344,14 +405,13 @@ BEGIN
                      min(sc.due_date) FILTER (WHERE sc.status = 'OPEN' AND sc.due_date < v_today) AS oldest_overdue_due
                 FROM store_charges sc WHERE sc.tenant_id = t.id) c ON TRUE
           LEFT JOIN LATERAL (
-              SELECT max(o.opened_at) AS last_order_at,
-                     count(*) FILTER (WHERE o.opened_at >= NOW() - INTERVAL '7 days' AND o.status <> 'CANCELED') AS orders_7d
-                FROM orders o WHERE o.tenant_id = t.id) u ON TRUE), '[]'::jsonb);
+              SELECT max(x.at) AS last_order_at, count(*) FILTER (WHERE x.at >= tchefood_admin_day_start(v_today - 6)) AS orders_7d
+                FROM tchefood_admin_sales(t.id) x) u ON TRUE), '[]'::jsonb);
 END;
 $$;
 
 CREATE OR REPLACE FUNCTION tchefood_admin_store(p_tenant UUID) RETURNS JSONB
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_t tenants%ROWTYPE; v_s store_subscriptions%ROWTYPE;
 BEGIN
     PERFORM tchefood_admin_require();
@@ -374,16 +434,16 @@ BEGIN
                              'created_at', a.created_at, 'admin_name', pa.name) AS j
                         FROM platform_admin_audit a LEFT JOIN platform_admins pa ON pa.user_id = a.admin_user_id
                        WHERE a.tenant_id = p_tenant ORDER BY a.created_at DESC LIMIT 50) x), '[]'::jsonb),
-        'last_order_at', (SELECT max(o.opened_at) FROM orders o WHERE o.tenant_id = p_tenant),
-        'orders_7d', (SELECT count(*) FROM orders o WHERE o.tenant_id = p_tenant AND o.opened_at >= NOW() - INTERVAL '7 days' AND o.status <> 'CANCELED'),
-        'orders_30d', (SELECT count(*) FROM orders o WHERE o.tenant_id = p_tenant AND o.opened_at >= NOW() - INTERVAL '30 days' AND o.status <> 'CANCELED'),
+        'last_order_at', (SELECT max(x.at) FROM tchefood_admin_sales(p_tenant) x),
+        'orders_7d', (SELECT count(*) FROM tchefood_admin_sales(p_tenant) x WHERE x.at >= tchefood_admin_day_start(tchefood_admin_today() - 6)),
+        'orders_30d', (SELECT count(*) FROM tchefood_admin_sales(p_tenant) x WHERE x.at >= tchefood_admin_day_start(tchefood_admin_today() - 29)),
         'staff_active', (SELECT count(*) FROM staff_users su WHERE su.tenant_id = p_tenant AND su.active));
 END;
 $$;
 
 -- Cobranças em aberto que vencem até daqui a p_days dias, e as vencidas (tela "Cobranças do dia").
 CREATE OR REPLACE FUNCTION tchefood_admin_charges_due(p_days INT DEFAULT 3) RETURNS JSONB
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_today DATE;
 BEGIN
     PERFORM tchefood_admin_require();
@@ -415,16 +475,17 @@ CREATE OR REPLACE FUNCTION tchefood_admin_create_store(
     p_plan_id TEXT, p_monthly_price NUMERIC, p_billing_day INT, p_trial_days INT,
     p_contact_name TEXT, p_contact_phone TEXT, p_contact_email TEXT, p_notes TEXT
 ) RETURNS UUID
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_plan platform_plans%ROWTYPE; v_cnpj TEXT; v_id UUID; v_s store_subscriptions%ROWTYPE;
         v_price NUMERIC;
 BEGIN
     v_admin := tchefood_admin_require();
-    v_cnpj := regexp_replace(COALESCE(p_cnpj, ''), '[^0-9]', '', 'g');
+    v_cnpj := tchefood_admin_clean_cnpj(p_cnpj);
     IF NOT tchefood_admin_cnpj_valid(v_cnpj) THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: CNPJ inválido'; END IF;
     IF length(btrim(COALESCE(p_name, ''))) < 2 OR length(btrim(p_name)) > 150 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: nome da loja inválido'; END IF;
     IF length(btrim(COALESCE(p_legal_name, ''))) < 2 OR length(btrim(p_legal_name)) > 200 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: razão social inválida'; END IF;
     IF p_state IS NOT NULL AND upper(btrim(p_state)) !~ '^[A-Z]{2}$' THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: UF inválida'; END IF;
+    IF length(btrim(COALESCE(p_city, ''))) > 100 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: cidade com até 100 caracteres'; END IF;
     IF p_trial_days IS NULL OR p_trial_days < 0 OR p_trial_days > 90 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: dias de teste entre 0 e 90'; END IF;
     PERFORM tchefood_admin_check_contact(p_billing_day, p_contact_name, p_contact_phone);
     SELECT * INTO v_plan FROM platform_plans WHERE id = p_plan_id AND active;
@@ -460,7 +521,7 @@ CREATE OR REPLACE FUNCTION tchefood_admin_save_subscription(
     p_tenant UUID, p_plan_id TEXT, p_monthly_price NUMERIC, p_status TEXT, p_billing_day INT, p_trial_ends_on DATE,
     p_contact_name TEXT, p_contact_phone TEXT, p_contact_email TEXT, p_notes TEXT, p_reason TEXT
 ) RETURNS JSONB
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_plan platform_plans%ROWTYPE; v_old store_subscriptions%ROWTYPE; v_new store_subscriptions%ROWTYPE;
         v_existed BOOLEAN;
 BEGIN
@@ -513,7 +574,7 @@ $$;
 CREATE OR REPLACE FUNCTION tchefood_admin_create_charge(
     p_tenant UUID, p_reference_month DATE, p_amount NUMERIC, p_due_date DATE, p_payment_link TEXT
 ) RETURNS UUID
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_s store_subscriptions%ROWTYPE; v_month DATE; v_amount NUMERIC; v_due DATE; v_id UUID;
         v_link TEXT;
 BEGIN
@@ -523,11 +584,14 @@ BEGIN
     IF v_s.status = 'CANCELLED' THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: assinatura cancelada não gera cobrança'; END IF;
     IF p_reference_month IS NULL THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o mês da cobrança'; END IF;
     v_month := date_trunc('month', p_reference_month)::date;
+    PERFORM tchefood_admin_check_month(v_month);
     v_amount := COALESCE(p_amount, v_s.monthly_price);
     IF v_amount IS NULL OR v_amount <= 0 OR v_amount > 100000 OR v_amount <> round(v_amount, 2) THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: valor da cobrança inválido';
     END IF;
-    v_due := COALESCE(p_due_date, tchefood_admin_due_date(v_month, v_s.billing_day));
+    -- Sem vencimento informado: o dia de cobrança do mês, mas nunca antes de hoje (cobrança
+    -- criada no meio do mês não nasce vencida).
+    v_due := COALESCE(p_due_date, GREATEST(tchefood_admin_due_date(v_month, v_s.billing_day), tchefood_admin_today()));
     IF v_due < v_month - 31 OR v_due > (v_month + INTERVAL '2 months')::date THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: vencimento longe do mês da cobrança';
     END IF;
@@ -547,22 +611,31 @@ BEGIN
 END;
 $$;
 
--- Cobranças do mês para todas as lojas ativas com preço, que ainda não têm a do mês.
+-- Cobranças do mês para as lojas ativas com preço e as em teste cujo teste termina até o fim
+-- do mês, que ainda não têm cobrança do mês (nem cancelada: cancelar é decisão do admin, como
+-- uma cortesia, e o lote não a desfaz; refazer é pela cobrança avulsa). O vencimento é o dia
+-- de cobrança, mas nunca antes de hoje nem antes do fim do teste.
 CREATE OR REPLACE FUNCTION tchefood_admin_generate_month(p_reference_month DATE) RETURNS INT
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
-DECLARE v_admin platform_admins%ROWTYPE; v_month DATE; v_s RECORD; v_count INT := 0; v_id UUID;
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE v_admin platform_admins%ROWTYPE; v_month DATE; v_s RECORD; v_count INT := 0; v_id UUID; v_due DATE;
 BEGIN
     v_admin := tchefood_admin_require();
     IF p_reference_month IS NULL THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o mês'; END IF;
     v_month := date_trunc('month', p_reference_month)::date;
-    FOR v_s IN SELECT * FROM store_subscriptions WHERE status = 'ACTIVE' AND monthly_price > 0 ORDER BY tenant_id FOR UPDATE LOOP
-        IF NOT EXISTS (SELECT 1 FROM store_charges WHERE tenant_id = v_s.tenant_id AND reference_month = v_month AND status <> 'CANCELLED') THEN
+    PERFORM tchefood_admin_check_month(v_month);
+    FOR v_s IN SELECT * FROM store_subscriptions
+                WHERE monthly_price > 0
+                  AND (status = 'ACTIVE' OR (status = 'TRIAL' AND trial_ends_on < (v_month + INTERVAL '1 month')::date))
+                ORDER BY tenant_id FOR UPDATE LOOP
+        IF NOT EXISTS (SELECT 1 FROM store_charges WHERE tenant_id = v_s.tenant_id AND reference_month = v_month) THEN
+            v_due := GREATEST(tchefood_admin_due_date(v_month, v_s.billing_day), tchefood_admin_today(),
+                              CASE WHEN v_s.status = 'TRIAL' THEN v_s.trial_ends_on + 1 END);
             INSERT INTO store_charges (tenant_id, reference_month, amount, due_date, created_by)
-            VALUES (v_s.tenant_id, v_month, v_s.monthly_price, tchefood_admin_due_date(v_month, v_s.billing_day), v_admin.user_id)
+            VALUES (v_s.tenant_id, v_month, v_s.monthly_price, v_due, v_admin.user_id)
             RETURNING id INTO v_id;
             PERFORM tchefood_admin_log(v_admin.user_id, v_s.tenant_id, v_id, 'CHARGE_CREATED', NULL,
-                jsonb_build_object('reference_month', v_month, 'amount', v_s.monthly_price,
-                                   'due_date', tchefood_admin_due_date(v_month, v_s.billing_day), 'batch', TRUE));
+                jsonb_build_object('reference_month', v_month, 'amount', v_s.monthly_price, 'due_date', v_due, 'batch', TRUE,
+                                   'subscription_status', v_s.status));
             v_count := v_count + 1;
         END IF;
     END LOOP;
@@ -575,7 +648,7 @@ $$;
 CREATE OR REPLACE FUNCTION tchefood_admin_record_payment(
     p_charge UUID, p_paid_amount NUMERIC, p_paid_on DATE, p_method TEXT, p_reference TEXT
 ) RETURNS JSONB
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_tenant UUID; v_c store_charges%ROWTYPE; v_s store_subscriptions%ROWTYPE;
         v_ref TEXT; v_activated BOOLEAN := FALSE;
 BEGIN
@@ -586,6 +659,7 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: forma de pagamento inválida';
     END IF;
     IF p_paid_on IS NULL OR p_paid_on > tchefood_admin_today() THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: data do pagamento inválida (não pode ser futura)'; END IF;
+    -- (o limite de data antiga é conferido abaixo, com o mês da cobrança)
 
     -- Trava a assinatura antes da cobrança (mesma ordem de tchefood_admin_create_charge).
     SELECT tenant_id INTO v_tenant FROM store_charges WHERE id = p_charge;
@@ -601,10 +675,13 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: esta cobrança já foi paga com outros dados';
     END IF;
     IF v_c.status <> 'OPEN' THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: cobrança cancelada não recebe pagamento'; END IF;
+    IF p_paid_on < (v_c.reference_month - INTERVAL '31 days')::date THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: data do pagamento muito antes do mês da cobrança';
+    END IF;
     IF p_paid_amount IS NULL OR p_paid_amount <> v_c.amount THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: valor pago (%) diferente do valor da cobrança (%)', p_paid_amount, v_c.amount;
     END IF;
-    IF EXISTS (SELECT 1 FROM store_charges WHERE status = 'PAID' AND payment_method = p_method AND lower(payment_reference) = lower(v_ref)) THEN
+    IF EXISTS (SELECT 1 FROM store_charges WHERE status = 'PAID' AND lower(payment_reference) = lower(v_ref)) THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: esta referência de pagamento já quitou outra cobrança';
     END IF;
 
@@ -612,7 +689,11 @@ BEGIN
                              payment_reference = v_ref, paid_at = NOW(), paid_by = v_admin.user_id
      WHERE id = p_charge;
 
-    IF v_s.status IN ('TRIAL', 'SUSPENDED') THEN
+    -- Em teste vira ativa no primeiro pagamento. Suspensa só volta a ativa se não sobrar outra
+    -- cobrança vencida em aberto (pagar outubro com novembro vencido não reativa).
+    IF v_s.status = 'TRIAL' OR (v_s.status = 'SUSPENDED' AND NOT EXISTS (
+           SELECT 1 FROM store_charges o WHERE o.tenant_id = v_tenant AND o.id <> p_charge AND o.status = 'OPEN'
+              AND o.due_date < tchefood_admin_today())) THEN
         UPDATE store_subscriptions SET status = 'ACTIVE', updated_at = NOW() WHERE tenant_id = v_tenant;
         v_activated := TRUE;
     END IF;
@@ -629,7 +710,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION tchefood_admin_cancel_charge(p_charge UUID, p_reason TEXT) RETURNS VOID
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_tenant UUID; v_c store_charges%ROWTYPE;
 BEGIN
     v_admin := tchefood_admin_require();
@@ -658,7 +739,7 @@ $$;
 -- se a reserva ainda for a mesma e ainda estiver PENDING; conta pronta nunca é trocada.
 DROP FUNCTION IF EXISTS tchefood_admin_reserve_device(UUID, TEXT);
 CREATE OR REPLACE FUNCTION tchefood_admin_reserve_device(p_tenant UUID, p_email TEXT, p_replace_user_id UUID DEFAULT NULL) RETURNS JSONB
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_s store_subscriptions%ROWTYPE; v_email TEXT; v_id UUID;
 BEGIN
     v_admin := tchefood_admin_require();
@@ -688,9 +769,42 @@ EXCEPTION WHEN unique_violation THEN
 END;
 $$;
 
--- Conta criada no Auth (ou senha trocada): marca a conta como pronta e grava no histórico.
-CREATE OR REPLACE FUNCTION tchefood_admin_confirm_device(p_tenant UUID, p_user_id UUID, p_action TEXT) RETURNS VOID
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+-- Uma operação por vez na conta do aparelho de cada loja. A função admin-device-account
+-- pega a vez (p_op = id sorteado por chamada) antes de mexer no Auth e só confirma com a
+-- mesma vez; a segunda chamada ao mesmo tempo recebe 55P03 (409 na função) e não gera
+-- senha. A vez expira em 10 minutos, mais que o tempo máximo de uma Edge Function (400 s),
+-- para uma função que caiu no meio não travar a loja para sempre.
+CREATE OR REPLACE FUNCTION tchefood_admin_device_lock(p_tenant UUID, p_op UUID) RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE v_s store_subscriptions%ROWTYPE;
+BEGIN
+    PERFORM tchefood_admin_require();
+    IF p_op IS NULL THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: operação inválida'; END IF;
+    SELECT * INTO v_s FROM store_subscriptions WHERE tenant_id = p_tenant FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: crie a assinatura da loja antes da conta do aparelho'; END IF;
+    IF v_s.device_op_id IS NOT NULL AND v_s.device_op_id <> p_op AND v_s.device_op_started_at > NOW() - INTERVAL '10 minutes' THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: outra operação na conta do aparelho desta loja está em andamento; aguarde e abra a loja de novo'
+            USING ERRCODE = '55P03';
+    END IF;
+    UPDATE store_subscriptions SET device_op_id = p_op, device_op_started_at = NOW() WHERE tenant_id = p_tenant;
+END;
+$$;
+
+-- Devolve a vez quando a operação falhou antes de confirmar (só a própria operação devolve).
+CREATE OR REPLACE FUNCTION tchefood_admin_device_unlock(p_tenant UUID, p_op UUID) RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+    PERFORM tchefood_admin_require();
+    UPDATE store_subscriptions SET device_op_id = NULL, device_op_started_at = NULL
+     WHERE tenant_id = p_tenant AND device_op_id = p_op;
+END;
+$$;
+
+-- Conta criada no Auth (ou senha trocada): marca a conta como pronta, devolve a vez e grava
+-- no histórico. Recusa se a vez não for mais desta operação (expirou e outra pegou).
+DROP FUNCTION IF EXISTS tchefood_admin_confirm_device(UUID, UUID, TEXT);
+CREATE OR REPLACE FUNCTION tchefood_admin_confirm_device(p_tenant UUID, p_user_id UUID, p_action TEXT, p_op UUID) RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_s store_subscriptions%ROWTYPE;
 BEGIN
     v_admin := tchefood_admin_require();
@@ -699,7 +813,14 @@ BEGIN
     IF NOT FOUND OR v_s.device_user_id IS DISTINCT FROM p_user_id THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: conta do aparelho não confere com a da loja';
     END IF;
-    UPDATE store_subscriptions SET device_status = 'READY', updated_at = NOW() WHERE tenant_id = p_tenant;
+    IF (p_action = 'CREATED' AND v_s.device_status <> 'PENDING') OR (p_action = 'PASSWORD_RESET' AND v_s.device_status <> 'READY') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: a conta do aparelho mudou de estado; abra a loja de novo';
+    END IF;
+    IF p_op IS NULL OR v_s.device_op_id IS DISTINCT FROM p_op THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: outra operação assumiu a conta do aparelho; abra a loja de novo' USING ERRCODE = '55P03';
+    END IF;
+    UPDATE store_subscriptions SET device_status = 'READY', device_op_id = NULL, device_op_started_at = NULL, updated_at = NOW()
+     WHERE tenant_id = p_tenant;
     PERFORM tchefood_admin_log(v_admin.user_id, p_tenant, NULL,
         CASE p_action WHEN 'CREATED' THEN 'DEVICE_ACCOUNT_CREATED' ELSE 'DEVICE_PASSWORD_RESET' END, NULL,
         jsonb_build_object('user_id', p_user_id, 'email', v_s.device_email));
@@ -718,7 +839,11 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_admin_today() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_admin_require() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_admin_cnpj_valid(TEXT) FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_admin_clean_cnpj(TEXT) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_admin_due_date(DATE, INT) FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_admin_check_month(DATE) FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_admin_day_start(DATE) FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_admin_sales(UUID) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_admin_log(UUID, UUID, UUID, TEXT, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_admin_clean_phone(TEXT) FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_admin_check_email(TEXT) FROM PUBLIC, anon, authenticated;
@@ -738,7 +863,9 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_admin_record_payment(UUID, NUMERIC, DATE, TEXT, TEXT) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_cancel_charge(UUID, TEXT) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_reserve_device(UUID, TEXT, UUID) FROM PUBLIC, anon;
-        REVOKE ALL ON FUNCTION tchefood_admin_confirm_device(UUID, UUID, TEXT) FROM PUBLIC, anon;
+        REVOKE ALL ON FUNCTION tchefood_admin_device_lock(UUID, UUID) FROM PUBLIC, anon;
+        REVOKE ALL ON FUNCTION tchefood_admin_device_unlock(UUID, UUID) FROM PUBLIC, anon;
+        REVOKE ALL ON FUNCTION tchefood_admin_confirm_device(UUID, UUID, TEXT, UUID) FROM PUBLIC, anon;
         GRANT EXECUTE ON FUNCTION tchefood_admin_me() TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_plans() TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_overview() TO authenticated;
@@ -752,6 +879,8 @@ BEGIN
         GRANT EXECUTE ON FUNCTION tchefood_admin_record_payment(UUID, NUMERIC, DATE, TEXT, TEXT) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_cancel_charge(UUID, TEXT) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_reserve_device(UUID, TEXT, UUID) TO authenticated;
-        GRANT EXECUTE ON FUNCTION tchefood_admin_confirm_device(UUID, UUID, TEXT) TO authenticated;
+        GRANT EXECUTE ON FUNCTION tchefood_admin_device_lock(UUID, UUID) TO authenticated;
+        GRANT EXECUTE ON FUNCTION tchefood_admin_device_unlock(UUID, UUID) TO authenticated;
+        GRANT EXECUTE ON FUNCTION tchefood_admin_confirm_device(UUID, UUID, TEXT, UUID) TO authenticated;
     END IF;
 END $$;

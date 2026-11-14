@@ -7,12 +7,15 @@
 // na nuvem (app_metadata.tenant_id = id da loja, que o hook copia para o JWT).
 //   1) Com o token de quem chama, tchefood_admin_store prova que é admin do painel e que a
 //      loja existe (o banco recusa token de loja e quem não está em platform_admins).
-//   2) tchefood_admin_reserve_device reserva o id e o e-mail da conta (repetir devolve a
+//   2) tchefood_admin_device_lock pega a vez da loja (uma operação por vez: a segunda
+//      chamada ao mesmo tempo recebe 409 e não gera senha); toda saída sem sucesso devolve
+//      a vez com tchefood_admin_device_unlock.
+//   3) tchefood_admin_reserve_device reserva o id e o e-mail da conta (repetir devolve a
 //      mesma reserva). A conta é criada no Auth com esse id: se a função cair no meio, a
 //      próxima chamada continua da reserva, sem conta solta.
-//   3) Com a service role, cria a conta (ou troca a senha) e só mexe em conta cujo
+//   4) Com a service role, cria a conta (ou troca a senha) e só mexe em conta cujo
 //      tenant_id e e-mail conferem com a reserva.
-//   4) tchefood_admin_confirm_device marca a conta como pronta e grava no histórico.
+//   5) tchefood_admin_confirm_device (com a mesma vez) marca a conta como pronta e grava no histórico.
 // A senha nova volta uma vez só na resposta; não fica gravada em lugar nenhum.
 
 export interface RpcResult {
@@ -37,6 +40,8 @@ export interface DeviceAccountDeps {
   rpc(fn: string, args: Record<string, unknown>): Promise<RpcResult>;
   auth: AuthAdmin;
   randomPassword(): string;
+  /** Id novo de operação (crypto.randomUUID). */
+  newOpId(): string;
 }
 
 export interface HandlerResult {
@@ -54,6 +59,10 @@ function fail(status: number, message: string): HandlerResult {
 function rpcFailure(error: { message: string; code?: string }): HandlerResult {
   const message = error.message.replace(/^TCHEFOOD_ADMIN:\s*/, '');
   if (error.code === '42501') return fail(403, message);
+  if (error.code === '55P03') return fail(409, message);
+  // Token vencido ou inválido no PostgREST: o painel volta para a entrada.
+  if (error.code === 'PGRST301' || error.code === 'PGRST302' || /JWT/i.test(error.message)) return fail(401, 'Sessão expirada. Entre de novo.');
+  if (/já é de outra loja|já é de um admin/.test(message)) return fail(409, message);
   if (/não encontrada/.test(message)) return fail(404, message);
   return fail(400, message);
 }
@@ -101,16 +110,38 @@ export async function handleDeviceAccount(input: unknown, deps: DeviceAccountDep
   if (action === 'create' && deviceStatus === 'READY') return fail(409, 'A loja já tem conta do aparelho. Use "Trocar senha".');
   if (action === 'reset_password' && deviceStatus !== 'READY') return fail(409, 'A loja ainda não tem conta do aparelho pronta. Use "Criar conta".');
 
-  // 2) Reserva (ou a já existente).
+  // 2) A vez da loja; qualquer saída sem sucesso devolve a vez.
+  const opId = deps.newOpId();
+  const lock = await deps.rpc('tchefood_admin_device_lock', { p_tenant: tenantId, p_op: opId });
+  if (lock.error) return rpcFailure(lock.error);
+  const unlock = () => deps.rpc('tchefood_admin_device_unlock', { p_tenant: tenantId, p_op: opId }).catch(() => undefined);
+  let result: HandlerResult;
+  try {
+    result = await withLock(tenantId, action, email, detail.cnpj ?? '', opId, deps);
+  } catch (err) {
+    await unlock();
+    throw err;
+  }
+  if (result.status !== 200) await unlock();
+  return result;
+}
+
+async function withLock(
+  tenantId: string, action: 'create' | 'reset_password', email: unknown, cnpj: string, opId: string, deps: DeviceAccountDeps,
+): Promise<HandlerResult> {
+  // 3) Reserva (ou a já existente).
   const reserve = await deps.rpc('tchefood_admin_reserve_device', {
     p_tenant: tenantId,
-    p_email: (typeof email === 'string' ? email.trim() : '') || suggestedDeviceEmail(detail.cnpj ?? ''),
+    p_email: (typeof email === 'string' ? email.trim() : '') || suggestedDeviceEmail(cnpj),
   });
   if (reserve.error) return rpcFailure(reserve.error);
   let r = (reserve.data ?? {}) as { user_id?: string; email?: string; status?: string };
   if (typeof r.user_id !== 'string' || !UUID.test(r.user_id) || typeof r.email !== 'string') return fail(500, 'Reserva da conta inválida.');
+  // O estado lido no passo 1 pode ter mudado antes da vez (outra operação terminou no meio).
+  if (action === 'create' && r.status === 'READY') return fail(409, 'A loja já tem conta do aparelho. Use "Trocar senha".');
+  if (action === 'reset_password' && r.status !== 'READY') return fail(409, 'A loja ainda não tem conta do aparelho pronta. Use "Criar conta".');
 
-  // 3) Auth, com a service role.
+  // 4) Auth, com a service role.
   const lookup = async (id: string) => {
     const res = await deps.auth.getUserById(id);
     const missing = !res.user && (!res.error || res.error.status === 404 || /not found/i.test(res.error.message));
@@ -140,20 +171,39 @@ export async function handleDeviceAccount(input: unknown, deps: DeviceAccountDep
     const upd = await deps.auth.updateUserById(userId, { password, app_metadata: appMetadata });
     if (upd.error) return fail(502, 'Não foi possível trocar a senha no Supabase Auth. Tente de novo.');
   } else {
-    if (action === 'reset_password') return fail(409, 'A conta do aparelho não existe mais no Supabase Auth. Fale com o suporte.');
+    // Conta pronta que sumiu do Auth (apagada à mão): "Trocar senha" recria com o mesmo id e
+    // e-mail reservados pelo banco, para a loja não ficar sem saída pelo painel.
     const created = await deps.auth.createUser({ id: userId, email: accountEmail, password, email_confirm: true, app_metadata: appMetadata });
     if (created.error) {
-      if (/already|exists|registered/i.test(created.error.message)) return fail(409, 'Já existe outra conta com este e-mail no Supabase Auth. Digite outro e-mail e toque em "Criar conta do aparelho" de novo.');
-      return fail(502, 'Não foi possível criar a conta no Supabase Auth. Tente de novo.');
+      if (/already|exists|registered/i.test(created.error.message)) {
+        // A conta com este id pode ter sido criada por uma tentativa anterior que caiu: confere.
+        const again = await lookup(userId);
+        if (again.user && sameAccount(again.user, tenantId, accountEmail)) {
+          const upd = await deps.auth.updateUserById(userId, { password, app_metadata: appMetadata });
+          if (upd.error) return fail(502, 'Não foi possível trocar a senha no Supabase Auth. Tente de novo.');
+        } else {
+          return fail(409, 'Já existe outra conta com este e-mail no Supabase Auth. Digite outro e-mail e toque em "Criar conta do aparelho" de novo.');
+        }
+      } else if (/invalid|format/i.test(created.error.message)) {
+        return fail(400, 'O Supabase Auth recusou este e-mail. Digite outro.');
+      } else {
+        return fail(502, 'Não foi possível criar a conta no Supabase Auth. Tente de novo.');
+      }
     }
   }
 
-  // 4) Pronta.
+  // 5) Pronta.
   const confirm = await deps.rpc('tchefood_admin_confirm_device', {
     p_tenant: tenantId,
     p_user_id: userId,
     p_action: action === 'reset_password' ? 'PASSWORD_RESET' : 'CREATED',
+    p_op: opId,
   });
-  if (confirm.error) return fail(500, 'A conta foi criada, mas o painel não registrou. Toque de novo em "Criar conta" para concluir (gera uma senha nova).');
+  if (confirm.error?.code === '55P03') return rpcFailure(confirm.error);
+  if (confirm.error) {
+    return fail(500, action === 'reset_password'
+      ? 'A senha foi trocada no Supabase Auth, mas o painel não registrou. Toque de novo em "Trocar senha" (gera outra senha) antes de configurar o aparelho.'
+      : 'A conta foi criada, mas o painel não registrou. Toque de novo em "Criar conta" para concluir (gera uma senha nova).');
+  }
   return { status: 200, body: { user_id: userId, email: accountEmail, password } };
 }

@@ -66,6 +66,7 @@ function Lista({ titulo, itens, today, onOpenStore, vazio }: { titulo: string; i
               { contactName: c.contact_name, storeName: c.store_name, referenceMonth: c.reference_month, amount: c.amount, dueDate: c.due_date, daysLate: c.days_late, paymentLink: c.payment_link },
               today,
             );
+            const wa = whatsappLink(c.contact_phone, msg);
             return (
               <li key={c.id} className="card flex flex-wrap items-center gap-3">
                 <div className="mr-auto">
@@ -80,9 +81,13 @@ function Lista({ titulo, itens, today, onOpenStore, vazio }: { titulo: string; i
                     {c.contact_name} · {formatPhone(c.contact_phone)}
                   </p>
                 </div>
-                <a className="btn-verde" href={whatsappLink(c.contact_phone, msg)} target="_blank" rel="noreferrer">
-                  <MessageCircle className="h-4 w-4" /> WhatsApp
-                </a>
+                {wa ? (
+                  <a className="btn-verde" href={wa} target="_blank" rel="noreferrer">
+                    <MessageCircle className="h-4 w-4" /> WhatsApp
+                  </a>
+                ) : (
+                  <span className="text-xs text-amber-700">WhatsApp do contato inválido: corrija na assinatura da loja.</span>
+                )}
               </li>
             );
           })}

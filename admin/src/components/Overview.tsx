@@ -1,5 +1,5 @@
 import type { AdminClient, Overview as OverviewData } from '../lib/api';
-import { dateBr, money } from '../lib/format';
+import { dateBr, money, trialDetail } from '../lib/format';
 import { Erro, Numero, useLoad } from './ui';
 
 export default function Overview({ client, today, irPara }: { client: AdminClient; today: string; irPara: (aba: 'lojas' | 'cobrancas') => void }) {
@@ -24,7 +24,12 @@ export default function Overview({ client, today, irPara }: { client: AdminClien
       </div>
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <Numero titulo="Ativas" valor={String(s.active)} />
-        <Numero titulo="Em teste" valor={String(s.trial)} detalhe={data.trials_ending_7d ? `${data.trials_ending_7d} terminam em até 7 dias` : undefined} />
+        <Numero
+          titulo="Em teste"
+          valor={String(s.trial)}
+          detalhe={trialDetail(data.trials_ending_7d, data.trials_expired ?? 0)}
+          destaque={data.trials_expired ? 'vermelho' : undefined}
+        />
         <Numero titulo="Suspensas" valor={String(s.suspended)} />
         <Numero titulo="Canceladas" valor={String(s.cancelled)} />
         <Numero titulo="Sem assinatura" valor={String(s.without_subscription)} detalhe={s.without_subscription ? 'Lojas criadas à mão: cadastre a assinatura' : undefined} />

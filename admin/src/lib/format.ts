@@ -8,19 +8,37 @@ export function money(value: number | null | undefined): string {
 }
 
 /**
- * Valor digitado ("199", "199,9", "1.299,90", "199.90") para o texto que vai ao banco
- * ("199.90"), sem passar por número de ponto flutuante. null = inválido.
+ * Valor digitado para o texto que vai ao banco ("199.90"), sem passar por número de ponto
+ * flutuante. Aceita "199", "199,9", "1.299,90", "199.90", "1.5" e "R$ 1.299.000" (milhar com
+ * ponto e sem vírgula, a partir de dois grupos). null = inválido ou ambíguo: "1.500" pode
+ * ser mil e quinhentos ou um e meio, e "0.999", "12.34,5" ou "1.2.3,4" não têm leitura segura.
  */
 export function parseMoneyInput(raw: string): string | null {
-  let s = raw.trim().replace(/^R\$\s*/i, '').replace(/\s/g, '');
+  const s = raw.trim().replace(/^R\$/i, '').replace(/\s/g, '');
   if (!s) return null;
-  if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
-  else if (/^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
-  const m = /^(\d{1,6})(?:\.(\d{1,2}))?$/.exec(s);
+  let norm: string;
+  if (/^\d{1,3}(\.\d{3})*,\d{1,2}$/.test(s) || /^\d+,\d{1,2}$/.test(s)) norm = s.replace(/\./g, '').replace(',', '.');
+  else if (/^\d+$/.test(s) || /^\d+\.\d{1,2}$/.test(s)) norm = s;
+  else if (/^[1-9]\d{0,2}(\.\d{3})+$/.test(s) && !AMBIGUOUS_MONEY.test(s)) norm = s.replace(/\./g, '');
+  else return null;
+  const m = /^(\d{1,6})(?:\.(\d{1,2}))?$/.exec(norm);
   if (!m) return null;
   const reais = String(Number(m[1]));
   const cents = (m[2] ?? '').padEnd(2, '0');
   return `${reais}.${cents}`;
+}
+
+/** "1.500": ponto de milhar ou decimal com três casas? Não dá para saber. */
+const AMBIGUOUS_MONEY = /^\d{1,3}\.\d{3}$/;
+
+/** Mensagem para um valor que parseMoneyInput recusou (o caso ambíguo tem a sua). */
+export function moneyInputError(raw: string, fallback: string): string {
+  const s = raw.trim().replace(/^R\$/i, '').replace(/\s/g, '');
+  if (AMBIGUOUS_MONEY.test(s)) {
+    const [a, b] = s.split('.');
+    return `"${s}" é ambíguo: escreva ${s},00 ou ${a}${b}.`;
+  }
+  return fallback;
 }
 
 /** Texto do banco ("199.90") ou número (199.9) para centavos inteiros. */
@@ -70,39 +88,74 @@ export function onlyDigits(s: string): string {
   return s.replace(/\D/g, '');
 }
 
+/**
+ * CNPJ como o banco guarda (tchefood_admin_clean_cnpj): só letras e números, letras em
+ * maiúsculas. Vale para o numérico e para o alfanumérico da Receita Federal (2026).
+ */
+export function cleanCnpj(raw: string): string {
+  return raw.replace(/[^0-9A-Za-z]/g, '').toUpperCase();
+}
+
+/** XX.XXX.XXX/XXXX-XX (numérico ou alfanumérico); fora do formato, devolve como veio. */
 export function formatCnpj(cnpj: string): string {
-  const d = onlyDigits(cnpj);
+  const d = cleanCnpj(cnpj);
   if (d.length !== 14) return cnpj;
   return `${d.slice(0, 2)}.${d.slice(2, 5)}.${d.slice(5, 8)}/${d.slice(8, 12)}-${d.slice(12)}`;
 }
 
-/** Mesma regra do banco (tchefood_admin_cnpj_valid). */
+/**
+ * Mesma regra do banco (tchefood_admin_cnpj_valid): 12 posições de 0-9 ou A-Z e 2 dígitos
+ * verificadores numéricos; cada posição vale o código ASCII menos 48 (dígito = ele mesmo,
+ * A = 17 ... Z = 42), com os pesos de sempre.
+ */
 export function validCnpj(raw: string): boolean {
-  const d = onlyDigits(raw);
-  if (d.length !== 14 || /^(\d)\1{13}$/.test(d)) return false;
+  const d = cleanCnpj(raw);
+  if (!/^[0-9A-Z]{12}[0-9]{2}$/.test(d) || /^(.)\1{13}$/.test(d)) return false;
   const digit = (len: number) => {
     const w = len === 12 ? [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2] : [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
     let s = 0;
-    for (let i = 0; i < len; i++) s += Number(d[i]) * w[i]!;
+    for (let i = 0; i < len; i++) s += (d.charCodeAt(i) - 48) * w[i]!;
     const r = s % 11;
     return r < 2 ? 0 : 11 - r;
   };
   return digit(12) === Number(d[12]) && digit(13) === Number(d[13]);
 }
 
+/** Busca da lista de lojas: o CNPJ bate com o que foi digitado (com ou sem pontuação, letras inclusas). */
+export function cnpjMatches(cnpj: string, query: string): boolean {
+  const q = cleanCnpj(query);
+  return q.length >= 3 && cleanCnpj(cnpj).includes(q);
+}
+
+/** Mesma regra do banco (tchefood_admin_check_contact): DDD + 8 ou 9 dígitos, com ou sem o 55. */
+export function validPhone(raw: string): boolean {
+  return /^(55)?[1-9][0-9]{9,10}$/.test(onlyDigits(raw));
+}
+
+/** Número nacional (DDD + número), sem o 55; null quando não é um telefone válido. */
+function nationalPhone(phone: string): string | null {
+  const d = onlyDigits(phone);
+  if (!validPhone(d)) return null;
+  if (d.length === 10 || d.length === 11) return d;
+  return d.slice(2);
+}
+
 export function formatPhone(phone: string): string {
-  let d = onlyDigits(phone);
-  if (d.length >= 12 && d.startsWith('55')) d = d.slice(2);
-  if (d.length === 11) return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
-  if (d.length === 10) return `(${d.slice(0, 2)}) ${d.slice(2, 6)}-${d.slice(6)}`;
+  const d = nationalPhone(phone);
+  if (d?.length === 11) return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
+  if (d?.length === 10) return `(${d.slice(0, 2)}) ${d.slice(2, 6)}-${d.slice(6)}`;
   return phone;
 }
 
-/** Link do WhatsApp com a mensagem pronta (DDI 55 quando o número veio só com DDD). */
-export function whatsappLink(phone: string, message: string): string {
-  let d = onlyDigits(phone);
-  if (d.length === 10 || d.length === 11) d = `55${d}`;
-  return `https://wa.me/${d}?text=${encodeURIComponent(message)}`;
+/**
+ * Link do WhatsApp com a mensagem pronta. O DDI 55 entra só quando o número veio com DDD e
+ * 8 ou 9 dígitos (10 ou 11 no total); 12 ou 13 dígitos só valem começando por 55.
+ * null = telefone inválido (a tela não oferece o link).
+ */
+export function whatsappLink(phone: string, message: string): string | null {
+  const d = nationalPhone(phone);
+  if (!d) return null;
+  return `https://wa.me/55${d}?text=${encodeURIComponent(message)}`;
 }
 
 export interface ChargeMessageInput {
@@ -152,7 +205,26 @@ export const METHOD_LABEL: Record<string, string> = {
 
 /** E-mail sugerido para a conta do aparelho da loja (não precisa receber e-mail). */
 export function suggestedDeviceEmail(cnpj: string): string {
-  return `loja-${onlyDigits(cnpj)}@aparelho.tchefood.com.br`;
+  return `loja-${cleanCnpj(cnpj).toLowerCase()}@aparelho.tchefood.com.br`;
+}
+
+/** Linha de detalhe do card "Em teste" na visão geral. */
+export function trialDetail(endingIn7d: number, expired: number): string | undefined {
+  const parts: string[] = [];
+  if (expired) parts.push(`${expired} com teste vencido`);
+  if (endingIn7d) parts.push(`${endingIn7d} terminam em até 7 dias`);
+  return parts.length ? parts.join(' · ') : undefined;
+}
+
+/** Mês de um campo type="month": só "AAAA-MM" com mês de 01 a 12. */
+export function validMonthInput(v: string): boolean {
+  const m = /^(\d{4})-(\d{2})$/.exec(v);
+  return !!m && Number(m[2]) >= 1 && Number(m[2]) <= 12;
+}
+
+/** Preço do plano no formato do campo de mensalidade ("199,90"). */
+export function priceInput(value: number): string {
+  return value.toFixed(2).replace('.', ',');
 }
 
 /** Dias entre duas datas "AAAA-MM-DD" (b - a). */

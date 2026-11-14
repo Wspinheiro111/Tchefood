@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import type { AdminClient, Plan } from '../lib/api';
-import { money, parseMoneyInput, validCnpj } from '../lib/format';
+import { cleanCnpj, money, moneyInputError, parseMoneyInput, validCnpj, validPhone } from '../lib/format';
 import { Campo, Erro, errorText, useLoad } from './ui';
 
 export default function NewStoreForm({ client, onCancel, onCreated }: { client: AdminClient; onCancel: () => void; onCreated: (id: string) => void }) {
@@ -17,12 +17,13 @@ export default function NewStoreForm({ client, onCancel, onCreated }: { client: 
     ev.preventDefault();
     setErro(null);
     if (!validCnpj(f.cnpj)) return setErro('CNPJ inválido.');
+    if (!validPhone(f.contactPhone)) return setErro('WhatsApp inválido: use DDD + número, com 10 ou 11 dígitos (ex.: (55) 99653-8255), com ou sem o 55 na frente.');
     const price = f.price.trim() ? parseMoneyInput(f.price) : null;
-    if (f.price.trim() && price === null) return setErro('Preço inválido (ex.: 199,90).');
+    if (f.price.trim() && price === null) return setErro(moneyInputError(f.price, 'Preço inválido (ex.: 199,90).'));
     setEnviando(true);
     try {
       const id = await client.createStore({
-        name: f.name, legalName: f.legalName, cnpj: f.cnpj, city: f.city, state: f.state, planId: f.planId, monthlyPrice: price,
+        name: f.name, legalName: f.legalName, cnpj: cleanCnpj(f.cnpj), city: f.city, state: f.state, planId: f.planId, monthlyPrice: price,
         billingDay: Number(f.billingDay), trialDays: Number(f.trialDays), contactName: f.contactName, contactPhone: f.contactPhone,
         contactEmail: f.contactEmail, notes: f.notes,
       });
@@ -41,7 +42,7 @@ export default function NewStoreForm({ client, onCancel, onCreated }: { client: 
       <div className="grid gap-3 sm:grid-cols-2">
         <Campo rotulo="Nome da loja"><input className="campo" value={f.name} onChange={set('name')} required /></Campo>
         <Campo rotulo="Razão social"><input className="campo" value={f.legalName} onChange={set('legalName')} required /></Campo>
-        <Campo rotulo="CNPJ"><input className="campo" inputMode="numeric" value={f.cnpj} onChange={set('cnpj')} required /></Campo>
+        <Campo rotulo="CNPJ" dica="Numérico ou alfanumérico (letras e números)."><input className="campo" autoCapitalize="characters" value={f.cnpj} onChange={set('cnpj')} required /></Campo>
         <div className="grid grid-cols-[1fr_5rem] gap-2">
           <Campo rotulo="Cidade"><input className="campo" value={f.city} onChange={set('city')} /></Campo>
           <Campo rotulo="UF"><input className="campo" maxLength={2} value={f.state} onChange={set('state')} /></Campo>

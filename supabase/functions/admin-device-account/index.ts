@@ -19,7 +19,7 @@ const CORS = {
 };
 
 function json(body: unknown, status: number): Response {
-  return new Response(JSON.stringify(body), { status, headers: { ...CORS, 'Content-Type': 'application/json' } });
+  return new Response(JSON.stringify(body), { status, headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
 }
 
 Deno.serve(async (req: Request) => {
@@ -63,6 +63,7 @@ Deno.serve(async (req: Request) => {
         },
       },
       randomPassword: () => randomPasswordFrom((a) => crypto.getRandomValues(a)),
+      newOpId: () => crypto.randomUUID(),
     });
     return json(result.body, result.status);
   } catch (error) {

@@ -16,6 +16,8 @@ const ROOT = join(__dirname, '..', '..');
 const ADMIN = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OTHER_USER = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const HAND_TENANT = '11111111-1111-4111-8111-111111111111';
+const OP_A = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const OP_B = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const CFG = { url: 'http://cloud.test', anonKey: 'anon' };
 
 function applySchema(t: PgTarget, db: string): void {
@@ -125,6 +127,14 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     await rejects(admin().createStore(store({ cnpj: '11111111111111' })), /CNPJ inválido/);
     await rejects(admin().createStore(store({ billingDay: 31 })), /dia de cobrança entre 1 e 28/);
     await rejects(admin().createStore(store({ contactPhone: '9965' })), /telefone/);
+    // 12 ou 13 dígitos só com o DDI 55 na frente (senão o link do WhatsApp vai para outro país).
+    await rejects(admin().createStore(store({ contactPhone: '125599653825' })), /telefone/);
+    await rejects(admin().createStore(store({ contactPhone: '1255996538255' })), /telefone/);
+    await rejects(admin().createStore(store({ contactPhone: '(05) 9965-3825' })), /telefone/);
+    await rejects(admin().createStore(store({ city: 'x'.repeat(101) })), /cidade com até 100/);
+    // CNPJ alfanumérico (Receita Federal): dígito trocado é recusado.
+    await rejects(admin().createStore(store({ cnpj: '00.000.000/E08G-13' })), /CNPJ inválido/);
+    await rejects(admin().createStore(store({ cnpj: '00.000.000/E08G-1A' })), /CNPJ inválido/);
     await rejects(admin().createStore(store({ planId: 'nao-existe' })), /plano inválido/);
     expect(sql(`SELECT count(*) FROM tenants`)).toBe('1');
 
@@ -141,6 +151,14 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     // Sem dias de teste: começa ativa, com o preço negociado.
     const active = await admin().createStore(store({ cnpj: '12345678000195', name: 'Churrascaria Ativa', trialDays: 0, monthlyPrice: '149.90' }));
     expect((await admin().store(active)).subscription).toMatchObject({ status: 'ACTIVE', monthly_price: 149.9, trial_ends_on: null });
+
+    // CNPJ alfanumérico, digitado com letras minúsculas e pontuação: gravado normalizado.
+    const alfa = await admin().createStore(store({ cnpj: '00.000.000/e08g-12', name: 'Pastelaria Alfa', contactPhone: '+55 (55) 99653-8255' }));
+    const da = await admin().store(alfa);
+    expect(da.cnpj).toBe('00000000E08G12');
+    expect(da.subscription!.contact_phone).toBe('5555996538255');
+    await rejects(admin().createStore(store({ cnpj: '00000000E08G12', name: 'Repetida' })), /já existe loja com este CNPJ/);
+    expect(await admin().createStore(store({ cnpj: '12.ABC.345/01DE-35', name: 'Pastelaria Beta', trialDays: 0, monthlyPrice: '0.00' }))).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   it('loja feita à mão no Supabase aparece sem assinatura; assinatura criada com motivo', async () => {
@@ -165,7 +183,10 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
   it('cobrança: uma por mês, pagamento só com o valor exato e referência; pagar ativa a loja em teste; reenvio não duplica', async () => {
     await rejects(admin().createCharge(tenant, '2026-11-01', '0', null, null), /valor da cobrança inválido/);
     await rejects(admin().createCharge(tenant, '2026-11-01', null, null, 'http://inseguro.com'), /https/);
+    // Criada no dia 5 (antes do vencimento do dia 10).
+    setToday('2026-11-05');
     const chargeId = await admin().createCharge(tenant, '2026-11-14', null, null, 'https://www.asaas.com/i/abc');
+    setToday('2026-11-14');
     let charge = (await admin().store(tenant)).charges[0]!;
     expect(charge).toMatchObject({ id: chargeId, reference_month: '2026-11-01', amount: 199, due_date: '2026-11-10', status: 'OPEN' });
     await rejects(admin().createCharge(tenant, '2026-11-20', null, null, null), /já existe cobrança deste mês/);
@@ -180,6 +201,7 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     await rejects(admin().recordPayment(chargeId, '190.00', '2026-11-13', 'PIX', 'E123456789'), /diferente do valor da cobrança/);
     await rejects(admin().recordPayment(chargeId, '199.00', '2026-11-13', 'PIX', ' ab '), /referência/);
     await rejects(admin().recordPayment(chargeId, '199.00', '2026-11-15', 'PIX', 'E123456789'), /futura/);
+    await rejects(admin().recordPayment(chargeId, '199.00', '1990-01-01', 'PIX', 'E123456789'), /muito antes do mês/);
     await rejects(admin().recordPayment(chargeId, '199.00', '2026-11-13', 'CHEQUE' as never, 'E123456789'), /forma de pagamento/);
     expect(sql(`SELECT status FROM store_charges WHERE id = '${chargeId}'`)).toBe('OPEN');
 
@@ -200,9 +222,17 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     expect(psql(target!, `UPDATE store_charges SET amount = 1 WHERE id = '${chargeId}'`, DB).message).toMatch(/já está fechada/);
     expect(psql(target!, `DELETE FROM store_charges WHERE id = '${chargeId}'`, DB).message).toMatch(/não é apagada/);
 
-    // A mesma referência não quita outra cobrança.
+    // A mesma referência não quita outra cobrança, nem lançada com outra forma de pagamento.
     const dec = await admin().createCharge(tenant, '2026-12-01', null, null, null);
     await rejects(admin().recordPayment(dec, '199.00', '2026-11-14', 'PIX', 'E123456789'), /já quitou outra cobrança/);
+    await rejects(admin().recordPayment(dec, '199.00', '2026-11-14', 'TRANSFERENCIA', 'e123456789'), /já quitou outra cobrança/);
+    await rejects(admin().recordPayment(dec, '199.00', '2026-11-14', 'BOLETO', ' E123456789 '), /já quitou outra cobrança/);
+    // Mesmo pulando a checagem da função, o índice único recusa.
+    expect(psql(target!, `UPDATE store_charges SET status = 'PAID', paid_on = '2026-11-14', paid_amount = amount, payment_method = 'DINHEIRO',
+        payment_reference = 'E123456789', paid_at = NOW(), paid_by = '${ADMIN}' WHERE id = '${dec}'`, DB).message).toMatch(/duplicate key|store_charges_payment_reference_once/);
+    // Mês fora do período (erro de digitação) é recusado.
+    await rejects(admin().createCharge(tenant, '1990-01-01', null, null, null), /fora do período/);
+    await rejects(admin().generateMonth('2199-12-01'), /fora do período/);
     // Cobrança em aberto: valor e vencimento não mudam direto; cancelamento pede motivo.
     expect(psql(target!, `UPDATE store_charges SET amount = 1 WHERE id = '${dec}'`, DB).message).toMatch(/não mudam/);
     await rejects(admin().cancelCharge(dec, 'ok'), /motivo/);
@@ -215,6 +245,17 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     expect(psql(target!, `UPDATE platform_admin_audit SET reason = 'x'`, DB).message).toMatch(/só recebe linhas novas/);
     expect(psql(target!, `DELETE FROM platform_admin_audit`, DB).message).toMatch(/só recebe linhas novas/);
     expect(psql(target!, `TRUNCATE platform_admin_audit`, DB).message).toMatch(/só recebe linhas novas/);
+    expect(psql(target!, `TRUNCATE store_charges CASCADE`, DB).message).toMatch(/não é apagada/);
+    expect(psql(target!, `TRUNCATE store_subscriptions CASCADE`, DB).message).toMatch(/não é apagada/);
+  });
+
+  it('cobrança avulsa criada depois do dia de cobrança vence hoje, não nasce vencida', async () => {
+    const t = await admin().createStore(store({ cnpj: '04.252.011/0001-10', name: 'Bar do Meio do Mês', trialDays: 0, monthlyPrice: '99.00', billingDay: 3 }));
+    const id = await admin().createCharge(t, '2026-11-01', null, null, null);
+    expect(sql(`SELECT due_date FROM store_charges WHERE id = '${id}'`)).toBe('2026-11-14');
+    expect((await admin().chargesDue(0)).find((d) => d.id === id)).toMatchObject({ days_late: 0 });
+    await admin().cancelCharge(id, 'Teste de vencimento');
+    sql(`UPDATE store_subscriptions SET status = 'CANCELLED' WHERE tenant_id = '${t}'`);
   });
 
   it('loja suspensa volta a ativa ao pagar; cancelada não gera cobrança', async () => {
@@ -224,21 +265,53 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
       contactName: sub.contact_name, contactPhone: sub.contact_phone, contactEmail: sub.contact_email ?? '', notes: '',
     };
     await admin().saveSubscription(tenant, { ...base, status: 'SUSPENDED', reason: 'Atraso de janeiro' });
+    // A cobrança de dezembro (refeita no teste anterior) fica fora: cancelada.
+    const decOpen = sql(`SELECT id FROM store_charges WHERE tenant_id = '${tenant}' AND reference_month = '2026-12-01' AND status = 'OPEN'`);
+    await admin().cancelCharge(decOpen, 'Cortesia de dezembro');
+    setToday('2027-01-01');
     const jan = await admin().createCharge(tenant, '2027-01-01', null, null, null);
-    setToday('2027-01-20');
-    expect(await admin().recordPayment(jan, '199.00', '2027-01-20', 'BOLETO', '00190000090')).toMatchObject({ subscription_status: 'ACTIVE' });
+    setToday('2027-02-01');
+    const feb = await admin().createCharge(tenant, '2027-02-01', null, null, null);
+    setToday('2027-02-20');
+    // Pagar janeiro com fevereiro vencido não reativa; pagar o último vencido reativa.
+    expect(await admin().recordPayment(jan, '199.00', '2027-02-20', 'BOLETO', '00190000090')).toMatchObject({ subscription_status: 'SUSPENDED' });
+    expect(await admin().recordPayment(feb, '199.00', '2027-02-20', 'BOLETO', '00190000091')).toMatchObject({ subscription_status: 'ACTIVE' });
     await admin().saveSubscription(tenant, { ...base, status: 'CANCELLED', reason: 'Loja fechou' });
-    await rejects(admin().createCharge(tenant, '2027-02-01', null, null, null), /cancelada não gera cobrança/);
+    await rejects(admin().createCharge(tenant, '2027-03-01', null, null, null), /cancelada não gera cobrança/);
     setToday('2026-11-14');
   });
 
-  it('cobranças do mês em lote: só lojas ativas com preço, sem repetir', async () => {
+  it('cobranças do mês em lote: ativas com preço e testes que terminam no mês, sem repetir nem refazer cancelada', async () => {
+    setToday('2027-03-01');
+    // Pastelaria Alfa: em teste até 29/11/2026, já terminado; entra no lote.
     const created = await admin().generateMonth('2027-03-15');
-    // Ativas com preço: só a "Churrascaria Ativa" (a do teste foi cancelada; o Flip é cortesia).
-    expect(created).toBe(1);
+    // Ativas com preço: "Churrascaria Ativa"; teste terminado: "Pastelaria Alfa" (a do teste foi
+    // cancelada; Flip e Beta são cortesia).
+    expect(created).toBe(2);
     expect(await admin().generateMonth('2027-03-01')).toBe(0);
     const row = sql(`SELECT amount || ' ' || due_date FROM store_charges c JOIN tenants t ON t.id = c.tenant_id WHERE t.cnpj = '12345678000195' AND reference_month = '2027-03-01'`);
     expect(row).toBe('149.90 2027-03-10');
+    // Cancelada (cortesia do mês) não volta no próximo lote.
+    const ativa = sql(`SELECT id FROM store_charges c WHERE reference_month = '2027-03-01' AND tenant_id = (SELECT id FROM tenants WHERE cnpj = '12345678000195')`);
+    await admin().cancelCharge(ativa, 'Cortesia de março');
+    expect(await admin().generateMonth('2027-03-01')).toBe(0);
+    // Gerado no meio do mês: vencimento não fica no passado.
+    setToday('2027-04-15');
+    expect(await admin().generateMonth('2027-04-01')).toBe(2);
+    expect(sql(`SELECT due_date FROM store_charges c WHERE reference_month = '2027-04-01' AND tenant_id = (SELECT id FROM tenants WHERE cnpj = '12345678000195')`)).toBe('2027-04-15');
+    setToday('2026-11-14');
+  });
+
+  it('testes: terminando em 7 dias conta só os que ainda não terminaram; vencidos à parte', async () => {
+    // Em 14/11: Pastelaria Alfa termina 29/11 (fora dos 7 dias). Põe uma que terminou e uma que termina em 3 dias.
+    const ended = await admin().createStore(store({ cnpj: '06.990.590/0001-23', name: 'Teste Vencido', trialDays: 1 }));
+    sql(`UPDATE store_subscriptions SET trial_ends_on = '2026-11-01' WHERE tenant_id = '${ended}'`);
+    const soon = await admin().createStore(store({ cnpj: '33.000.167/0001-01', name: 'Teste Acabando', trialDays: 3 }));
+    const today = await admin().createStore(store({ cnpj: '60.746.948/0001-12', name: 'Teste Hoje', trialDays: 1 }));
+    sql(`UPDATE store_subscriptions SET trial_ends_on = '2026-11-14' WHERE tenant_id = '${today}'`);
+    const ov = (await admin().overview()) as unknown as Record<string, unknown>;
+    expect(ov).toMatchObject({ trials_ending_7d: 2, trials_expired: 1 });
+    for (const t of [ended, soon, today]) sql(`UPDATE store_subscriptions SET status = 'CANCELLED' WHERE tenant_id = '${t}'`);
   });
 
   it('conta do aparelho: reserva repetida devolve a mesma; confirmação só com o id reservado', async () => {
@@ -263,12 +336,30 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     expect(r3.body.user_id).not.toBe(r1.body.user_id);
     expect(sql(`SELECT details->>'replaced_email' FROM platform_admin_audit WHERE action = 'DEVICE_ACCOUNT_RESERVED' ORDER BY created_at DESC LIMIT 1`)).toBe('loja-12345678000195@aparelho.tchefood.com.br');
     // O e-mail antigo fica livre para outra loja.
-    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: r1.body.user_id, p_action: 'CREATED' })).body.message).toMatch(/não confere/);
+    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: r1.body.user_id, p_action: 'CREATED', p_op: OP_A })).body.message).toMatch(/não confere/);
     const r4 = await call('tchefood_admin_reserve_device', { p_tenant: active, p_email: 'Loja-12345678000195@aparelho.tchefood.com.br', p_replace_user_id: r3.body.user_id });
     expect(r4.body.email).toBe('loja-12345678000195@aparelho.tchefood.com.br');
     r1.body.user_id = r4.body.user_id;
-    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: OTHER_USER, p_action: 'CREATED' })).body.message).toMatch(/não confere/);
-    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: r1.body.user_id, p_action: 'CREATED' })).status).toBe(200);
+    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: OTHER_USER, p_action: 'CREATED', p_op: OP_A })).body.message).toMatch(/não confere/);
+
+    // Uma operação por vez: com a vez de A, a operação B é recusada e não confirma.
+    expect((await call('tchefood_admin_device_lock', { p_tenant: active, p_op: OP_A })).status).toBe(200);
+    expect((await call('tchefood_admin_device_lock', { p_tenant: active, p_op: OP_A })).status).toBe(200); // repetir a mesma vez
+    const lb = await call('tchefood_admin_device_lock', { p_tenant: active, p_op: OP_B });
+    expect(lb.body.message).toMatch(/em andamento/);
+    expect(lb.body.code).toBe('55P03');
+    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: r1.body.user_id, p_action: 'CREATED', p_op: OP_B })).body.message).toMatch(/outra operação/);
+    // Estado errado também é recusado (trocar senha de conta ainda pendente).
+    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: r1.body.user_id, p_action: 'PASSWORD_RESET', p_op: OP_A })).body.message).toMatch(/mudou de estado/);
+    // Devolver a vez só vale para a própria operação.
+    await call('tchefood_admin_device_unlock', { p_tenant: active, p_op: OP_B });
+    expect(sql(`SELECT device_op_id FROM store_subscriptions WHERE tenant_id = '${active}'`)).toBe(OP_A);
+    // Vez vencida (função que caiu há mais de 10 minutos) pode ser tomada.
+    sql(`UPDATE store_subscriptions SET device_op_started_at = NOW() - INTERVAL '11 minutes' WHERE tenant_id = '${active}'`);
+    expect((await call('tchefood_admin_device_lock', { p_tenant: active, p_op: OP_B })).status).toBe(200);
+    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: r1.body.user_id, p_action: 'CREATED', p_op: OP_A })).body.message).toMatch(/outra operação/);
+    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: r1.body.user_id, p_action: 'CREATED', p_op: OP_B })).status).toBe(200);
+    expect(sql(`SELECT COALESCE(device_op_id::text, 'livre') FROM store_subscriptions WHERE tenant_id = '${active}'`)).toBe('livre');
     expect((await admin().store(active)).subscription).toMatchObject({ device_status: 'READY', device_email: 'loja-12345678000195@aparelho.tchefood.com.br' });
     // Conta pronta nunca é trocada.
     expect((await call('tchefood_admin_reserve_device', { p_tenant: active, p_email: 'x@y.com', p_replace_user_id: r1.body.user_id })).body.message).toMatch(/reserva da conta do aparelho mudou/);
@@ -278,9 +369,26 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     expect(r.status).toBe(403);
   });
 
-  it('uso da loja: última venda e pedidos dos últimos 7 dias', async () => {
-    const rows = await admin().stores();
-    const hand = rows.find((x) => x.tenant_id === HAND_TENANT)!;
+  it('uso da loja: última venda e pedidos dos últimos 7 dias, sem cancelado, com delivery', async () => {
+    let hand = (await admin().stores()).find((x) => x.tenant_id === HAND_TENANT)!;
     expect(hand).toMatchObject({ last_order_at: null, orders_7d: 0, staff_active: 0 });
+    // Venda válida ontem e pedido cancelado aberto hoje: a última venda continua a de ontem.
+    // (sem mesa nem garçom de verdade: chaves estrangeiras desligadas só nesta inserção)
+    sql(`SET session_replication_role = replica;
+         INSERT INTO orders (tenant_id, table_id, opened_by_user_id, status, opened_at) VALUES
+           ('${HAND_TENANT}', gen_random_uuid(), gen_random_uuid(), 'CLOSED', NOW() - INTERVAL '1 day'),
+           ('${HAND_TENANT}', gen_random_uuid(), gen_random_uuid(), 'CANCELED', NOW());
+         INSERT INTO delivery_orders (tenant_id, channel, external_id, display_id, status, total_amount, payload, placed_at, last_event_at) VALUES
+           ('${HAND_TENANT}', 'ifood', 'ext-1', '1001', 'concluded', 50, '{}', NOW() - INTERVAL '3 days', NOW()),
+           ('${HAND_TENANT}', 'ifood', 'ext-2', '1002', 'cancelled', 50, '{}', NOW() - INTERVAL '1 hour', NOW()),
+           ('${HAND_TENANT}', 'ifood', 'ext-3', '1003', 'concluded', 50, '{}', NOW() - INTERVAL '20 days', NOW());`);
+    hand = (await admin().stores()).find((x) => x.tenant_id === HAND_TENANT)!;
+    const yesterday = sql(`SELECT max(opened_at) FROM orders WHERE tenant_id = '${HAND_TENANT}' AND status = 'CLOSED'`);
+    expect(new Date(hand.last_order_at!).getTime()).toBe(new Date(yesterday.replace(' ', 'T').replace(/([+-]\d\d)$/, '$1:00')).getTime());
+    // Salão de ontem + delivery de 3 dias; o delivery cancelado não conta.
+    expect(hand.orders_7d).toBe(2);
+    const detail = await admin().store(HAND_TENANT);
+    expect(detail.last_order_at).toBe(hand.last_order_at);
+    expect(detail).toMatchObject({ orders_7d: 2, orders_30d: 3 });
   });
 });

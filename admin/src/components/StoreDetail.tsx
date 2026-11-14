@@ -3,7 +3,7 @@ import { ArrowLeft, Copy, KeyRound, MessageCircle } from 'lucide-react';
 import type { AdminClient, Charge, DeviceAccountResult, PaymentMethod, Plan, StoreDetail as Detail, SubscriptionStatus } from '../lib/api';
 import {
   METHOD_LABEL, STATUS_LABEL, chargeMessage, dateBr, dateTimeBr, daysBetween, formatCnpj, formatPhone, money, monthBr, monthStart,
-  parseMoneyInput, suggestedDeviceEmail, toCents, whatsappLink,
+  moneyInputError, parseMoneyInput, priceInput, suggestedDeviceEmail, toCents, validMonthInput, validPhone, whatsappLink,
 } from '../lib/format';
 import { Aviso, Campo, Erro, Numero, Selo, errorText, useLoad } from './ui';
 
@@ -77,7 +77,7 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
   const s = detail.subscription;
   const initial = () => ({
     planId: s?.plan_id ?? 'salao-pro',
-    price: s ? String(s.monthly_price.toFixed(2)).replace('.', ',') : '',
+    price: s ? priceInput(s.monthly_price) : '',
     status: (s?.status ?? 'ACTIVE') as SubscriptionStatus,
     billingDay: String(s?.billing_day ?? 10),
     trialEndsOn: s?.trial_ends_on ?? '',
@@ -91,15 +91,26 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
   const [aberto, setAberto] = useState(!s);
   const [erro, setErro] = useState<string | null>(null);
   const [enviando, setEnviando] = useState(false);
-  // Recarregou a loja (salvou ou outra ação): o formulário volta aos dados do banco.
-  useEffect(() => setF(initial()), [detail]);
+  // Recarregou a loja (salvou ou outra ação): o resumo volta aos dados do banco. Com o
+  // formulário aberto não mexe: outra ação na tela (cobrança, conta do aparelho) recarrega a
+  // loja e não pode apagar o que está sendo digitado.
+  const editando = !s || aberto;
+  useEffect(() => {
+    if (!editando) setF(initial());
+  }, [detail]);
   const set = (k: keyof typeof f) => (e: { target: { value: string } }) => setF({ ...f, [k]: e.target.value });
+  // Trocar o plano põe o preço do plano novo na mensalidade (dá para editar depois).
+  const setPlano = (e: { target: { value: string } }) => {
+    const p = plans.find((x) => x.id === e.target.value);
+    setF({ ...f, planId: e.target.value, price: p ? priceInput(p.monthly_price) : f.price });
+  };
 
   async function salvar(ev: FormEvent) {
     ev.preventDefault();
     setErro(null);
     const price = parseMoneyInput(f.price || (plans.find((p) => p.id === f.planId)?.monthly_price.toFixed(2) ?? ''));
-    if (price === null) return setErro('Mensalidade inválida (ex.: 199,90).');
+    if (price === null) return setErro(moneyInputError(f.price, 'Mensalidade inválida (ex.: 199,90).'));
+    if (!validPhone(f.contactPhone)) return setErro('WhatsApp inválido: use DDD + número, com 10 ou 11 dígitos (ex.: (55) 99653-8255), com ou sem o 55 na frente.');
     setEnviando(true);
     try {
       await client.saveSubscription(detail.tenant_id, {
@@ -130,7 +141,16 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
           </p>
           {s.notes && <p className="text-slate-600">Obs.: {s.notes}</p>}
         </div>
-        <button type="button" className="btn-secundario" onClick={() => setAberto(true)}>Alterar</button>
+        <button
+          type="button"
+          className="btn-secundario"
+          onClick={() => {
+            setF(initial());
+            setAberto(true);
+          }}
+        >
+          Alterar
+        </button>
       </section>
     );
   }
@@ -141,14 +161,14 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
       {!s && <Aviso>Esta loja foi criada direto no Supabase e ainda não tem assinatura. Cadastre para cobrar e criar a conta do aparelho por aqui.</Aviso>}
       <div className="grid gap-3 sm:grid-cols-3">
         <Campo rotulo="Plano">
-          <select className="campo" value={f.planId} onChange={set('planId')}>
+          <select className="campo" aria-label="Plano" value={f.planId} onChange={setPlano}>
             {plans.map((p) => (
               <option key={p.id} value={p.id}>{p.name} · {money(p.monthly_price)}</option>
             ))}
           </select>
         </Campo>
         <Campo rotulo="Mensalidade" dica="Vazio = preço do plano. Zero = cortesia.">
-          <input className="campo" inputMode="decimal" value={f.price} onChange={set('price')} />
+          <input className="campo" aria-label="Mensalidade" inputMode="decimal" value={f.price} onChange={set('price')} />
         </Campo>
         <Campo rotulo="Situação">
           <select className="campo" value={f.status} onChange={set('status')}>
@@ -160,11 +180,11 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
         <Campo rotulo="Dia de vencimento (1 a 28)"><input className="campo" type="number" min={1} max={28} value={f.billingDay} onChange={set('billingDay')} /></Campo>
         <Campo rotulo="Fim do teste"><input className="campo" type="date" value={f.trialEndsOn} onChange={set('trialEndsOn')} /></Campo>
         <Campo rotulo="Contato"><input className="campo" value={f.contactName} onChange={set('contactName')} /></Campo>
-        <Campo rotulo="WhatsApp (com DDD)"><input className="campo" value={f.contactPhone} onChange={set('contactPhone')} /></Campo>
+        <Campo rotulo="WhatsApp (com DDD)"><input className="campo" aria-label="WhatsApp" inputMode="tel" value={f.contactPhone} onChange={set('contactPhone')} /></Campo>
         <Campo rotulo="E-mail"><input className="campo" value={f.contactEmail} onChange={set('contactEmail')} /></Campo>
         <Campo rotulo="Observações"><input className="campo" value={f.notes} onChange={set('notes')} /></Campo>
       </div>
-      <Campo rotulo="Motivo da alteração (obrigatório)"><input className="campo" value={f.reason} onChange={set('reason')} placeholder="ex.: cliente pediu para trocar o vencimento" /></Campo>
+      <Campo rotulo="Motivo da alteração (obrigatório)"><input className="campo" aria-label="Motivo" value={f.reason} onChange={set('reason')} placeholder="ex.: cliente pediu para trocar o vencimento" /></Campo>
       <Erro>{erro}</Erro>
       <div className="flex gap-2">
         <button type="submit" className="btn-primario" disabled={enviando}>{enviando ? 'Salvando…' : 'Salvar'}</button>
@@ -177,17 +197,20 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
 function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; detail: Detail; onChanged: () => void }) {
   const s = detail.subscription!;
   const [email, setEmail] = useState(s.device_email ?? suggestedDeviceEmail(detail.cnpj));
-  const [res, setRes] = useState<DeviceAccountResult | null>(null);
+  const [res, setRes] = useState<(DeviceAccountResult & { action: 'create' | 'reset_password' }) | null>(null);
   const [erro, setErro] = useState<string | null>(null);
   const [enviando, setEnviando] = useState(false);
   const pronta = s.device_status === 'READY';
 
   async function run(action: 'create' | 'reset_password') {
+    // A senha de antes some já: nunca fica ao lado de um erro novo.
+    setRes(null);
     setErro(null);
     if (action === 'reset_password' && !window.confirm('Trocar a senha do aparelho? O aparelho da loja vai precisar entrar de novo em Retaguarda › Nuvem com a senha nova.')) return;
     setEnviando(true);
     try {
-      setRes(await client.deviceAccount(detail.tenant_id, action, action === 'create' ? email : undefined));
+      const r = await client.deviceAccount(detail.tenant_id, action, action === 'create' ? email : undefined);
+      setRes({ ...r, action });
       onChanged();
     } catch (e) {
       setErro(errorText(e));
@@ -219,6 +242,9 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
               <Copy className="h-3 w-3" /> copiar
             </button>
           </p>
+          {res.action === 'reset_password' && (
+            <p className="text-slate-700">O aparelho que estava conectado continua até o token atual vencer (até 1 hora); entre com a senha nova nele.</p>
+          )}
         </div>
       )}
       <Erro>{erro}</Erro>
@@ -239,7 +265,13 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
 
 function ChargesSection({ client, detail, today, onChanged }: { client: AdminClient; detail: Detail; today: string; onChanged: () => void }) {
   const s = detail.subscription!;
+  // Mês padrão = mês de hoje no servidor; acompanha a virada do mês enquanto ninguém mexeu no campo.
   const [mes, setMes] = useState(monthStart(today).slice(0, 7));
+  const [mesTocado, setMesTocado] = useState(false);
+  useEffect(() => {
+    if (!mesTocado) setMes(monthStart(today).slice(0, 7));
+  }, [today]);
+  const [cancelando, setCancelando] = useState<string | null>(null);
   const [valor, setValor] = useState('');
   const [vence, setVence] = useState('');
   const [link, setLink] = useState('');
@@ -250,8 +282,9 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
   async function criar(ev: FormEvent) {
     ev.preventDefault();
     setErro(null);
+    if (!validMonthInput(mes)) return setErro('Mês inválido: use AAAA-MM (ex.: 2026-11).');
     const amount = valor.trim() ? parseMoneyInput(valor) : null;
-    if (valor.trim() && amount === null) return setErro('Valor inválido (ex.: 199,90).');
+    if (valor.trim() && amount === null) return setErro(moneyInputError(valor, 'Valor inválido (ex.: 199,90).'));
     setEnviando(true);
     try {
       await client.createCharge(detail.tenant_id, `${mes}-01`, amount, vence || null, link || null);
@@ -267,14 +300,18 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
   }
 
   async function cancelar(c: Charge) {
+    if (cancelando) return;
     const motivo = window.prompt(`Motivo para cancelar a cobrança de ${monthBr(c.reference_month)} (${money(c.amount)}):`);
     if (motivo === null) return;
     setErro(null);
+    setCancelando(c.id);
     try {
       await client.cancelCharge(c.id, motivo);
       onChanged();
     } catch (e) {
       setErro(errorText(e));
+    } finally {
+      setCancelando(null);
     }
   }
 
@@ -283,8 +320,18 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
       <h2 className="font-bold text-slate-900">Cobranças</h2>
       {s.status !== 'CANCELLED' && (
         <form onSubmit={criar} className="grid gap-2 sm:grid-cols-5 sm:items-start">
-          <Campo rotulo="Mês"><input className="campo" type="month" value={mes} onChange={(e) => setMes(e.target.value)} required /></Campo>
-          <Campo rotulo="Valor" dica={`Vazio = ${money(s.monthly_price)}`}><input className="campo" inputMode="decimal" value={valor} onChange={(e) => setValor(e.target.value)} /></Campo>
+          <Campo rotulo="Mês"><input
+              className="campo"
+              aria-label="Mês"
+              type="month"
+              value={mes}
+              onChange={(e) => {
+                setMesTocado(true);
+                setMes(e.target.value);
+              }}
+              required
+            /></Campo>
+          <Campo rotulo="Valor" dica={`Vazio = ${money(s.monthly_price)}`}><input className="campo" aria-label="Valor" inputMode="decimal" value={valor} onChange={(e) => setValor(e.target.value)} /></Campo>
           <Campo rotulo="Vencimento" dica={`Vazio = dia ${s.billing_day}`}><input className="campo" type="date" value={vence} onChange={(e) => setVence(e.target.value)} /></Campo>
           <Campo rotulo="Link do boleto/Pix (Asaas)"><input className="campo" placeholder="https://…" value={link} onChange={(e) => setLink(e.target.value)} /></Campo>
           <button type="submit" className="btn-primario sm:mt-5" disabled={enviando}>Criar cobrança</button>
@@ -302,6 +349,10 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
             <tbody>
               {detail.charges.map((c) => {
                 const atraso = c.status === 'OPEN' ? Math.max(daysBetween(c.due_date, today), 0) : 0;
+                const wa = whatsappLink(
+                  s.contact_phone,
+                  chargeMessage({ contactName: s.contact_name, storeName: detail.name, referenceMonth: c.reference_month, amount: c.amount, dueDate: c.due_date, daysLate: atraso, paymentLink: c.payment_link }, today),
+                );
                 return (
                   <tr key={c.id}>
                     <td>{monthBr(c.reference_month)}</td>
@@ -322,19 +373,17 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
                     <td className="space-y-2 text-right">
                       {c.status === 'OPEN' && pagando !== c.id && (
                         <div className="flex flex-wrap justify-end gap-2">
-                          <a
-                            className="btn-secundario"
-                            target="_blank"
-                            rel="noreferrer"
-                            href={whatsappLink(
-                              s.contact_phone,
-                              chargeMessage({ contactName: s.contact_name, storeName: detail.name, referenceMonth: c.reference_month, amount: c.amount, dueDate: c.due_date, daysLate: atraso, paymentLink: c.payment_link }, today),
-                            )}
-                          >
-                            <MessageCircle className="h-4 w-4" /> WhatsApp
-                          </a>
-                          <button type="button" className="btn-verde" onClick={() => setPagando(c.id)}>Registrar pagamento</button>
-                          <button type="button" className="btn-secundario" onClick={() => cancelar(c)}>Cancelar</button>
+                          {wa ? (
+                            <a className="btn-secundario" target="_blank" rel="noreferrer" href={wa}>
+                              <MessageCircle className="h-4 w-4" /> WhatsApp
+                            </a>
+                          ) : (
+                            <span className="text-xs text-amber-700">WhatsApp do contato inválido: corrija na assinatura.</span>
+                          )}
+                          <button type="button" className="btn-verde" disabled={cancelando === c.id} onClick={() => setPagando(c.id)}>Registrar pagamento</button>
+                          <button type="button" className="btn-secundario" disabled={cancelando !== null} onClick={() => cancelar(c)}>
+                            {cancelando === c.id ? 'Cancelando…' : 'Cancelar'}
+                          </button>
                         </div>
                       )}
                       {pagando === c.id && (
@@ -373,7 +422,7 @@ function PaymentForm({ client, charge, today, onDone, onCancel }: { client: Admi
     ev.preventDefault();
     setErro(null);
     const pago = parseMoneyInput(valor);
-    if (pago === null) return setErro('Valor inválido.');
+    if (pago === null) return setErro(moneyInputError(valor, 'Valor inválido.'));
     if (toCents(pago) !== toCents(charge.amount)) return setErro(`O valor pago precisa ser o da cobrança (${money(charge.amount)}). Valor diferente: cancele e crie outra cobrança.`);
     setEnviando(true);
     try {
@@ -389,7 +438,7 @@ function PaymentForm({ client, charge, today, onDone, onCancel }: { client: Admi
   return (
     <form onSubmit={salvar} className="space-y-2 rounded-lg border border-borda p-3 text-left">
       <div className="grid gap-2 sm:grid-cols-2">
-        <Campo rotulo="Valor pago"><input className="campo" value={valor} onChange={(e) => setValor(e.target.value)} /></Campo>
+        <Campo rotulo="Valor pago"><input className="campo" aria-label="Valor pago" value={valor} onChange={(e) => setValor(e.target.value)} /></Campo>
         <Campo rotulo="Data do pagamento"><input className="campo" type="date" max={today} value={data} onChange={(e) => setData(e.target.value)} /></Campo>
         <Campo rotulo="Forma">
           <select className="campo" value={forma} onChange={(e) => setForma(e.target.value as PaymentMethod)}>

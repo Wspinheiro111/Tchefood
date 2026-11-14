@@ -80,15 +80,52 @@ export async function signIn(cfg: AdminConfig, email: string, password: string, 
   return sessionFrom(body, email.trim().toLowerCase(), now);
 }
 
+/**
+ * Troca o refresh token por um token novo. Só 400/401 do Auth (refresh token inválido,
+ * invalid_grant) vira AdminApiError(401), que encerra a sessão. Queda de rede vira status 0
+ * e 5xx/429 (ou outra resposta) vira 503: a sessão continua e a chamada pode ser repetida.
+ */
 export async function refreshSession(cfg: AdminConfig, session: Session, fetchFn: FetchLike, now = Date.now()): Promise<Session> {
-  const res = await fetchFn(`${normalizeUrl(cfg.url)}/auth/v1/token?grant_type=refresh_token`, {
-    method: 'POST',
-    headers: { apikey: cfg.anonKey, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ refresh_token: session.refreshToken }),
-  });
-  const body = await readJson(res);
-  if (!res.ok) throw new AdminApiError('Sessão expirada. Entre de novo.', 401);
-  return sessionFrom(body, session.email, now);
+  let res: Awaited<ReturnType<FetchLike>>;
+  let body: unknown;
+  try {
+    res = await fetchFn(`${normalizeUrl(cfg.url)}/auth/v1/token?grant_type=refresh_token`, {
+      method: 'POST',
+      headers: { apikey: cfg.anonKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: session.refreshToken }),
+    });
+    body = await readJson(res);
+  } catch {
+    throw new AdminApiError('Sem conexão com o servidor para renovar a sessão. Tente de novo.', 0);
+  }
+  if (res.status === 400 || res.status === 401) throw new AdminApiError('Sessão expirada. Entre de novo.', 401);
+  if (!res.ok) throw new AdminApiError('O servidor não renovou a sessão agora. Tente de novo em instantes.', 503);
+  try {
+    return sessionFrom(body, session.email, now);
+  } catch {
+    throw new AdminApiError('Resposta inválida ao renovar a sessão. Tente de novo.', 503);
+  }
+}
+
+/** Sai no servidor (revoga o refresh token). Melhor esforço: falha não impede sair da tela. */
+export async function signOut(cfg: AdminConfig, accessToken: string, fetchFn: FetchLike): Promise<void> {
+  try {
+    await fetchFn(`${normalizeUrl(cfg.url)}/auth/v1/logout`, {
+      method: 'POST',
+      headers: { apikey: cfg.anonKey, Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    });
+  } catch {
+    /* sem rede: o token vence sozinho em até 1 hora */
+  }
+}
+
+/** Nome do servidor de um endereço (o que recebe a senha); '' se o endereço não é válido. */
+export function hostOf(url: string): string {
+  try {
+    return new URL(normalizeUrl(url)).hostname;
+  } catch {
+    return '';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +215,10 @@ export interface Overview {
   overdue_amount: number;
   overdue_count: number;
   received_this_month: number;
+  /** Testes que terminam de hoje até daqui a 7 dias. */
   trials_ending_7d: number;
+  /** Lojas ainda em TRIAL com o fim do teste antes de hoje. */
+  trials_expired: number;
 }
 
 export interface DueCharge {
