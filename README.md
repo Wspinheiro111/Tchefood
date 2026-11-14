@@ -93,13 +93,31 @@ supabase db push                            # aplica supabase/migrations em orde
 ```
 As migrations rodam de novo sem erro numa base que já recebeu os arquivos de `db/` à mão. Ordem: NFC-e (060000) → Etapa 0 (070000) → Fase 5 (080000, cópia de `db/schema_expansion.sql`) → totem (090000, `db/schema_kiosk.sql`) → compras por XML (100000, `db/schema_purchases.sql`) → equipe pelo servidor (110000, `db/schema_equipe.sql`) → reenvio da autorização sem duplicar (120000, `db/schema_autorizacao.sql`) → troca de barril, saída do totem e cobrança pelo comprovante (130000, `db/schema_gerente_nuvem.sql`) → combos (140000, `db/schema_combos.sql`) → aparelho novo baixa a loja (150000, `db/schema_baixar_loja.sql`) → dinheiro conferido pelo servidor (160000, `db/schema_dinheiro_servidor.sql`). Cada migration copiada começa com `-- Cópia de db/...` e um teste confere que as duas estão iguais.
 1. No painel do Supabase: Authentication → Hooks → **Custom Access Token** → `public.tchefood_access_token_hook`. Ele copia `app_metadata.tenant_id` para a claim `tenant_id` que o RLS (`tchefood_tenant()`) lê.
-2. Crie a linha da loja em `tenants` e uma conta de usuário para o aparelho com `app_metadata = {"tenant_id": "<id da loja>"}` (pelo painel ou pela API admin; o app não cria lojas na nuvem).
+2. Crie a loja e a conta do aparelho pelo **painel administrativo** (abaixo), ou à mão: a linha em `tenants` e uma conta de usuário com `app_metadata = {"tenant_id": "<id da loja>"}` (o app da loja não cria lojas na nuvem).
 3. Build com `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY` (ou digite os dois na aba Nuvem).
 4. No aparelho: Retaguarda → Nuvem → entrar. Se a conta for de outra loja que a deste aparelho (ex.: ainda na demonstração), a própria tela oferece começar a loja da conta.
 
 **Nuvem → aparelho** (`src/lib/sync/cloudPull.ts`): um aparelho novo entra com a conta da loja em Nuvem; se a loja já tem equipe na nuvem, a tela oferece **Baixar a loja desta conta**: um gerente ou o proprietário escolhe o próprio nome e digita o PIN, o servidor confere (com o bloqueio de 3 erros) e entrega a equipe com os PINs (`tchefood_pull_staff`, que grava um `STAFF_PULL` no audit_log); o aparelho troca os dados dele pelos cadastros da loja (cardápio, combos, adicionais, preços por horário, mesas, maquininhas, permissões, fornecedores). Depois, a cada minuto com a fila vazia (e no "Sincronizar agora"), o aparelho lê os cadastros de novo e aplica o que mudou em outro aparelho; registro com mudança deste aparelho ainda na fila fica como está até subir. A equipe chega sem PIN nessa leitura (nome, perfil e ativo; quem é desativado num aparelho sai da sessão no outro); pessoa nova ou PIN trocado entra pelo botão **Atualizar equipe**, com o PIN de um gerente.
 
 Limites conhecidos desta etapa: contas, pagamentos, barris, fichas e fidelidade ainda **só sobem** (cada aparelho vê as contas que abriu; a ocupação da mesa não desce) e, fora das tabelas imutáveis, conflito entre dois aparelhos é "o último que gravou vale".
+
+## Painel administrativo (pasta `admin/`)
+Para a equipe do Tchê Food (não para as lojas): cadastro das lojas, planos, mensalidades e conta do aparelho. Tchê Food e Tchê Vendas ficam separados (decisão do Will, 14/11/2026): as lojas do Tchê Food não entram no Tchê Vendas Control.
+
+- **Banco** (`db/schema_painel_admin.sql`): `platform_admins`, `platform_plans` (os planos da landing), `store_subscriptions`, `store_charges` e `platform_admin_audit`. As tabelas ficam fechadas para `anon` e `authenticated`; tudo passa pelas funções `tchefood_admin_*`, que exigem admin ativo (`platform_admins.user_id` = `sub` do JWT) e token **sem** `tenant_id` (o token de um aparelho de loja nunca abre o painel). Cada alteração grava no histórico, que só recebe linhas novas.
+- **Mensalidade**: uma cobrança por loja e mês (cancelada pode ser refeita). Pagamento registrado só com o **valor exato** da cobrança, a data (não futura), a forma e a referência do comprovante (id do Pix, nosso número, recibo); a mesma referência não quita duas cobranças, e o reenvio do mesmo pagamento não grava de novo. Pagar põe a loja em teste ou suspensa como **ativa**. Cobrança paga ou cancelada não muda mais. **Vencida** = em aberto com vencimento antes de hoje (fuso de São Paulo).
+- **Telas**: Visão geral (receita mensal das ativas, recebido no mês, a receber, vencidas, lojas por situação), Lojas (busca, filtro, loja nova, detalhe com uso: última venda, pedidos em 7 e 30 dias, equipe ativa; assinatura com motivo; cobranças; histórico) e Cobranças do dia (vencidas com dias de atraso e as que vencem em até 3 dias, com a mensagem pronta no WhatsApp, e a geração das cobranças do mês para as lojas ativas). Loja criada à mão no Supabase (como a do piloto) aparece "sem assinatura" até ser cadastrada.
+- **Conta do aparelho**: `supabase/functions/admin-device-account` (service role) cria a conta do Supabase Auth com `app_metadata.tenant_id` ou troca a senha. Antes, o banco confere o admin e reserva o id e o e-mail da conta; a senha aparece uma vez só na tela.
+- **Ainda não**: bloqueio da loja por atraso (falta decidir os dias de carência) e integração com o Asaas (o link do boleto/Pix é colado na cobrança e o pagamento é registrado à mão).
+
+Instalar:
+```bash
+supabase db push                                  # inclui 20261114150000_painel_admin.sql
+supabase functions deploy admin-device-account
+```
+1. Crie a sua conta em Authentication → Users (e-mail e senha, **sem** `tenant_id` no app_metadata).
+2. No SQL Editor: `INSERT INTO platform_admins (user_id, email, name) VALUES ('<id da conta>', '<e-mail>', 'Will');`
+3. `npm run build:admin` (com `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY`, ou digite os dois na tela de entrada) e publique `admin/dist` num site separado da landing. Para testar local: `npm run dev:admin`.
 
 ## NFC-e real: `supabase/functions/emit-nfce`
 ```bash
