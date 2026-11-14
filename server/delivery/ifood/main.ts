@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { DeliveryInbox, InMemoryDeliveryRepository, type DeliveryRepository } from "../deliveryInbox";
 import { SupabaseDeliveryRepository } from "../supabaseDeliveryRepository";
-import { parsePort, readBodyOrReject } from "./httpBody";
+import { gracefulShutdown, parsePort, readBodyOrReject } from "./httpBody";
 import { IfoodMerchantApi } from "./ifoodMerchantApi";
 import { IfoodSandbox } from "./ifoodSandbox";
 import {
@@ -130,10 +130,12 @@ function main(): void {
   server.listen(listenPort, () => log(`[ifood] API na porta ${listenPort}; polling a cada 30 s.`));
   poller.start();
 
+  let stopping = false;
   const shutdown = () => {
-    log("[ifood] desligando: termina o ciclo em andamento antes de sair.");
-    server.close();
-    void poller.stop().then(() => process.exit(0));
+    if (stopping) return;
+    stopping = true;
+    log("[ifood] desligando: termina as requisições e o ciclo em andamento antes de sair.");
+    void gracefulShutdown({ server, stopPoller: () => poller.stop(), exit: (code) => process.exit(code), log });
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

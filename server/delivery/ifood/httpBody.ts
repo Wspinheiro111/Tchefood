@@ -1,4 +1,4 @@
-import type { IncomingMessage, ServerResponse } from "node:http";
+import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
 export const MAX_BODY_BYTES = 16 * 1024;
 
@@ -43,4 +43,33 @@ export function parsePort(raw: string | undefined): number {
   const port = /^\d{1,5}$/.test(value) ? Number(value) : NaN;
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`PORT inválida: "${value}" (use um número de 1 a 65535).`);
   return port;
+}
+
+export const SHUTDOWN_TIMEOUT_MS = 25_000;
+
+// Desligamento (SIGTERM/SIGINT): para de aceitar conexões, fecha as ociosas e espera as requisições em andamento
+// (um cancelamento, uma resposta à negociação ou uma pausa que já foi ao iFood precisam gravar o resultado e a
+// auditoria) e o ciclo de polling em andamento. Passado o prazo, sai com código 1 e avisa no log.
+export async function gracefulShutdown(options: {
+  server: Server;
+  stopPoller: () => Promise<void>;
+  exit: (code: number) => void;
+  log: (message: string) => void;
+  timeoutMs?: number;
+}): Promise<void> {
+  const closed = new Promise<void>((resolve) => options.server.close(() => resolve()));
+  options.server.closeIdleConnections();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), options.timeoutMs ?? SHUTDOWN_TIMEOUT_MS);
+  });
+  const finished = Promise.all([options.stopPoller(), closed]).then(() => "done" as const);
+  const outcome = await Promise.race([finished, deadline]);
+  clearTimeout(timer);
+  if (outcome === "timeout") {
+    options.log("[ifood] desligando: prazo esgotado com requisição ou ciclo ainda em andamento; saindo assim mesmo.");
+    options.exit(1);
+    return;
+  }
+  options.exit(0);
 }

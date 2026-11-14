@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { MAX_BODY_BYTES, parsePort, readBodyOrReject } from "./httpBody";
+import { MAX_BODY_BYTES, gracefulShutdown, parsePort, readBodyOrReject } from "./httpBody";
 
 // Servidor HTTP de verdade (porta efêmera): o 413 precisa chegar ao app, não virar conexão derrubada.
 let server: Server | null = null;
@@ -53,5 +53,51 @@ describe("porta do servidor do iFood (PORT)", () => {
     for (const raw of ["0", "-1", "65536", "abc", "80.5", "8787x", "0x50", "1e3"]) {
       expect(() => parsePort(raw)).toThrow(`PORT inválida: "${raw.trim()}" (use um número de 1 a 65535).`);
     }
+  });
+});
+
+describe("desligamento do servidor do iFood (SIGTERM/SIGINT)", () => {
+  it("espera a requisição em andamento terminar (e o ciclo de polling) antes de sair", async () => {
+    let finishHandler: () => void = () => undefined;
+    const handlerDone = new Promise<void>((resolve) => { finishHandler = resolve; });
+    const events: string[] = [];
+    const server = createServer((_request, response) => {
+      void handlerDone.then(() => {
+        events.push("resposta");
+        response.writeHead(200, { "content-type": "application/json" }).end("{}");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const inFlight = fetch(`http://127.0.0.1:${port}/ifood/x`).then((r) => r.status);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const exits: number[] = [];
+    const done = gracefulShutdown({
+      server,
+      stopPoller: async () => { events.push("polling parado"); },
+      exit: (code) => { events.push(`saiu ${code}`); exits.push(code); },
+      log: () => undefined,
+      timeoutMs: 5_000,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(exits).toEqual([]); // não sai com a ação ainda no meio
+    finishHandler();
+    expect(await inFlight).toBe(200);
+    await done;
+    expect(events).toEqual(["polling parado", "resposta", "saiu 0"]);
+  });
+
+  it("requisição que não termina no prazo: sai com código 1 e avisa no log", async () => {
+    const server = createServer(() => undefined); // nunca responde
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    void fetch(`http://127.0.0.1:${port}/x`).catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const logs: string[] = [];
+    const exits: number[] = [];
+    await gracefulShutdown({ server, stopPoller: async () => undefined, exit: (code) => { exits.push(code); }, log: (m) => logs.push(m), timeoutMs: 50 });
+    expect(exits).toEqual([1]);
+    expect(logs.join(" ")).toContain("prazo");
+    server.closeAllConnections();
   });
 });

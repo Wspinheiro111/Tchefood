@@ -27,6 +27,9 @@ iFood ──polling 30 s──> servidor (Node, 1 instância) ──service_role
 
 Todas exigem `Authorization: Bearer <JWT da sessão do app>`, menos `/health`. Corpo acima de 16 KB: 413
 `{error: "Corpo grande demais."}` com `connection: close` (o servidor para de ler, responde e só depois fecha a conexão).
+Ao desligar (SIGTERM/SIGINT) o servidor para de aceitar conexões e espera as requisições e o ciclo de polling em
+andamento (o resultado e a auditoria de uma ação que já foi ao iFood são gravados) por até 25 s; passado isso, sai com
+código 1 e avisa no log.
 
 - Limite por aparelho (chave = o JWT, só na memória do processo): mais de 30 requisições em 10 s dá 429
   `{error: "Muitas requisições; aguarde alguns segundos.", code: "rate_limited"}` antes da prova de loja e sem chamar o
