@@ -171,6 +171,15 @@ describe('fechamento da conta com a loja na nuvem', () => {
     expect(order(id).nfce_key).toHaveLength(44);
   });
 
+  it('aparelho atualizado com sessão já salva (sem cloudTenantId): desconectar continua real', () => {
+    const tenantId = st().tenant.id;
+    useTcheStore.setState({ cloud: session(tenantId), cloudTenantId: null });
+    expect(st().setCloudSession(null).ok).toBe(true);
+    expect(st().cloudTenantId).toBe(tenantId);
+    const id = closeOrder();
+    expect(order(id)).toMatchObject({ nfce_status: 'PENDING', nfce_key: null });
+  });
+
   it('loja da nuvem desconectada continua real: conta fecha pendente e é emitida ao reconectar', () => {
     const tenantId = st().tenant.id;
     expect(st().setCloudSession(session(tenantId)).ok).toBe(true);

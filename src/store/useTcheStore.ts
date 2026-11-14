@@ -3654,7 +3654,12 @@ export const useTcheStore = create<TcheState>()(
             return fail('Esta conta da nuvem é de outra loja. Use a conta desta loja ou inicie uma loja nova.');
           }
           // Desconectar (session null) não volta a loja para demonstração: cloudTenantId fica.
-          set(session ? { cloud: session, cloudTenantId: session.tenant_id } : { cloud: null });
+          // Aparelho atualizado com sessão já salva (cloudTenantId ainda null): a loja vem da sessão que sai.
+          set((s) =>
+            session
+              ? { cloud: session, cloudTenantId: session.tenant_id }
+              : { cloud: null, cloudTenantId: s.cloudTenantId ?? s.cloud?.tenant_id ?? null },
+          );
           return { ok: true, data: undefined };
         },
 
@@ -4850,7 +4855,10 @@ export const useTcheStore = create<TcheState>()(
       onRehydrateStorage: () => () => {
         // Com o fallback síncrono (localStorage), este callback roda ainda dentro de
         // create(), antes de useTcheStore existir; adiamos para depois da atribuição.
-        queueMicrotask(() => useTcheStore.setState({ hydrated: true }));
+        // Sessão salva antes de cloudTenantId existir: a loja dos dados é a da sessão.
+        queueMicrotask(() =>
+          useTcheStore.setState((s) => ({ hydrated: true, cloudTenantId: s.cloudTenantId ?? (s.cloud && s.cloud.tenant_id === s.tenant.id ? s.cloud.tenant_id : null) })),
+        );
       },
     },
   ),
