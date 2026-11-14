@@ -60,7 +60,7 @@ export const DEVICE_ONLY =
 
 /** Aviso de registros que ficaram de fora por data inválida (nunca somem calados). */
 const invalid = (n: number, what: string): string[] =>
-  n > 0 ? [`ATENÇÃO: ${n} ${what} com data inválida (não dá para saber o ano) ficaram fora. Se for deste ano, o total está menor: avise o suporte antes de enviar ao contador.`] : [];
+  n > 0 ? [`ATENÇÃO: ${n} ${what} com data inválida ou fora de 2000–2100, como relógio zerado (não dá para saber o ano), ficaram fora. Se for deste ano, o total está menor: avise o suporte antes de enviar ao contador.`] : [];
 
 /**
  * Aviso de registros do ano com data no instante do relatório ou depois (ano em
@@ -70,6 +70,10 @@ export const afterCutoffNote = (n: number, cutoff: number): string[] =>
   n > 0
     ? [`ATENÇÃO: ${n} registro(s) com data a partir de ${brasiliaDateTime(cutoff)} (instante deste relatório) ficaram de fora. Se foram lançados agora, atualize; se não, confira o relógio do aparelho.`]
     : [];
+
+/** Valor em reais para as notas: "R$ 12.345,67" (com milhar, como nas tabelas). */
+const BRL_NOTE = new Intl.NumberFormat('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const brl = (v: number): string => `R$ ${Number.isFinite(v) ? BRL_NOTE.format(v) : '—'}`;
 
 const qty = (v: number) => Math.round(v * 1000) / 1000;
 const day = (iso: string) => {
@@ -97,6 +101,7 @@ export function inventoryDoc(r: InventoryReport, base: Omit<ReportDoc, 'title' |
       'Saldo = soma das ENTRADAS por NF-e de compra importadas NESTE aparelho até a posição (o livro de estoque do Tchê Food ainda só registra entradas). As vendas não baixam o estoque e o saldo informado direto no cadastro do produto (sem nota) não entra, então o saldo não é o físico. Faça a contagem física em 31/12 e use este relatório como conferência.',
       'Custo unitário = custo médio ponderado das compras (com frete, IPI, ICMS-ST etc. da nota).',
       'A entrada conta pela data em que a nota foi IMPORTADA no app (nota emitida em 30/12 e importada em 03/01 não está neste saldo, mas está nas compras do ano).',
+      ...(r.duplicateMovements > 0 ? [`${r.duplicateMovements} entrada(s) de NF-e que também foi importada em OUTRO aparelho (a nuvem ficou com a de lá) ficaram fora deste saldo: elas já estão no inventário daquele aparelho.`] : []),
       ...(r.testMovements > 0 ? [`${r.testMovements} entrada(s) por NF-e de homologação (teste) ficaram de fora do saldo e do custo.`] : []),
       ...(r.missingNcm > 0 ? [`${r.missingNcm} produto(s) com saldo estão sem NCM válido (8 dígitos) no cadastro.`] : []),
       ...invalid(r.invalidDates, 'movimento(s) de estoque'),
@@ -106,7 +111,7 @@ export function inventoryDoc(r: InventoryReport, base: Omit<ReportDoc, 'title' |
     tables: [
       {
         head: ['Código', 'Descrição', 'NCM', 'Unidade', 'Saldo', 'Custo unitário (R$)', 'Custo total (R$)', 'Situação'],
-        rows: r.rows.map((x) => [code(x.code), x.name, code(x.ncm), x.unit, qty(x.quantity), x.unitCost, x.total, `${x.inactive ? 'Desativado' : 'Ativo'}${x.withoutTestInvoices ? ' (sem NF-e de teste)' : ''}`]),
+        rows: r.rows.map((x) => [code(x.code), x.name, code(x.ncm), x.unit, qty(x.quantity), x.unitCost, x.total, `${x.name === 'Produto não encontrado no cadastro' ? 'Não encontrado no cadastro' : x.inactive ? 'Desativado' : 'Ativo'}${x.withoutTestInvoices ? ' (sem NF-e de teste)' : ''}`]),
         foot: ['', 'Total', '', '', null, null, r.totalCost, ''],
       },
     ],
@@ -121,15 +126,15 @@ export function revenueDoc(r: RevenueReport, base: Omit<ReportDoc, 'title' | 'ta
       'Pagamentos aprovados pela data do pagamento (recusados ficam fora). Dinheiro devolvido ao cliente por sangria NÃO abate daqui: está na lista de sangrias do relatório de despesas. Gorjeta não entra no faturamento.',
       'Entrega própria paga em dinheiro conta na data do acerto com o entregador (é quando o dinheiro entra no caixa).',
       'Taxa = estimativa pela taxa da maquininha cadastrada em Taxas e recebíveis, sobre conta + gorjeta (como a maquininha cobra). Confira com os extratos. O Líquido não tem a gorjeta: o que a maquininha deposita é Líquido + gorjeta de cartão.',
-      ...(r.serviceFee > 0 ? [`Taxa de serviço (10%) das comandas fechadas no período: R$ ${br(r.serviceFee)}. Ela está DENTRO do Bruto (veio nos pagamentos); pela Lei 13.419/2017 é gorjeta. Decida com o contador se sai da receita.`] : []),
+      ...(r.serviceFee > 0 ? [`Taxa de serviço das comandas fechadas (na proporção dos pagamentos do período): ${brl(r.serviceFee)}. Ela está DENTRO do Bruto (veio nos pagamentos); pela Lei 13.419/2017 é gorjeta. Decida com o contador se sai da receita.`] : []),
       'Sangrias aqui = todas as retiradas do caixa, inclusive o pagamento de entregador pela gaveta (que no relatório de despesas está em Taxas de entrega, não em sangrias sem categoria).',
       'Estorno feito na maquininha NÃO chega ao Tchê Food: abata pelo extrato da adquirente.',
       ...(r.rows.some((x) => x.key === 'VOUCHER' && x.notTracked) ? ['Vale-refeição/alimentação: o app ainda não registra esta forma; o que foi passado como VR/VA na maquininha está dentro de crédito/débito (com a taxa de crédito/débito). Separe pelo extrato da adquirente.'] : []),
-      ...(r.cashOutsideSessionsCount > 0 ? [`${r.cashOutsideSessionsCount} recebimento(s) em dinheiro (R$ ${br(r.cashOutsideSessions)}) foram feitos sem turno de caixa aberto: estão no Dinheiro, mas não aparecem nos fechamentos.`] : []),
-      ...(r.simulatorCount > 0 ? [`${r.simulatorCount} pagamento(s) no simulador de maquininha (R$ ${br(r.simulatorAmount)}) ficaram de fora: não são dinheiro real.`] : []),
-      ...(r.totalWithoutRule > 0 ? [`R$ ${br(r.totalWithoutRule)} foram recebidos sem taxa cadastrada: a taxa deles NÃO foi descontada.`] : []),
-      `Gorjetas no ano: R$ ${br(r.tips)}.`,
-      ...(r.openSessions > 0 ? [`${r.openSessions} turno(s) de caixa estavam abertos na posição (abertos antes e fechados depois dela, ou ainda abertos): o fechamento deles não está na lista abaixo.`] : []),
+      ...(r.cashOutsideSessionsCount > 0 ? [`${r.cashOutsideSessionsCount} recebimento(s) em dinheiro (${brl(r.cashOutsideSessions)}) foram feitos sem turno de caixa aberto: estão no Dinheiro, mas não aparecem nos fechamentos.`] : []),
+      ...(r.simulatorCount > 0 ? [`${r.simulatorCount} pagamento(s) no simulador de maquininha (${brl(r.simulatorAmount)}) ficaram de fora: não são dinheiro real.`] : []),
+      ...(r.totalWithoutRule > 0 ? [`${brl(r.totalWithoutRule)} foram recebidos sem taxa cadastrada: a taxa deles NÃO foi descontada.`] : []),
+      `Gorjetas no ano: ${brl(r.tips)}.`,
+      ...(r.openSessions > 0 ? [`${r.openSessions} turno(s) de caixa estavam abertos no fim do período (abertos antes e fechados depois, ou ainda abertos): o fechamento deles não está na lista abaixo.`] : []),
       ...invalid(r.invalidDates, 'pagamento(s), fechamento(s) ou movimento(s) de caixa'),
       ...afterCutoffNote(r.afterCutoff, r.cutoff),
       ...extraNotes,
@@ -172,10 +177,10 @@ function noRuleNote(r: OpenPositionsReport): string[] {
   const thisYear = fromCents(toCents(r.cardWithoutRule) - toCents(r.cardWithoutRulePriorYears));
   const split =
     r.cardWithoutRulePriorYearsCount > 0
-      ? ` (${thisYearCount} deste ano, R$ ${br(thisYear)}; ${r.cardWithoutRulePriorYearsCount} de anos anteriores, R$ ${br(r.cardWithoutRulePriorYears)})`
+      ? ` (${thisYearCount} deste ano, ${brl(thisYear)}; ${r.cardWithoutRulePriorYearsCount} de anos anteriores, ${brl(r.cardWithoutRulePriorYears)})`
       : ' (todas deste ano)';
   return [
-    `SITUAÇÃO DE REPASSE DESCONHECIDA: ${r.cardWithoutRuleCount} venda(s) na maquininha até a posição sem taxa cadastrada, R$ ${br(r.cardWithoutRule)}${split}. Sem o prazo não dá para saber se o repasse já caiu ou ainda está a receber: o valor pode já ter sido recebido e NÃO está somado no A receber. Confira com a agenda da adquirente ou cadastre a taxa.`,
+    `SITUAÇÃO DE REPASSE DESCONHECIDA: ${r.cardWithoutRuleCount} venda(s) na maquininha sem taxa cadastrada nos ~18 meses até a posição (as mais antigas já caíram em qualquer prazo cadastrável, até D+400 úteis), ${brl(r.cardWithoutRule)}${split}. Sem o prazo não dá para saber se o repasse já caiu ou ainda está a receber: o valor pode já ter sido recebido e NÃO está somado no A receber. Confira com a agenda da adquirente ou cadastre a taxa.`,
   ];
 }
 
@@ -184,13 +189,13 @@ export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 
     ...base,
     title: REPORT_TITLE.open,
     notes: [
-      'A RECEBER de maquininha: vendas até a posição com repasse previsto para depois dela, pelo prazo e taxa cadastrados (estimativa; feriado não conta; confira com a agenda da adquirente).',
+      'A RECEBER de maquininha: vendas até a posição com repasse previsto para o dia da posição ou depois, pelo prazo e taxa cadastrados (estimativa; feriado não conta; confira com a agenda da adquirente).',
       'Estorno feito na maquininha NÃO chega ao Tchê Food: venda estornada ainda aparece aqui como a receber. Confira com a agenda da adquirente.',
       'A RECEBER de entregador: dinheiro de entregas pagas na entrega feitas até a posição e ainda não acertadas. O valor usa o total ATUAL do pedido menos o que foi pago até a posição: se o pedido foi alterado depois (desconto, item cancelado), o valor daquela data pode ser outro.',
       ...noRuleNote(r),
       'NÃO registrados no Tchê Food (informe pelo seu controle): contas a pagar de fornecedores (boletos/duplicatas), fiado e convênios de clientes, repasses pendentes dos apps de delivery, gorjetas e taxa de serviço ainda devidas à equipe.',
       'Bases: o A receber de maquininha é sobre conta + gorjeta (o que a maquininha repassa); a situação de repasse desconhecida é só o valor da conta, sem a gorjeta.',
-      ...invalid(r.invalidDates, 'entrega(s)'),
+      ...invalid(r.invalidDates, 'entrega(s), pagamento(s) ou acerto(s)'),
       ...afterCutoffNote(r.afterCutoff, r.cutoff),
       ...extraNotes,
     ],
@@ -226,12 +231,12 @@ export function expensesDoc(r: ExpensesReport, base: Omit<ReportDoc, 'title' | '
       'Compras de insumos entram no custo da mercadoria (CMV = estoque inicial + compras − estoque final), não como despesa operacional: separe na DRE.',
       'Taxas da maquininha e comissões dos apps são as MESMAS já abatidas no Líquido do relatório de faturamento: se lançar a receita pelo Líquido, não lance estas taxas de novo.',
       'Regime de caixa: taxas de entrega contam na data do acerto com o entregador. O que estava a pagar aos entregadores em 31/12 está no relatório de contas em aberto e entra aqui no ano do acerto.',
-      ...(r.homologationInvoices > 0 ? [`${r.homologationInvoices} NF-e de homologação (teste) no ano ficaram de fora.`] : []),
-      ...(r.duplicateInvoices > 0 ? [`${r.duplicateInvoices} NF-e repetida(s) neste aparelho (mesma chave de acesso, importada duas vezes) foram contadas uma vez só.`] : []),
-      ...(r.invalidIssueDates > 0 ? [`${r.invalidIssueDates} NF-e com data de emissão inválida foram contadas pela data da importação: confira o ano dessas notas.`] : []),
+      ...(r.homologationInvoices > 0 ? [`${r.homologationInvoices} NF-e de homologação (teste) no ano ficou(aram) de fora.`] : []),
+      ...(r.duplicateInvoices > 0 ? [`${r.duplicateInvoices} NF-e importada(s) também em outro aparelho (mesma chave de acesso, aparece duas vezes aqui) foi(ram) contada(s) uma vez só.`] : []),
+      ...(r.invalidIssueDates > 0 ? [`${r.invalidIssueDates} NF-e com data de emissão inválida foi(ram) contada(s) pela data da importação: confira o ano dessa(s) nota(s).`] : []),
       ...invalid(r.invalidDates, 'nota(s), acerto(s) ou sangria(s)'),
       ...afterCutoffNote(r.afterCutoff, r.cutoff),
-      ...(r.withdrawals.length > 0 ? [`Sangrias do caixa sem categoria (R$ ${br(r.withdrawalsTotal)}) estão listadas à parte e NÃO entram no total: classifique com o contador.`] : []),
+      ...(r.withdrawals.length > 0 ? [`Sangrias do caixa sem categoria (${brl(r.withdrawalsTotal)}) estão listadas à parte e NÃO entram no total: classifique com o contador.`] : []),
       ...extraNotes,
     ],
     tables: [

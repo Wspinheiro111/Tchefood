@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clockBeforeYear, ownStore, defaultYear, positionCutoff, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { clockBeforeYear, duplicateInvoiceMovementIds, ownStore, defaultYear, positionCutoff, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { br, code, escapeHtml, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, revenueDoc, toCsv, toPrintableHtml, type ReportDoc } from '../lib/annualCloseExport';
 import type { FeeRule } from '../lib/cardFees';
 import type { CashMovement, CashSession, CourierSettlement, OwnDelivery, Payment, Product, PurchaseInvoice, StockMovement, Supplier } from '../types';
@@ -501,7 +501,7 @@ describe('rodada interna após a auditoria 2: nada some calado', () => {
     const antigo = session({ opened_at: '2024-03-01T10:00:00-03:00', status: 'OPEN', closed_at: null });
     const r25 = revenueByMethod({ ...emptyRevenueInput, cashSessions: [virada, antigo] }, P, NOW);
     expect(r25.openSessions).toBe(2);
-    expect(toCsv(revenueDoc(r25, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('2 turno(s) de caixa estavam abertos na posição');
+    expect(toCsv(revenueDoc(r25, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('2 turno(s) de caixa estavam abertos no fim do período');
     // Em 2026 o da virada já fechou; o antigo continua aberto.
     expect(revenueByMethod({ ...emptyRevenueInput, cashSessions: [virada, antigo] }, yearPeriod(2026), NOW).openSessions).toBe(1);
     // Aberto depois do instante do relatório não conta como aberto.
@@ -585,17 +585,30 @@ describe('rodada interna 2: contador, dados e exportação', () => {
     const inv = (id: string) => ({ id, supplier_id: 's1', access_key: '4325'.padEnd(44, '1'), number: '1', series: '1', issued_at: '2025-03-01T10:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 10, imported_at: '2025-03-01T10:00:00-03:00' }) as PurchaseInvoice;
     const r = expensesByCategory({ purchaseInvoices: [inv('nuvem'), inv('recusada')], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW) }, P, NOW);
     expect([r.purchases.length, r.duplicateInvoices, r.rows.find((x) => x.key === 'PURCHASES')!.amount]).toEqual([1, 1, 10]);
-    expect(toCsv(expensesDoc(r, base))).toContain('1 NF-e repetida(s)');
+    expect(toCsv(expensesDoc(r, base))).toContain('1 NF-e importada(s) também em outro aparelho');
   });
 
-  it('taxa de serviço das comandas fechadas no ano aparece à parte (está dentro do bruto)', () => {
-    const r = revenueByMethod({ ...emptyRevenueInput, orders: [
-      { status: 'CLOSED', closed_at: '2025-05-01T22:00:00-03:00', service_fee_amount: 10 },
-      { status: 'CLOSED', closed_at: '2026-01-01T00:10:00-03:00', service_fee_amount: 7 },
-      { status: 'OPEN', closed_at: null, service_fee_amount: 5 },
-    ] }, P, NOW);
-    expect(r.serviceFee).toBe(10);
-    expect(toCsv(revenueDoc(r, base))).toContain('Taxa de serviço (10%) das comandas fechadas no período: R$ 10,00');
+  it('taxa de serviço aparece à parte, rateada pelos pagamentos reais do período (está dentro do bruto)', () => {
+    const r = revenueByMethod({
+      ...emptyRevenueInput,
+      payments: [
+        pay({ order_id: 'a', amount: 110, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2025-05-01T21:00:00-03:00' }),
+        // Comanda paga metade em 31/12 e metade em 01/01: metade da taxa em cada ano.
+        pay({ order_id: 'b', amount: 11, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2025-12-31T23:50:00-03:00' }),
+        pay({ order_id: 'b', amount: 11, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2026-01-01T00:05:00-03:00' }),
+        // Simulador: fora do bruto, então a taxa também fica fora.
+        pay({ order_id: 'c', amount: 55, method: 'CREDIT', acquirer: 'MOCK', created_at: '2025-06-01T21:00:00-03:00' }),
+        pay({ order_id: 'd', amount: 33, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2025-06-01T21:00:00-03:00' }),
+      ],
+      orders: [
+        { id: 'a', status: 'CLOSED', service_fee_amount: 10 },
+        { id: 'b', status: 'CLOSED', service_fee_amount: 2 },
+        { id: 'c', status: 'CLOSED', service_fee_amount: 5 },
+        { id: 'd', status: 'OPEN', service_fee_amount: 3 },
+      ],
+    }, P, NOW);
+    expect(r.serviceFee).toBe(11);
+    expect(toCsv(revenueDoc(r, base))).toContain('Taxa de serviço das comandas fechadas (na proporção dos pagamentos do período): R$ 11,00');
   });
 
   it('venda sem taxa mais antiga que o maior prazo cadastrável já caiu e fica fora do aviso', () => {
@@ -606,5 +619,40 @@ describe('rodada interna 2: contador, dados e exportação', () => {
   it('CSV: texto com vírgula vai entre aspas (quem separar por vírgula não cria célula com fórmula)', () => {
     const csv = toCsv({ ...base, title: 'T', notes: [], tables: [{ title: 't', head: ['a'], rows: [['ok,@SUM(1)']] }] });
     expect(csv).toContain('"ok,@SUM(1)"');
+  });
+});
+
+describe('rodada interna 3', () => {
+  const base = { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+
+  it('NF-e importada também em outro aparelho: as entradas daqui ficam fora do inventário e são avisadas', () => {
+    const key = '4325'.padEnd(44, '7');
+    const invoices = [{ id: 'nuvem', access_key: key }, { id: 'aqui', access_key: key }, { id: 'outra', access_key: '4325'.padEnd(44, '8') }];
+    const items = [{ id: 'it1', invoice_id: 'aqui' }, { id: 'it2', invoice_id: 'outra' }];
+    const movs = [mov({ id: 'm1', quantity: 10, unit_cost: 2, purchase_invoice_item_id: 'it1' }), mov({ id: 'm2', quantity: 3, unit_cost: 5, purchase_invoice_item_id: 'it2' })];
+    const dup = duplicateInvoiceMovementIds(movs, items, invoices);
+    expect([...dup]).toEqual(['m1']);
+    const r = inventoryAt([product({})], movs, P, new Set(), NOW, dup);
+    expect([r.rows[0]!.quantity, r.totalCost, r.duplicateMovements]).toEqual([3, 15, 1]);
+    expect(toCsv(inventoryDoc(r, base))).toContain('1 entrada(s) de NF-e que também foi importada em OUTRO aparelho');
+  });
+
+  it('data de relógio zerado (1970) conta como data inválida, não some', () => {
+    const r = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 9, created_at: '1970-01-01T00:05:00Z' })] }, P, NOW);
+    expect([r.totalGross, r.invalidDates]).toEqual([0, 1]);
+    expect(toCsv(revenueDoc(r, base))).toContain('fora de 2000–2100');
+    expect(yearsWithData(['1970-01-01T00:05:00Z'], NOW)).toEqual([2026]);
+  });
+
+  it('contas em aberto: pagamento e acerto com data inválida são avisados', () => {
+    const r = openPositionsAt({ payments: [pay({ amount: 5, method: 'PIX', acquirer: 'CASH_DESK', created_at: 'lixo' })], feeRules: [], ownDeliveries: [], courierSettlements: [{ id: 's', created_at: 'lixo' } as CourierSettlement], couriers: [], orders: [] }, P, NOW);
+    expect(r.invalidDates).toBe(2);
+  });
+
+  it('NF-e repetida de outro ano não aparece no aviso do ano escolhido', () => {
+    const inv = (id: string) => ({ id, supplier_id: 's1', access_key: '4325'.padEnd(44, '9'), number: '1', series: '1', issued_at: '2024-03-01T10:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 10, imported_at: '2024-03-01T10:00:00-03:00' }) as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv('a'), inv('b')], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW) }, P, NOW);
+    expect(r.duplicateInvoices).toBe(0);
   });
 });

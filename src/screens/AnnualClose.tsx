@@ -11,7 +11,7 @@ import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTche
 import { useOwnerSettings } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import type { MarketplaceSale } from '../lib/ownerDashboard';
-import { brasiliaDateTime, brasiliaYear, clockBeforeYear, defaultYear, ownStore, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { brasiliaDateTime, brasiliaYear, clockBeforeYear, defaultYear, duplicateInvoiceMovementIds, ownStore, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, REPORT_TITLE, revenueDoc, toCsv, toPrintableHtml, type AnnualReportKind, type ReportDoc } from '../lib/annualCloseExport';
 
 /**
@@ -26,7 +26,10 @@ const NO_MARKETPLACE: MarketplaceSale[] = [];
 const minuteNow = (): Date => {
   const t = Date.now();
   const rem = ((t % 60_000) + 60_000) % 60_000;
-  return new Date(rem === 0 ? t : t + (60_000 - rem));
+  const up = rem === 0 ? t : t + (60_000 - rem);
+  // No último minuto do ano, subir para 00:00 daria o ano por encerrado antes da hora.
+  const y = brasiliaYear(new Date(t).toISOString());
+  return new Date(y !== null && brasiliaYear(new Date(up).toISOString()) !== y ? t : up);
 };
 /** Hora em que o arquivo foi gerado (pode ser depois do instante dos números, dito no período). */
 const generatedAtLabel = (): string => new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
@@ -141,7 +144,11 @@ export function AnnualClose() {
   const clockWrong = clockBeforeYear(period, now);
 
   const testMovements = useMemo(() => testInvoiceMovementIds(stockMovements, purchaseInvoiceItems, purchaseInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices]);
-  const inventory = useMemo(() => inventoryAt(products, stockMovements, period, testMovements, now), [products, stockMovements, period, testMovements, now]);
+  const duplicateMovements = useMemo(() => duplicateInvoiceMovementIds(stockMovements, purchaseInvoiceItems, purchaseInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices]);
+  const inventory = useMemo(
+    () => inventoryAt(products, stockMovements, period, testMovements, now, duplicateMovements),
+    [products, stockMovements, period, testMovements, now, duplicateMovements],
+  );
   const revenue = useMemo(
     () => revenueByMethod({ payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff, orders }, period, now),
     [payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff, orders, period, now],
@@ -236,6 +243,15 @@ export function AnnualClose() {
         {actions(kind)}
       </div>
       {summary}
+      {/* As mesmas observações que vão no CSV/PDF: quem só vê a tela (app Android) lê tudo. */}
+      <details open className="mt-3 rounded-xl bg-surface p-3 text-sm">
+        <summary className="cursor-pointer font-bold">Observações deste relatório</summary>
+        <ul className="mt-2 list-disc space-y-1 pl-5 text-slate-600">
+          {build(kind).notes.map((n, i) => (
+            <li key={i}>{n}</li>
+          ))}
+        </ul>
+      </details>
     </section>
   );
 
@@ -327,14 +343,14 @@ export function AnnualClose() {
         'revenue',
         <>
           {revenue.rows.map((r) => line(r.label, r.notTracked ? 'não registrado' : formatBRL(r.gross), r.notTracked ? '(VR/VA está dentro de crédito/débito)' : r.fee > 0 ? `taxa estimada ${formatBRL(r.fee)}` : undefined))}
-          {line('Total vendido', formatBRL(revenue.totalGross))}
+          {line('Total recebido (bruto)', formatBRL(revenue.totalGross))}
           {line('Líquido estimado (já descontadas as taxas cadastradas)', formatBRL(revenue.totalNet))}
           {line('Gorjetas (fora do total)', formatBRL(revenue.tips))}
-          {revenue.serviceFee > 0 && line('Taxa de serviço (10%) dentro do total', formatBRL(revenue.serviceFee), '(é gorjeta pela Lei 13.419/2017: veja com o contador)')}
+          {revenue.serviceFee > 0 && line('Taxa de serviço dentro do total', formatBRL(revenue.serviceFee), '(é gorjeta pela Lei 13.419/2017: veja com o contador)')}
           {revenue.totalWithoutRule > 0 && line('Recebido sem taxa cadastrada', formatBRL(revenue.totalWithoutRule), '(taxa não descontada)')}
           {revenue.simulatorCount > 0 && line('Simulador de maquininha (fora do total)', formatBRL(revenue.simulatorAmount))}
           {line('Fechamentos de caixa', String(revenue.closings.length), revenue.closings.length > 0 ? `diferença somada ${formatBRL(revenue.closingsDifference)}` : undefined)}
-          {revenue.openSessions > 0 && line('Turnos de caixa abertos na posição', String(revenue.openSessions), '(o fechamento deles não está na lista)')}
+          {revenue.openSessions > 0 && line('Turnos de caixa abertos no fim do período', String(revenue.openSessions), '(fechamento fora deste relatório)')}
           {revenue.cashOutsideSessionsCount > 0 && line('Dinheiro recebido sem caixa aberto', formatBRL(revenue.cashOutsideSessions), '(está no Dinheiro, fora dos fechamentos)')}
           <p className="mt-2 text-sm text-slate-500">Fora deste relatório: pedidos dos apps de delivery (informe pelo extrato do app) e estornos feitos na maquininha (abata pelo extrato da adquirente).</p>
         </>,
@@ -347,7 +363,7 @@ export function AnnualClose() {
           {open.cardWithoutRuleCount > 0 && line('Situação de repasse desconhecida (sem taxa cadastrada)', formatBRL(open.cardWithoutRule), `(${open.cardWithoutRuleCount} venda(s); pode já ter caído; fora do A receber${open.cardWithoutRulePriorYearsCount > 0 ? `; inclui ${open.cardWithoutRulePriorYearsCount} venda(s) de anos anteriores, ${formatBRL(open.cardWithoutRulePriorYears)}` : ''})`)}
           {line('A receber: dinheiro com entregadores', formatBRL(open.courierCashTotal))}
           {line('A pagar a entregadores próprios', formatBRL(open.courierPayablesTotal))}
-          <p className="mt-2 text-sm text-slate-500">Não registrados no Tchê Food (informe pelo seu controle): boletos de fornecedores, fiado/convênio de clientes e repasses pendentes dos apps.</p>
+          <p className="mt-2 text-sm text-slate-500">Não registrados no Tchê Food (informe pelo seu controle): boletos de fornecedores, fiado/convênio de clientes, repasses pendentes dos apps e gorjetas/taxa de serviço devidas à equipe.</p>
         </>,
       )}
 

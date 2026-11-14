@@ -61,8 +61,8 @@ describe('Fechamento anual (tela)', () => {
   it('caixa não vê o faturamento do ano', () => {
     setup('cx', [pay(100, '2025-05-01T12:00:00')]);
     render(<AnnualClose />);
-    expect(screen.getByText(/Só o proprietário e o gerente/)).toBeTruthy();
-    expect(screen.queryByText(/Total vendido/)).toBeNull();
+    expect(screen.getAllByText(/Só o proprietário e o gerente/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Total recebido/)).toBeNull();
   });
 
   it('dono: em fevereiro abre o ano que terminou, troca de ano e mostra VR/VA como não registrado', () => {
@@ -71,19 +71,19 @@ describe('Fechamento anual (tela)', () => {
     const select = screen.getByLabelText('Ano do fechamento') as HTMLSelectElement;
     expect(select.value).toBe('2025');
     const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
-    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(100));
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(100));
     expect(screen.getByText('Vale-refeição / alimentação').parentElement!.parentElement!.textContent).toContain('não registrado');
     expect(screen.getAllByRole('button', { name: /baixar Excel/ })).toHaveLength(4);
     fireEvent.change(select, { target: { value: '2026' } });
-    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(40));
-    expect(screen.getByText(/2026 ainda não terminou/)).toBeTruthy();
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(40));
+    expect(screen.getAllByText(/2026 ainda não terminou/).length).toBeGreaterThan(0);
   });
 
   it('sem dados não quebra; no app Android não oferece exportar', () => {
     (window as unknown as Record<string, unknown>).SmartPosNative = {};
     setup('own');
     render(<AnnualClose />);
-    expect(screen.getByText(/não salva planilha nem PDF/)).toBeTruthy();
+    expect(screen.getAllByText(/não salva planilha nem PDF/).length).toBeGreaterThan(0);
     expect(screen.queryAllByRole('button', { name: /baixar Excel/ })).toHaveLength(0);
   });
 });
@@ -108,9 +108,9 @@ describe('Fechamento anual (tela): corte único no ano em andamento (auditoria P
     });
     render(<AnnualClose />);
     expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2026');
-    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
     expect(screen.getAllByText(/Posição em 14\/11\/2026 10:00 \(ano em andamento\)/)).toHaveLength(2);
-    expect(screen.getByText(/os números vão até 14\/11\/2026 10:00/)).toBeTruthy();
+    expect(screen.getAllByText(/os números vão até 14\/11\/2026 10:00/).length).toBeGreaterThan(0);
     const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
     expect(alert.textContent).toContain('a partir de 14/11/2026 10:00');
     expect(alert.textContent).toContain('Inventário de insumos e mercadorias: 1');
@@ -134,8 +134,8 @@ describe('Fechamento anual (tela): corte único no ano em andamento (auditoria P
     // Duas horas depois, "Atualizar" traz o registro das 11:00 e o aviso some.
     vi.setSystemTime(new Date('2026-11-14T12:00:00-03:00'));
     fireEvent.click(screen.getByRole('button', { name: 'Atualizar os números até agora' }));
-    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(100));
-    expect(screen.getByText(/os números vão até 14\/11\/2026 12:00/)).toBeTruthy();
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(100));
+    expect(screen.getAllByText(/os números vão até 14\/11\/2026 12:00/).length).toBeGreaterThan(0);
     expect(screen.queryAllByRole('alert').some((a) => a.textContent!.includes('instante deste relatório'))).toBe(false);
   });
 
@@ -144,7 +144,7 @@ describe('Fechamento anual (tela): corte único no ano em andamento (auditoria P
     setup('own', [pay(30, '2025-12-31T23:59:00'), pay(70, '2026-01-01T00:00:00')]);
     render(<AnnualClose />);
     expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2025');
-    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
     expect(screen.queryByRole('button', { name: 'Atualizar os números até agora' })).toBeNull();
     expect(screen.queryAllByRole('alert')).toHaveLength(0);
   });
@@ -158,7 +158,7 @@ describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
     setup('own', [pay(30, '2026-11-14T09:00:00')]);
     render(<AnnualClose />);
     // Corte no próximo minuto cheio: 10:00:30 vira 10:01 (o que já foi lançado entra).
-    expect(screen.getByText(/os números vão até 14\/11\/2026 10:01 /)).toBeTruthy();
+    expect(screen.getAllByText(/os números vão até 14\/11\/2026 10:01 /).length).toBeGreaterThan(0);
     vi.setSystemTime(new Date('2026-11-14T12:00:00-03:00'));
     act(() => {
       useTcheStore.setState({
@@ -167,7 +167,7 @@ describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
         cashMovements: [{ id: 'w11', type: 'WITHDRAWAL', amount: 5, reason: 'gelo', created_at: '2026-11-14T11:00:00-03:00' }],
       } as never);
     });
-    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
     expect(screen.getByText('Itens com saldo').parentElement!.textContent).toContain('0');
     expect(screen.getAllByText(/Posição em 14\/11\/2026 10:01 \(ano em andamento\)/)).toHaveLength(2);
     const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
@@ -192,7 +192,7 @@ describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
     setup('own', [pay(30, '2025-05-01T12:00:00'), pay(70, '2025-12-31T23:00:00')]);
     render(<AnnualClose />);
     expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2025');
-    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain(fmt(100));
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(100));
     expect(screen.getAllByRole('alert').some((a) => a.textContent!.includes('antes de 2025 começar'))).toBe(true);
     expect(screen.queryByRole('button', { name: 'Atualizar os números até agora' })).toBeNull();
   });
@@ -203,7 +203,27 @@ describe('Fechamento anual (tela): rodada interna 2', () => {
     vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
     setup('own', [pay(30, '2025-05-01T12:00:00'), { ...pay(70, '2025-06-01T12:00:00'), tenant_id: 'outra-loja' } as Payment]);
     render(<AnnualClose />);
-    expect(screen.getByText('Total vendido').parentElement!.textContent).toContain('30,00');
-    expect(screen.getByText(/1 registro\(s\) de outra loja/)).toBeTruthy();
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain('30,00');
+    expect(screen.getAllByText(/1 registro\(s\) de outra loja/).length).toBeGreaterThan(0);
+  });
+});
+
+describe('Fechamento anual (tela): rodada interna 3', () => {
+  it('no último minuto do ano o relatório continua "em andamento" (não arredonda para 01/01)', () => {
+    vi.setSystemTime(new Date('2026-12-31T23:59:30-03:00'));
+    setup('own', [pay(30, '2026-12-31T23:59:10')]);
+    render(<AnnualClose />);
+    expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2026');
+    expect(screen.getAllByText(/2026 ainda não terminou/).length).toBeGreaterThan(0);
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain('30,00');
+  });
+
+  it('a tela mostra as mesmas observações da exportação (quem não exporta lê tudo)', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    setup('own', [pay(30, '2025-05-01T12:00:00')]);
+    render(<AnnualClose />);
+    expect(screen.getAllByText('Observações deste relatório')).toHaveLength(4);
+    expect(screen.getAllByText(/venda estornada ainda aparece aqui como a receber/).length).toBe(1);
+    expect(screen.getAllByText(/não lance estas taxas de novo/).length).toBe(1);
   });
 });
