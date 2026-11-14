@@ -78,6 +78,18 @@ CREATE TABLE IF NOT EXISTS store_subscriptions (
     CHECK ((device_op_id IS NULL) = (device_op_started_at IS NULL))
 );
 
+-- Banco que já rodou um rascunho anterior deste arquivo: a tabela existe sem as colunas da vez.
+ALTER TABLE store_subscriptions ADD COLUMN IF NOT EXISTS device_op_id UUID;
+ALTER TABLE store_subscriptions ADD COLUMN IF NOT EXISTS device_op_started_at TIMESTAMPTZ;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'store_subscriptions'::regclass AND contype = 'c'
+                     AND pg_get_constraintdef(oid) LIKE '%device_op_id IS NULL%') THEN
+        ALTER TABLE store_subscriptions ADD CONSTRAINT store_subscriptions_device_op_check
+            CHECK ((device_op_id IS NULL) = (device_op_started_at IS NULL));
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS store_charges (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL REFERENCES store_subscriptions(tenant_id) ON DELETE RESTRICT,
@@ -190,6 +202,8 @@ END $$;
 -- Uso da loja no painel (última venda e pedidos nos últimos dias, por loja).
 CREATE INDEX IF NOT EXISTS idx_orders_tenant_opened ON orders (tenant_id, opened_at DESC);
 CREATE INDEX IF NOT EXISTS idx_delivery_orders_tenant_placed ON delivery_orders (tenant_id, placed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_tenant_closed ON orders (tenant_id, closed_at DESC) WHERE status = 'CLOSED';
+CREATE INDEX IF NOT EXISTS idx_delivery_orders_tenant_concluded ON delivery_orders (tenant_id, last_event_at DESC) WHERE status = 'concluded';
 
 -- -----------------------------------------------------------------------------
 -- Apoio
@@ -250,9 +264,10 @@ END;
 $$;
 
 -- Normaliza o CNPJ digitado: tira pontos, barra, traço e espaços, e passa letras para maiúsculas.
--- Tira espaços, tabulações e quebras de linha das pontas (btrim só tira espaço). NULL continua NULL.
+-- Tira espaços (inclusive o não separável), tabulações e quebras de linha das pontas (btrim só
+-- tira espaço). NULL continua NULL.
 CREATE OR REPLACE FUNCTION tchefood_admin_trim(p TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
-    SELECT regexp_replace(p, '^\s+|\s+$', '', 'g')
+    SELECT regexp_replace(p, '^[\s\u00a0\ufeff]+|[\s\u00a0\ufeff]+$', '', 'g')
 $$;
 
 CREATE OR REPLACE FUNCTION tchefood_admin_clean_cnpj(p_cnpj TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
@@ -269,26 +284,45 @@ CREATE OR REPLACE FUNCTION tchefood_admin_day_start(p_day DATE) RETURNS TIMESTAM
     SELECT (p_day::timestamp AT TIME ZONE 'America/Sao_Paulo')
 $$;
 
--- Pedidos da loja para os indicadores de uso: salão/balcão e delivery (iFood), sem cancelados.
--- at = quando o pedido foi aberto (contadores de 7 e 30 dias e "último pedido aberto");
--- sold_at = quando virou venda concluída, ou NULL se ainda não concluiu ("última venda").
--- Salão: só CLOSED conta como venda, no closed_at (fechamento pago; aberto ou pagando não conta).
--- Delivery: só 'concluded' conta, no horário do primeiro evento de conclusão recebido (eventos
--- depois da conclusão mexem no last_event_at); sem o evento gravado, o last_event_at.
+-- Indicadores de uso de uma loja, salão/balcão e delivery (iFood), sem cancelados:
+-- last_sale_at = última venda concluída. Salão: conta CLOSED, no closed_at (aberta ou pagando
+--   não conta). Delivery: 'concluded', no horário do primeiro evento de conclusão recebido (eventos
+--   depois da conclusão mexem no last_event_at); sem o evento gravado, o last_event_at.
+-- last_order_opened_at = último pedido aberto, concluído ou não; orders_7d/30d = pedidos abertos
+--   nos últimos 7/30 dias de São Paulo (hoje incluído).
+-- Consultas pelos índices (tenant_id, data): não percorre o histórico inteiro da loja.
 DROP FUNCTION IF EXISTS tchefood_admin_sales(UUID);
-CREATE OR REPLACE FUNCTION tchefood_admin_sales(p_tenant UUID) RETURNS TABLE (at TIMESTAMPTZ, sold_at TIMESTAMPTZ) LANGUAGE sql STABLE
-SET search_path = public, pg_temp AS $$
-    SELECT o.opened_at,
-           CASE WHEN o.status = 'CLOSED' THEN COALESCE(o.closed_at, o.opened_at) END
-      FROM orders o WHERE o.tenant_id = p_tenant AND o.status <> 'CANCELED'
-    UNION ALL
-    SELECT d.placed_at,
-           CASE WHEN d.status = 'concluded' THEN GREATEST(COALESCE(
-               (SELECT min(e.event_created_at) FROM delivery_events e
-                 WHERE e.tenant_id = p_tenant AND e.channel = d.channel AND e.external_order_id = d.external_id
-                   AND e.signal = 'concluded'),
-               d.last_event_at), d.placed_at) END
-      FROM delivery_orders d WHERE d.tenant_id = p_tenant AND d.status <> 'cancelled'
+DROP FUNCTION IF EXISTS tchefood_admin_usage(UUID, DATE);
+CREATE OR REPLACE FUNCTION tchefood_admin_usage(p_tenant UUID, p_today DATE,
+    OUT last_sale_at TIMESTAMPTZ, OUT last_order_opened_at TIMESTAMPTZ, OUT orders_7d BIGINT, OUT orders_30d BIGINT)
+LANGUAGE plpgsql STABLE SET search_path = public, pg_temp AS $$
+DECLARE v_d7 TIMESTAMPTZ := tchefood_admin_day_start(p_today - 6); v_d30 TIMESTAMPTZ := tchefood_admin_day_start(p_today - 29);
+        v_delivery TIMESTAMPTZ; r RECORD; v_at TIMESTAMPTZ;
+BEGIN
+    last_sale_at := GREATEST(
+        (SELECT max(o.closed_at) FROM orders o WHERE o.tenant_id = p_tenant AND o.status = 'CLOSED'),
+        (SELECT max(o.opened_at) FROM orders o WHERE o.tenant_id = p_tenant AND o.status = 'CLOSED' AND o.closed_at IS NULL));
+    -- A conclusão nunca é depois do last_event_at: percorre do mais recente e para quando nenhum
+    -- pedido restante pode passar do melhor já achado.
+    FOR r IN SELECT d.channel, d.external_id, d.placed_at, d.last_event_at FROM delivery_orders d
+              WHERE d.tenant_id = p_tenant AND d.status = 'concluded' ORDER BY d.last_event_at DESC LOOP
+        EXIT WHEN v_delivery IS NOT NULL AND r.last_event_at <= v_delivery;
+        v_at := GREATEST(COALESCE(
+            (SELECT min(e.event_created_at) FROM delivery_events e
+              WHERE e.tenant_id = p_tenant AND e.channel = r.channel AND e.external_order_id = r.external_id
+                AND e.signal = 'concluded'),
+            r.last_event_at), r.placed_at);
+        v_delivery := GREATEST(v_delivery, v_at);
+    END LOOP;
+    last_sale_at := GREATEST(last_sale_at, v_delivery);
+    last_order_opened_at := GREATEST(
+        (SELECT max(o.opened_at) FROM orders o WHERE o.tenant_id = p_tenant AND o.status <> 'CANCELED'),
+        (SELECT max(d.placed_at) FROM delivery_orders d WHERE d.tenant_id = p_tenant AND d.status <> 'cancelled'));
+    orders_7d := (SELECT count(*) FROM orders o WHERE o.tenant_id = p_tenant AND o.opened_at >= v_d7 AND o.status <> 'CANCELED')
+               + (SELECT count(*) FROM delivery_orders d WHERE d.tenant_id = p_tenant AND d.placed_at >= v_d7 AND d.status <> 'cancelled');
+    orders_30d := (SELECT count(*) FROM orders o WHERE o.tenant_id = p_tenant AND o.opened_at >= v_d30 AND o.status <> 'CANCELED')
+                + (SELECT count(*) FROM delivery_orders d WHERE d.tenant_id = p_tenant AND d.placed_at >= v_d30 AND d.status <> 'cancelled');
+END;
 $$;
 
 -- Mês de cobrança aceito: de 12 meses atrás até o mês que vem (evita 1990 por engano).
@@ -330,7 +364,7 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: dia de cobrança entre 1 e 28';
     END IF;
     IF length(tchefood_admin_trim(COALESCE(p_contact_name, ''))) < 2 OR length(tchefood_admin_trim(p_contact_name)) > 100 THEN
-        RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o nome do contato da loja';
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: nome do contato da loja com 2 a 100 caracteres';
     END IF;
     -- DDD + número (10 ou 11 dígitos), ou o mesmo com o DDI 55 na frente (12 ou 13).
     IF tchefood_admin_clean_phone(p_contact_phone) !~ '^(55)?[1-9][0-9]{9,10}$' THEN
@@ -425,19 +459,19 @@ BEGIN
                      min(sc.due_date) FILTER (WHERE sc.status = 'OPEN' AND sc.due_date < v_today) AS oldest_overdue_due
                 FROM store_charges sc WHERE sc.tenant_id = t.id) c ON TRUE
           LEFT JOIN LATERAL (
-              SELECT max(x.sold_at) AS last_sale_at, max(x.at) AS last_order_opened_at, count(*) FILTER (WHERE x.at >= tchefood_admin_day_start(v_today - 6)) AS orders_7d
-                FROM tchefood_admin_sales(t.id) x) u ON TRUE), '[]'::jsonb);
+              SELECT * FROM tchefood_admin_usage(t.id, v_today)) u ON TRUE), '[]'::jsonb);
 END;
 $$;
 
 CREATE OR REPLACE FUNCTION tchefood_admin_store(p_tenant UUID) RETURNS JSONB
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
-DECLARE v_t tenants%ROWTYPE; v_s store_subscriptions%ROWTYPE;
+DECLARE v_t tenants%ROWTYPE; v_s store_subscriptions%ROWTYPE; v_u RECORD;
 BEGIN
     PERFORM tchefood_admin_require();
     SELECT * INTO v_t FROM tenants WHERE id = p_tenant;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: loja não encontrada'; END IF;
     SELECT * INTO v_s FROM store_subscriptions WHERE tenant_id = p_tenant;
+    SELECT * INTO v_u FROM tchefood_admin_usage(p_tenant, tchefood_admin_today());
     RETURN jsonb_build_object(
         'tenant_id', v_t.id, 'name', v_t.name, 'legal_name', v_t.legal_name, 'cnpj', v_t.cnpj, 'city', v_t.city, 'state', v_t.state,
         'created_at', v_t.created_at,
@@ -454,10 +488,10 @@ BEGIN
                              'created_at', a.created_at, 'admin_name', pa.name) AS j
                         FROM platform_admin_audit a LEFT JOIN platform_admins pa ON pa.user_id = a.admin_user_id
                        WHERE a.tenant_id = p_tenant ORDER BY a.created_at DESC LIMIT 50) x), '[]'::jsonb),
-        'last_sale_at', (SELECT max(x.sold_at) FROM tchefood_admin_sales(p_tenant) x),
-        'last_order_opened_at', (SELECT max(x.at) FROM tchefood_admin_sales(p_tenant) x),
-        'orders_7d', (SELECT count(*) FROM tchefood_admin_sales(p_tenant) x WHERE x.at >= tchefood_admin_day_start(tchefood_admin_today() - 6)),
-        'orders_30d', (SELECT count(*) FROM tchefood_admin_sales(p_tenant) x WHERE x.at >= tchefood_admin_day_start(tchefood_admin_today() - 29)),
+        'last_sale_at', v_u.last_sale_at,
+        'last_order_opened_at', v_u.last_order_opened_at,
+        'orders_7d', v_u.orders_7d,
+        'orders_30d', v_u.orders_30d,
         'staff_active', (SELECT count(*) FROM staff_users su WHERE su.tenant_id = p_tenant AND su.active));
 END;
 $$;
@@ -552,11 +586,11 @@ CREATE OR REPLACE FUNCTION tchefood_admin_save_subscription(
 ) RETURNS JSONB
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_plan platform_plans%ROWTYPE; v_old store_subscriptions%ROWTYPE; v_new store_subscriptions%ROWTYPE;
-        v_existed BOOLEAN;
+        v_existed BOOLEAN; v_c RECORD;
 BEGIN
     v_admin := tchefood_admin_require();
-    IF length(tchefood_admin_trim(COALESCE(p_reason, ''))) < 5 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o motivo da alteração'; END IF;
-    PERFORM 1 FROM tenants WHERE id = p_tenant FOR UPDATE;
+    IF length(tchefood_admin_trim(COALESCE(p_reason, ''))) < 5 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o motivo da alteração (pelo menos 5 letras)'; END IF;
+    PERFORM 1 FROM tenants WHERE id = p_tenant FOR NO KEY UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: loja não encontrada'; END IF;
     SELECT * INTO v_plan FROM platform_plans WHERE id = p_plan_id;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: plano inválido'; END IF;
@@ -590,6 +624,21 @@ BEGIN
                 tchefood_admin_trim(COALESCE(p_contact_name, '')), tchefood_admin_clean_phone(p_contact_phone), tchefood_admin_check_email(p_contact_email),
                 NULLIF(tchefood_admin_trim(p_notes), ''))
         RETURNING * INTO v_new;
+    END IF;
+
+    -- Assinatura cancelada: as cobranças em aberto de meses depois do atual são canceladas junto
+    -- (a loja não vai usar). As do mês atual e de antes continuam a receber.
+    IF p_status = 'CANCELLED' AND (NOT v_existed OR v_old.status <> 'CANCELLED') THEN
+        FOR v_c IN SELECT id, reference_month, amount FROM store_charges
+                    WHERE tenant_id = p_tenant AND status = 'OPEN'
+                      AND reference_month > date_trunc('month', tchefood_admin_today())::date
+                    ORDER BY reference_month FOR UPDATE LOOP
+            UPDATE store_charges SET status = 'CANCELLED', cancel_reason = 'Assinatura cancelada: ' || tchefood_admin_trim(p_reason),
+                                     cancelled_at = NOW(), cancelled_by = v_admin.user_id
+             WHERE id = v_c.id;
+            PERFORM tchefood_admin_log(v_admin.user_id, p_tenant, v_c.id, 'CHARGE_CANCELLED', 'Assinatura cancelada: ' || tchefood_admin_trim(p_reason),
+                jsonb_build_object('reference_month', v_c.reference_month, 'amount', v_c.amount, 'subscription_cancelled', TRUE));
+        END LOOP;
     END IF;
 
     PERFORM tchefood_admin_log(v_admin.user_id, p_tenant, NULL,
@@ -632,10 +681,10 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: vencimento longe do mês da cobrança';
     END IF;
     v_due := COALESCE(p_due_date, GREATEST(tchefood_admin_due_date(v_month, v_s.billing_day), tchefood_admin_today(),
-                                           CASE WHEN v_s.status = 'TRIAL' THEN v_s.trial_ends_on + 1 END));
+                                           v_s.trial_ends_on + 1));
     v_link := NULLIF(tchefood_admin_trim(COALESCE(p_payment_link, '')), '');
     IF v_link IS NOT NULL AND (v_link !~ '^https://[^\s]+$' OR length(v_link) > 500) THEN
-        RAISE EXCEPTION 'TCHEFOOD_ADMIN: link de pagamento precisa começar com https://';
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: link de pagamento precisa começar com https://, sem espaços, com até 500 caracteres';
     END IF;
     IF EXISTS (SELECT 1 FROM store_charges WHERE tenant_id = p_tenant AND reference_month = v_month AND status <> 'CANCELLED') THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: já existe cobrança deste mês para a loja';
@@ -663,13 +712,16 @@ BEGIN
     PERFORM tchefood_admin_check_month(v_month);
     FOR v_s IN SELECT * FROM store_subscriptions
                 WHERE monthly_price > 0
-                  -- Em teste: só a partir do mês seguinte ao fim do teste (o mês em que o teste
-                  -- termina não é cobrado; teste até 30/11 não paga novembro).
-                  AND (status = 'ACTIVE' OR (status = 'TRIAL' AND trial_ends_on < v_month))
+                  AND status IN ('ACTIVE', 'TRIAL')
+                  -- Mês dentro do teste não é cobrado, mesmo se a loja já pagou adiantado e virou
+                  -- ativa: só a partir do mês seguinte ao fim do teste (teste até 30/11 não paga novembro).
+                  AND (trial_ends_on IS NULL OR trial_ends_on < v_month)
+                  -- Nem mês de antes de a loja entrar no painel.
+                  AND created_at < tchefood_admin_day_start((v_month + INTERVAL '1 month')::date)
                 ORDER BY tenant_id FOR UPDATE LOOP
         IF NOT EXISTS (SELECT 1 FROM store_charges WHERE tenant_id = v_s.tenant_id AND reference_month = v_month) THEN
             v_due := GREATEST(tchefood_admin_due_date(v_month, v_s.billing_day), tchefood_admin_today(),
-                              CASE WHEN v_s.status = 'TRIAL' THEN v_s.trial_ends_on + 1 END);
+                              v_s.trial_ends_on + 1);
             INSERT INTO store_charges (tenant_id, reference_month, amount, due_date, created_by)
             VALUES (v_s.tenant_id, v_month, v_s.monthly_price, v_due, v_admin.user_id)
             RETURNING id INTO v_id;
@@ -694,7 +746,7 @@ DECLARE v_admin platform_admins%ROWTYPE; v_tenant UUID; v_c store_charges%ROWTYP
 BEGIN
     v_admin := tchefood_admin_require();
     v_ref := tchefood_admin_trim(COALESCE(p_reference, ''));
-    IF length(v_ref) < 4 OR length(v_ref) > 120 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe a referência do pagamento (id do Pix, nosso número, recibo)'; END IF;
+    IF length(v_ref) < 4 OR length(v_ref) > 120 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe a referência do pagamento com 4 a 120 caracteres (id do Pix, nosso número, recibo)'; END IF;
     IF p_method IS NULL OR p_method NOT IN ('PIX', 'BOLETO', 'CARTAO', 'TRANSFERENCIA', 'DINHEIRO') THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: forma de pagamento inválida';
     END IF;
@@ -754,7 +806,7 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_tenant UUID; v_c store_charges%ROWTYPE;
 BEGIN
     v_admin := tchefood_admin_require();
-    IF length(tchefood_admin_trim(COALESCE(p_reason, ''))) < 5 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o motivo do cancelamento'; END IF;
+    IF length(tchefood_admin_trim(COALESCE(p_reason, ''))) < 5 THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: informe o motivo do cancelamento (pelo menos 5 letras)'; END IF;
     SELECT tenant_id INTO v_tenant FROM store_charges WHERE id = p_charge;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: cobrança não encontrada'; END IF;
     PERFORM 1 FROM store_subscriptions WHERE tenant_id = v_tenant FOR UPDATE;
@@ -798,7 +850,7 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: este e-mail é de um admin do painel';
     END IF;
     v_id := gen_random_uuid();
-    UPDATE store_subscriptions SET device_user_id = v_id, device_email = v_email, device_status = 'PENDING', updated_at = NOW()
+    UPDATE store_subscriptions SET device_user_id = v_id, device_email = v_email, device_status = 'PENDING'
      WHERE tenant_id = p_tenant;
     PERFORM tchefood_admin_log(v_admin.user_id, p_tenant, NULL, 'DEVICE_ACCOUNT_RESERVED', NULL,
         jsonb_build_object('user_id', v_id, 'email', v_email,
@@ -859,7 +911,7 @@ BEGIN
     IF p_op IS NULL OR v_s.device_op_id IS DISTINCT FROM p_op THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: outra operação assumiu a conta do aparelho; abra a loja de novo' USING ERRCODE = '55P03';
     END IF;
-    UPDATE store_subscriptions SET device_status = 'READY', device_op_id = NULL, device_op_started_at = NULL, updated_at = NOW()
+    UPDATE store_subscriptions SET device_status = 'READY', device_op_id = NULL, device_op_started_at = NULL
      WHERE tenant_id = p_tenant;
     PERFORM tchefood_admin_log(v_admin.user_id, p_tenant, NULL,
         CASE p_action WHEN 'CREATED' THEN 'DEVICE_ACCOUNT_CREATED' ELSE 'DEVICE_PASSWORD_RESET' END, NULL,
@@ -884,7 +936,7 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_admin_due_date(DATE, INT) FROM PUBLIC, anon, authenticated, service_role;
         REVOKE ALL ON FUNCTION tchefood_admin_check_month(DATE) FROM PUBLIC, anon, authenticated, service_role;
         REVOKE ALL ON FUNCTION tchefood_admin_day_start(DATE) FROM PUBLIC, anon, authenticated, service_role;
-        REVOKE ALL ON FUNCTION tchefood_admin_sales(UUID) FROM PUBLIC, anon, authenticated, service_role;
+        REVOKE ALL ON FUNCTION tchefood_admin_usage(UUID, DATE) FROM PUBLIC, anon, authenticated, service_role;
         REVOKE ALL ON FUNCTION tchefood_admin_log(UUID, UUID, UUID, TEXT, TEXT, JSONB) FROM PUBLIC, anon, authenticated, service_role;
         REVOKE ALL ON FUNCTION tchefood_admin_clean_phone(TEXT) FROM PUBLIC, anon, authenticated, service_role;
         REVOKE ALL ON FUNCTION tchefood_admin_check_email(TEXT) FROM PUBLIC, anon, authenticated, service_role;
