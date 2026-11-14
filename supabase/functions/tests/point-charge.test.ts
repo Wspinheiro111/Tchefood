@@ -8,7 +8,9 @@ import {
   cancelCharge,
   DISPATCH_START_LIMIT_MS,
   pollCharge,
+  reconcileCharge,
   startCharge,
+  type ChargeStatus,
   type ChargeContext,
   type ChargePatch,
   type ChargeStore,
@@ -58,13 +60,17 @@ class MemoryStore implements ChargeStore {
   /** Chamado logo depois da barreira passar (o que acontece entre a barreira e a chamada ao Mercado Pago). */
   afterBegin: ((row: TerminalChargeRow, kind: 1 | 2) => void | Promise<void>) | null = null;
   /** Quantas vezes cada método foi chamado. */
-  count: Partial<Record<StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel', number>> = {};
+  count: Partial<Record<StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel' | 'authorizeReconcile' | 'resolve', number>> = {};
+  /** Chaves com pagamento APPROVED do Mercado Pago registrado (tabela payments). */
+  registeredPayments = new Set<string>();
+  /** Fins verificados gravados (tchefood_resolve_point_charge). */
+  resolutions: { key: string; from: ChargeStatus; to: ChargeStatus; patch: ChargePatch; staff: string; reason: string; evidence: Record<string, unknown> }[] = [];
   private failures: Partial<Record<StoreMethod, number>> = {};
   /** Faz a próxima chamada (ou as próximas `times`) do método falhar, como uma queda do banco. */
   failOnce(method: StoreMethod, times = 1) {
     this.failures[method] = times;
   }
-  private enter(method: StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel') {
+  private enter(method: StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel' | 'authorizeReconcile' | 'resolve') {
     this.count[method] = (this.count[method] ?? 0) + 1;
     const left = this.failures[method as StoreMethod] ?? 0;
     if (left > 0) {
@@ -93,6 +99,8 @@ class MemoryStore implements ChargeStore {
       throw new Error(`TCHEFOOD_COBRANCA: ${m}`);
     };
     if (FINAL_STATES.has(r.status)) raise('a cobrança já terminou e não muda mais.');
+    // r5: revisão manual só sai pelo fim verificado (resolve), nunca por UPDATE direto.
+    if (r.status === 'manual_review' && next.status !== 'manual_review') raise('está em revisão manual e só sai dela com a confirmação do Mercado Pago lida pelo servidor.');
     if (next.created_at !== r.created_at) raise('a hora da cobrança não muda.');
     if (r.dispatched_at !== null && next.dispatched_at !== r.dispatched_at) raise('a cobrança já foi mandada ao Mercado Pago.');
     if (r.cancel_requested_at !== null) {
@@ -224,6 +232,43 @@ class MemoryStore implements ChargeStore {
     this.write(r, { cancel_reason: 'operator', cancel_requested_by: input.performed_by, cancel_requested_at: this.iso(), cancel_authorized_by: 'manager', cancel_audit_id: id });
     return id;
   }
+  /** Como tchefood_authorize_point_reconcile: confere operador, motivo, estado e PIN; grava um registro; não muda a cobrança. */
+  async authorizeReconcile(input: { idempotency_key: string; performed_by: string; manager_pin: string; reason: string }) {
+    this.enter('authorizeReconcile');
+    const r = this.rows.find((x) => x.idempotency_key === input.idempotency_key);
+    if (!r) throw new ChargeRefusedError('not_found', 'cobrança não encontrada nesta loja.');
+    if (input.performed_by !== STAFF) throw new ChargeRefusedError('invalid_staff', 'operador não é da equipe ativa desta loja.');
+    if (input.reason.trim().length < 10) throw new ChargeRefusedError('invalid_reason', 'motivo obrigatório (mínimo 10 caracteres).');
+    if (r.status !== 'manual_review' && r.status !== 'approved') throw new ChargeRefusedError('not_applicable', 'nada a conferir.');
+    if (input.manager_pin !== MANAGER_PIN) {
+      this.audits.push({ key: input.idempotency_key, action: 'MANAGER_PIN_FAILED', performed_by: input.performed_by, reason: 'PIN de gerente incorreto' });
+      return null;
+    }
+    this.audits.push({ key: input.idempotency_key, action: 'POINT_RECONCILE_AUTHORIZED', performed_by: input.performed_by, reason: input.reason });
+    return `audit-${this.audits.length}`;
+  }
+  async hasRegisteredPayment(key: string) {
+    return this.registeredPayments.has(key);
+  }
+  /** Como tchefood_resolve_point_charge + o gatilho com a flag ligada: só as transições aceitas, só do estado lido. */
+  async resolve(row: TerminalChargeRow, toStatus: ChargeStatus, patch: ChargePatch, audit: { staff: string; reason: string; evidence: Record<string, unknown> }) {
+    this.enter('resolve');
+    const r = this.get(row.id);
+    if (r.status !== row.status) return { ...r };
+    const fromReview = r.status === 'manual_review' && ['approved', 'rejected', 'cancelled', 'expired', 'refunded'].includes(toStatus);
+    const refund = r.status === 'approved' && toStatus === 'refunded' && !this.registeredPayments.has(r.idempotency_key);
+    if (!fromReview && !refund) throw new Error('TCHEFOOD_COBRANCA: transição não aceita.');
+    if ('status' in patch || 'external_order_id' in patch) throw new Error('TCHEFOOD_COBRANCA: o patch não muda estado nem ordem.');
+    const next = { ...r, ...patch, status: toStatus };
+    if (toStatus === 'approved' && (!next.external_payment_id || !next.authorization_code || !next.card_brand || next.paid_amount_cents !== next.amount_cents)) {
+      throw new Error('TCHEFOOD_COBRANCA: aprovação sem comprovante completo.');
+    }
+    if ((next.raw_status ?? '').length > 50 || (next.raw_status_detail ?? '').length > 80) throw new Error('value too long for type character varying');
+    this.resolutions.push({ key: r.idempotency_key, from: r.status, to: toStatus, patch, ...audit });
+    this.audits.push({ key: r.idempotency_key, action: 'POINT_CHARGE_RESOLVED', performed_by: audit.staff, reason: audit.reason });
+    Object.assign(r, next);
+    return { ...r };
+  }
 }
 
 function order(over: Partial<PaymentTerminalChargeResult> = {}): PaymentTerminalChargeResult {
@@ -253,8 +298,11 @@ const approvedPayment = (over: Partial<PointPaymentDetails> = {}): PointPaymentD
   id: '123456789', status: 'approved', amountCents: 2450, paymentMethodId: 'master', paymentTypeId: 'credit_card', authorizationCode: 'A1B2C3', lastFour: '4242', installments: 1, ...over,
 });
 
-function setup(opts: { create?: () => Promise<PaymentTerminalChargeResult>; get?: () => Promise<PaymentTerminalChargeResult>; payment?: () => Promise<PointPaymentDetails>; cancel?: () => Promise<void> } = {}) {
-  const calls: { create: PaymentTerminalChargeRequest[]; get: string[]; cancel: { id: string; key: string }[]; payment: string[] } = { create: [], get: [], cancel: [], payment: [] };
+function setup(opts: {
+  create?: () => Promise<PaymentTerminalChargeResult>; get?: () => Promise<PaymentTerminalChargeResult>; payment?: (id: string) => Promise<PointPaymentDetails>; cancel?: () => Promise<void>;
+  find?: () => Promise<PaymentTerminalChargeResult | null>;
+} = {}) {
+  const calls: { create: PaymentTerminalChargeRequest[]; get: string[]; cancel: { id: string; key: string }[]; payment: string[]; find: { ref: string; createdAt: string | undefined }[] } = { create: [], get: [], cancel: [], payment: [], find: [] };
   const provider: PaymentTerminalProvider = {
     key: 'mercado_pago_point',
     createRetryPolicy: 'same_key',
@@ -274,6 +322,10 @@ function setup(opts: { create?: () => Promise<PaymentTerminalChargeResult>; get?
       await (opts.cancel ?? (async () => undefined))();
       return { outcome: 'cancellation_pending', charge: null };
     },
+    findChargeByReference: async (ref, o) => {
+      calls.find.push({ ref, createdAt: o?.createdAt });
+      return (opts.find ?? (async () => null))();
+    },
   };
   const store = new MemoryStore();
   const ctx: ChargeContext = {
@@ -282,7 +334,7 @@ function setup(opts: { create?: () => Promise<PaymentTerminalChargeResult>; get?
     payments: {
       getPayment: async (id) => {
         calls.payment.push(id);
-        return (opts.payment ?? (async () => approvedPayment()))();
+        return (opts.payment ?? (async () => approvedPayment()))(id);
       },
     },
   };
@@ -390,6 +442,34 @@ describe('point-charge: criação', () => {
   });
 });
 
+/** Toda conferência da aprovação, com o código da revisão manual. A conferência da revisão (r5) usa a mesma tabela. */
+const APPROVAL_MISMATCHES = [
+  [{ externalReference: 'outra' }, {}, 'REFERENCE_MISMATCH'],
+  [{ externalReference: null }, {}, 'APPROVED_WITHOUT_REFERENCE'],
+  [{ externalTerminalId: 'OUTRA' }, {}, 'TERMINAL_MISMATCH'],
+  [{ externalTerminalId: null }, {}, 'APPROVED_WITHOUT_TERMINAL'],
+  [{ amountCents: 2400 }, {}, 'AMOUNT_MISMATCH'],
+  [{ paidAmountCents: 2400 }, {}, 'PAID_AMOUNT_MISMATCH'],
+  [{ paidAmountCents: null }, {}, 'PAID_AMOUNT_MISMATCH'],
+  [{ paymentMethodType: 'debit_card' }, {}, 'METHOD_MISMATCH'],
+  [{ paymentMethodType: null }, {}, 'METHOD_MISMATCH'],
+  [{ installments: 3 }, {}, 'INSTALLMENTS_MISMATCH'],
+  [{ externalPaymentId: null }, {}, 'APPROVED_WITHOUT_NSU'],
+  [{}, { id: '999' }, 'PAYMENT_ID_MISMATCH'],
+  [{}, { status: 'in_process' }, 'PAYMENT_NOT_APPROVED'],
+  [{}, { amountCents: 2449 }, 'PAYMENT_AMOUNT_MISMATCH'],
+  [{}, { amountCents: null }, 'PAYMENT_AMOUNT_MISMATCH'],
+  [{}, { paymentTypeId: 'account_money' }, 'PAYMENT_METHOD_MISMATCH'],
+  [{}, { installments: 2 }, 'PAYMENT_INSTALLMENTS_MISMATCH'],
+  [{}, { authorizationCode: null }, 'APPROVED_WITHOUT_AUTHORIZATION'],
+  [{}, { authorizationCode: '12 34' }, 'APPROVED_WITHOUT_AUTHORIZATION'],
+  [{}, { paymentMethodId: 'amex' }, 'UNSUPPORTED_BRAND'],
+  [{}, { installments: null }, 'PAYMENT_INSTALLMENTS_MISMATCH'],
+  [{ installments: null }, { installments: null }, 'PAYMENT_INSTALLMENTS_MISMATCH'],
+  [{}, { paymentMethodId: null }, 'UNSUPPORTED_BRAND'],
+  [{ paymentMethodId: 'visa' }, {}, 'BRAND_MISMATCH'],
+] as const;
+
 describe('point-charge: aprovação só com tudo conferido', () => {
   async function approveWith(orderOver: Partial<PaymentTerminalChargeResult> = {}, paymentOver: Partial<PointPaymentDetails> = {}, method: 'CREDIT' | 'DEBIT' = 'CREDIT') {
     const { ctx, store } = setup({ get: async () => approvedOrder(orderOver), payment: async () => approvedPayment(paymentOver) });
@@ -411,32 +491,7 @@ describe('point-charge: aprovação só com tudo conferido', () => {
     expect(reply).toMatchObject({ status: 'APPROVED', card_brand: 'VISA', method: 'DEBIT' });
   });
 
-  it.each([
-    [{ externalReference: 'outra' }, {}, 'REFERENCE_MISMATCH'],
-    [{ externalReference: null }, {}, 'APPROVED_WITHOUT_REFERENCE'],
-    [{ externalTerminalId: 'OUTRA' }, {}, 'TERMINAL_MISMATCH'],
-    [{ externalTerminalId: null }, {}, 'APPROVED_WITHOUT_TERMINAL'],
-    [{ amountCents: 2400 }, {}, 'AMOUNT_MISMATCH'],
-    [{ paidAmountCents: 2400 }, {}, 'PAID_AMOUNT_MISMATCH'],
-    [{ paidAmountCents: null }, {}, 'PAID_AMOUNT_MISMATCH'],
-    [{ paymentMethodType: 'debit_card' }, {}, 'METHOD_MISMATCH'],
-    [{ paymentMethodType: null }, {}, 'METHOD_MISMATCH'],
-    [{ installments: 3 }, {}, 'INSTALLMENTS_MISMATCH'],
-    [{ externalPaymentId: null }, {}, 'APPROVED_WITHOUT_NSU'],
-    [{}, { id: '999' }, 'PAYMENT_ID_MISMATCH'],
-    [{}, { status: 'in_process' }, 'PAYMENT_NOT_APPROVED'],
-    [{}, { amountCents: 2449 }, 'PAYMENT_AMOUNT_MISMATCH'],
-    [{}, { amountCents: null }, 'PAYMENT_AMOUNT_MISMATCH'],
-    [{}, { paymentTypeId: 'account_money' }, 'PAYMENT_METHOD_MISMATCH'],
-    [{}, { installments: 2 }, 'PAYMENT_INSTALLMENTS_MISMATCH'],
-    [{}, { authorizationCode: null }, 'APPROVED_WITHOUT_AUTHORIZATION'],
-    [{}, { authorizationCode: '12 34' }, 'APPROVED_WITHOUT_AUTHORIZATION'],
-    [{}, { paymentMethodId: 'amex' }, 'UNSUPPORTED_BRAND'],
-    [{}, { installments: null }, 'PAYMENT_INSTALLMENTS_MISMATCH'],
-    [{ installments: null }, { installments: null }, 'PAYMENT_INSTALLMENTS_MISMATCH'],
-    [{}, { paymentMethodId: null }, 'UNSUPPORTED_BRAND'],
-    [{ paymentMethodId: 'visa' }, {}, 'BRAND_MISMATCH'],
-  ] as const)('%o %o → revisão manual %s', async (o, p, code) => {
+  it.each(APPROVAL_MISMATCHES)('%o %o → revisão manual %s', async (o, p, code) => {
     const { reply, row } = await approveWith(o, p);
     expect(reply).toMatchObject({ status: 'MANUAL_REVIEW', code });
     expect(row.status).toBe('manual_review');
@@ -767,9 +822,9 @@ describe('point-charge: auditoria r3', () => {
       expect(store.rows[0]!.status).toBe('manual_review');
     });
 
-    it('a resposta que chega depois da revisão manual ainda grava a aprovação (o pagamento não se perde)', async () => {
+    it('a resposta que chega depois da revisão manual liga a ordem (o pagamento não se perde); a aprovação sai só pela conferência (r5)', async () => {
       let release: (o: PaymentTerminalChargeResult) => void = () => undefined;
-      const { ctx, store } = setup({ create: () => new Promise((resolve) => { release = resolve; }) });
+      const { ctx, store } = setup({ create: () => new Promise((resolve) => { release = resolve; }), get: async () => approvedOrder() });
       const creating = startCharge(ctx, terminal, input());
       await new Promise((r) => setTimeout(r, 0));
       // A posse venceu sem resposta e o gerente pediu o encerramento: revisão manual.
@@ -777,7 +832,11 @@ describe('point-charge: auditoria r3', () => {
       expect(await cancelCharge(ctx, store.rows[0]!, OPERATOR)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
       expect(store.rows[0]).toMatchObject({ status: 'manual_review', external_order_id: null });
       release(approvedOrder());
-      expect((await creating).status).toBe('APPROVED');
+      expect(await creating).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
+      expect(store.rows[0]).toMatchObject({ status: 'manual_review', external_order_id: 'ORD01' });
+      // A consulta também não tira da revisão; a conferência do gerente lê o Mercado Pago e aprova.
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('MANUAL_REVIEW');
+      expect(await reconcileCharge(ctx, { idempotency_key: KEY, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: 'conferido no app do Mercado Pago' })).toMatchObject({ status: 'APPROVED' });
       expect(store.rows[0]).toMatchObject({ status: 'approved', external_payment_id: '123456789', authorization_code: 'A1B2C3' });
     });
   });
@@ -1047,10 +1106,10 @@ describe('point-charge: auditoria r3, segunda revisão', () => {
 
   describe('C. envio em andamento sem resposta e encerramento pedido', () => {
     it.each([['por prazo', CANCEL, 'timeout'], ['pelo gerente (PIN certo)', OPERATOR, 'operator']])(
-      '%s: espera enquanto a posse vale; vencida, revisão manual (nunca recusa); a resposta atrasada ainda aprova',
+      '%s: espera enquanto a posse vale; vencida, revisão manual (nunca recusa); a resposta atrasada liga a ordem e a conferência aprova',
       async (_n, body, reason) => {
         let release: (o: PaymentTerminalChargeResult) => void = () => undefined;
-        const { ctx, store, calls } = setup({ create: () => new Promise((resolve) => { release = resolve; }) });
+        const { ctx, store, calls } = setup({ create: () => new Promise((resolve) => { release = resolve; }), get: async () => approvedOrder() });
         const creating = startCharge(ctx, terminal, input());
         await tick();
         expect(calls.create).toHaveLength(1);
@@ -1068,9 +1127,12 @@ describe('point-charge: auditoria r3, segunda revisão', () => {
         expect(calls.create).toHaveLength(1);
         // A resposta válida do primeiro envio chega depois: a ordem é ligada à cobrança em revisão manual.
         release(approvedOrder());
-        expect((await creating).status).toBe('APPROVED');
-        expect(store.rows[0]).toMatchObject({ status: 'approved', external_order_id: 'ORD01', external_payment_id: '123456789', cancel_reason: reason });
+        expect((await creating).status).toBe('MANUAL_REVIEW');
+        expect(store.rows[0]).toMatchObject({ status: 'manual_review', external_order_id: 'ORD01', cancel_reason: reason });
         expect(store.count.attachOrder).toBe(1);
+        // r5: só a conferência do gerente, lendo o Mercado Pago, tira da revisão.
+        expect(await reconcileCharge(ctx, { idempotency_key: KEY, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: 'conferido no app do Mercado Pago' })).toMatchObject({ status: 'APPROVED' });
+        expect(store.rows[0]).toMatchObject({ status: 'approved', external_order_id: 'ORD01', external_payment_id: '123456789', cancel_reason: reason });
       },
     );
 
@@ -1087,8 +1149,11 @@ describe('point-charge: auditoria r3, segunda revisão', () => {
       store.nowMs += 31_000;
       expect((await cancelCharge(ctx, store.rows[0]!, CANCEL)).status).toBe('MANUAL_REVIEW');
       release(order());
-      expect((await creating).status).toBe('DECLINED');
+      expect((await creating).status).toBe('MANUAL_REVIEW');
       expect(calls.cancel).toEqual([{ id: 'ORD01', key: `${KEY}-cancel` }]);
+      expect(store.rows[0]).toMatchObject({ status: 'manual_review', external_order_id: 'ORD01' });
+      // r5: o cancelamento confirmado no Mercado Pago libera só pela conferência.
+      expect(await reconcileCharge(ctx, { idempotency_key: KEY, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: 'conferido no app do Mercado Pago' })).toMatchObject({ status: 'DECLINED' });
       expect(store.rows[0]).toMatchObject({ status: 'cancelled', external_order_id: 'ORD01' });
     });
 
@@ -1695,7 +1760,10 @@ describe('point-charge: leitura do pagamento', () => {
 
   it('parse do GET /v1/payments/{id}', () => {
     expect(parsePayment({ id: 123, status: 'approved', transaction_amount: 24.5, payment_method_id: 'master', payment_type_id: 'credit_card', authorization_code: '301299', card: { last_four_digits: '4242' }, installments: 1 }))
-      .toEqual({ id: '123', status: 'approved', amountCents: 2450, paymentMethodId: 'master', paymentTypeId: 'credit_card', authorizationCode: '301299', lastFour: '4242', installments: 1 });
+      .toEqual({ id: '123', status: 'approved', amountCents: 2450, paymentMethodId: 'master', paymentTypeId: 'credit_card', authorizationCode: '301299', lastFour: '4242', installments: 1, externalReference: null, orderId: null });
+    // r5: referência e ordem do pagamento são lidas (para conferir contra a cobrança, nunca usadas sem conferência).
+    expect(parsePayment({ id: 7, status: 'approved', external_reference: KEY, order: { id: 'ORD01', type: 'mercadopago' } })).toMatchObject({ externalReference: KEY, orderId: 'ORD01' });
+    expect(parsePayment({ id: 7, external_reference: '', order: 'x' })).toMatchObject({ externalReference: null, orderId: null });
     expect(() => parsePayment({ status: 'approved' })).toThrow();
     expect(() => parsePayment(null)).toThrow();
   });
@@ -1861,5 +1929,506 @@ describe('point-charge: auditoria r4', () => {
       expect(await startCharge(ctx, terminal, input({ expected_balance_cents: 10_000 }))).toMatchObject({ status: 'PENDING' });
       expect(calls.create).toHaveLength(1);
     });
+  });
+});
+
+describe('point-charge: auditoria r5', () => {
+  const RECONCILE = { idempotency_key: KEY, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: 'conferido no app do Mercado Pago' };
+  const CREATED_AT = '2026-11-14T12:00:00.000Z';
+
+  /** Cobrança gravada no estado pedido (revisão manual com ordem, por padrão). */
+  const seed = (store: MemoryStore, over: Partial<TerminalChargeRow> = {}): TerminalChargeRow => {
+    store.rows.push({
+      id: 'row-1', tenant_id: TENANT, idempotency_key: KEY, order_id: ORDER, terminal_id: TERMINAL_UUID, provider: 'mercado_pago_point',
+      external_terminal_id: MP_TERMINAL, method: 'CREDIT', amount_cents: 2450, status: 'manual_review', external_order_id: 'ORD01', external_payment_id: null,
+      raw_status: 'processed', raw_status_detail: 'PAYMENT_NOT_APPROVED', paid_amount_cents: null, card_brand: null, authorization_code: null, last_four: null, created_by: STAFF,
+      dispatched_at: CREATED_AT, dispatch_lease_until: null, dispatch_attempts: 1, cancel_reason: null, cancel_requested_by: null, cancel_requested_at: null,
+      cancel_authorized_by: null, cancel_audit_id: null, created_at: CREATED_AT, ...over,
+    });
+    return { ...store.rows[0]! };
+  };
+  /** Envio sem resposta (DISPATCH_UNKNOWN): sem ordem ligada. */
+  const unknownDispatch = { external_order_id: null, raw_status: 'dispatch_unknown', raw_status_detail: 'DISPATCH_UNKNOWN' } as const;
+  /** Aprovada e conferida, sem pagamento registrado pelo aparelho. */
+  const approvedRow = {
+    status: 'approved', raw_status: 'processed', raw_status_detail: 'accredited', external_payment_id: '123456789', paid_amount_cents: 2450,
+    authorization_code: 'A1B2C3', card_brand: 'MASTERCARD', last_four: '4242',
+  } as const;
+  const APPROVED_REPLY = {
+    status: 'APPROVED', idempotency_key: KEY, nsu: '123456789', authorization_code: 'A1B2C3', card_brand: 'MASTERCARD', last_four: '4242',
+    terminal_serial: MP_TERMINAL, amount_cents: 2450, method: 'CREDIT',
+  };
+  const unchanged = (store: MemoryStore, before: TerminalChargeRow) => {
+    expect(store.rows[0]).toEqual(before);
+    expect(store.resolutions).toHaveLength(0);
+  };
+
+  describe('entrada e PIN de gerente', () => {
+    it.each([
+      [{ idempotency_key: 'chave inválida' }, 'invalid_key', 400],
+      [{ staff_id: 'x' }, 'invalid_staff', 400],
+      [{ staff_id: undefined }, 'invalid_staff', 400],
+      [{ manager_pin: undefined }, 'manager_required', 403],
+      [{ manager_pin: '12' }, 'manager_required', 403],
+      [{ reason_text: 'curto' }, 'invalid_reason', 400],
+      [{ reason_text: '   123456789   ' }, 'invalid_reason', 400],
+      [{ reason_text: undefined }, 'invalid_reason', 400],
+      [{ operation_id: '12a' }, 'invalid_operation', 400],
+      [{ operation_id: 123 }, 'invalid_operation', 400],
+      [{ operation_id: '1'.repeat(21) }, 'invalid_operation', 400],
+    ] as const)('%o → %s (%d), sem PIN nem Mercado Pago', async (over, code, http) => {
+      const { ctx, store, calls } = setup();
+      const before = seed(store);
+      await expect(reconcileCharge(ctx, { ...RECONCILE, ...over })).rejects.toMatchObject({ code, httpStatus: http });
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+      expect(calls.get).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('PIN errado: 403, registra a falha e não lê nem libera nada', async () => {
+      const { ctx, store, calls } = setup();
+      const before = seed(store);
+      await expect(reconcileCharge(ctx, { ...RECONCILE, manager_pin: '0000' })).rejects.toMatchObject({ code: 'manager_denied', httpStatus: 403 });
+      expect(store.audits.map((a) => a.action)).toEqual(['MANAGER_PIN_FAILED']);
+      expect(calls.get).toHaveLength(0);
+      expect(calls.find).toHaveLength(0);
+      expect(calls.payment).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('recusas do banco: operador fora da equipe 403, motivo 400', async () => {
+      const { ctx, store } = setup();
+      seed(store);
+      await expect(reconcileCharge(ctx, { ...RECONCILE, staff_id: '66666666-6666-4666-8666-666666666666' })).rejects.toMatchObject({ code: 'invalid_staff', httpStatus: 403 });
+      store.authorizeReconcile = async () => { throw new ChargeRefusedError('invalid_reason', 'motivo curto'); };
+      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'invalid_reason', httpStatus: 400 });
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('cobrança inexistente: 404', async () => {
+      const { ctx } = setup();
+      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_found', httpStatus: 404 });
+    });
+
+    it.each(['creating', 'pending', 'at_terminal', 'rejected', 'cancelled', 'expired', 'refunded'] as const)('cobrança "%s": 409 not_applicable, sem gastar PIN', async (status) => {
+      const { ctx, store, calls } = setup();
+      const before = seed(store, { status });
+      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+      expect(calls.get).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('aprovada com pagamento já registrado: 409 not_applicable', async () => {
+      const { ctx, store, calls } = setup();
+      const before = seed(store, approvedRow);
+      store.registeredPayments.add(KEY);
+      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+      expect(calls.get).toHaveLength(0);
+      unchanged(store, before);
+    });
+  });
+
+  describe('revisão manual com ordem: as mesmas conferências da aprovação', () => {
+    it('Mercado Pago confirma tudo: aprovada com os dados lidos, UM registro do fim verificado', async () => {
+      const { ctx, store, calls } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment() });
+      seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toEqual(APPROVED_REPLY);
+      expect(store.rows[0]).toMatchObject({ status: 'approved', external_order_id: 'ORD01', external_payment_id: '123456789', paid_amount_cents: 2450, authorization_code: 'A1B2C3', card_brand: 'MASTERCARD', last_four: '4242', raw_status_detail: 'accredited' });
+      expect(calls.get).toEqual(['ORD01']);
+      expect(calls.payment).toEqual(['123456789']);
+      expect(store.resolutions).toHaveLength(1);
+      expect(store.resolutions[0]).toMatchObject({ from: 'manual_review', to: 'approved', staff: STAFF, reason: 'conferido no app do Mercado Pago' });
+      expect(store.resolutions[0]!.patch).not.toHaveProperty('external_order_id');
+      expect(store.resolutions[0]!.evidence).toMatchObject({
+        source: 'mercado_pago_order', external_order_id: 'ORD01', order_status: 'processed', external_payment_id: '123456789', payment_status: 'approved', authorization_audit_id: 'audit-1', operation_id: null,
+      });
+      expect(store.audits.map((a) => a.action)).toEqual(['POINT_RECONCILE_AUTHORIZED', 'POINT_CHARGE_RESOLVED']);
+    });
+
+    it.each(APPROVAL_MISMATCHES)('%o %o → continua em revisão (%s), nada gravado', async (o, p, code) => {
+      const { ctx, store } = setup({ get: async () => approvedOrder(o), payment: async () => approvedPayment(p) });
+      const before = seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code });
+      unchanged(store, before);
+    });
+
+    it.each([
+      ['rejected', 'failed', 'rejected_by_issuer'],
+      ['cancelled', 'canceled', 'canceled'],
+      ['expired', 'expired', 'expired'],
+    ] as const)('Mercado Pago mostra "%s": libera com a leitura gravada (DECLINED)', async (status, rawStatus, rawStatusDetail) => {
+      const { ctx, store } = setup({ get: async () => order({ status, rawStatus, rawStatusDetail }) });
+      seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
+      expect(store.rows[0]).toMatchObject({ status, raw_status: rawStatus, raw_status_detail: rawStatusDetail });
+      expect(store.resolutions).toEqual([expect.objectContaining({ from: 'manual_review', to: status })]);
+    });
+
+    it('ordem estornada no Mercado Pago: refunded, uma vez só', async () => {
+      const { ctx, store } = setup({ get: async () => order({ status: 'refunded', rawStatus: 'refunded', rawStatusDetail: 'refunded' }) });
+      seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', reason: expect.stringContaining('estorno') });
+      expect(store.rows[0]!.status).toBe('refunded');
+      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      expect(store.resolutions).toHaveLength(1);
+    });
+
+    it('ordem processada com o pagamento estornado (refunded / charged_back): refunded', async () => {
+      for (const status of ['refunded', 'charged_back']) {
+        const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status }) });
+        seed(store);
+        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
+        expect(store.rows[0]).toMatchObject({ status: 'refunded', raw_status: `payment_${status}`, raw_status_detail: 'PAYMENT_REFUNDED' });
+      }
+    });
+
+    it('pagamento estornado de OUTRO valor não prova estorno desta cobrança', async () => {
+      const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status: 'refunded', amountCents: 100 }) });
+      const before = seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'PAYMENT_NOT_APPROVED' });
+      unchanged(store, before);
+    });
+
+    it('ordem ainda aberta no Mercado Pago: continua em revisão (MP_PENDING)', async () => {
+      for (const o of [order(), order({ status: 'pending', rawStatus: 'created' })]) {
+        const { ctx, store } = setup({ get: async () => o });
+        const before = seed(store);
+        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_PENDING' });
+        unchanged(store, before);
+      }
+    });
+
+    it('status incerto do Mercado Pago: continua em revisão', async () => {
+      const { ctx, store } = setup({ get: async () => order({ status: 'manual_review', rawStatus: 'action_required' }) });
+      const before = seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'PROVIDER_STATUS_UNCERTAIN' });
+      unchanged(store, before);
+    });
+
+    it('Mercado Pago fora do ar (ordem ou pagamento): continua em revisão (MP_UNAVAILABLE), nada liberado', async () => {
+      for (const opts of [
+        { get: async () => { throw new PaymentTerminalProviderError('unavailable'); } },
+        { get: async () => approvedOrder(), payment: async () => { throw new Error('rede'); } },
+      ]) {
+        const { ctx, store } = setup(opts);
+        const before = seed(store);
+        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_UNAVAILABLE' });
+        unchanged(store, before);
+      }
+    });
+
+    it('a consulta devolve outra ordem: MISMATCH', async () => {
+      const { ctx, store } = setup({ get: async () => approvedOrder({ externalOrderId: 'ORD02' }) });
+      const before = seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MISMATCH' });
+      unchanged(store, before);
+    });
+
+    it('duas ordens para a mesma chave (ORDER_ID_CHANGED): continua em revisão sem ler nada', async () => {
+      const { ctx, store, calls } = setup({ get: async () => approvedOrder() });
+      const before = seed(store, { raw_status_detail: 'ORDER_ID_CHANGED' });
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'ORDER_ID_CHANGED' });
+      expect(calls.get).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('segunda conferência depois de liberada: 409, sem gravar de novo', async () => {
+      const { ctx, store } = setup({ get: async () => order({ status: 'cancelled', rawStatus: 'canceled', rawStatusDetail: 'canceled' }) });
+      seed(store);
+      expect((await reconcileCharge(ctx, RECONCILE)).status).toBe('DECLINED');
+      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      expect(store.resolutions).toHaveLength(1);
+      expect(store.count.authorizeReconcile).toBe(1);
+    });
+
+    it('segunda conferência depois de aprovada (sem pagamento registrado): devolve a aprovação, sem gravar de novo', async () => {
+      const { ctx, store } = setup({ get: async () => approvedOrder() });
+      seed(store);
+      expect(await reconcileCharge(ctx, RECONCILE)).toEqual(APPROVED_REPLY);
+      expect(await reconcileCharge(ctx, RECONCILE)).toEqual(APPROVED_REPLY);
+      expect(store.resolutions).toHaveLength(1);
+    });
+
+    it('outra chamada liberou no meio: o fim verificado não grava e vale o que está gravado', async () => {
+      const { ctx, store } = setup({ get: async () => order({ status: 'cancelled', rawStatus: 'canceled', rawStatusDetail: 'canceled' }) });
+      seed(store);
+      const real = store.resolve.bind(store);
+      store.resolve = async (row, to, patch, audit) => {
+        Object.assign(store.rows[0]!, { status: 'expired', raw_status: 'expired' }); // a consulta normal terminou antes
+        return real(row, to, patch, audit);
+      };
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', reason: expect.stringContaining('expirou') });
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('a consulta normal terminou a cobrança entre o PIN e a leitura: devolve o estado gravado', async () => {
+      const { ctx, store, calls } = setup({ get: async () => approvedOrder() });
+      seed(store);
+      const real = store.authorizeReconcile.bind(store);
+      store.authorizeReconcile = async (i) => {
+        const id = await real(i);
+        Object.assign(store.rows[0]!, { status: 'rejected', raw_status: 'failed', raw_status_detail: 'failed' });
+        return id;
+      };
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
+      expect(calls.get).toHaveLength(0);
+      expect(store.resolutions).toHaveLength(0);
+    });
+  });
+
+  describe('revisão manual sem ordem (envio sem resposta)', () => {
+    it('procura pela referência com a hora gravada; uma ordem: liga e confere como na aprovação', async () => {
+      const { ctx, store, calls } = setup({ find: async () => approvedOrder(), get: async () => approvedOrder() });
+      seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, RECONCILE)).toEqual(APPROVED_REPLY);
+      expect(calls.find).toEqual([{ ref: KEY, createdAt: CREATED_AT }]);
+      expect(calls.get).toEqual(['ORD01']);
+      expect(store.rows[0]).toMatchObject({ status: 'approved', external_order_id: 'ORD01' });
+      expect(store.resolutions[0]!.evidence).toMatchObject({ found_by: 'search' });
+    });
+
+    it('ordem achada e ainda aberta: fica ligada, a cobrança segue em revisão', async () => {
+      const { ctx, store } = setup({ find: async () => order(), get: async () => order() });
+      seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_PENDING' });
+      expect(store.rows[0]).toMatchObject({ status: 'manual_review', external_order_id: 'ORD01' });
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('ordem achada com conferência falhando: continua em revisão com o código da aprovação', async () => {
+      const { ctx, store } = setup({ find: async () => approvedOrder(), get: async () => approvedOrder({ externalTerminalId: 'OUTRA' }) });
+      seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'TERMINAL_MISMATCH' });
+      expect(store.rows[0]!.status).toBe('manual_review');
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('nenhuma ordem e sem ID da operação: NOT_FOUND_YET, nada liberado', async () => {
+      const { ctx, store, calls } = setup({ find: async () => null });
+      const before = seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'NOT_FOUND_YET' });
+      expect(calls.payment).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('mais de uma ordem com a referência: MISMATCH, nem com ID da operação libera', async () => {
+      const { ctx, store, calls } = setup({ find: async () => { throw new PaymentTerminalProviderError('malformed_response', { detail: 'multiple_orders' }); } });
+      const before = seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, { ...RECONCILE, operation_id: '123456789' })).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MISMATCH' });
+      expect(calls.payment).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('busca fora do ar: MP_UNAVAILABLE, nem com ID da operação libera', async () => {
+      const { ctx, store, calls } = setup({ find: async () => { throw new PaymentTerminalProviderError('unavailable'); } });
+      const before = seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, { ...RECONCILE, operation_id: '123456789' })).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_UNAVAILABLE' });
+      expect(calls.payment).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('busca devolve ordem de outra referência: MISMATCH, não liga', async () => {
+      const { ctx, store, calls } = setup({ find: async () => approvedOrder({ externalReference: 'outra' }) });
+      const before = seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MISMATCH' });
+      expect(store.count.attachOrder ?? 0).toBe(0);
+      expect(calls.get).toHaveLength(0);
+      unchanged(store, before);
+    });
+
+    it('provider sem busca por referência: NOT_FOUND_YET', async () => {
+      const { ctx, store } = setup();
+      delete (ctx.provider as { findChargeByReference?: unknown }).findChargeByReference;
+      seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'NOT_FOUND_YET' });
+    });
+
+    const paid = (over: Partial<PointPaymentDetails> = {}) => approvedPayment({ externalReference: KEY, ...over });
+
+    it('nenhuma ordem, ID da operação digitado e pagamento desta cobrança aprovado: aprovada com o pagamento lido', async () => {
+      const { ctx, store, calls } = setup({ find: async () => null, payment: async () => paid() });
+      seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, { ...RECONCILE, operation_id: ' 123456789 ' })).toEqual(APPROVED_REPLY);
+      expect(calls.payment).toEqual(['123456789']);
+      expect(store.rows[0]).toMatchObject({ status: 'approved', external_order_id: null, external_payment_id: '123456789', paid_amount_cents: 2450, raw_status_detail: 'OPERATION_ID_CONFIRMED' });
+      expect(store.resolutions[0]!.evidence).toMatchObject({ source: 'mercado_pago_payment', found_by: 'operation_id', operation_id: '123456789', external_reference: KEY, payment_status: 'approved' });
+    });
+
+    it.each([
+      [{ amountCents: 2400 }],
+      [{ externalReference: 'outra-cobranca' }],
+      [{ externalReference: null }],
+      [{ status: 'rejected' }],
+      [{ status: 'in_process' }],
+      [{ status: 'refunded' }],
+      [{ id: '999' }],
+      [{ paymentTypeId: 'debit_card' }],
+      [{ installments: 3 }],
+      [{ authorizationCode: null }],
+      [{ paymentMethodId: 'amex' }],
+    ] as const)('ID da operação com pagamento %o: MISMATCH, nada liberado', async (over) => {
+      const { ctx, store } = setup({ find: async () => null, payment: async () => paid(over as Partial<PointPaymentDetails>) });
+      const before = seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, { ...RECONCILE, operation_id: '123456789' })).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MISMATCH' });
+      unchanged(store, before);
+    });
+
+    it('ID da operação com o Mercado Pago fora do ar: MP_UNAVAILABLE', async () => {
+      const { ctx, store } = setup({ find: async () => null, payment: async () => { throw new Error('mercado_pago_payment_http_500'); } });
+      const before = seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, { ...RECONCILE, operation_id: '123456789' })).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_UNAVAILABLE' });
+      unchanged(store, before);
+    });
+
+    it('ordem achada: o ID da operação não é usado (vale a ordem)', async () => {
+      const { ctx, store, calls } = setup({ find: async () => order(), get: async () => order(), payment: async () => paid() });
+      seed(store, unknownDispatch);
+      expect(await reconcileCharge(ctx, { ...RECONCILE, operation_id: '123456789' })).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_PENDING' });
+      expect(calls.payment).toHaveLength(0);
+    });
+  });
+
+  describe('aprovada sem pagamento registrado', () => {
+    it('continua aprovada no Mercado Pago: devolve APPROVED com os dados, sem gravar', async () => {
+      const { ctx, store } = setup({ get: async () => approvedOrder() });
+      const before = seed(store, approvedRow);
+      expect(await reconcileCharge(ctx, RECONCILE)).toEqual(APPROVED_REPLY);
+      unchanged(store, before);
+    });
+
+    it('ordem estornada no Mercado Pago: refunded uma vez; a segunda conferência é 409', async () => {
+      const { ctx, store } = setup({ get: async () => order({ status: 'refunded', rawStatus: 'refunded', rawStatusDetail: 'refunded', externalPaymentId: '123456789', paidAmountCents: 2450 }) });
+      seed(store, approvedRow);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED', reason: expect.stringContaining('estorno') });
+      expect(store.rows[0]).toMatchObject({ status: 'refunded', raw_status: 'refunded', raw_status_detail: 'ORDER_REFUNDED', external_payment_id: '123456789', authorization_code: 'A1B2C3' });
+      expect(store.resolutions).toEqual([expect.objectContaining({ from: 'approved', to: 'refunded' })]);
+      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      expect(store.resolutions).toHaveLength(1);
+    });
+
+    it('ordem estornada sem a referência ecoada não basta (precisa do pagamento mostrar)', async () => {
+      const { ctx, store } = setup({ get: async () => order({ status: 'refunded', rawStatus: 'refunded', rawStatusDetail: 'refunded', externalReference: null }), payment: async () => approvedPayment() });
+      const before = seed(store, approvedRow);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MISMATCH' });
+      unchanged(store, before);
+    });
+
+    it.each(['refunded', 'charged_back', 'cancelled'])('pagamento "%s" no Mercado Pago: refunded', async (status) => {
+      const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status }) });
+      seed(store, approvedRow);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
+      expect(store.rows[0]).toMatchObject({ status: 'refunded', raw_status: `payment_${status}`, raw_status_detail: 'PAYMENT_REFUNDED' });
+    });
+
+    it('ordem cancelada mas pagamento aprovado: MISMATCH, continua aprovada', async () => {
+      const { ctx, store } = setup({ get: async () => order({ status: 'cancelled', rawStatus: 'canceled', rawStatusDetail: 'canceled' }), payment: async () => approvedPayment() });
+      const before = seed(store, approvedRow);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MISMATCH' });
+      unchanged(store, before);
+    });
+
+    it('Mercado Pago fora do ar: MP_UNAVAILABLE, nada muda (o aparelho não registra)', async () => {
+      for (const opts of [
+        { get: async () => { throw new PaymentTerminalProviderError('unavailable'); } },
+        { get: async () => approvedOrder(), payment: async () => { throw new Error('rede'); } },
+      ]) {
+        const { ctx, store } = setup(opts);
+        const before = seed(store, approvedRow);
+        expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_UNAVAILABLE' });
+        unchanged(store, before);
+      }
+    });
+
+    it('o Mercado Pago mostra outro pagamento aprovado na ordem: MISMATCH', async () => {
+      const { ctx, store } = setup({ get: async () => approvedOrder({ externalPaymentId: '555' }), payment: async () => approvedPayment({ id: '555' }) });
+      const before = seed(store, approvedRow);
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MISMATCH' });
+      unchanged(store, before);
+    });
+
+    it('pagamento registrado entre o PIN e o estorno: 409, nada gravado', async () => {
+      const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status: 'refunded' }) });
+      const before = seed(store, approvedRow);
+      let n = 0;
+      store.hasRegisteredPayment = async () => (n++ >= 2); // o aparelho registra depois da segunda conferência
+      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      unchanged(store, before);
+    });
+
+    it('aprovada pelo ID da operação (sem ordem): o estorno é lido no pagamento', async () => {
+      const { ctx, store, calls } = setup({ payment: async () => approvedPayment({ status: 'refunded', externalReference: KEY }) });
+      seed(store, { ...approvedRow, external_order_id: null });
+      expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
+      expect(calls.get).toHaveLength(0);
+      expect(store.rows[0]!.status).toBe('refunded');
+    });
+
+    it('aprovada pelo ID da operação e ainda aprovada: APPROVED', async () => {
+      const { ctx, store } = setup({ payment: async () => approvedPayment({ externalReference: KEY }) });
+      const before = seed(store, { ...approvedRow, external_order_id: null });
+      expect(await reconcileCharge(ctx, RECONCILE)).toEqual(APPROVED_REPLY);
+      unchanged(store, before);
+    });
+  });
+
+  it('consulta, criação repetida e encerramento nunca tiram da revisão manual com ordem (nem aprovação, nem recusa, nem "na maquininha")', async () => {
+    for (const o of [approvedOrder(), order({ status: 'cancelled', rawStatus: 'canceled', rawStatusDetail: 'canceled' }), order(), order({ status: 'pending', rawStatus: 'created' })]) {
+      const { ctx, store } = setup({ get: async () => o });
+      const before = seed(store);
+      expect((await pollCharge(ctx, store.rows[0]!)).status).toBe('MANUAL_REVIEW');
+      expect((await startCharge(ctx, terminal, input())).status).toBe('MANUAL_REVIEW');
+      expect((await cancelCharge(ctx, store.rows[0]!, OPERATOR)).status).toBe('MANUAL_REVIEW');
+      expect(store.count.update ?? 0).toBe(0);
+      expect(store.rows[0]!.status).toBe('manual_review');
+      expect({ ...store.rows[0]!, cancel_reason: null, cancel_requested_by: null, cancel_requested_at: null, cancel_authorized_by: null, cancel_audit_id: null }).toEqual(before);
+    }
+  });
+
+  it('o banco de mentira recusa sair da revisão manual por UPDATE direto', () => {
+    const { store } = setup();
+    seed(store);
+    for (const status of ['creating', 'pending', 'at_terminal', 'approved', 'rejected', 'cancelled'] as const) {
+      expect(() => store.write(store.rows[0]!, { status })).toThrow('revisão manual');
+    }
+    expect(() => store.write(store.rows[0]!, { raw_status: 'x' })).not.toThrow();
+  });
+
+  it('autorização do gerente já usada (TF007 no fim verificado): 409, nada gravado', async () => {
+    const { ctx, store } = setup({ get: async () => approvedOrder() });
+    const before = seed(store);
+    store.resolve = async () => { throw new ChargeRefusedError('not_applicable', 'a autorização da conferência já foi usada'); };
+    await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+    expect(store.rows[0]).toEqual(before);
+  });
+
+  it('fim verificado só recebe os campos aceitos pelo banco (estorno da aprovada: só raw_status e raw_status_detail)', async () => {
+    const { ctx, store } = setup({ get: async () => approvedOrder(), payment: async () => approvedPayment({ status: 'refunded' }) });
+    seed(store, approvedRow);
+    await reconcileCharge(ctx, RECONCILE);
+    expect(Object.keys(store.resolutions[0]!.patch).sort()).toEqual(['raw_status', 'raw_status_detail']);
+    const review = setup({ get: async () => approvedOrder() });
+    seed(review.store);
+    await reconcileCharge(review.ctx, RECONCILE);
+    const allowed = ['external_payment_id', 'raw_status', 'raw_status_detail', 'paid_amount_cents', 'card_brand', 'authorization_code', 'last_four'];
+    expect(Object.keys(review.store.resolutions[0]!.patch).every((k) => allowed.includes(k))).toBe(true);
+    expect(review.store.resolutions[0]!.evidence).toHaveProperty('authorization_audit_id');
+    expect(review.store.resolutions[0]!.evidence).toHaveProperty('operation_id');
+  });
+
+  it('TF009 (chave de outro pagamento) no bloqueio da chave: 409 key_in_use', async () => {
+    const { ctx, store } = setup();
+    store.insertVoid = async () => { throw new ChargeRefusedError('key_in_use', 'a chave já é de outro pagamento'); };
+    await expect(voidCharge(ctx, terminal, { ...input(), ...CANCEL })).rejects.toMatchObject({ code: 'key_in_use', httpStatus: 409 });
+    store.insert = async () => { throw new ChargeRefusedError('key_in_use', 'a chave já é de outro pagamento'); };
+    await expect(startCharge(ctx, terminal, input())).rejects.toMatchObject({ code: 'key_in_use', httpStatus: 409 });
+  });
+
+  it('a consulta normal (status) continua igual: revisão manual não é liberada por ela', async () => {
+    const { ctx, store } = setup({ get: async () => approvedOrder() });
+    const before = seed(store, unknownDispatch);
+    expect(await pollCharge(ctx, store.rows[0]!)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'DISPATCH_UNKNOWN' });
+    unchanged(store, before);
   });
 });

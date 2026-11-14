@@ -70,12 +70,15 @@ export const POINT_POLL_MS = 2_000;
 /** Prazo de cada chamada à função point-charge. */
 export const POINT_REQUEST_TIMEOUT_MS = 15_000;
 
-type Reply =
+/** Resposta da função point-charge (create, status, cancel e reconcile). */
+export type ChargeReply =
   /** awaiting: a cobrança está gravada e nenhum envio saiu ainda (a consulta não manda; o create manda). */
   | { status: 'PENDING'; awaiting?: true }
   | { status: 'APPROVED'; nsu: string; authorization_code: string; card_brand: 'VISA' | 'MASTERCARD' | 'ELO'; last_four: string | null; terminal_serial: string; amount_cents: number; method: 'CREDIT' | 'DEBIT' }
   | { status: 'DECLINED'; reason: string }
   | { status: 'MANUAL_REVIEW'; reason: string; code: string };
+
+type Reply = ChargeReply;
 
 type CallOutcome =
   | { kind: 'reply'; reply: Reply }
@@ -95,6 +98,19 @@ function parseObject(text: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+/** URL e cabeçalhos da função point-charge com a sessão do aparelho (o mesmo caminho da cobrança). */
+export function pointChargeEndpoint(cfg: SyncConfig): { url: string; headers: Record<string, string> } {
+  return {
+    url: `${cfg.url.replace(/\/+$/, '')}/functions/v1/point-charge`,
+    headers: { apikey: cfg.anonKey, Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
+  };
+}
+
+/** Resposta 200 da point-charge validada; null = incompleta ou desconhecida (não prova nada). */
+export function parseChargeReply(text: string): ChargeReply | null {
+  return parseReply(text);
 }
 
 function parseReply(text: string): Reply | null {
@@ -181,9 +197,10 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     try {
       const request = (async () => {
-        const r = await this.deps.fetch(`${cfg.url.replace(/\/+$/, '')}/functions/v1/point-charge`, {
+        const endpoint = pointChargeEndpoint(cfg);
+        const r = await this.deps.fetch(endpoint.url, {
           method: 'POST',
-          headers: { apikey: cfg.anonKey, Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
+          headers: endpoint.headers,
           body: JSON.stringify(body),
           ...(controller ? { signal: controller.signal } : {}),
         });

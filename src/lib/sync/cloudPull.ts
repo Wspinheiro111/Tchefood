@@ -441,17 +441,83 @@ export function mergeStaffWithPins(local: readonly StaffUser[], cloud: readonly 
   return mergeRows(local, cloud, pending, { table: 'staff_users', key: (r) => r.id, dropMissing: false });
 }
 
-/** Reserva da Point Smart numa conta, lida agora da nuvem (tchefood_point_reservation, db/schema_point_reserva.sql). */
-export type CloudPointReservation = { reservedCents: number; openCharges: number; manualReview: boolean };
+/** Cobrança da Point desta conta que ainda reserva valor (tchefood_point_reservation → charges). */
+export type CloudPointCharge = { idempotencyKey: string; status: string; amountCents: number; rawStatusDetail: string | null; hasPayment: boolean };
+
+/** Reserva de pagamento fora da Point ainda aberta nesta conta (tchefood_point_reservation → claims). */
+export type CloudPaymentClaim = {
+  idempotencyKey: string; amountCents: number; method: string; acquirer: string;
+  createdAt: string | null; createdBy: string | null; createdByName: string | null;
+};
+
+/**
+ * Reserva da Point Smart numa conta, lida agora da nuvem (tchefood_point_reservation, db/schema_point_reserva.sql).
+ * reservedCents soma a Point e as reservas de outros pagamentos (claimsCents); pointCents é só a Point.
+ * claimsCents/pointCents/charges vêm do banco da rodada 6; banco anterior não os manda.
+ */
+export type CloudPointReservation = {
+  reservedCents: number;
+  openCharges: number;
+  manualReview: boolean;
+  claimsCents?: number;
+  pointCents?: number;
+  charges?: CloudPointCharge[];
+  claims?: CloudPaymentClaim[];
+};
 
 export async function fetchPointReservation(cfg: SyncConfig, fetchFn: FetchLike, orderId: string): Promise<CloudPointReservation> {
   const res = await fetchFn(`${root(cfg)}/rpc/tchefood_point_reservation`, { method: 'POST', headers: headers(cfg), body: JSON.stringify({ p_order: orderId }) });
   if (!res.ok) throw new Error(`Não foi possível ler a cobrança da Point desta conta: ${await readError(res)}`);
-  const body = JSON.parse((await res.text()) || 'null') as { reserved_cents?: unknown; open_charges?: unknown; manual_review?: unknown } | null;
+  const body = JSON.parse((await res.text()) || 'null') as {
+    reserved_cents?: unknown; open_charges?: unknown; manual_review?: unknown; claims_cents?: unknown; point_cents?: unknown; charges?: unknown; claims?: unknown;
+  } | null;
   const reserved = Number(body?.reserved_cents);
   const open = Number(body?.open_charges);
   if (!body || !Number.isSafeInteger(reserved) || reserved < 0 || !Number.isSafeInteger(open) || open < 0) {
     throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
   }
-  return { reservedCents: reserved, openCharges: open, manualReview: body.manual_review === true };
+  const out: CloudPointReservation = { reservedCents: reserved, openCharges: open, manualReview: body.manual_review === true };
+  const cents = (v: unknown): number | undefined => {
+    if (v === undefined || v === null) return undefined;
+    const n = Number(v);
+    if (!Number.isSafeInteger(n) || n < 0) throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+    return n;
+  };
+  const claims = cents(body.claims_cents);
+  const point = cents(body.point_cents);
+  if (claims !== undefined) out.claimsCents = claims;
+  if (point !== undefined) out.pointCents = point;
+  if (body.charges !== undefined && body.charges !== null) {
+    if (!Array.isArray(body.charges)) throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+    out.charges = body.charges.map((c: unknown) => {
+      const r = (c ?? {}) as Record<string, unknown>;
+      const amount = Number(r.amount_cents);
+      if (typeof r.idempotency_key !== 'string' || typeof r.status !== 'string' || !Number.isSafeInteger(amount) || amount < 0) {
+        throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+      }
+      return {
+        idempotencyKey: r.idempotency_key,
+        status: r.status,
+        amountCents: amount,
+        rawStatusDetail: typeof r.raw_status_detail === 'string' ? r.raw_status_detail : null,
+        hasPayment: r.has_payment === true,
+      };
+    });
+  }
+  if (body.claims !== undefined && body.claims !== null) {
+    if (!Array.isArray(body.claims)) throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+    const str = (v: unknown) => (typeof v === 'string' ? v : null);
+    out.claims = body.claims.map((c: unknown) => {
+      const r = (c ?? {}) as Record<string, unknown>;
+      const amount = Number(r.amount_cents);
+      if (typeof r.idempotency_key !== 'string' || !Number.isSafeInteger(amount) || amount <= 0) {
+        throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+      }
+      return {
+        idempotencyKey: r.idempotency_key, amountCents: amount, method: str(r.method) ?? '', acquirer: str(r.acquirer) ?? '',
+        createdAt: str(r.created_at), createdBy: str(r.created_by), createdByName: str(r.created_by_name),
+      };
+    });
+  }
+  return out;
 }

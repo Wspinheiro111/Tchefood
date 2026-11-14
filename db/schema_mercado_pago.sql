@@ -34,6 +34,13 @@
 --     revisão manual (tchefood_settle_point_dispatch) e segue reservando o saldo.
 --  8. Chave nunca gravada só é bloqueada por operador ativo da loja, com
 --     registro (tchefood_block_point_key). Não é cancelamento.
+-- 10. Auditoria r5 P1-01 (decisão do Will, 14/11/2026): cobrança em revisão manual só
+--     sai dela, e aprovada sem pagamento só vira estornada, com a leitura do Mercado
+--     Pago feita pelo servidor (tchefood_resolve_point_charge, db/schema_point_reserva.sql,
+--     com UM registro POINT_CHARGE_RESOLVED em audit_logs). O gatilho da cobrança recusa
+--     essas mudanças por qualquer outro caminho. PIN de gerente e tempo não liberam: o PIN
+--     só pede a conferência (tchefood_authorize_point_reconcile, com registro), e o fim
+--     verificado exige esse registro na evidência.
 -- =============================================================================
 
 ALTER TYPE acquirer_type ADD VALUE IF NOT EXISTS 'MERCADO_PAGO';
@@ -133,12 +140,51 @@ END $$;
 -- -----------------------------------------------------------------------------
 -- 2b. Estado final não muda; aprovado só com comprovante completo
 -- -----------------------------------------------------------------------------
+-- Auditoria r5 P1-01: o fim verificado no Mercado Pago (tchefood_resolve_point_charge) é o único caminho
+-- para sair da revisão manual (para aprovada, recusada, cancelada, expirada ou estornada) e para a aprovada
+-- virar estornada. A função grava antes o registro POINT_CHARGE_RESOLVED e liga, só na transação dela, a
+-- marca tchefood.point_resolution com o id desse registro. O gatilho só aceita a mudança se o registro
+-- existe e é desta cobrança, com o mesmo "de" e "para". Revisão manual que volta para criando, na fila ou
+-- na maquininha também é recusada: senão sairia dela em dois passos sem a leitura do Mercado Pago.
 CREATE OR REPLACE FUNCTION tchefood_terminal_charge_guard()
 RETURNS TRIGGER
 LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE
+    v_flag TEXT;
+    v_resolution BOOLEAN := FALSE;
 BEGIN
-    IF TG_OP = 'UPDATE' AND OLD.status IN ('approved', 'rejected', 'cancelled', 'expired', 'refunded') THEN
+    IF TG_OP = 'UPDATE' AND NEW.status IS DISTINCT FROM OLD.status
+       AND ((OLD.status = 'manual_review' AND NEW.status IN ('approved', 'rejected', 'cancelled', 'expired', 'refunded'))
+            OR (OLD.status = 'approved' AND NEW.status = 'refunded')) THEN
+        v_flag := current_setting('tchefood.point_resolution', true);
+        IF v_flag ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+           AND EXISTS (SELECT 1 FROM audit_logs a
+                        WHERE a.id = v_flag::uuid AND a.tenant_id = OLD.tenant_id AND a.action_type = 'POINT_CHARGE_RESOLVED'
+                          AND a.metadata->>'charge_id' = OLD.id::text
+                          AND a.metadata->>'from' = OLD.status AND a.metadata->>'to' = NEW.status) THEN
+            v_resolution := TRUE;
+        ELSE
+            RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % só passa de "%" para "%" com a confirmação do Mercado Pago lida pelo servidor.',
+                OLD.idempotency_key, OLD.status, NEW.status;
+        END IF;
+    END IF;
+    IF TG_OP = 'UPDATE' AND OLD.status = 'manual_review' AND NEW.status <> 'manual_review' AND NOT v_resolution THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % está em revisão manual e só sai dela com a confirmação do Mercado Pago lida pelo servidor.', OLD.idempotency_key;
+    END IF;
+    IF TG_OP = 'UPDATE' AND OLD.status IN ('approved', 'rejected', 'cancelled', 'expired', 'refunded') AND NOT v_resolution THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % já está "%" e não muda mais.', OLD.idempotency_key, OLD.status;
+    END IF;
+    -- Aprovada que vira estornada: só o estado e o que o Mercado Pago disse mudam; o comprovante fica.
+    IF v_resolution AND OLD.status = 'approved'
+       AND (NEW.external_order_id IS DISTINCT FROM OLD.external_order_id OR NEW.external_payment_id IS DISTINCT FROM OLD.external_payment_id
+            OR NEW.paid_amount_cents IS DISTINCT FROM OLD.paid_amount_cents OR NEW.card_brand IS DISTINCT FROM OLD.card_brand
+            OR NEW.authorization_code IS DISTINCT FROM OLD.authorization_code OR NEW.last_four IS DISTINCT FROM OLD.last_four
+            OR NEW.dispatched_at IS DISTINCT FROM OLD.dispatched_at OR NEW.dispatch_lease_until IS DISTINCT FROM OLD.dispatch_lease_until
+            OR NEW.dispatch_attempts IS DISTINCT FROM OLD.dispatch_attempts
+            OR NEW.cancel_reason IS DISTINCT FROM OLD.cancel_reason OR NEW.cancel_requested_at IS DISTINCT FROM OLD.cancel_requested_at
+            OR NEW.cancel_requested_by IS DISTINCT FROM OLD.cancel_requested_by OR NEW.cancel_authorized_by IS DISTINCT FROM OLD.cancel_authorized_by
+            OR NEW.cancel_audit_id IS DISTINCT FROM OLD.cancel_audit_id) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o estorno da cobrança % não muda o comprovante nem o envio.', OLD.idempotency_key;
     END IF;
     IF TG_OP = 'UPDATE' AND (NEW.idempotency_key <> OLD.idempotency_key OR NEW.tenant_id <> OLD.tenant_id OR NEW.order_id <> OLD.order_id
        OR NEW.terminal_id <> OLD.terminal_id OR NEW.method <> OLD.method OR NEW.amount_cents <> OLD.amount_cents
@@ -208,6 +254,9 @@ CREATE OR REPLACE TRIGGER trg_terminal_charges_final BEFORE INSERT OR UPDATE ON 
 -- Só libera com o fim comprovado no Mercado Pago: recusada, cancelada, expirada ou estornada. PIN de
 -- gerente e tempo passado não liberam cobrança de resultado desconhecido (ela fica em revisão manual).
 -- Vale para qualquer aparelho da loja.
+-- Auditoria r5 P0-01: a reserva também soma os pagamentos fora da Point já reservados no servidor e ainda
+-- não registrados (payment_claims: dinheiro, outra maquininha, Pix manual). A soma é a de
+-- tchefood_point_reserved_cents (db/schema_point_reserva.sql), a mesma do gatilho de payments.
 -- Auditoria r4 P1-01: o saldo da conta é conferido aqui, no servidor. p_expected_balance_cents é o saldo
 -- que o aparelho mostrou ao operador (obrigatório). Com a conta travada, saldo da nuvem diferente =
 -- TF008 e nada é gravado: o operador sincroniza e cobra de novo. O reenvio da MESMA chave devolve a
@@ -242,6 +291,12 @@ BEGIN
     IF FOUND THEN
         RETURN v_id; -- reenvio: o chamador confere se é o mesmo pedido
     END IF;
+    -- Auditoria r5 P0-01: a chave de uma reserva de pagamento fora da Point (payment_claims,
+    -- db/schema_point_reserva.sql) não vira cobrança da Point. O gatilho da cobrança confere de novo na
+    -- gravação, com a chave travada (duas gravações juntas da mesma chave não passam).
+    IF EXISTS (SELECT 1 FROM payment_claims pc WHERE pc.idempotency_key = p_key) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a chave % já é de outro pagamento (dinheiro ou outra maquininha).', p_key USING ERRCODE = 'TF009';
+    END IF;
     SELECT * INTO v_order FROM orders WHERE id = p_order AND tenant_id = p_tenant FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a conta ainda não está no servidor. Aguarde a sincronização e cobre de novo.' USING ERRCODE = 'TF001';
@@ -261,12 +316,9 @@ BEGIN
             to_char(v_balance / 100.0, 'FM999999990.00'), to_char(p_expected_balance_cents / 100.0, 'FM999999990.00')
             USING ERRCODE = 'TF008';
     END IF;
-    SELECT COALESCE(SUM(c.amount_cents), 0) INTO v_reserved FROM terminal_charges c
-     WHERE c.tenant_id = p_tenant AND c.order_id = p_order
-       AND (c.status IN ('creating', 'pending', 'at_terminal', 'manual_review')
-            OR (c.status = 'approved' AND NOT EXISTS (
-                SELECT 1 FROM payments p WHERE p.tenant_id = p_tenant AND p.idempotency_key = c.idempotency_key AND p.status = 'APPROVED'
-                  AND p.acquirer::text = 'MERCADO_PAGO')));
+    -- Reserva única (auditoria r5 P0-01): as outras cobranças da Point que reservam E as reservas de
+    -- pagamento fora da Point ainda não pagas (payment_claims), pela mesma função do gatilho de payments.
+    v_reserved := tchefood_point_reserved_cents(p_tenant, p_order, NULL);
     IF p_amount_cents > v_balance - v_reserved THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: R$ % passa do saldo da conta no servidor (R$ % livre).',
             to_char(p_amount_cents / 100.0, 'FM999999990.00'), to_char(GREATEST(v_balance - v_reserved, 0) / 100.0, 'FM999999990.00')
@@ -372,6 +424,69 @@ BEGIN
         -- Desfaz o audit_log junto: não fica registro de encerramento que não marcou a cobrança.
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o encerramento não foi gravado na cobrança.' USING ERRCODE = 'TF007';
     END IF;
+    RETURN v_id;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- 2d'. Pedir a conferência no Mercado Pago (auditoria r5 P1-01): PIN de gerente, sem liberar nada
+-- -----------------------------------------------------------------------------
+-- Decisão do Will (14/11/2026): PIN de gerente + motivo só PEDEM a conferência e ficam registrados; nunca
+-- liberam a cobrança sozinhos. Chamada pela Edge Function (service role) antes de ler o Mercado Pago (ação
+-- reconcile). Mesmas regras de PIN de tchefood_authorize_point_cancel (gerente ou dono ativo da loja,
+-- 3 PINs errados em 60 s bloqueiam, com a loja travada) e motivo com 10+ letras. Não muda a cobrança: grava
+-- UM audit_log POINT_CHARGE_RECONCILE_AUTHORIZED e devolve o id dele, que o fim verificado
+-- (tchefood_resolve_point_charge) exige na evidência e aceita uma vez só.
+--   * cobrança não encontrada nesta loja: TF005; operador fora da equipe ativa: TF004; motivo curto: TF006;
+--   * cobrança que não está em revisão manual nem aprovada: TF007, sem audit_log;
+--   * PIN errado ou bloqueado: NULL (a falha fica em audit_logs e conta no bloqueio).
+CREATE OR REPLACE FUNCTION tchefood_authorize_point_reconcile(
+    p_tenant UUID, p_key VARCHAR, p_staff UUID, p_manager_pin VARCHAR, p_reason TEXT)
+RETURNS UUID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_charge terminal_charges%ROWTYPE;
+    v_manager staff_users%ROWTYPE;
+    v_order UUID;
+    v_failures INT;
+    v_id UUID;
+BEGIN
+    SELECT * INTO v_charge FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
+    END IF;
+    IF p_staff IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_staff AND u.tenant_id = p_tenant AND u.active) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
+    END IF;
+    IF p_reason IS NULL OR length(trim(p_reason)) < 10 THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: motivo obrigatório (mínimo 10 caracteres).' USING ERRCODE = 'TF006';
+    END IF;
+    IF v_charge.status NOT IN ('manual_review', 'approved') THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança está "%"; não há o que conferir.', v_charge.status USING ERRCODE = 'TF007';
+    END IF;
+    SELECT o.id INTO v_order FROM orders o WHERE o.id = v_charge.order_id AND o.tenant_id = p_tenant;
+    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || p_tenant::text));
+    SELECT count(*) INTO v_failures FROM audit_logs a
+     WHERE a.tenant_id = p_tenant AND a.action_type = 'MANAGER_PIN_FAILED' AND a.created_at >= NOW() - INTERVAL '60 seconds';
+    IF v_failures >= 3 THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES (p_tenant, v_order, p_staff, 'MANAGER_PIN_LOCKOUT', 'PIN de gerente bloqueado por excesso de tentativas',
+                jsonb_build_object('attempted_action', 'POINT_CHARGE_RECONCILE_AUTHORIZED', 'idempotency_key', p_key));
+        RETURN NULL;
+    END IF;
+    SELECT * INTO v_manager FROM staff_users m
+     WHERE m.tenant_id = p_tenant AND m.pin_code = p_manager_pin AND m.active AND m.role IN ('MANAGER', 'OWNER');
+    IF NOT FOUND THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES (p_tenant, v_order, p_staff, 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto',
+                jsonb_build_object('attempted_action', 'POINT_CHARGE_RECONCILE_AUTHORIZED', 'idempotency_key', p_key));
+        RETURN NULL;
+    END IF;
+    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+    VALUES (p_tenant, v_order, p_staff, v_manager.id, 'POINT_CHARGE_RECONCILE_AUTHORIZED', 0, trim(p_reason),
+            jsonb_build_object('idempotency_key', p_key, 'charge_id', v_charge.id, 'charge_status', v_charge.status,
+                               'manager_name', v_manager.name, 'server_verified', true))
+    RETURNING id INTO v_id;
     RETURN v_id;
 END;
 $$;
@@ -541,12 +656,17 @@ BEGIN
 END;
 $$;
 
--- Os registros da Point em audit_logs (encerramento autorizado e bloqueio de chave) só são gravados pelas
--- funções acima. O aparelho (anon/authenticated) não consegue forjar um.
+-- Os registros da Point em audit_logs (encerramento autorizado, bloqueio de chave, fim verificado e
+-- liberação de reserva) só são gravados pelas funções do servidor. O aparelho (anon/authenticated) não
+-- consegue forjar um.
 CREATE OR REPLACE FUNCTION tchefood_guard_point_audit()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    IF NEW.action_type IN ('POINT_CHARGE_CANCELED', 'POINT_KEY_BLOCKED') AND current_user IN ('anon', 'authenticated') THEN
+    -- Auditoria r5: também o fim verificado da cobrança e a liberação da reserva de pagamento
+    -- (tchefood_resolve_point_charge e tchefood_release_payment_claim*, db/schema_point_reserva.sql).
+    IF NEW.action_type IN ('POINT_CHARGE_CANCELED', 'POINT_KEY_BLOCKED', 'POINT_CHARGE_RECONCILE_AUTHORIZED',
+                           'POINT_CHARGE_RESOLVED', 'PAYMENT_CLAIM_RELEASED')
+       AND current_user IN ('anon', 'authenticated') THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: registro da Point só é gravado pelo servidor.';
     END IF;
     RETURN NEW;
@@ -561,6 +681,7 @@ DECLARE
 BEGIN
     FOREACH v_fn IN ARRAY ARRAY[
         'tchefood_authorize_point_cancel(UUID, VARCHAR, UUID, VARCHAR, TEXT)',
+        'tchefood_authorize_point_reconcile(UUID, VARCHAR, UUID, VARCHAR, TEXT)',
         'tchefood_claim_point_dispatch(UUID, UUID, INT)',
         'tchefood_begin_point_dispatch(UUID, UUID, INT, INT, BOOLEAN)',
         'tchefood_settle_point_dispatch(UUID, UUID)',
@@ -591,8 +712,13 @@ BEGIN
     IF NEW.acquirer::text <> 'MERCADO_PAGO' OR NEW.status <> 'APPROVED' THEN
         RETURN NEW;
     END IF;
+    -- FOR SHARE (auditoria r5 P1-01): o estorno verificado (tchefood_resolve_point_charge) trava a mesma
+    -- cobrança antes de conferir que ela não tem pagamento. Pagamento e estorno juntos esperam um pelo outro:
+    -- ou o pagamento entra e o estorno é recusado (TF007), ou o estorno grava e o pagamento encontra a
+    -- cobrança estornada.
     SELECT * INTO v_charge FROM terminal_charges c
-     WHERE c.idempotency_key = NEW.idempotency_key AND c.tenant_id = NEW.tenant_id;
+     WHERE c.idempotency_key = NEW.idempotency_key AND c.tenant_id = NEW.tenant_id
+     FOR SHARE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: Mercado Pago aprovado sem a cobrança no servidor (chave %).', NEW.idempotency_key;
     END IF;

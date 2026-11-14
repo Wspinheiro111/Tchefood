@@ -170,8 +170,16 @@ export function useCloudSync(online: boolean): void {
   const hasSession = useTcheStore((s) => s.cloud !== null);
   useEffect(() => {
     if (!online || !hasSession) return;
+    // Liberações de reserva que não chegaram ao servidor (maquininha recusou sem internet): tenta ao abrir o
+    // app e a cada volta do laço (a própria função espera 30 s entre tentativas). Import tardio: o módulo da
+    // reserva usa este para a sessão.
+    const retryReleases = () => void import('../payments/paymentClaim').then((m) => m.retryPendingClaimReleases()).catch(() => undefined);
     void syncOnce();
-    const timer = setInterval(() => void syncOnce(), INTERVAL_MS);
+    retryReleases();
+    const timer = setInterval(() => {
+      void syncOnce();
+      retryReleases();
+    }, INTERVAL_MS);
     return () => clearInterval(timer);
   }, [online, hasSession]);
 }

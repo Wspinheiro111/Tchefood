@@ -185,7 +185,7 @@ export interface PaymentOutcome {
  * Mercado Pago confirmada pelo servidor (db/schema_mercado_pago.sql).
  */
 export const MERCADO_PAGO_MANUAL_ERROR =
-  'Cobrança do Mercado Pago não se registra pelo comprovante: o servidor só aceita a aprovação confirmada pelo Mercado Pago. Confira no app do Mercado Pago; se foi cobrado, estorne lá e cobre de novo.';
+  'Cobrança do Mercado Pago não se registra pelo comprovante: o servidor só aceita a aprovação confirmada pelo Mercado Pago. Use "Conferir no Mercado Pago" (PIN de gerente e motivo): o servidor lê a cobrança e registra o pagamento ou libera o valor, sem cobrar de novo.';
 
 export interface ReviewedChargeInput {
   orderId: UUID;

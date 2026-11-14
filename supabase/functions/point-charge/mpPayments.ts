@@ -41,6 +41,9 @@ export function parsePayment(body: unknown): PointPaymentDetails {
     authorizationCode: asText(p.authorization_code),
     lastFour: asText(asObject(p.card)?.last_four_digits),
     installments: typeof installments === 'number' && Number.isInteger(installments) && installments >= 1 ? installments : null,
+    // Só para conferir contra a cobrança (nunca usados sem conferência): referência enviada e ordem do pagamento.
+    externalReference: asText(p.external_reference),
+    orderId: asText(asObject(p.order)?.id),
   };
 }
 

@@ -19,7 +19,7 @@ const FINAL_LIST = '(approved,rejected,cancelled,expired,refunded)';
 
 /** Códigos das funções de db/schema_mercado_pago.sql. */
 const REFUSALS: Record<string, ChargeRefusedError['code']> = {
-  TF001: 'order_not_found', TF002: 'order_closed', TF003: 'over_balance', TF004: 'invalid_staff', TF005: 'not_found', TF006: 'invalid_reason', TF007: 'not_applicable', TF008: 'balance_mismatch',
+  TF001: 'order_not_found', TF002: 'order_closed', TF003: 'over_balance', TF004: 'invalid_staff', TF005: 'not_found', TF006: 'invalid_reason', TF007: 'not_applicable', TF008: 'balance_mismatch', TF009: 'key_in_use',
 };
 
 function refusal(error: { message: string; code?: string } | null): ChargeRefusedError | null {
@@ -222,6 +222,49 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
       if (refused) throw refused;
       const id = check(res, 'conferir o PIN do gerente');
       return typeof id === 'string' && id ? id : null;
+    },
+    async authorizeReconcile(input): Promise<string | null> {
+      // Só confere o PIN e grava o registro do pedido de conferência: não muda a cobrança.
+      const res = await db.rpc('tchefood_authorize_point_reconcile', {
+        p_tenant: tenantId,
+        p_key: input.idempotency_key,
+        p_staff: input.performed_by,
+        p_manager_pin: input.manager_pin,
+        p_reason: input.reason,
+      });
+      const refused = refusal(res.error);
+      if (refused) throw refused;
+      const id = check(res, 'conferir o PIN do gerente');
+      return typeof id === 'string' && id ? id : null;
+    },
+    async hasRegisteredPayment(idempotencyKey: string): Promise<boolean> {
+      // Mesma regra do banco (tchefood_point_reserved_cents): pagamento APPROVED do Mercado Pago com a chave.
+      const found = check(
+        await db.from('payments').select('id').eq('tenant_id', tenantId).eq('idempotency_key', idempotencyKey).eq('status', 'APPROVED').eq('acquirer', 'MERCADO_PAGO').maybeSingle(),
+        'ler o pagamento registrado',
+      );
+      return Boolean(found);
+    },
+    async resolve(row, toStatus, patch, audit): Promise<TerminalChargeRow> {
+      // Uma transação no banco: só grava se o estado ainda for o lido, com UM audit_log. Devolve a linha atual.
+      const res = await db.rpc('tchefood_resolve_point_charge', {
+        p_tenant: tenantId,
+        p_id: row.id,
+        p_from_status: row.status,
+        p_to_status: toStatus,
+        p_patch: patch,
+        p_staff: audit.staff,
+        p_reason: audit.reason,
+        p_evidence: audit.evidence,
+      });
+      const refused = refusal(res.error);
+      if (refused) throw refused;
+      const data = check(res, 'gravar a conferência no Mercado Pago');
+      const returned = normalize(Array.isArray(data) ? (data[0] ?? null) : (data ?? null));
+      if (returned && returned.id === row.id && returned.tenant_id === tenantId) return returned;
+      const current = await this.findByKey(row.idempotency_key);
+      if (!current) throw new Error('Cobrança não encontrada para gravar a conferência.');
+      return current;
     },
   };
 }

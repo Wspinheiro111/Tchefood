@@ -326,4 +326,65 @@ describe("MercadoPagoPointProvider", () => {
     const r = await makeProvider(vi.fn().mockResolvedValue(jsonResponse(200, { id: "ORD2", status: "processed", status_detail: "processed", total_amount: "50.00", transactions: {} }))).getCharge("ORD2");
     expect(r.status).toBe("manual_review");
   });
+
+  describe("findChargeByReference (auditoria r5)", () => {
+    const NOW = Date.parse("2026-11-14T12:30:00.000Z");
+    const CREATED = "2026-11-14T12:00:00.000Z";
+    const find = (fetchImpl: ReturnType<typeof vi.fn>, ref = "sale_1", options: { createdAt?: string } = { createdAt: CREATED }) =>
+      new MercadoPagoPointProvider({ accessToken: "TEST-token", fetchImpl: fetchImpl as unknown as typeof fetch, now: () => NOW }).findChargeByReference(ref, options);
+
+    it("GET /v1/orders com a referência e a janela em RFC 3339 (gravação - 10 min até agora + 10 min), só leitura", async () => {
+      const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(200, { data: [order()] }));
+      const found = await find(fetchImpl);
+      expect(found).toMatchObject({ externalOrderId: "ORD1", externalReference: "sale_1", externalTerminalId: "PAX_A910__SN1", status: "approved", externalPaymentId: "1234567890", amountCents: 5000 });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchImpl.mock.calls[0];
+      expect(url).toBe("https://api.mercadopago.com/v1/orders?external_reference=sale_1&begin_date=2026-11-14T11%3A50%3A00.000Z&end_date=2026-11-14T12%3A40%3A00.000Z");
+      expect(init.method).toBe("GET");
+      expect(init.body).toBeUndefined();
+      expect(init.headers.Authorization).toBe("Bearer TEST-token");
+      expect(init.headers["X-Idempotency-Key"]).toBeUndefined();
+      const query = new URL(url).searchParams;
+      expect([...query.keys()]).toEqual(["external_reference", "begin_date", "end_date"]);
+      expect(new Date(query.get("begin_date")!).toISOString()).toBe(query.get("begin_date"));
+    });
+
+    it("nenhuma ordem: null", async () => {
+      expect(await find(vi.fn().mockResolvedValue(jsonResponse(200, { data: [] })))).toBeNull();
+    });
+
+    it("só vale referência idêntica e tipo point (ou sem tipo)", async () => {
+      const others = [order({ id: "X1", external_reference: "sale_10" }), order({ id: "X2", external_reference: "SALE_1" }), order({ id: "X3", type: "qr" }), order({ id: "X4", external_reference: undefined }), "lixo", null];
+      expect(await find(vi.fn().mockResolvedValue(jsonResponse(200, { data: others })))).toBeNull();
+      const noType = order({ id: "ORD9" });
+      delete (noType as Record<string, unknown>).type;
+      expect((await find(vi.fn().mockResolvedValue(jsonResponse(200, { data: [...others, noType] }))))?.externalOrderId).toBe("ORD9");
+    });
+
+    it("mais de uma ordem com a referência: erro (multiple_orders), não escolhe", async () => {
+      const err = await find(vi.fn().mockResolvedValue(jsonResponse(200, { data: [order(), order({ id: "ORD2" })] }))).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(PaymentTerminalProviderError);
+      expect(err).toMatchObject({ code: "malformed_response", detail: "multiple_orders", outcomeUnknown: false });
+    });
+
+    it("erro HTTP, rede ou corpo sem lista: erro", async () => {
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(500, {})))).rejects.toMatchObject({ code: "unavailable", outcomeUnknown: false });
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(401, {})))).rejects.toMatchObject({ code: "unauthorized" });
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(404, {})))).rejects.toMatchObject({ code: "not_found" });
+      await expect(find(vi.fn().mockRejectedValue(new TypeError("rede")))).rejects.toMatchObject({ code: "unavailable", outcomeUnknown: false });
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(200, {})))).rejects.toMatchObject({ code: "malformed_response" });
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(200, { data: { results: [] } })))).rejects.toMatchObject({ code: "malformed_response" });
+      // Ordem com a referência, mas ilegível: erro, nunca "não achou".
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(200, { data: [{ external_reference: "sale_1", type: "point" }] })))).rejects.toMatchObject({ code: "malformed_response" });
+    });
+
+    it("referência inválida ou sem a hora da cobrança: recusa antes da rede", async () => {
+      const fetchImpl = vi.fn();
+      await expect(find(fetchImpl, "x".repeat(65))).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(find(fetchImpl, "sale 1")).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(find(fetchImpl, "sale_1", {})).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(find(fetchImpl, "sale_1", { createdAt: "ontem" })).rejects.toMatchObject({ code: "invalid_request" });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+  });
 });

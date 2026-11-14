@@ -4,6 +4,8 @@ import { round2, toCents } from './money';
 import { uuid } from './ids';
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest } from './payments/drivers';
 import { getReviewHold, setReviewHold, holdAcquirer } from './payments/reviewHolds';
+import { requirePaymentClaim } from './payments/paymentClaim';
+import { startPaymentClaim, type ClaimHandle } from './payments/claimFlow';
 import { cardReceiptLines } from './receipts';
 import { formatPickupNumber, pickupReceipt } from './kiosk';
 import { routeDispatch, usePrintPreview } from '../services/printer/printerService';
@@ -40,11 +42,20 @@ export async function chargePickupOrder(params: {
   // conferir o extrato: se a maquininha tiver cobrado, receber de novo seria cobrança em dobro.
   if (getReviewHold(order.id)) return { status: 'MANUAL_REVIEW', reason: 'Há uma cobrança sem confirmação. Confira o extrato da maquininha antes de receber de novo.' };
 
+  // Loja com Point: reserva no servidor, com a chave do pagamento, antes de receber (sem resposta, não recebe).
+  const needsClaim = requirePaymentClaim(s);
+
   if (params.method === 'CASH') {
     const given = round2(params.cashGiven ?? 0);
     if (given > 0 && toCents(given) < toCents(amount)) return { status: 'ERROR', reason: 'Valor recebido menor que o total.' };
-    const r = s.registerPayment({ orderId: order.id, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key, item_ids: [] });
-    if (!r.ok) return { status: 'ERROR', reason: r.error };
+    const c = await startPaymentClaim(needsClaim, { orderId: order.id, key: idempotency_key, method: 'CASH', acquirer: 'CASH_DESK', amount });
+    if (!c.ok) return { status: 'ERROR', reason: c.error };
+    const r = useTcheStore.getState().registerPayment({ orderId: order.id, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key, item_ids: [] });
+    if (!r.ok) {
+      c.handle.noCharge(`Dinheiro não registrado: ${r.error}`);
+      return { status: 'ERROR', reason: r.error };
+    }
+    c.handle.settle();
     finishPaidPickup(order.id, params.chassis, null, r.data.payment.id, preview);
     return { status: 'APPROVED', change: given > amount ? round2(given - amount) : 0 };
   }
@@ -61,8 +72,13 @@ export async function chargePickupOrder(params: {
   };
   const lock = s.beginTerminalCharge(order.id, req.request_id, amount);
   if (!lock.ok) return { status: 'ERROR', reason: lock.error };
+  let claim: ClaimHandle | null = null;
   try {
+    const c = await startPaymentClaim(needsClaim, { orderId: order.id, key: idempotency_key, method: params.method, acquirer: driver.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', amount });
+    if (!c.ok) return { status: 'ERROR', reason: c.error };
+    claim = c.handle;
     const result = await driver.charge(req);
+    if (result.status !== 'DECLINED') claim.settle();
     const st = useTcheStore.getState();
     if (result.status === 'MANUAL_REVIEW') {
       setReviewHold({
@@ -73,6 +89,8 @@ export async function chargePickupOrder(params: {
     }
     if (result.status === 'DECLINED') {
       st.registerPayment({ orderId: order.id, amount, method: params.method, status: 'DECLINED', terminal_id: result.terminal_id, acquirer: result.acquirer, acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: result.terminal_serial, idempotency_key, item_ids: [], charge_request_id: req.request_id });
+      // Nada cobrado: a reserva sai (com novas tentativas; se não der, fica pendente e aparece para o gerente).
+      claim.noCharge(`Maquininha recusou: ${result.reason}`);
       return { status: 'DECLINED', reason: result.reason };
     }
     const r = st.registerPayment({
@@ -91,6 +109,7 @@ export async function chargePickupOrder(params: {
     finishPaidPickup(order.id, params.chassis, result.masked_pan, r.data.payment.id, preview);
     return { status: 'APPROVED', change: 0 };
   } finally {
+    claim?.leave();
     useTcheStore.getState().endTerminalCharge(req.request_id);
   }
 }

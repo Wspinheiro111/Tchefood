@@ -537,8 +537,10 @@ function isUuidResponse(body: string): boolean {
 
 function describeError(body: string, status: number): string {
   try {
-    const j = JSON.parse(body) as { message?: string; details?: string; hint?: string };
-    return [j.message, j.details].filter(Boolean).join(' — ') || `HTTP ${status}`;
+    const j = JSON.parse(body) as { code?: string; message?: string; details?: string; hint?: string };
+    // TF010 claim_required: pagamento sem a reserva do servidor numa loja com Point (db/schema_point_reserva.sql).
+    const lead = j.code === 'TF010' ? 'Esta loja tem a Point: o pagamento precisa da reserva no servidor.' : undefined;
+    return [lead, j.message, j.details].filter(Boolean).join(' — ') || `HTTP ${status}`;
   } catch {
     return body.slice(0, 200) || `HTTP ${status}`;
   }

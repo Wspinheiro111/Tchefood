@@ -6,7 +6,8 @@ import { computeItemTotal, formatBRL, round2 } from '../lib/money';
 import { FULFILLMENT_LABEL, formatPickupNumber, kioskStage, kioskTableIds, brasiliaDate, type KioskStage } from '../lib/kiosk';
 import { chargePickupOrder, finishPaidPickup, printPickupKitchen, printPickupReceipt } from '../lib/pickupCharge';
 import { useTerminalBus, type Chassis } from '../lib/payments/drivers';
-import { clearReviewHold, getReviewHold } from '../lib/payments/reviewHolds';
+import { getReviewHold } from '../lib/payments/reviewHolds';
+import { HoldNotChargedButton, StuckClaimsPanel, useOrderClaims } from '../components/StuckClaims';
 import { ProductSheet } from '../components/ProductSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
@@ -396,6 +397,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
+  const { claims, refresh: refreshClaims } = useOrderClaims(orderId);
 
   if (!order) return null;
   const number = formatPickupNumber(order.pickup_number);
@@ -471,6 +473,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
         <div className="mt-2 flex justify-between border-t border-slate-200 pt-2 text-xl font-black"><span>Total</span><span className="tabular-nums text-brasa">{formatBRL(order.remaining_balance)}</span></div>
       </div>
 
+      <StuckClaimsPanel claims={claims} excludeKeys={[hold?.idempotency_key]} label={`Senha ${number}`} onReleased={refreshClaims} />
       <div className="mb-3 grid grid-cols-4 gap-2">
         {METHODS.map((m) => (
           <button key={m.key} onClick={() => setMethod(m.key)} className={`flex min-h-touch-lg flex-col items-center justify-center gap-1 rounded-xl text-sm font-bold ${method === m.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}>
@@ -494,7 +497,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
           <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de receber de novo, em qualquer forma de pagamento. Se a maquininha mostra a transação aprovada, não cobre de novo: guarde o comprovante e chame o gerente.</p>
           <div className="grid gap-2">
             <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
-            <Btn variant="secondary" block onClick={() => { clearReviewHold(orderId); setHold(null); }}>Conferi no extrato: não foi cobrado</Btn>
+            <HoldNotChargedButton hold={hold} label={`Senha ${number}`} size="md" onCleared={() => setHold(null)} />
           </div>
           <ConfirmReviewedChargeSheet
             open={confirmOpen}

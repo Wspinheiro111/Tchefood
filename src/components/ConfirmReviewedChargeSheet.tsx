@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { ReceiptText } from 'lucide-react';
 import { Btn, Sheet, toast } from './ui';
 import { PinPad } from './PinPad';
-import { MERCADO_PAGO_MANUAL_ERROR, MIN_REASON_LENGTH, RECEIPT_CARD_BRANDS, useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
+import { MIN_REASON_LENGTH, RECEIPT_CARD_BRANDS, useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
+import { PointReviewSheet } from './PointReviewSheet';
 import type { ReviewHold } from '../lib/payments/reviewHolds';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { formatBRL } from '../lib/money';
@@ -27,6 +28,8 @@ interface Props {
   /** Mesa, ficha ou senha, só para o resumo. */
   label: string;
   onSuccess: (outcome: PaymentOutcome) => void;
+  /** Mercado Pago confirmou que não cobrou: a trava local saiu. */
+  onReleased?: () => void;
 }
 
 /**
@@ -34,7 +37,7 @@ interface Props {
  * autorização do comprovante (nada é gerado nem preenchido sozinho), aprova com
  * o PIN e o pagamento entra sem nova cobrança. Fica em audit_logs.
  */
-export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSuccess }: Props) {
+export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSuccess, onReleased }: Props) {
   const [nsu, setNsu] = useState('');
   const [authCode, setAuthCode] = useState('');
   const [brand, setBrand] = useState<string | null>(null);
@@ -84,17 +87,21 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
   const field = 'min-h-touch-lg w-full rounded-xl border border-slate-300 bg-base px-3 text-2xl font-black tracking-widest outline-none focus:border-ouro';
   if (hold.acquirer === 'MERCADO_PAGO') {
     return (
-      <Sheet
+      <PointReviewSheet
         open={open}
         onClose={onClose}
-        title={<span className="flex items-center gap-2 text-brasa"><ReceiptText className="h-6 w-6" /> Cobrança do Mercado Pago</span>}
-        footer={<Btn block size="lg" variant="secondary" onClick={onClose}>Entendi</Btn>}
-      >
-        <div className="rounded-xl border border-ouro/50 bg-ouro/10 p-3 text-sm">
-          <div className="font-bold">{label} · {formatBRL(hold.amount)}{hold.method ? ` · ${METHOD_LABEL[hold.method]}` : ''} · Mercado Pago</div>
-          <p className="mt-1 text-slate-700">{MERCADO_PAGO_MANUAL_ERROR}</p>
-        </div>
-      </Sheet>
+        label={label}
+        charge={{
+          order_id: hold.order_id,
+          idempotency_key: hold.idempotency_key ?? null,
+          amount: hold.amount,
+          method: hold.method === 'CREDIT' || hold.method === 'DEBIT' ? hold.method : null,
+          terminal_id: hold.terminal_id ?? null,
+          item_ids: hold.item_ids ?? [],
+        }}
+        onSuccess={onSuccess}
+        onReleased={onReleased}
+      />
     );
   }
 

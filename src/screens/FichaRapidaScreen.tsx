@@ -6,8 +6,11 @@ import { effectivePrice } from '../lib/catalog';
 import { computeItemTotal, formatBRL, round2, toCents } from '../lib/money';
 import { uuid } from '../lib/ids';
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest } from '../lib/payments/drivers';
-import { clearReviewHold, getReviewHold, setReviewHold, type ReviewHold, holdAcquirer } from '../lib/payments/reviewHolds';
+import { getReviewHold, setReviewHold, type ReviewHold, holdAcquirer } from '../lib/payments/reviewHolds';
 import { cardReceiptLines } from '../lib/receipts';
+import { requirePaymentClaim } from '../lib/payments/paymentClaim';
+import { startPaymentClaim, type ClaimHandle } from '../lib/payments/claimFlow';
+import { HoldNotChargedButton, StuckClaimsPanel, useOrderClaims } from '../components/StuckClaims';
 import { formatTicketToken, ticketPrint } from '../lib/eventTickets';
 import { ProductSheet, type ProductDraft } from '../components/ProductSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
@@ -198,6 +201,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
   const [voidOpen, setVoidOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const printed = useRef(false);
+  const { claims, refresh: refreshClaims } = useOrderClaims(orderId);
 
   if (!order) return null;
   const tickets = s.eventTickets.filter((t) => t.order_id === orderId);
@@ -220,13 +224,29 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
     if (busy || order.status !== 'PAYING') return;
     const amount = order.remaining_balance;
     const idempotency_key = uuid();
+    // Loja com Point: reserva no servidor, com a chave do pagamento, antes de receber (sem resposta, não recebe).
+    const needsClaim = requirePaymentClaim(useTcheStore.getState());
     if (method === 'CASH') {
       const given = round2(Number(cashGiven.replace(',', '.')) || 0);
       if (given > 0 && toCents(given) < toCents(amount)) return toast.error('Valor recebido menor que o total.');
-      const r = s.registerPayment({ orderId, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key, item_ids: [] });
-      if (!r.ok) return toast.error(r.error);
-      if (given > amount) toast.info(`Troco: ${formatBRL(round2(given - amount))}`);
-      return finish(null, r.data.payment.id);
+      setBusy(true);
+      let cashClaim: ClaimHandle | null = null;
+      try {
+        const c = await startPaymentClaim(needsClaim, { orderId, key: idempotency_key, method: 'CASH', acquirer: 'CASH_DESK', amount });
+        if (!c.ok) return toast.error(c.error);
+        cashClaim = c.handle;
+        const r = useTcheStore.getState().registerPayment({ orderId, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key, item_ids: [] });
+        if (!r.ok) {
+          cashClaim.noCharge(`Dinheiro não registrado: ${r.error}`);
+          return toast.error(r.error);
+        }
+        cashClaim.settle();
+        if (given > amount) toast.info(`Troco: ${formatBRL(round2(given - amount))}`);
+        return finish(null, r.data.payment.id);
+      } finally {
+        cashClaim?.leave();
+        setBusy(false);
+      }
     }
     if (hold) return toast.error('Há uma cobrança sem confirmação. Confira o extrato da maquininha antes de cobrar de novo.');
     const driver = createDriver({ terminal: null, chassis, mode: 'SMARTPOS_EMBEDDED' });
@@ -234,8 +254,13 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
     const lock = s.beginTerminalCharge(orderId, req.request_id, amount);
     if (!lock.ok) return toast.error(lock.error);
     setBusy(true);
+    let claim: ClaimHandle | null = null;
     try {
+      const c = await startPaymentClaim(needsClaim, { orderId, key: idempotency_key, method: req.method, acquirer: driver.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE', amount });
+      if (!c.ok) return toast.error(c.error);
+      claim = c.handle;
       const result = await driver.charge(req);
+      if (result.status !== 'DECLINED') claim.settle();
       if (result.status === 'MANUAL_REVIEW') {
         setHold(setReviewHold({
           order_id: orderId, amount, reason: result.reason, code: result.failure_code, method: req.method,
@@ -246,6 +271,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
       }
       if (result.status === 'DECLINED') {
         s.registerPayment({ orderId, amount, method, status: 'DECLINED', terminal_id: result.terminal_id, acquirer: result.acquirer, acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: result.terminal_serial, idempotency_key, item_ids: [], charge_request_id: req.request_id });
+        claim.noCharge(`Maquininha recusou: ${result.reason}`);
         toast.error(`❌ Transação recusada: ${result.reason}`);
         return;
       }
@@ -265,6 +291,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
       }
       finish(result.masked_pan, r.data.payment.id);
     } finally {
+      claim?.leave();
       useTcheStore.getState().endTerminalCharge(req.request_id);
       setBusy(false);
     }
@@ -308,6 +335,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
         <div className="mt-2 flex justify-between border-t border-slate-200 pt-2 text-xl font-black"><span>Total</span><span className="tabular-nums text-brasa">{formatBRL(order.remaining_balance)}</span></div>
       </div>
 
+      <StuckClaimsPanel claims={claims} excludeKeys={[hold?.idempotency_key]} label="Balcão" onReleased={refreshClaims} />
       <div className="mb-3 grid grid-cols-4 gap-2">
         {METHODS.map((m) => (
           <button key={m.key} onClick={() => setMethod(m.key)} className={`flex min-h-touch-lg flex-col items-center justify-center gap-1 rounded-xl text-sm font-bold ${method === m.key ? 'bg-ouro text-slate-950' : 'bg-surface text-slate-700'}`}><m.icon className="h-5 w-5" /> {m.label}</button>
@@ -328,7 +356,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
           <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de tentar de novo.</p>
           <div className="grid gap-2">
             <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
-            <Btn variant="secondary" block onClick={() => { clearReviewHold(orderId); setHold(null); }}>Conferi no extrato: não foi cobrado</Btn>
+            <HoldNotChargedButton hold={hold} label="Balcão" size="md" onCleared={() => setHold(null)} />
           </div>
           <ConfirmReviewedChargeSheet
             open={confirmOpen}

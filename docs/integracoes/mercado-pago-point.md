@@ -96,8 +96,40 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   atrasada encontra a cobrança encerrada e não vai à Point.
 - Cobrança em estado final (aprovada, recusada, cancelada, expirada, estornada) não muda mais: cada gravação só vale
   se o estado ainda for o lido, e o banco recusa mudar uma cobrança final.
-- Cobrança incerta do Mercado Pago **não** entra pelo comprovante digitado: o banco recusaria. Confira no app
-  do Mercado Pago; se foi cobrado, estorne lá e cobre de novo.
+- Cobrança incerta do Mercado Pago **não** entra pelo comprovante digitado: o banco recusaria. Ela se resolve pela
+  tela "Conferir no Mercado Pago" (abaixo): o servidor lê o Mercado Pago e só então aprova, encerra ou libera.
+
+## Auditoria r5 (decisões do Will, 14/11/2026)
+
+**Reserva antes de qualquer cobrança.** Loja com Point (`tchefood_point_store`: maquininha `MERCADO_PAGO`
+cadastrada ou alguma cobrança da Point já feita): todo pagamento fora do Mercado Pago (dinheiro, Stone, PagBank,
+Pix manual, ficha rápida, retirada) pede antes a reserva no servidor (`tchefood_claim_payment`, conta travada,
+mesma chave do pagamento, saldo conferido). Sem internet ou sem resposta do servidor, o caixa avisa e não cobra.
+O banco também exige: pagamento aprovado fora do Mercado Pago sem reserva aberta da mesma conta, forma e
+credenciadora é recusado (TF010), mesmo de aparelho com a lista de maquininhas desatualizada. Única exceção: o
+dinheiro do entregador de uma entrega paga na entrega que o banco confere (`tchefood_courier_cash_payment`).
+A reserva e as cobranças da Point somam uma reserva só (`tchefood_point_reserved_cents`), usada pela Point,
+pela reserva nova e pelo gatilho de payments.
+
+Fim da reserva: o pagamento aprovado com a chave dela a consome de vez (`consumed`); recusa na maquininha ou
+desistência a libera (só quem pediu, sem PIN); reserva presa (aparelho fechou no meio, liberação sem rede) aparece
+na tela da conta e o gerente libera com PIN e motivo (`tchefood_release_payment_claim_manager`, registrado). O app
+repete a liberação que falhou por rede.
+
+**Cobrança da Point em revisão só sai com o Mercado Pago.** "Conferir no Mercado Pago" (PIN de gerente + motivo,
+`tchefood_authorize_point_reconcile`) faz o servidor ler a ordem e o pagamento no Mercado Pago:
+- revisão manual com ordem: aprovada com todas as conferências da aprovação normal, ou recusada/cancelada/expirada/
+  estornada como o Mercado Pago disser;
+- envio sem resposta e sem ordem (`DISPATCH_UNKNOWN`): busca a ordem pela referência (`GET /v1/orders`); achando uma,
+  segue como acima; sem ordem, o gerente pode digitar o ID da operação do comprovante, que o servidor confere
+  (referência, valor, forma, autorização). Sem nada disso a cobrança continua em revisão e reservando;
+- aprovada sem pagamento registrado: o app registra o pagamento com os dados do servidor, sem cobrar de novo; se o
+  Mercado Pago mostra o estorno, ela vira `refunded` e libera a reserva uma vez.
+Só `tchefood_resolve_point_charge` (service role, com a autorização do gerente, um registro por fim) tira uma
+cobrança da revisão ou estorna uma aprovada; a consulta normal não muda mais uma cobrança em revisão. Nada é
+liberado por tempo ou por declaração.
+
+"Cancelar cobrança" na espera da Point pede PIN de gerente e motivo.
 
 ## Passo a passo para testar com uma Point Smart
 

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ChargeRefusedError, type TerminalChargeRow } from '../point-charge/charge.ts';
 import { supabaseChargeStore, type SupabaseLike } from '../point-charge/repository.ts';
@@ -74,6 +76,7 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
     ['TF002', 'order_closed'],
     ['TF003', 'over_balance'],
     ['TF008', 'balance_mismatch'],
+    ['TF009', 'key_in_use'],
   ])('recusa do banco %s vira ChargeRefusedError(%s) sem o prefixo', async (code, mapped) => {
     const { db } = fakeDb({ rpc: { data: null, error: { code, message: 'TCHEFOOD_COBRANCA: explicação' } } });
     const { id: _id, created_at: _c, ...fresh } = ROW;
@@ -197,5 +200,75 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
     await expect(supabaseChargeStore(staff.db, TENANT).authorizeCancel(input)).rejects.toMatchObject({ code: 'invalid_staff' });
     const done = fakeDb({ rpc: { data: null, error: { code: 'TF007', message: 'TCHEFOOD_COBRANCA: a cobrança já está "approved"; não há o que encerrar.' } } });
     await expect(supabaseChargeStore(done.db, TENANT).authorizeCancel(input)).rejects.toMatchObject({ code: 'not_applicable' });
+  });
+
+  it('r5: PIN da conferência pela função própria (não encerra a cobrança); recusas viram ChargeRefusedError', async () => {
+    const ok = fakeDb({ rpc: { data: 'audit-9', error: null } });
+    const input = { idempotency_key: 'k1', performed_by: 'u', manager_pin: '1234', reason: 'conferido no app do MP' };
+    expect(await supabaseChargeStore(ok.db, TENANT).authorizeReconcile(input)).toBe('audit-9');
+    expect(ok.chains[0]).toEqual(['rpc:tchefood_authorize_point_reconcile', JSON.stringify(['p_key', 'p_manager_pin', 'p_reason', 'p_staff', 'p_tenant'])]);
+    expect(ok.rpcArgs[0]).toEqual({ p_tenant: TENANT, p_key: 'k1', p_staff: 'u', p_manager_pin: '1234', p_reason: 'conferido no app do MP' });
+    expect(await supabaseChargeStore(fakeDb({ rpc: { data: null, error: null } }).db, TENANT).authorizeReconcile(input)).toBeNull();
+    for (const [code, mapped] of [['TF004', 'invalid_staff'], ['TF005', 'not_found'], ['TF006', 'invalid_reason'], ['TF007', 'not_applicable']] as const) {
+      const refused = fakeDb({ rpc: { data: null, error: { code, message: 'TCHEFOOD_COBRANCA: x' } } });
+      await expect(supabaseChargeStore(refused.db, TENANT).authorizeReconcile(input)).rejects.toMatchObject({ code: mapped });
+    }
+    await expect(supabaseChargeStore(fakeDb({ rpc: { data: null, error: { message: 'boom' } } }).db, TENANT).authorizeReconcile(input)).rejects.not.toBeInstanceOf(ChargeRefusedError);
+  });
+
+  it('r5: fim verificado pela função do banco com o estado lido, o patch e a evidência; devolve a linha que o banco devolveu', async () => {
+    const resolved = { ...ROW, status: 'refunded', amount_cents: '1000' };
+    const { db, chains, rpcArgs } = fakeDb({ rpc: { data: resolved, error: null } });
+    const patch = { raw_status: 'refunded', raw_status_detail: 'ORDER_REFUNDED' };
+    const evidence = { source: 'mercado_pago_order', external_order_id: 'ORD' };
+    const r = await supabaseChargeStore(db, TENANT).resolve({ ...ROW, status: 'approved' }, 'refunded', patch, { staff: 'u', reason: 'conferido no app do MP', evidence });
+    expect(r).toMatchObject({ status: 'refunded', amount_cents: 1000 });
+    expect(chains).toHaveLength(1);
+    expect(chains[0]).toEqual(['rpc:tchefood_resolve_point_charge', JSON.stringify(['p_evidence', 'p_from_status', 'p_id', 'p_patch', 'p_reason', 'p_staff', 'p_tenant', 'p_to_status'])]);
+    expect(rpcArgs[0]).toEqual({ p_tenant: TENANT, p_id: 'r1', p_from_status: 'approved', p_to_status: 'refunded', p_patch: patch, p_staff: 'u', p_reason: 'conferido no app do MP', p_evidence: evidence });
+  });
+
+  it('r5: fim verificado sem linha na resposta relê a cobrança; erro do banco não vira linha', async () => {
+    const empty = fakeDb({ rpc: { data: null, error: null }, select: { ...ROW, status: 'manual_review' } });
+    const r = await supabaseChargeStore(empty.db, TENANT).resolve({ ...ROW, status: 'manual_review' }, 'cancelled', {}, { staff: 'u', reason: 'conferido no app do MP', evidence: {} });
+    expect(r.status).toBe('manual_review');
+    expect(empty.chains[1]).toEqual(expect.arrayContaining(['from:terminal_charges', 'eq:idempotency_key,k1']));
+    const broken = fakeDb({ rpc: { data: null, error: { message: 'TCHEFOOD_COBRANCA: transição não aceita' } } });
+    await expect(supabaseChargeStore(broken.db, TENANT).resolve(ROW, 'approved', {}, { staff: 'u', reason: 'x', evidence: {} })).rejects.toThrow('transição não aceita');
+  });
+
+  it('r5: pagamento registrado = APPROVED do Mercado Pago com a chave, na loja', async () => {
+    const found = fakeDb({ select: { id: 'p1' } });
+    expect(await supabaseChargeStore(found.db, TENANT).hasRegisteredPayment('k1')).toBe(true);
+    expect(found.chains[0]).toEqual(['from:payments', 'select:id', `eq:tenant_id,${TENANT}`, 'eq:idempotency_key,k1', 'eq:status,APPROVED', 'eq:acquirer,MERCADO_PAGO']);
+    expect(await supabaseChargeStore(fakeDb({ select: null }).db, TENANT).hasRegisteredPayment('k1')).toBe(false);
+  });
+
+  it('r6: os argumentos de cada RPC do repositório são os da assinatura em db/*.sql (sem banco)', async () => {
+    const sqlText = ['schema_mercado_pago.sql', 'schema_point_reserva.sql'].map((f) => readFileSync(join(__dirname, '..', '..', '..', 'db', f), 'utf8')).join('\n');
+    const params = (fn: string): string[] => {
+      const all = [...sqlText.matchAll(new RegExp(`CREATE OR REPLACE FUNCTION ${fn}\\(([^)]*)\\)`, 'g'))];
+      expect(all.length, fn).toBeGreaterThan(0);
+      // A última definição é a que vale (os arquivos são aplicados em ordem).
+      return all[all.length - 1]![1]!.split(',').map((p) => p.trim().split(/\s+/)[0]!).filter(Boolean).sort();
+    };
+    const { db, rpcArgs, chains } = fakeDb({ select: ROW, rpc: { data: 'audit-1', error: null } });
+    const store = supabaseChargeStore(db, TENANT);
+    const { id: _id, created_at: _c, ...fresh } = ROW;
+    const input = { idempotency_key: 'k1', performed_by: 'u', manager_pin: '1234', reason: 'conferido no app do MP' };
+    await store.insert(fresh, 1000);
+    await store.insertVoid({ ...fresh, cancel_requested_by: 'u' });
+    await store.claimDispatch(ROW, 30_000);
+    await store.beginDispatch(ROW, 30_000, true);
+    await store.settleDispatch(ROW);
+    await store.authorizeCancel(input);
+    await store.authorizeReconcile(input);
+    await store.resolve({ ...ROW, status: 'manual_review' }, 'cancelled', {}, { staff: 'u', reason: 'conferido no app do MP', evidence: { authorization_audit_id: 'a', operation_id: null } });
+    const fakeTimeout = fakeDb({ select: ROW, rpc: { data: 1, error: null } });
+    await supabaseChargeStore(fakeTimeout.db, TENANT).requestTimeoutCancel(ROW, 120_000);
+    const calls = [...chains, ...fakeTimeout.chains].filter((c) => c[0]!.startsWith('rpc:'));
+    const args = [...rpcArgs, ...fakeTimeout.rpcArgs];
+    expect(calls.map((c) => c[0])).toEqual(expect.arrayContaining(['rpc:tchefood_authorize_point_reconcile', 'rpc:tchefood_resolve_point_charge', 'rpc:tchefood_request_point_timeout']));
+    calls.forEach((c, i) => expect(Object.keys(args[i]!).sort(), c[0]).toEqual(params(c[0]!.slice(4))));
   });
 });

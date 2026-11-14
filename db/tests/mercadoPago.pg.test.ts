@@ -338,7 +338,10 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       expect(open('rpc-e', ORDER2, 1)).toMatchObject({ ok: false, sqlstate: 'TF003' });
       sql(`UPDATE terminal_charges SET status = 'cancelled' WHERE idempotency_key = 'rpc-c';`);
       expect(open('rpc-e', ORDER2, 2001)).toMatchObject({ ok: false, sqlstate: 'TF003' });
-      sql(`UPDATE terminal_charges SET status = 'rejected' WHERE idempotency_key = 'rpc-a';`);
+      // Auditoria r5 P1-01: a revisão manual só sai com o fim verificado no Mercado Pago (db/schema_point_reserva.sql,
+      // testado em paymentClaims.pg.test.ts); o UPDATE direto é recusado. Aqui só monta o cenário, sem os gatilhos.
+      expect(psql(target!, `UPDATE terminal_charges SET status = 'rejected' WHERE idempotency_key = 'rpc-a';`, DB).message).toContain('confirmação do Mercado Pago');
+      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE terminal_charges SET status = 'rejected' WHERE idempotency_key = 'rpc-a'; COMMIT;`);
     });
 
     it('aprovada sem pagamento gravado reserva; recusada e cancelada não reservam', () => {
@@ -782,9 +785,18 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       // A resposta atrasada ainda liga a ordem (qualquer estado não final) e grava a aprovação por cima da revisão manual.
       expect(sql(`UPDATE terminal_charges SET external_order_id = 'ORD-LATE' WHERE idempotency_key = 'unk-a' AND external_order_id IS NULL
                   AND status NOT IN ('approved','rejected','cancelled','expired','refunded') RETURNING status;`)).toBe('manual_review');
+      // Auditoria r5 P1-01: a aprovação por cima da revisão manual não é mais gravada direto (nem pela consulta
+      // da Edge Function): só pelo fim verificado, com a conferência pedida com PIN de gerente.
       const late = psql(target!, `UPDATE terminal_charges SET status = 'approved', external_payment_id = '4242', paid_amount_cents = 10000, card_brand = 'VISA', authorization_code = 'LATE1'
                                   WHERE idempotency_key = 'unk-a' AND status = 'manual_review';`, DB);
-      expect(late.ok, late.message ?? '').toBe(true);
+      expect(late.ok).toBe(false);
+      expect(late.message).toContain('só passa de "manual_review" para "approved" com a confirmação do Mercado Pago');
+      const rec = psql(target!, `SELECT tchefood_authorize_point_reconcile('${TENANT}', 'unk-a', '${STAFF}', '${MANAGER_PIN}', 'conferido no app do Mercado Pago');`, DB);
+      expect(rec.out, rec.message ?? '').toMatch(/^[0-9a-f-]{36}$/);
+      const resolved = psql(target!, `SELECT status FROM tchefood_resolve_point_charge('${TENANT}', ${idOf('unk-a')}, 'manual_review', 'approved',
+                                      '{"external_payment_id":"4242","paid_amount_cents":10000,"card_brand":"VISA","authorization_code":"LATE1"}'::jsonb,
+                                      '${STAFF}', 'resposta atrasada conferida no Mercado Pago', '{"authorization_audit_id":"${rec.out}","operation_id":"4242"}'::jsonb);`, DB);
+      expect(resolved.out, resolved.message ?? '').toBe('approved');
       expect(field('unk-a', `status || '|' || external_order_id`)).toBe('approved|ORD-LATE');
     });
 
@@ -1346,10 +1358,16 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     expect(again.ok).toBe(false);
   });
 
-  it('recusado do Mercado Pago e Stone aprovado seguem as regras de antes', () => {
+  it('recusado do Mercado Pago e Stone aprovado seguem as regras de antes (a Stone, com a reserva dela: a loja tem Point)', () => {
     expect(pay('chave-recusada', { status: 'DECLINED', nsu: null, authorization_code: null, card_brand: null }).ok).toBe(true);
-    const stone = pay('stone-1', { order_id: ORDER6, acquirer: 'STONE', acquirer_cnpj: '16501555000157', terminal_id: STONE_TERMINAL, terminal_serial: 'STONE-01', nsu: '784512', authorization_code: 'A12345' });
+    const stoneOver = { order_id: ORDER6, acquirer: 'STONE', acquirer_cnpj: '16501555000157', terminal_id: STONE_TERMINAL, terminal_serial: 'STONE-01', nsu: '784512', authorization_code: 'A12345' };
+    // Revisão P1-B: sem a reserva no servidor, a Stone aprovada na loja com Point é recusada (TF010).
+    expect(pay('stone-1', stoneOver)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+    sql(`INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
+         VALUES ('${TENANT}', 'stone-1', '${ORDER6}', 'CREDIT', 'STONE', 1000, '${STAFF}');`);
+    const stone = pay('stone-1', stoneOver);
     expect(stone.ok, stone.message ?? '').toBe(true);
+    expect(sql(`SELECT status FROM payment_claims WHERE idempotency_key = 'stone-1'`)).toBe('consumed');
   });
 
   it('auditoria r3: a migration roda de novo sem erro e devolve as colunas e a regra que faltarem (banco de uma versão anterior)', () => {
@@ -1401,7 +1419,20 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       method: 'CASH', status: 'APPROVED', acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null,
       terminal_serial: null, idempotency_key: crypto.randomUUID(), created_at: new Date().toISOString(), ...over,
     });
-    const register = (json: string) => asDevice(`SELECT tchefood_register_payment('${json}'::jsonb)`);
+    /**
+     * Revisão P1-B: a loja tem Point, então o pagamento fora dela só entra com a reserva no servidor. Aqui a reserva
+     * é gravada direto (dono do banco), na MESMA transação do pagamento do aparelho, para testar a conta da reserva
+     * da Point no gatilho de payments (a reserva do próprio pagamento fica de fora da soma). Chave de cobrança da
+     * Point não vira reserva (TF009): nesse caso vai sem reserva, e o gatilho de payments recusa pela chave.
+     */
+    const claimFor = (json: string) => {
+      const p = JSON.parse(json) as { tenant_id: string; idempotency_key: string; order_id: string; method: string; acquirer: string; amount: number; waiter_id: string };
+      return `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
+              SELECT '${p.tenant_id}', '${p.idempotency_key}', '${p.order_id}', '${p.method}', '${p.acquirer}', ${Math.round(p.amount * 100)}, '${p.waiter_id}'
+               WHERE NOT EXISTS (SELECT 1 FROM terminal_charges c WHERE c.idempotency_key = '${p.idempotency_key}');`;
+    };
+    const register = (json: string) => psql(target!, `BEGIN; ${claimFor(json)} SET LOCAL ROLE authenticated;
+      SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true); SELECT tchefood_register_payment('${json}'::jsonb); COMMIT;`, DB);
     const stone = (order: string, amount: number) => payment(order, amount, {
       method: 'CREDIT', acquirer: 'STONE', acquirer_cnpj: '16501555000157', terminal_id: STONE_TERMINAL, terminal_serial: 'STONE-01',
       card_brand: 'VISA', nsu: `R${crypto.randomUUID().slice(0, 8)}`, authorization_code: 'A12345',
@@ -1444,7 +1475,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       const key = charge({ order_id: order, amount_cents: 10000, paid_amount_cents: 10000 });
       const own = pay(key, { order_id: order, amount: 100 });
       expect(own.ok, own.message ?? '').toBe(true);
-      expect(reservation(order)).toEqual({ reserved_cents: 0, open_charges: 0, manual_review: false });
+      expect(reservation(order)).toMatchObject({ reserved_cents: 0, open_charges: 0, manual_review: false, charges: [] });
     });
 
     it('duas cobranças abertas somam; reserva de outra conta não conta', () => {
@@ -1454,7 +1485,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       expect(openPoint('soma-b', order, 2500).ok).toBe(true);
       force('soma-b', 'manual_review');
       expect(openPoint('soma-outra', other, 9000).ok).toBe(true);
-      expect(reservation(order)).toEqual({ reserved_cents: 5500, open_charges: 2, manual_review: true });
+      expect(reservation(order)).toMatchObject({ reserved_cents: 5500, point_cents: 5500, claims_cents: 0, open_charges: 2, manual_review: true });
       expect(register(payment(order, 45.01)).message).toMatch(/R\$ 55\.00 reservado\)\. Livre para este pagamento: R\$ 45\.00/);
       expect(register(payment(order, 45)).ok).toBe(true);
     });
@@ -1463,10 +1494,20 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       const order = fresh(100);
       expect(openPoint('leitura', order, 1000).ok).toBe(true);
       expect(reservation(order).reserved_cents).toBe(1000);
-      expect(reservation(order, OTHER)).toEqual({ reserved_cents: 0, open_charges: 0, manual_review: false });
+      expect(reservation(order, OTHER)).toEqual({ reserved_cents: 0, point_cents: 0, claims_cents: 0, open_charges: 0, manual_review: false, charges: [], claims: [] });
       expect(asDevice(`SELECT tchefood_point_reserved_cents('${TENANT}', '${order}', NULL)`, OTHER).ok).toBe(false);
       expect(psql(target!, `SET ROLE anon; SELECT tchefood_point_reservation('${order}');`, DB).ok).toBe(false);
     });
+
+    /**
+     * O caminho do aparelho na loja com Point: a reserva (tchefood_claim_payment, que trava a conta e confere o
+     * saldo livre) e o pagamento com a chave dela, num comando só (se a reserva é recusada, nada é gravado).
+     */
+    const claimAndPay = (json: string, expected: number | string) => {
+      const p = JSON.parse(json) as { idempotency_key: string; order_id: string; method: string; acquirer: string; amount: number; waiter_id: string };
+      return `WITH c AS MATERIALIZED (SELECT tchefood_claim_payment('${p.idempotency_key}', '${p.order_id}', '${p.method}', '${p.acquirer}', ${Math.round(p.amount * 100)}, ${expected}, '${p.waiter_id}') AS r)
+              SELECT tchefood_register_payment('${json}'::jsonb) FROM c`;
+    };
 
     it('cobrança e dinheiro ao mesmo tempo na mesma conta: a conta travada deixa passar só o que cabe no saldo', async () => {
       const order = fresh(100);
@@ -1474,11 +1515,13 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       const [point, cash] = await contend(`SELECT 1 FROM orders WHERE id = '${order}' FOR UPDATE`, [
         `${tryFn} SELECT pg_temp.t($q$SELECT tchefood_open_terminal_charge('${TENANT}', 'junto', '${order}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 10000, '${STAFF}', 10000)$q$);`,
         `${tryFn} BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);
-         SELECT pg_temp.t($q$SELECT tchefood_register_payment('${payment(order, 100)}'::jsonb)$q$); COMMIT;`,
+         SELECT pg_temp.t($q$${claimAndPay(payment(order, 100), 10000)}$q$); COMMIT;`,
       ]);
       expect(lastOverlap).toBe(2);
       expect(point).toBe('ok');
-      expect(cash).toMatch(/^recusado: .*cobrança na Point em andamento/);
+      // A reserva do dinheiro espera a conta travada e vê a cobrança gravada: nada passa, nada é gravado.
+      expect(cash).toMatch(/^recusado: .*R\$ 100\.00 passa do saldo livre da conta no servidor \(R\$ 0\.00 livre; R\$ 100\.00 reservado/);
+      expect(sql(`SELECT count(*) FROM payment_claims WHERE order_id = '${order}'`)).toBe('0');
       expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${order}'`)).toBe('0');
     });
 
@@ -1499,9 +1542,10 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     const tryFn = `CREATE FUNCTION pg_temp.t(q text) RETURNS text LANGUAGE plpgsql AS $f$ BEGIN EXECUTE q; RETURN 'ok'; EXCEPTION WHEN others THEN RETURN 'recusado ' || SQLSTATE || ': ' || SQLERRM; END $f$;`;
     const pointQ = (key: string, order: string, cents: number, expected: number | string) =>
       `${tryFn} SELECT pg_temp.t($q$SELECT tchefood_open_terminal_charge('${TENANT}', '${key}', '${order}', '${TERMINAL}', '${MP_ID}', 'CREDIT', ${cents}, '${STAFF}', ${expected})$q$);`;
+    /** Reserva e pagamento do aparelho num comando só (claimAndPay), com o saldo que o aparelho viu ao montar. */
     const deviceQ = (json: string) =>
       `${tryFn} BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);
-       SELECT pg_temp.t($q$SELECT tchefood_register_payment('${json}'::jsonb)$q$); COMMIT;`;
+       SELECT pg_temp.t($q$${claimAndPay(json, bal((JSON.parse(json) as { order_id: string }).order_id))}$q$); COMMIT;`;
     const field = (key: string, expr: string) => sql(`SELECT ${expr} FROM terminal_charges WHERE idempotency_key = '${key}'`);
     const lockOrder = (order: string) => `SELECT 1 FROM orders WHERE id = '${order}' FOR UPDATE`;
     const charges = (key: string) => sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = '${key}'`);
@@ -1516,7 +1560,8 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
           const [point, card] = await contend(lockOrder(order), [pointQ(key, order, 10000, 10000), deviceQ(stone(order, 100))]);
           expect(lastOverlap, key).toBe(2);
           expect(point, key).toBe('ok');
-          expect(card, key).toMatch(/^recusado P0001: .*cobrança na Point em andamento nesta conta \(R\$ 100\.00 reservado\)\. Livre para este pagamento: R\$ 0\.00/);
+          expect(card, key).toMatch(/^recusado TF003: .*R\$ 100\.00 passa do saldo livre da conta no servidor \(R\$ 0\.00 livre; R\$ 100\.00 reservado/);
+          expect(sql(`SELECT count(*) FROM payment_claims WHERE order_id = '${order}'`), key).toBe('0');
           expect(approved(order), key).toBe('0');
           expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${order}'`), key).toBe('0');
           expect(field(key, `status || '|' || amount_cents`), key).toBe('creating|10000');
@@ -1563,7 +1608,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
           expect(lastOverlap, key).toBe(2);
           expect(point, key).toBe('ok');
           if (ok) expect(money, key).toBe('ok');
-          else expect(money, key).toMatch(/^recusado P0001: .*R\$ 60\.00 reservado\)\. Livre para este pagamento: R\$ 40\.00/);
+          else expect(money, key).toMatch(/^recusado TF003: .*R\$ 40\.01 passa do saldo livre da conta no servidor \(R\$ 40\.00 livre; R\$ 60\.00 reservado/);
           expect(approved(order), key).toBe(ok ? '40.00' : '0');
           expect(field(key, 'status'), key).toBe('creating');
         }
@@ -1592,16 +1637,28 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       it('o UPDATE também é conferido: pendente que vira aprovado, valor que sobe e pagamento que muda de conta não passam da reserva', () => {
         const order = withItems(100);
         expect(openPoint('r4-upd', order, 6000).ok).toBe(true);
-        const insert = (orderId: string, amount: number, status: string) => {
+        /**
+         * Pagamento direto no banco com a reserva dele (chave = id do pagamento) gravada antes, na mesma transação: a
+         * chave de um pagamento já gravado não vira reserva depois (TF009), então quem vai ser aprovado por UPDATE nasce
+         * com a reserva. O aprovado nasce sempre com ela (a loja tem Point).
+         */
+        const insert = (orderId: string, amount: number, status: string, claimCents?: number) => {
           const id = crypto.randomUUID();
-          sql(`INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
-               VALUES ('${id}', '${orderId}', '${TENANT}', '${STAFF}', ${amount}, 'CASH', '${status}', 'CASH_DESK', '${id}');`);
+          const cents = claimCents ?? (status === 'APPROVED' ? Math.round(amount * 100) : null);
+          sql(`BEGIN; ${cents === null ? '' : `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
+               VALUES ('${TENANT}', '${id}', '${orderId}', 'CASH', 'CASH_DESK', ${cents}, '${STAFF}');`}
+               INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+               VALUES ('${id}', '${orderId}', '${TENANT}', '${STAFF}', ${amount}, 'CASH', '${status}', 'CASH_DESK', '${id}'); COMMIT;`);
           return id;
         };
         const update = (id: string, set: string) => psql(target!, `UPDATE payments SET ${set} WHERE id = '${id}';`, DB);
         const reserved = /há uma cobrança na Point em andamento nesta conta \(R\$ 60\.00 reservado\)/;
-        // Pendente de R$ 100,00 (não abate saldo) que vira aprovado por UPDATE: recusado.
-        const big = insert(order, 100, 'PENDING');
+        // Revisão P1-B: pendente SEM reserva que vira aprovado: nem chega à conta da Point (TF010).
+        const bare = insert(order, 100, 'PENDING');
+        expect(update(bare, `status = 'APPROVED'`)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+        expect(sql(`SELECT status FROM payments WHERE id = '${bare}'`)).toBe('PENDING');
+        // Pendente de R$ 100,00 (não abate saldo), com a reserva dele, que vira aprovado por UPDATE: recusado pela Point.
+        const big = insert(order, 100, 'PENDING', 10000);
         const promote = update(big, `status = 'APPROVED'`);
         expect(promote.ok).toBe(false);
         expect(promote.message).toMatch(reserved);
@@ -1609,15 +1666,18 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         // Recusado (DECLINED) que vira aprovado: também.
         expect(update(big, `status = 'DECLINED'`).ok).toBe(true);
         expect(update(big, `status = 'APPROVED'`).message).toMatch(reserved);
-        // Pendente de R$ 40,00 vira aprovado: cabe (100 - 60).
-        const cash = insert(order, 40, 'PENDING');
+        // Só para o resto do cenário: a reserva de R$ 100,00 que não virou pagamento sai.
+        sql(`DELETE FROM payment_claims WHERE idempotency_key = '${big}' AND status = 'open';`);
+        // Pendente de R$ 40,00 vira aprovado: cabe (100 - 60), e consome a reserva dele.
+        const cash = insert(order, 40, 'PENDING', 4000);
         const ok = update(cash, `status = 'APPROVED'`);
         expect(ok.ok, ok.message ?? '').toBe(true);
         expect(balanceOf(order)).toBe('60.00|OPEN');
-        // Valor aprovado que sobe 1 centavo: recusado.
+        expect(sql(`SELECT status || '|' || (consumed_payment_id = '${cash}') FROM payment_claims WHERE idempotency_key = '${cash}'`)).toBe('consumed|true');
+        // Valor aprovado que sobe 1 centavo: passa do valor reservado para ele (TF010), antes mesmo da reserva da Point.
         const up = update(cash, 'amount = 40.01');
-        expect(up.ok).toBe(false);
-        expect(up.message).toMatch(/R\$ 60\.00 reservado\)\. Livre para este pagamento: R\$ 40\.00/);
+        expect(up).toMatchObject({ ok: false, sqlstate: 'TF010' });
+        expect(up.message).toContain('R$ 40.01 passa do valor reservado para este pagamento (R$ 40.00)');
         // O próprio valor não conta duas vezes: o saldo gravado (R$ 60,00) já desconta estes R$ 40,00. Baixar
         // para 39,00 e voltar para 40,00 cabe (com o saldo gravado de R$ 61,00 contado de novo, só caberia R$ 1,00).
         expect(update(cash, 'amount = 39').ok).toBe(true);
@@ -1628,16 +1688,16 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         // Aprovado → aprovado com o mesmo valor, ou outro campo: não reabre a conferência (nada sai da reserva).
         expect(update(cash, `status = 'APPROVED'`).ok).toBe(true);
         expect(update(cash, 'tip_amount = 5').ok).toBe(true);
-        // Pagamento aprovado de outra conta que muda para esta: recusado (aqui não sobra nada além da reserva).
+        // Pagamento aprovado de outra conta que muda para esta: recusado (a reserva dele é da outra conta, TF010).
         const other = withItems(100);
         const moved = insert(other, 10, 'APPROVED');
         const move = update(moved, `order_id = '${order}'`);
-        expect(move.ok).toBe(false);
-        expect(move.message).toMatch(/R\$ 60\.00 reservado\)\. Livre para este pagamento: R\$ 0\.00/);
+        expect(move).toMatchObject({ ok: false, sqlstate: 'TF010' });
+        expect(move.message).toContain('é da reserva de pagamento de outra conta');
         expect(sql(`SELECT order_id FROM payments WHERE id = '${moved}'`)).toBe(other);
         expect(approved(order)).toBe('40.00');
         // Cobrança encerrada: a reserva sai, e o pendente de R$ 60,00 que não cabia passa a caber.
-        const rest = insert(order, 60, 'PENDING');
+        const rest = insert(order, 60, 'PENDING', 6000);
         expect(update(rest, `status = 'APPROVED'`).message).toMatch(/Livre para este pagamento: R\$ 0\.00/);
         force('r4-upd', 'cancelled');
         const paid = update(rest, `status = 'APPROVED'`);
@@ -1662,7 +1722,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
           expect(r.message, label).toContain('a chave r4-furo é de uma cobrança da Point');
         }
         expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${order}'`)).toBe('0');
-        expect(reservation(order)).toEqual({ reserved_cents: 6000, open_charges: 1, manual_review: false });
+        expect(reservation(order)).toMatchObject({ reserved_cents: 6000, open_charges: 1, manual_review: false });
         // Mesmo gravando direto no banco (fora do aparelho): recusado.
         const direct = psql(target!, `INSERT INTO payments (order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
                                       VALUES ('${order}', '${TENANT}', '${STAFF}', 10, 'CASH', 'APPROVED', 'CASH_DESK', 'r4-furo');`, DB);
@@ -1683,7 +1743,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         // O caminho legítimo: o pagamento do Mercado Pago, igual à cobrança aprovada, entra e consome a própria reserva.
         const mp = pay(key, { order_id: order, amount: 60 });
         expect(mp.ok, mp.message ?? '').toBe(true);
-        expect(reservation(order)).toEqual({ reserved_cents: 0, open_charges: 0, manual_review: false });
+        expect(reservation(order)).toMatchObject({ reserved_cents: 0, open_charges: 0, manual_review: false, charges: [] });
         expect(balanceOf(order)).toBe('40.00|OPEN');
         // E a Point nova da conta vê os R$ 40,00 livres.
         expect(openPoint('r4-furo-mp', order, 4001)).toMatchObject({ ok: false, sqlstate: 'TF003' });
@@ -1703,7 +1763,9 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       it('o UPDATE que troca a loja do pagamento aprovado para uma loja que não é a da conta é recusado', () => {
         const order = withItems(100);
         const id = crypto.randomUUID();
-        sql(`INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+        sql(`INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
+             VALUES ('${TENANT}', '${id}', '${order}', 'CASH', 'CASH_DESK', 1000, '${STAFF}');
+             INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
              VALUES ('${id}', '${order}', '${TENANT}', '${STAFF}', 10, 'CASH', 'APPROVED', 'CASH_DESK', '${id}');`);
         const r = psql(target!, `UPDATE payments SET tenant_id = '${OTHER}' WHERE id = '${id}';`, DB);
         expect(r.ok).toBe(false);
@@ -1717,7 +1779,10 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         const key = charge({ order_id: order, amount_cents: 6000, paid_amount_cents: 6000 });
         const insert = (amount: number, status: string) => {
           const id = crypto.randomUUID();
-          sql(`INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+          // O aprovado nasce com a reserva dele (a loja tem Point).
+          sql(`${status === 'APPROVED' ? `INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
+               VALUES ('${TENANT}', '${id}', '${order}', 'CASH', 'CASH_DESK', ${Math.round(amount * 100)}, '${STAFF}');` : ''}
+               INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
                VALUES ('${id}', '${order}', '${TENANT}', '${STAFF}', ${amount}, 'CASH', '${status}', 'CASH_DESK', '${id}');`);
           return id;
         };
@@ -1732,9 +1797,11 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         const promote = psql(target!, `UPDATE payments SET status = 'APPROVED' WHERE id = '${pending}';`, DB);
         expect(promote.ok).toBe(false);
         expect(promote.message).toContain('é de uma cobrança da Point');
-        // A reserva da cobrança continua inteira; trocar para uma chave qualquer segue normal.
+        // A reserva da cobrança continua inteira. Revisão P1-B: trocar para uma chave sem reserva também é recusado
+        // na loja com Point (TF010); o pagamento segue com a chave e a reserva dele.
         expect(reservation(order).reserved_cents).toBe(6000);
-        expect(psql(target!, `UPDATE payments SET idempotency_key = 'r4-chave-livre' WHERE id = '${cash}';`, DB).ok).toBe(true);
+        expect(psql(target!, `UPDATE payments SET idempotency_key = 'r4-chave-livre' WHERE id = '${cash}';`, DB)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+        expect(sql(`SELECT idempotency_key FROM payments WHERE id = '${cash}'`)).toBe(cash);
         expect(balanceOf(order)).toBe('60.00|OPEN');
       });
     });
