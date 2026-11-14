@@ -19,6 +19,7 @@ import { ReviewCapture } from '../components/ReviewCapture';
 import { CashbackCapture } from '../components/CashbackPanel';
 import { Badge, Btn, toast } from '../components/ui';
 import { CategoryIcon } from './OrderScreen';
+import { declineMessage } from '../lib/payments/pointTexts';
 
 interface CartLine extends CounterLine {
   key: string;
@@ -290,7 +291,7 @@ function CounterCheckout({ orderId, onDone }: { orderId: string; onDone: () => v
       if (result.status === 'DECLINED') {
         s.registerPayment({ orderId, amount, method, status: 'DECLINED', terminal_id: result.terminal_id, acquirer: result.acquirer, acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: result.terminal_serial, idempotency_key, item_ids: [], charge_request_id: req.request_id });
         claim.noCharge(`Maquininha recusou: ${result.reason}`);
-        toast.error(`❌ Transação recusada: ${result.reason}`);
+        toast.error(`❌ ${declineMessage(result.reason).text}`);
         return;
       }
       const r = s.registerPayment({

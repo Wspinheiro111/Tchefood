@@ -29,6 +29,9 @@ export const CLAIM_REQUIRED_ERROR =
 /** Motivo mínimo da liberação pelo gerente (tchefood_release_payment_claim_manager). */
 export const MANAGER_RELEASE_MIN_REASON = 10;
 
+/** Recusa sem texto próprio na liberação pelo gerente (auditoria interna 2, P2-8). */
+export const MANAGER_RELEASE_REFUSED = 'O servidor não liberou esta reserva. Nada foi liberado; tente de novo e, se continuar, fale com o suporte.';
+
 export const CLAIM_OFFLINE_ERROR =
   'Loja conectada à nuvem: todo pagamento é reservado no servidor antes; sem conexão não dá para receber neste aparelho. Confira a internet e tente de novo. Nada foi recebido.';
 
@@ -39,7 +42,7 @@ export type ClaimAcquirer = 'CASH_DESK' | 'STONE' | 'PAGBANK';
 export const CLAIM_ERRORS: Record<string, string> = {
   TF001: 'O servidor não encontrou esta conta. Nada foi recebido; aguarde a sincronização e tente de novo.',
   TF002: 'Esta conta já está fechada no servidor. Nada foi recebido.',
-  TF003: 'O valor passa do saldo livre desta conta no servidor (há cobrança na Point ou outro pagamento reservando). Nada foi recebido.',
+  TF003: 'O valor passa do saldo livre desta conta no servidor (outro pagamento ou cobrança em andamento reserva parte do saldo). Nada foi recebido.',
   TF004: 'O servidor não reconhece o operador como da equipe ativa desta loja. Entre de novo com o seu PIN. Nada foi recebido.',
   TF006: 'O servidor recusou a reserva: dados do pagamento inválidos. Nada foi recebido.',
   TF008: 'O saldo desta conta no servidor é diferente do deste aparelho. Aguarde a sincronização e tente de novo. Nada foi recebido.',
@@ -432,7 +435,8 @@ export async function releasePaymentClaimManager(key: string, managerPin: string
         const lead = localClaim(key) ? CLAIM_ACTIVE_HERE : CLAIM_ERRORS.TF011!;
         return { ok: false, active: true, error: at ? `${lead} O gerente pode liberar a partir de ${at} (horário de Brasília).` : lead };
       }
-      return { ok: false, error: `O servidor não liberou a reserva: ${out.message}` };
+      // Auditoria interna 2 (P2-8): recusa desconhecida não mostra a mensagem crua do PostgREST.
+      return { ok: false, error: `${MANAGER_RELEASE_REFUSED}${out.code ? ` (código ${out.code})` : ''}` };
     }
     // Só o JSON null literal é a resposta de PIN errado ou bloqueado; corpo vazio, HTML ou outro lixo é falha
     // de comunicação (não convida a digitar o PIN de novo).

@@ -288,8 +288,14 @@ const FINAL: ReadonlySet<ChargeStatus> = new Set(['approved', 'rejected', 'cance
 /** Valor máximo de uma cobrança (R$ 100.000,00): protege contra digitação em centavos trocada. */
 export const MAX_AMOUNT_CENTS = 10_000_000;
 
+/**
+ * Sufixos que o servidor usa nas chaves de cancelamento no Mercado Pago (X-Idempotency-Key `<chave>-cancel`,
+ * `<chave>-cancel-2`): uma chave de cobrança assim poderia ocupar antes o cancelamento de outra (revisão de segurança).
+ */
+const CANCEL_KEY_SUFFIX = /-cancel(-\d+)?$/i;
+
 export function validKey(value: unknown): value is string {
-  return typeof value === 'string' && KEY.test(value) && isValidExternalReference(value);
+  return typeof value === 'string' && KEY.test(value) && !CANCEL_KEY_SUFFIX.test(value) && isValidExternalReference(value);
 }
 
 /** Bandeira pelo payment_method_id do Mercado Pago. Outra bandeira não tem código no app: revisão manual. */
@@ -796,6 +802,7 @@ export function validateCancel(input: CancelInput): CancelRequest {
   if (typeof input.staff_id !== 'string' || !UUID.test(input.staff_id)) throw new ChargeInputError('invalid_staff', 'Informe quem está encerrando a cobrança.');
   if (typeof input.manager_pin !== 'string' || !/^\d{4,8}$/.test(input.manager_pin)) throw new ChargeInputError('manager_required', 'Encerrar a cobrança exige o PIN do gerente.', 403);
   if (typeof input.reason_text !== 'string' || input.reason_text.trim().length < 5) throw new ChargeInputError('invalid_reason', 'Informe o motivo (mínimo 5 caracteres).');
+  if (input.reason_text.trim().length > RECONCILE_REASON_MAX) throw new ChargeInputError('invalid_reason', `Motivo longo demais (máximo ${RECONCILE_REASON_MAX} caracteres).`);
   return { reason: 'operator', staff_id: input.staff_id, manager_pin: input.manager_pin, reason_text: input.reason_text.trim() };
 }
 

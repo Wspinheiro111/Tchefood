@@ -11,6 +11,8 @@ import {
   reconcileCharge,
   refundCharge,
   startCharge,
+  validKey,
+  validateCancel,
   type ChargeStatus,
   type ChargeContext,
   type ChargePatch,
@@ -2732,6 +2734,28 @@ describe('point-charge: auditoria r5', () => {
     expect(Object.keys(review.store.resolutions[0]!.patch).every((k) => allowed.includes(k))).toBe(true);
     expect(review.store.resolutions[0]!.evidence).toHaveProperty('authorization_audit_id');
     expect(review.store.resolutions[0]!.evidence).toHaveProperty('operation_id');
+  });
+
+  it('revisão de segurança (a): chave terminada em -cancel / -cancel-N é recusada (é a chave de cancelamento de outra cobrança)', async () => {
+    for (const key of [`${KEY}-cancel`, `${KEY}-cancel-2`, `${KEY}-CANCEL`, 'abc-cancel-10', '-cancel']) {
+      expect(validKey(key), key).toBe(false);
+      const { ctx, store, calls } = setup();
+      await expect(startCharge(ctx, terminal, input({ idempotency_key: key }))).rejects.toMatchObject({ code: 'invalid_key', httpStatus: 400 });
+      await expect(voidCharge(ctx, terminal, { ...input({ idempotency_key: key }), ...CANCEL })).rejects.toMatchObject({ code: 'invalid_key' });
+      await expect(reconcileCharge(ctx, { idempotency_key: key, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: 'conferido no app do Mercado Pago' })).rejects.toMatchObject({ code: 'invalid_key' });
+      expect(store.rows).toHaveLength(0);
+      expect(calls.create).toHaveLength(0);
+    }
+    // Só o sufixo exato: "cancel" no meio, "-canceled" ou "-cancel-x" continuam valendo; a chave uuid do aparelho também.
+    for (const key of [KEY, 'cancel-abc', 'abc-canceled', 'abc-cancel-x', 'abc_cancel']) expect(validKey(key), key).toBe(true);
+  });
+
+  it('revisão de segurança (b): motivo do encerramento com mais de 500 caracteres → 400, sem PIN', async () => {
+    const { ctx, store } = setup();
+    await startCharge(ctx, terminal, input());
+    await expect(cancelCharge(ctx, store.rows[0]!, { ...input(), ...OPERATOR, reason_text: 'x'.repeat(501) })).rejects.toMatchObject({ code: 'invalid_reason', httpStatus: 400 });
+    expect(store.count.authorizeCancel ?? 0).toBe(0);
+    expect(() => validateCancel({ ...input(), ...OPERATOR, reason_text: 'x'.repeat(500) } as never)).not.toThrow();
   });
 
   it('TF009 (chave de outro pagamento) no bloqueio da chave: 409 key_in_use', async () => {

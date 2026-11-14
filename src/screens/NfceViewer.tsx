@@ -7,6 +7,12 @@ import { printDocument } from '../lib/payments/drivers';
 import { Btn, Sheet, toast } from '../components/ui';
 import { ThermalPaper } from '../components/SmartPosSimulator';
 
+/**
+ * Auditoria interna 2 (P2-C): a nota foi emitida com um pagamento que depois foi estornado; a reimpressão monta a nota
+ * pelos pagamentos de agora (sem o estornado).
+ */
+export const NFCE_REFUNDED_WARNING = 'Nota emitida com o pagamento estornado: confira o cancelamento na SEFAZ. A reimpressão abaixo não mostra o pagamento estornado.';
+
 /** Visualizador do payload Focus NFe + DANFE NFC-e em bobina de 58mm. */
 export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () => void }) {
   const s = useTcheStore();
@@ -62,6 +68,9 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
         </div>
       }
     >
+      {order.nfce_key && s.payments.some((p) => p.order_id === orderId && p.status === 'REFUNDED') && (
+        <p role="alert" className="mb-3 rounded-xl border-2 border-ouro bg-ouro/10 p-3 text-sm font-semibold text-brasa">{NFCE_REFUNDED_WARNING}</p>
+      )}
       <div className="mb-3 rounded-xl bg-base p-3 text-xs">
         <div><b>Chave de acesso:</b> <span className="font-mono">{formatAccessKey(doc.access_key)}</span></div>
         <div><b>Protocolo SEFAZ-RS:</b> {doc.protocol} · <b>Status:</b> {order.nfce_status} (homologação)</div>

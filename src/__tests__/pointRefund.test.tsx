@@ -138,7 +138,7 @@ describe('espelho do estorno gravado no servidor', () => {
     setReviewHold({ order_id: orderId, amount: 5, reason: 'outra', code: 'CLAIM_UNCONFIRMED', idempotency_key: OTHER, acquirer: 'MERCADO_PAGO' });
     const { d } = deps(REFUNDED);
     const r = await submitPointRefund(payment, '1234', 'venda estornada na maquininha', d);
-    expect(r).toEqual({ ok: true, data: { nfceIssued: false } });
+    expect(r).toEqual({ ok: true, data: { nfceIssued: false, itemsStayPaid: false } });
     expect(st().payments.find((p) => p.id === payment.id)!.status).toBe('REFUNDED');
     const after = st().orders.find((o) => o.id === orderId)!;
     expect(after.remaining_balance).toBeCloseTo(before.remaining_balance + 20, 2);

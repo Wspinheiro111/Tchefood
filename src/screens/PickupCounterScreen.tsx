@@ -16,6 +16,7 @@ import { Badge, Btn, toast } from '../components/ui';
 import { CategoryIcon } from './OrderScreen';
 import { useSalePrice } from '../lib/useSalePrice';
 import { parsePdvQuery, PDV_SHORTCUTS, searchProducts } from '../lib/pdvSearch';
+import { declineMessage } from '../lib/payments/pointTexts';
 
 /** Barra com os atalhos de teclado (só em tela larga, onde há teclado). */
 function ShortcutBar({ items }: { items: ReadonlyArray<readonly [string, string]> }) {
@@ -414,7 +415,7 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
       if (r.status === 'APPROVED') {
         toast.success(`✅ Senha ${number} paga e enviada para a cozinha.`);
         if (r.change > 0) toast.info(`Troco: ${formatBRL(r.change)}`);
-      } else if (r.status === 'DECLINED') toast.error(`❌ Transação recusada: ${r.reason}`);
+      } else if (r.status === 'DECLINED') toast.error(`❌ ${declineMessage(r.reason).text}`);
       else if (r.status === 'MANUAL_REVIEW') {
         setHold(getReviewHold(orderId));
         toast.alert(`⚠️ ${r.reason}`);

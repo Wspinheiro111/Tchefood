@@ -337,6 +337,11 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
         // PIN recusado: o pedido do operador cai e a cobrança segue as regras do prazo.
         this.aborted.delete(req.request_id);
         if (this.deps.now() - started < POINT_WAIT_MS) cancelAt = null;
+        try {
+          manager.onRefused?.(out.message);
+        } catch {
+          // aviso da tela não pode parar a cobrança
+        }
         return null;
       }
       if (out.kind === 'rejected' && manager && out.httpStatus === 404) {

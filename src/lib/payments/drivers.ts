@@ -35,6 +35,8 @@ export type CardBrand = 'VISA' | 'MASTERCARD' | 'ELO' | 'PIX';
 export interface ManagerAbort {
   manager_pin: string;
   reason: string;
+  /** Auditoria interna 2 (P2-5): o servidor recusou o PIN (403); a cobrança segue até o prazo. Nunca recebe o PIN. */
+  onRefused?: (message: string) => void;
 }
 
 export interface ChargeRequest {

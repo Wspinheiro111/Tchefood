@@ -8,6 +8,8 @@ import { clearReviewHold, getReviewHolds, reviewHoldKey } from '../lib/payments/
 import { RECONCILE_MIN_REASON, pointPaymentOnServer, readPointChargeStatus, reconcilePointCharge, type ReconcileDeps } from '../lib/payments/pointReconcile';
 import { formatBRL } from '../lib/money';
 import { playDeniedBuzz, vibrate } from '../lib/sound';
+import { MAX_REASON_LENGTH } from './ManagerAuthSheet';
+import { POINT_REFUND_NFCE } from './PointRefund';
 
 export const POINT_NOT_CHARGED = 'O Mercado Pago confirmou que não foi cobrado. Valor liberado.';
 /** Estorno provado pelo Mercado Pago (houve cobrança e o dinheiro voltou ao cliente). */
@@ -170,6 +172,14 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
       return;
     }
     if (reply.status === 'DECLINED') {
+      // Auditoria interna 2 (P1-A, variante): estornada no Mercado Pago e com o pagamento aprovado aqui (a inclusão
+      // seria recusada para sempre, TF007): o mesmo espelho do estorno registrado.
+      const local = out.refunded ? useTcheStore.getState().payments.find((p) => p.idempotency_key === key && p.acquirer === 'MERCADO_PAGO' && p.status === 'APPROVED') : undefined;
+      if (local) {
+        const m = useTcheStore.getState().mirrorServerPointRefund(key, reason);
+        if (!m.ok) return fail(m.error);
+        if (m.data.nfceIssued) toast.alert(POINT_REFUND_NFCE);
+      }
       clearHoldOf(charge.order_id, key);
       toast.success(out.refunded ? POINT_REFUNDED : POINT_NOT_CHARGED);
       onReleased?.();
@@ -246,10 +256,10 @@ export function PointReviewSheet({ open, onClose, label, charge, onSuccess, onRe
       <input id="point-operation-id" inputMode="numeric" autoComplete="off" value={operationId} onChange={(e) => { setOperationId(e.target.value.replace(/\D/g, '').slice(0, 20)); setError(null); }} placeholder="Do comprovante ou do app do Mercado Pago" className="mb-3 min-h-touch-lg w-full rounded-xl border border-slate-300 bg-base px-3 text-xl font-bold outline-none focus:border-ouro" />
 
       <label htmlFor="point-review-reason" className="mb-1 block text-sm font-semibold text-slate-700">Motivo</label>
-      <textarea id="point-review-reason" value={reason} onChange={(e) => setReason(e.target.value)} rows={2} placeholder="Ex.: cliente diz que a Point mostrou aprovado" className="mb-3 w-full rounded-xl border border-slate-300 bg-base p-3 text-base outline-none focus:border-ouro" />
+      <textarea id="point-review-reason" value={reason} maxLength={MAX_REASON_LENGTH} onChange={(e) => setReason(e.target.value.slice(0, MAX_REASON_LENGTH))} rows={2} placeholder="Ex.: cliente diz que a Point mostrou aprovado" className="mb-3 w-full rounded-xl border border-slate-300 bg-base p-3 text-base outline-none focus:border-ouro" />
 
       <p className="mb-2 text-center text-sm font-semibold text-slate-700">PIN do Gerente</p>
-      <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => ready && void submit(v)} error={Boolean(error)} compact disabled={busy} />
+      <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => ready && void submit(v)} error={Boolean(error)} compact disabled={busy} label="PIN do gerente" />
       {error && <p className="mt-3 rounded-lg bg-brasa/20 p-2 text-center text-sm font-semibold text-rose-700">{error}</p>}
     </Sheet>
   );

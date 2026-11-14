@@ -213,7 +213,7 @@ describe('caixa da mesa (CheckoutScreen) numa loja com Point', () => {
     fireEvent.change(within(dialog).getByPlaceholderText('Descreva o motivo…'), { target: { value: 'Cliente desistiu' } });
     for (const d of '9999') fireEvent.click(within(dialog).getByRole('button', { name: d }));
     const req = driver.charge.mock.calls[0]![0] as { request_id: string };
-    expect(driver.abort).toHaveBeenCalledWith(req.request_id, { manager_pin: '9999', reason: 'Cliente desistiu' });
+    expect(driver.abort).toHaveBeenCalledWith(req.request_id, expect.objectContaining({ manager_pin: '9999', reason: 'Cliente desistiu' }));
     await act(async () => { finish(declined('MERCADO_PAGO')); });
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Cancelar cobrança' })).toBeNull());
   });

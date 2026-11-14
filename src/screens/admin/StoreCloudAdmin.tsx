@@ -818,6 +818,9 @@ function RejectedItemPrice({ eventId }: { eventId: string }) {
   );
 }
 
+/** Reenvio dos recusados que não terminou (auditoria interna 2, P2-8). */
+export const RESEND_FAILED = 'Não foi possível reenviar agora: confira a internet e tente de novo. Nada foi tirado da lista.';
+
 function CloudStatus() {
   const cloud = useTcheStore((s) => s.cloud)!;
   const status = useTcheStore((s) => s.syncStatus);
@@ -837,6 +840,9 @@ function CloudStatus() {
       const failed = [...results.values()].filter((r) => !r.ok).length;
       if (failed > 0) toast.error(`${failed} pagamento(s) sem reserva não puderam ser reenviados: veja o motivo na lista.`);
       await syncOnce();
+    } catch {
+      // Auditoria interna 2 (P2-8): falha no reenvio aparece (antes o botão só voltava).
+      toast.error(RESEND_FAILED);
     } finally {
       setResending(false);
     }

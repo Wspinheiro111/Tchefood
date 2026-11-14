@@ -183,7 +183,9 @@ repete a liberação que falhou por rede.
   aprovada no meio da chamada pela consulta de outro aparelho, a resposta é `APPROVED_ELSEWHERE`, nunca a aprovação.
   A tela da conta só oferece "Resolver cobrança da Point" para a cobrança aberta que o servidor marca vencida
   (`stale` em `tchefood_point_reservation`, relógio do banco); antes disso mostra "cobrando em outro aparelho", sem
-  ação;
+  ação. A aprovada sem pagamento registrado (de outro aparelho) só fica `stale` `tchefood_claim_abandon_after()`
+  (5 min) depois da aprovação (`updated_at` da cobrança), não da criação: o aparelho que cobrou pode estar sem rede
+  com o pagamento na fila; antes disso a tela mostra "aguardando o pagamento do aparelho que cobrou";
 - estornada: só leitura, sem PIN e sem gravar nada. Com o ID do pagamento: o pagamento precisa provar o estorno (mesmo
   ID, valor e referência; `refunded` com `transaction_amount_refunded` igual ao valor; contestação `charged_back` nunca
   serve aqui). Sem o ID do

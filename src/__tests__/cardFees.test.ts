@@ -61,6 +61,13 @@ describe('agenda de recebíveis', () => {
     expect(r.totalNet).toBe(293);
     expect(r).toMatchObject({ withoutRule: 80, withoutRuleCount: 1 });
   });
+
+  it('auditoria 2 (P2-D): venda da Point (Mercado Pago) sem taxa cadastrada entra em "sem taxa", não some', () => {
+    const now = new Date(2026, 10, 10, 9);
+    const r = receivables([pay({ method: 'CREDIT', amount: 120, acquirer: 'MERCADO_PAGO' }), pay({ method: 'DEBIT', amount: 30, acquirer: 'MERCADO_PAGO' })], [rule({})], now);
+    expect(r).toMatchObject({ withoutRule: 150, withoutRuleCount: 2 });
+    expect(r.days).toEqual([]);
+  });
 });
 
 describe('quanto sobrou', () => {

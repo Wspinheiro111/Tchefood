@@ -34,20 +34,35 @@ export function effectiveReservation(cloud: Omit<PointReservation, 'source'> | n
  * Reserva lida do servidor sem as reservas de pagamento cuja chave já é um pagamento APROVADO desta conta neste
  * aparelho: o saldo local já descontou esse pagamento (contar a reserva dele de novo recusaria a 2ª cota até a
  * fila subir, e para sempre se ela travar). A reserva de outro aparelho ou a deste ainda não paga continua.
- * Mesma regra de reservationExceeds.
+ * Mesma regra de reservationExceeds. Auditoria interna 2 (P2-1): vale também para a cobrança da Point aprovada cuja
+ * chave é um pagamento APROVADO aqui (o pagamento ainda está na fila deste aparelho; o servidor a conta como
+ * "aprovada sem pagamento" até a fila subir).
  */
-export function withoutClaimsPaidHere<T extends { reservedCents: number; claimsCents?: number; claims?: ReadonlyArray<{ idempotencyKey: string; amountCents: number }> }>(
+export function withoutClaimsPaidHere<T extends {
+  reservedCents: number; claimsCents?: number; pointCents?: number; openCharges?: number;
+  claims?: ReadonlyArray<{ idempotencyKey: string; amountCents: number }>;
+  charges?: ReadonlyArray<{ idempotencyKey: string; amountCents: number; status: string }>;
+}>(
   reservation: T | null,
   paidKeys: ReadonlySet<string>,
 ): T | null {
-  if (!reservation || !reservation.claims || paidKeys.size === 0) return reservation;
-  const paid = reservation.claims.filter((c) => paidKeys.has(c.idempotencyKey)).reduce((a, c) => a + c.amountCents, 0);
-  if (paid === 0) return reservation;
+  if (!reservation || paidKeys.size === 0) return reservation;
+  const paidClaims = (reservation.claims ?? []).filter((c) => paidKeys.has(c.idempotencyKey)).reduce((a, c) => a + c.amountCents, 0);
+  const paidCharges = (reservation.charges ?? []).filter((c) => c.status === 'approved' && paidKeys.has(c.idempotencyKey));
+  const chargeCents = paidCharges.reduce((a, c) => a + c.amountCents, 0);
+  if (paidClaims === 0 && paidCharges.length === 0) return reservation;
   return {
     ...reservation,
-    reservedCents: Math.max(reservation.reservedCents - paid, 0),
-    ...(reservation.claimsCents !== undefined ? { claimsCents: Math.max(reservation.claimsCents - paid, 0) } : {}),
-    claims: reservation.claims.filter((c) => !paidKeys.has(c.idempotencyKey)),
+    reservedCents: Math.max(reservation.reservedCents - paidClaims - chargeCents, 0),
+    ...(reservation.claimsCents !== undefined && paidClaims > 0 ? { claimsCents: Math.max(reservation.claimsCents - paidClaims, 0) } : {}),
+    ...(reservation.claims && paidClaims > 0 ? { claims: reservation.claims.filter((c) => !paidKeys.has(c.idempotencyKey)) } : {}),
+    ...(paidCharges.length > 0
+      ? {
+          ...(reservation.pointCents !== undefined ? { pointCents: Math.max(reservation.pointCents - chargeCents, 0) } : {}),
+          ...(reservation.openCharges !== undefined ? { openCharges: Math.max(reservation.openCharges - paidCharges.length, 0) } : {}),
+          charges: reservation.charges!.filter((c) => !(c.status === 'approved' && paidKeys.has(c.idempotencyKey))),
+        }
+      : {}),
   };
 }
 
@@ -124,13 +139,25 @@ export function describeTotalBelowPaid(detail: string): string | null {
 const lastRead = new Map<string, { reservedCents: number; claims: Array<{ key: string; cents: number }>; at: number }>();
 export const RESERVATION_READ_MAX_AGE_MS = 60_000;
 
-export function rememberServerReservation(orderId: string, reservedCents: number, claims: ReadonlyArray<{ idempotencyKey: string; amountCents: number }> = [], nowMs = Date.now()): void {
-  lastRead.set(orderId, { reservedCents, claims: claims.map((c) => ({ key: c.idempotencyKey, cents: c.amountCents })), at: nowMs });
+/**
+ * `charges`: as cobranças da Point da leitura. A aprovada entra na lista que reservationExceeds desconta quando a chave
+ * é um pagamento APROVADO aqui (auditoria interna 2, a mesma regra de withoutClaimsPaidHere).
+ */
+export function rememberServerReservation(
+  orderId: string,
+  reservedCents: number,
+  claims: ReadonlyArray<{ idempotencyKey: string; amountCents: number }> = [],
+  nowMs = Date.now(),
+  charges: ReadonlyArray<{ idempotencyKey: string; amountCents: number; status: string }> = [],
+): void {
+  const counted = [...claims, ...charges.filter((c) => c.status === 'approved')];
+  lastRead.set(orderId, { reservedCents, claims: counted.map((c) => ({ key: c.idempotencyKey, cents: c.amountCents })), at: nowMs });
 }
 
 /**
  * Reduzir o total para `newRemaining` passaria do que está reservado no servidor? Usa a última leitura (até
- * 60 s); reservas cujo pagamento já está aprovado aqui não contam (o saldo daqui já as descontou).
+ * 60 s); reservas e cobranças da Point aprovadas cujo pagamento já está aprovado aqui não contam (o saldo daqui já as
+ * descontou).
  * Sem leitura recente: null (o servidor ainda confere, com TF012).
  */
 export function reservationExceeds(orderId: string, newRemaining: number, paidKeys: ReadonlySet<string>, nowMs = Date.now()): string | null {

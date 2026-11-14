@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { MercadoPagoPointDriver, POINT_CANCEL_WAIT_MS, POINT_HARD_LIMIT_MS, POINT_WAIT_MS, type PointDriverDeps } from '../lib/payments/mercadoPagoPointDriver';
 import { createDriver, type ChargeRequest } from '../lib/payments/drivers';
 import { holdAcquirer } from '../lib/payments/reviewHolds';
@@ -278,6 +278,16 @@ describe('MercadoPagoPointDriver', () => {
     const cancels = h.calls.filter((c) => c.body.action === 'cancel').map((c) => c.body.reason);
     expect(cancels).toEqual(['operator', 'timeout']);
     expect(h.counts.status).toBeGreaterThanOrEqual(POINT_WAIT_MS / 2_000 - 2);
+  });
+
+  it('auditoria interna 2 (P2-5): PIN recusado (403) avisa quem pediu, uma vez, sem mandar o aviso ao servidor', async () => {
+    const h = harness((action, n) => (action === 'cancel' ? (n === 1 ? { status: 403, body: { error: 'manager_denied', message: 'PIN errado' } } : { status: 200, body: { status: 'DECLINED', idempotency_key: REQ.idempotency_key, reason: 'cancelada' } }) : pending));
+    const refused = vi.fn();
+    const p = h.driver.charge(REQ);
+    h.driver.abort(REQ.request_id, { manager_pin: '0000', reason: 'cliente desistiu', onRefused: refused });
+    expect((await p).status).toBe('DECLINED');
+    expect(refused).toHaveBeenCalledTimes(1);
+    expect(h.calls.every((c) => !('onRefused' in c.body))).toBe(true);
   });
 
   it('auditoria r3 P2-02: o prazo do cartão conta do primeiro envio, não da sincronização', async () => {

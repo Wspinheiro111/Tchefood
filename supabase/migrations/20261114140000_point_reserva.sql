@@ -277,10 +277,16 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtextextended('tchefood_payment_key:' || NEW.idempotency_key, 0));
     -- Revisão r8 (itens 1 e 2): já existe cobrança com a chave (desta loja ou de outra): a linha nova vai cair no
     -- conflito da chave, e quem grava decide (ON CONFLICT de tchefood_open_terminal_charge e tchefood_block_point_key:
-    -- devolve a desta loja, ou TF005 para a de outra loja, sem dizer o que há com a chave). As conferências abaixo
+    -- devolve a desta loja, ou a recusa única da chave em uso para a de outra loja, sem dizer o que há com a chave). As conferências abaixo
     -- só valem para a chave ainda sem cobrança; a trava da chave já foi pega, na mesma ordem.
     IF EXISTS (SELECT 1 FROM terminal_charges c WHERE c.idempotency_key = NEW.idempotency_key) THEN
         RETURN NEW;
+    END IF;
+    -- Auditoria 2 (segurança, P2-1): reserva ou pagamento de outra loja com a chave é a recusa única da chave em uso
+    -- (TF009, key_in_use, a mesma de tchefood_claim_payment e do gatilho de payments); só a desta loja diz qual é.
+    IF EXISTS (SELECT 1 FROM payment_claims pc WHERE pc.idempotency_key = NEW.idempotency_key AND pc.tenant_id <> NEW.tenant_id)
+       OR EXISTS (SELECT 1 FROM payments p WHERE p.idempotency_key = NEW.idempotency_key AND p.tenant_id <> NEW.tenant_id) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % já está em uso (outra reserva, cobrança ou pagamento).', NEW.idempotency_key USING ERRCODE = 'TF009', DETAIL = 'key_in_use';
     END IF;
     IF EXISTS (SELECT 1 FROM payment_claims pc WHERE pc.idempotency_key = NEW.idempotency_key) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a chave % já é de outro pagamento (dinheiro ou outra maquininha).', NEW.idempotency_key USING ERRCODE = 'TF009';
@@ -694,7 +700,9 @@ $$;
 -- da cobrança (relógio do banco). stale (auditoria interna 3 P1-02): a cobrança tem mais de
 -- tchefood_point_charge_timeout() (o prazo de espera do cartão de point-charge, SERVER_TIMEOUT_MS) pelo relógio do
 -- banco; só a idade, em qualquer estado da lista (quem mostra decide; o aparelho que não criou a cobrança só oferece
--- "Resolver" para a aberta antiga). has_payment:
+-- "Resolver" para a aberta antiga). Aprovada sem pagamento (auditoria 2): stale só depois de
+-- tchefood_claim_abandon_after() (5 min) contados da aprovação (updated_at, gravado por point-charge ao aprovar), não
+-- da criação: o aparelho que cobrou pode estar sem rede com o pagamento na fila. has_payment:
 -- há linha em payments desta loja com a chave da cobrança (qualquer estado; o aprovado do Mercado Pago tira
 -- a cobrança da lista).
 CREATE OR REPLACE FUNCTION tchefood_point_reservation(p_order UUID)
@@ -714,7 +722,13 @@ BEGIN
                'idempotency_key', c.idempotency_key, 'status', c.status, 'amount_cents', c.amount_cents,
                'raw_status_detail', c.raw_status_detail,
                'created_at', c.created_at,
-               'stale', clock_timestamp() >= c.created_at + tchefood_point_charge_timeout(),
+               -- Auditoria 2 (aprovada sem pagamento): a aprovada conta da hora da aprovação (updated_at; nada mais muda a
+               -- aprovada antes do pagamento ou do fim verificado) mais tchefood_claim_abandon_after(), o mesmo prazo do
+               -- aparelho sumido das reservas: o pagamento pode estar na fila do aparelho que cobrou, sem rede. A aberta
+               -- segue com o prazo de espera do cartão.
+               'stale', CASE WHEN c.status = 'approved'
+                             THEN clock_timestamp() >= c.updated_at + tchefood_claim_abandon_after()
+                             ELSE clock_timestamp() >= c.created_at + tchefood_point_charge_timeout() END,
                -- Revisão r8 (F1): a mesma regra da soma e de point-charge (hasRegisteredPayment): só o APROVADO do Mercado Pago.
                'has_payment', EXISTS (SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = c.idempotency_key
                                          AND p.status = 'APPROVED' AND p.acquirer::text = 'MERCADO_PAGO'))
@@ -1032,8 +1046,8 @@ BEGIN
     IF v_tenant IS NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
     END IF;
-    IF p_reason IS NULL OR length(trim(p_reason)) < 3 THEN
-        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: motivo obrigatório (mínimo 3 caracteres).' USING ERRCODE = 'TF006';
+    IF p_reason IS NULL OR length(trim(p_reason)) < 3 OR length(trim(p_reason)) > 500 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: motivo obrigatório (de 3 a 500 caracteres).' USING ERRCODE = 'TF006';
     END IF;
     IF p_staff IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_staff AND u.tenant_id = v_tenant) THEN
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
@@ -1151,8 +1165,8 @@ BEGIN
     IF v_tenant IS NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
     END IF;
-    IF p_reason IS NULL OR length(trim(p_reason)) < 10 THEN
-        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: motivo obrigatório (mínimo 10 caracteres).' USING ERRCODE = 'TF006';
+    IF p_reason IS NULL OR length(trim(p_reason)) < 10 OR length(trim(p_reason)) > 500 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: motivo obrigatório (de 10 a 500 caracteres).' USING ERRCODE = 'TF006';
     END IF;
     IF p_staff IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_staff AND u.tenant_id = v_tenant AND u.active) THEN
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
@@ -1248,8 +1262,8 @@ BEGIN
     IF v_tenant IS NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
     END IF;
-    IF p_reason IS NULL OR length(trim(p_reason)) < 10 THEN
-        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: motivo obrigatório (mínimo 10 caracteres).' USING ERRCODE = 'TF006';
+    IF p_reason IS NULL OR length(trim(p_reason)) < 10 OR length(trim(p_reason)) > 500 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: motivo obrigatório (de 10 a 500 caracteres).' USING ERRCODE = 'TF006';
     END IF;
     IF jsonb_typeof(v_meta) <> 'object' THEN
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: dados do estorno inválidos (refund_kind card ou cash; payment_local_id opcional).' USING ERRCODE = 'TF006';

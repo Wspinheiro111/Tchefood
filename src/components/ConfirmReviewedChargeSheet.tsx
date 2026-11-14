@@ -14,6 +14,7 @@ import { requirePaymentClaim } from '../lib/payments/paymentClaim';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { formatBRL } from '../lib/money';
 import { playDeniedBuzz, vibrate } from '../lib/sound';
+import { MAX_REASON_LENGTH } from './ManagerAuthSheet';
 
 type Method = 'CREDIT' | 'DEBIT' | 'PIX';
 type Acquirer = 'STONE' | 'PAGBANK';
@@ -242,7 +243,7 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
       )}
 
       <label className="mb-1 block text-sm font-semibold text-slate-700">Motivo</label>
-      <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={2} className="mb-3 w-full rounded-xl border border-slate-300 bg-base p-3 text-base outline-none focus:border-ouro" />
+      <textarea value={reason} maxLength={MAX_REASON_LENGTH} onChange={(e) => setReason(e.target.value.slice(0, MAX_REASON_LENGTH))} rows={2} className="mb-3 w-full rounded-xl border border-slate-300 bg-base p-3 text-base outline-none focus:border-ouro" />
 
       <p className="mb-2 text-center text-sm font-semibold text-slate-700">PIN do Gerente</p>
       <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => ready && void submit(v)} error={Boolean(error)} compact />

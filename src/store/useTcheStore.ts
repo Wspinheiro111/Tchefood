@@ -474,7 +474,12 @@ interface Actions {
    * segue fechada, como no servidor) —, tira a trava desta chave e guarda o registro só neste aparelho. Nada sobe pela
    * fila: o servidor já tem o estorno e o registro dele (POINT_PAYMENT_REFUNDED).
    */
-  mirrorServerPointRefund: (idempotencyKey: string, reason: string) => ActionResult<{ payment: Payment | null; nfceIssued: boolean }>;
+  /**
+   * Espelha aqui o estorno da Point que o servidor registrou. opts.paymentRegistered: a resposta do servidor diz se ele
+   * tem o pagamento (point-charge, ação refund); false com a inclusão ainda na fila daqui: desfaz as consequências do
+   * registro (auditoria interna 2, P1-A).
+   */
+  mirrorServerPointRefund: (idempotencyKey: string, reason: string, opts?: { paymentRegistered?: boolean }) => ActionResult<{ payment: Payment | null; nfceIssued: boolean }>;
 
   // Fase 3 — KDS e QR Code
   advanceItemStatus: (itemId: UUID) => ActionResult<OrderItem>;
@@ -889,6 +894,113 @@ export function isValidCnpj(cnpj: string): boolean {
     return r < 2 ? 0 : 11 - r;
   };
   return calc(12) === Number(cnpj[12]) && calc(13) === Number(cnpj[13]);
+}
+
+/** A inclusão deste pagamento ainda na fila ou nos recusados deste aparelho (o servidor não a tem). */
+function queuedPaymentInsert(state: TcheState, payment: Payment): SyncEvent | null {
+  const isInsert = (e: SyncEvent) => e.table === 'payments' && e.op === 'INSERT' && e.row_id === payment.id;
+  return state.outbox.find(isInsert) ?? (state.syncRejected ?? []).find((r) => isInsert(r.event))?.event ?? null;
+}
+
+/**
+ * Desfaz aqui um pagamento que o servidor nunca recebeu (a inclusão está na fila ou nos recusados): tira da fila as
+ * consequências do registro (itens pagos, comanda fechada, mesa livre), reabre a conta e sobe o estado atual de itens,
+ * conta e mesa. `replacement` é o pagamento depois (estornado). keepInsert (auditoria interna 2, P1-A, Point estornada
+ * no servidor): a inclusão fica, como `replacement`; senão sai junto (retirada do gerente). null: conta não encontrada.
+ */
+function undoQueuedPayment(state: TcheState, payment: Payment, replacement: Payment, keepInsert: boolean): { update: (s: TcheState) => Partial<TcheState>; nfceIssued: boolean } | null {
+  const isInsert = (e: SyncEvent) => e.table === 'payments' && e.op === 'INSERT' && e.row_id === payment.id;
+  const insertEvent = queuedPaymentInsert(state, payment);
+  if (!insertEvent) return null;
+  const order = state.orders.find((o) => o.id === payment.order_id);
+  if (!order) return null;
+  const ts = nowISO();
+  const itemIds = new Set(state.orderItems.filter((i) => i.order_id === order.id).map((i) => i.id));
+  // Consequências do registro deste pagamento na fila (itens pagos, comanda fechada, mesa livre): saem junto.
+  // Fila gravada antes da marca caused_by_payment_id: as mudanças gravadas junto com o pagamento. Elas saem
+  // da mesma ação, mas cada evento lê o relógio de novo e pode cair no milissegundo seguinte: vale a janela
+  // de LEGACY_CONSEQUENCE_WINDOW_MS depois do pagamento, até o próximo pagamento da mesma conta (cujas
+  // consequências seriam dele).
+  const queued = [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)];
+  const t0 = Date.parse(insertEvent.created_at);
+  const nextPayment = queued
+    .filter((e) => e.table === 'payments' && e.op === 'INSERT' && e.row_id !== payment.id && e.payload.order_id === order.id)
+    .map((e) => Date.parse(e.created_at))
+    .filter((t) => t >= t0)
+    .reduce((a, t) => Math.min(a, t), Infinity);
+  const windowEnd = Math.min(t0 + LEGACY_CONSEQUENCE_WINDOW_MS, nextPayment);
+  const inWindow = (e: SyncEvent) => {
+    const t = Date.parse(e.created_at);
+    // O mesmo instante do pagamento sempre conta (a regra antiga).
+    return Number.isFinite(t0) && t >= t0 && (t < windowEnd || t === t0);
+  };
+  const isConsequence = (e: SyncEvent) => {
+    if (e.caused_by_payment_id) return e.caused_by_payment_id === payment.id;
+    if (e.op !== 'UPDATE' || !inWindow(e)) return false;
+    return (e.table === 'orders' && e.row_id === order.id)
+      || (e.table === 'order_items' && itemIds.has(e.row_id))
+      || (e.table === 'dining_tables' && e.depends_on_order_id === order.id);
+  };
+  // keepInsert (Point estornada no servidor): a inclusão fica na fila, como `replacement` (estornado).
+  const dropped = (e: SyncEvent) => (!keepInsert && isInsert(e)) || isConsequence(e);
+  const droppedIds = new Set([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)].filter(dropped).map((e) => e.id));
+
+  const payments = state.payments.map((p) => (p.id === payment.id ? replacement : p));
+  // "Pago" dos itens pelos pagamentos aprovados que sobram. Pagamento antigo sem a lista: mantém o que
+  // estava marcado, menos os itens deste e os marcados só pelo fechamento que ele causou.
+  const approved = payments.filter((p) => p.order_id === order.id && p.status === 'APPROVED');
+  const paidByOthers = new Set(approved.flatMap((p) => p.paid_item_ids ?? []));
+  const legacy = approved.some((p) => p.paid_item_ids === undefined);
+  const closedByThis = order.status === 'CLOSED';
+  const orderItems = state.orderItems.map((i) => {
+    if (i.order_id !== order.id || i.status === 'CANCELED') return i;
+    const paid = paidByOthers.has(i.id)
+      || (legacy && !closedByThis && i.is_paid && !(payment.paid_item_ids ?? []).includes(i.id));
+    return paid === i.is_paid ? i : { ...i, is_paid: paid };
+  });
+  const changedItems = orderItems.filter((i, idx) => i !== state.orderItems[idx]);
+  let recalculated = applyOrderTotals(order, orderItems, payments);
+  let table: DiningTable | null = null;
+  const nfceIssued = Boolean(order.nfce_key);
+  if (closedByThis) {
+    // Reabre: a conta não está quitada no servidor. A NFC-e já emitida fica registrada (a trava pede o cancelamento).
+    recalculated = { ...recalculated, status: 'PAYING', closed_at: null };
+    const t = state.tables.find((x) => x.id === order.table_id);
+    if (t && t.status === 'FREE' && t.current_order_id === null) table = { ...t, status: 'PAYING', current_order_id: order.id, updated_at: ts };
+  }
+  const tableNow = table ?? state.tables.find((x) => x.id === order.table_id) ?? null;
+  // A mesa: se o fechamento dela saiu da fila, sobe o estado atual (que pode já ser de outra comanda).
+  const tableDropped = [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)].some((e) => droppedIds.has(e.id) && e.table === 'dining_tables');
+  const droppedItemIds = new Set([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]
+    .filter((e) => droppedIds.has(e.id) && e.table === 'order_items').map((e) => e.row_id));
+  const keep = (e: SyncEvent): SyncEvent | null => {
+    if (droppedIds.has(e.id)) return null;
+    return e.depends_on_event_ids?.some((id) => droppedIds.has(id)) ? { ...e, depends_on_event_ids: e.depends_on_event_ids.filter((id) => !droppedIds.has(id)) } : e;
+  };
+  // keepInsert: a inclusão nos recusados volta para a fila (na frente), já como `replacement`.
+  const asReplacement = (e: SyncEvent): SyncEvent => (keepInsert && isInsert(e) ? { ...e, payload: { ...e.payload, status: replacement.status } } : e);
+  const back = keepInsert ? (state.syncRejected ?? []).filter((r) => isInsert(r.event)).map((r) => asReplacement(r.event)) : [];
+  const update = (s: TcheState): Partial<TcheState> => ({
+    payments,
+    orderItems,
+    orders: s.orders.map((o) => (o.id === order.id ? recalculated : o)),
+    tables: table ? s.tables.map((t) => (t.id === table!.id ? table! : t)) : s.tables,
+    outbox: [
+      ...back,
+      ...s.outbox.map(keep).filter((e): e is SyncEvent => e !== null).map(asReplacement),
+      ...changedItems.map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
+      // Item cuja mudança saiu da fila junto (fila antiga: pela janela de tempo, pode ser de outra ação, como o
+      // KDS avançando o preparo): sobe o estado atual dele, para nada que não era do pagamento se perder.
+      ...orderItems
+        .filter((i) => droppedItemIds.has(i.id) && !changedItems.includes(i))
+        .map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
+      syncEvent('orders', 'UPDATE', recalculated),
+      ...(tableNow && (table || tableDropped) ? [tableEventForOrder(tableNow, tableNow.current_order_id ?? order.id)] : []),
+    ],
+    // "Reenviar recusados" não traz de volta o pagamento nem o fechamento retirados.
+    syncRejected: (s.syncRejected ?? []).filter((r) => !droppedIds.has(r.event.id) && !(keepInsert && isInsert(r.event))),
+  });
+  return { update, nfceIssued };
 }
 
 export const useTcheStore = create<TcheState>()(
@@ -2269,97 +2381,15 @@ export const useTcheStore = create<TcheState>()(
           if (!payment) return fail('Pagamento aprovado não encontrado neste aparelho.');
           // Point: quem diz se a cobrança vale é o servidor (point-charge); nunca vira estorno aqui.
           if (payment.acquirer === 'MERCADO_PAGO') return fail('Pagamento da Point: só o servidor desfaz.');
-          const isInsert = (e: SyncEvent) => e.table === 'payments' && e.op === 'INSERT' && e.row_id === payment.id;
-          const insertEvent = state.outbox.find(isInsert) ?? (state.syncRejected ?? []).find((r) => isInsert(r.event))?.event;
-          if (!insertEvent) return fail('Este pagamento já entrou no servidor: não pode ser retirado aqui.');
-          const order = state.orders.find((o) => o.id === payment.order_id);
-          if (!order) return fail('Conta do pagamento não encontrada.');
-          const ts = nowISO();
-          const itemIds = new Set(state.orderItems.filter((i) => i.order_id === order.id).map((i) => i.id));
-          // Consequências do registro deste pagamento na fila (itens pagos, comanda fechada, mesa livre): saem junto.
-          // Fila gravada antes da marca caused_by_payment_id: as mudanças gravadas junto com o pagamento. Elas saem
-          // da mesma ação, mas cada evento lê o relógio de novo e pode cair no milissegundo seguinte: vale a janela
-          // de LEGACY_CONSEQUENCE_WINDOW_MS depois do pagamento, até o próximo pagamento da mesma conta (cujas
-          // consequências seriam dele).
-          const queued = [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)];
-          const t0 = Date.parse(insertEvent.created_at);
-          const nextPayment = queued
-            .filter((e) => e.table === 'payments' && e.op === 'INSERT' && e.row_id !== payment.id && e.payload.order_id === order.id)
-            .map((e) => Date.parse(e.created_at))
-            .filter((t) => t >= t0)
-            .reduce((a, t) => Math.min(a, t), Infinity);
-          const windowEnd = Math.min(t0 + LEGACY_CONSEQUENCE_WINDOW_MS, nextPayment);
-          const inWindow = (e: SyncEvent) => {
-            const t = Date.parse(e.created_at);
-            // O mesmo instante do pagamento sempre conta (a regra antiga).
-            return Number.isFinite(t0) && t >= t0 && (t < windowEnd || t === t0);
-          };
-          const isConsequence = (e: SyncEvent) => {
-            if (e.caused_by_payment_id) return e.caused_by_payment_id === payment.id;
-            if (e.op !== 'UPDATE' || !inWindow(e)) return false;
-            return (e.table === 'orders' && e.row_id === order.id)
-              || (e.table === 'order_items' && itemIds.has(e.row_id))
-              || (e.table === 'dining_tables' && e.depends_on_order_id === order.id);
-          };
-          const dropped = (e: SyncEvent) => isInsert(e) || isConsequence(e);
-          const droppedIds = new Set([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)].filter(dropped).map((e) => e.id));
-
+          if (!queuedPaymentInsert(state, payment)) return fail('Este pagamento já entrou no servidor: não pode ser retirado aqui.');
           const withdrawn: Payment = { ...payment, status: 'REFUNDED', withdrawn_reason: reason };
-          const payments = state.payments.map((p) => (p.id === payment.id ? withdrawn : p));
-          // "Pago" dos itens pelos pagamentos aprovados que sobram. Pagamento antigo sem a lista: mantém o que
-          // estava marcado, menos os itens deste e os marcados só pelo fechamento que ele causou.
-          const approved = payments.filter((p) => p.order_id === order.id && p.status === 'APPROVED');
-          const paidByOthers = new Set(approved.flatMap((p) => p.paid_item_ids ?? []));
-          const legacy = approved.some((p) => p.paid_item_ids === undefined);
-          const closedByThis = order.status === 'CLOSED';
-          const orderItems = state.orderItems.map((i) => {
-            if (i.order_id !== order.id || i.status === 'CANCELED') return i;
-            const paid = paidByOthers.has(i.id)
-              || (legacy && !closedByThis && i.is_paid && !(payment.paid_item_ids ?? []).includes(i.id));
-            return paid === i.is_paid ? i : { ...i, is_paid: paid };
-          });
-          const changedItems = orderItems.filter((i, idx) => i !== state.orderItems[idx]);
-          let recalculated = applyOrderTotals(order, orderItems, payments);
-          let table: DiningTable | null = null;
-          const nfceIssued = Boolean(order.nfce_key);
-          if (closedByThis) {
-            // Reabre: a conta não está quitada no servidor. A NFC-e já emitida fica registrada (a trava pede o cancelamento).
-            recalculated = { ...recalculated, status: 'PAYING', closed_at: null };
-            const t = state.tables.find((x) => x.id === order.table_id);
-            if (t && t.status === 'FREE' && t.current_order_id === null) table = { ...t, status: 'PAYING', current_order_id: order.id, updated_at: ts };
-          }
-          const tableNow = table ?? state.tables.find((x) => x.id === order.table_id) ?? null;
-          // A mesa: se o fechamento dela saiu da fila, sobe o estado atual (que pode já ser de outra comanda).
-          const tableDropped = [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)].some((e) => droppedIds.has(e.id) && e.table === 'dining_tables');
-          const droppedItemIds = new Set([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]
-            .filter((e) => droppedIds.has(e.id) && e.table === 'order_items').map((e) => e.row_id));
-          const keep = (e: SyncEvent): SyncEvent | null => {
-            if (droppedIds.has(e.id)) return null;
-            return e.depends_on_event_ids?.some((id) => droppedIds.has(id)) ? { ...e, depends_on_event_ids: e.depends_on_event_ids.filter((id) => !droppedIds.has(id)) } : e;
-          };
-          set((s) => ({
-            payments,
-            orderItems,
-            orders: s.orders.map((o) => (o.id === order.id ? recalculated : o)),
-            tables: table ? s.tables.map((t) => (t.id === table!.id ? table! : t)) : s.tables,
-            outbox: [
-              ...s.outbox.map(keep).filter((e): e is SyncEvent => e !== null),
-              ...changedItems.map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
-              // Item cuja mudança saiu da fila junto (fila antiga: pela janela de tempo, pode ser de outra ação, como o
-              // KDS avançando o preparo): sobe o estado atual dele, para nada que não era do pagamento se perder.
-              ...orderItems
-                .filter((i) => droppedItemIds.has(i.id) && !changedItems.includes(i))
-                .map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
-              syncEvent('orders', 'UPDATE', recalculated),
-              ...(tableNow && (table || tableDropped) ? [tableEventForOrder(tableNow, tableNow.current_order_id ?? order.id)] : []),
-            ],
-            // "Reenviar recusados" não traz de volta o pagamento nem o fechamento retirados.
-            syncRejected: (s.syncRejected ?? []).filter((r) => !droppedIds.has(r.event.id)),
-          }));
-          return { ok: true, data: { payment: withdrawn, nfceIssued } };
+          const out = undoQueuedPayment(state, payment, withdrawn, false);
+          if (!out) return fail('Conta do pagamento não encontrada.');
+          set(out.update);
+          return { ok: true, data: { payment: withdrawn, nfceIssued: out.nfceIssued } };
         },
 
-        mirrorServerPointRefund: (idempotencyKey, reason) => {
+        mirrorServerPointRefund: (idempotencyKey, reason, opts) => {
           const state = get();
           const payment = state.payments.find((p) => p.idempotency_key === idempotencyKey && p.acquirer === 'MERCADO_PAGO') ?? null;
           const hold = getReviewHoldByKey(idempotencyKey);
@@ -2370,7 +2400,14 @@ export const useTcheStore = create<TcheState>()(
           let mirrored: Payment | null = payment;
           let orders = state.orders;
           let payments = state.payments;
-          if (payment && payment.status === 'APPROVED') {
+          // Auditoria interna 2 (P1-A): o servidor nunca recebeu o pagamento (a inclusão está na fila ou nos recusados
+          // daqui, e ele não diz que tem). As consequências do registro (itens pagos, comanda fechada, mesa livre) seriam
+          // recusadas lá (a conta deve o valor) ou deixariam a mesa livre com a conta aberta: saem, a conta reabre aqui e
+          // o estado atual sobe. A inclusão fica, como estornada (o servidor aceita com a cobrança estornada).
+          const undo = payment && payment.status === 'APPROVED' && opts?.paymentRegistered !== true
+            ? undoQueuedPayment(state, payment, { ...payment, status: 'REFUNDED' }, true)
+            : null;
+          if (payment && payment.status === 'APPROVED' && !undo) {
             mirrored = { ...payment, status: 'REFUNDED' };
             payments = state.payments.map((p) => (p.id === payment.id ? mirrored! : p));
             // Só o saldo, como o servidor (tchefood_refund_point_payment): conta aberta volta a dever; fechada segue fechada.
@@ -2404,6 +2441,11 @@ export const useTcheStore = create<TcheState>()(
           // (db/schema_mercado_pago.sql), e sai dos recusados.
           const isInsert = (e: SyncEvent) => payment !== null && e.table === 'payments' && e.op === 'INSERT' && e.row_id === payment.id;
           const asRefunded = (e: SyncEvent): SyncEvent => (isInsert(e) ? { ...e, payload: { ...e.payload, status: 'REFUNDED' } } : e);
+          if (undo) {
+            set((s) => ({ ...undo.update(s), ...(log ? { auditLogs: [log, ...s.auditLogs] } : {}) }));
+            if (hold && orderId) clearReviewHold(orderId, reviewHoldKey(hold));
+            return { ok: true, data: { payment: { ...payment!, status: 'REFUNDED' }, nfceIssued: undo.nfceIssued } };
+          }
           set((s) => {
             const back = (s.syncRejected ?? []).filter((r) => isInsert(r.event)).map((r) => asRefunded(r.event));
             return {

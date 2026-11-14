@@ -252,7 +252,7 @@ function expected(kind: OwnerKind, s: OwnerState, w: Writer, cross: boolean): Ex
       if (w.kind === 'reg') return ref('TF009');
       if (w.kind === 'mp') return ref('TF005'); // a cobrança da chave não é desta loja: para o MP, não existe
       if (w.kind === 'claim') return ref('TF009');
-      return ref('TF005'); // chave de cobrança de outra loja: indisponível, nada devolvido
+      return ref('TF009'); // auditoria 2 (P2-1): chave de cobrança de outra loja é a recusa única da chave em uso
     }
     // r8 P1-01 (item 14): fora do Mercado Pago, a chave da cobrança é recusada em qualquer status (TF009 key_in_use;
     // PENDING/REFUNDED já são recusados por si, TF007 ou TF009).

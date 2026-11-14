@@ -15,12 +15,15 @@ import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeS
 import { effectiveReservation, freeCents, onlyClaims, pointReservationBlock, rememberServerReservation, reservationNotice, withoutClaimsPaidHere, type PointReservation } from '../lib/payments/pointReservation';
 import { fetchPointReservation } from '../lib/sync/cloudPull';
 import { freshCloudConfig } from '../lib/sync/useCloudSync';
+import { declineMessage, pointCodeText } from '../lib/payments/pointTexts';
+import { forgetPointChargeHere, isPointChargeHere, rememberPointChargeHere } from '../lib/payments/pointChargesHere';
 import { requirePaymentClaim, type ClaimAcquirer, type ClaimMethod } from '../lib/payments/paymentClaim';
 import { startPaymentClaim, type ClaimHandle } from '../lib/payments/claimFlow';
 import { HOLD_BLOCKS_ALL, holdBlocksCash, HoldNotChargedButton, isRefundHold, RefundedAtTerminalButton, StuckClaimsPanel } from '../components/StuckClaims';
 import type { CloudPaymentClaim } from '../lib/sync/cloudPull';
 import { PointReviewSheet, type PointReviewTarget } from '../components/PointReviewSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
+import { POINT_REFUND_ITEMS_PAID } from '../components/PointRefund';
 import type { PaymentOutcome } from '../store/useTcheStore';
 import type { CloudPointCharge } from '../lib/sync/cloudPull';
 
@@ -29,6 +32,9 @@ const POINT_RESERVATION_POLL_MS = 5000;
 
 /** Sem a leitura da reserva desta conta na nuvem: o caixa não recebe (toda loja conectada à nuvem). */
 export const CLOUD_READ_BLOCK = 'Sem leitura da nuvem: loja conectada à nuvem só recebe com o servidor confirmando a reserva desta conta. Confira a internet e aguarde.';
+
+/** O servidor recusou o PIN do pedido de cancelamento (auditoria interna 2, P2-5). */
+export const CANCEL_PIN_REFUSED = 'PIN recusado: o servidor não aceitou o PIN do gerente e a cobrança segue na Point. Peça o cancelamento de novo com o PIN certo, ou aguarde o prazo.';
 
 /** Cobrança da Point que ainda não terminou no servidor (enviando, na fila, na maquininha). */
 const OPEN_POINT_STATUSES: ReadonlySet<string> = new Set(['creating', 'pending', 'at_terminal']);
@@ -46,14 +52,23 @@ function needsResolution(c: CloudPointCharge, chargingKey: string | null): boole
  * Auditoria interna 3 (P1-02): só tem ação ("Resolver") a cobrança em revisão, a aprovada sem pagamento e a aberta que
  * o servidor diz vencida (`stale`, prazo de espera do cartão pelo relógio do banco). A aberta antes disso está sendo
  * cobrada em outro aparelho: só o aviso, sem ação (dois aparelhos registrando a mesma aprovação = duas NFC-e).
+ * Auditoria interna 2 (P1): a aprovada sem pagamento também espera o `stale`, porque o pagamento pode estar na fila do
+ * aparelho que cobrou; a deste aparelho (`own`, chave gravada aqui ao enviar e sem pagamento local) resolve já.
  */
-export function canResolve(c: CloudPointCharge): boolean {
-  return !OPEN_POINT_STATUSES.has(c.status) || c.stale === true;
+export function canResolve(c: CloudPointCharge, own = false): boolean {
+  if (c.status === 'manual_review') return true;
+  if (c.status === 'approved' && own) return true;
+  return c.stale === true;
 }
 
-export function resolutionLabel(c: CloudPointCharge): string {
-  if (OPEN_POINT_STATUSES.has(c.status)) return c.stale === true ? 'na maquininha, sem resposta' : 'cobrando em outro aparelho';
-  return c.status === 'manual_review' ? 'em revisão' : 'aprovada sem pagamento registrado';
+export function resolutionLabel(c: CloudPointCharge, own = false): string {
+  if (OPEN_POINT_STATUSES.has(c.status)) {
+    if (own) return c.stale === true ? 'cobrança deste aparelho na maquininha, sem resposta' : 'cobrança deste aparelho na maquininha (o app foi reaberto); aguarde a Point terminar';
+    return c.stale === true ? 'na maquininha, sem resposta' : 'cobrando em outro aparelho';
+  }
+  if (c.status === 'manual_review') return 'em revisão';
+  if (own) return 'aprovada neste aparelho, sem pagamento registrado';
+  return c.stale === true ? 'aprovada sem pagamento registrado' : 'aprovada; aguardando o pagamento do aparelho que cobrou';
 }
 
 type SplitMode = 'EQUAL' | 'FREE' | 'ITEMS';
@@ -132,7 +147,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         if (!cfg) throw new Error('sem sessão');
         const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
         if (alive) {
-          rememberServerReservation(orderId, r.reservedCents, r.claims ?? []);
+          rememberServerReservation(orderId, r.reservedCents, r.claims ?? [], Date.now(), r.charges ?? []);
           setCloudReservation(r);
           setReservationRead('ok');
         }
@@ -159,7 +174,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const countedReservation = withoutClaimsPaidHere(cloudReservation, paidHereKeys);
   const pointReservation = effectiveReservation(countedReservation, reviewHold);
   const cloudBlocked = needsClaim && reservationRead !== 'ok';
-  const unresolvedCharges = (cloudReservation?.charges ?? []).filter((c) => needsResolution(c, pointCharge?.idempotencyKey ?? null) && c.idempotencyKey !== reviewHold?.idempotency_key);
+  const unresolvedCharges = (countedReservation?.charges ?? []).filter((c) => needsResolution(c, pointCharge?.idempotencyKey ?? null) && c.idempotencyKey !== reviewHold?.idempotency_key);
 
   if (closedOrderId) {
     const closedOrder = s.orders.find((o) => o.id === closedOrderId)!;
@@ -169,6 +184,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
 
   const remaining = order.remaining_balance;
   const unpaidItems = items.filter((i) => !i.is_paid);
+  const refundedWithPaidItems = items.some((i) => i.is_paid) && s.payments.some((p) => p.order_id === orderId && p.status === 'REFUNDED' && p.acquirer === 'MERCADO_PAGO');
   const itemShare = computeItemsShare(order, s.orderItems.filter((i) => selected.includes(i.id)), s.orderItems);
   const freeValue = round2(Number(freeRaw.replace(',', '.')) || 0);
 
@@ -258,7 +274,10 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     try {
       if (claimed && !(await claim(method, driver.acquirer === 'PAGBANK' ? 'PAGBANK' : 'STONE'))) return;
       if (opMode === 'TEF_POS_WIRELESS') toast.info(`📡 Cobrança de ${formatBRL(amount)} enviada para ${terminal?.name} (${terminal?.serial_number}).`);
-      if (viaPoint) setPointCharge({ driver, requestId: req.request_id, idempotencyKey: idempotency_key });
+      if (viaPoint) {
+        rememberPointChargeHere(idempotency_key, orderId);
+        setPointCharge({ driver, requestId: req.request_id, idempotencyKey: idempotency_key });
+      }
       const result = await driver.charge(req);
       if (result.status === 'MANUAL_REVIEW') {
         // Não registra pagamento nem recusa: o resultado é desconhecido e não pode ser repetido sozinho.
@@ -283,7 +302,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         }
         // Nada cobrado: a reserva sai.
         noCharge(`Maquininha recusou: ${result.reason}`);
-        toast.error(`❌ Transação recusada: ${result.reason}`);
+        toast.error(`❌ ${declineMessage(result.reason).text}`);
         return;
       }
       const check = handle ? await (handle as ClaimHandle).beforeRegister(result.acquirer) : null;
@@ -322,6 +341,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     } finally {
       leaveClaim();
       useTcheStore.getState().endTerminalCharge(req.request_id);
+      if (viaPoint) forgetPointChargeHere(idempotency_key);
       setPointCharge(null);
       setCancelOpen(false);
       setBusy(false);
@@ -342,7 +362,11 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     if (!pointCharge) return { ok: false, error: 'A cobrança já terminou.' };
     if (!/^\d{4}$/.test(managerPin)) return { ok: false, error: 'Digite o PIN do gerente.' };
     // O servidor confere o PIN e o motivo; sem autorização válida a cobrança segue até o prazo.
-    pointCharge.driver.abort(pointCharge.requestId, { manager_pin: managerPin, reason: reason.trim() });
+    // Auditoria interna 2 (P2-5): PIN recusado no servidor (403) aparece aqui; a cobrança segue e o pedido pode ser refeito.
+    pointCharge.driver.abort(pointCharge.requestId, {
+      manager_pin: managerPin, reason: reason.trim(),
+      onRefused: () => toast.error(CANCEL_PIN_REFUSED),
+    });
     return { ok: true, data: undefined };
   };
 
@@ -380,14 +404,21 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
           </p>
           {unresolvedCharges.length > 0 && (
             <ul className="mt-3 grid gap-2">
-              {unresolvedCharges.map((c) => (
+              {unresolvedCharges.map((c) => {
+                const own = isPointChargeHere(c.idempotencyKey);
+                const detail = pointCodeText(c.rawStatusDetail);
+                return (
                 <li key={c.idempotencyKey} className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-surface p-2">
-                  <span>{formatBRL(c.amountCents / 100)} · {resolutionLabel(c)}{c.rawStatusDetail ? ` (${c.rawStatusDetail})` : ''}</span>
-                  {canResolve(c) && (
+                  <span>
+                    {formatBRL(c.amountCents / 100)} · {resolutionLabel(c, own)}{detail ? `: ${detail}` : ''}
+                    {c.rawStatusDetail && <span className="ml-1 text-xs text-slate-500">código {c.rawStatusDetail}</span>}
+                  </span>
+                  {canResolve(c, own) && (
                     <Btn variant="gold" onClick={() => setResolveTarget({ order_id: orderId, idempotency_key: c.idempotencyKey, amount: c.amountCents / 100, method: null, terminal_id: null, item_ids: [] })}>Resolver cobrança da Point</Btn>
                   )}
                 </li>
-              ))}
+                );
+              })}
             </ul>
           )}
         </div>
@@ -446,6 +477,10 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         )}
         {mode === 'ITEMS' && (
           <div>
+            {refundedWithPaidItems && (
+              // Auditoria interna 2 (P2-B): itens de pagamento estornado seguem pagos; o saldo vai por valor.
+              <p role="alert" className="mb-2 rounded-xl border border-ouro bg-ouro/10 p-2 text-sm font-semibold text-brasa">{POINT_REFUND_ITEMS_PAID}</p>
+            )}
             <p className="mb-2 text-sm text-slate-500">Marque o que este cliente consumiu (taxa de {order.charge_service_fee ? `${order.service_fee_pct}%` : '0%'} proporcional incluída)</p>
             <ul className="scroll-thin max-h-72 space-y-2 overflow-y-auto">
               {unpaidItems.map((i) => {
@@ -522,7 +557,10 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
 
       {reviewHold && (
         <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
-          <div className="mb-1 font-black text-brasa">Cobrança de {formatBRL(reviewHold.amount)} sem confirmação ({reviewHold.code})</div>
+          <div className="mb-1 font-black text-brasa">
+            Cobrança de {formatBRL(reviewHold.amount)} sem confirmação{pointCodeText(reviewHold.code) ? `: ${pointCodeText(reviewHold.code)}` : ''}
+            {reviewHold.code && <span className="ml-1 text-xs font-normal text-slate-500">código {reviewHold.code}</span>}
+          </div>
           <p className="mb-3 text-slate-800">{reviewHold.reason} Se a maquininha mostra a transação aprovada, não cobre de novo: o gerente registra pelo comprovante. Se não houve cobrança, libere abaixo.</p>
           {isRefundHold(reviewHold) ? (
             // Reserva liberada: o comprovante não entra (o servidor recusaria); só o estorno com PIN de gerente.
@@ -570,7 +608,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
             quickReasons={['Cliente desistiu', 'Cliente vai pagar de outro jeito', 'Valor errado']}
             onSubmit={requestCancel}
             onSuccess={() => undefined}
-            successMessage="Pedido de cancelamento enviado. Se o servidor não aceitar o PIN, a cobrança segue até o prazo."
+            successMessage="Pedido de cancelamento enviado. O servidor confere o PIN do gerente; se recusar, aparece um aviso e a cobrança segue."
           />
         </div>
       )}

@@ -297,7 +297,15 @@ BEGIN
     -- Auditoria r5 P0-01: a chave de uma reserva de pagamento fora da Point (payment_claims,
     -- db/schema_point_reserva.sql) não vira cobrança da Point. O gatilho da cobrança confere de novo na
     -- gravação, com a chave travada (duas gravações juntas da mesma chave não passam).
-    IF EXISTS (SELECT 1 FROM payment_claims pc WHERE pc.idempotency_key = p_key) THEN
+    -- Auditoria 2 (segurança, P2-1): chave de outra loja (reserva, cobrança ou pagamento) é uma recusa só, a mesma de
+    -- tchefood_claim_payment e do gatilho de payments (TF009, key_in_use), conferida aqui antes de qualquer coisa da
+    -- conta: a loja não descobre o que outra loja fez com a chave (nem pela ordem das recusas).
+    IF EXISTS (SELECT 1 FROM payment_claims pc WHERE pc.idempotency_key = p_key AND pc.tenant_id <> p_tenant)
+       OR EXISTS (SELECT 1 FROM terminal_charges c WHERE c.idempotency_key = p_key AND c.tenant_id <> p_tenant)
+       OR EXISTS (SELECT 1 FROM payments p WHERE p.idempotency_key = p_key AND p.tenant_id <> p_tenant) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % já está em uso (outra reserva, cobrança ou pagamento).', p_key USING ERRCODE = 'TF009', DETAIL = 'key_in_use';
+    END IF;
+    IF EXISTS (SELECT 1 FROM payment_claims pc WHERE pc.idempotency_key = p_key AND pc.tenant_id = p_tenant) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a chave % já é de outro pagamento (dinheiro ou outra maquininha).', p_key USING ERRCODE = 'TF009';
     END IF;
     SELECT * INTO v_order FROM orders WHERE id = p_order AND tenant_id = p_tenant FOR UPDATE;
@@ -333,10 +341,10 @@ BEGIN
     RETURNING id INTO v_id;
     IF v_id IS NULL THEN
         -- A chave foi gravada no meio (bloqueio preventivo com outra conta, ou outra loja): devolve a desta
-        -- loja para o chamador conferir; de outra loja, não devolve nada.
+        -- loja para o chamador conferir; de outra loja, não devolve nada (a recusa única da chave em uso, P2-1).
         SELECT id INTO v_id FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant;
         IF v_id IS NULL THEN
-            RAISE EXCEPTION 'TCHEFOOD_COBRANCA: chave de cobrança indisponível.' USING ERRCODE = 'TF005';
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % já está em uso (outra reserva, cobrança ou pagamento).', p_key USING ERRCODE = 'TF009', DETAIL = 'key_in_use';
         END IF;
     END IF;
     RETURN v_id;
@@ -399,8 +407,8 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_performed_by AND u.tenant_id = p_tenant AND u.active) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
     END IF;
-    IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
-        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: motivo obrigatório (mínimo 5 caracteres).' USING ERRCODE = 'TF006';
+    IF p_reason IS NULL OR length(trim(p_reason)) < 5 OR length(trim(p_reason)) > 500 THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: motivo obrigatório (de 5 a 500 caracteres).' USING ERRCODE = 'TF006';
     END IF;
     IF v_charge.status IN ('approved', 'rejected', 'cancelled', 'expired', 'refunded') THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança já está "%"; não há o que encerrar.', v_charge.status USING ERRCODE = 'TF007';
@@ -710,10 +718,11 @@ BEGIN
     ON CONFLICT (idempotency_key) DO NOTHING
     RETURNING id INTO v_id;
     IF v_id IS NULL THEN
-        -- A criação gravou primeiro (ou a chave já estava bloqueada): devolve a que ficou, só desta loja.
+        -- A criação gravou primeiro (ou a chave já estava bloqueada): devolve a que ficou, só desta loja. Cobrança de
+        -- outra loja com a chave: a recusa única da chave em uso (auditoria 2, P2-1), sem dizer o que há com ela.
         SELECT id INTO v_id FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant;
         IF v_id IS NULL THEN
-            RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a chave % já está em uso (outra reserva, cobrança ou pagamento).', p_key USING ERRCODE = 'TF009', DETAIL = 'key_in_use';
         END IF;
         RETURN v_id;
     END IF;
@@ -833,6 +842,19 @@ BEGIN
         END IF;
         IF (NEW.status = 'DECLINED' AND v_charge.status IN ('rejected', 'cancelled', 'expired'))
            OR (NEW.status = 'REFUNDED' AND v_charge.status = 'refunded') THEN
+            -- Auditoria 2 (segurança, P2-2): o recusado ou estornado é o desta cobrança, não um valor qualquer com a chave
+            -- dela: mesma conta, valor e forma. Comprovante, quando a cobrança tem o pagamento do Mercado Pago
+            -- (external_payment_id): o estornado traz o dela (é o aprovado que voltou); o recusado vem sem comprovante
+            -- (como o aparelho grava) ou com o dela.
+            IF v_charge.order_id <> NEW.order_id
+               OR v_charge.amount_cents <> round(NEW.amount * 100)
+               OR v_charge.method <> NEW.method::text
+               OR (NEW.status = 'REFUNDED' AND v_charge.external_payment_id IS NOT NULL AND NEW.nsu IS DISTINCT FROM v_charge.external_payment_id)
+               OR (NEW.status = 'DECLINED' AND v_charge.external_payment_id IS NOT NULL AND NEW.nsu IS NOT NULL
+                   AND NEW.nsu <> v_charge.external_payment_id) THEN
+                RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o pagamento "%" do Mercado Pago não confere com a cobrança da chave % (conta, valor, forma ou comprovante).',
+                    NEW.status, NEW.idempotency_key USING ERRCODE = 'TF006';
+            END IF;
             RETURN NEW;
         END IF;
         RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento do Mercado Pago "%" com a cobrança "%" no servidor (chave %): não confere. Recusado ou estornado só com a cobrança resolvida no servidor.',

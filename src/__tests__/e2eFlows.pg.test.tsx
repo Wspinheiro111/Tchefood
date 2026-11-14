@@ -745,4 +745,47 @@ function freeValue(v: string) {
     await waitFor(() => expect(ledger.inFlightClaims().filter((c) => c.order_id === o.id)).toEqual([]), { timeout: 35_000, interval: 500 });
     expectInvariants(o.id);
   }, 60_000);
+  it('auditoria interna 2 (P1-A): estorno da Point de um pagamento que não subiu: o estornado sobe, a conta reabre e deve no servidor e aqui, a mesa não fica livre', async () => {
+    login(OWNER_PIN);
+    if (!st().tables.some((t) => t.number === 10)) ok(st().saveTable({ number: 10, label: 'Mesa 10', area: 'Salão', capacity: 4, active: true }));
+    const id = openTableWith(10);
+    await expectSynced('conta da Point');
+    const o = st().orders.find((x) => x.id === id)!;
+    const cents = Math.round(o.remaining_balance * 100);
+    const termId = crypto.randomUUID();
+    const key = crypto.randomUUID();
+    sql(`INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${termId}', '${TENANT}', 'Point E2E', 'MP-E2E', 'MERCADO_PAGO');`);
+    useTcheStore.setState((s) => ({ terminals: [...s.terminals, { id: termId, tenant_id: TENANT, name: 'Point E2E', serial_number: 'MP-E2E', acquirer: 'MERCADO_PAGO', mode: 'TEF_POS_WIRELESS', online: true, battery_level: 90 } as never] }));
+    // Aprovada na Point e registrada aqui; a fila (pagamento, itens pagos, conta fechada, mesa livre) ainda não subiu.
+    net.down = true;
+    const paid = ok(st().registerPayment({
+      orderId: id, amount: o.remaining_balance, method: 'CREDIT', status: 'APPROVED', terminal_id: termId, acquirer: 'MERCADO_PAGO',
+      acquirer_cnpj: '10573521000191', card_brand: 'VISA', nsu: 'PE2E1', authorization_code: 'AUT1', terminal_serial: 'MP-E2E', idempotency_key: key, item_ids: [],
+    }));
+    expect(paid.closed).toBe(true);
+    // No servidor, a cobrança terminou estornada (o Mercado Pago provou o estorno) sem o pagamento gravado.
+    sql(`BEGIN; SET LOCAL session_replication_role = replica;
+         INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status, external_order_id, external_payment_id, paid_amount_cents, card_brand, authorization_code)
+         VALUES ('${TENANT}', '${key}', '${id}', '${termId}', 'mercado_pago_point', 'MP-E2E', 'CREDIT', ${cents}, 'refunded', 'ORD-${key}', 'PE2E1', ${cents}, 'VISA', 'AUT1'); COMMIT;`);
+    const m = st().mirrorServerPointRefund(key, 'Venda estornada na maquininha', { paymentRegistered: false });
+    expect(m.ok).toBe(true);
+    expect(st().orders.find((x) => x.id === id)).toMatchObject({ status: 'PAYING', remaining_balance: o.remaining_balance });
+    expect(st().tables.find((t) => t.id === o.table_id)).toMatchObject({ status: 'PAYING', current_order_id: id });
+    net.down = false;
+    await expectSynced('estorno espelhado');
+    expect(serverPayments(id).map((p) => `${p.key}:${p.status}`)).toEqual([`${key}:REFUNDED`]);
+    expect(serverOrder(id)).not.toMatch(/^CLOSED/);
+    expect(Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${id}'`))).toBeCloseTo(o.remaining_balance, 2);
+    expect(sql(`SELECT status || ' ' || COALESCE(current_order_id::text, '-') FROM dining_tables WHERE id = '${o.table_id}'`)).not.toMatch(/^FREE/);
+    expect(sql(`SELECT count(*) FROM order_items WHERE order_id = '${id}' AND is_paid`)).toBe('0');
+    // A conta volta a fechar pelo caminho normal (dinheiro, com reserva).
+    await renderCheckout(id);
+    chooseMethod(/Dinheiro/);
+    freeValue(o.remaining_balance.toFixed(2));
+    await waitForReservationRead();
+    await clickCharge();
+    await waitFor(() => expect(st().orders.find((x) => x.id === id)!.status, toasts().join(' | ')).toBe('CLOSED'));
+    await expectSynced('conta paga depois do estorno');
+    await waitFor(() => expect(serverOrder(id)).toBe('CLOSED 0.00'));
+  }, 60_000);
 });

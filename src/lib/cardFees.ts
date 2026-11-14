@@ -203,7 +203,8 @@ export function receivables(payments: readonly Payment[], rules: readonly FeeRul
     if (!cardLike(p) || new Date(p.created_at).getTime() < since) continue;
     const rule = ruleFor(p, rules);
     if (!rule) {
-      if (p.acquirer === 'STONE' || p.acquirer === 'PAGBANK') {
+      // Auditoria 2 (P2-D): a Point (Mercado Pago) ainda não tem taxa cadastrável; entra em "sem taxa" em vez de sumir.
+      if (p.acquirer === 'STONE' || p.acquirer === 'PAGBANK' || p.acquirer === 'MERCADO_PAGO') {
         noRule += chargedCents(p);
         noRuleCount += 1;
       }

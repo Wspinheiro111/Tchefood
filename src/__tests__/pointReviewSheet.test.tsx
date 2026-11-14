@@ -387,6 +387,27 @@ describe('auditoria interna 3: antes de registrar, o servidor ainda não tem o p
     expect(getReviewHold(id)).toBeNull();
   });
 
+  it('auditoria interna 2 (P1-A, variante): estorno provado com o pagamento aprovado aqui (fila): espelha o estorno, a inclusão sobe estornada e o fechamento sai', async () => {
+    const id = openTable();
+    const hold = mpHold(id);
+    const r = st().registerPayment({
+      orderId: id, amount: hold.amount, method: 'CREDIT', status: 'APPROVED', terminal_id: 'mp-term', acquirer: 'MERCADO_PAGO', acquirer_cnpj: '10573521000191',
+      card_brand: 'VISA', nsu: '55667788', authorization_code: 'AB12CD', terminal_serial: 'MP-SERIAL', idempotency_key: KEY, item_ids: [],
+    });
+    expect(r.ok && r.data.closed).toBe(true);
+    reconcile.mockResolvedValue({ kind: 'reply', refunded: true, reply: { idempotency_key: KEY, status: 'DECLINED', reason: 'O Mercado Pago confirmou o estorno: nada fica cobrado nesta cobrança.' } });
+    const { onReleased } = sheet(hold);
+    fill();
+    await pin();
+    await waitFor(() => expect(onReleased).toHaveBeenCalledTimes(1));
+    expect(mpPayments(id).map((p) => p.status)).toEqual(['REFUNDED']);
+    const ins = st().outbox.find((e) => e.table === 'payments' && e.op === 'INSERT' && e.payload.idempotency_key === KEY);
+    expect(ins?.payload.status).toBe('REFUNDED');
+    expect(st().outbox.some((e) => e.table === 'orders' && e.payload.status === 'CLOSED')).toBe(false);
+    expect(st().orders.find((o) => o.id === id)!.status).toBe('PAYING');
+    expect(getReviewHold(id)).toBeNull();
+  });
+
   it.each(['WAITING_CARD', 'DISPATCH_PENDING', 'MP_PENDING', 'APPROVED_ELSEWHERE'])('P3-03: %s mostra "em andamento", sem o procedimento do ID da operação', async (code) => {
     const id = openTable();
     const hold = mpHold(id);

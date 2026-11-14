@@ -2373,6 +2373,30 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(byKey.get(old.key)).toMatchObject({ stale: true });
       expect(sql(`SELECT to_jsonb(created_at) #>> '{}' FROM terminal_charges WHERE id = '${old.id}'`)).toBe(byKey.get(old.key)!.created_at);
     });
+
+    it('auditoria 2: aprovada sem pagamento só fica stale tchefood_claim_abandon_after() depois da aprovação (updated_at), não da criação', () => {
+      expect(sql(`SELECT tchefood_claim_abandon_after() = INTERVAL '5 minutes'`)).toBe('t');
+      const order = withItems(100);
+      const recent = charge(order, 'approved', 1000);
+      const edge = charge(order, 'approved', 1000);
+      const old = charge(order, 'approved', 1000);
+      const open = charge(order, 'pending', 1000);
+      const at = (id: string, created: string, updated: string) => sql(`BEGIN; SET LOCAL session_replication_role = replica;
+        UPDATE terminal_charges SET created_at = clock_timestamp() - INTERVAL '${created}', updated_at = clock_timestamp() - INTERVAL '${updated}' WHERE id = '${id}'; COMMIT;`);
+      // Criada há 10 min e aprovada há 3 min (o aparelho que cobrou pode estar sem rede com o pagamento na fila): não é stale.
+      at(recent.id, '10 minutes', '3 minutes');
+      at(edge.id, '10 minutes', '299 seconds');
+      at(old.id, '10 minutes', '301 seconds');
+      // A aberta segue pela criação (prazo do cartão), qualquer que seja updated_at.
+      at(open.id, '121 seconds', '1 second');
+      const byKey = new Map(reservation(order).charges.map((c) => [c.idempotency_key, c]));
+      expect(byKey.get(recent.key)).toMatchObject({ status: 'approved', stale: false });
+      expect(byKey.get(edge.key)).toMatchObject({ status: 'approved', stale: false });
+      expect(byKey.get(old.key)).toMatchObject({ status: 'approved', stale: true });
+      expect(byKey.get(open.key)).toMatchObject({ status: 'pending', stale: true });
+      // tchefood_point_charge_in_wait não muda para a aprovada (estado final: FALSE).
+      expect(sql(`SELECT tchefood_point_charge_in_wait('${TENANT}', '${recent.id}')`)).toBe('f');
+    });
   });
 
   describe('fuzzer de concorrência: total abaixo do pago, chave repetida e prazo de espera do cartão', () => {
@@ -2797,6 +2821,131 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(refunds(ch)).toBe(1);
       expect(state(ch)).toBe('refunded|REFUNDED');
       expect(orderState(order)).toBe('0|10000|OPEN');
+    });
+  });
+
+  describe('auditoria 2 (segurança): chave de outra loja, recusado/estornado do Mercado Pago e motivo longo', () => {
+    /** "sqlstate|DETAIL|mensagem" da recusa de um SELECT de uma função só, rodado como o servidor (sem erro: "ok||"). */
+    const refusalOf = (q: string) => {
+      const r = psql(target!, `BEGIN; DO $d$ DECLARE c TEXT := 'ok'; d TEXT := ''; m TEXT := ''; BEGIN
+          BEGIN PERFORM ${q.replace(/^SELECT /, '')};
+          EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = RETURNED_SQLSTATE, d = PG_EXCEPTION_DETAIL, m = MESSAGE_TEXT; END;
+          PERFORM set_config('tchefood.test_err', c || '|' || d || '|' || m, true); END $d$;
+        SELECT current_setting('tchefood.test_err'); COMMIT;`, DB);
+      if (!r.ok) throw new Error(r.message ?? 'refusalOf');
+      return r.out.split('\n').pop() ?? '';
+    };
+    const inUse = (k: string) => `TF009|key_in_use|TCHEFOOD_PAGAMENTO: a chave ${k} já está em uso (outra reserva, cobrança ou pagamento).`;
+    const blockQ = (k: string, order: string) =>
+      `SELECT tchefood_block_point_key('${TENANT}', '${k}', '${order}', '${TERMINAL}', '${MP_ID}', 'CREDIT', 1000, '${STAFF}')`;
+    /** Uma chave de cada dono em outras lojas: reserva (OTHER), cobrança da Point (PIN_TENANT) e pagamento gravado (OTHER). */
+    const foreignKeys = () => {
+      const otherOrder = withItems(100, OTHER, OTHER_TABLE, OTHER_STAFF);
+      const claimKey = key('a2c');
+      expect(claim(claimKey, otherOrder, 'CASH', 'CASH_DESK', 1000, undefined, OTHER_STAFF, OTHER).ok).toBe(true);
+      const pinOrder = withItems(100, PIN_TENANT, PIN_TABLE, PIN_STAFF);
+      const chargeKey = charge(pinOrder, 'cancelled', 1000, { tenant_id: PIN_TENANT, terminal_id: PIN_TERMINAL }).key;
+      const paymentKey = key('a2p');
+      sql(`BEGIN; SET LOCAL session_replication_role = replica;
+           INSERT INTO payments (order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
+           VALUES ('${otherOrder}', '${OTHER}', '${OTHER_STAFF}', 10, 'CASH', 'APPROVED', 'CASH_DESK', '${paymentKey}'); COMMIT;`);
+      return { claim: claimKey, charge: chargeKey, payment: paymentKey };
+    };
+
+    it('P2-1: abrir cobrança com a chave de outra loja (reserva, cobrança ou pagamento): a mesma recusa TF009 key_in_use, nada gravado', () => {
+      const keys = foreignKeys();
+      const order = withItems(100);
+      for (const [owner, k] of Object.entries(keys)) {
+        expect(refusalOf(openPointQ(k, order, 1000, bal(order))), owner).toBe(inUse(k));
+      }
+      // Conta desta loja fechada: a recusa da chave de outra loja é a mesma para todo dono (não diz o que há com a chave).
+      const closed = withItems(100);
+      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE orders SET status = 'CLOSED' WHERE id = '${closed}'; COMMIT;`);
+      for (const [owner, k] of Object.entries(keys)) {
+        expect(refusalOf(openPointQ(k, closed, 1000, bal(closed))), `fechada ${owner}`).toBe(inUse(k));
+      }
+      for (const k of Object.values(keys)) expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = '${k}' AND tenant_id = '${TENANT}'`)).toBe('0');
+    });
+
+    it('P2-1: bloquear a chave de outra loja (reserva, cobrança ou pagamento): a mesma recusa TF009 key_in_use, nada gravado', () => {
+      const keys = foreignKeys();
+      const order = withItems(100);
+      for (const [owner, k] of Object.entries(keys)) {
+        expect(refusalOf(blockQ(k, order)), owner).toBe(inUse(k));
+        expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = '${k}' AND tenant_id = '${TENANT}'`)).toBe('0');
+      }
+      expect(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'POINT_KEY_BLOCKED' AND metadata->>'idempotency_key' IN ('${Object.values(keys).join("','")}')`)).toBe('0');
+    });
+
+    it('P2-1: chave desta loja segue com a recusa específica (reserva: "outro pagamento"; pagamento gravado)', () => {
+      const order = withItems(100);
+      const k = key('a2own');
+      expect(cash(k, order, 1000).ok).toBe(true);
+      expect(refusalOf(openPointQ(k, order, 1000, bal(order)))).toMatch(/^TF009\|.*\|TCHEFOOD_COBRANCA: a chave .* já é de outro pagamento/);
+      expect(refusalOf(blockQ(k, order))).toMatch(/^TF009\|.*\|TCHEFOOD_COBRANCA: a chave .* já é de outro pagamento/);
+    });
+
+    /** Pagamento do Mercado Pago com a chave da cobrança, igual a ela, trocando os campos de `over` (SQL). */
+    const mpRow = (id: string, status: string, over: Record<string, string> = {}) => {
+      const [order, cents, pid, k] = sql(`SELECT order_id || '|' || amount_cents || '|' || COALESCE(external_payment_id, '') || '|' || idempotency_key FROM terminal_charges WHERE id = '${id}'`).split('|');
+      const row: Record<string, string> = {
+        order_id: `'${order}'`, tenant_id: `'${TENANT}'`, waiter_id: `'${STAFF}'`, terminal_id: `'${TERMINAL}'`, amount: String(Number(cents) / 100),
+        method: `'CREDIT'`, status: `'${status}'`, acquirer: `'MERCADO_PAGO'`, acquirer_cnpj: `'10573521000191'`, nsu: pid ? `'${pid}'` : 'NULL',
+        terminal_serial: `'${MP_ID}'`, idempotency_key: `'${k}'`, ...over,
+      };
+      return psql(target!, `INSERT INTO payments (${Object.keys(row).join(', ')}) VALUES (${Object.values(row).join(', ')});`, DB);
+    };
+
+    it('P2-2: recusado do Mercado Pago só entra igual à cobrança (conta, valor, forma; comprovante, se houver)', () => {
+      const order = withItems(100);
+      const other = withItems(100);
+      const cancelled = charge(order, 'cancelled', 100);
+      // O caso da revisão: R$ 999,99 em débito numa cobrança de R$ 1,00 no crédito, cancelada.
+      expect(mpRow(cancelled.id, 'DECLINED', { amount: '999.99', method: `'DEBIT'` })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(mpRow(cancelled.id, 'DECLINED', { amount: '999.99' })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(mpRow(cancelled.id, 'DECLINED', { method: `'DEBIT'` })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(mpRow(cancelled.id, 'DECLINED', { order_id: `'${other}'` })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      // Cobrança recusada com o pagamento do Mercado Pago: o recusado vem sem comprovante (como o aparelho grava) ou com o dela.
+      const rejected = charge(order, 'rejected', 100, { external_payment_id: 'PREJ1' });
+      expect(mpRow(rejected.id, 'DECLINED', { nsu: `'OUTRO'` })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(sql(`SELECT count(*) FROM payments WHERE idempotency_key IN ('${cancelled.key}', '${rejected.key}')`)).toBe('0');
+      expect(mpRow(cancelled.id, 'DECLINED').ok).toBe(true);
+      expect(mpRow(rejected.id, 'DECLINED', { nsu: 'NULL' }).ok).toBe(true);
+      const rejected2 = charge(order, 'rejected', 100, { external_payment_id: 'PREJ2' });
+      expect(mpRow(rejected2.id, 'DECLINED').ok).toBe(true);
+    });
+
+    it('P2-2: estornado do Mercado Pago só entra igual à cobrança estornada (conta, valor, forma e comprovante)', () => {
+      const order = withItems(100);
+      const other = withItems(100);
+      const refunded = charge(order, 'refunded', 100, { external_payment_id: 'PREF1', paid_amount_cents: 100, card_brand: 'VISA', authorization_code: 'AUT1' });
+      expect(mpRow(refunded.id, 'REFUNDED', { amount: '999.99' })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(mpRow(refunded.id, 'REFUNDED', { method: `'DEBIT'` })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(mpRow(refunded.id, 'REFUNDED', { order_id: `'${other}'` })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(mpRow(refunded.id, 'REFUNDED', { nsu: `'OUTRO'` })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(mpRow(refunded.id, 'REFUNDED', { nsu: 'NULL' })).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(sql(`SELECT count(*) FROM payments WHERE idempotency_key = '${refunded.key}'`)).toBe('0');
+      // O espelho do aparelho (o aprovado que vira estornado na fila: os campos do aprovado) entra.
+      expect(mpRow(refunded.id, 'REFUNDED', { card_brand: `'VISA'`, authorization_code: `'AUT1'` }).ok).toBe(true);
+    });
+
+    it('P2-3: motivo de mais de 500 caracteres é recusado (TF006) nas liberações, no estorno da reserva e no encerramento com PIN', () => {
+      const long = 'x'.repeat(501);
+      const order = withItems(100);
+      const k = key('a2r');
+      expect(cash(k, order, 1000).ok).toBe(true);
+      expect(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, '${long}')`)).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(asDevice(`SELECT tchefood_release_payment_claim_manager('${k}', '${STAFF}', '${MANAGER_PIN}', '${long}')`)).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(asDevice(`SELECT tchefood_authorize_claim_refunded('${k}', '${STAFF}', '${MANAGER_PIN}', '${long}', '{}'::jsonb)`)).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(claimField(k, 'status')).toBe('open');
+      // 500 depois de tirar os espaços das pontas ainda vale.
+      const ok = json<{ status: string }>(asDevice(`SELECT tchefood_release_payment_claim('${k}', '${STAFF}', ${tok(k)}, '  ${'y'.repeat(500)}  ')`));
+      expect(ok.status).toBe('released');
+      const ch = charge(order, 'creating', 100);
+      const cancel = psql(target!, `SELECT tchefood_authorize_point_cancel('${TENANT}', '${ch.key}', '${STAFF}', '${MANAGER_PIN}', '${long}');`, DB);
+      expect(cancel).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(cancel.message).toContain('500');
+      expect(audits('POINT_CHARGE_CANCELED', 'idempotency_key', ch.key)).toBe(0);
     });
   });
 });

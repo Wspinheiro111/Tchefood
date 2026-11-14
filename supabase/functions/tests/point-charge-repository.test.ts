@@ -85,6 +85,14 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
     expect(err).toMatchObject({ code: mapped, message: 'explicação' });
   });
 
+  it('TF009 (chave de outra loja ou de outro pagamento, recusa uniforme do banco) no bloqueio da chave: key_in_use, sem ler a cobrança', async () => {
+    const { db } = fakeDb({ rpc: { data: null, error: { code: 'TF009', message: 'TCHEFOOD_COBRANCA: chave em uso' } } });
+    const { id: _id, created_at: _c, ...fresh } = ROW;
+    const err = await supabaseChargeStore(db, TENANT).insertVoid(fresh).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ChargeRefusedError);
+    expect(err).toMatchObject({ code: 'key_in_use', message: 'chave em uso' });
+  });
+
   it('outro erro do banco não vira recusa', async () => {
     const { db } = fakeDb({ rpc: { data: null, error: { code: '57014', message: 'timeout' } } });
     const { id: _id, created_at: _c, ...fresh } = ROW;

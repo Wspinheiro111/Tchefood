@@ -10,7 +10,7 @@ import { endLocalClaim, isClaimActiveHere, localClaim, pendingRelease, removePen
 import { fetchPointReservation, type CloudPaymentClaim } from '../lib/sync/cloudPull';
 import { freshCloudConfig } from '../lib/sync/useCloudSync';
 import { clearReviewHold, getReviewHolds, reviewHoldKey, type ReviewHold } from '../lib/payments/reviewHolds';
-import { ManagerAuthSheet } from './ManagerAuthSheet';
+import { ManagerAuthSheet, MAX_REASON_LENGTH, SERVER_REASON_MIN_LENGTH } from './ManagerAuthSheet';
 import { rememberServerReservation } from '../lib/payments/pointReservation';
 import { confirmClaimRefunded } from '../lib/payments/claimFlow';
 
@@ -53,6 +53,7 @@ export function RefundedAtTerminalButton({ hold, label, onCleared, size = 'lg' }
         open={open}
         onClose={() => setOpen(false)}
         title="Estornei / devolvi"
+        minReason={SERVER_REASON_MIN_LENGTH}
         summary={<span>{label} · {formatBRL(hold.amount)} · {cash ? 'confirme que o dinheiro foi devolvido ao cliente.' : 'confirme que a venda foi estornada (cancelada) na maquininha.'}</span>}
         confirmLabel="Confirmar"
         quickReasons={cash ? ['Dinheiro devolvido ao cliente'] : ['Venda estornada na maquininha', 'Cancelado na maquininha, cliente reembolsado']}
@@ -63,6 +64,9 @@ export function RefundedAtTerminalButton({ hold, label, onCleared, size = 'lg' }
     </>
   );
 }
+
+/** TF005 ao liberar: não havia reserva no servidor (auditoria interna 2, P2-8). */
+export const RELEASE_NOT_FOUND = 'Não havia reserva no servidor para este pagamento: nada foi liberado lá. A conferência do gerente ficou registrada aqui.';
 
 export const RELEASE_CLAIM_WARNING =
   'Use só se o pagamento NÃO aconteceu: nenhum dinheiro foi recebido e a maquininha não mostra aprovação. Liberar devolve o valor ao saldo livre da conta.';
@@ -122,7 +126,9 @@ export function ReleaseClaimSheet({ open, onClose, claimKey, title = 'Liberar re
       vibrate([80, 40, 80]);
       return;
     }
-    toast.success('Reserva liberada no servidor. Registrado em audit_logs.');
+    // Auditoria interna 2 (P2-8): TF005 não liberou nada (o servidor não tinha a reserva).
+    if (out.ok && out.notFound) toast.info(RELEASE_NOT_FOUND);
+    else toast.success('Reserva liberada no servidor. Registrado em audit_logs.');
     onReleased();
     onClose();
   };
@@ -140,9 +146,9 @@ export function ReleaseClaimSheet({ open, onClose, claimKey, title = 'Liberar re
         <p className="mt-1 text-slate-800">{RELEASE_CLAIM_WARNING}</p>
       </div>
       <label htmlFor="release-claim-reason" className="mb-1 block text-sm font-semibold text-slate-700">Motivo</label>
-      <textarea id="release-claim-reason" value={reason} onChange={(e) => setReason(e.target.value)} rows={2} placeholder="Ex.: maquininha recusou, cliente pagou de outro jeito" className="mb-3 w-full rounded-xl border border-slate-300 bg-base p-3 text-base outline-none focus:border-ouro" />
+      <textarea id="release-claim-reason" value={reason} maxLength={MAX_REASON_LENGTH} onChange={(e) => setReason(e.target.value.slice(0, MAX_REASON_LENGTH))} rows={2} placeholder="Ex.: maquininha recusou, cliente pagou de outro jeito" className="mb-3 w-full rounded-xl border border-slate-300 bg-base p-3 text-base outline-none focus:border-ouro" />
       <p className="mb-2 text-center text-sm font-semibold text-slate-700">PIN do Gerente</p>
-      <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => reasonOk && !busy && void submit(v)} error={Boolean(error)} compact disabled={busy} />
+      <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => reasonOk && !busy && void submit(v)} error={Boolean(error)} compact disabled={busy} label="PIN do gerente" />
       {error && <p className="mt-3 rounded-lg bg-brasa/20 p-2 text-center text-sm font-semibold text-rose-700">{error}</p>}
     </Sheet>
   );
@@ -249,7 +255,7 @@ export function useOrderClaims(orderId: string): { claims: CloudPaymentClaim[]; 
         if (!cfg) return;
         const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
         if (!alive) return;
-        rememberServerReservation(orderId, r.reservedCents, r.claims ?? []);
+        rememberServerReservation(orderId, r.reservedCents, r.claims ?? [], Date.now(), r.charges ?? []);
         setClaims(r.claims ?? []);
       } catch {
         // Sem leitura: fica a última lista (o servidor ainda recusa o que passar da reserva).

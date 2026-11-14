@@ -5,7 +5,7 @@ import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../st
 import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
-import { AUDIT_LABEL, declinedInShift, formatShiftStart, inShiftPeriod, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
+import { AUDIT_LABEL, declinedInShift, formatShiftStart, pointRefundsInShift, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
 import { PointRefunds } from '../components/PointRefund';
 import { useShiftPeriod } from '../lib/useShiftStart';
 import { Badge, Btn, toast } from '../components/ui';
@@ -179,7 +179,8 @@ export function Reconciliation() {
   const label = { CREDIT: 'Crédito', DEBIT: 'Débito', PIX: 'Pix', CASH: 'Dinheiro' } as const;
   const totals = methods.map((m) => rows.reduce((a, r) => a + r.byMethod[m], 0));
   const declined = useMemo(() => declinedInShift(payments, period), [payments, period]);
-  const inShift = useMemo(() => payments.filter((p) => inShiftPeriod(p.created_at, period)), [payments, period]);
+  const logs = useTcheStore((s) => s.auditLogs);
+  const mpRefunds = useMemo(() => pointRefundsInShift(payments, logs, period), [payments, logs, period]);
   return (
     <div className="space-y-4">
       <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-surface">
@@ -212,7 +213,14 @@ export function Reconciliation() {
         <div className="mb-1 font-bold">Transações recusadas no turno: {declined.length}</div>
         {declined.map((p) => <div key={p.id} className="text-slate-500">{new Date(p.created_at).toLocaleTimeString('pt-BR')} · {p.acquirer} · {p.terminal_serial} · {formatBRL(p.amount)}</div>)}
       </div>
-      <PointRefunds payments={inShift} />
+      {mpRefunds.count > 0 && (
+        // Auditoria interna 2 (P2-E): o extrato do Mercado Pago traz a venda e o estorno; a linha acima já não conta o estornado.
+        <div className="rounded-2xl border border-slate-200 bg-surface p-4 text-sm">
+          <div className="flex justify-between font-bold"><span>Estornos Mercado Pago no turno</span><span className="tabular-nums text-rose-600">−{formatBRL(mpRefunds.total)} ({mpRefunds.count})</span></div>
+          <p className="mt-1 text-xs text-slate-500">No extrato do Mercado Pago cada estorno aparece como a venda e a devolução. A linha Mercado Pago acima conta só os pagamentos que seguem aprovados.</p>
+        </div>
+      )}
+      <PointRefunds payments={payments} />
     </div>
   );
 }

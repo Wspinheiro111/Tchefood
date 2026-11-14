@@ -212,6 +212,28 @@ export function reconciliation(payments: readonly Payment[], period: ShiftPeriod
   return rows.MERCADO_PAGO.count > 0 ? [rows.STONE, rows.PAGBANK, rows.MERCADO_PAGO, rows.CASH_DESK] : [rows.STONE, rows.PAGBANK, rows.CASH_DESK];
 }
 
+/**
+ * Estornos do Mercado Pago no turno (auditoria interna 2, P2-E): pagamentos da Point estornados, pela hora do registro
+ * do estorno neste aparelho (audit_logs POINT_PAYMENT_REFUNDED) ou, sem ele, pela hora da venda. O extrato do Mercado
+ * Pago mostra a venda e o estorno; a linha "Mercado Pago" da conciliação já não conta o estornado.
+ */
+export function pointRefundsInShift(payments: readonly Payment[], logs: readonly AuditLog[], period: ShiftPeriod = currentShiftPeriod()): { total: number; count: number } {
+  const refundedAt = new Map<string, string>();
+  for (const l of logs) {
+    const id = l.action_type === 'POINT_PAYMENT_REFUNDED' ? (l.metadata as Record<string, unknown> | null)?.payment_id : null;
+    if (typeof id === 'string' && !refundedAt.has(id)) refundedAt.set(id, l.created_at);
+  }
+  let cents = 0;
+  let count = 0;
+  for (const p of payments) {
+    if (p.acquirer !== 'MERCADO_PAGO' || p.status !== 'REFUNDED') continue;
+    if (!inShiftPeriod(refundedAt.get(p.id) ?? p.created_at, period)) continue;
+    cents += toCents(p.amount);
+    count += 1;
+  }
+  return { total: fromCents(cents), count };
+}
+
 /** Transações recusadas dentro do período do turno [start, end), mesmo filtro da conciliação. */
 export function declinedInShift(payments: readonly Payment[], period: ShiftPeriod = currentShiftPeriod()): Payment[] {
   return payments.filter((p) => p.status === 'DECLINED' && inShiftPeriod(p.created_at, period));

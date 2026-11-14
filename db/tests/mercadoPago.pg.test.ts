@@ -919,10 +919,11 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       }
     }, 120_000);
 
-    it('auditoria r3 P1-01: chave que já é de uma loja não é bloqueada nem lida por outra, mesmo com maquininha e operador da outra (TF005)', () => {
+    it('auditoria r3 P1-01: chave que já é de uma loja não é bloqueada nem lida por outra, mesmo com maquininha e operador da outra (TF009 key_in_use, auditoria 2)', () => {
       const before = sql(`SELECT id || '|' || tenant_id || '|' || status || '|' || cancel_requested_by FROM terminal_charges WHERE idempotency_key = 'blk-ok'`);
       const stolen = psql(target!, `SELECT tchefood_block_point_key('${OTHER}', 'blk-ok', '${ORDER3}', '${OTHER_TERMINAL}', 'OUTRA-POINT', 'CREDIT', 100, '${OTHER_STAFF}');`, DB);
-      expect(stolen).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(stolen).toMatchObject({ ok: false, sqlstate: 'TF009' }); // auditoria 2 (P2-1): a recusa única da chave em uso
+      expect(stolen.message).toContain('já está em uso (outra reserva, cobrança ou pagamento)');
       expect(stolen.out).toBe(''); // nem o id da cobrança da outra loja volta
       expect(sql(`SELECT id || '|' || tenant_id || '|' || status || '|' || cancel_requested_by FROM terminal_charges WHERE idempotency_key = 'blk-ok'`)).toBe(before);
       expect(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${OTHER}' AND action_type = 'POINT_KEY_BLOCKED'`)).toBe('0');
@@ -931,7 +932,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
       expect(own.ok, own.message ?? '').toBe(true);
       expect(sql(`SELECT tenant_id || '|' || status FROM terminal_charges WHERE idempotency_key = 'blk-outra'`)).toBe(`${OTHER}|cancelled`);
       // E a primeira loja não a enxerga nem a bloqueia.
-      expect(block('blk-outra', `'${STAFF}'`)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(block('blk-outra', `'${STAFF}'`)).toMatchObject({ ok: false, sqlstate: 'TF009' });
       // Maquininha da outra loja com a loja certa: recusa.
       expect(block('blk-term', `'${STAFF}'`, TENANT, OTHER_TERMINAL)).toMatchObject({ ok: false, sqlstate: 'TF005' });
       expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = 'blk-term'`)).toBe('0');
@@ -970,12 +971,13 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     const idOf = (key: string) => `(SELECT id FROM terminal_charges WHERE idempotency_key = '${key}')`;
     const set = (key: string, what: string) => psql(target!, `UPDATE terminal_charges SET ${what} WHERE idempotency_key = '${key}';`, DB);
 
-    it('auditoria r3, terceira revisão: chave que já é de OUTRA loja não abre cobrança, não devolve o id dela e não grava nada (TF005)', () => {
+    it('auditoria r3, terceira revisão: chave que já é de OUTRA loja não abre cobrança, não devolve o id dela e não grava nada (TF009 key_in_use, auditoria 2)', () => {
       const theirs = psql(target!, `SELECT tchefood_block_point_key('${OTHER}', 't3-alheia', '${ORDER5}', '${OTHER_TERMINAL}', '${OTHER_MP_ID}', 'CREDIT', 100, '${OTHER_STAFF}');`, DB);
       expect(theirs.ok, theirs.message ?? '').toBe(true);
       const before = field('t3-alheia', `id || '|' || tenant_id || '|' || status || '|' || updated_at`);
       const r = open('t3-alheia', ORDER5, 100);
-      expect(r).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(r).toMatchObject({ ok: false, sqlstate: 'TF009' });
+      expect(r.message).toContain('já está em uso (outra reserva, cobrança ou pagamento)');
       expect(r.out).toBe('');
       expect(r.out).not.toContain(theirs.out);
       expect(field('t3-alheia', `id || '|' || tenant_id || '|' || status || '|' || updated_at`)).toBe(before);

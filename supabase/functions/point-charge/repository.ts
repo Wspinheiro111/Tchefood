@@ -24,7 +24,7 @@ const REFUSALS: Record<string, ChargeRefusedError['code']> = {
 
 function refusal(error: { message: string; code?: string } | null): ChargeRefusedError | null {
   const code = error?.code ? REFUSALS[error.code] : undefined;
-  return code ? new ChargeRefusedError(code, (error?.message ?? '').replace(/^TCHEFOOD_COBRANCA:\s*/, '')) : null;
+  return code ? new ChargeRefusedError(code, (error?.message ?? '').replace(/^TCHEFOOD_(COBRANCA|PAGAMENTO):\s*/, '')) : null;
 }
 
 function check(result: { data: Query; error: { message: string; code?: string } | null }, what: string): Query {
