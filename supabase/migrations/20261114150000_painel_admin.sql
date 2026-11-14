@@ -108,6 +108,9 @@ CREATE TABLE IF NOT EXISTS store_charges (
     cancel_reason TEXT,
     cancelled_at TIMESTAMPTZ,
     cancelled_by UUID,
+    -- Cancelada junto com a assinatura (não pelo admin nesta cobrança): se a loja voltar, o lote do
+    -- mês gera de novo.
+    cancelled_with_subscription BOOLEAN NOT NULL DEFAULT FALSE,
     created_by UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CHECK ((status = 'PAID') = (paid_on IS NOT NULL AND paid_amount IS NOT NULL AND payment_method IS NOT NULL
@@ -115,6 +118,7 @@ CREATE TABLE IF NOT EXISTS store_charges (
     CHECK (status <> 'PAID' OR paid_amount = amount),
     CHECK ((status = 'CANCELLED') = (cancel_reason IS NOT NULL AND cancelled_at IS NOT NULL AND cancelled_by IS NOT NULL))
 );
+ALTER TABLE store_charges ADD COLUMN IF NOT EXISTS cancelled_with_subscription BOOLEAN NOT NULL DEFAULT FALSE;
 -- Uma cobrança por loja e mês (a cancelada não conta: pode ser refeita).
 CREATE UNIQUE INDEX IF NOT EXISTS store_charges_one_per_month ON store_charges (tenant_id, reference_month) WHERE status <> 'CANCELLED';
 -- A mesma referência de pagamento não paga duas cobranças.
@@ -599,7 +603,9 @@ BEGIN
     END IF;
     IF p_status IS NULL OR p_status NOT IN ('TRIAL', 'ACTIVE', 'SUSPENDED', 'CANCELLED') THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: situação inválida'; END IF;
     IF p_status = 'TRIAL' AND p_trial_ends_on IS NULL THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: loja em teste precisa da data de fim do teste'; END IF;
-    IF p_status = 'TRIAL' AND p_trial_ends_on > tchefood_admin_today() + 90 THEN
+    -- O fim do teste segura o lote (mês dentro do teste não é cobrado) em qualquer situação: nunca
+    -- mais de 90 dias à frente (ano digitado errado não deixa a loja um ano sem cobrança).
+    IF p_trial_ends_on > tchefood_admin_today() + 90 THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: fim do teste em até 90 dias a partir de hoje';
     END IF;
     PERFORM tchefood_admin_check_contact(p_billing_day, p_contact_name, p_contact_phone);
@@ -613,14 +619,17 @@ BEGIN
     IF v_existed THEN
         UPDATE store_subscriptions SET
             plan_id = v_plan.id, monthly_price = p_monthly_price, status = p_status, billing_day = p_billing_day,
-            trial_ends_on = CASE WHEN p_status = 'TRIAL' THEN p_trial_ends_on ELSE COALESCE(p_trial_ends_on, v_old.trial_ends_on) END,
+            -- Fora do teste, a data só pode ser mantida ou antecipada (não estica o teste de quem já paga).
+            trial_ends_on = CASE WHEN p_status = 'TRIAL' THEN p_trial_ends_on
+                                 WHEN v_old.trial_ends_on IS NULL THEN NULL
+                                 ELSE LEAST(COALESCE(p_trial_ends_on, v_old.trial_ends_on), v_old.trial_ends_on) END,
             contact_name = tchefood_admin_trim(COALESCE(p_contact_name, '')), contact_phone = tchefood_admin_clean_phone(p_contact_phone),
             contact_email = tchefood_admin_check_email(p_contact_email), notes = NULLIF(tchefood_admin_trim(p_notes), ''), updated_at = NOW()
          WHERE tenant_id = p_tenant RETURNING * INTO v_new;
     ELSE
         INSERT INTO store_subscriptions (tenant_id, plan_id, monthly_price, status, billing_day, trial_ends_on,
                                          contact_name, contact_phone, contact_email, notes)
-        VALUES (p_tenant, v_plan.id, p_monthly_price, p_status, p_billing_day, p_trial_ends_on,
+        VALUES (p_tenant, v_plan.id, p_monthly_price, p_status, p_billing_day, CASE WHEN p_status = 'TRIAL' THEN p_trial_ends_on END,
                 tchefood_admin_trim(COALESCE(p_contact_name, '')), tchefood_admin_clean_phone(p_contact_phone), tchefood_admin_check_email(p_contact_email),
                 NULLIF(tchefood_admin_trim(p_notes), ''))
         RETURNING * INTO v_new;
@@ -634,7 +643,7 @@ BEGIN
                       AND reference_month > date_trunc('month', tchefood_admin_today())::date
                     ORDER BY reference_month FOR UPDATE LOOP
             UPDATE store_charges SET status = 'CANCELLED', cancel_reason = 'Assinatura cancelada: ' || tchefood_admin_trim(p_reason),
-                                     cancelled_at = NOW(), cancelled_by = v_admin.user_id
+                                     cancelled_at = NOW(), cancelled_by = v_admin.user_id, cancelled_with_subscription = TRUE
              WHERE id = v_c.id;
             PERFORM tchefood_admin_log(v_admin.user_id, p_tenant, v_c.id, 'CHARGE_CANCELLED', 'Assinatura cancelada: ' || tchefood_admin_trim(p_reason),
                 jsonb_build_object('reference_month', v_c.reference_month, 'amount', v_c.amount, 'subscription_cancelled', TRUE));
@@ -719,7 +728,9 @@ BEGIN
                   -- Nem mês de antes de a loja entrar no painel.
                   AND created_at < tchefood_admin_day_start((v_month + INTERVAL '1 month')::date)
                 ORDER BY tenant_id FOR UPDATE LOOP
-        IF NOT EXISTS (SELECT 1 FROM store_charges WHERE tenant_id = v_s.tenant_id AND reference_month = v_month) THEN
+        -- Cancelada pelo admin não volta; cancelada junto com a assinatura volta se a loja voltou.
+        IF NOT EXISTS (SELECT 1 FROM store_charges WHERE tenant_id = v_s.tenant_id AND reference_month = v_month
+                          AND NOT (status = 'CANCELLED' AND cancelled_with_subscription)) THEN
             v_due := GREATEST(tchefood_admin_due_date(v_month, v_s.billing_day), tchefood_admin_today(),
                               v_s.trial_ends_on + 1);
             INSERT INTO store_charges (tenant_id, reference_month, amount, due_date, created_by)
