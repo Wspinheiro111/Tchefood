@@ -1,37 +1,88 @@
 /**
  * Etapa 0 — laço de sincronização: a cada 5 s, com internet e sessão da nuvem,
- * envia a fila na ordem e confirma o que o servidor aceitou. Com a fila vazia, a
- * cada minuto lê os cadastros da nuvem (mudanças feitas em outro aparelho).
+ * envia a fila na ordem e confirma o que o servidor aceitou. Com a fila vazia, lê da
+ * nuvem o que outro aparelho mudou: as contas e a ocupação das mesas a cada 10 s
+ * (src/lib/sync/orderPull.ts) e os cadastros a cada minuto.
  */
 import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
+import { fetchCloudOrders, missingCatalog, missingModifiers } from './orderPull';
 
 const INTERVAL_MS = 5_000;
 /** Leitura dos cadastros da nuvem (só com a fila vazia: o que é daqui sobe antes). */
 export const PULL_EVERY_MS = 60_000;
+/** Leitura das contas e mesas da nuvem (também só com a fila vazia). */
+export const ORDERS_PULL_EVERY_MS = 10_000;
 let running = false;
 
 const browserFetch: FetchLike = (url, init) => fetch(url, init);
 
-function pullDue(lastPullAt: string | null | undefined, nowMs: number): boolean {
-  return !lastPullAt || nowMs - Date.parse(lastPullAt) >= PULL_EVERY_MS;
+function pullDue(lastPullAt: string | null | undefined, nowMs: number, everyMs: number = PULL_EVERY_MS): boolean {
+  return !lastPullAt || !(nowMs - Date.parse(lastPullAt) < everyMs);
 }
 
 /** Lê os cadastros da nuvem e aplica (o store deixa como está o que ainda não subiu daqui). */
-async function pullOnce(cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
+async function pullCatalog(cfg: SyncConfig, fetchFn: FetchLike): Promise<boolean> {
   const tenantId = useTcheStore.getState().tenant.id;
   try {
     const snapshot = await fetchCloudSnapshot(cfg, tenantId, fetchFn);
     const st = useTcheStore.getState();
     // Trocou de loja ou desconectou enquanto lia: descarta.
-    if (!st.cloud || st.tenant.id !== tenantId) return;
+    if (!st.cloud || st.tenant.id !== tenantId) return false;
     const r = st.applyCloudSnapshot(snapshot);
-    if (!r.ok) st.setPullError(r.error);
+    if (!r.ok) st.setPullError(r.error, 'catalog');
+    return r.ok;
   } catch (e) {
-    useTcheStore.getState().setPullError((e as Error).message);
+    useTcheStore.getState().setPullError((e as Error).message, 'catalog');
+    return false;
   }
+}
+
+/**
+ * Lê as contas e a ocupação das mesas e aplica (a nuvem manda no dinheiro; conta com
+ * mudança daqui pendente fica como está). Conta com produto ou mesa que este aparelho
+ * ainda não tem lê os cadastros antes, para a conta não aparecer com item sem nome.
+ */
+async function pullOrders(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh: boolean): Promise<void> {
+  const tenantId = useTcheStore.getState().tenant.id;
+  try {
+    const openHere = useTcheStore.getState().orders.filter((o) => o.status === 'OPEN' || o.status === 'PAYING').map((o) => o.id);
+    const snapshot = await fetchCloudOrders(cfg, tenantId, fetchFn, openHere);
+    let st = useTcheStore.getState();
+    if (!st.cloud || st.tenant.id !== tenantId) return;
+    const known = () => ({ productIds: useTcheStore.getState().products.map((p) => p.id), tableIds: useTcheStore.getState().tables.map((t) => t.id) });
+    const options = () => {
+      const s = useTcheStore.getState();
+      return missingModifiers(snapshot, s.modifierOptions.map((m) => m.id), s.pullStatus?.last_pull_at ?? null);
+    };
+    if (!catalogFresh && (missingCatalog(snapshot, known()) || options())) {
+      await pullCatalog(cfg, fetchFn);
+      st = useTcheStore.getState();
+      if (!st.cloud || st.tenant.id !== tenantId) return;
+    }
+    // Ainda falta produto ou mesa (a leitura dos cadastros falhou, ou ainda não tem o
+    // cadastro novo), ou adicional lançado depois da última leitura dos cadastros que deu
+    // certo: a foto não é aplicada, o aparelho fica com a anterior e tenta de novo na próxima
+    // rodada (GPT, rodadas 1, 2 e 6 do PR #54).
+    if (missingCatalog(snapshot, known()) || options()) {
+      st.setPullError('Não foi possível ler as contas da nuvem: falta o cadastro de um produto, adicional ou mesa usado nelas. Tentando de novo.', 'orders');
+      return;
+    }
+    // Uma mudança deste aparelho pode ter entrado na fila enquanto a leitura voltava: o
+    // store confere a fila de agora e deixa essa conta como está.
+    const r = st.applyCloudOrders(snapshot);
+    if (!r.ok) st.setPullError(r.error, 'orders');
+  } catch (e) {
+    useTcheStore.getState().setPullError((e as Error).message, 'orders');
+  }
+}
+
+/** Leituras da nuvem que estão na hora (ou todas, com force). */
+async function pullOnce(cfg: SyncConfig, fetchFn: FetchLike, due: { catalog: boolean; orders: boolean }): Promise<void> {
+  const catalogFresh = due.catalog ? await pullCatalog(cfg, fetchFn) : false;
+  if (due.orders) await pullOrders(cfg, fetchFn, catalogFresh);
 }
 
 /**
@@ -44,7 +95,12 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
   const state = useTcheStore.getState();
   const session = state.cloud;
   if (!session) return;
-  const wantsPull = opts.forcePull === true || pullDue(state.pullStatus?.last_pull_at, Date.now());
+  const nowMs = Date.now();
+  const due = {
+    catalog: opts.forcePull === true || pullDue(state.pullStatus?.last_pull_at, nowMs),
+    orders: opts.forcePull === true || pullDue(state.pullStatus?.last_orders_pull_at, nowMs, ORDERS_PULL_EVERY_MS),
+  };
+  const wantsPull = due.catalog || due.orders;
   if (state.outbox.length === 0 && !wantsPull) return;
   running = true;
   try {
@@ -66,7 +122,7 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
     const cfg: SyncConfig = { url: session.url, anonKey: session.anon_key, accessToken: token };
     const { outbox: events, syncRejected } = useTcheStore.getState();
     if (events.length === 0) {
-      await pullOnce(cfg, fetchFn);
+      await pullOnce(cfg, fetchFn, due);
       return;
     }
     const held = (syncRejected ?? []).map((r) => r.event);
@@ -81,8 +137,15 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
       const more = result.rejected.length > 1 ? ` (+${result.rejected.length - 1})` : '';
       st.setSyncError(`Servidor recusou um evento${more} (HTTP ${first.status}): ${first.message}`, null);
     }
-    // Fila zerou nesta rodada: lê a nuvem agora, se estava na hora.
-    if (wantsPull && useTcheStore.getState().outbox.length === 0 && !result.retryLater) await pullOnce(cfg, fetchFn);
+    // Cadastros: só com a fila zerada nesta rodada (o que é daqui sobe antes).
+    // Contas e mesas: na hora certa, mesmo com a fila cheia, segurada atrás de uma recusa ou
+    // esperando uma nova tentativa. A junção deixa como está a conta (e a mesa) com evento
+    // pendente; as outras descem. Sem isso, um evento de outro registro parado na fila
+    // escondia o fechamento e os pagamentos feitos em outro aparelho (GPT, rodada 1 do PR #54),
+    // e a conta que ficou na mesa nunca chegava para resolver a recusa de mesa ocupada (Codex).
+    const after = useTcheStore.getState();
+    const catalog = due.catalog && after.outbox.length === 0 && !result.retryLater;
+    if (catalog || due.orders) await pullOnce(cfg, fetchFn, { catalog, orders: due.orders });
   } finally {
     running = false;
   }

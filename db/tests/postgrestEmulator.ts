@@ -36,6 +36,8 @@ export interface PsqlResult {
   out: string;
   sqlstate: string | null;
   message: string | null;
+  /** DETAIL do erro, que o PostgREST devolve em "details". */
+  details?: string | null;
 }
 
 export function psql(t: PgTarget, sql: string, db = t.db): PsqlResult {
@@ -50,7 +52,8 @@ export function psql(t: PgTarget, sql: string, db = t.db): PsqlResult {
     const err = e as { stderr?: string; stdout?: string };
     const stderr = err.stderr ?? '';
     const m = /ERROR:\s+([0-9A-Z]{5}):\s+(.*)/.exec(stderr);
-    return { ok: false, out: (err.stdout ?? '').trim(), sqlstate: m?.[1] ?? null, message: m?.[2] ?? stderr.trim() };
+    const d = /^DETAIL:\s+(.*)$/m.exec(stderr);
+    return { ok: false, out: (err.stdout ?? '').trim(), sqlstate: m?.[1] ?? null, message: m?.[2] ?? stderr.trim(), details: d?.[1] ?? null };
   }
 }
 
@@ -164,7 +167,7 @@ export function postgrestFetch(t: PgTarget, db: string, claims: Record<string, u
         return `${ident(k)} => ${val}`;
       });
       const r = run(`SELECT to_jsonb(public.${ident(fn)}(${args.join(', ')}));`);
-      if (!r.ok) return done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message }, r.message ?? undefined);
+      if (!r.ok) return done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message, details: r.details ?? null }, r.message ?? undefined);
       const line = r.out.split('\n').filter(Boolean).pop() ?? '';
       return done(200, line === '' ? null : JSON.parse(line));
     }
@@ -190,13 +193,13 @@ export function postgrestFetch(t: PgTarget, db: string, claims: Record<string, u
       const offset = u.searchParams.get('offset');
       const page = `${limit ? ` LIMIT ${Number(limit)}` : ''}${offset ? ` OFFSET ${Number(offset)}` : ''}`;
       const r = run(`SELECT coalesce(jsonb_agg(to_jsonb(q)), '[]'::jsonb) FROM (SELECT ${select} FROM public.${ident(table)}${where ? ` WHERE ${where}` : ''}${orderBy}${page}) q;`);
-      if (!r.ok) return done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message }, r.message ?? undefined);
+      if (!r.ok) return done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message, details: r.details ?? null }, r.message ?? undefined);
       return done(200, JSON.parse(r.out.split('\n').filter(Boolean).pop() ?? '[]'));
     }
 
     if (init.method === 'DELETE') {
       const r = run(`DELETE FROM public.${ident(table)} WHERE ${where};`);
-      return r.ok ? done(204) : done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message }, r.message ?? undefined);
+      return r.ok ? done(204) : done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message, details: r.details ?? null }, r.message ?? undefined);
     }
 
     const keys = Object.keys(body);
@@ -211,7 +214,7 @@ export function postgrestFetch(t: PgTarget, db: string, claims: Record<string, u
     if (init.method === 'PATCH') {
       const sets = keys.map((k) => `${ident(k)} = (${src}).${ident(k)}`).join(', ');
       const r = run(`UPDATE public.${ident(table)} SET ${sets} WHERE ${where};`);
-      return r.ok ? done(204) : done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message }, r.message ?? undefined);
+      return r.ok ? done(204) : done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message, details: r.details ?? null }, r.message ?? undefined);
     }
 
     // POST = INSERT / upsert
@@ -224,6 +227,6 @@ export function postgrestFetch(t: PgTarget, db: string, claims: Record<string, u
       onConflict = ` ON CONFLICT (${conflict.join(', ')}) DO UPDATE SET ${sets}`;
     }
     const r = run(`INSERT INTO public.${ident(table)} (${colList}) SELECT ${colList} FROM ${src}${onConflict};`);
-    return r.ok ? done(201) : done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message }, r.message ?? undefined);
+    return r.ok ? done(201) : done(statusFor(r.sqlstate), { code: r.sqlstate, message: r.message, details: r.details ?? null }, r.message ?? undefined);
   };
 }

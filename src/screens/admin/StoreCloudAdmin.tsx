@@ -698,6 +698,51 @@ function RejectedAuthPin({ eventId }: { eventId: string }) {
   );
 }
 
+/**
+ * Conta recusada porque a mesa já tinha outra conta aberta (dois aparelhos abriram a mesma
+ * mesa): os itens passam para a conta que ficou na mesa, que a nuvem já tem.
+ */
+function RejectedTableTaken({ eventId }: { eventId: string }) {
+  const move = useTcheStore((s) => s.moveRejectedOrderToTableOrder);
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2">
+      <Btn
+        onClick={() => {
+          if (!window.confirm('Passar os itens desta conta para a conta aberta da mesa? Confira com o garçom que é a mesma mesa.')) return;
+          const r = move(eventId);
+          if (r.ok) {
+            toast.success(`${r.data.items} item(ns) passados para a conta aberta da mesa.`);
+            void syncOnce();
+          } else toast.error(r.error);
+        }}
+      >
+        Passar os itens para a conta da mesa
+      </Btn>
+    </span>
+  );
+}
+
+/** Item lançado numa conta que outro aparelho já encerrou: vai para uma conta nova da mesa. */
+function RejectedLateItem({ eventId }: { eventId: string }) {
+  const move = useTcheStore((s) => s.moveLateItemsToNewOrder);
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2">
+      <Btn
+        onClick={() => {
+          if (!window.confirm('A conta já foi encerrada em outro aparelho. Abrir uma conta nova da mesma mesa com os itens que não entraram nela?')) return;
+          const r = move(eventId);
+          if (r.ok) {
+            toast.success(`${r.data.items} item(ns) numa conta nova da mesa.`);
+            void syncOnce();
+          } else toast.error(r.error);
+        }}
+      >
+        Abrir conta nova da mesa com os itens
+      </Btn>
+    </span>
+  );
+}
+
 /** Item recusado por preço diferente do cadastro: o gerente aceita com PIN e motivo. */
 function RejectedItemPrice({ eventId }: { eventId: string }) {
   const approve = useTcheStore((s) => s.approveRejectedItemPrice);
@@ -771,6 +816,7 @@ function CloudStatus() {
         <dt className="text-slate-500">Fila</dt><dd>{outbox.length} evento(s){outbox.length > 0 && ` · ${Object.entries(byTable).map(([t, n]) => `${t} ${n}`).join(', ')}`}</dd>
         <dt className="text-slate-500">Último envio</dt><dd>{status.last_success_at ? new Date(status.last_success_at).toLocaleString('pt-BR') : 'ainda não'}</dd>
         <dt className="text-slate-500">Cadastros da nuvem</dt><dd>{pull?.last_pull_at ? `lidos ${new Date(pull.last_pull_at).toLocaleString('pt-BR')}` : 'ainda não lidos'} <span className="text-xs text-slate-500">(a cada minuto, com a fila vazia)</span></dd>
+        <dt className="text-slate-500">Contas e mesas</dt><dd>{pull?.last_orders_pull_at ? `lidas ${new Date(pull.last_orders_pull_at).toLocaleString('pt-BR')}` : 'ainda não lidas'} <span className="text-xs text-slate-500">(a cada 10 s, com a fila vazia)</span></dd>
         {!online && (<><dt className="text-slate-500">Conexão</dt><dd className="text-brasa">Sem internet: a fila espera e sobe sozinha quando voltar.</dd></>)}
       </dl>
       {status.last_error && (
@@ -796,6 +842,8 @@ function CloudStatus() {
                 <b>{r.event.table}</b> {r.event.op} (registro {r.event.row_id.slice(0, 8)}…) · HTTP {r.status}: {r.message}
                 {needsManagerPin(r.event) && <RejectedAuthPin eventId={r.event.id} />}
                 {isRejectedItemPrice(r) && <RejectedItemPrice eventId={r.event.id} />}
+                {r.event.table === 'orders' && r.event.op === 'INSERT' && /TCHEFOOD_MESA_OCUPADA/.test(r.message ?? '') && <RejectedTableTaken eventId={r.event.id} />}
+                {r.event.table === 'order_items' && r.event.op === 'INSERT' && /TCHEFOOD_CONTA_ENCERRADA/.test(r.message ?? '') && <RejectedLateItem eventId={r.event.id} />}
                 {r.event.table === 'orders' && cloudDiscountOf(r.message) !== null && (
                   <AdoptCloudDiscount eventId={r.event.id} value={cloudDiscountOf(r.message)!} />
                 )}
