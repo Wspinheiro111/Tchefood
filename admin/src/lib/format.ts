@@ -233,3 +233,10 @@ export function daysBetween(a: string, b: string): number {
   const pb = Date.UTC(Number(b.slice(0, 4)), Number(b.slice(5, 7)) - 1, Number(b.slice(8, 10)));
   return Math.round((pb - pa) / 86_400_000);
 }
+
+/** Nome do contato: de 2 a 100 caracteres depois de aparar as pontas (igual ao banco). */
+export const CONTACT_NAME_MAX = 100;
+export function contactNameError(nome: string): string | null {
+  const n = nome.trim().length;
+  return n < 2 || n > CONTACT_NAME_MAX ? `Contato: de 2 a ${CONTACT_NAME_MAX} caracteres.` : null;
+}

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { MessageCircle } from 'lucide-react';
 import type { AdminClient, DueCharge } from '../lib/api';
 import { chargeMessage, dateBr, formatPhone, money, monthBr, monthStart, whatsappLink } from '../lib/format';
-import { Aviso, Erro, errorText, useLoad } from './ui';
+import { Aviso, Erro, Selo, errorText, useLoad } from './ui';
 
 // As listas usam a data do servidor (atraso e janela de 3 dias): today nas dependências faz
 // a tela reler quando o dia muda com o painel aberto.
@@ -69,12 +69,20 @@ function Lista({ titulo, itens, today, onOpenStore, vazio }: { titulo: string; i
               today,
             );
             const wa = whatsappLink(c.contact_phone, msg);
+            // Loja cancelada ou suspensa: a cobrança antiga continua em aberto, mas a mensagem
+            // pronta é o lembrete de rotina. Fica marcado para não sair por engano.
+            const alerta = c.subscription_status === 'CANCELLED' ? 'loja cancelada' : c.subscription_status === 'SUSPENDED' ? 'loja suspensa' : null;
             return (
               <li key={c.id} className="card flex flex-wrap items-center gap-3">
                 <div className="mr-auto">
                   <button type="button" className="font-semibold text-slate-900 underline-offset-2 hover:underline" onClick={() => onOpenStore(c.tenant_id)}>
                     {c.store_name}
                   </button>
+                  {c.subscription_status !== 'ACTIVE' && c.subscription_status !== 'TRIAL' && (
+                    <span className="ml-2 align-middle">
+                      <Selo status={c.subscription_status} />
+                    </span>
+                  )}
                   <p className="text-sm text-slate-600">
                     {monthBr(c.reference_month)} · {money(c.amount)} · vence {dateBr(c.due_date)}
                     {c.days_late > 0 && <span className="ml-1 font-semibold text-brasa">({c.days_late} dia(s) de atraso)</span>}
@@ -84,9 +92,12 @@ function Lista({ titulo, itens, today, onOpenStore, vazio }: { titulo: string; i
                   </p>
                 </div>
                 {wa ? (
-                  <a className="btn-verde" href={wa} target="_blank" rel="noreferrer">
-                    <MessageCircle className="h-4 w-4" /> WhatsApp
-                  </a>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {alerta && <span className="text-xs font-semibold text-brasa">{alerta}: não é lembrete de rotina, confira a mensagem antes de mandar</span>}
+                    <a className={alerta ? 'btn-secundario' : 'btn-verde'} href={wa} target="_blank" rel="noreferrer" aria-label={alerta ? `WhatsApp (${alerta})` : undefined}>
+                      <MessageCircle className="h-4 w-4" /> WhatsApp{alerta ? ` · ${alerta}` : ''}
+                    </a>
+                  </div>
                 ) : (
                   <span className="text-xs text-amber-700">WhatsApp do contato inválido: corrija na assinatura da loja.</span>
                 )}

@@ -338,6 +338,9 @@ export function createAdminClient(cfg: AdminConfig, getToken: () => Promise<stri
   }
   const rpc = <T>(fn: string, args: Record<string, unknown> = {}) => call<T>(`/rest/v1/rpc/${fn}`, args);
   const blank = (s: string | null | undefined) => (s && s.trim() ? s.trim() : null);
+  // Textos obrigatórios vão sem os espaços das pontas (o banco também apara e mede o tamanho
+  // depois de aparar; vazio continua vazio e o banco recusa com a mensagem dele).
+  const trim = (s: string | null | undefined) => (s ?? '').trim();
 
   return {
     me: () => rpc<Me>('tchefood_admin_me'),
@@ -348,8 +351,8 @@ export function createAdminClient(cfg: AdminConfig, getToken: () => Promise<stri
     chargesDue: (days) => rpc<DueCharge[]>('tchefood_admin_charges_due', { p_days: days }),
     createStore: (i) =>
       rpc<string>('tchefood_admin_create_store', {
-        p_name: i.name,
-        p_legal_name: i.legalName,
+        p_name: trim(i.name),
+        p_legal_name: trim(i.legalName),
         p_cnpj: i.cnpj,
         p_city: blank(i.city),
         p_state: blank(i.state),
@@ -357,7 +360,7 @@ export function createAdminClient(cfg: AdminConfig, getToken: () => Promise<stri
         p_monthly_price: blank(i.monthlyPrice),
         p_billing_day: i.billingDay,
         p_trial_days: i.trialDays,
-        p_contact_name: i.contactName,
+        p_contact_name: trim(i.contactName),
         p_contact_phone: i.contactPhone,
         p_contact_email: blank(i.contactEmail),
         p_notes: blank(i.notes),
@@ -370,11 +373,11 @@ export function createAdminClient(cfg: AdminConfig, getToken: () => Promise<stri
         p_status: i.status,
         p_billing_day: i.billingDay,
         p_trial_ends_on: blank(i.trialEndsOn),
-        p_contact_name: i.contactName,
+        p_contact_name: trim(i.contactName),
         p_contact_phone: i.contactPhone,
         p_contact_email: blank(i.contactEmail),
         p_notes: blank(i.notes),
-        p_reason: i.reason,
+        p_reason: trim(i.reason),
         p_expected_updated_at: i.expectedUpdatedAt,
       }),
     createCharge: (tenantId, referenceMonth, amount, dueDate, paymentLink) =>
@@ -387,9 +390,9 @@ export function createAdminClient(cfg: AdminConfig, getToken: () => Promise<stri
       }),
     generateMonth: (referenceMonth) => rpc<number>('tchefood_admin_generate_month', { p_reference_month: referenceMonth }),
     recordPayment: (chargeId, paidAmount, paidOn, method, reference) =>
-      rpc('tchefood_admin_record_payment', { p_charge: chargeId, p_paid_amount: paidAmount, p_paid_on: paidOn, p_method: method, p_reference: reference }),
+      rpc('tchefood_admin_record_payment', { p_charge: chargeId, p_paid_amount: paidAmount, p_paid_on: paidOn, p_method: method, p_reference: trim(reference) }),
     cancelCharge: async (chargeId, reason) => {
-      await rpc('tchefood_admin_cancel_charge', { p_charge: chargeId, p_reason: reason });
+      await rpc('tchefood_admin_cancel_charge', { p_charge: chargeId, p_reason: trim(reason) });
     },
     deviceAccount: (tenantId, action, email) =>
       call<DeviceAccountResult>('/functions/v1/admin-device-account', { tenant_id: tenantId, action, ...(email ? { email } : {}) }),

@@ -5,14 +5,15 @@
  * clique duplo, nova loja com CNPJ alfanumérico e telefone, e o host da senha no login.
  */
 import { StrictMode } from 'react';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AdminClient, Charge, Plan, StoreDetail as Detail, Subscription } from '../lib/api';
+import { AdminApiError, type AdminClient, type Charge, type DueCharge, type Plan, type StoreDetail as Detail, type StoreRow, type Subscription } from '../lib/api';
 import StoreDetail from '../components/StoreDetail';
 import NewStoreForm from '../components/NewStoreForm';
 import Login from '../components/Login';
 import Overview from '../components/Overview';
 import Charges from '../components/Charges';
+import Stores from '../components/Stores';
 import App from '../App';
 
 afterEach(() => {
@@ -143,7 +144,8 @@ describe('detalhe da loja', () => {
     render(<StoreDetail client={fakeClient({ saveSubscription: save2, store: async () => detail({ subscription: null, charges: [] }) })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
     await screen.findByText('Cadastrar assinatura');
     fireEvent.change(input('WhatsApp'), { target: { value: '(55) 99653-8255' } });
-    fireEvent.change(input('Motivo'), { target: { value: 'nova' } });
+    fireEvent.change(input('Contato'), { target: { value: 'Maria' } });
+    fireEvent.change(input('Motivo'), { target: { value: 'loja nova' } });
     fireEvent.click(screen.getByText('Salvar'));
     await waitFor(() => expect(save2).toHaveBeenCalledTimes(1));
     expect(save2.mock.calls[0]![1]).toMatchObject({ expectedUpdatedAt: null });
@@ -157,22 +159,30 @@ describe('detalhe da loja', () => {
       if (i.expectedUpdatedAt !== atual.updated_at) throw new Error('a assinatura mudou enquanto o formulário estava aberto; recarregue a loja');
       return atual;
     });
+    let cobranca: Charge = CHARGE;
     const client = fakeClient({
       saveSubscription: save,
-      store: async () => detail({ subscription: atual }),
-      deviceAccount: async () => ({ email: 'e', password: 'p1', user_id: 'u' }),
+      store: async () => detail({ subscription: atual, charges: [cobranca] }),
+      // O banco: pagamento de loja suspensa a reativa (e muda o updated_at da assinatura).
+      recordPayment: async () => {
+        atual = { ...SUB, status: 'ACTIVE', contact_phone: '55996538255', updated_at: T2 };
+        cobranca = { ...CHARGE, status: 'PAID', paid_on: '2026-11-14', paid_amount: 179.9, payment_method: 'PIX', payment_reference: 'E2E1' };
+        return { status: 'PAID', subscription_status: 'ACTIVE', replayed: false };
+      },
     });
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     render(<StoreDetail client={client} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
     fireEvent.click(await screen.findByText('Alterar'));
     fireEvent.change(input('WhatsApp'), { target: { value: '(11) 3333-4444' } });
     fireEvent.change(input('Motivo'), { target: { value: 'troca' } });
     expect(screen.queryByText(/mudou enquanto você editava/)).toBeNull();
 
-    // Um pagamento reativou a loja; outra ação da tela recarrega a loja.
-    atual = { ...SUB, status: 'ACTIVE', contact_phone: '55996538255', updated_at: T2 };
-    fireEvent.click(screen.getByText('Trocar senha'));
+    // Um pagamento registrado nesta tela reativa a loja e recarrega a assinatura.
+    fireEvent.click(screen.getByText('Registrar pagamento'));
+    fireEvent.change(screen.getByLabelText('Referência do comprovante'), { target: { value: 'E2E1' } });
+    fireEvent.click(screen.getByText('Confirmar pagamento'));
     expect(await screen.findByText(/mudou enquanto você editava/)).toBeTruthy();
+    // O aviso não põe a culpa só num pagamento: outra aba ou outra pessoa também mudam a assinatura.
+    expect(screen.getByText(/mudou enquanto você editava/).textContent).toMatch(/outra aba ou por outra pessoa/);
     expect(input('WhatsApp').value).toBe('(11) 3333-4444');
 
     fireEvent.click(screen.getByText('Salvar'));
@@ -249,6 +259,198 @@ describe('detalhe da loja', () => {
     expect(cancel).toHaveBeenCalledTimes(1);
     await act(async () => fim());
     await screen.findByText('Cancelar');
+  });
+});
+
+describe('revisão: cobranças, conta do aparelho e validações', () => {
+  const ROW: StoreRow = {
+    tenant_id: 't1', name: 'Flip', legal_name: 'Flip Ltda', cnpj: '12ABC34501DE35', city: 'Santo Ângelo', state: 'RS', created_at: '', subscription: SUB,
+    open_count: 0, open_amount: 0, overdue_count: 0, overdue_amount: 0, oldest_overdue_due: null, last_sale_at: null, last_order_opened_at: null, orders_7d: 0,
+    staff_active: 1,
+  };
+  const due = (over: Partial<DueCharge>): DueCharge => ({
+    id: 'd', tenant_id: 't1', store_name: 'Flip', reference_month: '2026-11-01', amount: 179.9, due_date: '2026-11-10', days_late: 4, payment_link: null,
+    contact_name: 'Maria', contact_phone: '55996538255', subscription_status: 'ACTIVE', ...over,
+  });
+
+  it('vencimento vazio: a dica diz que nunca fica antes de hoje nem do fim do teste', async () => {
+    render(<StoreDetail client={fakeClient()} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    expect(await screen.findByText('Vazio = dia 10, nunca antes de hoje nem antes do fim do teste.')).toBeTruthy();
+  });
+
+  it('cobranças do dia: loja cancelada ou suspensa aparece com a situação e o WhatsApp marcado', async () => {
+    const chargesDue = async () => [
+      due({ id: 'a', store_name: 'Ativa', subscription_status: 'ACTIVE' }),
+      due({ id: 'b', store_name: 'Cancelada Ltda', subscription_status: 'CANCELLED' }),
+      due({ id: 'c', store_name: 'Suspensa Ltda', subscription_status: 'SUSPENDED' }),
+    ];
+    render(<Charges client={fakeClient({ chargesDue })} today="2026-11-14" onOpenStore={() => {}} />);
+    await screen.findByText('Ativa');
+    const item = (nome: string) => screen.getByText(nome).closest('li')!;
+    expect(item('Ativa').textContent).not.toMatch(/loja (cancelada|suspensa)/);
+    expect(within(item('Ativa')).queryByText('Ativa', { selector: 'span' })).toBeNull();
+    expect(within(item('Cancelada Ltda')).getByText('Cancelada', { selector: 'span' })).toBeTruthy();
+    expect(item('Cancelada Ltda').textContent).toMatch(/loja cancelada: não é lembrete de rotina/);
+    expect(within(item('Suspensa Ltda')).getByText('Suspensa', { selector: 'span' })).toBeTruthy();
+    expect(item('Suspensa Ltda').textContent).toMatch(/loja suspensa: não é lembrete de rotina/);
+  });
+
+  it('lista de lojas: o nome é um botão (teclado) que abre a loja', async () => {
+    const abrir = vi.fn();
+    render(<Stores client={fakeClient({ stores: async () => [ROW] })} today="2026-11-14" onOpenStore={abrir} />);
+    const btn = await screen.findByRole('button', { name: 'Flip' });
+    fireEvent.click(btn);
+    expect(abrir).toHaveBeenCalledTimes(1);
+    expect(abrir).toHaveBeenCalledWith('t1');
+  });
+
+  it('conta do aparelho: sem conexão avisa que a senha nova pode ter se perdido e relê a loja', async () => {
+    const store = vi.fn(async () => detail());
+    const reset = vi.fn(async () => {
+      throw new AdminApiError('Sem conexão com o servidor. Confira se a ação foi registrada antes de repetir.', 0);
+    });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<StoreDetail client={fakeClient({ store, deviceAccount: reset })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    fireEvent.click(await screen.findByText('Trocar senha'));
+    expect(await screen.findByText(/a senha nova se perdeu/)).toBeTruthy();
+    expect(screen.getByText(/a senha nova se perdeu/).textContent).toMatch(/"Trocar senha" para gerar outra/);
+    await waitFor(() => expect(store).toHaveBeenCalledTimes(2));
+  });
+
+  it('copiar a senha: diz "copiado" ou mostra o erro (sem área de transferência ou recusada)', async () => {
+    const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    const setClip = (v: unknown) => Object.defineProperty(navigator, 'clipboard', { value: v, configurable: true });
+    try {
+      const write = vi.fn(async (_t: string) => {});
+      setClip({ writeText: write });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      render(<StoreDetail client={fakeClient({ deviceAccount: async () => ({ email: 'e', password: 'senha-1', user_id: 'u' }) })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+      fireEvent.click(await screen.findByText('Trocar senha'));
+      await screen.findByText('senha-1');
+      fireEvent.click(screen.getByText('copiar'));
+      expect(await screen.findByText('copiado')).toBeTruthy();
+      expect(write).toHaveBeenCalledWith('senha-1');
+
+      setClip({ writeText: async () => Promise.reject(new Error('negado')) });
+      fireEvent.click(screen.getByText('copiar'));
+      expect(await screen.findByText(/Não deu para copiar/)).toBeTruthy();
+      expect(screen.queryByText('copiado')).toBeNull();
+
+      setClip(undefined);
+      fireEvent.click(screen.getByText('copiar'));
+      expect(await screen.findByText(/Não deu para copiar/)).toBeTruthy();
+    } finally {
+      if (original) Object.defineProperty(navigator, 'clipboard', original);
+      else delete (navigator as { clipboard?: unknown }).clipboard;
+    }
+  });
+
+  it('erro ao criar, cancelar ou pagar cobrança relê a loja', async () => {
+    const store = vi.fn(async () => detail());
+    const falha = async () => {
+      throw new Error('recusado pelo banco');
+    };
+    vi.spyOn(window, 'prompt').mockReturnValue('duplicada');
+    render(<StoreDetail client={fakeClient({ store, createCharge: falha, cancelCharge: falha, recordPayment: falha })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    fireEvent.click(await screen.findByText('Criar cobrança'));
+    await screen.findByText('recusado pelo banco');
+    await waitFor(() => expect(store).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByText('Cancelar'));
+    await waitFor(() => expect(store).toHaveBeenCalledTimes(3));
+
+    fireEvent.click(screen.getByText('Registrar pagamento'));
+    fireEvent.change(screen.getByLabelText('Referência do comprovante'), { target: { value: 'E2E123' } });
+    fireEvent.click(screen.getByText('Confirmar pagamento'));
+    await waitFor(() => expect(store).toHaveBeenCalledTimes(4));
+    // O formulário de pagamento continua aberto com o erro.
+    expect(screen.getByText('Confirmar pagamento')).toBeTruthy();
+    expect(screen.getAllByText('recusado pelo banco').length).toBeGreaterThan(0);
+  });
+
+  it('validações iguais às do banco: referência, motivos, contato e link', async () => {
+    const pay = vi.fn();
+    const cancel = vi.fn();
+    const create = vi.fn();
+    const save = vi.fn();
+    const prompt = vi.spyOn(window, 'prompt').mockReturnValue(' abc ');
+    render(<StoreDetail client={fakeClient({ recordPayment: pay, cancelCharge: cancel, createCharge: create, saveSubscription: save })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+
+    // Referência do comprovante: 4 a 120 caracteres.
+    fireEvent.click(await screen.findByText('Registrar pagamento'));
+    const ref = input('Referência do comprovante');
+    expect(ref.minLength).toBe(4);
+    expect(ref.maxLength).toBe(120);
+    fireEvent.change(ref, { target: { value: ' ab ' } });
+    fireEvent.submit(ref.form!);
+    expect(await screen.findByText(/Referência do comprovante: de 4 a 120 caracteres/)).toBeTruthy();
+    fireEvent.change(ref, { target: { value: 'x'.repeat(121) } });
+    fireEvent.submit(ref.form!);
+    expect(await screen.findByText(/Referência do comprovante: de 4 a 120 caracteres/)).toBeTruthy();
+    expect(pay).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText('Voltar'));
+
+    // Motivo do cancelamento: pelo menos 5 letras.
+    fireEvent.click(screen.getByText('Cancelar'));
+    expect(await screen.findByText(/motivo do cancelamento \(pelo menos 5 letras\)/)).toBeTruthy();
+    expect(cancel).not.toHaveBeenCalled();
+    prompt.mockReturnValue('duplicada');
+
+    // Link de pagamento: https://, sem espaços, até 500.
+    const link = input('Link do boleto/Pix (Asaas)');
+    expect(link.maxLength).toBe(500);
+    for (const v of ['http://asaas.com/x', 'https://asaas.com/a b', `https://${'a'.repeat(493)}`]) {
+      fireEvent.change(link, { target: { value: v } });
+      fireEvent.submit(link.form!);
+      expect(await screen.findByText(/precisa começar com https:\/\/, sem espaços, com até 500 caracteres/)).toBeTruthy();
+    }
+    expect(create).not.toHaveBeenCalled();
+
+    // Assinatura: motivo com pelo menos 5 letras e contato de 2 a 100.
+    fireEvent.click(screen.getByText('Alterar'));
+    const contato = input('Contato');
+    expect(contato.maxLength).toBe(100);
+    fireEvent.change(input('Motivo'), { target: { value: ' ab  ' } });
+    fireEvent.click(screen.getByText('Salvar'));
+    expect(await screen.findByText(/motivo da alteração \(pelo menos 5 letras\)/)).toBeTruthy();
+    fireEvent.change(input('Motivo'), { target: { value: 'troca de dia' } });
+    fireEvent.change(contato, { target: { value: 'x'.repeat(101) } });
+    fireEvent.click(screen.getByText('Salvar'));
+    expect(await screen.findByText(/Contato: de 2 a 100 caracteres/)).toBeTruthy();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('nova loja: contato com até 100 caracteres', async () => {
+    const create = vi.fn();
+    render(<NewStoreForm client={fakeClient({ createStore: create })} onCancel={() => {}} onCreated={() => {}} />);
+    const byLabel = (t: string) => [...document.querySelectorAll('label')].find((l) => l.textContent?.startsWith(t))!.querySelector('input')!;
+    fireEvent.change(byLabel('Nome da loja'), { target: { value: 'Flip' } });
+    fireEvent.change(byLabel('Razão social'), { target: { value: 'Flip Ltda' } });
+    fireEvent.change(byLabel('CNPJ'), { target: { value: '11.444.777/0001-61' } });
+    fireEvent.change(byLabel('WhatsApp do contato'), { target: { value: '(55) 99653-8255' } });
+    const contato = byLabel('Contato');
+    expect(contato.maxLength).toBe(100);
+    fireEvent.change(contato, { target: { value: 'x'.repeat(101) } });
+    fireEvent.submit(contato.form!);
+    expect(await screen.findByText(/Contato: de 2 a 100 caracteres/)).toBeTruthy();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('assinatura cancelada: o aviso e a confirmação dizem que as cobranças em aberto dos meses seguintes são canceladas', async () => {
+    const save = vi.fn(async () => SUB);
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(<StoreDetail client={fakeClient({ saveSubscription: save })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    fireEvent.click(await screen.findByText('Alterar'));
+    fireEvent.change(screen.getByLabelText('Situação'), { target: { value: 'CANCELLED' } });
+    expect(screen.getByText(/cobranças em aberto de meses depois de novembro\/2026 também são canceladas/i)).toBeTruthy();
+    fireEvent.change(input('Motivo'), { target: { value: 'loja fechou' } });
+    fireEvent.click(screen.getByText('Salvar'));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm.mock.calls[0]![0]).toMatch(/cobranças em aberto de meses depois de novembro\/2026 também vão ser canceladas/i);
+    expect(save).not.toHaveBeenCalled();
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByText('Salvar'));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
   });
 });
 

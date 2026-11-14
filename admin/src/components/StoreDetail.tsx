@@ -1,8 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { ArrowLeft, Copy, KeyRound, MessageCircle } from 'lucide-react';
-import type { AdminClient, Charge, DeviceAccountResult, PaymentMethod, Plan, StoreDetail as Detail, SubscriptionStatus } from '../lib/api';
+import { AdminApiError, type AdminClient, type Charge, type DeviceAccountResult, type PaymentMethod, type Plan, type StoreDetail as Detail, type SubscriptionStatus } from '../lib/api';
 import {
-  METHOD_LABEL, STATUS_LABEL, chargeMessage, dateBr, dateTimeBr, daysBetween, formatCnpj, formatPhone, money, monthBr, monthStart,
+  CONTACT_NAME_MAX, METHOD_LABEL, STATUS_LABEL, chargeMessage, contactNameError, dateBr, dateTimeBr, daysBetween, formatCnpj, formatPhone, money, monthBr, monthStart,
   moneyInputError, parseMoneyInput, priceInput, suggestedDeviceEmail, toCents, validMonthInput, validPhone, whatsappLink,
 } from '../lib/format';
 import { Aviso, Campo, Erro, Numero, Selo, errorText, useLoad } from './ui';
@@ -38,7 +38,7 @@ export default function StoreDetail({ client, tenantId, today, onBack }: { clien
             <Numero titulo="Pedidos em 30 dias" valor={String(data.orders_30d)} />
             <Numero titulo="Equipe ativa" valor={String(data.staff_active)} />
           </div>
-          <SubscriptionForm client={client} detail={data} plans={plans.data ?? []} onChanged={reload} />
+          <SubscriptionForm client={client} detail={data} plans={plans.data ?? []} today={today} onChanged={reload} />
           {data.subscription && <DeviceAccount client={client} detail={data} onChanged={reload} />}
           {data.subscription && <ChargesSection client={client} detail={data} today={today} onChanged={reload} />}
           <section className="card space-y-2">
@@ -75,7 +75,15 @@ const ACTION_LABEL: Record<string, string> = {
   DEVICE_PASSWORD_RESET: 'Senha do aparelho trocada',
 };
 
-function SubscriptionForm({ client, detail, plans, onChanged }: { client: AdminClient; detail: Detail; plans: Plan[]; onChanged: () => void }) {
+// Mesmos limites do banco (db/schema_painel_admin.sql), medidos depois de aparar as pontas.
+const MOTIVO_MIN = 5;
+function paymentLinkError(link: string): string | null {
+  const l = link.trim();
+  if (!l) return null;
+  return /^https:\/\/\S+$/.test(l) && l.length <= 500 ? null : 'O link de pagamento precisa começar com https://, sem espaços, com até 500 caracteres.';
+}
+
+function SubscriptionForm({ client, detail, plans, today, onChanged }: { client: AdminClient; detail: Detail; plans: Plan[]; today: string; onChanged: () => void }) {
   const s = detail.subscription;
   const initial = () => ({
     planId: s?.plan_id ?? 'salao-pro',
@@ -105,8 +113,9 @@ function SubscriptionForm({ client, detail, plans, onChanged }: { client: AdminC
     setF(initial());
     setBase(s?.updated_at ?? null);
   }, [detail]);
-  // A loja recarregou com a assinatura mudada (ex.: um pagamento a reativou): o que está no
-  // formulário partiu de valores velhos e o banco vai recusar.
+  // A loja recarregou com a assinatura mudada (outra aba, outra pessoa, ou um pagamento que a
+  // reativou): o que está no formulário partiu de valores velhos e o banco vai recusar. As
+  // ações da conta do aparelho não mexem no updated_at da assinatura.
   const mudou = editando && (s?.updated_at ?? null) !== base;
   const recomecar = () => {
     setF(initial());
@@ -126,6 +135,11 @@ function SubscriptionForm({ client, detail, plans, onChanged }: { client: AdminC
     const price = parseMoneyInput(f.price || (plans.find((p) => p.id === f.planId)?.monthly_price.toFixed(2) ?? ''));
     if (price === null) return setErro(moneyInputError(f.price, 'Mensalidade inválida (ex.: 199,90).'));
     if (!validPhone(f.contactPhone)) return setErro('WhatsApp inválido: use DDD + número, com 10 ou 11 dígitos (ex.: (55) 99653-8255), com ou sem o 55 na frente.');
+    const contato = contactNameError(f.contactName);
+    if (contato) return setErro(contato);
+    if (f.reason.trim().length < MOTIVO_MIN) return setErro(`Informe o motivo da alteração (pelo menos ${MOTIVO_MIN} letras).`);
+    // Cancelar a assinatura também cancela, no banco, as cobranças em aberto dos meses seguintes.
+    if (f.status === 'CANCELLED' && s?.status !== 'CANCELLED' && !window.confirm(`Cancelar a assinatura? As cobranças em aberto de meses depois de ${monthBr(monthStart(today))} também vão ser canceladas; as de ${monthBr(monthStart(today))} e de antes continuam em aberto.`)) return;
     setEnviando(true);
     try {
       await client.saveSubscription(detail.tenant_id, {
@@ -181,7 +195,7 @@ function SubscriptionForm({ client, detail, plans, onChanged }: { client: AdminC
       {mudou && (
         <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900" role="alert">
           <p>
-            A assinatura desta loja mudou enquanto você editava (por exemplo, um pagamento registrado a reativou). Salvar vai ser recusado: descarte o que
+            A assinatura desta loja mudou enquanto você editava (alterada em outra aba ou por outra pessoa, ou reativada por um pagamento registrado). Salvar vai ser recusado: descarte o que
             digitou e recarregue os valores atuais antes de alterar.
           </p>
           <button type="button" className="btn-secundario" onClick={recomecar}>Descartar e recarregar</button>
@@ -198,8 +212,11 @@ function SubscriptionForm({ client, detail, plans, onChanged }: { client: AdminC
         <Campo rotulo="Mensalidade" dica="Vazio = preço do plano. Zero = cortesia.">
           <input className="campo" aria-label="Mensalidade" inputMode="decimal" value={f.price} onChange={set('price')} />
         </Campo>
-        <Campo rotulo="Situação">
-          <select className="campo" value={f.status} onChange={set('status')}>
+        <Campo
+          rotulo="Situação"
+          dica={f.status === 'CANCELLED' && s?.status !== 'CANCELLED' ? `Ao salvar, as cobranças em aberto de meses depois de ${monthBr(monthStart(today))} também são canceladas.` : undefined}
+        >
+          <select className="campo" aria-label="Situação" value={f.status} onChange={set('status')}>
             {(['TRIAL', 'ACTIVE', 'SUSPENDED', 'CANCELLED'] as const).map((st) => (
               <option key={st} value={st}>{STATUS_LABEL[st]}</option>
             ))}
@@ -207,12 +224,12 @@ function SubscriptionForm({ client, detail, plans, onChanged }: { client: AdminC
         </Campo>
         <Campo rotulo="Dia de vencimento (1 a 28)"><input className="campo" type="number" min={1} max={28} value={f.billingDay} onChange={set('billingDay')} /></Campo>
         <Campo rotulo="Fim do teste"><input className="campo" type="date" value={f.trialEndsOn} onChange={set('trialEndsOn')} /></Campo>
-        <Campo rotulo="Contato"><input className="campo" value={f.contactName} onChange={set('contactName')} /></Campo>
+        <Campo rotulo="Contato"><input className="campo" aria-label="Contato" minLength={2} maxLength={CONTACT_NAME_MAX} value={f.contactName} onChange={set('contactName')} /></Campo>
         <Campo rotulo="WhatsApp (com DDD)"><input className="campo" aria-label="WhatsApp" inputMode="tel" value={f.contactPhone} onChange={set('contactPhone')} /></Campo>
         <Campo rotulo="E-mail"><input className="campo" value={f.contactEmail} onChange={set('contactEmail')} /></Campo>
         <Campo rotulo="Observações"><input className="campo" value={f.notes} onChange={set('notes')} /></Campo>
       </div>
-      <Campo rotulo="Motivo da alteração (obrigatório)"><input className="campo" aria-label="Motivo" value={f.reason} onChange={set('reason')} placeholder="ex.: cliente pediu para trocar o vencimento" /></Campo>
+      <Campo rotulo="Motivo da alteração (obrigatório)"><input className="campo" aria-label="Motivo" minLength={MOTIVO_MIN} value={f.reason} onChange={set('reason')} placeholder="ex.: cliente pediu para trocar o vencimento" /></Campo>
       <Erro>{erro}</Erro>
       <div className="flex gap-2">
         <button type="submit" className="btn-primario" disabled={enviando}>{enviando ? 'Salvando…' : 'Salvar'}</button>
@@ -228,13 +245,26 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
   const [res, setRes] = useState<(DeviceAccountResult & { action: 'create' | 'reset_password' }) | null>(null);
   const [erro, setErro] = useState<string | null>(null);
   const [enviando, setEnviando] = useState(false);
+  const [copia, setCopia] = useState<'ok' | 'erro' | null>(null);
   const pronta = s.device_status === 'READY';
+
+  async function copiar(senha: string) {
+    setCopia(null);
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('sem área de transferência');
+      await navigator.clipboard.writeText(senha);
+      setCopia('ok');
+    } catch {
+      setCopia('erro');
+    }
+  }
 
   async function run(action: 'create' | 'reset_password') {
     // Desistiu da troca: a senha que está na tela (mostrada uma vez só) fica.
     if (action === 'reset_password' && !window.confirm('Trocar a senha do aparelho? O aparelho da loja vai precisar entrar de novo em Retaguarda › Nuvem com a senha nova.')) return;
     // A senha de antes some já: nunca fica ao lado de um erro novo.
     setRes(null);
+    setCopia(null);
     setErro(null);
     setEnviando(true);
     try {
@@ -242,7 +272,13 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
       setRes({ ...r, action });
       onChanged();
     } catch (e) {
-      setErro(errorText(e));
+      // Sem conexão: a ação pode ter chegado ao servidor e só a resposta (com a senha, que não
+      // fica guardada em lugar nenhum) se perdeu.
+      setErro(
+        e instanceof AdminApiError && e.status === 0
+          ? `Sem conexão com o servidor. Se ${action === 'create' ? 'a conta foi criada' : 'a senha foi trocada'}, a senha nova se perdeu (ela só aparece uma vez): use "Trocar senha" para gerar outra.`
+          : errorText(e),
+      );
       // Relê a loja: os botões passam a refletir o estado real (ex.: 409 "já tem conta").
       onChanged();
     } finally {
@@ -269,10 +305,12 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
           <p>E-mail: <code>{res.email}</code></p>
           <p>
             Senha: <code className="text-base font-bold">{res.password}</code>
-            <button type="button" className="ml-2 inline-flex items-center gap-1 text-xs underline" onClick={() => void navigator.clipboard?.writeText(res.password)}>
+            <button type="button" className="ml-2 inline-flex items-center gap-1 text-xs underline" onClick={() => void copiar(res.password)}>
               <Copy className="h-3 w-3" /> copiar
             </button>
+            {copia === 'ok' && <span className="ml-2 text-xs font-semibold text-green-800" role="status">copiado</span>}
           </p>
+          {copia === 'erro' && <p className="text-xs font-semibold text-red-800" role="alert">Não deu para copiar (o navegador não deixou): selecione a senha e copie à mão, ou anote.</p>}
           {res.action === 'reset_password' && (
             <p className="text-slate-700">O aparelho que estava conectado continua até o token atual vencer (até 1 hora); entre com a senha nova nele.</p>
           )}
@@ -316,6 +354,8 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
     if (!validMonthInput(mes)) return setErro('Mês inválido: use AAAA-MM (ex.: 2026-11).');
     const amount = valor.trim() ? parseMoneyInput(valor) : null;
     if (valor.trim() && amount === null) return setErro(moneyInputError(valor, 'Valor inválido (ex.: 199,90).'));
+    const erroLink = paymentLinkError(link);
+    if (erroLink) return setErro(erroLink);
     setEnviando(true);
     try {
       await client.createCharge(detail.tenant_id, `${mes}-01`, amount, vence || null, link || null);
@@ -325,6 +365,9 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
       onChanged();
     } catch (e) {
       setErro(errorText(e));
+      // Relê a loja (sem apagar o formulário): a lista mostra o que o banco tem de fato antes
+      // de tentar de novo (ex.: a cobrança foi criada e só a resposta se perdeu).
+      onChanged();
     } finally {
       setEnviando(false);
     }
@@ -335,12 +378,14 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
     const motivo = window.prompt(`Motivo para cancelar a cobrança de ${monthBr(c.reference_month)} (${money(c.amount)}):`);
     if (motivo === null) return;
     setErro(null);
+    if (motivo.trim().length < MOTIVO_MIN) return setErro(`Informe o motivo do cancelamento (pelo menos ${MOTIVO_MIN} letras).`);
     setCancelando(c.id);
     try {
       await client.cancelCharge(c.id, motivo);
       onChanged();
     } catch (e) {
       setErro(errorText(e));
+      onChanged();
     } finally {
       setCancelando(null);
     }
@@ -363,8 +408,8 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
               required
             /></Campo>
           <Campo rotulo="Valor" dica={`Vazio = ${money(s.monthly_price)}`}><input className="campo" aria-label="Valor" inputMode="decimal" value={valor} onChange={(e) => setValor(e.target.value)} /></Campo>
-          <Campo rotulo="Vencimento" dica={`Vazio = dia ${s.billing_day}`}><input className="campo" type="date" value={vence} onChange={(e) => setVence(e.target.value)} /></Campo>
-          <Campo rotulo="Link do boleto/Pix (Asaas)"><input className="campo" placeholder="https://…" value={link} onChange={(e) => setLink(e.target.value)} /></Campo>
+          <Campo rotulo="Vencimento" dica={`Vazio = dia ${s.billing_day}, nunca antes de hoje nem antes do fim do teste.`}><input className="campo" type="date" value={vence} onChange={(e) => setVence(e.target.value)} /></Campo>
+          <Campo rotulo="Link do boleto/Pix (Asaas)"><input className="campo" aria-label="Link do boleto/Pix (Asaas)" placeholder="https://…" maxLength={500} value={link} onChange={(e) => setLink(e.target.value)} /></Campo>
           <button type="submit" className="btn-primario sm:mt-5" disabled={enviando}>Criar cobrança</button>
         </form>
       )}
@@ -427,6 +472,7 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
                             onChanged();
                           }}
                           onCancel={() => setPagando(null)}
+                          onFailed={onChanged}
                         />
                       )}
                     </td>
@@ -441,7 +487,10 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
   );
 }
 
-function PaymentForm({ client, charge, today, onDone, onCancel }: { client: AdminClient; charge: Charge; today: string; onDone: () => void; onCancel: () => void }) {
+const REF_MIN = 4;
+const REF_MAX = 120;
+
+function PaymentForm({ client, charge, today, onDone, onCancel, onFailed }: { client: AdminClient; charge: Charge; today: string; onDone: () => void; onCancel: () => void; onFailed: () => void }) {
   const [valor, setValor] = useState(charge.amount.toFixed(2).replace('.', ','));
   const [data, setData] = useState(today);
   const [forma, setForma] = useState<PaymentMethod>('PIX');
@@ -455,12 +504,17 @@ function PaymentForm({ client, charge, today, onDone, onCancel }: { client: Admi
     const pago = parseMoneyInput(valor);
     if (pago === null) return setErro(moneyInputError(valor, 'Valor inválido.'));
     if (toCents(pago) !== toCents(charge.amount)) return setErro(`O valor pago precisa ser o da cobrança (${money(charge.amount)}). Valor diferente: cancele e crie outra cobrança.`);
+    const r = ref.trim();
+    if (r.length < REF_MIN || r.length > REF_MAX) return setErro(`Referência do comprovante: de ${REF_MIN} a ${REF_MAX} caracteres (id do Pix, nosso número, nº do recibo).`);
     setEnviando(true);
     try {
-      await client.recordPayment(charge.id, pago, data, forma, ref);
+      await client.recordPayment(charge.id, pago, data, forma, r);
       onDone();
     } catch (e) {
       setErro(errorText(e));
+      // Relê a loja com o formulário aberto: se o pagamento entrou e só a resposta se perdeu,
+      // a linha já mostra a cobrança paga antes de tentar de novo.
+      onFailed();
     } finally {
       setEnviando(false);
     }
@@ -479,7 +533,7 @@ function PaymentForm({ client, charge, today, onDone, onCancel }: { client: Admi
           </select>
         </Campo>
         <Campo rotulo="Referência do comprovante" dica="id do Pix (E2E), nosso número, nº do recibo">
-          <input className="campo" value={ref} onChange={(e) => setRef(e.target.value)} required />
+          <input className="campo" aria-label="Referência do comprovante" minLength={REF_MIN} maxLength={REF_MAX} value={ref} onChange={(e) => setRef(e.target.value)} required />
         </Campo>
       </div>
       <Erro>{erro}</Erro>

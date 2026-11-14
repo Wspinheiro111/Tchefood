@@ -71,4 +71,23 @@ describe('cliente do painel', () => {
     expect(l.status).toBe(0);
     expect(l.message).toMatch(/^Sem conexão com o servidor/);
   });
+
+  it('tira os espaços das pontas dos textos antes de mandar (nomes, contato, motivo, referência)', async () => {
+    const f = fakeFetch([{ status: 200, body: 'id' }, { status: 200, body: {} }, { status: 200, body: {} }, { status: 200, body: null }]);
+    const c = createAdminClient(CFG, async () => 'tok', f.fetch);
+    await c.createStore({
+      name: '  Flip ', legalName: ' Flip Ltda\u00a0', cnpj: '12ABC34501DE35', city: ' ', state: 'RS', planId: 'salao-pro', monthlyPrice: null,
+      billingDay: 10, trialDays: 15, contactName: ' Maria  ', contactPhone: '55996538255', contactEmail: '', notes: '  obs ',
+    });
+    expect(f.calls[0]!.body).toMatchObject({ p_name: 'Flip', p_legal_name: 'Flip Ltda', p_city: null, p_contact_name: 'Maria', p_contact_email: null, p_notes: 'obs' });
+    await c.saveSubscription('t', {
+      planId: 'salao-pro', monthlyPrice: '199.90', status: 'ACTIVE', billingDay: 10, trialEndsOn: null, contactName: ' Maria ', contactPhone: '55996538255',
+      contactEmail: ' ', notes: ' ', reason: '  troca de dia ', expectedUpdatedAt: null,
+    });
+    expect(f.calls[1]!.body).toMatchObject({ p_contact_name: 'Maria', p_contact_email: null, p_notes: null, p_reason: 'troca de dia' });
+    await c.recordPayment('ch', '199.90', '2026-11-14', 'PIX', '  E2E123 ');
+    expect(f.calls[2]!.body).toMatchObject({ p_reference: 'E2E123' });
+    await c.cancelCharge('ch', ' duplicada ');
+    expect(f.calls[3]!.body).toEqual({ p_charge: 'ch', p_reason: 'duplicada' });
+  });
 });

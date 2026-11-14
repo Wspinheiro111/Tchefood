@@ -76,7 +76,17 @@ export default function Stores({ client, today, onOpenStore }: { client: AdminCl
               {lista.map((r) => (
                 <tr key={r.tenant_id} className="cursor-pointer hover:bg-surface" onClick={() => onOpenStore(r.tenant_id)}>
                   <td>
-                    <p className="font-semibold text-slate-900">{r.name}</p>
+                    {/* Botão de verdade: abre a loja pelo teclado (Tab + Enter); o clique na linha continua valendo. */}
+                    <button
+                      type="button"
+                      className="text-left font-semibold text-slate-900 underline-offset-2 hover:underline"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenStore(r.tenant_id);
+                      }}
+                    >
+                      {r.name}
+                    </button>
                     <p className="text-xs text-slate-500">
                       {formatCnpj(r.cnpj)} · {r.city ?? '—'}/{r.state ?? '—'}
                     </p>

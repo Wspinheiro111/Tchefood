@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import type { AdminClient, Plan } from '../lib/api';
-import { cleanCnpj, money, moneyInputError, parseMoneyInput, validCnpj, validPhone } from '../lib/format';
+import { CONTACT_NAME_MAX, cleanCnpj, contactNameError, money, moneyInputError, parseMoneyInput, validCnpj, validPhone } from '../lib/format';
 import { Campo, Erro, errorText, useLoad } from './ui';
 
 export default function NewStoreForm({ client, onCancel, onCreated }: { client: AdminClient; onCancel: () => void; onCreated: (id: string) => void }) {
@@ -18,6 +18,8 @@ export default function NewStoreForm({ client, onCancel, onCreated }: { client: 
     setErro(null);
     if (!validCnpj(f.cnpj)) return setErro('CNPJ inválido.');
     if (!validPhone(f.contactPhone)) return setErro('WhatsApp inválido: use DDD + número, com 10 ou 11 dígitos (ex.: (55) 99653-8255), com ou sem o 55 na frente.');
+    const contato = contactNameError(f.contactName);
+    if (contato) return setErro(contato);
     const price = f.price.trim() ? parseMoneyInput(f.price) : null;
     if (f.price.trim() && price === null) return setErro(moneyInputError(f.price, 'Preço inválido (ex.: 199,90).'));
     setEnviando(true);
@@ -59,7 +61,7 @@ export default function NewStoreForm({ client, onCancel, onCreated }: { client: 
         </Campo>
         <Campo rotulo="Dia de vencimento (1 a 28)"><input className="campo" type="number" min={1} max={28} value={f.billingDay} onChange={set('billingDay')} required /></Campo>
         <Campo rotulo="Dias de teste" dica="0 = começa ativa."><input className="campo" type="number" min={0} max={90} value={f.trialDays} onChange={set('trialDays')} required /></Campo>
-        <Campo rotulo="Contato (responsável)"><input className="campo" value={f.contactName} onChange={set('contactName')} required /></Campo>
+        <Campo rotulo="Contato (responsável)"><input className="campo" minLength={2} maxLength={CONTACT_NAME_MAX} value={f.contactName} onChange={set('contactName')} required /></Campo>
         <Campo rotulo="WhatsApp do contato" dica="Com DDD."><input className="campo" inputMode="tel" value={f.contactPhone} onChange={set('contactPhone')} required /></Campo>
         <Campo rotulo="E-mail do contato"><input className="campo" type="email" value={f.contactEmail} onChange={set('contactEmail')} /></Campo>
         <Campo rotulo="Observações"><input className="campo" value={f.notes} onChange={set('notes')} /></Campo>
