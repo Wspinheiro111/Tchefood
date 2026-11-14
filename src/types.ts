@@ -444,7 +444,10 @@ export type AuditActionType =
   | 'CASH_WITHDRAWAL'
   | 'CASH_CLOSE_DIFFERENCE'
   // Item com preço diferente do cadastro aceito com PIN de gerente (db/schema_preco_gerente.sql)
-  | 'PRICE_OVERRIDE';
+  | 'PRICE_OVERRIDE'
+  // Reserva liberada pelo gerente com a maquininha aprovada: o caixa estornou na maquininha (só local;
+  // o servidor ainda não aceita este tipo em audit_logs).
+  | 'CLAIM_RELEASED_REFUNDED';
 
 export interface AuditLog {
   id: UUID;

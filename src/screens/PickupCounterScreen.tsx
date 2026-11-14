@@ -6,8 +6,8 @@ import { computeItemTotal, formatBRL, round2 } from '../lib/money';
 import { FULFILLMENT_LABEL, formatPickupNumber, kioskStage, kioskTableIds, brasiliaDate, type KioskStage } from '../lib/kiosk';
 import { chargePickupOrder, finishPaidPickup, printPickupKitchen, printPickupReceipt } from '../lib/pickupCharge';
 import { useTerminalBus, type Chassis } from '../lib/payments/drivers';
-import { getReviewHold } from '../lib/payments/reviewHolds';
-import { HoldNotChargedButton, StuckClaimsPanel, useOrderClaims } from '../components/StuckClaims';
+import { getReviewHold, subscribeReviewHolds } from '../lib/payments/reviewHolds';
+import { HoldNotChargedButton, RefundedAtTerminalButton, StuckClaimsPanel, useOrderClaims } from '../components/StuckClaims';
 import { ProductSheet } from '../components/ProductSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
@@ -375,6 +375,10 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
   const [cashGiven, setCashGiven] = useState('');
   const [busy, setBusy] = useState(false);
   const [hold, setHold] = useState(() => getReviewHold(orderId));
+  // Trava criada fora da tela (reserva liberada antes do pagamento chegar ao servidor): aparece na hora.
+  useEffect(() => subscribeReviewHolds((id) => {
+    if (id === orderId) setHold(getReviewHold(orderId));
+  }), [orderId]);
   const [voidOpen, setVoidOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const cashRef = useRef<HTMLInputElement>(null);
@@ -495,15 +499,20 @@ function PickupCheckout({ orderId, onDone }: { orderId: string; onDone: () => vo
         <div className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-3 text-sm">
           <p className="mb-2 font-bold text-brasa">⚠️ {hold.reason}</p>
           <p className="mb-2">Confira no extrato da maquininha se {formatBRL(hold.amount)} foi cobrado antes de receber de novo, em qualquer forma de pagamento. Se a maquininha mostra a transação aprovada, não cobre de novo: guarde o comprovante e chame o gerente.</p>
-          <div className="grid gap-2">
-            <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
-            <HoldNotChargedButton hold={hold} label={`Senha ${number}`} size="md" onCleared={() => setHold(null)} />
-          </div>
+          {hold.code === 'CLAIM_RELEASED' ? (
+            <RefundedAtTerminalButton hold={hold} label={`Senha ${number}`} size="md" onCleared={() => setHold(null)} />
+          ) : (
+            <div className="grid gap-2">
+              <Btn variant="success" block onClick={() => setConfirmOpen(true)}>Maquininha aprovou: registrar comprovante</Btn>
+              <HoldNotChargedButton hold={hold} label={`Senha ${number}`} size="md" onCleared={() => setHold(null)} />
+            </div>
+          )}
           <ConfirmReviewedChargeSheet
             open={confirmOpen}
             onClose={() => setConfirmOpen(false)}
             hold={hold}
             label={`Senha ${number}`}
+            onHoldChanged={setHold}
             onSuccess={(outcome) => {
               setHold(null);
               // O comprovante TEF já saiu da maquininha: imprime a senha e manda para a cozinha.

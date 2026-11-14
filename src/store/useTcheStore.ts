@@ -123,6 +123,9 @@ export const MIN_REASON_LENGTH = 5;
 /** Cobrança na maquininha sem resposta após este tempo é considerada abandonada. */
 export const PENDING_CHARGE_TTL_MS = 5 * 60_000;
 
+/** Trava de reserva liberada: o comprovante não é registrado (o servidor recusaria sem reserva). */
+export const CLAIM_RELEASED_REGISTER_ERROR = 'A reserva deste pagamento foi liberada pelo gerente: não dá para registrar. Estorne na maquininha.';
+
 /** Cobrança enviada à maquininha e ainda sem resposta: trava a conta até voltar. */
 export interface PendingCharge {
   request_id: string;
@@ -434,6 +437,11 @@ interface Actions {
    * PIN de gerente, audit_log) sem cobrar de novo. Libera a trava e fecha a conta se quitou.
    */
   confirmReviewedCharge: (input: ReviewedChargeInput, auth: ManagerAuthInput) => ActionResult<PaymentOutcome>;
+  /**
+   * Trava CLAIM_RELEASED (o gerente liberou a reserva com a maquininha aprovada): o caixa estornou na
+   * maquininha; PIN de gerente e motivo tiram a trava. Registro só local em audit_logs.
+   */
+  resolveRefundedClaimHold: (orderId: UUID, auth: ManagerAuthInput) => ActionResult<AuditLog>;
 
   // Fase 3 — KDS e QR Code
   advanceItemStatus: (itemId: UUID) => ActionResult<OrderItem>;
@@ -2021,6 +2029,8 @@ export const useTcheStore = create<TcheState>()(
         confirmReviewedCharge: (input, auth) => {
           const hold = getReviewHold(input.orderId);
           if (!hold) return fail('Não há cobrança sem confirmação para esta conta.');
+          // A reserva desta cobrança foi liberada no servidor: registrar aqui seria recusado (TF010). Só estornar.
+          if (hold.code === 'CLAIM_RELEASED') return fail(CLAIM_RELEASED_REGISTER_ERROR);
           const res = findEditableOrder(input.orderId);
           if (!res.ok) return res;
           const order = res.data;
@@ -2092,6 +2102,39 @@ export const useTcheStore = create<TcheState>()(
           set((s) => ({ auditLogs: [log, ...s.auditLogs], outbox: [...s.outbox, managerAuthEvent(log, auth.managerPin)] }));
           clearReviewHold(order.id);
           return pay;
+        },
+
+        resolveRefundedClaimHold: (orderId, auth) => {
+          const hold = getReviewHold(orderId);
+          if (!hold || hold.code !== 'CLAIM_RELEASED') return fail('Não há reserva liberada para estornar nesta conta.');
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const authRes = authorizeManager(auth, { orderId, action: 'CLAIM_RELEASED_REFUNDED' });
+          if (!authRes.ok) return authRes;
+          const manager = authRes.data;
+          const log = buildAudit({
+            order_id: orderId,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: manager.id,
+            action_type: 'CLAIM_RELEASED_REFUNDED',
+            amount_impact: 0,
+            reason: auth.reason.trim(),
+            metadata: {
+              amount: hold.amount,
+              method: hold.method ?? null,
+              acquirer: hold.acquirer ?? null,
+              terminal_serial: hold.terminal_serial ?? null,
+              idempotency_key: hold.idempotency_key ?? null,
+              review_reason: hold.reason,
+              review_started_at: hold.created_at,
+              operator_name: user.name,
+              manager_name: manager.name,
+            },
+          });
+          // Só local: o tipo ainda não existe no servidor (a fila recusaria a linha).
+          set((s) => ({ auditLogs: [log, ...s.auditLogs] }));
+          clearReviewHold(orderId);
+          return { ok: true, data: log };
         },
 
         advanceItemStatus: (itemId) => {

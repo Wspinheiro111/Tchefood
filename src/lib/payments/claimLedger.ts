@@ -6,11 +6,26 @@
  *    A reserva aparece na lista de reservas presas (vinda do servidor) com o aviso de que foi este aparelho;
  *  - liberação pendente (persistido): a maquininha recusou, mas a liberação não chegou ao servidor. O laço
  *    de sincronização tenta de novo; até lá a reserva aparece na lista para o gerente.
+ *  - cobrança terminada aguardando o servidor (persistido, estado 'settled'): o pagamento foi registrado aqui
+ *    e a reserva precisa continuar viva (batimento pelo laço de sincronização) até o servidor consumi-la.
+ *
+ * O segredo da reserva (release_token) é gerado AQUI, gravado antes de chamar o servidor e nunca mostrado.
  */
 export interface LocalClaim {
   key: string;
   order_id: string;
   started_at: string;
+  /** Segredo da reserva (32 bytes em hex). Ausente em registros de versões anteriores. */
+  release_token?: string | null;
+  /** 'charging': cobrança em andamento (ou o app caiu no meio). 'settled': fim conhecido, aguardando o servidor. */
+  state?: 'charging' | 'settled';
+}
+
+/** Segredo novo da reserva: 32 bytes aleatórios em hex (64 caracteres). */
+export function generateReleaseToken(): string {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 export interface PendingRelease {
@@ -19,6 +34,10 @@ export interface PendingRelease {
   reason: string;
   created_at: string;
   last_error: string | null;
+  /** Segredo da reserva para liberar sem PIN (nunca mostrado). null = só o gerente libera. */
+  release_token: string | null;
+  /** O servidor recusou de vez (ou falta o segredo): não tenta mais sozinho; só o gerente libera. */
+  final?: boolean;
 }
 
 interface Ledger {
@@ -62,12 +81,28 @@ function persist() {
   }
 }
 
-/** Reserva feita; a cobrança vai começar. Gravado antes de mandar para a maquininha ou registrar o dinheiro. */
-export function beginLocalClaim(key: string, orderId: string): void {
+/**
+ * A reserva vai ser pedida; a cobrança vai começar. Gravado ANTES de chamar o servidor (com o segredo): se a
+ * resposta se perder, o aparelho ainda consegue liberar a reserva que o servidor criou.
+ */
+export function beginLocalClaim(key: string, orderId: string, releaseToken: string | null = null): void {
   const l = load();
   active.add(key);
-  l.inFlight = [...l.inFlight.filter((c) => c.key !== key), { key, order_id: orderId, started_at: new Date().toISOString() }];
+  l.inFlight = [...l.inFlight.filter((c) => c.key !== key), { key, order_id: orderId, started_at: new Date().toISOString(), release_token: releaseToken, state: 'charging' }];
   persist();
+}
+
+/** Fim conhecido (pago ou em conferência): o registro fica, com o segredo, até o servidor consumir ou liberar. */
+export function settleLocalClaim(key: string): void {
+  const l = load();
+  active.delete(key);
+  l.inFlight = l.inFlight.map((c) => (c.key === key ? { ...c, state: 'settled' as const } : c));
+  persist();
+}
+
+/** Reservas terminadas aqui que aguardam o servidor (batimento e limpeza pelo laço de sincronização). */
+export function settledClaims(): LocalClaim[] {
+  return load().inFlight.filter((c) => c.state === 'settled');
 }
 
 /** A cobrança terminou (com qualquer resultado já tratado pela tela). */
@@ -96,12 +131,16 @@ export function localClaim(key: string): LocalClaim | null {
   return load().inFlight.find((c) => c.key === key) ?? null;
 }
 
-export function addPendingRelease(p: Omit<PendingRelease, 'created_at' | 'last_error'> & { last_error?: string | null }): void {
+export function addPendingRelease(p: Omit<PendingRelease, 'created_at' | 'last_error' | 'release_token' | 'final'> & { last_error?: string | null; release_token?: string | null; final?: boolean }): void {
   const l = load();
   const prev = l.pendingReleases.find((r) => r.key === p.key);
   l.pendingReleases = [
     ...l.pendingReleases.filter((r) => r.key !== p.key),
-    { key: p.key, order_id: p.order_id, reason: p.reason, created_at: prev?.created_at ?? new Date().toISOString(), last_error: p.last_error ?? null },
+    {
+      key: p.key, order_id: p.order_id, reason: p.reason, created_at: prev?.created_at ?? new Date().toISOString(), last_error: p.last_error ?? null,
+      release_token: p.release_token ?? prev?.release_token ?? null,
+      final: Boolean(p.final),
+    },
   ];
   persist();
 }

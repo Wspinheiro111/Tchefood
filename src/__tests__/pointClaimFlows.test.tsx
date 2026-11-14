@@ -9,7 +9,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useTcheStore } from '../store/useTcheStore';
 import { clearReviewHold, getReviewHold, setReviewHold } from '../lib/payments/reviewHolds';
-import { localClaim, resetClaimLedger } from '../lib/payments/claimLedger';
+import { addPendingRelease, beginLocalClaim, isClaimActiveHere, localClaim, resetClaimLedger, settleLocalClaim } from '../lib/payments/claimLedger';
 import type { IPaymentTerminalDriver, TerminalResult } from '../lib/payments/drivers';
 import type { PosTerminal } from '../types';
 
@@ -19,12 +19,14 @@ const releasePaymentClaim = vi.fn();
 const releasePaymentClaimManager = vi.fn();
 const fetchPointReservation = vi.fn();
 const createDriver = vi.fn();
+const touchPaymentClaim = vi.fn();
 
 vi.mock('../lib/payments/paymentClaim', async (orig) => ({
   ...(await orig<typeof import('../lib/payments/paymentClaim')>()),
   claimPayment: (...a: unknown[]) => claimPayment(...a),
   releaseClaimAfterNoCharge: (...a: unknown[]) => releasePaymentClaim(...a),
   releasePaymentClaimManager: (...a: unknown[]) => releasePaymentClaimManager(...a),
+  touchPaymentClaim: (...a: unknown[]) => touchPaymentClaim(...a),
 }));
 vi.mock('../lib/sync/cloudPull', async (orig) => ({
   ...(await orig<typeof import('../lib/sync/cloudPull')>()),
@@ -59,6 +61,13 @@ function fakeDriver(acquirer: 'STONE' | 'PAGBANK' | 'MERCADO_PAGO', result: Term
 }
 const declined = (acquirer: 'STONE' | 'MERCADO_PAGO' = 'STONE'): TerminalResult => ({ status: 'DECLINED', acquirer, reason: 'Saldo insuficiente', terminal_serial: 'S1', terminal_id: null });
 const review: TerminalResult = { status: 'MANUAL_REVIEW', acquirer: 'STONE', reason: 'Sem resposta', failure_code: 'TIMEOUT', terminal_serial: 'S1', terminal_id: null };
+
+/** Sem nuvem configurada (demonstração local), com Point na lista local: não pede reserva. */
+function localOnly() {
+  act(() => {
+    useTcheStore.setState({ terminals: [...st().terminals, MP_TERMINAL], cloud: null } as never);
+  });
+}
 
 function withPoint(point = true, pulled = true) {
   act(() => {
@@ -99,6 +108,7 @@ beforeEach(() => {
   resetClaimLedger();
   fetchPointReservation.mockReset().mockResolvedValue(NO_RESERVATION);
   createDriver.mockReset();
+  touchPaymentClaim.mockReset().mockResolvedValue({ ok: true, status: 'open', activeUntil: null });
 });
 afterEach(() => {
   cleanup();
@@ -131,7 +141,9 @@ describe('caixa da mesa (CheckoutScreen) numa loja com Point', () => {
     fireEvent.click(screen.getByRole('button', { name: /Dinheiro/ }));
     await waitFor(() => expect((chargeButton() as HTMLButtonElement).disabled).toBe(false));
     await act(async () => { fireEvent.click(chargeButton()); });
-    await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(1));
+    // Sem resposta: uma nova tentativa com a mesma chave e o mesmo segredo; depois, libera com o segredo.
+    await waitFor(() => expect(releasePaymentClaim).toHaveBeenCalledTimes(1));
+    expect(claimPayment).toHaveBeenCalledTimes(2);
     expect(payments(id)).toHaveLength(0);
   });
 
@@ -161,7 +173,7 @@ describe('caixa da mesa (CheckoutScreen) numa loja com Point', () => {
     render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
     await waitFor(() => expect((chargeButton() as HTMLButtonElement).disabled).toBe(false));
     await act(async () => { fireEvent.click(chargeButton()); });
-    await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(2));
     expect(driver.charge).not.toHaveBeenCalled();
     expect(st().pendingCharges).toHaveLength(0);
   });
@@ -239,9 +251,9 @@ describe('caixa da mesa (CheckoutScreen) numa loja com Point', () => {
     expect(screen.getByRole('button', { name: 'Conferir no Mercado Pago' })).toBeTruthy();
   });
 
-  it('loja sem Point: nada muda (sem reserva e sem bloqueio pela leitura da nuvem)', async () => {
+  it('aparelho sem nuvem (demonstração local): nada muda (sem reserva e sem bloqueio pela leitura da nuvem)', async () => {
     const id = openTable();
-    withPoint(false);
+    localOnly();
     fetchPointReservation.mockRejectedValue(new Error('rede'));
     render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
     fireEvent.click(screen.getByRole('button', { name: /Dinheiro/ }));
@@ -270,11 +282,11 @@ describe('ficha rápida numa loja com Point', () => {
   it('dinheiro: reserva antes de registrar; sem internet não registra', async () => {
     const id = counterSale();
     withPoint();
-    claimPayment.mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' });
+    claimPayment.mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' }).mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' });
     openSale();
     fireEvent.click(screen.getByRole('button', { name: /Dinheiro/ }));
     await act(async () => { fireEvent.click(cobrar()); });
-    await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(2));
     expect(payments(id)).toHaveLength(0);
 
     claimPayment.mockImplementation(async (input: { key: string; amount: number }) => {
@@ -284,7 +296,7 @@ describe('ficha rápida numa loja com Point', () => {
     await act(async () => { fireEvent.click(cobrar()); });
     await waitFor(() => expect(payments(id)).toHaveLength(1));
     expect(claimLog).toEqual(['claim:0']);
-    expect((claimPayment.mock.calls[1]![0] as { key: string }).key).toBe(payments(id)[0]!.idempotency_key);
+    expect((claimPayment.mock.calls[2]![0] as { key: string }).key).toBe(payments(id)[0]!.idempotency_key);
   });
 
   it('SmartPOS: reserva antes da maquininha e recusa libera', async () => {
@@ -314,7 +326,7 @@ describe('retirada (chargePickupOrder) numa loja com Point', () => {
   it('dinheiro: reserva antes de registrar; sem internet é ERROR sem pagamento', async () => {
     const o = pickupOrder();
     withPoint();
-    claimPayment.mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' });
+    claimPayment.mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' }).mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' });
     expect(await chargePickupOrder({ orderId: o.id, method: 'CASH', chassis: 'STONE', kitchenPreview: false })).toEqual({ status: 'ERROR', reason: 'Sem internet' });
     expect(payments(o.id)).toHaveLength(0);
     claimPayment.mockImplementation(async (input: { key: string; amount: number }) => {
@@ -323,7 +335,7 @@ describe('retirada (chargePickupOrder) numa loja com Point', () => {
     });
     expect((await chargePickupOrder({ orderId: o.id, method: 'CASH', chassis: 'STONE', kitchenPreview: false })).status).toBe('APPROVED');
     expect(claimLog).toEqual(['claim:0']);
-    expect((claimPayment.mock.calls[1]![0] as { key: string }).key).toBe(payments(o.id)[0]!.idempotency_key);
+    expect((claimPayment.mock.calls[2]![0] as { key: string }).key).toBe(payments(o.id)[0]!.idempotency_key);
   });
 
   it('maquininha: recusa libera; revisão manual mantém', async () => {
@@ -340,17 +352,17 @@ describe('retirada (chargePickupOrder) numa loja com Point', () => {
     clearReviewHold(o.id);
   });
 
-  it('loja sem Point: não pede reserva', async () => {
+  it('aparelho sem nuvem: não pede reserva', async () => {
     const o = pickupOrder();
-    withPoint(false);
+    localOnly();
     expect((await chargePickupOrder({ orderId: o.id, method: 'CASH', chassis: 'STONE', kitchenPreview: false })).status).toBe('APPROVED');
     expect(claimPayment).not.toHaveBeenCalled();
   });
 });
 
-const claimsOf = (list: Array<{ key: string; cents: number }>) => ({
+const claimsOf = (list: Array<{ key: string; cents: number; releasableAt?: string | null }>) => ({
   reservedCents: list.reduce((a, c) => a + c.cents, 0), openCharges: 0, manualReview: false, claimsCents: list.reduce((a, c) => a + c.cents, 0), charges: [],
-  claims: list.map((c) => ({ idempotencyKey: c.key, amountCents: c.cents, method: 'CASH', acquirer: 'CASH_DESK', createdAt: '2026-11-14T10:00:00Z', createdBy: 's1', createdByName: 'Tião' })),
+  claims: list.map((c) => ({ idempotencyKey: c.key, amountCents: c.cents, method: 'CASH', acquirer: 'CASH_DESK', createdAt: '2026-11-14T10:00:00Z', createdBy: 's1', createdByName: 'Tião', activeUntil: null, releasableAt: c.releasableAt ?? null })),
 });
 function managerRelease(reason = 'Não recebi nenhum dinheiro', pin = '9999') {
   const dialog = screen.getByRole('dialog');
@@ -432,9 +444,9 @@ describe('revisão independente: reservas presas, conferência do extrato, falha
     expect(releasePaymentClaimManager).toHaveBeenLastCalledWith('k-trava', '9999', 'Extrato da Stone sem a venda');
   });
 
-  it('"Conferi no extrato" em loja sem Point tira a trava como antes', async () => {
+  it('"Conferi no extrato" sem nuvem tira a trava como antes', async () => {
     const id = openTable();
-    withPoint(false);
+    localOnly();
     setReviewHold({ order_id: id, amount: 2, reason: 'sem resposta', code: 'X', method: 'CREDIT', acquirer: 'STONE', terminal_id: null, terminal_serial: 'S', idempotency_key: 'k-trava' });
     render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
     fireEvent.click(screen.getByRole('button', { name: 'Conferi no extrato: não foi cobrado' }));
@@ -442,7 +454,7 @@ describe('revisão independente: reservas presas, conferência do extrato, falha
     expect(releasePaymentClaimManager).not.toHaveBeenCalled();
   });
 
-  it('falha fechada: ligado à nuvem sem ter lido as maquininhas, o dinheiro pede a reserva', async () => {
+  it('ligado à nuvem sem ter lido as maquininhas: o dinheiro pede a reserva', async () => {
     const id = openTable();
     withPoint(false, false);
     claimPayment.mockResolvedValue({ ok: false, code: 'TF010', error: 'Esta loja tem a Point: o pagamento precisa da reserva no servidor.' });
@@ -462,15 +474,15 @@ describe('revisão independente: reservas presas, conferência do extrato, falha
     withPoint();
     const driver = fakeDriver('STONE', declined());
     createDriver.mockReturnValue(driver);
-    claimPayment.mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' }).mockResolvedValueOnce({ ok: false, code: 'TF003', error: 'saldo livre' });
+    claimPayment.mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' }).mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' }).mockResolvedValueOnce({ ok: false, code: 'TF003', error: 'saldo livre' });
     render(<FichaRapidaScreen />);
     const box = screen.getByText('Vendas aguardando pagamento').parentElement!;
     fireEvent.click(within(box).getAllByRole('button')[0]!);
     const cobrar = () => screen.getByRole('button', { name: /^Cobrar R\$/ });
     await act(async () => { fireEvent.click(cobrar()); });
-    await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(1));
-    await act(async () => { fireEvent.click(cobrar()); });
     await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(2));
+    await act(async () => { fireEvent.click(cobrar()); });
+    await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(3));
     expect(driver.charge).not.toHaveBeenCalled();
     expect(st().pendingCharges).toHaveLength(0);
     expect(payments(sale.data.id)).toHaveLength(0);
@@ -486,10 +498,402 @@ describe('revisão independente: reservas presas, conferência do extrato, falha
     withPoint();
     const driver = fakeDriver('STONE', declined());
     createDriver.mockReturnValue(driver);
-    claimPayment.mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' }).mockResolvedValueOnce({ ok: false, code: 'TF010', error: 'Esta loja tem a Point: o pagamento precisa da reserva no servidor.' });
+    claimPayment.mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' }).mockResolvedValueOnce({ ok: false, offline: true, error: 'Sem internet' }).mockResolvedValueOnce({ ok: false, code: 'TF010', error: 'Esta loja tem a Point: o pagamento precisa da reserva no servidor.' });
     expect(await chargePickupOrder({ orderId: r.data.id, method: 'CREDIT', chassis: 'STONE', kitchenPreview: false })).toEqual({ status: 'ERROR', reason: 'Sem internet' });
     expect(await chargePickupOrder({ orderId: r.data.id, method: 'DEBIT', chassis: 'STONE', kitchenPreview: false })).toEqual({ status: 'ERROR', reason: 'Esta loja tem a Point: o pagamento precisa da reserva no servidor.' });
     expect(driver.charge).not.toHaveBeenCalled();
     expect(st().pendingCharges).toHaveLength(0);
+  });
+});
+
+const approved = (acquirer: 'STONE' | 'PAGBANK'): TerminalResult => ({
+  status: 'APPROVED', acquirer, acquirer_cnpj: '00.000.000/0001-00', card_brand: 'VISA', nsu: '123', authorization_code: 'A1',
+  terminal_serial: 'S1', terminal_id: null, masked_pan: null, mode: 'TEF_POS_WIRELESS',
+} as TerminalResult);
+
+type Outcome = 'recusada' | 'sem internet' | 'falhou';
+const OUTCOMES: Outcome[] = ['recusada', 'sem internet', 'falhou'];
+function failClaim(o: Outcome) {
+  if (o === 'recusada') claimPayment.mockResolvedValue({ ok: false, code: 'TF010', error: 'Esta loja tem a Point: o pagamento precisa da reserva no servidor.' });
+  else if (o === 'sem internet') claimPayment.mockResolvedValue({ ok: false, offline: true, error: 'Sem internet' });
+  else claimPayment.mockRejectedValue(new Error('erro inesperado'));
+}
+/** Sem resposta (ou exceção): uma nova tentativa com a mesma chave e o mesmo segredo. */
+const attempts = (o: Outcome) => (o === 'recusada' ? 1 : 2);
+const MATRIX = (['CASH', 'STONE', 'PAGBANK'] as const).flatMap((m) => OUTCOMES.map((o) => [m, o] as const));
+
+describe('r7 P0-01: lista de maquininhas velha (sem Point aqui, já sincronizada) ainda pede a reserva', () => {
+  it.each(MATRIX)('caixa da mesa · %s · reserva %s: bloqueia, sem maquininha e sem pagamento', async (method, outcome) => {
+    const id = openTable();
+    withPoint(false, true);
+    failClaim(outcome);
+    const driver = fakeDriver(method === 'CASH' ? 'STONE' : method, approved(method === 'CASH' ? 'STONE' : method));
+    createDriver.mockReturnValue(driver);
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    if (method === 'CASH') fireEvent.click(screen.getByRole('button', { name: /Dinheiro/ }));
+    await waitFor(() => expect((chargeButton() as HTMLButtonElement).disabled).toBe(false));
+    await act(async () => { fireEvent.click(chargeButton()); });
+    await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(attempts(outcome)));
+    await act(async () => { await Promise.resolve(); });
+    expect(driver.charge).not.toHaveBeenCalled();
+    expect(payments(id)).toHaveLength(0);
+    expect(st().pendingCharges).toHaveLength(0);
+  });
+
+  it.each(MATRIX)('ficha rápida · %s · reserva %s: bloqueia, sem maquininha e sem pagamento', async (method, outcome) => {
+    expect(st().login('1111').ok).toBe(true);
+    const p = st().products.find((x) => x.code === '222')!;
+    const sale = st().createCounterSale([{ product_id: p.id, quantity: 1, modifiers: [], meat_doneness: null }]);
+    if (!sale.ok) throw new Error(sale.error);
+    withPoint(false, true);
+    failClaim(outcome);
+    const driver = fakeDriver(method === 'CASH' ? 'STONE' : method, approved(method === 'CASH' ? 'STONE' : method));
+    createDriver.mockReturnValue(driver);
+    render(<FichaRapidaScreen />);
+    const box = screen.getByText('Vendas aguardando pagamento').parentElement!;
+    fireEvent.click(within(box).getAllByRole('button')[0]!);
+    if (method === 'CASH') fireEvent.click(screen.getByRole('button', { name: /Dinheiro/ }));
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /^Cobrar R\$/ })); });
+    await waitFor(() => expect(claimPayment).toHaveBeenCalledTimes(attempts(outcome)));
+    await act(async () => { await Promise.resolve(); });
+    expect(driver.charge).not.toHaveBeenCalled();
+    expect(payments(sale.data.id)).toHaveLength(0);
+  });
+
+  it.each(MATRIX)('retirada · %s · reserva %s: ERROR, sem maquininha e sem pagamento', async (method, outcome) => {
+    expect(st().login('4444').ok).toBe(true);
+    const p = st().products.find((x) => x.code === '222')!;
+    const r = st().createPickupOrder({ lines: [{ product_id: p.id, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' }], fulfillment: 'TAKEOUT', customerName: 'Ana' });
+    if (!r.ok) throw new Error(r.error);
+    st().logout();
+    expect(st().login('5555').ok).toBe(true);
+    withPoint(false, true);
+    failClaim(outcome);
+    const driver = fakeDriver(method === 'CASH' ? 'STONE' : method, approved(method === 'CASH' ? 'STONE' : method));
+    createDriver.mockReturnValue(driver);
+    const out = await chargePickupOrder({ orderId: r.data.id, method: method === 'CASH' ? 'CASH' : 'CREDIT', chassis: method === 'PAGBANK' ? 'PAGBANK' : 'STONE', kitchenPreview: false });
+    expect(out.status).toBe('ERROR');
+    expect(claimPayment).toHaveBeenCalledTimes(attempts(outcome));
+    expect(claimPayment.mock.calls[0]![0]).toMatchObject({ acquirer: method === 'CASH' ? 'CASH_DESK' : method });
+    expect(driver.charge).not.toHaveBeenCalled();
+    expect(payments(r.data.id)).toHaveLength(0);
+  });
+});
+
+describe('r7 P0-02: gerente liberou a reserva durante a cobrança', () => {
+  const okClaim = () => claimPayment.mockImplementation(async (input: { key: string; amount: number }) => CLAIM_OK(input.key, Math.round(input.amount * 100)));
+
+  it('caixa da mesa: a maquininha aprovou, mas não registra; trava a conta e avisa para estornar', async () => {
+    const id = openTable();
+    withPoint();
+    okClaim();
+    createDriver.mockReturnValue(fakeDriver('STONE', approved('STONE')));
+    touchPaymentClaim.mockResolvedValue({ ok: true, status: 'released', activeUntil: null });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await waitFor(() => expect((chargeButton() as HTMLButtonElement).disabled).toBe(false));
+    await act(async () => { fireEvent.click(chargeButton()); });
+    await waitFor(() => expect(getReviewHold(id)).not.toBeNull());
+    expect(getReviewHold(id)).toMatchObject({ code: 'CLAIM_RELEASED', reason: 'A reserva foi liberada pelo gerente durante a cobrança: confira e estorne na maquininha' });
+    expect(payments(id)).toHaveLength(0);
+    expect(releasePaymentClaim).not.toHaveBeenCalled();
+    expect((await screen.findAllByText(/A reserva foi liberada pelo gerente durante a cobrança/)).length).toBeGreaterThan(0);
+  });
+
+  it('ficha rápida e retirada: mesma regra (sem registro, trava CLAIM_RELEASED)', async () => {
+    expect(st().login('1111').ok).toBe(true);
+    const p = st().products.find((x) => x.code === '222')!;
+    const sale = st().createCounterSale([{ product_id: p.id, quantity: 1, modifiers: [], meat_doneness: null }]);
+    if (!sale.ok) throw new Error(sale.error);
+    withPoint();
+    okClaim();
+    createDriver.mockReturnValue(fakeDriver('PAGBANK', approved('PAGBANK')));
+    touchPaymentClaim.mockResolvedValue({ ok: true, status: 'released', activeUntil: null });
+    render(<FichaRapidaScreen />);
+    const box = screen.getByText('Vendas aguardando pagamento').parentElement!;
+    fireEvent.click(within(box).getAllByRole('button')[0]!);
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /^Cobrar R\$/ })); });
+    await waitFor(() => expect(getReviewHold(sale.data.id)).toMatchObject({ code: 'CLAIM_RELEASED' }));
+    expect(payments(sale.data.id).filter((x) => x.status === 'APPROVED')).toHaveLength(0);
+    cleanup();
+
+    st().logout();
+    expect(st().login('4444').ok).toBe(true);
+    const r = st().createPickupOrder({ lines: [{ product_id: p.id, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' }], fulfillment: 'TAKEOUT', customerName: 'Ana' });
+    if (!r.ok) throw new Error(r.error);
+    st().logout();
+    expect(st().login('5555').ok).toBe(true);
+    createDriver.mockReturnValue(fakeDriver('STONE', approved('STONE')));
+    expect(await chargePickupOrder({ orderId: r.data.id, method: 'CREDIT', chassis: 'STONE', kitchenPreview: false })).toEqual({
+      status: 'MANUAL_REVIEW', reason: 'A reserva foi liberada pelo gerente durante a cobrança: confira e estorne na maquininha',
+    });
+    expect(getReviewHold(r.data.id)).toMatchObject({ code: 'CLAIM_RELEASED' });
+    expect(payments(r.data.id)).toHaveLength(0);
+    clearReviewHold(r.data.id);
+  });
+
+  it('reserva com batimento recente (liberável no futuro): "Em andamento (outro aparelho)" e botão desligado', async () => {
+    const id = openTable();
+    withPoint();
+    const later = new Date(Date.now() + 4 * 60_000);
+    fetchPointReservation.mockResolvedValue(claimsOf([{ key: 'k-rodando', cents: 900, releasableAt: later.toISOString() }]));
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    const hhmm = later.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+    expect(await screen.findByText(`Em andamento (outro aparelho) — liberável às ${hhmm} (horário de Brasília)`)).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'Liberar reserva' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('TF011 do servidor ao liberar: mostra a mensagem e a reserva continua', async () => {
+    const id = openTable();
+    withPoint();
+    fetchPointReservation.mockResolvedValue(claimsOf([{ key: 'k-preso', cents: 1500, releasableAt: new Date(Date.now() - 60_000).toISOString() }]));
+    releasePaymentClaimManager.mockResolvedValue({ ok: false, active: true, error: 'Reserva em andamento (outro aparelho): ainda não pode ser liberada.' });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Liberar reserva' }));
+    managerRelease();
+    expect(await screen.findByText('Reserva em andamento (outro aparelho): ainda não pode ser liberada.')).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'Liberar reserva' }).length).toBeGreaterThan(0);
+  });
+});
+
+describe('r7 P2-01 e release_token na lista de reservas', () => {
+  it('pagamento RECUSADO aqui com a chave não esconde a reserva', async () => {
+    const id = openTable();
+    withPoint();
+    st().registerPayment({ orderId: id, amount: 1, method: 'CREDIT', status: 'DECLINED', terminal_id: null, acquirer: 'STONE', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: 'S1', idempotency_key: 'k-recusado', item_ids: [] });
+    fetchPointReservation.mockResolvedValue(claimsOf([{ key: 'k-recusado', cents: 100 }]));
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    expect(((await screen.findByRole('button', { name: 'Liberar reserva' })) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('liberação pendente com o código: mostra o erro, nunca o código, e o gerente pode liberar', async () => {
+    const id = openTable();
+    withPoint();
+    addPendingRelease({ key: 'k-pend', order_id: id, reason: 'recusou', release_token: 'segredo-zz-123', last_error: 'Sem internet' });
+    fetchPointReservation.mockResolvedValue(claimsOf([{ key: 'k-pend', cents: 300 }]));
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    expect(await screen.findByText(/a liberação automática ainda não chegou ao servidor \(Sem internet\)/)).toBeTruthy();
+    expect(document.body.innerHTML).not.toContain('segredo-zz-123');
+    const btn = screen.getByRole('button', { name: 'Liberar reserva' }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+  });
+
+  it('sem o código (repetição idempotente, registro perdido): a lista diz que só o gerente libera, e libera', async () => {
+    const id = openTable();
+    withPoint();
+    addPendingRelease({ key: 'k-sem', order_id: id, reason: 'recusou', release_token: null, last_error: 'x' });
+    fetchPointReservation.mockResolvedValue(claimsOf([{ key: 'k-sem', cents: 300 }]));
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    expect(await screen.findByText('Nada foi cobrado, mas este aparelho não tem o código desta reserva: só o gerente libera.')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Liberar reserva' }));
+    managerRelease();
+    await waitFor(() => expect(releasePaymentClaimManager).toHaveBeenCalledWith('k-sem', '9999', 'Não recebi nenhum dinheiro'));
+  });
+
+  it('recusa na maquininha: o código da reserva vai para a liberação e não aparece na tela', async () => {
+    const id = openTable();
+    withPoint();
+    claimPayment.mockImplementation(async (input: { key: string; amount: number }) => CLAIM_OK(input.key, Math.round(input.amount * 100)));
+    createDriver.mockReturnValue(fakeDriver('STONE', declined()));
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await waitFor(() => expect((chargeButton() as HTMLButtonElement).disabled).toBe(false));
+    await act(async () => { fireEvent.click(chargeButton()); });
+    await waitFor(() => expect(releasePaymentClaim).toHaveBeenCalledTimes(1));
+    const token = (claimPayment.mock.calls[0]![0] as { releaseToken: string }).releaseToken;
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+    expect(releasePaymentClaim.mock.calls[0]![3]).toBe(token);
+    expect(document.body.innerHTML).not.toContain(token);
+  });
+});
+
+describe('r7 revisão: trava CLAIM_RELEASED, comprovante, adquirente, aviso e retirada', () => {
+  const releasedHold = (orderId: string, key = 'k-liberada') => setReviewHold({
+    order_id: orderId, amount: 5, reason: 'A reserva foi liberada pelo gerente durante a cobrança: confira e estorne na maquininha', code: 'CLAIM_RELEASED',
+    method: 'CREDIT', acquirer: 'STONE', terminal_id: null, terminal_serial: 'S1', idempotency_key: key,
+  });
+  function managerAuth(reason: string, pin = '9999') {
+    const dialog = screen.getByRole('dialog');
+    fireEvent.change(within(dialog).getByPlaceholderText('Descreva o motivo…'), { target: { value: reason } });
+    for (const d of pin) fireEvent.click(within(dialog).getByRole('button', { name: d }));
+  }
+
+  it('caixa da mesa: com CLAIM_RELEASED nem dinheiro recebe; sem "registrar comprovante"; "Estornei na maquininha" com PIN tira a trava (registro local)', async () => {
+    const id = openTable();
+    withPoint();
+    setReviewHoldState(id);
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    fireEvent.click(screen.getByRole('button', { name: /Dinheiro/ }));
+    await waitFor(() => expect(fetchPointReservation).toHaveBeenCalled());
+    expect((chargeButton() as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => { fireEvent.click(chargeButton()); });
+    expect(claimPayment).not.toHaveBeenCalled();
+    expect(payments(id)).toHaveLength(0);
+    expect(screen.queryByRole('button', { name: 'Maquininha aprovou: registrar comprovante' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Conferi no extrato: não foi cobrado' })).toBeNull();
+    expect(screen.getByText(/Estorne \(cancele a venda\) na maquininha/)).toBeTruthy();
+    const outboxBefore = st().outbox.length;
+    fireEvent.click(screen.getByRole('button', { name: 'Estornei na maquininha' }));
+    // O PIN completo confirma (como nas outras autorizações de gerente).
+    managerAuth('Venda estornada na maquininha Stone');
+    await waitFor(() => expect(getReviewHold(id)).toBeNull());
+    expect(st().auditLogs[0]).toMatchObject({ action_type: 'CLAIM_RELEASED_REFUNDED', order_id: id, reason: 'Venda estornada na maquininha Stone' });
+    expect(st().outbox.length).toBe(outboxBefore);
+    // O registro pelo comprovante também recusa direto na loja.
+    releasedHold(id);
+    expect(st().confirmReviewedCharge({ orderId: id, nsu: '123456', authorization_code: 'AB12', card_brand: null, method: 'CREDIT', acquirer: 'STONE' }, { managerPin: '9999', reason: 'Maquininha aprovou, conferido' }).ok).toBe(false);
+    clearReviewHold(id);
+  });
+  function setReviewHoldState(orderId: string) { releasedHold(orderId); }
+
+  it('ficha rápida: com CLAIM_RELEASED não há "Cobrar" nem comprovante, só o estorno', async () => {
+    expect(st().login('1111').ok).toBe(true);
+    const p = st().products.find((x) => x.code === '222')!;
+    const sale = st().createCounterSale([{ product_id: p.id, quantity: 1, modifiers: [], meat_doneness: null }]);
+    if (!sale.ok) throw new Error(sale.error);
+    withPoint();
+    releasedHold(sale.data.id);
+    render(<FichaRapidaScreen />);
+    const box = screen.getByText('Vendas aguardando pagamento').parentElement!;
+    fireEvent.click(within(box).getAllByRole('button')[0]!);
+    fireEvent.click(screen.getByRole('button', { name: /Dinheiro/ }));
+    expect(screen.queryByRole('button', { name: /^Cobrar R\$/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Maquininha aprovou: registrar comprovante' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Estornei na maquininha' })).toBeTruthy();
+    expect(claimPayment).not.toHaveBeenCalled();
+    clearReviewHold(sale.data.id);
+  });
+
+  async function openReceiptAndSubmit() {
+    fireEvent.click(screen.getByRole('button', { name: 'Maquininha aprovou: registrar comprovante' }));
+    const dialog = screen.getByRole('dialog');
+    fireEvent.change(within(dialog).getByPlaceholderText('Só números'), { target: { value: '445566' } });
+    fireEvent.change(within(dialog).getByPlaceholderText('Letras e números'), { target: { value: 'AB12CD' } });
+    for (const d of '9999') fireEvent.click(within(dialog).getByRole('button', { name: d }));
+  }
+
+  it('registrar comprovante confere a reserva antes: liberada vira CLAIM_RELEASED sem registrar; sem resposta recusa; aberta registra', async () => {
+    const id = openTable();
+    withPoint();
+    beginLocalClaim('k-falhou', id, 'ef'.repeat(32));
+    settleLocalClaim('k-falhou');
+    setReviewHold({ order_id: id, amount: 5, reason: 'Aprovado na maquininha, mas não registrado', code: 'REGISTER_FAILED', method: 'CREDIT', acquirer: 'STONE', terminal_id: null, terminal_serial: 'S1', idempotency_key: 'k-falhou' });
+
+    touchPaymentClaim.mockResolvedValueOnce({ ok: false, offline: true, error: 'rede' });
+    const view = render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    expect(await screen.findByText('Sem conexão com o servidor para conferir a reserva: tente de novo.')).toBeTruthy();
+    expect(touchPaymentClaim).toHaveBeenCalledWith('k-falhou', 'ef'.repeat(32));
+    expect(payments(id)).toHaveLength(0);
+    view.unmount();
+
+    touchPaymentClaim.mockResolvedValueOnce({ ok: true, status: 'released', activeUntil: null });
+    const v2 = render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    await waitFor(() => expect(getReviewHold(id)).toMatchObject({ code: 'CLAIM_RELEASED' }));
+    expect(payments(id)).toHaveLength(0);
+    expect(await screen.findByRole('button', { name: 'Estornei na maquininha' })).toBeTruthy();
+    v2.unmount();
+
+    setReviewHold({ order_id: id, amount: 5, reason: 'Aprovado na maquininha, mas não registrado', code: 'REGISTER_FAILED', method: 'CREDIT', acquirer: 'STONE', terminal_id: null, terminal_serial: 'S1', idempotency_key: 'k-falhou' });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    await waitFor(() => expect(payments(id).filter((x) => x.status === 'APPROVED')).toHaveLength(1));
+    expect(getReviewHold(id)).toBeNull();
+  });
+
+  it('a maquininha aprova por outra adquirente que a reservada: não registra, trava ACQUIRER_MISMATCH', async () => {
+    const id = openTable();
+    withPoint();
+    claimPayment.mockImplementation(async (input: { key: string; amount: number }) => CLAIM_OK(input.key, Math.round(input.amount * 100)));
+    createDriver.mockReturnValue(fakeDriver('STONE', approved('PAGBANK')));
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await waitFor(() => expect((chargeButton() as HTMLButtonElement).disabled).toBe(false));
+    await act(async () => { fireEvent.click(chargeButton()); });
+    await waitFor(() => expect(getReviewHold(id)).toMatchObject({ code: 'ACQUIRER_MISMATCH' }));
+    expect(payments(id)).toHaveLength(0);
+    clearReviewHold(id);
+  });
+
+  it('só reservas de pagamento (sem Point): o aviso diz "pagamento reservado aguardando envio ao servidor"', async () => {
+    const id = openTable();
+    withPoint();
+    fetchPointReservation.mockResolvedValue({ ...claimsOf([{ key: 'k-x', cents: 300 }]), pointCents: 0 });
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    expect(await screen.findByText('Há um pagamento reservado aguardando envio ao servidor')).toBeTruthy();
+    expect(screen.queryByText('Há uma cobrança na Point em andamento nesta conta')).toBeNull();
+  });
+
+  it('reserva deste aparelho com batimento recente: "Em andamento" sem "(outro aparelho)"', async () => {
+    const id = openTable();
+    withPoint();
+    beginLocalClaim('k-minha', id, 'aa'.repeat(32));
+    const { detachLocalClaim } = await import('../lib/payments/claimLedger');
+    detachLocalClaim('k-minha');
+    const later = new Date(Date.now() + 4 * 60_000);
+    fetchPointReservation.mockResolvedValue(claimsOf([{ key: 'k-minha', cents: 900, releasableAt: later.toISOString() }]));
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    const hhmm = later.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+    expect(await screen.findByText(`Em andamento — liberável às ${hhmm} (horário de Brasília)`)).toBeTruthy();
+  });
+
+  it('trava criada fora da tela (laço de sincronização) aparece na hora', async () => {
+    const id = openTable();
+    withPoint();
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    expect(screen.queryByRole('button', { name: 'Estornei na maquininha' })).toBeNull();
+    act(() => { releasedHold(id); });
+    expect(await screen.findByRole('button', { name: 'Estornei na maquininha' })).toBeTruthy();
+    clearReviewHold(id);
+  });
+
+  function pickupOrderFor() {
+    expect(st().login('4444').ok).toBe(true);
+    const p = st().products.find((x) => x.code === '222')!;
+    const r = st().createPickupOrder({ lines: [{ product_id: p.id, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' }], fulfillment: 'TAKEOUT', customerName: 'Ana' });
+    if (!r.ok) throw new Error(r.error);
+    st().logout();
+    expect(st().login('5555').ok).toBe(true);
+    return r.data;
+  }
+
+  it('retirada: batimento vê a liberação no meio da cobrança; a aprovação não é registrada e nada é cancelado na maquininha', async () => {
+    const o = pickupOrderFor();
+    withPoint();
+    claimPayment.mockImplementation(async (input: { key: string; amount: number }) => CLAIM_OK(input.key, Math.round(input.amount * 100)));
+    let finish: (r: TerminalResult) => void = () => undefined;
+    const driver = fakeDriver('STONE', new Promise<TerminalResult>((r) => { finish = r; }));
+    createDriver.mockReturnValue(driver);
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const run = chargePickupOrder({ orderId: o.id, method: 'CREDIT', chassis: 'STONE', kitchenPreview: false });
+      await vi.waitFor(() => expect(driver.charge).toHaveBeenCalled());
+      touchPaymentClaim.mockResolvedValue({ ok: true, status: 'released', activeUntil: null });
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(touchPaymentClaim).toHaveBeenCalledTimes(1);
+      finish(approved('STONE'));
+      expect(await run).toEqual({ status: 'MANUAL_REVIEW', reason: 'A reserva foi liberada pelo gerente durante a cobrança: confira e estorne na maquininha' });
+      expect(touchPaymentClaim).toHaveBeenCalledTimes(1);
+      expect(driver.abort).not.toHaveBeenCalled();
+      expect(payments(o.id)).toHaveLength(0);
+      expect(getReviewHold(o.id)).toMatchObject({ code: 'CLAIM_RELEASED' });
+    } finally {
+      vi.useRealTimers();
+      clearReviewHold(o.id);
+    }
+  });
+
+  it('retirada em dinheiro com erro inesperado no registro: o batimento para (leave) e o registro local fica', async () => {
+    const o = pickupOrderFor();
+    withPoint();
+    let key = '';
+    claimPayment.mockImplementation(async (input: { key: string; amount: number }) => { key = input.key; return CLAIM_OK(input.key, Math.round(input.amount * 100)); });
+    const original = st().registerPayment;
+    useTcheStore.setState({ registerPayment: () => { throw new Error('banco local caiu'); } } as never);
+    try {
+      await expect(chargePickupOrder({ orderId: o.id, method: 'CASH', chassis: 'STONE', kitchenPreview: false })).rejects.toThrow('banco local caiu');
+    } finally {
+      useTcheStore.setState({ registerPayment: original } as never);
+    }
+    expect(isClaimActiveHere(key)).toBe(false);
+    expect(localClaim(key)).toMatchObject({ key, state: 'charging' });
   });
 });

@@ -27,6 +27,13 @@ export function amountToCents(value: unknown): number | null {
   return cents;
 }
 
+// Em GET /v1/payments/{id}, "order" costuma ser a merchant_order ({ id: <número>, type: "mercadopago" }), que não é
+// a ordem da Orders API (ORD…). Só um id da Orders API serve para conferir contra a cobrança; qualquer outro conta
+// como ausente.
+function ordersApiId(value: unknown): string | null {
+  return typeof value === 'string' && /^ORD[0-9A-Za-z]+$/.test(value) ? value : null;
+}
+
 export function parsePayment(body: unknown): PointPaymentDetails {
   const p = asObject(body);
   const id = asText(p?.id);
@@ -43,7 +50,7 @@ export function parsePayment(body: unknown): PointPaymentDetails {
     installments: typeof installments === 'number' && Number.isInteger(installments) && installments >= 1 ? installments : null,
     // Só para conferir contra a cobrança (nunca usados sem conferência): referência enviada e ordem do pagamento.
     externalReference: asText(p.external_reference),
-    orderId: asText(asObject(p.order)?.id),
+    orderId: ordersApiId(asObject(p.order)?.id),
   };
 }
 

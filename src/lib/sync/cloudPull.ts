@@ -448,6 +448,8 @@ export type CloudPointCharge = { idempotencyKey: string; status: string; amountC
 export type CloudPaymentClaim = {
   idempotencyKey: string; amountCents: number; method: string; acquirer: string;
   createdAt: string | null; createdBy: string | null; createdByName: string | null;
+  /** Prazo da cobrança em andamento (renovado pelo aparelho que a faz) e a hora a partir da qual o gerente libera. */
+  activeUntil: string | null; releasableAt: string | null;
 };
 
 /**
@@ -516,6 +518,7 @@ export async function fetchPointReservation(cfg: SyncConfig, fetchFn: FetchLike,
       return {
         idempotencyKey: r.idempotency_key, amountCents: amount, method: str(r.method) ?? '', acquirer: str(r.acquirer) ?? '',
         createdAt: str(r.created_at), createdBy: str(r.created_by), createdByName: str(r.created_by_name),
+        activeUntil: str(r.active_until), releasableAt: str(r.releasable_at),
       };
     });
   }

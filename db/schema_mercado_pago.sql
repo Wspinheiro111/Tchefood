@@ -376,7 +376,12 @@ DECLARE
     v_failures INT;
     v_id UUID;
     v_rows INT;
+    v_checked_at TIMESTAMPTZ;
 BEGIN
+    -- Trava do PIN da loja ANTES de qualquer trava de linha (regra da main, #50): na ordem inversa, esta autorização
+    -- (cobrança travada, esperando o PIN) e outra com PIN na mesma conta (PIN na mão, gravando o registro que aponta
+    -- para a conta) esperavam uma pela outra.
+    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || p_tenant::text));
     SELECT * INTO v_charge FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
@@ -394,21 +399,24 @@ BEGIN
         RETURN v_charge.cancel_audit_id; -- mesma intenção, repetida: vale a primeira autorização
     END IF;
     SELECT o.id INTO v_order FROM orders o WHERE o.id = v_charge.order_id AND o.tenant_id = p_tenant;
-    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || p_tenant::text));
+    -- Janela de 60 s pelo relógio de agora (a chamada pode ter esperado pelas travas), como na main (#50); as falhas
+    -- e o bloqueio são gravados com esse horário.
+    v_checked_at := clock_timestamp();
     SELECT count(*) INTO v_failures FROM audit_logs a
-     WHERE a.tenant_id = p_tenant AND a.action_type = 'MANAGER_PIN_FAILED' AND a.created_at >= NOW() - INTERVAL '60 seconds';
+     WHERE a.tenant_id = p_tenant AND a.action_type = 'MANAGER_PIN_FAILED'
+       AND a.created_at >= v_checked_at - INTERVAL '60 seconds' AND a.created_at <= v_checked_at;
     IF v_failures >= 3 THEN
-        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata, created_at)
         VALUES (p_tenant, v_order, p_performed_by, 'MANAGER_PIN_LOCKOUT', 'PIN de gerente bloqueado por excesso de tentativas',
-                jsonb_build_object('attempted_action', 'POINT_CHARGE_CANCELED', 'idempotency_key', p_key));
+                jsonb_build_object('attempted_action', 'POINT_CHARGE_CANCELED', 'idempotency_key', p_key), v_checked_at);
         RETURN NULL;
     END IF;
     SELECT * INTO v_manager FROM staff_users m
      WHERE m.tenant_id = p_tenant AND m.pin_code = p_manager_pin AND m.active AND m.role IN ('MANAGER', 'OWNER');
     IF NOT FOUND THEN
-        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata, created_at)
         VALUES (p_tenant, v_order, p_performed_by, 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto',
-                jsonb_build_object('attempted_action', 'POINT_CHARGE_CANCELED', 'idempotency_key', p_key));
+                jsonb_build_object('attempted_action', 'POINT_CHARGE_CANCELED', 'idempotency_key', p_key), v_checked_at);
         RETURN NULL;
     END IF;
     INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
@@ -450,7 +458,12 @@ DECLARE
     v_order UUID;
     v_failures INT;
     v_id UUID;
+    v_checked_at TIMESTAMPTZ;
 BEGIN
+    -- Trava do PIN da loja ANTES de qualquer trava de linha (regra da main, #50): na ordem inversa, esta autorização
+    -- (cobrança travada, esperando o PIN) e outra com PIN na mesma conta (PIN na mão, gravando o registro que aponta
+    -- para a conta) esperavam uma pela outra.
+    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || p_tenant::text));
     SELECT * INTO v_charge FROM terminal_charges WHERE idempotency_key = p_key AND tenant_id = p_tenant FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
@@ -465,21 +478,24 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança está "%"; não há o que conferir.', v_charge.status USING ERRCODE = 'TF007';
     END IF;
     SELECT o.id INTO v_order FROM orders o WHERE o.id = v_charge.order_id AND o.tenant_id = p_tenant;
-    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || p_tenant::text));
+    -- Janela de 60 s pelo relógio de agora (a chamada pode ter esperado pelas travas), como na main (#50); as falhas
+    -- e o bloqueio são gravados com esse horário.
+    v_checked_at := clock_timestamp();
     SELECT count(*) INTO v_failures FROM audit_logs a
-     WHERE a.tenant_id = p_tenant AND a.action_type = 'MANAGER_PIN_FAILED' AND a.created_at >= NOW() - INTERVAL '60 seconds';
+     WHERE a.tenant_id = p_tenant AND a.action_type = 'MANAGER_PIN_FAILED'
+       AND a.created_at >= v_checked_at - INTERVAL '60 seconds' AND a.created_at <= v_checked_at;
     IF v_failures >= 3 THEN
-        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata, created_at)
         VALUES (p_tenant, v_order, p_staff, 'MANAGER_PIN_LOCKOUT', 'PIN de gerente bloqueado por excesso de tentativas',
-                jsonb_build_object('attempted_action', 'POINT_CHARGE_RECONCILE_AUTHORIZED', 'idempotency_key', p_key));
+                jsonb_build_object('attempted_action', 'POINT_CHARGE_RECONCILE_AUTHORIZED', 'idempotency_key', p_key), v_checked_at);
         RETURN NULL;
     END IF;
     SELECT * INTO v_manager FROM staff_users m
      WHERE m.tenant_id = p_tenant AND m.pin_code = p_manager_pin AND m.active AND m.role IN ('MANAGER', 'OWNER');
     IF NOT FOUND THEN
-        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata, created_at)
         VALUES (p_tenant, v_order, p_staff, 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto',
-                jsonb_build_object('attempted_action', 'POINT_CHARGE_RECONCILE_AUTHORIZED', 'idempotency_key', p_key));
+                jsonb_build_object('attempted_action', 'POINT_CHARGE_RECONCILE_AUTHORIZED', 'idempotency_key', p_key), v_checked_at);
         RETURN NULL;
     END IF;
     INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)

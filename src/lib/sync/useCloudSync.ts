@@ -173,7 +173,12 @@ export function useCloudSync(online: boolean): void {
     // Liberações de reserva que não chegaram ao servidor (maquininha recusou sem internet): tenta ao abrir o
     // app e a cada volta do laço (a própria função espera 30 s entre tentativas). Import tardio: o módulo da
     // reserva usa este para a sessão.
-    const retryReleases = () => void import('../payments/paymentClaim').then((m) => m.retryPendingClaimReleases()).catch(() => undefined);
+    // Reservas já pagas aqui: batimento até o servidor consumir (claimSupervisor); sobrevive a fechar a tela e
+    // reabrir o app, porque lê o registro persistido.
+    const retryReleases = () => {
+      void import('../payments/paymentClaim').then((m) => m.retryPendingClaimReleases()).catch(() => undefined);
+      void import('../payments/claimSupervisor').then((m) => m.superviseSettledClaims()).catch(() => undefined);
+    };
     void syncOnce();
     retryReleases();
     const timer = setInterval(() => {

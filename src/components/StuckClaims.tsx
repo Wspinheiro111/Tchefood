@@ -10,6 +10,45 @@ import { isClaimActiveHere, localClaim, pendingRelease } from '../lib/payments/c
 import { fetchPointReservation, type CloudPaymentClaim } from '../lib/sync/cloudPull';
 import { freshCloudConfig } from '../lib/sync/useCloudSync';
 import { clearReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
+import { ManagerAuthSheet } from './ManagerAuthSheet';
+
+/** Hora no horário de Brasília (o servidor também fala nesse horário). */
+export function brasiliaTime(ms: number): string {
+  return new Date(ms).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+}
+
+/** Travas criadas pela reserva com a maquininha aprovada: bloqueiam qualquer forma de pagamento, inclusive dinheiro. */
+const CLAIM_HOLD_CODES = new Set(['CLAIM_RELEASED', 'CLAIM_UNCONFIRMED', 'ACQUIRER_MISMATCH']);
+export function holdBlocksCash(hold: ReviewHold | null): boolean {
+  return hold !== null && CLAIM_HOLD_CODES.has(hold.code);
+}
+
+export const HOLD_BLOCKS_ALL = 'A maquininha aprovou uma cobrança desta conta que não pôde ser registrada: resolva a trava antes de receber de novo, em qualquer forma de pagamento.';
+
+export const REFUND_INSTRUCTION =
+  'A maquininha aprovou, mas a reserva deste pagamento foi liberada no servidor: o pagamento não pode ser registrado. Estorne (cancele a venda) na maquininha e, depois, o gerente confirma aqui.';
+
+/** Trava CLAIM_RELEASED: em vez de "registrar comprovante", a instrução de estorno e "Estornei na maquininha" (PIN de gerente). */
+export function RefundedAtTerminalButton({ hold, label, onCleared, size = 'lg' }: { hold: ReviewHold; label: string; onCleared: () => void; size?: 'md' | 'lg' }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <p className="mb-2 rounded-xl bg-brasa/10 p-2 font-semibold text-brasa">{REFUND_INSTRUCTION}</p>
+      <Btn variant="secondary" size={size} block onClick={() => setOpen(true)}>Estornei na maquininha</Btn>
+      <ManagerAuthSheet
+        open={open}
+        onClose={() => setOpen(false)}
+        title="Estornei na maquininha"
+        summary={<span>{label} · {formatBRL(hold.amount)} · confirme que a venda foi estornada (cancelada) na maquininha.</span>}
+        confirmLabel="Confirmar estorno"
+        quickReasons={['Venda estornada na maquininha', 'Cancelado na maquininha, cliente reembolsado']}
+        onSubmit={(pin, reason) => useTcheStore.getState().resolveRefundedClaimHold(hold.order_id, { managerPin: pin, reason })}
+        onSuccess={() => onCleared()}
+        successMessage="Estorno registrado (audit_logs deste aparelho)."
+      />
+    </>
+  );
+}
 
 export const RELEASE_CLAIM_WARNING =
   'Use só se o pagamento NÃO aconteceu: nenhum dinheiro foi recebido e a maquininha não mostra aprovação. Liberar devolve o valor ao saldo livre da conta.';
@@ -107,7 +146,9 @@ export function StuckClaimsPanel({ claims, excludeKeys = [], label, onReleased }
   const payments = useTcheStore((s) => s.payments);
   const [target, setTarget] = useState<CloudPaymentClaim | null>(null);
   const [released, setReleased] = useState<string[]>([]);
-  const paid = new Set(payments.map((p) => p.idempotency_key).filter((k): k is string => typeof k === 'string'));
+  // Só pagamento APROVADO aqui consome a reserva (r6 P2-01): recusado ou outro estado não esconde nada.
+  const paid = new Set(payments.filter((p) => p.status === 'APPROVED').map((p) => p.idempotency_key).filter((k): k is string => typeof k === 'string'));
+  const now = Date.now();
   const list = stuckClaims(claims, paid, [...excludeKeys, ...released]);
   if (list.length === 0) return null;
   return (
@@ -118,16 +159,28 @@ export function StuckClaimsPanel({ claims, excludeKeys = [], label, onReleased }
         {list.map((c) => {
           const mine = localClaim(c.idempotencyKey);
           const pending = pendingRelease(c.idempotencyKey);
+          // Cobrança ainda rodando em outro aparelho (prazo renovado + 5 min): o servidor recusa liberar (TF011).
+          const until = c.releasableAt ? Date.parse(c.releasableAt) : NaN;
+          const running = Number.isFinite(until) && until > now;
           return (
             <li key={c.idempotencyKey} className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-surface p-2">
               <span>
                 <b>{formatBRL(c.amountCents / 100)}</b> · {METHOD_LABEL[c.method] ?? c.method}{c.acquirer && c.acquirer !== 'CASH_DESK' ? ` · ${ACQUIRER_LABEL[c.acquirer] ?? c.acquirer}` : ''}
                 {c.createdByName ? ` · ${c.createdByName}` : ''}
                 {c.createdAt ? ` · ${new Date(c.createdAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}` : ''}
-                {mine && <span className="block text-xs text-slate-600">Este aparelho reservou e não viu a cobrança terminar: confira a maquininha antes de liberar.</span>}
-                {pending && <span className="block text-xs text-slate-600">A maquininha recusou e a liberação automática ainda não chegou ao servidor.</span>}
+                {mine && mine.state !== 'settled' && <span className="block text-xs text-slate-600">Este aparelho reservou e não viu a cobrança terminar: confira a maquininha antes de liberar.</span>}
+                {pending && (
+                  <span className="block text-xs text-slate-600">
+                    {!pending.release_token
+                      ? 'Nada foi cobrado, mas este aparelho não tem o código desta reserva: só o gerente libera.'
+                      : pending.final
+                        ? `Nada foi cobrado, mas o servidor não aceitou a liberação automática${pending.last_error ? ` (${pending.last_error})` : ''}: só o gerente libera.`
+                        : `Nada foi cobrado, mas a liberação automática ainda não chegou ao servidor${pending.last_error ? ` (${pending.last_error})` : ''}.`}
+                  </span>
+                )}
+                {running && <span className="block text-xs font-semibold text-brasa">{mine ? 'Em andamento' : 'Em andamento (outro aparelho)'} — liberável às {brasiliaTime(until)} (horário de Brasília)</span>}
               </span>
-              <Btn variant="secondary" onClick={() => setTarget(c)}>Liberar reserva</Btn>
+              <Btn variant="secondary" disabled={running} onClick={() => setTarget(c)}>Liberar reserva</Btn>
             </li>
           );
         })}

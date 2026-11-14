@@ -9,7 +9,7 @@
  * Sem internet, sem sessão ou sem resposta no prazo: não recebe (nunca cai para "cobra assim mesmo").
  * Loja sem Point: nada muda (nenhuma chamada).
  */
-import type { PosTerminal, UUID } from '../../types';
+import type { UUID } from '../../types';
 import type { FetchLike, SyncConfig } from '../sync/supabaseSync';
 import type { OrderSyncCheck } from '../sync/useCloudSync';
 import { addPendingRelease, endLocalClaim, pendingReleases, removePendingRelease } from './claimLedger';
@@ -38,6 +38,7 @@ export const CLAIM_ERRORS: Record<string, string> = {
   TF008: 'O saldo desta conta no servidor é diferente do deste aparelho. Aguarde a sincronização e tente de novo. Nada foi recebido.',
   TF009: 'A chave deste pagamento já está em uso por outra cobrança. Nada foi recebido; tente de novo.',
   TF010: CLAIM_REQUIRED_ERROR,
+  TF011: 'Reserva em andamento (outro aparelho): ainda não pode ser liberada.',
 };
 
 export interface PaymentClaim {
@@ -77,17 +78,13 @@ export function defaultClaimDeps(): ClaimDeps {
 }
 
 /**
- * A loja tem Point Smart (maquininha MERCADO_PAGO cadastrada): todo pagamento fora dela pede a reserva antes.
- * Falha fechada: aparelho ligado à nuvem que nunca leu as maquininhas de lá (não sabe se a loja tem Point)
- * também pede (o servidor recusa sem reserva numa loja com Point, TF010).
+ * Aparelho ligado à nuvem: todo pagamento fora da Point (dinheiro, Stone, PagBank, Pix manual) pede a reserva
+ * antes, tenha ou não Point na lista de maquininhas daqui (auditoria r6 P0-01: a lista local pode estar velha;
+ * quem sabe se a loja tem Point é o servidor, que recusa sem reserva com TF010). A lista local só serve para
+ * mostrar. Aparelho sem nuvem nenhuma (demonstração local): não pede.
  */
-export function requirePaymentClaim(store: {
-  terminals: ReadonlyArray<Pick<PosTerminal, 'acquirer'>>;
-  cloud?: unknown;
-  pullStatus?: { last_pull_at: string | null } | null;
-}): boolean {
-  if (store.terminals.some((t) => t.acquirer === 'MERCADO_PAGO')) return true;
-  return Boolean(store.cloud) && !store.pullStatus?.last_pull_at;
+export function requirePaymentClaim(store: { cloud?: unknown }): boolean {
+  return Boolean(store.cloud);
 }
 
 /** `promise` com prazo: erro ou prazo vencido viram `{ done: false }`. */
@@ -145,6 +142,12 @@ export interface ClaimInput {
   acquirer: ClaimAcquirer;
   /** Em reais. */
   amount: number;
+  /**
+   * Segredo da reserva gerado neste aparelho (claimLedger.generateReleaseToken), gravado no registro local
+   * antes da chamada. A nova tentativa depois de um prazo vencido usa a MESMA chave e o MESMO segredo.
+   * Nunca mostrar nem registrar em log.
+   */
+  releaseToken: string;
 }
 
 /**
@@ -156,6 +159,7 @@ export async function claimPayment(input: ClaimInput, deps: ClaimDeps = defaultC
   const offline = (): ClaimResult => ({ ok: false, offline: true, error: CLAIM_OFFLINE_ERROR });
   const amountCents = Math.round(input.amount * 100);
   if (!Number.isSafeInteger(amountCents) || amountCents <= 0) return { ok: false, code: 'TF006', error: CLAIM_ERRORS.TF006! };
+  if (!/^[0-9a-f]{64}$/.test(input.releaseToken ?? '')) return { ok: false, error: 'Reserva sem código deste aparelho. Nada foi recebido; tente de novo.' };
   const staff = await deps.staff().catch(() => null);
   if (!staff) return { ok: false, error: 'Entre com o seu PIN para receber.' };
   const session = await within(deps.config(), deps);
@@ -176,6 +180,7 @@ export async function claimPayment(input: ClaimInput, deps: ClaimDeps = defaultC
     p_amount_cents: amountCents,
     p_expected_balance_cents: balance,
     p_staff: staff,
+    p_release_token: input.releaseToken,
   }, deps);
   if (out.kind === 'offline') return offline();
   if (out.kind === 'refused') {
@@ -192,11 +197,15 @@ export async function claimPayment(input: ClaimInput, deps: ClaimDeps = defaultC
 
 export type ReleaseResult =
   | { ok: true }
-  /** transient: sem resposta do servidor (vale tentar de novo); senão o servidor recusou. */
-  | { ok: false; transient: boolean; error: string };
+  /** transient: sem resposta do servidor (vale tentar de novo); noToken: só o gerente libera (lista de reservas). */
+  | { ok: false; transient: boolean; noToken?: true; error: string };
+
+/** Sem o segredo da reserva neste aparelho: a liberação só sai pelo gerente. */
+export const RELEASE_NEEDS_MANAGER = 'Este aparelho não tem o código desta reserva: só o gerente libera, em "Liberar reserva".';
 
 /** Uma tentativa de liberar pelo aparelho que criou a reserva (tchefood_release_payment_claim). Nunca lança. */
-export async function releasePaymentClaim(key: string, reason: string, deps: ClaimDeps = defaultClaimDeps()): Promise<ReleaseResult> {
+export async function releasePaymentClaim(key: string, reason: string, releaseToken: string | null | undefined, deps: ClaimDeps = defaultClaimDeps()): Promise<ReleaseResult> {
+  if (!releaseToken) return { ok: false, transient: false, noToken: true, error: RELEASE_NEEDS_MANAGER };
   try {
     const staff = await deps.staff().catch(() => null);
     if (!staff) return { ok: false, transient: false, error: 'Sem operador identificado para liberar a reserva.' };
@@ -204,7 +213,7 @@ export async function releasePaymentClaim(key: string, reason: string, deps: Cla
     if (!session.done || !session.value) return { ok: false, transient: true, error: CLAIM_OFFLINE_ERROR };
     const cfg = session.value;
     const text = reason.trim().length >= 3 ? reason.trim() : 'Pagamento não recebido';
-    const out = await callRpc(cfg, 'tchefood_release_payment_claim', { p_key: key, p_staff: staff, p_reason: text.slice(0, 500) }, deps);
+    const out = await callRpc(cfg, 'tchefood_release_payment_claim', { p_key: key, p_staff: staff, p_reason: text.slice(0, 500), p_release_token: releaseToken }, deps);
     if (out.kind === 'offline') return { ok: false, transient: true, error: CLAIM_OFFLINE_ERROR };
     // TF005: não há reserva com a chave (nada a liberar). TF007: já virou pagamento (não reserva mais à toa).
     if (out.kind === 'refused' && (out.code === 'TF005' || out.code === 'TF007')) return { ok: true };
@@ -223,15 +232,17 @@ export const RELEASE_BACKOFF_MS = [1_000, 3_000];
  * Se ainda falhar, guarda a liberação pendente neste aparelho (o laço de sincronização tenta de novo) e a
  * reserva aparece na lista de reservas presas para o gerente. Sempre encerra o registro local da cobrança.
  */
-export async function releaseClaimAfterNoCharge(key: string, orderId: string, reason: string, deps: ClaimDeps = defaultClaimDeps()): Promise<ReleaseResult> {
+export async function releaseClaimAfterNoCharge(key: string, orderId: string, reason: string, releaseToken: string | null | undefined, deps: ClaimDeps = defaultClaimDeps()): Promise<ReleaseResult> {
   const sleep = deps.sleep ?? deps.timer;
-  let out = await releasePaymentClaim(key, reason, deps);
+  let out = await releasePaymentClaim(key, reason, releaseToken, deps);
   for (let i = 0; !out.ok && out.transient && i < RELEASE_BACKOFF_MS.length; i += 1) {
     await sleep(RELEASE_BACKOFF_MS[i]!);
-    out = await releasePaymentClaim(key, reason, deps);
+    out = await releasePaymentClaim(key, reason, releaseToken, deps);
   }
   if (out.ok) removePendingRelease(key);
-  else addPendingRelease({ key, order_id: orderId, reason, last_error: out.error });
+  // O segredo vai junto na pendência (a nova tentativa precisa dele); sem ele, ou com recusa definitiva do
+  // servidor, a pendência para de tentar e mostra o caminho do gerente.
+  else addPendingRelease({ key, order_id: orderId, reason, release_token: releaseToken ?? null, last_error: out.error, final: !out.transient });
   endLocalClaim(key);
   return out;
 }
@@ -246,12 +257,14 @@ export async function retryPendingClaimReleases(deps: ClaimDeps = defaultClaimDe
   lastRetry = nowMs;
   let released = 0;
   for (const p of list) {
-    const out = await releasePaymentClaim(p.key, p.reason, deps);
+    // Sem o segredo, ou recusada de vez pelo servidor: não tenta mais; fica para o gerente na lista de reservas.
+    if (!p.release_token || p.final) continue;
+    const out = await releasePaymentClaim(p.key, p.reason, p.release_token, deps);
     if (out.ok) {
       removePendingRelease(p.key);
       released += 1;
     } else {
-      addPendingRelease({ key: p.key, order_id: p.order_id, reason: p.reason, last_error: out.error });
+      addPendingRelease({ key: p.key, order_id: p.order_id, reason: p.reason, release_token: p.release_token, last_error: out.error, final: !out.transient });
     }
   }
   return released;
@@ -259,8 +272,8 @@ export async function retryPendingClaimReleases(deps: ClaimDeps = defaultClaimDe
 
 export type ManagerReleaseResult =
   | { ok: true }
-  /** pin: PIN de gerente recusado ou bloqueado (a função devolveu NULL). */
-  | { ok: false; pin?: true; error: string };
+  /** pin: PIN de gerente recusado ou bloqueado (a função devolveu NULL). active: cobrança ainda rodando (TF011). */
+  | { ok: false; pin?: true; active?: true; error: string };
 
 /**
  * Liberação pelo gerente (tchefood_release_payment_claim_manager): reserva presa de outro aparelho, ou a
@@ -282,6 +295,12 @@ export async function releasePaymentClaimManager(key: string, managerPin: string
     if (out.kind === 'refused') {
       if (out.code === 'TF005') return { ok: true };
       if (out.code === 'TF007') return { ok: false, error: 'Esta reserva já virou pagamento: não há o que liberar.' };
+      // TF011 claim_active: a cobrança ainda está rodando em outro aparelho (a reserva tem prazo renovado).
+      // O banco diz a partir de quando o gerente pode liberar (horário de Brasília): mostra isso quando vier.
+      if (out.code === 'TF011') {
+        const at = /a partir de (\d{2}:\d{2}(?::\d{2})?)/.exec(out.message)?.[1];
+        return { ok: false, active: true, error: at ? `${CLAIM_ERRORS.TF011!} O gerente pode liberar a partir de ${at} (horário de Brasília).` : CLAIM_ERRORS.TF011! };
+      }
       return { ok: false, error: `O servidor não liberou a reserva: ${out.message}` };
     }
     if (!out.body) return { ok: false, pin: true, error: 'PIN de gerente incorreto ou bloqueado. Nada foi liberado.' };
@@ -291,5 +310,36 @@ export async function releasePaymentClaimManager(key: string, managerPin: string
     return { ok: true };
   } catch (e) {
     return { ok: false, error: (e as Error).message };
+  }
+}
+
+/** Prazo da reserva renovado enquanto a cobrança roda (tchefood_touch_payment_claim). */
+export const CLAIM_HEARTBEAT_MS = 20_000;
+
+export type TouchResult =
+  | { ok: true; status: 'open' | 'released' | 'consumed'; activeUntil: string | null }
+  /** offline: sem resposta (vale tentar de novo). code: SQLSTATE da recusa (TF004 segredo errado, TF005 não existe). */
+  | { ok: false; offline?: true; code?: string; error: string };
+
+/**
+ * Renova o prazo da reserva (a cobrança desta chave continua rodando aqui). Devolve 'released' quando o gerente
+ * liberou a reserva no meio (nada é renovado) e 'consumed' quando já virou pagamento. Nunca lança.
+ */
+export async function touchPaymentClaim(key: string, releaseToken: string | null | undefined, deps: ClaimDeps = defaultClaimDeps()): Promise<TouchResult> {
+  // Sem o segredo o servidor recusa (TF004): não renova, a reserva só envelhece (gerente libera depois de 5 min).
+  if (!releaseToken) return { ok: false, error: RELEASE_NEEDS_MANAGER };
+  try {
+    const staff = await deps.staff().catch(() => null);
+    if (!staff) return { ok: false, error: 'Sem operador identificado.' };
+    const session = await within(deps.config(), deps);
+    if (!session.done || !session.value) return { ok: false, offline: true, error: CLAIM_OFFLINE_ERROR };
+    const out = await callRpc(session.value, 'tchefood_touch_payment_claim', { p_key: key, p_staff: staff, p_release_token: releaseToken }, deps);
+    if (out.kind === 'offline') return { ok: false, offline: true, error: CLAIM_OFFLINE_ERROR };
+    if (out.kind === 'refused') return { ok: false, ...(out.code ? { code: out.code } : {}), error: `O servidor recusou a renovação da reserva: ${out.message}` };
+    const status = out.body?.status;
+    if (status !== 'open' && status !== 'released' && status !== 'consumed') return { ok: false, error: 'Resposta incompleta do servidor.' };
+    return { ok: true, status, activeUntil: typeof out.body?.active_until === 'string' ? out.body.active_until : null };
+  } catch (e) {
+    return { ok: false, offline: true, error: (e as Error).message };
   }
 }

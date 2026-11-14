@@ -33,6 +33,25 @@ export function holdAcquirer(acquirer: string): 'STONE' | 'PAGBANK' | 'MERCADO_P
 const STORAGE_KEY = 'tchefood.paymentReviewHolds.v1';
 const memory = new Map<string, ReviewHold>();
 let loaded = false;
+const listeners = new Set<(orderId: string) => void>();
+
+/** Avisa a tela quando uma trava muda fora dela (ex.: reserva liberada antes do pagamento chegar ao servidor). */
+export function subscribeReviewHolds(fn: (orderId: string) => void): () => void {
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+  };
+}
+
+function notify(orderId: string) {
+  for (const fn of [...listeners]) {
+    try {
+      fn(orderId);
+    } catch {
+      // Uma tela com erro não impede as outras.
+    }
+  }
+}
 
 function storage(): Storage | null {
   try {
@@ -72,6 +91,7 @@ export function setReviewHold(hold: Omit<ReviewHold, 'created_at'>): ReviewHold 
   const full = { ...hold, created_at: new Date().toISOString() };
   memory.set(hold.order_id, full);
   persist();
+  notify(hold.order_id);
   return full;
 }
 
@@ -79,4 +99,5 @@ export function clearReviewHold(orderId: string) {
   load();
   memory.delete(orderId);
   persist();
+  notify(orderId);
 }

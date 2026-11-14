@@ -1445,7 +1445,8 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
 
     it('dinheiro e Stone não pagam o valor reservado por cobrança aberta; o que sobra entra', () => {
       for (const status of ['creating', 'pending', 'at_terminal', 'manual_review', 'approved']) {
-        const order = fresh(100);
+        // Conta com item: o recálculo depois do pagamento mantém o total (fresh() o zeraria, abaixo do reservado: TF012).
+        const order = withItems(100);
         expect(openPoint(`res-${status}`, order, 6000).ok).toBe(true);
         if (status !== 'creating') force(`res-${status}`, status);
         const cash = register(payment(order, 100));
@@ -1479,7 +1480,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     });
 
     it('duas cobranças abertas somam; reserva de outra conta não conta', () => {
-      const order = fresh(100);
+      const order = withItems(100);
       const other = fresh(100);
       expect(openPoint('soma-a', order, 3000).ok).toBe(true);
       expect(openPoint('soma-b', order, 2500).ok).toBe(true);
@@ -1505,7 +1506,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
      */
     const claimAndPay = (json: string, expected: number | string) => {
       const p = JSON.parse(json) as { idempotency_key: string; order_id: string; method: string; acquirer: string; amount: number; waiter_id: string };
-      return `WITH c AS MATERIALIZED (SELECT tchefood_claim_payment('${p.idempotency_key}', '${p.order_id}', '${p.method}', '${p.acquirer}', ${Math.round(p.amount * 100)}, ${expected}, '${p.waiter_id}') AS r)
+      return `WITH c AS MATERIALIZED (SELECT tchefood_claim_payment('${p.idempotency_key}', '${p.order_id}', '${p.method}', '${p.acquirer}', ${Math.round(p.amount * 100)}, ${expected}, '${p.waiter_id}', '${'c'.repeat(64)}') AS r)
               SELECT tchefood_register_payment('${json}'::jsonb) FROM c`;
     };
 

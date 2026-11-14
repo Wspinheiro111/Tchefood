@@ -443,6 +443,9 @@ async function sendCreate(ctx: ChargeContext, row: TerminalChargeRow, allowFirst
   // A barreira passou, mas a resposta dela demorou demais: a chamada poderia passar do fim da posse (e outra
   // consulta mandaria por cima, ou um encerramento já teria levado a cobrança à revisão manual). Não manda.
   // O envio fica marcado como iniciado, então a cobrança é tratada como resultado desconhecido, nunca recusa.
+  // Efeito conhecido (revisão independente, F4): o primeiro POST de verdade pode sair depois de uma consulta
+  // (allowFirst false, begun 2) quando a posse vencer. Ele conta como repetição: recusa ali não vira "nada foi
+  // cobrado", fica desconhecida e segue para revisão. Lado seguro; o código fica como está.
   if (monotonic(ctx) - asked > DISPATCH_START_LIMIT_MS) return closeUnsent(ctx, await reread(ctx, row));
   // Entre a barreira e esta chamada não há nenhuma outra espera.
   let order: PaymentTerminalChargeResult;
@@ -542,10 +545,15 @@ async function judgeOrder(ctx: ChargeContext, row: TerminalChargeRow, order: Pay
   switch (order.status) {
     case 'pending':
     case 'at_terminal':
+      return { kind: 'status', status: order.status, patch: base, payment: null };
     case 'rejected':
     case 'cancelled':
     case 'expired':
     case 'refunded':
+      // Fim que libera a reserva: como na aprovação, a ordem precisa ecoar a referência e a maquininha desta
+      // cobrança (não basta faltarem). Sem isso, revisão.
+      if (order.externalReference === null) return mismatch('FINAL_WITHOUT_REFERENCE');
+      if (order.externalTerminalId === null) return mismatch('FINAL_WITHOUT_TERMINAL');
       return { kind: 'status', status: order.status, patch: base, payment: null };
     case 'manual_review':
       return mismatch('PROVIDER_STATUS_UNCERTAIN');
@@ -568,7 +576,7 @@ async function judgeOrder(ctx: ChargeContext, row: TerminalChargeRow, order: Pay
     return { kind: 'payment_unavailable', patch: base };
   }
   if (payment.id !== order.externalPaymentId) return mismatch('PAYMENT_ID_MISMATCH');
-  const approval = checkPayment(row, payment);
+  const approval = checkPayment(row, payment, order.externalOrderId);
   if (approval.kind === 'mismatch') return mismatch(approval.code, payment);
   if (order.paymentMethodId !== null && brandFromMethodId(order.paymentMethodId) !== approval.brand) return mismatch('BRAND_MISMATCH', payment);
   return {
@@ -577,10 +585,23 @@ async function judgeOrder(ctx: ChargeContext, row: TerminalChargeRow, order: Pay
   };
 }
 
-/** Conferências do pagamento lido (GET /v1/payments/{id}) para aprovar esta cobrança. */
-function checkPayment(row: TerminalChargeRow, payment: PointPaymentDetails):
+/**
+ * Conferências do pagamento lido (GET /v1/payments/{id}) para aprovar esta cobrança. `orderId` é a ordem do Mercado
+ * Pago que está sendo conferida (ou a ligada à cobrança), quando há uma.
+ * Auditoria r6 (P2): a referência (external_reference) e a ordem (order.id) que o pagamento informar precisam ser
+ * desta cobrança; ausentes, valem as outras conferências como antes.
+ */
+// Só um id da Orders API (ORD…) se compara com a ordem da cobrança; o order.id do pagamento costuma ser a
+// merchant_order (número), que não diz nada sobre esta ordem e conta como ausente.
+function isOrdersApiId(value: string | null | undefined): value is string {
+  return typeof value === 'string' && value.startsWith('ORD');
+}
+
+function checkPayment(row: TerminalChargeRow, payment: PointPaymentDetails, orderId: string | null):
   | { kind: 'ok'; authorization: string; brand: PointCardBrand; lastFour: string | null }
   | { kind: 'mismatch'; code: string } {
+  if (payment.externalReference != null && payment.externalReference !== row.idempotency_key) return { kind: 'mismatch', code: 'PAYMENT_REFERENCE_MISMATCH' };
+  if (isOrdersApiId(payment.orderId) && orderId != null && payment.orderId !== orderId) return { kind: 'mismatch', code: 'PAYMENT_ORDER_MISMATCH' };
   if (payment.status !== 'approved') return { kind: 'mismatch', code: 'PAYMENT_NOT_APPROVED' };
   if (payment.amountCents !== row.amount_cents) return { kind: 'mismatch', code: 'PAYMENT_AMOUNT_MISMATCH' };
   if (payment.paymentTypeId !== expectedType(row.method)) return { kind: 'mismatch', code: 'PAYMENT_METHOD_MISMATCH' };
@@ -922,6 +943,7 @@ function stillInReview(row: TerminalChargeRow, code: string, reason: string): Ch
 
 const REVIEW_TEXT = {
   NOT_FOUND_YET: 'O Mercado Pago ainda não mostra cobrança com esta referência. Confira no app do Mercado Pago: se houver a operação, digite o ID dela; se não houver, tente de novo mais tarde. O valor segue reservado na conta.',
+  MP_SEARCH_REFUSED: 'O Mercado Pago recusou a busca por esta cobrança; use o número da operação. Confira no app do Mercado Pago e digite o ID dela. O valor segue reservado na conta.',
   MP_UNAVAILABLE: 'Não foi possível ler o Mercado Pago agora. Tente de novo em instantes. Nada foi liberado e o valor segue reservado na conta.',
   MP_PENDING: 'A cobrança ainda está aberta no Mercado Pago (não terminou). Finalize ou cancele na maquininha e confira de novo. O valor segue reservado na conta.',
 } as const;
@@ -994,6 +1016,7 @@ function provesRefund(row: TerminalChargeRow, payment: PointPaymentDetails | nul
   if (!payment || !paymentId || payment.id !== paymentId) return false;
   if (payment.amountCents !== row.amount_cents) return false;
   if (payment.externalReference != null && payment.externalReference !== row.idempotency_key) return false;
+  if (isOrdersApiId(payment.orderId) && row.external_order_id != null && payment.orderId !== row.external_order_id) return false;
   return payment.status !== null && REFUND_PAYMENT_STATUSES.has(payment.status);
 }
 
@@ -1067,6 +1090,11 @@ async function reconcileReview(ctx: ChargeContext, row: TerminalChargeRow, auth:
       found = ctx.provider.findChargeByReference ? await ctx.provider.findChargeByReference(current.idempotency_key, { createdAt: current.created_at }) : null;
     } catch (error) {
       if (error instanceof PaymentTerminalProviderError && error.detail === 'multiple_orders') return mismatchReview(current, 'mais de uma ordem com esta referência');
+      if (error instanceof PaymentTerminalProviderError && error.detail === 'search_refused') {
+        // Busca recusada (400) não diz que a ordem não existe: com o número da operação, confere pelo pagamento.
+        if (auth.operation_id) return reconcileByOperation(ctx, current, auth);
+        return stillInReview(current, 'MP_SEARCH_REFUSED', REVIEW_TEXT.MP_SEARCH_REFUSED);
+      }
       return stillInReview(current, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
     }
     if (!found) {
@@ -1099,6 +1127,14 @@ async function reconcileReview(ctx: ChargeContext, row: TerminalChargeRow, auth:
       return verdictReview(current, verdict.code);
     case 'status':
       if (verdict.status === 'pending' || verdict.status === 'at_terminal') return stillInReview(current, 'MP_PENDING', REVIEW_TEXT.MP_PENDING);
+      if (verdict.status === 'refunded') {
+        // Estorno da ordem tira a cobrança da revisão só com o próprio pagamento da ordem mostrando o dinheiro devolvido.
+        if (!order.externalPaymentId) return verdictReview(current, 'REFUND_WITHOUT_PAYMENT');
+        const payment = await readPayment(ctx, order.externalPaymentId);
+        if (!payment) return stillInReview(current, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
+        if (!provesRefund(current, payment, order.externalPaymentId)) return verdictReview(current, 'REFUND_NOT_PROVEN');
+        return resolveTo(ctx, current, 'refunded', verdict.patch, auth, orderEvidence(order, payment, foundBy));
+      }
       return resolveTo(ctx, current, verdict.status, verdict.patch, auth, orderEvidence(order, verdict.payment, foundBy));
   }
 }
@@ -1118,7 +1154,7 @@ async function reconcileByOperation(ctx: ChargeContext, row: TerminalChargeRow, 
   }
   if (payment.id !== operation) return mismatchReview(row, 'ID da operação');
   if (payment.externalReference !== row.idempotency_key) return mismatchReview(row, 'a operação é de outra cobrança');
-  const check = checkPayment(row, payment);
+  const check = checkPayment(row, payment, row.external_order_id);
   if (check.kind === 'mismatch') return mismatchReview(row, check.code);
   return resolveTo(ctx, row, 'approved', {
     external_payment_id: payment.id,
@@ -1147,7 +1183,7 @@ async function reconcileApproved(ctx: ChargeContext, row: TerminalChargeRow, aut
     const payment = await readPayment(ctx, row.external_payment_id);
     if (!payment) return stillInReview(row, 'MP_UNAVAILABLE', REVIEW_TEXT.MP_UNAVAILABLE);
     if (provesRefund(row, payment, row.external_payment_id)) return refund(payment, null);
-    if (payment.id === row.external_payment_id && checkPayment(row, payment).kind === 'ok' && payment.externalReference === row.idempotency_key) return replyFor(row);
+    if (payment.id === row.external_payment_id && checkPayment(row, payment, row.external_order_id).kind === 'ok' && payment.externalReference === row.idempotency_key) return replyFor(row);
     return mismatchReview(row, 'pagamento');
   }
 

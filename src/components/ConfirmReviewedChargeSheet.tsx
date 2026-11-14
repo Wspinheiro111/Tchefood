@@ -4,7 +4,9 @@ import { Btn, Sheet, toast } from './ui';
 import { PinPad } from './PinPad';
 import { MIN_REASON_LENGTH, RECEIPT_CARD_BRANDS, useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
 import { PointReviewSheet } from './PointReviewSheet';
-import type { ReviewHold } from '../lib/payments/reviewHolds';
+import { setReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
+import { checkHoldClaim, CLAIM_RELEASED_DURING_CHARGE } from '../lib/payments/claimFlow';
+import { requirePaymentClaim } from '../lib/payments/paymentClaim';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { formatBRL } from '../lib/money';
 import { playDeniedBuzz, vibrate } from '../lib/sound';
@@ -30,6 +32,8 @@ interface Props {
   onSuccess: (outcome: PaymentOutcome) => void;
   /** Mercado Pago confirmou que não cobrou: a trava local saiu. */
   onReleased?: () => void;
+  /** A conferência da reserva trocou a trava (reserva liberada: CLAIM_RELEASED). */
+  onHoldChanged?: (hold: ReviewHold) => void;
 }
 
 /**
@@ -37,7 +41,7 @@ interface Props {
  * autorização do comprovante (nada é gerado nem preenchido sozinho), aprova com
  * o PIN e o pagamento entra sem nova cobrança. Fica em audit_logs.
  */
-export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSuccess, onReleased }: Props) {
+export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSuccess, onReleased, onHoldChanged }: Props) {
   const [nsu, setNsu] = useState('');
   const [authCode, setAuthCode] = useState('');
   const [brand, setBrand] = useState<string | null>(null);
@@ -46,6 +50,7 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
   const [reason, setReason] = useState(DEFAULT_REASON);
   const [pin, setPin] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -63,21 +68,39 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
   const reasonOk = reason.trim().length >= MIN_REASON_LENGTH;
   const ready = proof.ok && reasonOk && method !== null && acquirer !== null;
 
-  const submit = (pinValue = pin) => {
+  const refuse = (text: string) => {
+    setError(text);
+    setPin('');
+    playDeniedBuzz();
+    vibrate([80, 40, 80]);
+  };
+
+  const submit = async (pinValue = pin) => {
+    if (checking) return;
     if (!proof.ok) return setError(proof.error);
     if (!method || !acquirer) return setError('Informe a forma de pagamento e a maquininha do comprovante.');
     if (!reasonOk) return setError(`Informe o motivo (mínimo ${MIN_REASON_LENGTH} caracteres).`);
+    // Aparelho ligado à nuvem: antes de registrar, a reserva desta cobrança ainda está no servidor?
+    if (requirePaymentClaim(useTcheStore.getState())) {
+      setChecking(true);
+      const check = await checkHoldClaim(hold.idempotency_key).finally(() => setChecking(false));
+      if (!check.ok) {
+        if (check.released) {
+          // Liberada pelo gerente: não registra; a trava passa a pedir o estorno.
+          const next = setReviewHold({ ...hold, reason: CLAIM_RELEASED_DURING_CHARGE, code: 'CLAIM_RELEASED' });
+          onHoldChanged?.(next);
+          toast.alert(`⚠️ ${CLAIM_RELEASED_DURING_CHARGE}`);
+          onClose();
+          return;
+        }
+        return refuse(check.error);
+      }
+    }
     const res = useTcheStore.getState().confirmReviewedCharge(
       { orderId: hold.order_id, nsu, authorization_code: authCode, card_brand: method === 'PIX' ? null : brand, method, acquirer },
       { managerPin: pinValue, reason },
     );
-    if (!res.ok) {
-      setError(res.error);
-      setPin('');
-      playDeniedBuzz();
-      vibrate([80, 40, 80]);
-      return;
-    }
+    if (!res.ok) return refuse(res.error);
     toast.success(`✅ ${formatBRL(res.data.payment.amount)} registrado pelo comprovante · NSU ${res.data.payment.nsu}`);
     toast.alert('🔔 Registrado em audit_logs e alerta enviado ao WhatsApp do proprietário.');
     onSuccess(res.data);
@@ -112,7 +135,7 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
       open={open}
       onClose={onClose}
       title={<span className="flex items-center gap-2 text-brasa"><ReceiptText className="h-6 w-6" /> Registrar cobrança aprovada</span>}
-      footer={<Btn block size="lg" variant="success" disabled={!ready || pin.length !== 4} onClick={() => submit()}>Registrar {formatBRL(hold.amount)} sem cobrar de novo</Btn>}
+      footer={<Btn block size="lg" variant="success" disabled={!ready || pin.length !== 4 || checking} onClick={() => void submit()}>Registrar {formatBRL(hold.amount)} sem cobrar de novo</Btn>}
     >
       <div className="mb-3 rounded-xl border border-ouro/50 bg-ouro/10 p-3 text-sm">
         <div className="font-bold">{label} · {formatBRL(hold.amount)}{hold.method ? ` · ${METHOD_LABEL[hold.method]}` : ''}{hold.acquirer ? ` · ${ACQUIRER_LABEL[hold.acquirer]}` : ''}</div>
@@ -150,7 +173,7 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
       <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={2} className="mb-3 w-full rounded-xl border border-slate-300 bg-base p-3 text-base outline-none focus:border-ouro" />
 
       <p className="mb-2 text-center text-sm font-semibold text-slate-700">PIN do Gerente</p>
-      <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => ready && submit(v)} error={Boolean(error)} compact />
+      <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={(v) => ready && void submit(v)} error={Boolean(error)} compact />
       {error && <p className="mt-3 rounded-lg bg-brasa/20 p-2 text-center text-sm font-semibold text-rose-700">{error}</p>}
     </Sheet>
   );

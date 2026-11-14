@@ -6,18 +6,18 @@ import { computeEqualShare, computeItemsShare, formatBRL, round2, toCents } from
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest, type IPaymentTerminalDriver } from '../lib/payments/drivers';
 import { cardReceiptLines, conferenceLines } from '../lib/receipts';
 import { uuid } from '../lib/ids';
-import { getReviewHold, setReviewHold, type ReviewHold, holdAcquirer } from '../lib/payments/reviewHolds';
+import { getReviewHold, setReviewHold, subscribeReviewHolds, type ReviewHold, holdAcquirer } from '../lib/payments/reviewHolds';
 import { Btn, Stepper, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
 import { ReviewCapture } from '../components/ReviewCapture';
 import { CashbackCapture, CashbackRedeem } from '../components/CashbackPanel';
 import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
-import { effectiveReservation, freeCents, pointReservationBlock, POINT_RESERVATION_NOTICE, type PointReservation } from '../lib/payments/pointReservation';
+import { effectiveReservation, freeCents, onlyClaims, pointReservationBlock, reservationNotice, type PointReservation } from '../lib/payments/pointReservation';
 import { fetchPointReservation } from '../lib/sync/cloudPull';
 import { freshCloudConfig } from '../lib/sync/useCloudSync';
 import { requirePaymentClaim, type ClaimAcquirer, type ClaimMethod } from '../lib/payments/paymentClaim';
 import { startPaymentClaim, type ClaimHandle } from '../lib/payments/claimFlow';
-import { HoldNotChargedButton, StuckClaimsPanel } from '../components/StuckClaims';
+import { HOLD_BLOCKS_ALL, holdBlocksCash, HoldNotChargedButton, RefundedAtTerminalButton, StuckClaimsPanel } from '../components/StuckClaims';
 import type { CloudPaymentClaim } from '../lib/sync/cloudPull';
 import { PointReviewSheet, type PointReviewTarget } from '../components/PointReviewSheet';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
@@ -72,6 +72,11 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const [pointCharge, setPointCharge] = useState<{ driver: IPaymentTerminalDriver; requestId: string } | null>(null);
   const [cancelOpen, setCancelOpen] = useState(false);
 
+  // Trava criada fora da tela (reserva liberada antes do pagamento chegar ao servidor): aparece na hora.
+  useEffect(() => subscribeReviewHolds((id) => {
+    if (id === orderId) setReviewHoldState(getReviewHold(orderId));
+  }), [orderId]);
+
   useEffect(() => {
     if (order && order.status === 'OPEN' && order.remaining_balance > 0) {
       const r = s.startCheckout(orderId);
@@ -83,7 +88,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   // qualquer forma de pagamento; o caixa lê a reserva para avisar e não aceitar o valor reservado.
   const cloudConnected = useTcheStore((st) => st.cloud !== null);
   const needsClaim = useTcheStore((st) => requirePaymentClaim(st));
-  const [cloudReservation, setCloudReservation] = useState<(Omit<PointReservation, 'source'> & { claimsCents?: number; charges?: CloudPointCharge[]; claims?: CloudPaymentClaim[] }) | null>(null);
+  const [cloudReservation, setCloudReservation] = useState<(Omit<PointReservation, 'source'> & { claimsCents?: number; pointCents?: number; charges?: CloudPointCharge[]; claims?: CloudPaymentClaim[] }) | null>(null);
   /** Estado da leitura da reserva: com Point na loja, só 'ok' libera receber. */
   const [reservationRead, setReservationRead] = useState<'pending' | 'ok' | 'failed'>('pending');
   /** Relê a reserva agora (depois de liberar uma reserva presa). */
@@ -162,7 +167,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
 
   const charge = async () => {
     if (!amountValid || busy || trayPending) return;
-    const reserved = pointReservationBlock(amount, remaining, pointReservation);
+    const reserved = pointReservationBlock(amount, remaining, pointReservation, cloudReservation);
     if (reserved) return toast.error(reserved);
     if (cloudBlocked) return toast.error(CLOUD_READ_BLOCK);
     const idempotency_key = uuid();
@@ -182,6 +187,8 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     const noCharge = (why: string) => handle?.noCharge(why);
     const leaveClaim = () => handle?.leave();
 
+    // Maquininha aprovou e a reserva foi liberada (ou não confirmada): nem dinheiro até resolver a trava.
+    if (holdBlocksCash(reviewHold)) return toast.error(HOLD_BLOCKS_ALL);
     if (method === 'CASH') {
       if (cashGivenValue > 0 && cashGivenValue < amount) return toast.error('Valor recebido menor que a cobrança.');
       setBusy(true);
@@ -242,6 +249,19 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         // Nada cobrado: a reserva sai.
         noCharge(`Maquininha recusou: ${result.reason}`);
         toast.error(`❌ Transação recusada: ${result.reason}`);
+        return;
+      }
+      const check = handle ? await (handle as ClaimHandle).beforeRegister(result.acquirer) : null;
+      if (check && !check.ok) {
+        // Aprovou, mas a reserva já não é desta cobrança (ou não deu para confirmar, ou outra adquirente):
+        // nunca registra sozinho; trava a conta para conferência.
+        setReviewHoldState(setReviewHold({
+          order_id: orderId, amount, reason: check.reason, code: check.code, method,
+          acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial,
+          idempotency_key, item_ids: itemIds,
+        }));
+        settleClaim();
+        toast.alert(`⚠️ ${check.reason}`);
         return;
       }
       settleClaim();
@@ -316,12 +336,12 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
 
       {pointReservation && (
         <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
-          <div className="mb-1 font-black text-brasa">{POINT_RESERVATION_NOTICE}</div>
+          <div className="mb-1 font-black text-brasa">{reservationNotice(cloudReservation)}</div>
           <p className="text-slate-800">
             {formatBRL(pointReservation.reservedCents / 100)} reservado{pointReservation.openCharges > 1 ? ` em ${pointReservation.openCharges} cobranças` : ''}.
             {' '}Livre para outro pagamento (dinheiro, Pix ou outra maquininha): <b>{formatBRL(freeCents(remaining, pointReservation) / 100)}</b>.
             {cloudReservation?.claimsCents ? ` Inclui ${formatBRL(cloudReservation.claimsCents / 100)} de outro pagamento sendo recebido.` : ''}
-            {pointReservation.manualReview ? ' Uma cobrança está em revisão: o valor só é liberado quando o gerente conferir no Mercado Pago.' : ' Aguarde a Point terminar.'}
+            {pointReservation.manualReview ? ' Uma cobrança está em revisão: o valor só é liberado quando o gerente conferir no Mercado Pago.' : onlyClaims(cloudReservation) ? ' Aguarde o pagamento chegar ao servidor.' : ' Aguarde a Point terminar.'}
           </p>
           {unresolvedCharges.length > 0 && (
             <ul className="mt-3 grid gap-2">
@@ -467,7 +487,10 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
           <div className="mb-1 font-black text-brasa">Cobrança de {formatBRL(reviewHold.amount)} sem confirmação ({reviewHold.code})</div>
           <p className="mb-3 text-slate-800">{reviewHold.reason} Se a maquininha mostra a transação aprovada, não cobre de novo: o gerente registra pelo comprovante. Se não houve cobrança, libere abaixo.</p>
-          {reviewHold.acquirer === 'MERCADO_PAGO' ? (
+          {reviewHold.code === 'CLAIM_RELEASED' ? (
+            // Reserva liberada: o comprovante não entra (o servidor recusaria); só o estorno com PIN de gerente.
+            <RefundedAtTerminalButton hold={reviewHold} label={table.label} onCleared={() => setReviewHoldState(null)} />
+          ) : reviewHold.acquirer === 'MERCADO_PAGO' ? (
             // Point: só a leitura do Mercado Pago pelo servidor registra ou libera (decisão do Will, 14/11/2026).
             <Btn variant="success" size="lg" block onClick={() => setConfirmOpen(true)}>Conferir no Mercado Pago</Btn>
           ) : (
@@ -484,6 +507,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
             // Sem reimprimir o comprovante TEF (a maquininha já imprimiu).
             onSuccess={afterReviewed}
             onReleased={() => setReviewHoldState(null)}
+            onHoldChanged={setReviewHoldState}
           />
         </div>
       )}
@@ -493,7 +517,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       )}
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_2fr]">
         <Btn variant="secondary" size="lg" onClick={printPreview}>Prévia de conferência</Btn>
-        <Btn variant="success" size="lg" disabled={!amountValid || busy || trayPending || cloudBlocked || (reviewHold !== null && method !== 'CASH')} onClick={charge}>
+        <Btn variant="success" size="lg" disabled={!amountValid || busy || trayPending || cloudBlocked || (reviewHold !== null && (method !== 'CASH' || holdBlocksCash(reviewHold)))} onClick={charge}>
           {busy ? (method === 'CASH' ? 'Confirmando com o servidor…' : 'Aguardando maquininha…') : `${method === 'CASH' ? 'Receber' : opMode === 'TEF_POS_WIRELESS' ? 'Enviar para maquininha' : 'Cobrar na SmartPOS'} ${formatBRL(amount)}`}
         </Btn>
       </div>

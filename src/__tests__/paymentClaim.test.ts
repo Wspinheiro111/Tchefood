@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CLAIM_ERRORS, CLAIM_OFFLINE_ERROR, CLAIM_REQUIRED_ERROR, claimPayment, releaseClaimAfterNoCharge, releasePaymentClaim, releasePaymentClaimManager,
-  requirePaymentClaim, retryPendingClaimReleases, type ClaimDeps,
+  RELEASE_NEEDS_MANAGER, requirePaymentClaim, retryPendingClaimReleases, touchPaymentClaim, type ClaimDeps,
 } from '../lib/payments/paymentClaim';
 import { beginLocalClaim, isClaimActiveHere, localClaim, pendingRelease, pendingReleases, resetClaimLedger } from '../lib/payments/claimLedger';
 import { flushOutbox } from '../lib/sync/supabaseSync';
@@ -9,7 +9,8 @@ import { reconcilePointCharge, type ReconcileDeps } from '../lib/payments/pointR
 import { fetchPointReservation } from '../lib/sync/cloudPull';
 
 const cfg = { url: 'https://x.supabase.co/', anonKey: 'anon', accessToken: 'jwt' };
-const INPUT = { orderId: 'o1', key: 'k-1', method: 'CASH' as const, acquirer: 'CASH_DESK' as const, amount: 25.5 };
+const TOKEN = 'ab'.repeat(32);
+const INPUT = { orderId: 'o1', key: 'k-1', method: 'CASH' as const, acquirer: 'CASH_DESK' as const, amount: 25.5, releaseToken: TOKEN };
 const OK_BODY = JSON.stringify({ id: 'c1', idempotency_key: 'k-1', status: 'open', amount_cents: 2550 });
 
 type Call = { url: string; body: Record<string, unknown>; headers: Record<string, string> };
@@ -35,18 +36,16 @@ const reply = (status: number, body: string) => async () => ({ ok: status >= 200
 beforeEach(() => resetClaimLedger());
 
 describe('requirePaymentClaim', () => {
-  it('só loja com maquininha Mercado Pago pede a reserva antes de receber', () => {
-    expect(requirePaymentClaim({ terminals: [{ acquirer: 'STONE' }, { acquirer: 'PAGBANK' }] })).toBe(false);
-    expect(requirePaymentClaim({ terminals: [] })).toBe(false);
-    expect(requirePaymentClaim({ terminals: [{ acquirer: 'STONE' }, { acquirer: 'MERCADO_PAGO' }] })).toBe(true);
+  it('ligado à nuvem: sempre pede a reserva, com ou sem Point na lista local (r6 P0-01)', () => {
+    const cloud = { url: 'x' };
+    expect(requirePaymentClaim({ cloud, terminals: [{ acquirer: 'STONE' }], pullStatus: { last_pull_at: '2026-11-14T10:00:00Z' } } as never)).toBe(true);
+    expect(requirePaymentClaim({ cloud, terminals: [] } as never)).toBe(true);
+    expect(requirePaymentClaim({ cloud, terminals: [{ acquirer: 'MERCADO_PAGO' }] } as never)).toBe(true);
   });
 
-  it('falha fechada: ligado à nuvem sem nunca ter lido as maquininhas de lá, pede a reserva', () => {
-    const stone = [{ acquirer: 'STONE' as const }];
-    expect(requirePaymentClaim({ terminals: stone, cloud: { url: 'x' }, pullStatus: { last_pull_at: null } })).toBe(true);
-    expect(requirePaymentClaim({ terminals: stone, cloud: { url: 'x' }, pullStatus: null })).toBe(true);
-    expect(requirePaymentClaim({ terminals: stone, cloud: { url: 'x' }, pullStatus: { last_pull_at: '2026-11-14T10:00:00Z' } })).toBe(false);
-    expect(requirePaymentClaim({ terminals: stone, cloud: null, pullStatus: { last_pull_at: null } })).toBe(false);
+  it('sem nuvem nenhuma (demonstração local): não pede, nem com Point na lista', () => {
+    expect(requirePaymentClaim({ cloud: null, terminals: [{ acquirer: 'MERCADO_PAGO' }] } as never)).toBe(false);
+    expect(requirePaymentClaim({})).toBe(false);
   });
 });
 
@@ -63,8 +62,16 @@ describe('claimPayment (tchefood_claim_payment)', () => {
     expect(calls[0]!.url).toBe('https://x.supabase.co/rest/v1/rpc/tchefood_claim_payment');
     expect(calls[0]!.headers).toMatchObject({ apikey: 'anon', Authorization: 'Bearer jwt' });
     expect(calls[0]!.body).toEqual({
-      p_key: 'k-1', p_order: 'o1', p_method: 'CASH', p_acquirer: 'CASH_DESK', p_amount_cents: 2550, p_expected_balance_cents: 8000, p_staff: 'staff-1',
+      p_key: 'k-1', p_order: 'o1', p_method: 'CASH', p_acquirer: 'CASH_DESK', p_amount_cents: 2550, p_expected_balance_cents: 8000, p_staff: 'staff-1', p_release_token: TOKEN,
     });
+  });
+
+  it('o segredo é do aparelho (64 hex): sem ele, ou fora do formato, não chama o servidor', async () => {
+    for (const releaseToken of ['', 'curto', 'G'.repeat(64)]) {
+      const { d, calls } = deps(reply(200, OK_BODY));
+      expect((await claimPayment({ ...INPUT, releaseToken }, d)).ok).toBe(false);
+      expect(calls).toHaveLength(0);
+    }
   });
 
   it.each([
@@ -128,23 +135,31 @@ describe('claimPayment (tchefood_claim_payment)', () => {
 describe('releasePaymentClaim (tchefood_release_payment_claim)', () => {
   it('libera com a chave, o operador e o motivo', async () => {
     const { d, calls } = deps(reply(200, '{"status":"released"}'));
-    expect(await releasePaymentClaim('k-1', 'Maquininha recusou: saldo insuficiente', d)).toEqual({ ok: true });
+    expect(await releasePaymentClaim('k-1', 'Maquininha recusou: saldo insuficiente', 'tok-1', d)).toEqual({ ok: true });
     expect(calls[0]!.url).toBe('https://x.supabase.co/rest/v1/rpc/tchefood_release_payment_claim');
-    expect(calls[0]!.body).toEqual({ p_key: 'k-1', p_staff: 'staff-1', p_reason: 'Maquininha recusou: saldo insuficiente' });
+    expect(calls[0]!.body).toEqual({ p_key: 'k-1', p_staff: 'staff-1', p_reason: 'Maquininha recusou: saldo insuficiente', p_release_token: 'tok-1' });
   });
 
   it('melhor esforço: falha de rede, prazo ou recusa devolvem erro sem lançar', async () => {
-    expect((await releasePaymentClaim('k-1', 'x', deps(async () => { throw new Error('rede'); }).d)).ok).toBe(false);
-    expect((await releasePaymentClaim('k-1', 'motivo', deps(() => new Promise(() => undefined), { timer: async () => undefined }).d)).ok).toBe(false);
-    const refused = await releasePaymentClaim('k-1', 'motivo', deps(reply(400, '{"code":"TF004","message":"só quem criou libera"}')).d);
+    expect((await releasePaymentClaim('k-1', 'x', 'tok-1', deps(async () => { throw new Error('rede'); }).d)).ok).toBe(false);
+    expect((await releasePaymentClaim('k-1', 'motivo', 'tok-1', deps(() => new Promise(() => undefined), { timer: async () => undefined }).d)).ok).toBe(false);
+    const refused = await releasePaymentClaim('k-1', 'motivo', 'tok-1', deps(reply(400, '{"code":"TF004","message":"só quem criou libera"}')).d);
     expect(refused).toEqual({ ok: false, transient: false, error: 'O servidor não liberou a reserva: só quem criou libera' });
     // Não existe (TF005) ou já virou pagamento (TF007): nada a liberar.
-    expect(await releasePaymentClaim('k-1', 'motivo', deps(reply(400, '{"code":"TF005","message":"x"}')).d)).toEqual({ ok: true });
-    expect(await releasePaymentClaim('k-1', 'motivo', deps(reply(400, '{"code":"TF007","message":"x"}')).d)).toEqual({ ok: true });
+    expect(await releasePaymentClaim('k-1', 'motivo', 'tok-1', deps(reply(400, '{"code":"TF005","message":"x"}')).d)).toEqual({ ok: true });
+    expect(await releasePaymentClaim('k-1', 'motivo', 'tok-1', deps(reply(400, '{"code":"TF007","message":"x"}')).d)).toEqual({ ok: true });
     // Motivo curto demais para o banco (≥ 3) vai com o texto padrão.
     const short = deps(reply(200, '{}'));
-    await releasePaymentClaim('k-1', 'x', short.d);
+    await releasePaymentClaim('k-1', 'x', 'tok-1', short.d);
     expect(short.calls[0]!.body.p_reason).toBe('Pagamento não recebido');
+  });
+
+  it('sem o código da reserva (repetição idempotente, registro perdido): não chama o servidor e aponta o gerente', async () => {
+    for (const tok of [null, undefined, '']) {
+      const { d, calls } = deps(reply(200, '{}'));
+      expect(await releasePaymentClaim('k-1', 'motivo', tok, d)).toEqual({ ok: false, transient: false, noToken: true, error: RELEASE_NEEDS_MANAGER });
+      expect(calls).toHaveLength(0);
+    }
   });
 });
 
@@ -209,7 +224,7 @@ describe('liberação depois de nada cobrado (releaseClaimAfterNoCharge)', () =>
     beginLocalClaim('k-1', 'o1');
     const sleeps: number[] = [];
     const { d, calls } = deps(async () => { throw new Error('rede'); }, { sleep: async (ms) => { sleeps.push(ms); } });
-    const out = await releaseClaimAfterNoCharge('k-1', 'o1', 'Maquininha recusou: saldo', d);
+    const out = await releaseClaimAfterNoCharge('k-1', 'o1', 'Maquininha recusou: saldo', 'tok-k-1', d);
     expect(out.ok).toBe(false);
     expect(calls).toHaveLength(3);
     expect(sleeps).toEqual([1_000, 3_000]);
@@ -221,25 +236,53 @@ describe('liberação depois de nada cobrado (releaseClaimAfterNoCharge)', () =>
   it('a segunda tentativa libera: sem pendência; recusa do servidor não repete', async () => {
     let n = 0;
     const flaky = deps(async () => { n += 1; if (n === 1) throw new Error('rede'); return { ok: true, status: 200, text: async () => '{}' }; }, { sleep: async () => undefined });
-    expect(await releaseClaimAfterNoCharge('k-2', 'o1', 'recusou', flaky.d)).toEqual({ ok: true });
+    expect(await releaseClaimAfterNoCharge('k-2', 'o1', 'recusou', 'tok-k-2', flaky.d)).toEqual({ ok: true });
     expect(pendingReleases()).toEqual([]);
     const refused = deps(reply(400, '{"code":"TF004","message":"x"}'), { sleep: async () => undefined });
-    await releaseClaimAfterNoCharge('k-3', 'o1', 'recusou', refused.d);
+    await releaseClaimAfterNoCharge('k-3', 'o1', 'recusou', 'tok-k-3', refused.d);
     expect(refused.calls).toHaveLength(1);
-    expect(pendingRelease('k-3')).not.toBeNull();
+    expect(pendingRelease('k-3')).toMatchObject({ final: true });
+  });
+
+  it('recusa definitiva não é tentada de novo pelo laço; sem rede continua tentando (P2-8)', async () => {
+    const refused = deps(reply(400, '{"code":"TF004","message":"só o aparelho que pediu a reserva libera sem PIN"}'), { sleep: async () => undefined });
+    await releaseClaimAfterNoCharge('k-8', 'o1', 'recusou', 'tok-8', refused.d);
+    const offline = deps(async () => { throw new Error('rede'); }, { sleep: async () => undefined });
+    await releaseClaimAfterNoCharge('k-9', 'o1', 'recusou', 'tok-9', offline.d);
+    expect(pendingRelease('k-8')).toMatchObject({ final: true, last_error: 'O servidor não liberou a reserva: só o aparelho que pediu a reserva libera sem PIN' });
+    expect(pendingRelease('k-9')).toMatchObject({ final: false });
+    const ok = deps(reply(200, '{}'));
+    expect(await retryPendingClaimReleases(ok.d, 3_000_000, true)).toBe(1);
+    expect(ok.calls.map((c) => c.body.p_key)).toEqual(['k-9']);
+    expect(pendingRelease('k-8')).not.toBeNull();
   });
 
   it('a sincronização tenta as pendências de novo (no máximo a cada 30 s) e tira as que liberou', async () => {
     const offline = deps(async () => { throw new Error('rede'); }, { sleep: async () => undefined });
-    await releaseClaimAfterNoCharge('k-4', 'o1', 'recusou', offline.d);
+    await releaseClaimAfterNoCharge('k-4', 'o1', 'recusou', 'tok-k-4', offline.d);
     expect(pendingRelease('k-4')).not.toBeNull();
     const ok = deps(reply(200, '{}'));
     expect(await retryPendingClaimReleases(ok.d, 1_000_000, true)).toBe(1);
-    expect(ok.calls[0]!.body).toEqual({ p_key: 'k-4', p_staff: 'staff-1', p_reason: 'recusou' });
+    expect(ok.calls[0]!.body).toEqual({ p_key: 'k-4', p_staff: 'staff-1', p_reason: 'recusou', p_release_token: 'tok-k-4' });
     expect(pendingReleases()).toEqual([]);
-    await releaseClaimAfterNoCharge('k-5', 'o1', 'recusou', offline.d);
+    await releaseClaimAfterNoCharge('k-5', 'o1', 'recusou', 'tok-k-5', offline.d);
     expect(await retryPendingClaimReleases(ok.d, 1_010_000)).toBe(0);
     expect(await retryPendingClaimReleases(ok.d, 1_031_000)).toBe(1);
+  });
+
+  it('o código vai para a pendência (para a nova tentativa); sem código, a pendência fica para o gerente', async () => {
+    const offline = deps(async () => { throw new Error('rede'); }, { sleep: async () => undefined });
+    await releaseClaimAfterNoCharge('k-6', 'o1', 'recusou', 'segredo-6', offline.d);
+    expect(pendingRelease('k-6')!.release_token).toBe('segredo-6');
+    const none = deps(reply(200, '{}'), { sleep: async () => undefined });
+    expect(await releaseClaimAfterNoCharge('k-7', 'o1', 'recusou', null, none.d)).toMatchObject({ ok: false, noToken: true });
+    expect(none.calls).toHaveLength(0);
+    expect(pendingRelease('k-7')).toMatchObject({ release_token: null, last_error: RELEASE_NEEDS_MANAGER });
+    const ok = deps(reply(200, '{}'));
+    expect(await retryPendingClaimReleases(ok.d, 2_000_000, true)).toBe(1);
+    expect(ok.calls.map((c) => c.body.p_key)).toEqual(['k-6']);
+    expect(ok.calls[0]!.body.p_release_token).toBe('segredo-6');
+    expect(pendingRelease('k-7')).not.toBeNull();
   });
 });
 
@@ -279,6 +322,36 @@ describe('fetchPointReservation: reservas abertas (claims)', () => {
       claims: [{ idempotency_key: 'k-9', amount_cents: 2000, method: 'CASH', acquirer: 'CASH_DESK', created_at: '2026-11-14T10:00:00Z', created_by: 's1', created_by_name: 'Tião' }],
     };
     const r = await fetchPointReservation(cfg, async () => ({ ok: true, status: 200, text: async () => JSON.stringify(body) }), 'o1');
-    expect(r.claims).toEqual([{ idempotencyKey: 'k-9', amountCents: 2000, method: 'CASH', acquirer: 'CASH_DESK', createdAt: '2026-11-14T10:00:00Z', createdBy: 's1', createdByName: 'Tião' }]);
+    expect(r.claims).toEqual([{
+      idempotencyKey: 'k-9', amountCents: 2000, method: 'CASH', acquirer: 'CASH_DESK', createdAt: '2026-11-14T10:00:00Z', createdBy: 's1', createdByName: 'Tião',
+      activeUntil: null, releasableAt: null,
+    }]);
+    const leased = { ...body, claims: [{ ...body.claims[0], active_until: '2026-11-14T10:01:30Z', releasable_at: '2026-11-14T10:06:30Z' }] };
+    const r2 = await fetchPointReservation(cfg, async () => ({ ok: true, status: 200, text: async () => JSON.stringify(leased) }), 'o1');
+    expect(r2.claims![0]).toMatchObject({ activeUntil: '2026-11-14T10:01:30Z', releasableAt: '2026-11-14T10:06:30Z' });
+  });
+});
+
+describe('prazo da reserva (r6 P0-02)', () => {
+  it('touchPaymentClaim renova pela RPC e devolve released/consumed sem lançar', async () => {
+    const { d, calls } = deps(reply(200, '{"status":"open","active_until":"2026-11-14T10:01:30Z"}'));
+    expect(await touchPaymentClaim('k-1', 'tok-1', d)).toEqual({ ok: true, status: 'open', activeUntil: '2026-11-14T10:01:30Z' });
+    expect(calls[0]!.url).toBe('https://x.supabase.co/rest/v1/rpc/tchefood_touch_payment_claim');
+    expect(calls[0]!.body).toEqual({ p_key: 'k-1', p_staff: 'staff-1', p_release_token: 'tok-1' });
+    expect(await touchPaymentClaim('k-1', 'tok-1', deps(reply(200, '{"status":"released","active_until":null}')).d)).toEqual({ ok: true, status: 'released', activeUntil: null });
+    expect((await touchPaymentClaim('k-1', 'tok-1', deps(async () => { throw new Error('rede'); }).d)).ok).toBe(false);
+    expect((await touchPaymentClaim('k-1', 'tok-1', deps(reply(200, '{"status":"x"}')).d)).ok).toBe(false);
+    // Sem o segredo: não chama o servidor (a reserva envelhece).
+    const none = deps(reply(200, '{"status":"open"}'));
+    expect((await touchPaymentClaim('k-1', null, none.d)).ok).toBe(false);
+    expect(none.calls).toHaveLength(0);
+  });
+
+  it('TF011: o gerente não libera reserva de cobrança em andamento em outro aparelho', async () => {
+    const out = await releasePaymentClaimManager('k-1', '9999', 'Não houve cobrança', deps(reply(400, '{"code":"TF011","message":"claim_active"}')).d);
+    expect(out).toEqual({ ok: false, active: true, error: 'Reserva em andamento (outro aparelho): ainda não pode ser liberada.' });
+    const msg = 'TCHEFOOD_CLAIM: claim_active: o gerente pode liberá-la a partir de 14:32:05 (horário de Brasília).';
+    const timed = await releasePaymentClaimManager('k-1', '9999', 'Não houve cobrança', deps(reply(400, JSON.stringify({ code: 'TF011', message: msg, details: 'releasable_at=2026-11-14T17:32:05Z' }))).d);
+    expect(timed).toEqual({ ok: false, active: true, error: 'Reserva em andamento (outro aparelho): ainda não pode ser liberada. O gerente pode liberar a partir de 14:32:05 (horário de Brasília).' });
   });
 });

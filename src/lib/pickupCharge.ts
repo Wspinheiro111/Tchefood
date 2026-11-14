@@ -50,14 +50,19 @@ export async function chargePickupOrder(params: {
     if (given > 0 && toCents(given) < toCents(amount)) return { status: 'ERROR', reason: 'Valor recebido menor que o total.' };
     const c = await startPaymentClaim(needsClaim, { orderId: order.id, key: idempotency_key, method: 'CASH', acquirer: 'CASH_DESK', amount });
     if (!c.ok) return { status: 'ERROR', reason: c.error };
-    const r = useTcheStore.getState().registerPayment({ orderId: order.id, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key, item_ids: [] });
-    if (!r.ok) {
-      c.handle.noCharge(`Dinheiro não registrado: ${r.error}`);
-      return { status: 'ERROR', reason: r.error };
+    try {
+      const r = useTcheStore.getState().registerPayment({ orderId: order.id, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key, item_ids: [] });
+      if (!r.ok) {
+        c.handle.noCharge(`Dinheiro não registrado: ${r.error}`);
+        return { status: 'ERROR', reason: r.error };
+      }
+      c.handle.settle();
+      finishPaidPickup(order.id, params.chassis, null, r.data.payment.id, preview);
+      return { status: 'APPROVED', change: given > amount ? round2(given - amount) : 0 };
+    } finally {
+      // Erro inesperado no meio: o batimento para; sem fim conhecido, o registro local fica (lista de presas).
+      c.handle.leave();
     }
-    c.handle.settle();
-    finishPaidPickup(order.id, params.chassis, null, r.data.payment.id, preview);
-    return { status: 'APPROVED', change: given > amount ? round2(given - amount) : 0 };
   }
 
   const driver = createDriver({ terminal: null, chassis: params.chassis, mode: 'SMARTPOS_EMBEDDED' });
@@ -78,6 +83,17 @@ export async function chargePickupOrder(params: {
     if (!c.ok) return { status: 'ERROR', reason: c.error };
     claim = c.handle;
     const result = await driver.charge(req);
+    const check = result.status === 'APPROVED' ? await claim.beforeRegister(result.acquirer) : null;
+    if (result.status === 'APPROVED' && check && !check.ok) {
+      // Aprovou, mas a reserva não é mais desta cobrança (ou não confirmada, ou outra adquirente): nunca
+      // registra sozinho; trava para conferência.
+      claim.settle();
+      setReviewHold({
+        order_id: order.id, amount, reason: check.reason, code: check.code, method: params.method,
+        acquirer: holdAcquirer(result.acquirer), terminal_id: result.terminal_id, terminal_serial: result.terminal_serial, idempotency_key,
+      });
+      return { status: 'MANUAL_REVIEW', reason: check.reason };
+    }
     if (result.status !== 'DECLINED') claim.settle();
     const st = useTcheStore.getState();
     if (result.status === 'MANUAL_REVIEW') {

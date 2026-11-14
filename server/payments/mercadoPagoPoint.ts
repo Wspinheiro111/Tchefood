@@ -157,11 +157,21 @@ export class MercadoPagoPointProvider implements PaymentTerminalProvider {
       ...(request.description ? { description: request.description.slice(0, 150) } : {}),
     };
 
-    const { body } = await this.request("POST", "/v1/orders", {
-      mutating: true,
-      idempotencyKey: request.idempotencyKey,
-      payload,
-    });
+    let body: unknown;
+    try {
+      ({ body } = await this.request("POST", "/v1/orders", {
+        mutating: true,
+        idempotencyKey: request.idempotencyKey,
+        payload,
+      }));
+    } catch (error) {
+      // 409 sem código conhecido na criação não prova que a ordem não foi criada: o resultado fica desconhecido
+      // (reconsulta/revisão), nunca recusa direta. Os 409 conhecidos (idempotency_conflict, terminal_busy) seguem iguais.
+      if (error instanceof PaymentTerminalProviderError && error.httpStatus === 409 && error.code === "invalid_request") {
+        throw new PaymentTerminalProviderError("invalid_request", { httpStatus: 409, outcomeUnknown: true, detail: "unknown_conflict" });
+      }
+      throw error;
+    }
     return this.parseMutatingOrder(body);
   }
 
@@ -171,18 +181,31 @@ export class MercadoPagoPointProvider implements PaymentTerminalProvider {
   }
 
   // Ordem de uma criação sem resposta, pela referência enviada (GET /v1/orders com external_reference e a janela
-  // begin_date/end_date em RFC 3339, lista em "data"). Só vale item com a referência idêntica e tipo "point" (ou sem
-  // tipo). Nenhum = null (não achou AGORA, não prova que não existe); mais de um = erro; erro HTTP = erro.
+  // begin_date/end_date em RFC 3339, lista em "data"). A janela é a criação ± SEARCH_MARGIN_MS, com o fim nunca no
+  // futuro. Só vale item com a referência idêntica e tipo "point" (ou sem tipo); do item da busca só se usa o id, e a
+  // ordem completa vem de getCharge. Nenhum = null (não achou AGORA, não prova que não existe); mais de um = erro;
+  // busca recusada (400) = erro com detail "search_refused"; outro erro HTTP = erro.
   async findChargeByReference(externalReference: string, options: { createdAt?: string } = {}): Promise<PaymentTerminalChargeResult | null> {
     if (!isValidExternalReference(externalReference)) throw new PaymentTerminalProviderError("invalid_request");
     const created = typeof options.createdAt === "string" ? Date.parse(options.createdAt) : Number.NaN;
     if (!Number.isFinite(created)) throw new PaymentTerminalProviderError("invalid_request");
+    const now = this.now();
+    const begin = created - SEARCH_MARGIN_MS;
+    const end = Math.max(begin, Math.min(now, created + SEARCH_MARGIN_MS));
     const query = new URLSearchParams({
       external_reference: externalReference,
-      begin_date: new Date(created - SEARCH_MARGIN_MS).toISOString(),
-      end_date: new Date(this.now() + SEARCH_MARGIN_MS).toISOString(),
+      begin_date: new Date(begin).toISOString(),
+      end_date: new Date(end).toISOString(),
     });
-    const { body } = await this.request("GET", `/v1/orders?${query.toString()}`, { mutating: false });
+    let body: unknown;
+    try {
+      ({ body } = await this.request("GET", `/v1/orders?${query.toString()}`, { mutating: false }));
+    } catch (error) {
+      if (error instanceof PaymentTerminalProviderError && error.httpStatus === 400) {
+        throw new PaymentTerminalProviderError("invalid_request", { httpStatus: 400, detail: "search_refused" });
+      }
+      throw error;
+    }
     const data = asObject(body)?.data;
     if (!Array.isArray(data)) throw malformed();
     const matches = data.filter((raw) => {
@@ -191,9 +214,11 @@ export class MercadoPagoPointProvider implements PaymentTerminalProvider {
     });
     if (matches.length === 0) return null;
     if (matches.length > 1) throw new PaymentTerminalProviderError("malformed_response", { detail: "multiple_orders" });
-    const found = this.parseOrder(matches[0]);
-    // parseOrder lê a referência do mesmo campo; a conferência fica explícita.
-    if (found.externalReference !== externalReference) throw malformed();
+    const id = asString(asObject(matches[0])?.id);
+    if (!id) throw malformed();
+    const found = await this.getCharge(id);
+    // A ordem lida pelo id precisa ser a mesma e ter a referência idêntica.
+    if (found.externalOrderId !== id || found.externalReference !== externalReference) throw malformed();
     return found;
   }
 

@@ -66,7 +66,10 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
   Sem resultado do Mercado Pago (queda, prazo, erro 5xx, 408, 429, resposta ilegível), a posse **nunca é devolvida
   antes da hora**: fica até vencer e só então a próxima consulta repete com a **mesma chave** (o Mercado Pago
   devolve a ordem original). Se a resposta da barreira demorar mais de 10 s para chegar, o envio não sai (a
-  chamada poderia passar do fim da posse). Recusa do pedido só vira "nada foi cobrado" no **primeiro**
+  chamada poderia passar do fim da posse). Nesse caso o primeiro envio já ficou marcado sem a chamada ter saído,
+  e quem faz o primeiro POST de verdade pode ser uma consulta (`status`) depois que a posse vence; ele conta como
+  repetição, então uma recusa ali fica como resultado desconhecido (vai para revisão), nunca "nada foi cobrado".
+  Recusa do pedido só vira "nada foi cobrado" no **primeiro**
   envio; numa repetição (ou com conflito de idempotência) o envio anterior pode ter criado a ordem, e a cobrança
   segue como resultado desconhecido.
 - **Envio sem resposta nunca vira recusa por tempo nem por PIN.** Encerramento pedido com a ordem ainda desconhecida:

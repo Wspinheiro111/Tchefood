@@ -19,6 +19,7 @@ import { KioskScreen } from './screens/KioskScreen';
 import { PickupCounterScreen } from './screens/PickupCounterScreen';
 import { CashRegisterScreen } from './screens/CashRegisterScreen';
 import { useCloudSync } from './lib/sync/useCloudSync';
+import { setClaimAlertHandler } from './lib/payments/claimSupervisor';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
 import { PrintSimulatorModal } from './components/PrintSimulator';
 import { ToastHost, toast } from './components/ui';
@@ -64,6 +65,11 @@ export default function App() {
   const backOfficeTabs = useBackOfficeTabs();
   // Etapa 0: envia a fila para o Supabase quando há internet e o aparelho está conectado.
   useCloudSync(online);
+  // Reserva liberada pelo gerente antes do pagamento chegar ao servidor (laço de sincronização): alerta na tela.
+  useEffect(() => {
+    setClaimAlertHandler((text) => toast.alert(`⚠️ ${text}`));
+    return () => setClaimAlertHandler(null);
+  }, []);
 
   // Perfil Cozinha entra direto no KDS.
   useEffect(() => {
