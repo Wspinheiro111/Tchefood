@@ -2498,6 +2498,200 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     forgetPinFailures();
   });
 
+  /** Sessão psql à parte, com o token do aparelho; resolve com a saída quando o psql fecha. */
+  function pinSession(body: string, app = 'tchefood_test', tenant = TENANT) {
+    const psqlArgs = ['-h', target!.host, '-p', target!.port, '-U', target!.user, '-d', DB, '-X', '-q', '-t', '-A', '-v', 'ON_ERROR_STOP=1'];
+    return new Promise<string>((resolve, reject) => {
+      const p = spawn('psql', psqlArgs, { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, PGAPPNAME: app } });
+      let out = '';
+      let err = '';
+      p.stdout.on('data', (c) => { out += c; });
+      p.stderr.on('data', (c) => { err += c; });
+      p.on('error', reject);
+      // 'close' (e não 'exit'): a saída já foi lida inteira.
+      p.on('close', (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(err || `psql saiu com ${code}`))));
+      const claims = JSON.stringify({ role: 'authenticated', tenant_id: tenant, sub: 'device' });
+      p.stdin.end(`BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '${claims}', true) \\g /dev/null
+        ${body} COMMIT;`);
+    });
+  }
+
+  /** Sessão de superusuário que segura uma trava até `release()`; espera a trava estar concedida. */
+  async function holdLock(lockSql: string, granted: string) {
+    const p = spawn('psql', ['-h', target!.host, '-p', target!.port, '-U', target!.user, '-d', DB, '-X', '-q', '-v', 'ON_ERROR_STOP=1'],
+      { stdio: ['pipe', 'ignore', 'pipe'], env: { ...process.env, PGAPPNAME: 'tchefood_holder' } });
+    const closed = new Promise((r) => p.on('close', r));
+    p.stdin.write(`BEGIN; ${lockSql}\n`);
+    await waitFor(granted);
+    return { release: async () => { p.stdin.end('COMMIT;\n'); await closed; } };
+  }
+
+  /** Espera a consulta devolver 't' (sem dormir um tempo fixo). */
+  async function waitFor(q: string, timeoutMs = 10_000) {
+    const until = Date.now() + timeoutMs;
+    while (sql(q) !== 't') {
+      if (Date.now() > until) throw new Error(`tempo esgotado esperando: ${q}`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  const AUDIT_SHARE_HELD = `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity s ON s.pid = l.pid
+    WHERE s.application_name = 'tchefood_holder' AND l.locktype = 'relation' AND l.relation = 'audit_logs'::regclass AND l.mode = 'ShareLock' AND l.granted)`;
+
+  it('PIN do gerente nas autorizações: 20 tentativas erradas simultâneas, só 3 conferem o PIN e a conciliação espera pela mesma trava (corrida do bloqueio em tchefood_authorize_manager)', async () => {
+    vi.useRealTimers();
+    forgetPinFailures();
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    // Troca de barril (sem comanda), cada tentativa com o seu client_audit_id: a trava do reenvio
+    // não junta tentativas diferentes, só a trava da loja enfileira a contagem.
+    const authorize = () => pinSession(`SELECT COALESCE(tchefood_authorize_manager(NULL, 'KEG_CHANGED', '0000', '${cashier}', 'Tentativa concorrente', 0,
+        jsonb_build_object('client_audit_id', '${crypto.randomUUID()}'))::text, 'NULL');`);
+    const reconcile = () => pinSession(`SELECT tchefood_reconcile_cashback('${crypto.randomUUID()}', 'ORPHAN', '${crypto.randomUUID()}', NULL, 'DISCARD', 5, '0000', '${cashier}', 'Tentativa concorrente')->>'status';`);
+    const pinRows = (type: string) => sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = '${type}' AND created_at >= NOW() - INTERVAL '60 seconds'`);
+    // Segura a gravação no audit_logs: sem a trava da loja, as 20 contariam 0 falhas antes de qualquer uma gravar.
+    const holder = await holdLock('LOCK TABLE audit_logs IN SHARE MODE;', AUDIT_SHARE_HELD);
+    const attempts = Promise.all(Array.from({ length: 20 }, () => authorize()));
+    await new Promise((r) => setTimeout(r, 500));
+    await holder.release();
+    expect(await attempts).toEqual(Array(20).fill('NULL'));
+    expect(pinRows('MANAGER_PIN_FAILED')).toBe('3');
+    expect(pinRows('MANAGER_PIN_LOCKOUT')).toBe('17');
+    // Mesma chave nas duas funções: 10 autorizações e 10 conciliações juntas somam 3 conferências.
+    forgetPinFailures();
+    const holder2 = await holdLock('LOCK TABLE audit_logs IN SHARE MODE;', AUDIT_SHARE_HELD);
+    const mixed = Promise.all(Array.from({ length: 20 }, (_, i) => (i % 2 ? reconcile() : authorize())));
+    await new Promise((r) => setTimeout(r, 500));
+    await holder2.release();
+    await mixed;
+    expect(pinRows('MANAGER_PIN_FAILED')).toBe('3');
+    expect(pinRows('MANAGER_PIN_LOCKOUT')).toBe('17');
+    forgetPinFailures();
+  });
+
+  /** Comanda nova da loja, para as autorizações presas a uma comanda. */
+  function newOrder(): string {
+    const id = crypto.randomUUID();
+    const table = sql(`SELECT id FROM dining_tables WHERE tenant_id = '${TENANT}' LIMIT 1`);
+    const opener = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'OWNER' LIMIT 1`);
+    sql(`SET session_replication_role = replica;
+         INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${id}', '${TENANT}', '${table}', '${opener}');
+         SET session_replication_role = origin;`);
+    return id;
+  }
+
+  it('autorização na comanda e conciliação de uma retenção dela, juntas, terminam as duas sem deadlock (P1-01 da rodada 1 do GPT no PR #50)', async () => {
+    vi.useRealTimers();
+    forgetPinFailures();
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    const customer = sql(`SELECT id FROM loyalty_customers WHERE tenant_id = '${TENANT}' LIMIT 1`);
+    const order = newOrder();
+    const hold = crypto.randomUUID();
+    sql(`INSERT INTO cashback_ledger (id, tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, created_by_user_id)
+         VALUES ('${hold}', '${TENANT}', '${customer}', '${order}', 'HOLD', 1.25, 0, '${cashier}');`);
+    // O cliente travado por outra transação: a conciliação pega a trava da loja e para no cliente.
+    const holder = await holdLock(`SELECT 1 FROM loyalty_customers WHERE id = '${customer}' FOR UPDATE;`,
+      `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = 'tchefood_holder' AND state = 'idle in transaction')`);
+    const reconcile = pinSession(`SELECT tchefood_reconcile_cashback('${crypto.randomUUID()}', 'HOLD', '${customer}', '${hold}', 'DISCARD', 1.25, '${MANAGER_PIN}', '${cashier}', 'Conferido com o cliente')->>'status';`, 'tchefood_reconcile');
+    await waitFor(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = 'tchefood_reconcile' AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple'))`);
+    // A autorização na mesma comanda chega e espera a trava da loja (antes: já com a comanda travada).
+    const authorize = pinSession(`SELECT tchefood_authorize_manager('${order}', 'SERVICE_FEE_REMOVED', '${MANAGER_PIN}', '${cashier}', 'Cliente pediu sem os 10%', 0,
+        jsonb_build_object('client_audit_id', '${crypto.randomUUID()}')) IS NOT NULL;`, 'tchefood_authorize');
+    await waitFor(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = 'tchefood_authorize' AND wait_event_type = 'Lock' AND wait_event = 'advisory')`);
+    // Solta o cliente: a conciliação grava o audit_log que aponta para a comanda.
+    await holder.release();
+    const [reconciled, authorized] = await Promise.allSettled([reconcile, authorize]);
+    expect(reconciled).toEqual({ status: 'fulfilled', value: 'OK' });
+    expect(authorized).toEqual({ status: 'fulfilled', value: 't' });
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE order_id = '${order}' AND action_type = 'CASHBACK_RECONCILED' AND authorized_by_manager_id IS NOT NULL`)).toBe('1');
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE order_id = '${order}' AND action_type = 'SERVICE_FEE_REMOVED' AND authorized_by_manager_id IS NOT NULL`)).toBe('1');
+    expect(sql(`SELECT count(*) FROM cashback_reconciliations WHERE hold_id = '${hold}'`)).toBe('1');
+  });
+
+  it('janela de 60 s pelo relógio de agora: a espera pela trava não deixa falha vencida bloquear, e a falha grava a hora da conferência (P2-01 da rodada 1 do GPT no PR #50)', async () => {
+    vi.useRealTimers();
+    forgetPinFailures();
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    const order = newOrder();
+    const PIN_LOCK = `SELECT pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || '${TENANT}'));`;
+    const PIN_HELD = `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity s ON s.pid = l.pid WHERE s.application_name = 'tchefood_holder' AND l.locktype = 'advisory' AND l.granted)`;
+    const waiting = (app: string) => `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = '${app}' AND wait_event_type = 'Lock' AND wait_event = 'advisory')`;
+    const authorize = (pin: string, app: string) => pinSession(`SELECT COALESCE(tchefood_authorize_manager('${order}', 'SERVICE_FEE_REMOVED', '${pin}', '${cashier}', 'Janela do bloqueio', 0,
+        jsonb_build_object('client_audit_id', '${crypto.randomUUID()}'))::text, 'NULL');`, app);
+    const failures = (when: string) => sql(`INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata, created_at)
+         SELECT '${TENANT}', '${cashier}', 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto', '{}'::jsonb, ${when} FROM generate_series(1, 3);`);
+
+    // Três falhas que vencem durante a espera: quando a trava sai, já passaram de 60 s.
+    failures(`clock_timestamp() - INTERVAL '58 seconds'`);
+    let holder = await holdLock(PIN_LOCK, PIN_HELD);
+    const late = authorize(MANAGER_PIN, 'tchefood_late');
+    await waitFor(waiting('tchefood_late'));
+    await new Promise((r) => setTimeout(r, 3000));
+    await holder.release();
+    expect(await late).not.toBe('NULL');
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE order_id = '${order}' AND action_type = 'MANAGER_PIN_LOCKOUT'`)).toBe('0');
+
+    // Três falhas recentes de verdade continuam bloqueando a quarta tentativa, mesmo com o PIN certo.
+    forgetPinFailures();
+    failures('clock_timestamp()');
+    expect(await authorize(MANAGER_PIN, 'tchefood_locked')).toBe('NULL');
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE order_id = '${order}' AND action_type = 'MANAGER_PIN_LOCKOUT'`)).toBe('1');
+
+    // A falha que esperou pela trava grava a hora da conferência, não a do início da transação.
+    forgetPinFailures();
+    holder = await holdLock(PIN_LOCK, PIN_HELD);
+    const wrong = authorize('0000', 'tchefood_wrong');
+    await waitFor(waiting('tchefood_wrong'));
+    await new Promise((r) => setTimeout(r, 1500));
+    const released = sql(`SELECT clock_timestamp()`);
+    await holder.release();
+    expect(await wrong).toBe('NULL');
+    expect(sql(`SELECT created_at >= '${released}'::timestamptz FROM audit_logs WHERE order_id = '${order}' AND action_type = 'MANAGER_PIN_FAILED' ORDER BY server_seq DESC LIMIT 1`)).toBe('t');
+    forgetPinFailures();
+  }, 30_000);
+
+  it('janela de 60 s na conciliação do cashback pelo relógio de agora: falha vencida durante a espera não bloqueia, e a falha grava a hora da conferência (P2-01 da rodada 2 do GPT no PR #50)', async () => {
+    vi.useRealTimers();
+    forgetPinFailures();
+    const cashier = sql(`SELECT id FROM staff_users WHERE tenant_id = '${TENANT}' AND role = 'CASHIER' LIMIT 1`);
+    const customer = sql(`SELECT id FROM loyalty_customers WHERE tenant_id = '${TENANT}' LIMIT 1`);
+    const hold = crypto.randomUUID();
+    sql(`INSERT INTO cashback_ledger (id, tenant_id, customer_id, order_id, entry_type, amount, remaining_amount, created_by_user_id)
+         VALUES ('${hold}', '${TENANT}', '${customer}', NULL, 'HOLD', 2.50, 0, '${cashier}');`);
+    const PIN_LOCK = `SELECT pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || '${TENANT}'));`;
+    const PIN_HELD = `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity s ON s.pid = l.pid WHERE s.application_name = 'tchefood_holder' AND l.locktype = 'advisory' AND l.granted)`;
+    const waiting = (app: string) => `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = '${app}' AND wait_event_type = 'Lock' AND wait_event = 'advisory')`;
+    const reconcile = (pin: string, app: string) => pinSession(`SELECT tchefood_reconcile_cashback('${crypto.randomUUID()}', 'HOLD', '${customer}', '${hold}', 'DISCARD', 2.50, '${pin}', '${cashier}', 'Conferido com o cliente')->>'status';`, app);
+    const recent = (type: string) => sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = '${type}'
+         AND metadata->>'attempted_action' = 'CASHBACK_RECONCILED' AND created_at >= NOW() - INTERVAL '60 seconds'`);
+    const failures = (when: string) => sql(`INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, reason, metadata, created_at)
+         SELECT '${TENANT}', '${cashier}', 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto', '{}'::jsonb, ${when} FROM generate_series(1, 3);`);
+
+    // Três falhas que vencem durante a espera pela trava: a conciliação com o PIN certo passa.
+    failures(`clock_timestamp() - INTERVAL '58 seconds'`);
+    let holder = await holdLock(PIN_LOCK, PIN_HELD);
+    const late = reconcile(MANAGER_PIN, 'tchefood_late_reconcile');
+    await waitFor(waiting('tchefood_late_reconcile'));
+    await new Promise((r) => setTimeout(r, 3000));
+    await holder.release();
+    expect(await late).toBe('OK');
+    expect(sql(`SELECT count(*) FROM cashback_reconciliations WHERE hold_id = '${hold}'`)).toBe('1');
+    expect(recent('MANAGER_PIN_LOCKOUT')).toBe('0');
+
+    // A falha que esperou pela trava grava a hora da conferência, não a do início da transação.
+    forgetPinFailures();
+    holder = await holdLock(PIN_LOCK, PIN_HELD);
+    const wrong = reconcile('0000', 'tchefood_wrong_reconcile');
+    await waitFor(waiting('tchefood_wrong_reconcile'));
+    await new Promise((r) => setTimeout(r, 1500));
+    const released = sql(`SELECT clock_timestamp()`);
+    await holder.release();
+    expect(await wrong).toBe('PIN_FAILED');
+    expect(sql(`SELECT created_at >= '${released}'::timestamptz FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'
+         AND metadata->>'attempted_action' = 'CASHBACK_RECONCILED' ORDER BY server_seq DESC LIMIT 1`)).toBe('t');
+    expect(sql(`SELECT count(*) FROM cashback_reconciliations WHERE hold_id = '${hold}'`)).toBe('1');
+    forgetPinFailures();
+  }, 30_000);
+
   it('troca de barril com PIN de gerente: histórico, audit_log e barril novo pela função do servidor', async () => {
     forgetPinFailures();
     const tapId = crypto.randomUUID();
