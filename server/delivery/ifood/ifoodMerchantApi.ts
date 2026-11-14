@@ -3,6 +3,11 @@ import {
   type DeliveryAddress,
   type DeliveryCancellationReason,
   type DeliveryCourier,
+  type DeliveryDispute,
+  type DeliveryDisputeAlternative,
+  type DeliveryDisputeDecision,
+  type DeliveryDisputeSettlement,
+  type DeliveryDisputeSettlementStatus,
   type DeliveryEvent,
   type DeliveryEventSignal,
   type DeliveryFulfillment,
@@ -14,28 +19,60 @@ import {
   type DeliveryOrderOption,
   type DeliveryOrderPayment,
   type DeliveryPaymentMethod,
+  type DeliveryStoreControl,
+  type DeliveryStorePause,
+  type DeliveryStoreState,
+  type DeliveryStoreStatus,
 } from "../marketplace";
 
 // iFood Merchant API (https://developer.ifood.com.br). Fluxo de pedidos:
-//  1. Token OAuth2 (client_credentials) em /authentication/v1.0/oauth/token.
-//  2. Polling de eventos a cada 30s em /order/v1.0/events:polling (o iFood considera a loja aberta enquanto
-//     o polling estiver ativo). Evento sem ack volta no próximo polling.
-//  3. Ack em /order/v1.0/events/acknowledgment — só DEPOIS de gravar o evento (senão o pedido some).
-//  4. Detalhes em /order/v1.0/orders/{id} e ações confirm/startPreparation/readyToPickup/dispatch.
-// Os caminhos e códigos seguem a versão 1.0 da API; conferir na homologação, antes da primeira loja real.
+//  1. Token OAuth2 (client_credentials) de app centralizado (sem refresh token). Reaproveitado até perto de vencer.
+//  2. Polling de eventos a cada 30 s com o header x-polling-merchants: o polling mantém a loja ativa no iFood.
+//  3. Ack de TODO evento recebido (até os ignorados), só DEPOIS de gravar. Evento sem ack volta no próximo polling.
+//  4. Detalhe do pedido consultado uma vez (é imutável); ações confirm/startPreparation/readyToPickup/dispatch
+//     respondem 202 e só valem quando o evento correspondente chega no polling.
+//
+// Conferência com a documentação oficial (14/11/2026): docs/integracoes/delivery/ifood-homologacao.md. As rotas
+// abaixo marcadas "a confirmar" existem no portal (página de limites), mas o prefixo de versão ou o corpo não
+// puderam ser lidos; todas ficam neste objeto para corrigir num lugar só.
+export const IFOOD_PATHS = {
+  // a confirmar: prefixo /authentication/v1.0 e nomes grantType/clientId/clientSecret.
+  token: "/authentication/v1.0/oauth/token",
+  // a confirmar: prefixo /order/v1.0 (a página de limites lista só "/events:polling").
+  polling: "/order/v1.0/events:polling",
+  acknowledgment: "/order/v1.0/events/acknowledgment",
+  order: (orderId: string) => `/order/v1.0/orders/${orderId}`,
+  orderAction: (orderId: string, action: string) => `/order/v1.0/orders/${orderId}/${action}`,
+  // conferido na página de limites e na da plataforma de negociação (handshake-platform), com o corpo de cada uma.
+  disputeAccept: (disputeId: string) => `/order/v1.0/disputes/${disputeId}/accept`,
+  disputeReject: (disputeId: string) => `/order/v1.0/disputes/${disputeId}/reject`,
+  disputeAlternative: (disputeId: string, alternativeId: string) => `/order/v1.0/disputes/${disputeId}/alternatives/${alternativeId}`,
+  // a confirmar: prefixo /merchant/v1.0 (a página de limites lista só "/merchants/{merchantId}/...").
+  merchantStatus: (merchantId: string) => `/merchant/v1.0/merchants/${merchantId}/status`,
+  interruptions: (merchantId: string) => `/merchant/v1.0/merchants/${merchantId}/interruptions`,
+  interruption: (merchantId: string, interruptionId: string) => `/merchant/v1.0/merchants/${merchantId}/interruptions/${interruptionId}`,
+} as const;
 
 export const IFOOD_DEFAULT_BASE_URL = "https://merchant-api.ifood.com.br";
+// Documentação oficial (boas práticas): "Execute polling every 30 seconds to keep the merchant active".
 export const IFOOD_POLLING_INTERVAL_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 15_000;
 // Renova o token um pouco antes de vencer para não perder um ciclo de polling.
 const TOKEN_EXPIRY_MARGIN_MS = 60_000;
-// O iFood recebe no máximo esta quantidade de ids por chamada de ack.
+// Ids por chamada de ack (a confirmar no portal; lotes menores não fazem mal).
 const MAX_ACK_BATCH = 2_000;
 // Ids do iFood são UUIDs; o merchantId também.
 const ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
 
-// Código do evento -> sinal comum. Código ausente desta tabela (handshake, disputa, entrega etc.) vira
-// "unknown": o evento é registrado e confirmado, mas não mexe no status do pedido.
+// merchantId no formato que setMerchantIds aceita (o servidor filtra a lista antes, para uma integração mal
+// cadastrada não derrubar o polling das outras lojas).
+export function isValidIfoodMerchantId(id: string): boolean {
+  return ID_PATTERN.test(id);
+}
+
+// Código do evento -> sinal comum (lista oficial: /pt-BR/docs/guides/order/events). Código ausente desta tabela
+// (entregador, troca de endereço, alteração de itens etc.) vira "unknown": o evento é registrado e confirmado,
+// mas não mexe no pedido. SPS/SPE são só do iFood Mercado; ficam como "preparando" por segurança.
 const IFOOD_EVENT_SIGNALS: Readonly<Record<string, DeliveryEventSignal>> = {
   PLC: "placed",
   CFM: "confirmed",
@@ -47,6 +84,11 @@ const IFOOD_EVENT_SIGNALS: Readonly<Record<string, DeliveryEventSignal>> = {
   CAN: "cancelled",
   CAR: "cancellation_requested",
   CARF: "cancellation_denied",
+  CCR: "customer_cancellation_requested",
+  CCA: "customer_cancellation_accepted",
+  CCD: "customer_cancellation_denied",
+  HSD: "dispute_opened",
+  HSS: "dispute_settled",
 };
 
 export function mapIfoodEventCode(code: string): DeliveryEventSignal {
@@ -77,13 +119,13 @@ export type IfoodMerchantApiOptions = {
 
 type CachedToken = { value: string; expiresAt: number };
 
-export class IfoodMerchantApi implements DeliveryMarketplaceAdapter {
+export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliveryStoreControl {
   readonly channel = "ifood" as const;
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
-  private readonly merchantIds: readonly string[];
+  private merchantIds: readonly string[];
   private token: CachedToken | null = null;
   private tokenRequest: Promise<string> | null = null;
 
@@ -102,36 +144,51 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter {
     this.merchantIds = options.merchantIds ?? [];
   }
 
+  // Lojas buscadas no polling (o servidor relê as integrações ativas a cada ciclo).
+  setMerchantIds(merchantIds: readonly string[]): void {
+    for (const id of merchantIds) {
+      if (!ID_PATTERN.test(id)) throw new DeliveryMarketplaceError("ifood", "invalid_request", `merchantId inválido: ${id}`);
+    }
+    this.merchantIds = [...merchantIds];
+  }
+
   async pollEvents(): Promise<DeliveryEvent[]> {
     const headers: Record<string, string> = {};
     if (this.merchantIds.length > 0) headers["x-polling-merchants"] = this.merchantIds.join(",");
-    const body = await this.request("GET", "/order/v1.0/events:polling", { headers });
+    const body = await this.request("GET", IFOOD_PATHS.polling, { headers });
     // 204 = nenhum evento novo.
     if (body === null) return [];
     if (!Array.isArray(body)) throw this.invalid("Resposta do polling não é uma lista.");
-    return body.map((raw) => parseIfoodEvent(raw));
+    // Um evento estranho não pode travar os outros: o que tem id é confirmado (ack) mesmo sem dar para usar;
+    // sem id não há como confirmar, e ele só é descartado.
+    const events: DeliveryEvent[] = [];
+    for (const raw of body) {
+      const event = parseIfoodEventLenient(raw);
+      if (event) events.push(event);
+    }
+    return events;
   }
 
   async acknowledge(events: readonly DeliveryEvent[]): Promise<void> {
     const ids = [...new Set(events.map((event) => event.externalEventId))];
     for (let start = 0; start < ids.length; start += MAX_ACK_BATCH) {
       const batch = ids.slice(start, start + MAX_ACK_BATCH).map((id) => ({ id }));
-      await this.request("POST", "/order/v1.0/events/acknowledgment", { json: batch });
+      await this.request("POST", IFOOD_PATHS.acknowledgment, { json: batch });
     }
   }
 
   async getOrder(externalOrderId: string): Promise<DeliveryOrder> {
-    const body = await this.request("GET", `/order/v1.0/orders/${this.orderId(externalOrderId)}`);
+    const body = await this.request("GET", IFOOD_PATHS.order(this.orderId(externalOrderId)));
     if (body === null) throw new DeliveryMarketplaceError("ifood", "not_found", `Pedido ${externalOrderId} sem detalhes no iFood.`);
     return mapIfoodOrder(body);
   }
 
   async performAction(externalOrderId: string, action: DeliveryOrderAction): Promise<void> {
-    await this.request("POST", `/order/v1.0/orders/${this.orderId(externalOrderId)}/${ACTION_PATHS[action]}`);
+    await this.request("POST", IFOOD_PATHS.orderAction(this.orderId(externalOrderId), ACTION_PATHS[action]));
   }
 
   async listCancellationReasons(externalOrderId: string): Promise<DeliveryCancellationReason[]> {
-    const body = await this.request("GET", `/order/v1.0/orders/${this.orderId(externalOrderId)}/cancellationReasons`);
+    const body = await this.request("GET", IFOOD_PATHS.orderAction(this.orderId(externalOrderId), "cancellationReasons"));
     if (body === null) return [];
     if (!Array.isArray(body)) throw this.invalid("Lista de motivos de cancelamento inválida.");
     return body.map((raw) => {
@@ -145,18 +202,78 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter {
 
   async requestCancellation(externalOrderId: string, reason: DeliveryCancellationReason, details?: string): Promise<void> {
     if (!reason.code.trim()) throw new DeliveryMarketplaceError("ifood", "invalid_request", "Escolha um motivo de cancelamento do iFood.");
-    await this.request("POST", `/order/v1.0/orders/${this.orderId(externalOrderId)}/requestCancellation`, {
+    await this.request("POST", IFOOD_PATHS.orderAction(this.orderId(externalOrderId), "requestCancellation"), {
       json: { reason: (details?.trim() || reason.description).slice(0, 250), cancellationCode: reason.code },
     });
+  }
+
+  // Corpos conforme a página da plataforma de negociação (developer.ifood.com.br/en-US/docs/guides/modules/order/
+  // handshake-platform): todas respondem 201. O aceite leva {reason, detailReason?} quando a negociação traz
+  // acceptCancellationReasons; a proposta leva o tipo e o valor (centavos, em texto) ou os minutos e o motivo.
+  async respondToDispute(disputeId: string, decision: DeliveryDisputeDecision): Promise<void> {
+    const id = this.safeId(disputeId, "negociação");
+    if (decision.kind === "accept") {
+      const reason = decision.reason?.trim();
+      const detailReason = decision.detailReason?.trim().slice(0, 250);
+      const json = reason ? { reason, ...(detailReason ? { detailReason } : {}) } : undefined;
+      await this.request("POST", IFOOD_PATHS.disputeAccept(id), json ? { json } : {});
+    } else if (decision.kind === "reject") {
+      const reason = decision.reason.trim();
+      if (!reason) throw new DeliveryMarketplaceError("ifood", "invalid_request", "Informe o motivo da recusa.");
+      await this.request("POST", IFOOD_PATHS.disputeReject(id), { json: { reason: reason.slice(0, 250) } });
+    } else {
+      const alternativeId = this.safeId(decision.alternativeId, "proposta");
+      await this.request("POST", IFOOD_PATHS.disputeAlternative(id, alternativeId), { json: ifoodAlternativeBody(decision) });
+    }
+  }
+
+  async getStoreStatus(merchantExternalId: string): Promise<DeliveryStoreStatus> {
+    const body = await this.request("GET", IFOOD_PATHS.merchantStatus(this.safeId(merchantExternalId, "loja")));
+    return mapIfoodStoreStatus(body);
+  }
+
+  async listPauses(merchantExternalId: string): Promise<DeliveryStorePause[]> {
+    const body = await this.request("GET", IFOOD_PATHS.interruptions(this.safeId(merchantExternalId, "loja")));
+    if (body === null) return [];
+    if (!Array.isArray(body)) throw this.invalid("Lista de pausas inválida.");
+    return body.map(mapIfoodInterruption);
+  }
+
+  // id: o id da interrupção, escolhido por quem cria. O servidor passa o id da tentativa, para que a mesma tentativa
+  // nunca crie duas pausas; sem id, um UUID novo.
+  async pauseStore(merchantExternalId: string, pause: { id?: string; description: string; start: string; end: string }): Promise<DeliveryStorePause> {
+    const description = pause.description.trim();
+    const start = Date.parse(pause.start);
+    const end = Date.parse(pause.end);
+    if (!description) throw new DeliveryMarketplaceError("ifood", "invalid_request", "Informe o motivo da pausa.");
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      throw new DeliveryMarketplaceError("ifood", "invalid_request", "Pausa com início/fim inválidos.");
+    }
+    // O id da interrupção é escolhido por quem cria (a confirmar no portal).
+    if (pause.id !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pause.id)) {
+      throw new DeliveryMarketplaceError("ifood", "invalid_request", "Id da pausa inválido.");
+    }
+    const id = pause.id ?? crypto.randomUUID();
+    const json = { id, description: description.slice(0, 200), start: new Date(start).toISOString(), end: new Date(end).toISOString() };
+    const body = await this.request("POST", IFOOD_PATHS.interruptions(this.safeId(merchantExternalId, "loja")), { json });
+    return body === null ? json : mapIfoodInterruption(body);
+  }
+
+  async resumeStore(merchantExternalId: string, pauseId: string): Promise<void> {
+    await this.request("DELETE", IFOOD_PATHS.interruption(this.safeId(merchantExternalId, "loja"), this.safeId(pauseId, "pausa")));
   }
 
   // -------------------------------------------------------------------------
 
   private orderId(externalOrderId: string): string {
-    if (!ID_PATTERN.test(externalOrderId)) {
-      throw new DeliveryMarketplaceError("ifood", "invalid_request", `Id de pedido iFood inválido: ${externalOrderId}`);
+    return this.safeId(externalOrderId, "pedido");
+  }
+
+  private safeId(value: string, label: string): string {
+    if (!ID_PATTERN.test(value)) {
+      throw new DeliveryMarketplaceError("ifood", "invalid_request", `Id de ${label} iFood inválido: ${value}`);
     }
-    return encodeURIComponent(externalOrderId);
+    return encodeURIComponent(value);
   }
 
   private invalid(message: string): DeliveryMarketplaceError {
@@ -180,7 +297,7 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter {
       clientId: this.options.credentials.clientId,
       clientSecret: this.options.credentials.clientSecret,
     });
-    const response = await this.send("/authentication/v1.0/oauth/token", {
+    const response = await this.send(IFOOD_PATHS.token, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
       body: form.toString(),
@@ -198,7 +315,7 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter {
   }
 
   private async request(
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "DELETE",
     path: string,
     init: { headers?: Record<string, string>; json?: unknown } = {},
   ): Promise<unknown> {
@@ -250,7 +367,13 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter {
   private readBody(response: RawResponse): unknown {
     if (response.status === 204) return null;
     if (!response.ok) {
-      throw new DeliveryMarketplaceError("ifood", errorCodeForStatus(response.status), describeIfoodError(response.status, response.text), response.status);
+      throw new DeliveryMarketplaceError(
+        "ifood",
+        errorCodeForStatus(response.status),
+        describeIfoodError(response.status, response.text),
+        response.status,
+        ifoodErrorCode(response.text),
+      );
     }
     if (!response.text.trim()) return null;
     try {
@@ -270,6 +393,18 @@ function errorCodeForStatus(status: number): DeliveryMarketplaceErrorCode {
   if (status === 429) return "rate_limited";
   if (status >= 500) return "unavailable";
   return "invalid_request";
+}
+
+// Código de erro do iFood no corpo (ex.: 422 "DISPUTE_ALREADY_ANSWERED"), em {error: {code}} ou {code}.
+function ifoodErrorCode(text: string): string | null {
+  try {
+    const record = asRecord(JSON.parse(text));
+    const error = asRecord(record?.error) ?? record;
+    const code = optionalString(error?.code);
+    return code && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? code : null;
+  } catch {
+    return null;
+  }
 }
 
 function describeIfoodError(status: number, text: string): string {
@@ -323,18 +458,225 @@ function quantity(value: unknown, field: string): number {
   return value;
 }
 
+// Horário do evento sempre em ISO UTC ("...Z"): a caixa de entrada compara horários como texto, e o iFood pode
+// mandar com fuso ("-03:00") ou sem milissegundos. Horário ausente ou ilegível vira o mais antigo possível, para
+// nunca passar na frente de um evento com horário de verdade.
+function isoInstant(value: unknown): string {
+  const text = optionalString(value);
+  const parsed = text ? Date.parse(text) : Number.NaN;
+  return new Date(Number.isFinite(parsed) ? parsed : 0).toISOString();
+}
+
 export function parseIfoodEvent(raw: unknown): DeliveryEvent {
   const record = asRecord(raw);
   if (!record) throw new DeliveryMarketplaceError("ifood", "invalid_response", "Evento do iFood inválido.");
   const rawCode = requiredString(record.code, "event.code");
+  const signal = mapIfoodEventCode(rawCode);
   return {
     channel: "ifood",
     externalEventId: requiredString(record.id, "event.id"),
     externalOrderId: requiredString(record.orderId, "event.orderId"),
     merchantExternalId: optionalString(record.merchantId) ?? "",
     rawCode,
-    signal: mapIfoodEventCode(rawCode),
-    createdAt: optionalString(record.createdAt) ?? new Date(0).toISOString(),
+    signal,
+    createdAt: isoInstant(record.createdAt),
+    dispute: signal === "dispute_opened" ? parseIfoodDispute(record.metadata) : null,
+    ...(signal === "dispute_settled" ? { settlement: parseIfoodSettlement(record.metadata) } : {}),
+  };
+}
+
+// Versão do polling: evento com id mas incompleto vira "unknown" com malformed = true, mantendo o pedido quando
+// ele veio (vai para o histórico do pedido e vira pendência); evento sem id volta null (não há o que confirmar).
+// Nunca lança.
+export function parseIfoodEventLenient(raw: unknown): DeliveryEvent | null {
+  try {
+    return parseIfoodEvent(raw);
+  } catch {
+    const record = asRecord(raw);
+    const id = optionalString(record?.id);
+    if (!id) return null;
+    // O pedido do evento é mantido sempre que vier num formato aceitável: o evento vai para o histórico do pedido
+    // (e busca o detalhe, se o pedido for novo) em vez de ser confirmado e esquecido.
+    const orderId = optionalString(record?.orderId);
+    return {
+      channel: "ifood",
+      externalEventId: id,
+      externalOrderId: orderId && ID_PATTERN.test(orderId) ? orderId : "",
+      merchantExternalId: optionalString(record?.merchantId) ?? "",
+      rawCode: optionalString(record?.code) ?? "?",
+      signal: "unknown",
+      createdAt: isoInstant(record?.createdAt),
+      dispute: null,
+      malformed: true,
+    };
+  }
+}
+
+// Metadados da negociação (HSD), conforme a página da plataforma de negociação. Sem id a negociação não pode ser
+// respondida e o pedido vai para conferência humana. A documentação põe acceptCancellationReasons ora em
+// metadata.metadata (exemplos), ora em metadata (tabela): os dois lugares são lidos.
+export function parseIfoodDispute(raw: unknown): DeliveryDispute | null {
+  const metadata = asRecord(raw);
+  const id = optionalString(metadata?.disputeId) ?? optionalString(metadata?.id);
+  if (!metadata || !id || !ID_PATTERN.test(id)) return null;
+  const alternatives = Array.isArray(metadata.alternatives)
+    ? metadata.alternatives.flatMap((entry): DeliveryDisputeAlternative[] => {
+        const alternative = asRecord(entry);
+        const alternativeId = optionalString(alternative?.id);
+        if (!alternative || !alternativeId || !ID_PATTERN.test(alternativeId)) return [];
+        const details = asRecord(alternative.metadata);
+        const maxAmount = asRecord(details?.maxAmount);
+        return [{
+          id: alternativeId,
+          type: alternativeType(alternative.type),
+          description: optionalString(alternative.description),
+          maxAmountCents: minorUnits(maxAmount?.value),
+          currency: optionalString(maxAmount?.currency),
+          allowedAdditionalTimeInMinutes: integerList(details?.allowedsAdditionalTimeInMinutes),
+          allowedAdditionalTimeReasons: stringList(details?.allowedsAdditionalTimeReasons),
+        }];
+      })
+    : [];
+  const nested = asRecord(metadata.metadata);
+  return {
+    id,
+    action: optionalString(metadata.action),
+    handshakeType: optionalString(metadata.handshakeType),
+    timeoutAction: optionalString(metadata.timeoutAction),
+    message: optionalString(metadata.message),
+    expiresAt: optionalString(metadata.expiresAt) ?? optionalString(metadata.timeoutAt),
+    alternatives,
+    acceptCancellationReasons: stringList(nested?.acceptCancellationReasons ?? metadata.acceptCancellationReasons),
+  };
+}
+
+const SETTLEMENT_STATUSES: Readonly<Record<string, DeliveryDisputeSettlementStatus>> = {
+  ACCEPTED: "accepted",
+  REJECTED: "rejected",
+  EXPIRED: "expired",
+  ALTERNATIVE_REPLIED: "alternative_replied",
+};
+
+// Andamento/desfecho da negociação (HSS). Status fora da lista vira "unknown" (a caixa de entrada não fecha nada).
+export function parseIfoodSettlement(raw: unknown): DeliveryDisputeSettlement {
+  const metadata = asRecord(raw);
+  const disputeId = optionalString(metadata?.disputeId);
+  const rawStatus = optionalString(metadata?.status);
+  const selected = asRecord(metadata?.selectedDisputeAlternative);
+  const details = asRecord(selected?.metadata);
+  return {
+    disputeId: disputeId && ID_PATTERN.test(disputeId) ? disputeId : null,
+    status: SETTLEMENT_STATUSES[rawStatus ?? ""] ?? "unknown",
+    rawStatus,
+    reason: optionalString(metadata?.reason),
+    selectedAlternative: selected
+      ? {
+          id: optionalString(selected.id),
+          type: alternativeType(selected.type),
+          amountCents: minorUnits(asRecord(details?.amount)?.value),
+          additionalTimeInMinutes: minorUnits(details?.additionalTimeInMinutes),
+          additionalTimeReason: optionalString(details?.additionalTimeReason),
+        }
+      : null,
+  };
+}
+
+// Os exemplos do iFood escrevem "ADDTIONAL_TIME" no evento e "ADDITIONAL_TIME" na resposta.
+function alternativeType(value: unknown): string | null {
+  const type = optionalString(value)?.toUpperCase() ?? null;
+  return type === "ADDTIONAL_TIME" ? "ADDITIONAL_TIME" : type;
+}
+
+// Valor sem casas decimais (centavos), em texto ou número ("6000" = R$ 60,00). Qualquer outra coisa = null.
+function minorUnits(value: unknown): number | null {
+  const text = optionalString(value);
+  if (!text || !/^\d{1,9}$/.test(text)) return null;
+  return Number(text);
+}
+
+function integerList(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const parsed = minorUnits(entry);
+    return parsed !== null && parsed > 0 ? [parsed] : [];
+  });
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const parsed = optionalString(entry);
+    return parsed && parsed.length <= 80 ? [parsed] : [];
+  });
+}
+
+// Corpo da proposta. Os limites (teto do valor, minutos e motivos aceitos) são conferidos pela caixa de entrada
+// contra a negociação gravada; aqui só se garante que nada sai incompleto.
+function ifoodAlternativeBody(decision: Extract<DeliveryDisputeDecision, { kind: "alternative" }>): Record<string, unknown> {
+  const type = decision.alternativeType;
+  if (type === "REFUND" || type === "BENEFIT") {
+    const amount = decision.amountCents;
+    if (typeof amount !== "number" || !Number.isInteger(amount) || amount <= 0) {
+      throw new DeliveryMarketplaceError("ifood", "invalid_request", "Informe o valor da proposta.");
+    }
+    return { type, metadata: { amount: { value: String(amount), currency: decision.currency ?? "BRL" } } };
+  }
+  if (type === "ADDITIONAL_TIME") {
+    const minutes = decision.additionalTimeInMinutes;
+    const reason = decision.additionalTimeReason?.trim();
+    if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes <= 0 || !reason) {
+      throw new DeliveryMarketplaceError("ifood", "invalid_request", "Informe os minutos e o motivo do novo prazo.");
+    }
+    return { type, metadata: { additionalTimeInMinutes: minutes, additionalTimeReason: reason } };
+  }
+  throw new DeliveryMarketplaceError("ifood", "invalid_request", "Tipo de proposta desconhecido; responda pelo Portal do Parceiro.");
+}
+
+const STORE_STATES: Readonly<Record<string, DeliveryStoreState>> = {
+  OK: "open",
+  WARNING: "warning",
+  CLOSED: "closed",
+  ERROR: "error",
+};
+
+// Status da loja: o iFood devolve uma lista por operação (entrega, retirada...). A loja está aberta se alguma
+// operação estiver OK; fechada se todas estiverem fechadas. Campos a confirmar no portal.
+export function mapIfoodStoreStatus(raw: unknown): DeliveryStoreStatus {
+  const list = Array.isArray(raw) ? raw : raw === null ? [] : [raw];
+  const operations = list.flatMap((entry) => {
+    const record = asRecord(entry);
+    if (!record) return [];
+    const message = asRecord(record.message);
+    return [{
+      operation: optionalString(record.operation) ?? "DELIVERY",
+      state: STORE_STATES[optionalString(record.state) ?? ""] ?? ("unknown" as DeliveryStoreState),
+      available: typeof record.available === "boolean" ? record.available : null,
+      message: optionalString(message?.title) ?? optionalString(message?.subtitle) ?? optionalString(record.message),
+    }];
+  });
+  const states = operations.map((operation) => operation.state);
+  const state: DeliveryStoreState = states.length === 0
+    ? "unknown"
+    : states.includes("open")
+      ? "open"
+      : states.includes("warning")
+        ? "warning"
+        : states.includes("error")
+          ? "error"
+          : states.every((value) => value === "closed")
+            ? "closed"
+            : "unknown";
+  return { state, message: operations.find((operation) => operation.message)?.message ?? null, operations };
+}
+
+export function mapIfoodInterruption(raw: unknown): DeliveryStorePause {
+  const record = asRecord(raw);
+  if (!record) throw new DeliveryMarketplaceError("ifood", "invalid_response", "Pausa do iFood inválida.");
+  return {
+    id: requiredString(record.id, "interruption.id"),
+    description: optionalString(record.description) ?? "",
+    start: requiredString(record.start, "interruption.start"),
+    end: requiredString(record.end, "interruption.end"),
   };
 }
 
@@ -423,6 +765,26 @@ function mapPayment(raw: unknown, index: number): DeliveryOrderPayment {
   };
 }
 
+// Parte dos descontos que o iFood (ou um parceiro) paga: patrocínio IFOOD/EXTERNAL conta como pagamento para a
+// loja; MERCHANT/CHAIN é desconto da própria loja (página oficial de detalhes do pedido).
+const MARKETPLACE_SPONSORS = new Set(["IFOOD", "EXTERNAL"]);
+
+function sponsoredByMarketplace(raw: unknown): number {
+  if (!Array.isArray(raw)) return 0;
+  let total = 0;
+  raw.forEach((entry, index) => {
+    const benefit = asRecord(entry);
+    const sponsorships = Array.isArray(benefit?.sponsorshipValues) ? benefit.sponsorshipValues : [];
+    sponsorships.forEach((value, sponsorIndex) => {
+      const sponsorship = asRecord(value);
+      if (MARKETPLACE_SPONSORS.has(optionalString(sponsorship?.name) ?? "")) {
+        total += cents(sponsorship?.value, `benefits[${index}].sponsorshipValues[${sponsorIndex}].value`);
+      }
+    });
+  });
+  return total;
+}
+
 export function mapIfoodOrder(raw: unknown): DeliveryOrder {
   const record = asRecord(raw);
   if (!record) throw new DeliveryMarketplaceError("ifood", "invalid_response", "Pedido do iFood inválido.");
@@ -434,6 +796,7 @@ export function mapIfoodOrder(raw: unknown): DeliveryOrder {
   const paymentsRecord = asRecord(record.payments);
   const schedule = asRecord(record.schedule);
   const fulfillment = mapFulfillment(optionalString(record.orderType));
+  const scheduled = optionalString(record.orderTiming) === "SCHEDULED";
 
   const items = Array.isArray(record.items) ? record.items.map(mapItem) : [];
   if (items.length === 0) throw new DeliveryMarketplaceError("ifood", "invalid_response", "Pedido do iFood sem itens.");
@@ -444,11 +807,15 @@ export function mapIfoodOrder(raw: unknown): DeliveryOrder {
     deliveryFeeCents: cents(total?.deliveryFee, "total.deliveryFee"),
     additionalFeesCents: cents(total?.additionalFees, "total.additionalFees"),
     benefitsCents: cents(total?.benefits, "total.benefits"),
+    benefitsSponsoredByMarketplaceCents: sponsoredByMarketplace(record.benefits),
     orderCents: cents(total?.orderAmount, "total.orderAmount", true),
   };
 
   // O pedido nunca é recusado por divergência: entra com aviso para o lojista conferir.
   const warnings: string[] = [];
+  if (scheduled && !optionalString(schedule?.deliveryDateTimeStart)) {
+    warnings.push("Pedido agendado sem horário de entrega informado pelo iFood.");
+  }
   for (const item of items) {
     if (!item.externalCode) warnings.push(`"${item.name}" está sem código PDV no iFood; vincule ao produto do cardápio.`);
   }
@@ -459,6 +826,9 @@ export function mapIfoodOrder(raw: unknown): DeliveryOrder {
   const expected = totals.itemsCents + totals.deliveryFeeCents + totals.additionalFeesCents - totals.benefitsCents;
   if (expected !== totals.orderCents) {
     warnings.push(`Total do pedido (${totals.orderCents}) não fecha com itens + taxas − descontos (${expected}).`);
+  }
+  if (totals.benefitsSponsoredByMarketplaceCents > totals.benefitsCents) {
+    warnings.push(`Patrocínio do iFood nos descontos (${totals.benefitsSponsoredByMarketplaceCents}) maior que o total de descontos (${totals.benefitsCents}).`);
   }
   const paidSum = payments.reduce((sum, payment) => sum + payment.amountCents, 0);
   if (payments.length > 0 && paidSum !== totals.orderCents) {
@@ -477,7 +847,11 @@ export function mapIfoodOrder(raw: unknown): DeliveryOrder {
     status: "placed",
     fulfillment,
     courier: fulfillment === "delivery" ? mapCourier(optionalString(delivery?.deliveredBy)) : "unknown",
-    scheduledFor: optionalString(record.orderTiming) === "SCHEDULED" ? optionalString(schedule?.deliveryDateTimeStart) : null,
+    scheduledFor: scheduled ? optionalString(schedule?.deliveryDateTimeStart) : null,
+    scheduledUntil: scheduled ? optionalString(schedule?.deliveryDateTimeEnd) : null,
+    preparationStartAt: optionalString(record.preparationStartDateTime),
+    pickupCode: optionalString(delivery?.pickupCode),
+    isTest: record.isTest === true,
     createdAt: requiredString(record.createdAt, "createdAt"),
     customer: {
       name: optionalString(customer?.name) ?? "Cliente iFood",

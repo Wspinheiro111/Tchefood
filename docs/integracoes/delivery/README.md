@@ -8,7 +8,7 @@ Pedidos de iFood, 99Food, Keeta, Delivery Much, Aiqfome, Anota AI e Rappi entram
 
 | App | Como integra | Situação no Tchê Food | O que falta |
 |-----|--------------|-----------------------|-------------|
-| iFood | API oficial (Merchant API), homologação do app | Adapter pronto + simulador | Conta no Portal do Desenvolvedor, credenciais de teste, homologação |
+| iFood | API oficial (Merchant API), homologação do app | Servidor de polling + gravação no Supabase prontos ([ifood-homologacao.md](ifood-homologacao.md)); tela no item 5 | Credenciais de teste, conferir rotas "a confirmar", homologação |
 | 99Food | Open Platform da 99Food | Planejado | Cadastro de parceiro; documentação só abre com navegador |
 | Keeta | Padrão Open Delivery (Abrasel) | Planejado (adapter Open Delivery genérico) | Credenciais OAuth `od.all` + `X-App-Signature` |
 | Delivery Much | API de parceiro | Planejado | Contrato de parceria |
@@ -31,27 +31,21 @@ Pedidos de iFood, 99Food, Keeta, Delivery Much, Aiqfome, Anota AI e Rappi entram
 
 ## iFood
 
-`server/delivery/ifood/ifoodMerchantApi.ts`
+Servidor de polling, API para o app, rotas conferidas e o que falta para a homologação:
+[ifood-homologacao.md](ifood-homologacao.md).
 
-- Token: `POST /authentication/v1.0/oauth/token` (`client_credentials`), reaproveitado até 1 min antes de vencer e
-  renovado sozinho se o iFood responder 401.
-- Polling: `GET /order/v1.0/events:polling` a cada 30 s com `x-polling-merchants` (o iFood considera a loja aberta
-  enquanto o polling roda).
-- Ack: `POST /order/v1.0/events/acknowledgment`.
-- Pedido: `GET /order/v1.0/orders/{id}`; ações `confirm`, `startPreparation`, `readyToPickup`, `dispatch`
-  (só com motoboy da loja), `cancellationReasons` e `requestCancellation`.
-- Códigos de evento: PLC, CFM, PRS/SPS, RTP, DSP, CON, CAN, CAR, CARF. Os demais ficam só no histórico.
-
-Os caminhos seguem a versão 1.0 da API e foram escritos sem acesso à documentação oficial (o portal não abre sem
-navegador). **Conferir cada um no portal antes da homologação.**
-
-`server/delivery/ifood/ifoodSandbox.ts` é um iFood falso em memória que responde pelo mesmo `fetch`. Os testes e a tela
-**Delivery** (perfis Caixa, Gerente e Proprietário) usam ele.
+- `server/delivery/ifood/ifoodMerchantApi.ts`: adapter (token, polling, ack, pedido, ações, negociação, pausa da loja).
+  Caminhos em `IFOOD_PATHS`.
+- `server/delivery/ifood/ifoodServer.ts` e `main.ts`: polling a cada 30 s e API HTTP para o app.
+- `server/delivery/supabaseDeliveryRepository.ts`: grava pelas funções de `db/schema_delivery_servidor.sql`.
+- `server/delivery/ifood/ifoodSandbox.ts`: iFood falso em memória que responde pelo mesmo `fetch`. Os testes e a tela
+  **Delivery** (perfis Caixa, Gerente e Proprietário) usam ele.
 
 ## Para ligar uma loja de verdade
 
-1. Criar a conta em developer.ifood.com.br e o app (modelo centralizado), anotar `client_id`/`client_secret`.
-2. Rodar a caixa de entrada num servidor (ainda não existe; ver PRs de backend) com as credenciais em variáveis de
-   ambiente e `DeliveryRepository` gravando em `delivery_orders` / `delivery_events` no Supabase.
-3. Trocar a tela Delivery do simulador para ler `delivery_orders` (Realtime) e chamar as ações pelo servidor.
-4. Passar pela homologação do iFood com a loja de teste.
+1. Conta no Portal do Desenvolvedor do iFood, app centralizado, `client_id`/`client_secret` (o segredo só nas variáveis
+   de ambiente do servidor).
+2. Aplicar as migrations no Supabase e cadastrar o `merchantId` da loja em `delivery_integrations`.
+3. Subir o servidor (uma instância) com as variáveis de [ifood-homologacao.md](ifood-homologacao.md#rodar).
+4. Trocar a tela Delivery do simulador para ler `delivery_orders` e chamar as ações pelo servidor (item 5 do piloto).
+5. Passar pela homologação do iFood com a loja de teste.

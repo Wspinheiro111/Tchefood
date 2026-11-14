@@ -8,7 +8,9 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit && tsc -p tsconfig.server.json && tsc -p tsconfig.functions.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "build:ifood": "vite build --ssr server/delivery/ifood/main.ts --outDir dist-ifood --emptyOutDir",
+    "start:ifood": "node dist-ifood/main.js"
   },
   "dependencies": {
     "@google/model-viewer": "^4.4.0",
