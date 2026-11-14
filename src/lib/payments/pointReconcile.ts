@@ -162,3 +162,78 @@ export async function pointPaymentOnServer(orderId: string, idempotencyKey: stri
     return fail;
   }
 }
+
+/**
+ * Estorno da cobrança da Point aprovada com pagamento já registrado (ação `refund` da point-charge; auditoria GPT r9,
+ * P1-01). O PIN de gerente e o motivo só pedem a leitura: o servidor grava o estorno só com o próprio pagamento lido
+ * no Mercado Pago mostrando o dinheiro devolvido.
+ *  - refunded: o servidor gravou (ou já tinha gravado) o estorno, provado no Mercado Pago;
+ *  - not_proven: o servidor leu o Mercado Pago e não gravou nada (code diz o que faltou);
+ *  - pin: PIN de gerente recusado (403);
+ *  - refused: o servidor recusou o pedido (400/404/409): nada foi gravado;
+ *  - unknown: sem resposta conclusiva (rede, prazo, falha interna). O estorno PODE ter sido gravado: repetir é
+ *    seguro (a repetição não grava de novo) e é o único jeito de saber.
+ */
+export type RefundOutcome =
+  | { kind: 'refunded' }
+  | { kind: 'not_proven'; code: string; error: string }
+  | { kind: 'pin'; error: string }
+  | { kind: 'refused'; error: string }
+  | { kind: 'unknown'; error: string };
+
+export interface RefundInput {
+  idempotency_key: string;
+  staff_id: string;
+  manager_pin: string;
+  reason_text: string;
+}
+
+const REFUND_UNKNOWN = 'Sem resposta conclusiva do servidor: não dá para saber se o estorno foi registrado. Tente de novo (repetir não registra duas vezes).';
+
+export async function refundPointPayment(input: RefundInput, deps: ReconcileDeps = defaultReconcileDeps()): Promise<RefundOutcome> {
+  if (!/^\d{4,8}$/.test(input.manager_pin)) return { kind: 'pin', error: 'Digite o PIN do gerente.' };
+  if (input.reason_text.trim().length < RECONCILE_MIN_REASON) return { kind: 'refused', error: `Informe o motivo (mínimo ${RECONCILE_MIN_REASON} caracteres).` };
+  const body = {
+    action: 'refund',
+    idempotency_key: input.idempotency_key,
+    staff_id: input.staff_id,
+    manager_pin: input.manager_pin,
+    reason_text: input.reason_text.trim(),
+  };
+  const deadline = deps.timer(RECONCILE_TIMEOUT_MS).then(() => null);
+  let sent = false;
+  try {
+    const cfg = await Promise.race([deps.config().catch(() => null), deadline]);
+    // Nada foi enviado: com certeza nada foi gravado.
+    if (!cfg) return { kind: 'refused', error: 'Sem sessão da nuvem. Conecte a loja e tente de novo; nada foi alterado.' };
+    const endpoint = pointChargeEndpoint(cfg);
+    sent = true;
+    const out = await Promise.race([
+      (async () => {
+        const res = await deps.fetch(endpoint.url, { method: 'POST', headers: endpoint.headers, body: JSON.stringify(body) });
+        return { status: res.status, text: await res.text() };
+      })(),
+      deadline,
+    ]);
+    if (!out) return { kind: 'unknown', error: REFUND_UNKNOWN };
+    const obj = parseObject(out.text);
+    const message = obj && typeof obj.message === 'string' ? obj.message : null;
+    if (out.status === 200) {
+      const parsed = parseChargeReply(out.text);
+      // Resposta de outra cobrança não prova nada sobre esta.
+      const reply = parsed && parsed.idempotency_key === input.idempotency_key ? parsed : null;
+      if (reply?.status === 'DECLINED' && obj?.code === 'REFUNDED') return { kind: 'refunded' };
+      if (reply?.status === 'MANUAL_REVIEW') return { kind: 'not_proven', code: reply.code, error: reply.reason };
+      // APPROVED, DECLINED sem REFUNDED, PENDING ou resposta ilegível: não é a resposta deste pedido.
+      return { kind: 'unknown', error: REFUND_UNKNOWN };
+    }
+    if (out.status === 403) return { kind: 'pin', error: message ?? 'PIN de gerente incorreto ou bloqueado. Nada foi alterado.' };
+    // Recusas da função (com o código dela no corpo). Sem corpo da função (proxy, gateway): não é recusa.
+    if ((out.status === 400 || out.status === 404 || out.status === 409) && obj && typeof obj.error === 'string') {
+      return { kind: 'refused', error: message ?? 'O servidor recusou o estorno. Nada foi alterado.' };
+    }
+    return { kind: 'unknown', error: REFUND_UNKNOWN };
+  } catch {
+    return sent ? { kind: 'unknown', error: REFUND_UNKNOWN } : { kind: 'refused', error: 'Sem sessão da nuvem. Conecte a loja e tente de novo; nada foi alterado.' };
+  }
+}

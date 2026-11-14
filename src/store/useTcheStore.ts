@@ -86,7 +86,7 @@ import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SEL
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, reviewHoldKey } from '../lib/payments/reviewHolds';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
-import { reservationExceeds, TOTAL_BELOW_PAID } from '../lib/payments/pointReservation';
+import { isTf012Rejection, reservationExceeds, TOTAL_BELOW_PAID } from '../lib/payments/pointReservation';
 import { localClaim } from '../lib/payments/claimLedger';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { buildAccessKey } from '../lib/nfce';
@@ -468,6 +468,13 @@ interface Actions {
    * Recusa se o pagamento já subiu (não está na fila nem nos recusados).
    */
   withdrawUnacceptedPayment: (idempotencyKey: string, reason: string) => ActionResult<{ payment: Payment; nfceIssued: boolean }>;
+  /**
+   * Estorno da cobrança da Point já GRAVADO no servidor (ação `refund` da point-charge respondeu REFUNDED): espelha
+   * aqui o que o servidor fez — o pagamento da chave vira REFUNDED e o saldo da conta é recalculado (conta fechada
+   * segue fechada, como no servidor) —, tira a trava desta chave e guarda o registro só neste aparelho. Nada sobe pela
+   * fila: o servidor já tem o estorno e o registro dele (POINT_PAYMENT_REFUNDED).
+   */
+  mirrorServerPointRefund: (idempotencyKey: string, reason: string) => ActionResult<{ payment: Payment | null; nfceIssued: boolean }>;
 
   // Fase 3 — KDS e QR Code
   advanceItemStatus: (itemId: UUID) => ActionResult<OrderItem>;
@@ -549,7 +556,10 @@ interface Actions {
   /** Tira da fila os eventos recusados pela nuvem e guarda em syncRejected. */
   rejectSyncEvents: (rejections: Array<{ eventId: UUID; status: number; message: string }>) => void;
   /** Devolve os recusados para o começo da fila, na ordem original, para nova tentativa. */
-  retryRejectedSync: () => void;
+  /** Volta os recusados para a fila; os de `keep` ficam nos recusados (ex.: pagamento à espera do gerente). */
+  retryRejectedSync: (keep?: ReadonlyArray<string>) => void;
+  /** Volta só estes recusados para a fila, na frente (ex.: pagamento cuja reserva foi pedida agora). */
+  requeueRejectedEvents: (eventIds: ReadonlyArray<string>) => void;
   /**
    * Autorização de gerente recusada (fila antiga sem PIN, ou PIN trocado em outro
    * aparelho antes de subir): o mesmo gerente digita o PIN atual e o evento fica
@@ -569,6 +579,12 @@ interface Actions {
    * com o PIN (auth): a autorização da fila descreve a troca a partir do desconto velho.
    */
   adoptCloudDiscount: (eventId: UUID, auth?: ManagerAuthInput) => ActionResult<number>;
+  /**
+   * Desconto recusado pela nuvem com TF012 (abaixo do reservado ou do já pago): desfaz aqui o desconto, voltando ao
+   * de antes (o que o servidor tem), tira a recusa e corrige o desconto das versões seguintes da conta na fila.
+   * Sem isso a recusa segura a conta (inclusive o pagamento que consumiria a reserva).
+   */
+  revertRejectedDiscount: (eventId: UUID) => ActionResult<{ discount: number }>;
   /**
    * Resgate de cashback recusado pela nuvem (o banco não concedeu o crédito): desfaz aqui o
    * resgate, a baixa dos créditos e o desconto da conta, e refaz as versões seguintes da conta
@@ -692,6 +708,12 @@ function permissionEvent(row: RolePermission): SyncEvent {
     created_at: nowISO(),
   };
 }
+
+/**
+ * Fila antiga (sem caused_by_payment_id): as mudanças da conta gravadas até este tempo depois do pagamento são
+ * dele (withdrawUnacceptedPayment).
+ */
+export const LEGACY_CONSEQUENCE_WINDOW_MS = 1_000;
 
 function syncEvent(table: SyncEvent['table'], op: SyncEvent['op'], row: { id: UUID }): SyncEvent {
   return {
@@ -2231,10 +2253,26 @@ export const useTcheStore = create<TcheState>()(
           const ts = nowISO();
           const itemIds = new Set(state.orderItems.filter((i) => i.order_id === order.id).map((i) => i.id));
           // Consequências do registro deste pagamento na fila (itens pagos, comanda fechada, mesa livre): saem junto.
-          // Fila gravada antes da marca caused_by_payment_id: as mudanças gravadas junto com o pagamento (mesma hora).
+          // Fila gravada antes da marca caused_by_payment_id: as mudanças gravadas junto com o pagamento. Elas saem
+          // da mesma ação, mas cada evento lê o relógio de novo e pode cair no milissegundo seguinte: vale a janela
+          // de LEGACY_CONSEQUENCE_WINDOW_MS depois do pagamento, até o próximo pagamento da mesma conta (cujas
+          // consequências seriam dele).
+          const queued = [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)];
+          const t0 = Date.parse(insertEvent.created_at);
+          const nextPayment = queued
+            .filter((e) => e.table === 'payments' && e.op === 'INSERT' && e.row_id !== payment.id && e.payload.order_id === order.id)
+            .map((e) => Date.parse(e.created_at))
+            .filter((t) => t >= t0)
+            .reduce((a, t) => Math.min(a, t), Infinity);
+          const windowEnd = Math.min(t0 + LEGACY_CONSEQUENCE_WINDOW_MS, nextPayment);
+          const inWindow = (e: SyncEvent) => {
+            const t = Date.parse(e.created_at);
+            // O mesmo instante do pagamento sempre conta (a regra antiga).
+            return Number.isFinite(t0) && t >= t0 && (t < windowEnd || t === t0);
+          };
           const isConsequence = (e: SyncEvent) => {
             if (e.caused_by_payment_id) return e.caused_by_payment_id === payment.id;
-            if (e.op !== 'UPDATE' || e.created_at !== insertEvent.created_at) return false;
+            if (e.op !== 'UPDATE' || !inWindow(e)) return false;
             return (e.table === 'orders' && e.row_id === order.id)
               || (e.table === 'order_items' && itemIds.has(e.row_id))
               || (e.table === 'dining_tables' && e.depends_on_order_id === order.id);
@@ -2288,6 +2326,48 @@ export const useTcheStore = create<TcheState>()(
             syncRejected: (s.syncRejected ?? []).filter((r) => !droppedIds.has(r.event.id)),
           }));
           return { ok: true, data: { payment: withdrawn, nfceIssued } };
+        },
+
+        mirrorServerPointRefund: (idempotencyKey, reason) => {
+          const state = get();
+          const payment = state.payments.find((p) => p.idempotency_key === idempotencyKey && p.acquirer === 'MERCADO_PAGO') ?? null;
+          const hold = getReviewHoldByKey(idempotencyKey);
+          const orderId = payment?.order_id ?? hold?.order_id ?? null;
+          const order = orderId ? state.orders.find((o) => o.id === orderId) ?? null : null;
+          let mirrored: Payment | null = payment;
+          let orders = state.orders;
+          let payments = state.payments;
+          if (payment && payment.status === 'APPROVED') {
+            mirrored = { ...payment, status: 'REFUNDED' };
+            payments = state.payments.map((p) => (p.id === payment.id ? mirrored! : p));
+            // Só o saldo, como o servidor (tchefood_refund_point_payment): conta aberta volta a dever; fechada segue fechada.
+            if (order) {
+              const recalculated = applyOrderTotals(order, state.orderItems, payments);
+              orders = state.orders.map((o) => (o.id === order.id ? { ...recalculated, status: order.status, closed_at: order.closed_at } : o));
+            }
+          }
+          const user = currentUser();
+          const log = user
+            ? buildAudit({
+              order_id: orderId,
+              performed_by_user_id: user.id,
+              authorized_by_manager_id: null,
+              action_type: 'POINT_PAYMENT_REFUNDED',
+              amount_impact: 0,
+              reason: reason.trim(),
+              metadata: {
+                idempotency_key: idempotencyKey,
+                payment_id: payment?.id ?? null,
+                amount: payment?.amount ?? null,
+                nsu: payment?.nsu ?? null,
+                server_verified: true,
+                operator_name: user.name,
+              },
+            })
+            : null;
+          set((s) => ({ payments, orders, ...(log ? { auditLogs: [log, ...s.auditLogs] } : {}) }));
+          if (hold && orderId) clearReviewHold(orderId, reviewHoldKey(hold));
+          return { ok: true, data: { payment: mirrored, nfceIssued: Boolean(order?.nfce_key) } };
         },
 
         advanceItemStatus: (itemId) => {
@@ -3986,13 +4066,25 @@ export const useTcheStore = create<TcheState>()(
           }));
         },
 
-        retryRejectedSync: () =>
+        retryRejectedSync: (keep = []) =>
           set((s) => {
-            const back = (s.syncRejected ?? []).map((r) => r.event);
+            const stay = new Set(keep);
+            const all = s.syncRejected ?? [];
+            const back = all.filter((r) => !stay.has(r.event.id)).map((r) => r.event);
             if (back.length === 0) return {};
             // Voltam na frente: são mais antigos que tudo o que entrou na fila depois.
             back.sort((a, b) => a.created_at.localeCompare(b.created_at));
-            return { outbox: [...back, ...s.outbox], syncRejected: [] };
+            return { outbox: [...back, ...s.outbox], syncRejected: all.filter((r) => stay.has(r.event.id)) };
+          }),
+
+        requeueRejectedEvents: (eventIds) =>
+          set((s) => {
+            const ids = new Set(eventIds);
+            const all = s.syncRejected ?? [];
+            const back = all.filter((r) => ids.has(r.event.id)).map((r) => r.event);
+            if (back.length === 0) return {};
+            back.sort((a, b) => a.created_at.localeCompare(b.created_at));
+            return { outbox: [...back, ...s.outbox], syncRejected: all.filter((r) => !ids.has(r.event.id)) };
           }),
 
         confirmRejectedAuthorization: (eventId, managerPin) => {
@@ -4061,6 +4153,47 @@ export const useTcheStore = create<TcheState>()(
             outbox: [managerAuthEvent(log, auth.managerPin), ev, ...s.outbox],
           }));
           return { ok: true, data: log };
+        },
+
+        revertRejectedDiscount: (eventId) => {
+          const state = get();
+          const rejected = (state.syncRejected ?? []).find((r) => r.event.id === eventId);
+          if (!rejected || rejected.event.table !== 'orders' || rejected.event.op !== 'UPDATE') return fail('Conta recusada não encontrada.');
+          if (!isTf012Rejection(rejected.message)) return fail('Esta recusa não é de desconto abaixo do reservado ou do já pago.');
+          const orderId = rejected.event.row_id;
+          const order = state.orders.find((o) => o.id === orderId);
+          if (!order) return fail('Conta não encontrada neste aparelho.');
+          if (order.status === 'CLOSED') return fail('A conta já foi fechada neste aparelho: chame o gerente para conferir com o cliente.');
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (state.cashbackLedger.some((e) => e.order_id === orderId && e.entry_type === 'REDEEM')) {
+            return fail('Esta conta usou cashback (que entra no desconto): chame o gerente para conferir.');
+          }
+          const own = toCents(Number(rejected.event.payload.discount_amount ?? Number.NaN));
+          if (!Number.isFinite(own)) return fail('A recusa não traz o desconto desta conta.');
+          // O desconto de antes: o da autorização (deste aparelho) que levou a este valor.
+          const auth = state.auditLogs.find(
+            (l) => l.order_id === orderId && l.action_type === 'DISCOUNT_APPLIED' && toCents(Number(l.metadata?.discount_after)) === own,
+          );
+          const before = auth ? Number(auth.metadata?.discount_before) : Number.NaN;
+          if (!Number.isFinite(before)) return fail('Não achei neste aparelho o desconto de antes desta troca: chame o gerente.');
+          // Versões da conta na fila: as que levam este desconto passam ao de antes; as de antes já estão certas.
+          // Outro desconto (outra troca depois): o gerente decide.
+          const queued = state.outbox.filter((e) => e.table === 'orders' && e.row_id === orderId && e.payload.discount_amount !== undefined);
+          if (queued.some((e) => ![own, toCents(before)].includes(toCents(Number(e.payload.discount_amount))))) {
+            return fail('Há outra troca de desconto desta conta na fila: chame o gerente.');
+          }
+          const reverted = applyOrderTotals({ ...order, discount_amount: before }, state.orderItems, state.payments);
+          set((s) => ({
+            orders: s.orders.map((o) => (o.id === orderId ? reverted : o)),
+            syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
+            outbox: [
+              ...s.outbox.map((e) => (e.table === 'orders' && e.row_id === orderId && e.payload.discount_amount !== undefined && toCents(Number(e.payload.discount_amount)) === own
+                ? { ...e, payload: { ...e.payload, discount_amount: before } }
+                : e)),
+              syncEvent('orders', 'UPDATE', reverted),
+            ],
+          }));
+          return { ok: true, data: { discount: before } };
         },
 
         adoptCloudDiscount: (eventId, auth) => {

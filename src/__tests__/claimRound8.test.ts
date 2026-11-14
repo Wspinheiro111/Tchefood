@@ -11,7 +11,7 @@ import { cashSummary } from '../lib/cashRegister';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, getReviewHolds, setReviewHold } from '../lib/payments/reviewHolds';
 import { beginLocalClaim, localClaim, pendingRelease, resetClaimLedger, settleLocalClaim } from '../lib/payments/claimLedger';
 import { authorizeClaimRefunded, NOT_FOUND_SPAN_MS, reclaimPayment, releaseClaimAfterNoCharge, retryPendingClaimReleases, type ClaimDeps } from '../lib/payments/paymentClaim';
-import { RESERVED_EXCEEDS_BALANCE, TOTAL_BELOW_PAID, rememberServerReservation, reservationExceeds, resetServerReservations, RESERVATION_READ_MAX_AGE_MS } from '../lib/payments/pointReservation';
+import { isTf012Rejection, RESERVED_EXCEEDS_BALANCE, TOTAL_BELOW_PAID, withoutClaimsPaidHere, rememberServerReservation, reservationExceeds, resetServerReservations, RESERVATION_READ_MAX_AGE_MS } from '../lib/payments/pointReservation';
 import { flushOutbox, sanitizePayload } from '../lib/sync/supabaseSync';
 import { confirmClaimRefunded, REFUND_NEEDS_MANAGER_RELEASE } from '../lib/payments/claimFlow';
 import type { SyncEvent } from '../types';
@@ -328,7 +328,58 @@ describe('P2-E: TF012 (reservado maior que o saldo)', () => {
   it('a recusa do servidor ao sincronizar mostra a mensagem clara', async () => {
     const ev: SyncEvent = { id: 'e1', table: 'orders', op: 'UPDATE', row_id: 'o1', payload: { id: 'o1', discount_amount: 50 }, created_at: '' };
     const res = await flushOutbox([ev], cfg, async () => ({ ok: false, status: 400, text: async () => '{"code":"TF012","message":"reserved_exceeds_balance"}' }));
-    expect(res.rejected[0]!.message).toBe('Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total. — reserved_exceeds_balance');
+    expect(res.rejected[0]!.message).toBe('Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total. Em Retaguarda › Nuvem, desfaça o desconto ou o ajuste recusado, ou reenvie depois de a cobrança terminar.');
+    const detailed = JSON.stringify({ code: 'TF012', message: 'TCHEFOOD_RESERVA: reserved_exceeds_balance', details: 'reserved_exceeds_balance reserved_cents=3000 remaining_cents=2500' });
+    const res2 = await flushOutbox([ev], cfg, async () => ({ ok: false, status: 400, text: async () => detailed }));
+    expect(res2.rejected[0]!.message).toMatch(/^Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total \(reservado R\$\s30,00; o saldo ficaria R\$\s25,00\)\. Em Retaguarda › Nuvem/);
+    expect(isTf012Rejection(res2.rejected[0]!.message)).toBe(true);
+  });
+
+  it('desconto recusado com TF012: desfazer volta ao desconto de antes, solta a conta e corrige a fila', async () => {
+    const id = openTableWith(['101', '311']);
+    const before = order(id);
+    const auth = { managerPin: '9999', reason: 'Cortesia da casa ao cliente' };
+    expect(st().applyDiscount(id, 5, auth).ok).toBe(true);
+    const disc = st().outbox.filter((e) => e.table === 'orders' && e.row_id === id).at(-1)!;
+    expect(disc.payload.discount_amount).toBe(5);
+    // Mudança seguinte da conta (mesmo desconto) segurada atrás da recusa.
+    const later = { ...disc, id: 'e-later', payload: { ...disc.payload, status: 'PAYING' } };
+    useTcheStore.setState((s) => ({ outbox: [...s.outbox, later] }));
+    const msg = 'Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total (reservado R$ 30,00; o saldo ficaria R$ 25,00). Em Retaguarda › Nuvem, desfaça o desconto ou o ajuste recusado, ou reenvie depois de a cobrança terminar.';
+    st().rejectSyncEvents([{ eventId: disc.id, status: 400, message: msg }]);
+    const r = st().revertRejectedDiscount(disc.id);
+    expect(r, JSON.stringify(r)).toEqual({ ok: true, data: { discount: before.discount_amount } });
+    expect(order(id)).toMatchObject({ discount_amount: before.discount_amount, total_amount: before.total_amount, remaining_balance: before.remaining_balance });
+    expect(st().syncRejected).toEqual([]);
+    const q = st().outbox.filter((e) => e.table === 'orders' && e.row_id === id);
+    expect(q.find((e) => e.id === 'e-later')!.payload.discount_amount).toBe(before.discount_amount);
+    expect(q.at(-1)!.payload).toMatchObject({ discount_amount: before.discount_amount });
+    expect(q.some((e) => e.payload.discount_amount === 5)).toBe(false);
+    // Outra recusa (não TF012) não é desfeita por aqui.
+    expect(st().applyDiscount(id, 4, auth).ok).toBe(true);
+    const d2 = st().outbox.filter((e) => e.table === 'orders' && e.row_id === id).at(-1)!;
+    st().rejectSyncEvents([{ eventId: d2.id, status: 403, message: 'permissão' }]);
+    expect(st().revertRejectedDiscount(d2.id).ok).toBe(false);
+    expect(order(id).discount_amount).toBe(4);
+  });
+
+  it('desfazer recusa: com outra troca de desconto na fila, não mexe (o gerente decide)', () => {
+    const id = openTableWith(['101', '311']);
+    const auth = { managerPin: '9999', reason: 'Cortesia da casa ao cliente' };
+    expect(st().applyDiscount(id, 5, auth).ok).toBe(true);
+    const disc = st().outbox.filter((e) => e.table === 'orders' && e.row_id === id).at(-1)!;
+    expect(st().applyDiscount(id, 3, auth).ok).toBe(true);
+    st().rejectSyncEvents([{ eventId: disc.id, status: 400, message: 'O total ficaria abaixo do que já foi pago; estorne um pagamento antes.' }]);
+    expect(st().revertRejectedDiscount(disc.id)).toEqual({ ok: false, error: 'Há outra troca de desconto desta conta na fila: chame o gerente.' });
+    expect(order(id).discount_amount).toBe(3);
+  });
+
+  it('caixa: reserva cuja chave é pagamento aprovado aqui não conta de novo; a de outro aparelho conta', () => {
+    const r = { reservedCents: 5000, claimsCents: 3000, openCharges: 0, manualReview: false, claims: [{ idempotencyKey: 'k-aqui', amountCents: 2000 }, { idempotencyKey: 'k-outro', amountCents: 1000 }] };
+    expect(withoutClaimsPaidHere(r, new Set(['k-aqui']))).toMatchObject({ reservedCents: 3000, claimsCents: 1000, claims: [{ idempotencyKey: 'k-outro', amountCents: 1000 }] });
+    expect(withoutClaimsPaidHere(r, new Set())).toBe(r);
+    expect(withoutClaimsPaidHere(r, new Set(['k-nada']))).toBe(r);
+    expect(withoutClaimsPaidHere(null, new Set(['k-aqui']))).toBeNull();
   });
 
   it('conferência local: última leitura recente; reservas já pagas aqui não contam', () => {

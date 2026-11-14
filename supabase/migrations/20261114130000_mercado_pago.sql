@@ -160,7 +160,10 @@ BEGIN
         v_flag := current_setting('tchefood.point_resolution', true);
         IF v_flag ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
            AND EXISTS (SELECT 1 FROM audit_logs a
-                        WHERE a.id = v_flag::uuid AND a.tenant_id = OLD.tenant_id AND a.action_type = 'POINT_CHARGE_RESOLVED'
+                        WHERE a.id = v_flag::uuid AND a.tenant_id = OLD.tenant_id
+                          -- GPT r9 P1-01: o estorno do pagamento registrado (tchefood_refund_point_payment) também.
+                          AND (a.action_type = 'POINT_CHARGE_RESOLVED'
+                               OR (a.action_type = 'POINT_PAYMENT_REFUNDED' AND OLD.status = 'approved'))
                           AND a.metadata->>'charge_id' = OLD.id::text
                           AND a.metadata->>'from' = OLD.status AND a.metadata->>'to' = NEW.status) THEN
             v_resolution := TRUE;
@@ -724,8 +727,9 @@ BEGIN
     -- Auditoria r5: também o fim verificado da cobrança e a liberação da reserva de pagamento
     -- (tchefood_resolve_point_charge e tchefood_release_payment_claim*, db/schema_point_reserva.sql).
     -- Segunda revisão: o estorno da reserva liberada com recibo (tchefood_authorize_claim_refunded).
+    -- GPT r9 P1-01: o estorno do pagamento da Point registrado (tchefood_refund_point_payment).
     IF NEW.action_type IN ('POINT_CHARGE_CANCELED', 'POINT_KEY_BLOCKED', 'POINT_CHARGE_RECONCILE_AUTHORIZED',
-                           'POINT_CHARGE_RESOLVED', 'PAYMENT_CLAIM_RELEASED', 'CLAIM_RELEASED_REFUNDED')
+                           'POINT_CHARGE_RESOLVED', 'PAYMENT_CLAIM_RELEASED', 'CLAIM_RELEASED_REFUNDED', 'POINT_PAYMENT_REFUNDED')
        AND current_user IN ('anon', 'authenticated') THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: registro da Point só é gravado pelo servidor.';
     END IF;
@@ -769,6 +773,8 @@ RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
     v_charge terminal_charges%ROWTYPE;
+    v_flag TEXT;
+    v_refund_ok BOOLEAN := FALSE;
 BEGIN
     IF NEW.acquirer::text <> 'MERCADO_PAGO' THEN
         RETURN NEW;
@@ -801,6 +807,22 @@ BEGIN
         -- aparelho só registra aprovado ou recusado; a cobrança em andamento vive em terminal_charges). Recusado.
         IF NEW.status = 'PENDING' THEN
             RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento pendente do Mercado Pago não é gravado (a cobrança em andamento fica na cobrança da Point, chave %).', NEW.idempotency_key
+                USING ERRCODE = 'TF007';
+        END IF;
+        -- GPT r9 P1-01: o pagamento APROVADO que vira estornado só pelo estorno verificado
+        -- (tchefood_refund_point_payment), com a marca tchefood.point_resolution apontando para o registro
+        -- POINT_PAYMENT_REFUNDED deste pagamento; UPDATE isolado ou forjado (mesmo com a cobrança estornada) é recusado.
+        IF TG_OP = 'UPDATE' AND OLD.status = 'APPROVED' AND NEW.status = 'REFUNDED' AND v_charge.status = 'refunded' THEN
+            v_flag := COALESCE(current_setting('tchefood.point_resolution', true), '');
+            IF v_flag ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+                SELECT EXISTS (SELECT 1 FROM audit_logs a
+                                WHERE a.id = v_flag::uuid AND a.tenant_id = OLD.tenant_id AND a.action_type = 'POINT_PAYMENT_REFUNDED'
+                                  AND a.metadata->>'payment_id' = OLD.id::text AND a.metadata->>'charge_id' = v_charge.id::text)
+                  INTO v_refund_ok;
+            END IF;
+        END IF;
+        IF TG_OP = 'UPDATE' AND OLD.status = 'APPROVED' AND NEW.status = 'REFUNDED' AND v_charge.status = 'refunded' AND NOT v_refund_ok THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o pagamento do Mercado Pago (chave %) só vira estornado pelo estorno verificado no servidor.', NEW.idempotency_key
                 USING ERRCODE = 'TF007';
         END IF;
         IF (NEW.status = 'DECLINED' AND v_charge.status IN ('rejected', 'cancelled', 'expired'))

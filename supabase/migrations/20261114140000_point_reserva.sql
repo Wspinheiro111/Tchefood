@@ -54,6 +54,12 @@
 -- 7. P1-01: fim verificado da cobrança da Point (tchefood_resolve_point_charge, só a service role,
 --    chamada pela Edge Function depois de ler o Mercado Pago): revisão manual que termina e aprovada
 --    sem pagamento que foi estornada, com UM registro POINT_CHARGE_RESOLVED.
+-- 7c. GPT r9: pagamento APROVADO só sai de aprovado pelo estorno verificado do Mercado Pago (item 7b); qualquer
+--    outra mudança de status (DECLINED, PENDING, REFUNDED fora do Mercado Pago), de qualquer papel, é TF007. O estorno
+--    fora do Mercado Pago (Stone, PagBank, dinheiro) não tem caminho no sistema, como na main; fica decisão do Will.
+-- 7b. GPT r9 P1-01: aprovada COM pagamento registrado é estornada por tchefood_refund_point_payment (só a service
+--    role, PIN de gerente pela conferência e estorno provado no Mercado Pago): cobrança e pagamento juntos, com UM
+--    registro POINT_PAYMENT_REFUNDED; a conta fechada continua fechada, com o saldo devolvido.
 --
 -- Códigos (SQLSTATE) das funções novas: TF001 conta não está no servidor, TF002 conta encerrada,
 -- TF003 passa do saldo livre, TF004 operador fora da equipe ativa, TF005 não encontrada, TF006 dado
@@ -360,6 +366,16 @@ DECLARE
     v_claim_ok BOOLEAN := FALSE;
     v_exclude VARCHAR;
 BEGIN
+    -- GPT r9 (a verificar b): pagamento APROVADO só deixa de ser aprovado pelo estorno verificado do Mercado Pago
+    -- (tchefood_refund_point_payment: REFUNDED, conferido com a marca pelo gatilho do Mercado Pago). Qualquer outra
+    -- saída (para DECLINED, PENDING, ou REFUNDED fora do Mercado Pago), de qualquer papel, inclusive service role e
+    -- dono do banco, tiraria dinheiro do pago sem registro: TF007. Estorno fora do Mercado Pago não tem caminho no
+    -- sistema (como na main); fica decisão do Will.
+    IF TG_OP = 'UPDATE' AND OLD.status = 'APPROVED' AND NEW.status <> 'APPROVED'
+       AND NOT (NEW.status = 'REFUNDED' AND NEW.acquirer::text = 'MERCADO_PAGO' AND OLD.acquirer::text = 'MERCADO_PAGO') THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento aprovado não vira "%" (só o estorno verificado do Mercado Pago tira um pagamento aprovado).', NEW.status
+            USING ERRCODE = 'TF007', DETAIL = 'approved_is_final';
+    END IF;
     -- Auditoria r8 P1-01: a chave é conferida em TODO status, antes de sair pelo status. Pagamento recusado,
     -- pendente ou estornado com a chave de uma cobrança da Point ocuparia a chave (única em payments) e o
     -- pagamento aprovado do Mercado Pago dela nunca entraria. Mesma ordem de travas de tchefood_open_terminal_charge
@@ -1369,7 +1385,7 @@ BEGIN
     IF p_from_status = 'approved' AND EXISTS (
         SELECT 1 FROM payments p WHERE p.tenant_id = p_tenant AND p.idempotency_key = v_charge.idempotency_key
            AND p.status = 'APPROVED' AND p.acquirer::text = 'MERCADO_PAGO') THEN
-        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % já virou pagamento; o estorno segue o fluxo do pagamento.', v_charge.idempotency_key USING ERRCODE = 'TF007';
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % já virou pagamento; o estorno segue o fluxo do pagamento (tchefood_refund_point_payment).', v_charge.idempotency_key USING ERRCODE = 'TF007';
     END IF;
     -- A conferência foi pedida com PIN de gerente (tchefood_authorize_point_reconcile) para ESTA cobrança, e
     -- cada pedido vale para um fim só.
@@ -1379,7 +1395,7 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a conferência da cobrança % não foi autorizada por gerente.', v_charge.idempotency_key USING ERRCODE = 'TF006';
     END IF;
     IF EXISTS (SELECT 1 FROM audit_logs a
-                WHERE a.tenant_id = p_tenant AND a.action_type = 'POINT_CHARGE_RESOLVED'
+                WHERE a.tenant_id = p_tenant AND a.action_type IN ('POINT_CHARGE_RESOLVED', 'POINT_PAYMENT_REFUNDED')
                   AND a.metadata->'evidence'->>'authorization_audit_id' = v_authorization::text) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a autorização da conferência já foi usada; peça outra.' USING ERRCODE = 'TF007';
     END IF;
@@ -1414,6 +1430,143 @@ END;
 $$;
 
 -- -----------------------------------------------------------------------------
+-- 7b. Estorno verificado do pagamento da Point já registrado (GPT r9 P1-01)
+-- -----------------------------------------------------------------------------
+-- Antes: o pagamento do Mercado Pago só virava REFUNDED com a cobrança já estornada, e a cobrança aprovada só
+-- virava estornada sem pagamento APROVADO com a chave. Pagamento registrado nunca chegava a estornado.
+-- tchefood_refund_point_payment (só a service role; a Edge Function chama depois de provar o estorno no Mercado
+-- Pago: mesmo pagamento, valor e referência, status refunded ou cancelled, chargeback nunca), numa transação:
+--   * trava do PIN da loja, depois a conta da cobrança (FOR UPDATE), depois a cobrança (FOR UPDATE), depois o
+--     pagamento: a ordem de tchefood_authorize_point_reconcile, do fim verificado e do registro do pagamento;
+--   * cobrança "refunded" (já estornada, por esta ou outra chamada): devolve a linha como está, nada gravado;
+--     outro estado que não "approved": TF007;
+--   * exige o pagamento APROVADO do Mercado Pago com a chave nesta loja (sem ele: TF007, o fim verificado,
+--     tchefood_resolve_point_charge, é que estorna a cobrança sem pagamento);
+--   * p_evidence (objeto): authorization_audit_id (registro POINT_CHARGE_RECONCILE_AUTHORIZED desta cobrança, com
+--     gerente, de tchefood_authorize_point_reconcile, aceito para um fim só: o mesmo id não serve a um
+--     POINT_CHARGE_RESOLVED nem a outro estorno, TF007), operation_id, e o que foi lido no Mercado Pago:
+--     mp_payment_id (= external_payment_id da cobrança e nsu do pagamento), mp_amount_cents (= valor da cobrança),
+--     mp_external_reference (= chave), mp_status ('refunded' ou 'cancelled'). Não confere: TF006;
+--   * p_patch: só raw_status e raw_status_detail (o comprovante fica);
+--   * grava UM registro POINT_PAYMENT_REFUNDED (só o servidor grava: tchefood_guard_point_audit), liga só nesta
+--     transação tchefood.point_resolution com o id dele (os gatilhos da cobrança e do pagamento conferem o
+--     registro: UPDATE isolado ou forjado continua recusado), grava a cobrança "refunded" e o pagamento
+--     REFUNDED. O recálculo da conta (gatilho de payments) tira o valor do pago.
+-- Conta já fechada: continua fechada (no servidor a conta encerrada não reabre: tchefood_order_close_guard), com o
+-- saldo devolvido em remaining_balance e o registro do estorno. Conta aberta: o saldo volta e ela segue aberta.
+CREATE OR REPLACE FUNCTION tchefood_refund_point_payment(
+    p_tenant UUID, p_id UUID, p_staff UUID, p_reason TEXT, p_patch JSONB, p_evidence JSONB)
+RETURNS terminal_charges
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_charge terminal_charges%ROWTYPE;
+    v_payment payments%ROWTYPE;
+    v_patch JSONB := COALESCE(p_patch, '{}'::jsonb);
+    v_field TEXT;
+    v_order UUID;
+    v_audit UUID;
+    v_authorization UUID;
+    v_manager UUID;
+    v_rows INT;
+BEGIN
+    IF p_reason IS NULL OR length(trim(p_reason)) < 10 THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: motivo obrigatório (mínimo 10 caracteres).' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_evidence IS NULL OR jsonb_typeof(p_evidence) <> 'object'
+       OR NOT (p_evidence ?& ARRAY['authorization_audit_id', 'operation_id', 'mp_payment_id', 'mp_amount_cents', 'mp_external_reference', 'mp_status']) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: falta o que foi lido no Mercado Pago (autorização, operação, pagamento, valor, referência e status).' USING ERRCODE = 'TF006';
+    END IF;
+    IF jsonb_typeof(p_evidence->'authorization_audit_id') <> 'string'
+       OR (p_evidence->>'authorization_audit_id') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: autorização da conferência inválida.' USING ERRCODE = 'TF006';
+    END IF;
+    v_authorization := (p_evidence->>'authorization_audit_id')::uuid;
+    IF jsonb_typeof(p_evidence->'mp_payment_id') <> 'string' OR jsonb_typeof(p_evidence->'mp_external_reference') <> 'string'
+       OR jsonb_typeof(p_evidence->'mp_amount_cents') <> 'number' OR jsonb_typeof(p_evidence->'mp_status') <> 'string'
+       OR (p_evidence->>'mp_status') NOT IN ('refunded', 'cancelled') THEN
+        -- Chargeback (charged_back) e qualquer outro status não provam o estorno.
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o Mercado Pago não mostra o pagamento estornado ou cancelado.' USING ERRCODE = 'TF006';
+    END IF;
+    IF jsonb_typeof(v_patch) <> 'object' THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: campos da cobrança inválidos.' USING ERRCODE = 'TF006';
+    END IF;
+    FOR v_field IN SELECT jsonb_object_keys(v_patch) LOOP
+        IF NOT v_field = ANY (ARRAY['raw_status', 'raw_status_detail']) THEN
+            RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o campo % não muda no estorno da cobrança.', v_field USING ERRCODE = 'TF006';
+        END IF;
+    END LOOP;
+    IF p_staff IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_staff AND u.tenant_id = p_tenant AND u.active) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
+    END IF;
+    -- Travas: PIN da loja, conta, cobrança, pagamento (a conta da cobrança não muda: gatilho de terminal_charges).
+    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || p_tenant::text));
+    SELECT c.order_id INTO v_order FROM terminal_charges c WHERE c.id = p_id AND c.tenant_id = p_tenant;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
+    END IF;
+    PERFORM 1 FROM orders o WHERE o.id = v_order AND o.tenant_id = p_tenant FOR UPDATE;
+    SELECT * INTO v_charge FROM terminal_charges WHERE id = p_id AND tenant_id = p_tenant FOR UPDATE;
+    IF v_charge.status = 'refunded' THEN
+        RETURN v_charge; -- já estornada: a repetição devolve a mesma linha e não grava nada
+    END IF;
+    IF v_charge.status <> 'approved' THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança está "%"; só a aprovada é estornada.', v_charge.status USING ERRCODE = 'TF007';
+    END IF;
+    SELECT * INTO v_payment FROM payments p
+     WHERE p.tenant_id = p_tenant AND p.idempotency_key = v_charge.idempotency_key AND p.acquirer::text = 'MERCADO_PAGO' AND p.status = 'APPROVED'
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a cobrança % não tem pagamento registrado; o estorno dela é pelo fim verificado.', v_charge.idempotency_key
+            USING ERRCODE = 'TF007';
+    END IF;
+    SELECT a.authorized_by_manager_id INTO v_manager FROM audit_logs a
+     WHERE a.id = v_authorization AND a.tenant_id = p_tenant AND a.action_type = 'POINT_CHARGE_RECONCILE_AUTHORIZED'
+       AND a.authorized_by_manager_id IS NOT NULL AND a.metadata->>'idempotency_key' = v_charge.idempotency_key;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o estorno da cobrança % não foi autorizado por gerente.', v_charge.idempotency_key USING ERRCODE = 'TF006';
+    END IF;
+    IF EXISTS (SELECT 1 FROM audit_logs a
+                WHERE a.tenant_id = p_tenant AND a.action_type IN ('POINT_CHARGE_RESOLVED', 'POINT_PAYMENT_REFUNDED')
+                  AND a.metadata->'evidence'->>'authorization_audit_id' = v_authorization::text) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a autorização da conferência já foi usada; peça outra.' USING ERRCODE = 'TF007';
+    END IF;
+    IF (p_evidence->>'mp_payment_id') IS DISTINCT FROM v_charge.external_payment_id
+       OR v_payment.nsu IS DISTINCT FROM v_charge.external_payment_id
+       OR (p_evidence->>'mp_external_reference') <> v_charge.idempotency_key
+       OR (p_evidence->>'mp_amount_cents')::NUMERIC <> v_charge.amount_cents
+       OR round(v_payment.amount * 100) <> v_charge.amount_cents THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o estorno lido no Mercado Pago não confere com a cobrança % (pagamento, valor ou referência).', v_charge.idempotency_key
+            USING ERRCODE = 'TF006';
+    END IF;
+    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+    VALUES (p_tenant, v_order, p_staff, v_manager, 'POINT_PAYMENT_REFUNDED', 0, trim(p_reason),
+            jsonb_build_object('charge_id', v_charge.id, 'payment_id', v_payment.id, 'idempotency_key', v_charge.idempotency_key,
+                               'amount_cents', v_charge.amount_cents, 'from', 'approved', 'to', 'refunded', 'patch', v_patch,
+                               'evidence', p_evidence, 'server_verified', true))
+    RETURNING id INTO v_audit;
+    PERFORM set_config('tchefood.point_resolution', v_audit::text, true);
+    UPDATE terminal_charges
+       SET status = 'refunded',
+           raw_status = CASE WHEN v_patch ? 'raw_status' THEN v_patch->>'raw_status' ELSE raw_status END,
+           raw_status_detail = CASE WHEN v_patch ? 'raw_status_detail' THEN v_patch->>'raw_status_detail' ELSE raw_status_detail END,
+           updated_at = clock_timestamp()
+     WHERE id = v_charge.id AND status = 'approved'
+    RETURNING * INTO v_charge;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    IF v_rows = 1 THEN
+        UPDATE payments SET status = 'REFUNDED' WHERE id = v_payment.id AND status = 'APPROVED';
+        GET DIAGNOSTICS v_rows = ROW_COUNT;
+    END IF;
+    -- A marca vale só para estas duas gravações.
+    PERFORM set_config('tchefood.point_resolution', '', true);
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o estorno não foi gravado na cobrança e no pagamento.' USING ERRCODE = 'TF007';
+    END IF;
+    RETURN v_charge;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
 -- Permissões
 -- -----------------------------------------------------------------------------
 -- Aparelho (authenticated, loja do token): ler a reserva da conta, pedir e liberar reserva de pagamento.
@@ -1440,7 +1593,8 @@ BEGIN
         'tchefood_touch_payment_claim(VARCHAR, UUID, TEXT)',
         'tchefood_reclaim_payment(VARCHAR, TEXT, VARCHAR, TEXT, VARCHAR, VARCHAR, BIGINT, UUID)',
         'tchefood_authorize_claim_refunded(VARCHAR, UUID, VARCHAR, TEXT, JSONB)',
-        'tchefood_resolve_point_charge(UUID, UUID, VARCHAR, VARCHAR, JSONB, UUID, TEXT, JSONB)'] LOOP
+        'tchefood_resolve_point_charge(UUID, UUID, VARCHAR, VARCHAR, JSONB, UUID, TEXT, JSONB)',
+        'tchefood_refund_point_payment(UUID, UUID, UUID, TEXT, JSONB, JSONB)'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
             EXECUTE format('REVOKE ALL ON FUNCTION %s FROM anon', v_fn);
@@ -1468,7 +1622,8 @@ BEGIN
         'tchefood_point_charges_reserved_cents(UUID, UUID, VARCHAR)',
         'tchefood_payment_claims_reserved_cents(UUID, UUID, VARCHAR)',
         'tchefood_point_reserved_cents(UUID, UUID, VARCHAR)',
-        'tchefood_resolve_point_charge(UUID, UUID, VARCHAR, VARCHAR, JSONB, UUID, TEXT, JSONB)'] LOOP
+        'tchefood_resolve_point_charge(UUID, UUID, VARCHAR, VARCHAR, JSONB, UUID, TEXT, JSONB)',
+        'tchefood_refund_point_payment(UUID, UUID, UUID, TEXT, JSONB, JSONB)'] LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
             EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role', v_fn);
         END IF;

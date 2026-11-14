@@ -18,6 +18,10 @@
 //                                                             leitura, quem libera é o que o MP mostrar; ver charge.ts).
 //                                                             Cobrança ainda não final: segue no MP como a consulta e o
 //                                                             encerramento por prazo; estornada: só confere o estorno.
+//   { "action": "refund", "idempotency_key": "...", "staff_id": "<uuid>", "manager_pin": "1234", "reason_text": "..." }
+//                                                             (estorno da cobrança aprovada com pagamento já registrado:
+//                                                             só grava com o próprio pagamento lido no MP mostrando o
+//                                                             estorno; cobrança refunded + pagamento REFUNDED no banco).
 //   O encerramento não estorna nada: cobrança paga continua paga.
 //   Cancel sem cobrança gravada não cancela nada: com "timeout" grava o bloqueio preventivo da chave (operador
 //   ativo da loja, com registro), e a criação atrasada não chega mais à Point; com "operator" é recusado (404).
@@ -29,7 +33,7 @@
 // Variáveis: SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY (já injetadas pelo Supabase).
 import { createClient } from 'npm:@supabase/supabase-js@2.45.4';
 import { MercadoPagoPointProvider } from '../../../server/payments/mercadoPagoPoint.ts';
-import { ChargeInputError, cancelCharge, pollCharge, reconcileCharge, startCharge, validKey, validateCancel, validateReconcile, voidCharge, type ChargeContext } from './charge.ts';
+import { ChargeInputError, cancelCharge, pollCharge, reconcileCharge, refundCharge, startCharge, validKey, validateCancel, validateReconcile, voidCharge, type ChargeContext } from './charge.ts';
 import { createMercadoPagoPayments } from './mpPayments.ts';
 import { supabaseChargeStore } from './repository.ts';
 
@@ -60,7 +64,7 @@ Deno.serve(async (req: Request) => {
     return json({ error: 'json', message: 'JSON inválido.' }, 400);
   }
   const action = body.action;
-  if (action !== 'create' && action !== 'status' && action !== 'cancel' && action !== 'reconcile') return json({ error: 'action', message: 'Ação inválida.' }, 400);
+  if (action !== 'create' && action !== 'status' && action !== 'cancel' && action !== 'reconcile' && action !== 'refund') return json({ error: 'action', message: 'Ação inválida.' }, 400);
   if (!validKey(body.idempotency_key)) return json({ error: 'invalid_key', message: 'Chave da cobrança inválida.' }, 400);
   const key = body.idempotency_key;
 
@@ -89,7 +93,7 @@ Deno.serve(async (req: Request) => {
       throw error;
     }
   }
-  if (action === 'reconcile') {
+  if (action === 'reconcile' || action === 'refund') {
     try {
       validateReconcile(body as { idempotency_key: unknown });
     } catch (error) {
@@ -128,6 +132,7 @@ Deno.serve(async (req: Request) => {
   try {
     if (action === 'create') return json(await startCharge(ctx, terminal!, body), 200);
     if (action === 'reconcile') return json(await reconcileCharge(ctx, body as { idempotency_key: unknown }), 200);
+    if (action === 'refund') return json(await refundCharge(ctx, body as { idempotency_key: unknown }), 200);
     const row = await ctx.store.findByKey(key);
     if (action === 'cancel') {
       const input = body as { idempotency_key: unknown; order_id: unknown; amount_cents: unknown; method: unknown; reason: unknown; staff_id?: unknown; manager_pin?: unknown; reason_text?: unknown };

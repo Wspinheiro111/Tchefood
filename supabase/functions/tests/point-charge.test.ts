@@ -9,6 +9,7 @@ import {
   DISPATCH_START_LIMIT_MS,
   pollCharge,
   reconcileCharge,
+  refundCharge,
   startCharge,
   type ChargeStatus,
   type ChargeContext,
@@ -60,7 +61,7 @@ class MemoryStore implements ChargeStore {
   /** Chamado logo depois da barreira passar (o que acontece entre a barreira e a chamada ao Mercado Pago). */
   afterBegin: ((row: TerminalChargeRow, kind: 1 | 2) => void | Promise<void>) | null = null;
   /** Quantas vezes cada método foi chamado. */
-  count: Partial<Record<StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel' | 'authorizeReconcile' | 'resolve', number>> = {};
+  count: Partial<Record<StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel' | 'authorizeReconcile' | 'resolve' | 'refundPayment', number>> = {};
   /** Chaves com pagamento APPROVED do Mercado Pago registrado (tabela payments). */
   registeredPayments = new Set<string>();
   /** Fins verificados gravados (tchefood_resolve_point_charge). */
@@ -70,7 +71,14 @@ class MemoryStore implements ChargeStore {
   failOnce(method: StoreMethod, times = 1) {
     this.failures[method] = times;
   }
-  private enter(method: StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel' | 'authorizeReconcile' | 'resolve') {
+  /** Estornos gravados (tchefood_refund_point_payment) e as chaves cujo pagamento virou REFUNDED. */
+  refunds: { key: string; patch: ChargePatch; staff: string; reason: string; evidence: Record<string, unknown> }[] = [];
+  refundedPayments = new Set<string>();
+  /** NSU e valor (centavos) do pagamento registrado com a chave, quando diferem da cobrança (padrão: os da cobrança). */
+  registeredPaymentData = new Map<string, { nsu: string | null; amountCents: number }>();
+  /** Recusa que o próximo refundPayment devolve (como o banco), antes de qualquer conferência. */
+  refundRefusal: ChargeRefusedError | null = null;
+  private enter(method: StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel' | 'authorizeReconcile' | 'resolve' | 'refundPayment') {
     this.count[method] = (this.count[method] ?? 0) + 1;
     const left = this.failures[method as StoreMethod] ?? 0;
     if (left > 0) {
@@ -274,6 +282,44 @@ class MemoryStore implements ChargeStore {
     this.resolutions.push({ key: r.idempotency_key, from: r.status, to: toStatus, patch, ...audit });
     this.audits.push({ key: r.idempotency_key, action: 'POINT_CHARGE_RESOLVED', performed_by: audit.staff, reason: audit.reason });
     Object.assign(r, next);
+    return { ...r };
+  }
+  /** Como tchefood_refund_point_payment: as mesmas conferências e recusas (TF004/5/6/7), cobrança e pagamento juntos. */
+  async refundPayment(row: TerminalChargeRow, patch: ChargePatch, audit: { staff: string; reason: string; evidence: Record<string, unknown> }) {
+    this.enter('refundPayment');
+    if (this.refundRefusal) {
+      const refusal = this.refundRefusal;
+      this.refundRefusal = null;
+      throw refusal;
+    }
+    const e = audit.evidence;
+    if (audit.reason.trim().length < 10) throw new ChargeRefusedError('invalid_reason', 'motivo obrigatório.');
+    for (const k of ['authorization_audit_id', 'operation_id', 'mp_payment_id', 'mp_amount_cents', 'mp_external_reference', 'mp_status']) {
+      if (!(k in e)) throw new ChargeRefusedError('invalid_reason', `falta ${k}.`);
+    }
+    if (typeof e.mp_payment_id !== 'string' || typeof e.mp_external_reference !== 'string' || typeof e.mp_amount_cents !== 'number' || !['refunded', 'cancelled'].includes(String(e.mp_status))) {
+      throw new ChargeRefusedError('invalid_reason', 'o Mercado Pago não mostra o pagamento estornado ou cancelado.');
+    }
+    if (Object.keys(patch).some((k) => k !== 'raw_status' && k !== 'raw_status_detail')) throw new ChargeRefusedError('invalid_reason', 'campo não muda no estorno.');
+    if (audit.staff !== STAFF) throw new ChargeRefusedError('invalid_staff', 'operador não é da equipe ativa desta loja.');
+    const r = this.rows.find((x) => x.id === row.id);
+    if (!r) throw new ChargeRefusedError('not_found', 'cobrança não encontrada nesta loja.');
+    if (r.status === 'refunded') return { ...r };
+    if (r.status !== 'approved') throw new ChargeRefusedError('not_applicable', `a cobrança está "${r.status}".`);
+    if (!this.registeredPayments.has(r.idempotency_key)) throw new ChargeRefusedError('not_applicable', 'sem pagamento registrado.');
+    const auth = /^audit-(\d+)$/.exec(String(e.authorization_audit_id));
+    const authorized = auth ? this.audits[Number(auth[1]) - 1] : undefined;
+    if (!authorized || authorized.action !== 'POINT_RECONCILE_AUTHORIZED' || authorized.key !== r.idempotency_key) throw new ChargeRefusedError('invalid_reason', 'não autorizado por gerente.');
+    if ([...this.resolutions, ...this.refunds].some((x) => x.evidence.authorization_audit_id === e.authorization_audit_id)) throw new ChargeRefusedError('not_applicable', 'a autorização da conferência já foi usada; peça outra.');
+    const pay = this.registeredPaymentData.get(r.idempotency_key) ?? { nsu: r.external_payment_id, amountCents: r.amount_cents };
+    if (e.mp_payment_id !== r.external_payment_id || pay.nsu !== r.external_payment_id || e.mp_external_reference !== r.idempotency_key || e.mp_amount_cents !== r.amount_cents || pay.amountCents !== r.amount_cents) {
+      throw new ChargeRefusedError('invalid_reason', 'o estorno lido no Mercado Pago não confere com a cobrança.');
+    }
+    this.refunds.push({ key: r.idempotency_key, patch, ...audit });
+    this.audits.push({ key: r.idempotency_key, action: 'POINT_PAYMENT_REFUNDED', performed_by: audit.staff, reason: audit.reason });
+    Object.assign(r, patch, { status: 'refunded' as ChargeStatus });
+    this.registeredPayments.delete(r.idempotency_key);
+    this.refundedPayments.add(r.idempotency_key);
     return { ...r };
   }
 }
@@ -2856,6 +2902,202 @@ describe('point-charge: auditoria r5', () => {
         expect(await reconcileCharge(ctx, RECONCILE)).toMatchObject({ status: 'DECLINED' });
         expect(store.rows[0]!.status).toBe('refunded');
       });
+    });
+  });
+
+  describe('auditoria GPT r9 (P1-01): estorno da aprovada com pagamento registrado', () => {
+    const REFUND = RECONCILE;
+    const refundedPayment = (over: Partial<PointPaymentDetails> = {}) => approvedPayment({ status: 'refunded', externalReference: KEY, ...over });
+    const registered = (store: MemoryStore, over: Partial<TerminalChargeRow> = {}) => {
+      const row = seed(store, { ...approvedRow, ...over });
+      store.registeredPayments.add(KEY);
+      return row;
+    };
+    const nothingWritten = (store: MemoryStore, before: TerminalChargeRow) => {
+      expect(store.rows[0]).toEqual(before);
+      expect(store.count.refundPayment ?? 0).toBe(0);
+      expect(store.refunds).toHaveLength(0);
+      expect(store.registeredPayments.has(KEY)).toBe(true);
+    };
+
+    it('o Mercado Pago mostra o pagamento estornado: grava cobrança refunded + pagamento REFUNDED com a prova lida', async () => {
+      const { ctx, store, calls } = setup({ payment: async () => refundedPayment({ statusDetail: 'refunded', orderId: 'ORD01' }) });
+      registered(store);
+      expect(await refundCharge(ctx, REFUND)).toEqual({ status: 'DECLINED', idempotency_key: KEY, code: 'REFUNDED', reason: 'O Mercado Pago confirmou o estorno: nada fica cobrado nesta cobrança.' });
+      expect(calls.payment).toEqual(['123456789']);
+      expect(calls.get).toHaveLength(0);
+      expect(store.rows[0]).toMatchObject({ status: 'refunded', raw_status: 'payment_refunded', raw_status_detail: 'PAYMENT_REFUNDED', external_payment_id: '123456789', authorization_code: 'A1B2C3' });
+      expect(store.refundedPayments.has(KEY)).toBe(true);
+      expect(store.audits.map((a) => a.action)).toEqual(['POINT_RECONCILE_AUTHORIZED', 'POINT_PAYMENT_REFUNDED']);
+      expect(store.refunds).toEqual([{
+        key: KEY, patch: { raw_status: 'payment_refunded', raw_status_detail: 'PAYMENT_REFUNDED' }, staff: STAFF, reason: 'conferido no app do Mercado Pago',
+        evidence: {
+          source: 'mercado_pago_payment', authorization_audit_id: 'audit-1', operation_id: '123456789', mp_payment_id: '123456789', mp_amount_cents: 2450,
+          mp_external_reference: KEY, mp_status: 'refunded', mp_status_detail: 'refunded', mp_order_id: 'ORD01',
+        },
+      }]);
+      expect(store.resolutions).toHaveLength(0);
+    });
+
+    it('cancelled também prova (o dinheiro voltou)', async () => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment({ status: 'cancelled' }) });
+      registered(store);
+      expect(await refundCharge(ctx, REFUND)).toMatchObject({ status: 'DECLINED', code: 'REFUNDED' });
+      expect(store.refunds[0]!.evidence.mp_status).toBe('cancelled');
+    });
+
+    it('prova só do Mercado Pago: operation_id do aparelho não entra na prova', async () => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment() });
+      registered(store);
+      await refundCharge(ctx, { ...REFUND, operation_id: '999' });
+      expect(store.refunds[0]!.evidence).toMatchObject({ operation_id: '123456789', mp_payment_id: '123456789' });
+    });
+
+    it.each([
+      ['aprovado', { status: 'approved' }, 'NOT_REFUNDED'],
+      ['em processamento', { status: 'in_process' }, 'NOT_REFUNDED'],
+      ['sem status', { status: null }, 'NOT_REFUNDED'],
+      ['contestação (settled)', { status: 'charged_back', statusDetail: 'settled' }, 'CHARGEBACK'],
+      ['contestação (reimbursed)', { status: 'charged_back', statusDetail: 'reimbursed' }, 'CHARGEBACK'],
+      ['outro ID', { id: '987654321' }, 'MISMATCH'],
+      ['outro valor', { amountCents: 2400 }, 'MISMATCH'],
+      ['outra referência', { externalReference: 'outra-chave' }, 'MISMATCH'],
+      ['sem referência', { externalReference: null }, 'MISMATCH'],
+      ['outra ordem', { orderId: 'ORD99' }, 'MISMATCH'],
+    ] as const)('pagamento %s: MANUAL_REVIEW %s e nada é gravado', async (_name, over, code) => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment(over as Partial<PointPaymentDetails>) });
+      const before = registered(store);
+      const reply = await refundCharge(ctx, REFUND);
+      expect(reply).toMatchObject({ status: 'MANUAL_REVIEW', code });
+      expect((reply as { reason: string }).reason).toContain('Nada foi alterado');
+      nothingWritten(store, before);
+    });
+
+    it('Mercado Pago fora do ar: MP_UNAVAILABLE e nada é gravado', async () => {
+      const { ctx, store } = setup({ payment: async () => { throw new Error('rede'); } });
+      const before = registered(store);
+      expect(await refundCharge(ctx, REFUND)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'MP_UNAVAILABLE' });
+      nothingWritten(store, before);
+    });
+
+    it('aprovação sem ID do pagamento: NO_PAYMENT_ID antes do PIN, sem ler nem gravar', async () => {
+      const { ctx, store, calls } = setup({ payment: async () => refundedPayment() });
+      const before = registered(store, { external_payment_id: null });
+      expect(await refundCharge(ctx, REFUND)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'NO_PAYMENT_ID' });
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+      expect(calls.payment).toHaveLength(0);
+      nothingWritten(store, before);
+    });
+
+    it.each([
+      ['aprovada sem pagamento registrado', { ...approvedRow }, false],
+      ['em revisão manual', {}, true],
+      ['recusada', { status: 'rejected' }, true],
+      ['na maquininha', { status: 'at_terminal' }, true],
+    ] as const)('%s: 409 not_applicable antes do PIN, sem Mercado Pago', async (_name, over, withPayment) => {
+      const { ctx, store, calls } = setup({ payment: async () => refundedPayment() });
+      const before = seed(store, over as Partial<TerminalChargeRow>);
+      if (withPayment) store.registeredPayments.add(KEY);
+      await expect(refundCharge(ctx, REFUND)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+      expect(calls.payment).toHaveLength(0);
+      expect(calls.get).toHaveLength(0);
+      expect(store.rows[0]).toEqual(before);
+      expect(store.refunds).toHaveLength(0);
+    });
+
+    it('cobrança de outra loja / inexistente: 404', async () => {
+      const { ctx } = setup();
+      await expect(refundCharge(ctx, REFUND)).rejects.toMatchObject({ code: 'not_found', httpStatus: 404 });
+    });
+
+    it('PIN errado: 403, registra a falha e não lê nem grava', async () => {
+      const { ctx, store, calls } = setup({ payment: async () => refundedPayment() });
+      const before = registered(store);
+      await expect(refundCharge(ctx, { ...REFUND, manager_pin: '0000' })).rejects.toMatchObject({ code: 'manager_denied', httpStatus: 403 });
+      expect(store.audits.map((a) => a.action)).toEqual(['MANAGER_PIN_FAILED']);
+      expect(calls.payment).toHaveLength(0);
+      nothingWritten(store, before);
+    });
+
+    it.each([
+      [{ manager_pin: undefined }, 'manager_required', 403],
+      [{ reason_text: 'curto' }, 'invalid_reason', 400],
+      [{ staff_id: 'x' }, 'invalid_staff', 400],
+    ] as const)('entrada %o → %s, sem PIN nem Mercado Pago', async (over, code, http) => {
+      const { ctx, store, calls } = setup({ payment: async () => refundedPayment() });
+      const before = registered(store);
+      await expect(refundCharge(ctx, { ...REFUND, ...over })).rejects.toMatchObject({ code, httpStatus: http });
+      expect(store.count.authorizeReconcile ?? 0).toBe(0);
+      expect(calls.payment).toHaveLength(0);
+      nothingWritten(store, before);
+    });
+
+    it.each([
+      [new ChargeRefusedError('not_applicable', 'a autorização da conferência já foi usada; peça outra.'), 'not_applicable', 409],
+      [new ChargeRefusedError('invalid_reason', 'o estorno lido no Mercado Pago não confere com a cobrança.'), 'refund_refused', 409],
+      [new ChargeRefusedError('invalid_staff', 'operador não é da equipe ativa desta loja.'), 'invalid_staff', 403],
+      [new ChargeRefusedError('not_found', 'cobrança não encontrada nesta loja.'), 'not_found', 404],
+    ] as const)('recusa do banco %s → %s (%d), nada gravado', async (refusal, code, http) => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment() });
+      const before = registered(store);
+      store.refundRefusal = refusal;
+      await expect(refundCharge(ctx, REFUND)).rejects.toMatchObject({ code, httpStatus: http });
+      expect(store.rows[0]).toEqual(before);
+      expect(store.refunds).toHaveLength(0);
+      expect(store.registeredPayments.has(KEY)).toBe(true);
+    });
+
+    it('banco confere a prova de novo: pagamento registrado com outro NSU é recusado (refund_refused)', async () => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment() });
+      const before = registered(store);
+      store.registeredPaymentData.set(KEY, { nsu: '111', amountCents: 2450 });
+      await expect(refundCharge(ctx, REFUND)).rejects.toMatchObject({ code: 'refund_refused', httpStatus: 409 });
+      expect(store.rows[0]).toEqual(before);
+    });
+
+    it('repetição: já estornada, confere o estorno no Mercado Pago sem PIN e sem gravar de novo', async () => {
+      const { ctx, store, calls } = setup({ payment: async () => refundedPayment() });
+      registered(store);
+      await refundCharge(ctx, REFUND);
+      const after = { ...store.rows[0]! };
+      const audits = store.audits.length;
+      expect(await refundCharge(ctx, { ...REFUND, manager_pin: '0000' })).toMatchObject({ status: 'DECLINED', code: 'REFUNDED' });
+      expect(store.rows[0]).toEqual(after);
+      expect(store.audits).toHaveLength(audits);
+      expect(store.count.refundPayment).toBe(1);
+      expect(store.count.authorizeReconcile).toBe(1);
+      expect(calls.payment).toEqual(['123456789', '123456789']);
+    });
+
+    it('repetição com o Mercado Pago já não provando: a trava fica (MANUAL_REVIEW), nada gravado', async () => {
+      let status = 'refunded';
+      const { ctx, store } = setup({ payment: async () => refundedPayment({ status }) });
+      registered(store);
+      await refundCharge(ctx, REFUND);
+      status = 'charged_back';
+      expect(await refundCharge(ctx, REFUND)).toMatchObject({ status: 'MANUAL_REVIEW', code: 'REFUNDED' });
+      expect(store.count.refundPayment).toBe(1);
+    });
+
+    it('outro aparelho registrou o estorno durante o PIN: não grava de novo', async () => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment() });
+      registered(store);
+      const authorize = store.authorizeReconcile.bind(store);
+      store.authorizeReconcile = async (i) => {
+        const id = await authorize(i);
+        store.rows[0]!.status = 'refunded';
+        return id;
+      };
+      expect(await refundCharge(ctx, REFUND)).toMatchObject({ status: 'DECLINED', code: 'REFUNDED' });
+      expect(store.count.refundPayment ?? 0).toBe(0);
+    });
+
+    it('a conferência continua recusando a aprovada com pagamento registrado (o estorno é pela ação refund)', async () => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment() });
+      const before = registered(store);
+      await expect(reconcileCharge(ctx, RECONCILE)).rejects.toMatchObject({ code: 'not_applicable', httpStatus: 409 });
+      nothingWritten(store, before);
     });
   });
 });

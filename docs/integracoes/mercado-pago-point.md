@@ -120,6 +120,29 @@ chave de uma cobrança só entra com a cobrança recusada, cancelada ou expirada
 cobrança estornada. Pagamento PENDING do Mercado Pago não entra (auditoria r8: nada no app nem nas Edge Functions o
 grava; a cobrança em andamento fica em `terminal_charges`).
 
+**Estorno do pagamento da Point já registrado (GPT r9 P1-01).** Pagamento APROVADO do Mercado Pago só vira REFUNDED
+por `tchefood_refund_point_payment(p_tenant, p_id, p_staff, p_reason, p_patch, p_evidence)` (só a service role, chamada
+pela Edge Function): PIN de gerente pela conferência (`tchefood_authorize_point_reconcile`, uso único) e o estorno
+provado no Mercado Pago (mesmo pagamento, valor e referência; `refunded` ou `cancelled`; contestação nunca). Numa
+transação, com as travas na ordem PIN, conta, cobrança, pagamento: a cobrança vira `refunded`, o pagamento REFUNDED, a
+conta é recalculada e fica UM registro `POINT_PAYMENT_REFUNDED` (gerente, motivo, prova). Conta ainda aberta: o saldo
+volta. Conta já fechada: continua fechada, mostrando o saldo devolvido (como na main, a conta encerrada não reabre).
+UPDATE direto do pagamento para REFUNDED é recusado (TF007), mesmo com a cobrança estornada. Repetir devolve a
+cobrança estornada sem gravar de novo.
+Quem chama é a ação `refund` da point-charge (`refundCharge`), pedida na retaguarda (Conciliação → "Pagamentos da
+Point" → "Registrar estorno", PIN de gerente e motivo). Antes do PIN ela confere que a cobrança está aprovada com o
+pagamento registrado (senão 409; a aprovada sem pagamento segue pela conferência). Depois do PIN lê só o próprio
+pagamento (`GET /v1/payments/{id}`, token da loja) e exige o mesmo ID, o mesmo valor, a referência ecoada (= chave) e
+`refunded`/`cancelled`; a prova enviada ao banco é montada só com essa resposta. Sem prova não grava nada e responde
+revisão (`NOT_REFUNDED`, `CHARGEBACK`, `MISMATCH`, `MP_UNAVAILABLE`, `NO_PAYMENT_ID`); recusa do banco = 409
+(`refund_refused` / `not_applicable`). Gravado, o aparelho que pediu espelha o pagamento REFUNDED e o saldo e tira a
+trava da chave; os outros aparelhos não recebem pagamentos pela nuvem (`applyCloudSnapshot` não traz pagamentos).
+Sem resposta conclusiva, o aparelho não muda nada e pede para repetir (a repetição não grava duas vezes).
+
+**Pagamento aprovado é final.** Fora desse estorno, nenhum papel (aparelho, service role, dono do banco) tira um
+pagamento de APROVADO: DECLINED, PENDING ou REFUNDED fora do Mercado Pago são TF007 (`approved_is_final`). Estorno
+fora do Mercado Pago (Stone, PagBank, dinheiro) não tem caminho no sistema (como na main); fica decisão do Will.
+
 **Chave conferida em todo status (auditoria r8 P1-01).** Fora do Mercado Pago, pagamento com a chave de uma cobrança
 da Point é recusado em qualquer status (TF009, `key_in_use`), com a conta e a chave travadas na mesma ordem da abertura
 da cobrança (as duas ao mesmo tempo esperam uma pela outra). Fora do Mercado Pago só entram aprovado e recusado:

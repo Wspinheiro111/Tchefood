@@ -275,5 +275,24 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
       if (!current) throw new Error('Cobrança não encontrada para gravar a conferência.');
       return current;
     },
+    async refundPayment(row, patch, audit): Promise<TerminalChargeRow> {
+      // Uma transação no banco: cobrança refunded + pagamento REFUNDED, com UM audit_log. Já estornada: a mesma linha.
+      const res = await db.rpc('tchefood_refund_point_payment', {
+        p_tenant: tenantId,
+        p_id: row.id,
+        p_staff: audit.staff,
+        p_reason: audit.reason,
+        p_patch: patch,
+        p_evidence: audit.evidence,
+      });
+      const refused = refusal(res.error);
+      if (refused) throw refused;
+      const data = check(res, 'gravar o estorno da cobrança');
+      const returned = normalize(Array.isArray(data) ? (data[0] ?? null) : (data ?? null));
+      if (returned && returned.id === row.id && returned.tenant_id === tenantId) return returned;
+      const current = await this.findByKey(row.idempotency_key);
+      if (!current) throw new Error('Cobrança não encontrada para gravar o estorno.');
+      return current;
+    },
   };
 }

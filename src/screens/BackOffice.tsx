@@ -5,7 +5,8 @@ import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../st
 import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
-import { AUDIT_LABEL, declinedInShift, formatShiftStart, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
+import { AUDIT_LABEL, declinedInShift, formatShiftStart, inShiftPeriod, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
+import { PointRefunds } from '../components/PointRefund';
 import { useShiftPeriod } from '../lib/useShiftStart';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
@@ -178,6 +179,7 @@ export function Reconciliation() {
   const label = { CREDIT: 'Crédito', DEBIT: 'Débito', PIX: 'Pix', CASH: 'Dinheiro' } as const;
   const totals = methods.map((m) => rows.reduce((a, r) => a + r.byMethod[m], 0));
   const declined = useMemo(() => declinedInShift(payments, period), [payments, period]);
+  const inShift = useMemo(() => payments.filter((p) => inShiftPeriod(p.created_at, period)), [payments, period]);
   return (
     <div className="space-y-4">
       <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-surface">
@@ -210,6 +212,7 @@ export function Reconciliation() {
         <div className="mb-1 font-bold">Transações recusadas no turno: {declined.length}</div>
         {declined.map((p) => <div key={p.id} className="text-slate-500">{new Date(p.created_at).toLocaleTimeString('pt-BR')} · {p.acquirer} · {p.terminal_serial} · {formatBRL(p.amount)}</div>)}
       </div>
+      <PointRefunds payments={inShift} />
     </div>
   );
 }

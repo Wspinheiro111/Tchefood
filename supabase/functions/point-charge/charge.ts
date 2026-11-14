@@ -192,6 +192,13 @@ export interface ChargeStore {
    * com `toStatus` se gravou, ou como estava se outra chamada passou na frente (nada gravado).
    */
   resolve(row: TerminalChargeRow, toStatus: ChargeStatus, patch: ChargePatch, audit: { staff: string; reason: string; evidence: Record<string, unknown> }): Promise<TerminalChargeRow>;
+  /**
+   * Estorno da aprovada com pagamento registrado (tchefood_refund_point_payment, só service role): numa transação, a
+   * cobrança vira refunded e o pagamento APPROVED da chave vira REFUNDED, com UM audit_log POINT_PAYMENT_REFUNDED. O
+   * banco confere a autorização do gerente (desta cobrança, uso único) e o que foi lido no Mercado Pago contra a
+   * cobrança e o pagamento. Já estornada: devolve a linha sem gravar. Recusa: ChargeRefusedError (nada gravado).
+   */
+  refundPayment(row: TerminalChargeRow, patch: ChargePatch, audit: { staff: string; reason: string; evidence: Record<string, unknown> }): Promise<TerminalChargeRow>;
 }
 
 /** Pagamento do Mercado Pago (GET /v1/payments/{id}), só os campos conferidos. */
@@ -1165,20 +1172,7 @@ export async function reconcileCharge(ctx: ChargeContext, input: ReconcileInput)
   if (row.status === 'refunded') return confirmRefund(ctx, row);
   // Antes do PIN: cobrança que não tem o que conferir não gasta tentativa de PIN nem grava registro.
   if (!(await reconcilable(ctx, row))) throw notApplicable();
-  let audit: string | null;
-  try {
-    audit = await ctx.store.authorizeReconcile({ idempotency_key: row.idempotency_key, performed_by: req.staff_id, manager_pin: req.manager_pin, reason: req.reason_text });
-  } catch (error) {
-    if (error instanceof ChargeRefusedError) {
-      if (error.code === 'not_applicable') throw notApplicable();
-      if (error.code === 'not_found') throw new ChargeInputError('not_found', error.message, 404);
-      if (error.code === 'invalid_reason') throw new ChargeInputError('invalid_reason', error.message, 400);
-      throw new ChargeInputError(error.code, error.message, 403);
-    }
-    throw error;
-  }
-  if (!audit) throw new ChargeInputError('manager_denied', 'PIN de gerente incorreto ou bloqueado. Nada foi conferido nem liberado.', 403);
-  const auth: ReconcileAuth = { staff: req.staff_id, reason: req.reason_text, audit_id: audit, operation_id: req.operation_id };
+  const auth = await authorizeWithPin(ctx, row, req, notApplicable);
   // Relê depois do PIN: uma consulta pode ter terminado a cobrança no meio.
   const current = (await ctx.store.findByKey(row.idempotency_key)) ?? row;
   if (current.status === 'manual_review') return reconcileReview(ctx, current, auth);
@@ -1187,6 +1181,116 @@ export async function reconcileCharge(ctx: ChargeContext, input: ReconcileInput)
     return reconcileApproved(ctx, current, auth);
   }
   return replyFor(current);
+}
+
+/** PIN de gerente e motivo conferidos no banco (tchefood_authorize_point_reconcile), com UM audit_log. Recusas: ChargeInputError. */
+async function authorizeWithPin(ctx: ChargeContext, row: TerminalChargeRow, req: ReconcileRequest, notApplicableError: () => ChargeInputError): Promise<ReconcileAuth> {
+  let audit: string | null;
+  try {
+    audit = await ctx.store.authorizeReconcile({ idempotency_key: row.idempotency_key, performed_by: req.staff_id, manager_pin: req.manager_pin, reason: req.reason_text });
+  } catch (error) {
+    if (error instanceof ChargeRefusedError) {
+      if (error.code === 'not_applicable') throw notApplicableError();
+      if (error.code === 'not_found') throw new ChargeInputError('not_found', error.message, 404);
+      if (error.code === 'invalid_reason') throw new ChargeInputError('invalid_reason', error.message, 400);
+      throw new ChargeInputError(error.code, error.message, 403);
+    }
+    throw error;
+  }
+  if (!audit) throw new ChargeInputError('manager_denied', 'PIN de gerente incorreto ou bloqueado. Nada foi conferido nem liberado.', 403);
+  return { staff: req.staff_id, reason: req.reason_text, audit_id: audit, operation_id: req.operation_id };
+}
+
+// -----------------------------------------------------------------------------
+// Estorno de cobrança aprovada com pagamento já registrado (auditoria GPT r9, P1-01)
+// -----------------------------------------------------------------------------
+//
+// A cobrança aprovada cujo pagamento o aparelho já registrou e que depois foi estornada no Mercado Pago (na maquininha
+// ou no app) não tinha caminho: a conferência recusa (409) porque o pagamento já existe. A ação "refund" é esse caminho:
+//  - PIN de gerente e motivo (tchefood_authorize_point_reconcile, o mesmo da conferência) só pedem a leitura;
+//  - quem prova é o Mercado Pago: GET /v1/payments/{id} do próprio pagamento da cobrança, com o token da loja, ecoando
+//    o mesmo ID, o mesmo valor, a referência (= chave, obrigatória) e status refunded/cancelled (contestação nunca);
+//  - a prova vai ao banco montada só com o que o Mercado Pago respondeu (nada vem do aparelho), e o banco confere de
+//    novo contra a cobrança e o pagamento (tchefood_refund_point_payment);
+//  - sem prova, nada é gravado: a resposta diz o que o Mercado Pago mostrou e a cobrança segue aprovada.
+// Já estornada: só confere o estorno no Mercado Pago (como a conferência), sem PIN e sem gravar.
+
+const REFUND_TEXT = {
+  NOT_APPLICABLE: 'Esta cobrança não está aprovada com pagamento registrado: não há estorno a registrar aqui. Se ela está em revisão ou aprovada sem pagamento, use "Conferir no Mercado Pago".',
+  NO_PAYMENT_ID: 'A aprovação desta cobrança não tem o ID do pagamento no Mercado Pago, e sem ele o estorno não pode ser conferido. Confira no app do Mercado Pago. Nada foi alterado.',
+  NOT_REFUNDED: 'O Mercado Pago não mostra este pagamento estornado ou cancelado. Nada foi alterado: o pagamento segue registrado na conta.',
+  CHARGEBACK: 'O Mercado Pago mostra este pagamento contestado pelo cliente (chargeback), e contestação não prova estorno. Resolva com o Mercado Pago. Nada foi alterado: o pagamento segue registrado na conta.',
+  REFUSED: 'O banco recusou o estorno: o que o Mercado Pago mostrou não confere com a cobrança e o pagamento registrados. Nada foi alterado.',
+} as const;
+
+function refundNotApplicable(): ChargeInputError {
+  return new ChargeInputError('not_applicable', REFUND_TEXT.NOT_APPLICABLE, 409);
+}
+
+function refundMismatch(row: TerminalChargeRow, detail: string): ChargeReply {
+  return stillInReview(row, 'MISMATCH', `Os dados do Mercado Pago não conferem com esta cobrança (${detail}). Confira no app do Mercado Pago. Nada foi alterado: o pagamento segue registrado na conta.`);
+}
+
+/**
+ * Estorno pedido pelo gerente para a cobrança aprovada com pagamento registrado. Respostas: DECLINED code REFUNDED
+ * (estorno gravado ou já gravado e provado agora); MANUAL_REVIEW com o código do que faltou (MP_UNAVAILABLE,
+ * NOT_REFUNDED, CHARGEBACK, MISMATCH, NO_PAYMENT_ID), sem gravar nada. Erros de entrada e de aplicabilidade são
+ * ChargeInputError (400/403/404/409).
+ */
+export async function refundCharge(ctx: ChargeContext, input: ReconcileInput): Promise<ChargeReply> {
+  const req = validateReconcile(input);
+  const row = await ctx.store.findByKey(req.idempotency_key);
+  if (!row) throw new ChargeInputError('not_found', 'Cobrança não encontrada nesta loja.', 404);
+  // Repetição: o estorno já está gravado; o aparelho só tira a trava com o Mercado Pago provando (sem PIN, sem gravar).
+  if (row.status === 'refunded') return confirmRefund(ctx, row);
+  // Antes do PIN: nada a estornar não gasta tentativa de PIN nem grava registro.
+  if (row.status !== 'approved' || !(await ctx.store.hasRegisteredPayment(row.idempotency_key))) throw refundNotApplicable();
+  if (!row.external_payment_id) return stillInReview(row, 'NO_PAYMENT_ID', REFUND_TEXT.NO_PAYMENT_ID);
+  const auth = await authorizeWithPin(ctx, row, req, refundNotApplicable);
+  // Relê depois do PIN: outro aparelho pode ter registrado o estorno no meio.
+  const current = (await ctx.store.findByKey(row.idempotency_key)) ?? row;
+  if (current.status === 'refunded') return confirmRefund(ctx, current);
+  if (current.status !== 'approved' || current.external_payment_id !== row.external_payment_id) throw refundNotApplicable();
+  const paymentId = row.external_payment_id;
+  const payment = await readPayment(ctx, paymentId);
+  if (!payment) return stillInReview(current, 'MP_UNAVAILABLE', 'Não foi possível ler o Mercado Pago agora. Tente de novo em instantes. Nada foi alterado.');
+  if (payment.id !== paymentId) return refundMismatch(current, 'ID do pagamento');
+  if (payment.amountCents !== current.amount_cents) return refundMismatch(current, 'valor');
+  // A referência precisa vir ecoada (não basta faltar): é ela que liga o pagamento a esta cobrança.
+  if (payment.externalReference !== current.idempotency_key) return refundMismatch(current, 'referência');
+  if (isOrdersApiId(payment.orderId) && current.external_order_id != null && payment.orderId !== current.external_order_id) return refundMismatch(current, 'ordem');
+  if (payment.status === 'charged_back') return stillInReview(current, 'CHARGEBACK', REFUND_TEXT.CHARGEBACK);
+  if (!provesRefund(current, payment, paymentId)) return stillInReview(current, 'NOT_REFUNDED', REFUND_TEXT.NOT_REFUNDED);
+  let saved: TerminalChargeRow;
+  try {
+    saved = await ctx.store.refundPayment(current, { raw_status: clip(`payment_${payment.status}`, 50), raw_status_detail: 'PAYMENT_REFUNDED' }, {
+      staff: auth.staff,
+      reason: auth.reason,
+      // Só o que o Mercado Pago respondeu agora (e o id da autorização do gerente desta chamada).
+      evidence: {
+        source: 'mercado_pago_payment',
+        authorization_audit_id: auth.audit_id,
+        operation_id: payment.id,
+        mp_payment_id: payment.id,
+        mp_amount_cents: payment.amountCents,
+        mp_external_reference: payment.externalReference,
+        mp_status: payment.status,
+        mp_status_detail: payment.statusDetail ?? null,
+        mp_order_id: payment.orderId ?? null,
+      },
+    });
+  } catch (error) {
+    if (error instanceof ChargeRefusedError) {
+      // TF007: autorização já usada, cobrança não mais aprovada ou sem pagamento registrado. Nada foi gravado.
+      if (error.code === 'not_applicable') throw new ChargeInputError('not_applicable', `${error.message} Nada foi alterado.`, 409);
+      // TF006: a prova não conferiu no banco. Nada foi gravado.
+      if (error.code === 'invalid_reason') throw new ChargeInputError('refund_refused', REFUND_TEXT.REFUSED, 409);
+      if (error.code === 'invalid_staff') throw new ChargeInputError(error.code, error.message, 403);
+      if (error.code === 'not_found') throw new ChargeInputError('not_found', error.message, 404);
+    }
+    throw error;
+  }
+  return reconcileReply(saved);
 }
 
 async function reconcileReview(ctx: ChargeContext, row: TerminalChargeRow, auth: ReconcileAuth): Promise<ChargeReply> {

@@ -457,7 +457,10 @@ export type AuditActionType =
   | 'PRICE_OVERRIDE'
   // Reserva liberada pelo gerente com a maquininha aprovada: o caixa estornou na maquininha (só local;
   // o servidor ainda não aceita este tipo em audit_logs).
-  | 'CLAIM_RELEASED_REFUNDED';
+  | 'CLAIM_RELEASED_REFUNDED'
+  // Estorno da cobrança da Point com pagamento já registrado, provado no Mercado Pago pelo servidor
+  // (tchefood_refund_point_payment grava o do servidor; o deste aparelho fica só aqui).
+  | 'POINT_PAYMENT_REFUNDED';
 
 export interface AuditLog {
   id: UUID;

@@ -565,3 +565,22 @@ export async function fetchPointReservation(
   }
   return out;
 }
+
+/** Saldo e situação da conta no servidor, lidos agora (sem a fila deste aparelho). */
+export type ServerOrderBalance = { balanceCents: number; status: string };
+
+/**
+ * Lê `remaining_balance` e `status` da conta na nuvem (orders, pela RLS da loja). Usado pela recuperação do
+ * pagamento recusado sem reserva (claimRecovery): o saldo esperado da reserva é o do servidor, que ainda não tem
+ * este pagamento. Lança se a conta não está lá ou a resposta não serve.
+ */
+export async function fetchServerOrderBalance(cfg: SyncConfig, fetchFn: FetchLike, orderId: string): Promise<ServerOrderBalance> {
+  const r = await fetchFn(`${root(cfg)}/orders?id=eq.${encodeURIComponent(orderId)}&select=remaining_balance,status`, { method: 'GET', headers: headers(cfg) });
+  if (!r.ok) throw new Error(`Não foi possível ler a conta no servidor: ${await readError(r)}`);
+  const rows = JSON.parse((await r.text()) || '[]') as Array<{ remaining_balance?: unknown; status?: unknown }>;
+  const row = Array.isArray(rows) ? rows[0] : undefined;
+  if (!row) throw new Error('A conta não está no servidor.');
+  const cents = Math.round(Number(row.remaining_balance) * 100);
+  if (!Number.isSafeInteger(cents) || cents < 0 || typeof row.status !== 'string') throw new Error('Não foi possível ler a conta no servidor: resposta incompleta.');
+  return { balanceCents: cents, status: row.status };
+}

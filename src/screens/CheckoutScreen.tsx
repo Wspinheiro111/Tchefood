@@ -12,7 +12,7 @@ import { NfceViewer } from './NfceViewer';
 import { ReviewCapture } from '../components/ReviewCapture';
 import { CashbackCapture, CashbackRedeem } from '../components/CashbackPanel';
 import { ConfirmReviewedChargeSheet } from '../components/ConfirmReviewedChargeSheet';
-import { effectiveReservation, freeCents, onlyClaims, pointReservationBlock, rememberServerReservation, reservationNotice, type PointReservation } from '../lib/payments/pointReservation';
+import { effectiveReservation, freeCents, onlyClaims, pointReservationBlock, rememberServerReservation, reservationNotice, withoutClaimsPaidHere, type PointReservation } from '../lib/payments/pointReservation';
 import { fetchPointReservation } from '../lib/sync/cloudPull';
 import { freshCloudConfig } from '../lib/sync/useCloudSync';
 import { requirePaymentClaim, type ClaimAcquirer, type ClaimMethod } from '../lib/payments/paymentClaim';
@@ -154,7 +154,10 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
       clearInterval(timer);
     };
   }, [orderId, cloudConnected, busy, readTick]);
-  const pointReservation = effectiveReservation(cloudReservation, reviewHold);
+  // Reserva de pagamento já aprovado aqui nesta conta: o saldo local já o descontou (não conta duas vezes).
+  const paidHereKeys = new Set(s.payments.filter((p) => p.order_id === orderId && p.status === 'APPROVED' && p.idempotency_key).map((p) => p.idempotency_key!));
+  const countedReservation = withoutClaimsPaidHere(cloudReservation, paidHereKeys);
+  const pointReservation = effectiveReservation(countedReservation, reviewHold);
   const cloudBlocked = needsClaim && reservationRead !== 'ok';
   const unresolvedCharges = (cloudReservation?.charges ?? []).filter((c) => needsResolution(c, pointCharge?.idempotencyKey ?? null) && c.idempotencyKey !== reviewHold?.idempotency_key);
 
@@ -196,7 +199,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
 
   const charge = async () => {
     if (!amountValid || busy || trayPending) return;
-    const reserved = pointReservationBlock(amount, remaining, pointReservation, cloudReservation);
+    const reserved = pointReservationBlock(amount, remaining, pointReservation, countedReservation);
     if (reserved) return toast.error(reserved);
     if (cloudBlocked) return toast.error(CLOUD_READ_BLOCK);
     const idempotency_key = uuid();
@@ -368,12 +371,12 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
 
       {pointReservation && (
         <div role="alert" className="mb-3 rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
-          <div className="mb-1 font-black text-brasa">{reservationNotice(cloudReservation)}</div>
+          <div className="mb-1 font-black text-brasa">{reservationNotice(countedReservation)}</div>
           <p className="text-slate-800">
             {formatBRL(pointReservation.reservedCents / 100)} reservado{pointReservation.openCharges > 1 ? ` em ${pointReservation.openCharges} cobranças` : ''}.
             {' '}Livre para outro pagamento (dinheiro, Pix ou outra maquininha): <b>{formatBRL(freeCents(remaining, pointReservation) / 100)}</b>.
-            {cloudReservation?.claimsCents ? ` Inclui ${formatBRL(cloudReservation.claimsCents / 100)} de outro pagamento sendo recebido.` : ''}
-            {pointReservation.manualReview ? ' Uma cobrança está em revisão: o valor só é liberado quando o gerente conferir no Mercado Pago.' : onlyClaims(cloudReservation) ? ' Aguarde o pagamento chegar ao servidor.' : ' Aguarde a Point terminar.'}
+            {countedReservation?.claimsCents ? ` Inclui ${formatBRL(countedReservation.claimsCents / 100)} de outro pagamento sendo recebido.` : ''}
+            {pointReservation.manualReview ? ' Uma cobrança está em revisão: o valor só é liberado quando o gerente conferir no Mercado Pago.' : onlyClaims(countedReservation) ? ' Aguarde o pagamento chegar ao servidor.' : ' Aguarde a Point terminar.'}
           </p>
           {unresolvedCharges.length > 0 && (
             <ul className="mt-3 grid gap-2">

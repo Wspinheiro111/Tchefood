@@ -27,7 +27,7 @@
  *    o operador reenvia os recusados depois de corrigir a causa.
  */
 import type { SyncEvent } from '../../types';
-import { describeTotalBelowPaid } from '../payments/pointReservation';
+import { describeReservedExceeds, describeTotalBelowPaid } from '../payments/pointReservation';
 
 export interface SyncConfig {
   url: string;
@@ -577,6 +577,8 @@ function describeError(body: string, status: number): string {
     // TF012 total_below_paid: o total ficaria abaixo do já pago; o DETAIL vira os valores em reais.
     const belowPaid = j.code === 'TF012' ? describeTotalBelowPaid(`${j.details ?? ''} ${j.message ?? ''}`) : null;
     if (belowPaid) return belowPaid;
+    const reservedOver = j.code === 'TF012' ? describeReservedExceeds(`${j.details ?? ''} ${j.message ?? ''}`) : null;
+    if (reservedOver) return reservedOver;
     const lead = j.code === 'TF010'
       // O mesmo texto de CLAIM_REQUIRED_ERROR (paymentClaim.ts).
       ? 'Loja conectada à nuvem: todo pagamento é reservado no servidor antes. Este pagamento chegou sem a reserva: confira na Retaguarda e registre de novo pelo caixa.'

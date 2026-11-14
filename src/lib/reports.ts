@@ -287,6 +287,7 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   CASH_CLOSE_DIFFERENCE: 'Caixa fechado com diferença',
   PRICE_OVERRIDE: 'Preço diferente do cadastro aceito pelo gerente',
   CLAIM_RELEASED_REFUNDED: 'Reserva liberada com a maquininha aprovada: estornado na maquininha',
+  POINT_PAYMENT_REFUNDED: 'Pagamento da Point estornado (confirmado no Mercado Pago)',
 };
 
 /** Texto do alerta enviado ao WhatsApp do proprietário. */

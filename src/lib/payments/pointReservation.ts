@@ -30,6 +30,27 @@ export function effectiveReservation(cloud: Omit<PointReservation, 'source'> | n
   return null;
 }
 
+/**
+ * Reserva lida do servidor sem as reservas de pagamento cuja chave já é um pagamento APROVADO desta conta neste
+ * aparelho: o saldo local já descontou esse pagamento (contar a reserva dele de novo recusaria a 2ª cota até a
+ * fila subir, e para sempre se ela travar). A reserva de outro aparelho ou a deste ainda não paga continua.
+ * Mesma regra de reservationExceeds.
+ */
+export function withoutClaimsPaidHere<T extends { reservedCents: number; claimsCents?: number; claims?: ReadonlyArray<{ idempotencyKey: string; amountCents: number }> }>(
+  reservation: T | null,
+  paidKeys: ReadonlySet<string>,
+): T | null {
+  if (!reservation || !reservation.claims || paidKeys.size === 0) return reservation;
+  const paid = reservation.claims.filter((c) => paidKeys.has(c.idempotencyKey)).reduce((a, c) => a + c.amountCents, 0);
+  if (paid === 0) return reservation;
+  return {
+    ...reservation,
+    reservedCents: Math.max(reservation.reservedCents - paid, 0),
+    ...(reservation.claimsCents !== undefined ? { claimsCents: Math.max(reservation.claimsCents - paid, 0) } : {}),
+    claims: reservation.claims.filter((c) => !paidKeys.has(c.idempotencyKey)),
+  };
+}
+
 /** Saldo livre para outro pagamento, em centavos (nunca negativo). */
 export function freeCents(remaining: number, reservation: PointReservation | null): number {
   return Math.max(toCents(remaining) - (reservation?.reservedCents ?? 0), 0);
@@ -73,6 +94,22 @@ export const RESERVED_EXCEEDS_BALANCE = 'Há cobrança reservada nesta comanda: 
  * estornados não contam), com ou sem reserva. A mesma regra é conferida aqui antes de o ajuste ir para a fila.
  */
 export const TOTAL_BELOW_PAID = 'O total ficaria abaixo do que já foi pago; estorne um pagamento antes.';
+
+/** Recusa da fila com TF012 (como describeError a escreve): abaixo do reservado ou do já pago. */
+export function isTf012Rejection(message: string): boolean {
+  return message.startsWith(RESERVED_EXCEEDS_BALANCE.slice(0, -1)) || message.startsWith(TOTAL_BELOW_PAID.slice(0, -1));
+}
+
+/** Recusa do banco com DETAIL `reserved_exceeds_balance reserved_cents=… remaining_cents=…`, em reais; null se não for. */
+export function describeReservedExceeds(detail: string): string | null {
+  if (!/reserved_exceeds_balance/.test(detail)) return null;
+  const reserved = /reserved_cents=(-?\d+)/.exec(detail)?.[1];
+  const remaining = /remaining_cents=(-?\d+)/.exec(detail)?.[1];
+  const values = reserved !== undefined && remaining !== undefined
+    ? ` (reservado ${formatBRL(Number(reserved) / 100)}; o saldo ficaria ${formatBRL(Number(remaining) / 100)})`
+    : '';
+  return `${RESERVED_EXCEEDS_BALANCE.slice(0, -1)}${values}. Em Retaguarda › Nuvem, desfaça o desconto ou o ajuste recusado, ou reenvie depois de a cobrança terminar.`;
+}
 
 /** Recusa do banco com DETAIL `total_below_paid paid_cents=… total_cents=…`, em texto para o operador. */
 export function describeTotalBelowPaid(detail: string): string | null {

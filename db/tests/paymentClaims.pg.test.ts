@@ -286,6 +286,19 @@ const resolveQ = (id: string, from: string, to: string, patch: string, evidence:
   `SELECT status FROM tchefood_resolve_point_charge('${tenant}', '${id}', '${from}', '${to}', '${patch}'::jsonb, '${staff}', '${reason}', '${evidence}'::jsonb)`;
 const resolve = (id: string, from: string, to: string, patch = '{}', evidence?: string) =>
   psql(target!, `${resolveQ(id, from, to, patch, evidence ?? `{"authorization_audit_id":"${authorized(sql(`SELECT idempotency_key FROM terminal_charges WHERE id = '${id}'`))}","operation_id":"op-1","mp_status":"x"}`)};`, DB);
+/**
+ * Estorno verificado do pagamento registrado (GPT r9 P1-01, tchefood_refund_point_payment) com a prova lida no Mercado
+ * Pago igual à cobrança; `over` troca campos da prova; authorization: id do pedido de conferência com PIN.
+ */
+const refundEvidence = (id: string, authorization: string, over: Record<string, unknown> = {}) => {
+  const [k, pid, cents] = sql(`SELECT idempotency_key || '|' || COALESCE(external_payment_id, '') || '|' || amount_cents FROM terminal_charges WHERE id = '${id}'`).split('|');
+  return JSON.stringify({ authorization_audit_id: authorization, operation_id: null, mp_payment_id: pid, mp_amount_cents: Number(cents),
+    mp_external_reference: k, mp_status: 'refunded', ...over });
+};
+const refundQ = (id: string, evidence: string, patch = '{"raw_status":"refunded","raw_status_detail":"refunded"}', staff = STAFF, tenant = TENANT, reason = 'estorno conferido no Mercado Pago') =>
+  `SELECT status FROM tchefood_refund_point_payment('${tenant}', '${id}', '${staff}', '${reason}', '${patch}'::jsonb, '${evidence}'::jsonb)`;
+const refundPoint = (id: string, over: Record<string, unknown> = {}, authorization?: string) =>
+  psql(target!, `BEGIN; SET LOCAL ROLE service_role; ${refundQ(id, refundEvidence(id, authorization ?? authorized(sql(`SELECT idempotency_key FROM terminal_charges WHERE id = '${id}'`)), over))}; COMMIT;`, DB);
 const receiptPatch = (cents: number, nsu = `N${crypto.randomUUID().slice(0, 6)}`) =>
   `{"external_payment_id":"${nsu}","paid_amount_cents":${cents},"card_brand":"VISA","authorization_code":"AUTR1","raw_status":"processed","raw_status_detail":"accredited"}`;
 
@@ -2419,8 +2432,9 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(sql(`SELECT status FROM order_items WHERE id = '${item}'`)).toBe('PENDING');
       expect(total(order)).toBe('15000|12000|OPEN');
       // Estorno gravado (a cobrança estornada no servidor, o pagamento do Mercado Pago vira REFUNDED): sai do pago.
-      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE terminal_charges SET status = 'refunded' WHERE id = '${ch.id}'; COMMIT;`);
-      expect(psql(target!, `UPDATE payments SET status = 'REFUNDED' WHERE id = '${mpId}';`, DB).ok).toBe(true);
+      const refunded = refundPoint(ch.id);
+      expect(refunded.ok, refunded.message ?? '').toBe(true);
+      expect(sql(`SELECT status FROM payments WHERE id = '${mpId}'`)).toBe('REFUNDED');
       expect(total(order)).toBe('15000|6000|OPEN');
       const ok = cancelItem();
       expect(ok, ok.message ?? undefined).toMatchObject({ ok: true });
@@ -2482,6 +2496,203 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       }
       expect(asDevice(`SELECT tchefood_point_charge_in_wait('${TENANT}', '${fresh.id}')`)).toMatchObject({ ok: false, sqlstate: '42501' });
       expect(sql(`SELECT p.provolatile::text || '|' || p.prosecdef FROM pg_proc p WHERE p.proname = 'tchefood_point_charge_in_wait'`)).toBe('s|true');
+    });
+  });
+
+  describe('GPT r9 P1-01: estorno do pagamento da Point já registrado (tchefood_refund_point_payment)', () => {
+    const lockOrder = (order: string) => `SELECT 1 FROM orders WHERE id = '${order}' FOR UPDATE`;
+    const state = (ch: { id: string; key: string }) => sql(`SELECT c.status || '|' || COALESCE((SELECT string_agg(p.status::text, ',') FROM payments p WHERE p.idempotency_key = c.idempotency_key), '-')
+      FROM terminal_charges c WHERE c.id = '${ch.id}'`);
+    const orderState = (order: string) => sql(`SELECT round(paid_amount * 100)::bigint || '|' || round(remaining_balance * 100)::bigint || '|' || status FROM orders WHERE id = '${order}'`);
+    const refunds = (ch: { id: string }) => Number(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'POINT_PAYMENT_REFUNDED' AND metadata->>'charge_id' = '${ch.id}'`));
+    /** Cobrança aprovada com o pagamento do Mercado Pago registrado. */
+    const paidCharge = (order: string, cents: number) => {
+      const ch = charge(order, 'approved', cents);
+      const r = mpPayment(ch.id);
+      expect(r.ok, r.message ?? '').toBe(true);
+      return ch;
+    };
+
+    it('aprovada com pagamento registrado: o estorno autorizado estorna os dois, recalcula a conta; repetir devolve o mesmo e não grava de novo', () => {
+      const order = withItems(100);
+      const ch = paidCharge(order, 6000);
+      expect(orderState(order)).toBe('6000|4000|OPEN');
+      // Antes da correção: o fim verificado recusa (já virou pagamento) e o pagamento não vira estornado sozinho.
+      expect(resolve(ch.id, 'approved', 'refunded', '{"raw_status":"refunded"}')).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      const auth = authorized(ch.key);
+      const r = refundPoint(ch.id, {}, auth);
+      expect(r.ok, r.message ?? '').toBe(true);
+      expect(state(ch)).toBe('refunded|REFUNDED');
+      expect(chargeField(ch.id, `raw_status || '|' || raw_status_detail || '|' || external_payment_id`)).toBe(`refunded|refunded|${chargeField(ch.id, 'external_payment_id')}`);
+      expect(orderState(order)).toBe('0|10000|OPEN');
+      expect(refunds(ch)).toBe(1);
+      const meta = JSON.parse(sql(`SELECT metadata::text FROM audit_logs WHERE action_type = 'POINT_PAYMENT_REFUNDED' AND metadata->>'charge_id' = '${ch.id}'`)) as Record<string, unknown>;
+      expect(meta).toMatchObject({ idempotency_key: ch.key, payment_id: sql(`SELECT id FROM payments WHERE idempotency_key = '${ch.key}'`), amount_cents: 6000,
+        from: 'approved', to: 'refunded', server_verified: true, evidence: { authorization_audit_id: auth, mp_status: 'refunded' } });
+      // A cobrança estornada não reserva e o saldo volta a poder ser recebido.
+      expect(reservation(order)).toMatchObject({ reserved_cents: 0, charges: [] });
+      // Repetição (mesma autorização ou qualquer outra: a cobrança já estornada não grava nada): devolve "refunded" e não grava nada.
+      for (const again of [refundPoint(ch.id, {}, auth), refundPoint(ch.id, {}, crypto.randomUUID())]) {
+        expect(again.ok, again.message ?? '').toBe(true);
+        expect(again.out).toContain('refunded');
+      }
+      expect(refunds(ch)).toBe(1);
+      expect(state(ch)).toBe('refunded|REFUNDED');
+      expect(orderState(order)).toBe('0|10000|OPEN');
+    });
+
+    it('conta já fechada pelo pagamento: continua fechada, com o saldo devolvido e o registro do estorno (no servidor a conta encerrada não reabre)', () => {
+      const order = withItems(60);
+      const ch = paidCharge(order, 6000);
+      expect(orderState(order)).toBe('6000|0|CLOSED');
+      const r = refundPoint(ch.id, { mp_status: 'cancelled' });
+      expect(r.ok, r.message ?? '').toBe(true);
+      expect(state(ch)).toBe('refunded|REFUNDED');
+      expect(orderState(order)).toBe('0|6000|CLOSED');
+      expect(refunds(ch)).toBe(1);
+    });
+
+    it('sem prova, sem autorização ou com prova que não confere: recusado, nada muda', () => {
+      const order = withItems(100);
+      // A cobrança saiu da revisão manual pelo fim verificado (autorização A) e o pagamento dela foi registrado.
+      const ch = charge(order, 'manual_review', 3000);
+      const usedAuth = authorized(ch.key);
+      const ok = resolve(ch.id, 'manual_review', 'approved', receiptPatch(3000), `{"authorization_audit_id":"${usedAuth}","operation_id":"op-1"}`);
+      expect(ok.ok, ok.message ?? '').toBe(true);
+      expect(mpPayment(ch.id).ok).toBe(true);
+      const other = paidCharge(order, 1000);
+      const auth = () => authorized(ch.key);
+      const run = (over: Record<string, unknown>, a = auth(), patch?: string, staff = STAFF, tenant = TENANT) =>
+        psql(target!, `BEGIN; SET LOCAL ROLE service_role; ${refundQ(ch.id, refundEvidence(ch.id, a, over), patch, staff, tenant)}; COMMIT;`, DB);
+      for (const [label, r, code] of [
+        ['autorização inexistente', run({}, crypto.randomUUID()), 'TF006'],
+        ['autorização de outra cobrança', run({}, authorized(other.key)), 'TF006'],
+        ['autorização já usada pelo fim verificado', run({}, usedAuth), 'TF007'],
+        ['chargeback', run({ mp_status: 'charged_back' }), 'TF006'],
+        ['status aprovado', run({ mp_status: 'approved' }), 'TF006'],
+        ['outro pagamento', run({ mp_payment_id: 'P-OUTRO' }), 'TF006'],
+        ['outro valor', run({ mp_amount_cents: 2999 }), 'TF006'],
+        ['outra referência', run({ mp_external_reference: 'outra-chave' }), 'TF006'],
+        ['sem o status', run({ mp_status: undefined }), 'TF006'],
+        ['valor em texto', run({ mp_amount_cents: '3000' }), 'TF006'],
+        ['patch com comprovante', run({}, auth(), '{"external_payment_id":"X"}'), 'TF006'],
+        ['operador inativo', run({}, auth(), undefined, INACTIVE), 'TF004'],
+        ['outra loja', run({}, auth(), undefined, OTHER_STAFF, OTHER), 'TF005'],
+      ] as const) {
+        expect(r, label).toMatchObject({ ok: false, sqlstate: code });
+      }
+      expect(state(ch)).toBe('approved|APPROVED');
+      expect(orderState(order)).toBe('4000|6000|OPEN');
+      expect(refunds(ch)).toBe(0);
+      // Autorização gasta pelo estorno de outra cobrança não serve ao fim verificado desta (é de outra chave: TF006).
+      const spent = authorized(other.key);
+      expect(refundPoint(other.id, {}, spent).ok).toBe(true);
+      const order2 = withItems(100);
+      const review = charge(order2, 'manual_review', 1000);
+      expect(resolve(review.id, 'manual_review', 'rejected', '{}', `{"authorization_audit_id":"${spent}","operation_id":null}`)).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      // Sem pagamento registrado: é o fim verificado que estorna (TF007); cobrança recusada: TF007.
+      const bare = charge(order2, 'approved', 1000);
+      expect(refundPoint(bare.id)).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      const rejected = charge(order2, 'rejected', 1000);
+      expect(psql(target!, `BEGIN; SET LOCAL ROLE service_role; ${refundQ(rejected.id, refundEvidence(rejected.id, crypto.randomUUID()))}; COMMIT;`, DB))
+        .toMatchObject({ ok: false, sqlstate: 'TF007' });
+      // Só a service role.
+      for (const role of ['authenticated', 'anon']) {
+        expect(asRole(role, refundQ(ch.id, refundEvidence(ch.id, auth()))), role).toMatchObject({ ok: false, sqlstate: '42501' });
+      }
+    });
+
+    it('UPDATE direto ou forjado do pagamento para REFUNDED é recusado, com ou sem a cobrança estornada e com a marca de outro registro', () => {
+      const order = withItems(100);
+      const ch = paidCharge(order, 2000);
+      const pid = sql(`SELECT id FROM payments WHERE idempotency_key = '${ch.key}'`);
+      const upd = `UPDATE payments SET status = 'REFUNDED' WHERE id = '${pid}'`;
+      expect(psql(target!, `${upd};`, DB)).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      const auth = authorized(ch.key);
+      // A cobrança estornada sem os gatilhos (só para montar o cenário): o UPDATE isolado continua recusado.
+      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE terminal_charges SET status = 'refunded' WHERE id = '${ch.id}'; COMMIT;`);
+      const alone = psql(target!, `${upd};`, DB);
+      expect(alone).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      expect(alone.message).toContain('só vira estornado pelo estorno verificado');
+      // Marca apontando para outro registro (o pedido de conferência) ou lixo: recusado.
+      for (const flag of [auth, 'nao-e-uuid', crypto.randomUUID()]) {
+        expect(psql(target!, `BEGIN; SELECT set_config('tchefood.point_resolution', '${flag}', true); ${upd}; COMMIT;`, DB), flag).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      }
+      // Registro POINT_PAYMENT_REFUNDED forjado pelo aparelho: recusado pelo gatilho de audit_logs.
+      expect(asDevice(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES ('${TENANT}', '${order}', '${STAFF}', 'POINT_PAYMENT_REFUNDED', 'forjado pelo aparelho', jsonb_build_object('payment_id', '${pid}', 'charge_id', '${ch.id}'))`).ok).toBe(false);
+      expect(sql(`SELECT status FROM payments WHERE id = '${pid}'`)).toBe('APPROVED');
+      expect(orderState(order)).toBe('2000|8000|OPEN');
+      // A cobrança aprovada também não vira estornada pelo UPDATE direto com a marca de um POINT_PAYMENT_REFUNDED de outra cobrança.
+      const ch2 = paidCharge(order, 1000);
+      expect(refundPoint(ch2.id).ok).toBe(true);
+      const foreign = sql(`SELECT id FROM audit_logs WHERE action_type = 'POINT_PAYMENT_REFUNDED' AND metadata->>'charge_id' = '${ch2.id}'`);
+      const ch3 = paidCharge(order, 1000);
+      expect(psql(target!, `BEGIN; SELECT set_config('tchefood.point_resolution', '${foreign}', true); UPDATE terminal_charges SET status = 'refunded' WHERE id = '${ch3.id}'; COMMIT;`, DB).ok).toBe(false);
+      expect(state(ch3)).toBe('approved|APPROVED');
+    });
+
+    it('pagamento aprovado é final: nenhum papel o tira de APROVADO fora do estorno verificado (DECLINED, PENDING, REFUNDED fora do MP)', () => {
+      const order = withItems(100);
+      const k = key('final');
+      expect(pay(payment(order, 20, { idempotency_key: k })).ok).toBe(true);
+      const cashId = sql(`SELECT id FROM payments WHERE idempotency_key = '${k}'`);
+      const ch = paidCharge(order, 3000);
+      const mpId = sql(`SELECT id FROM payments WHERE idempotency_key = '${ch.key}'`);
+      for (const [id, to] of [[cashId, 'DECLINED'], [cashId, 'PENDING'], [cashId, 'REFUNDED'], [mpId, 'DECLINED'], [mpId, 'PENDING']] as const) {
+        for (const role of ['owner', 'service_role']) {
+          const upd = `UPDATE payments SET status = '${to}' WHERE id = '${id}'`;
+          const q = role === 'owner' ? `${upd};` : `BEGIN; SET LOCAL ROLE service_role; ${upd}; COMMIT;`;
+          const r = psql(target!, q, DB);
+          expect(r, `${id === cashId ? 'dinheiro' : 'MP'} → ${to} (${role})`).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        }
+      }
+      // DETAIL do recusado fora do MP (o do MP para DECLINED/PENDING sai antes, pelo gatilho do Mercado Pago).
+      expect(last(psql(target!, `DO $d$ DECLARE c TEXT; d TEXT; BEGIN
+          BEGIN UPDATE payments SET status = 'DECLINED' WHERE id = '${cashId}'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = RETURNED_SQLSTATE, d = PG_EXCEPTION_DETAIL; END;
+          PERFORM set_config('tchefood.test_err', c || '|' || d, false); END $d$; SELECT current_setting('tchefood.test_err');`, DB))).toBe('TF007|approved_is_final');
+      expect(sql(`SELECT string_agg(status::text, ',' ORDER BY amount) FROM payments WHERE id IN ('${cashId}', '${mpId}')`)).toBe('APPROVED,APPROVED');
+      expect(orderState(order)).toBe('5000|5000|OPEN');
+      // O caminho autorizado continua valendo, e grava o gerente que autorizou.
+      expect(refundPoint(ch.id).ok).toBe(true);
+      expect(sql(`SELECT authorized_by_manager_id FROM audit_logs WHERE action_type = 'POINT_PAYMENT_REFUNDED' AND metadata->>'charge_id' = '${ch.id}'`)).toBe(MANAGER);
+      expect(orderState(order)).toBe('2000|8000|OPEN');
+    });
+
+    for (const refundFirst of [false, true]) {
+      it(`estorno e registro do pagamento ao mesmo tempo (${refundFirst ? 'estorno' : 'pagamento'} primeiro): sem 40P01, um resultado coerente`, async () => {
+        const order = withItems(100);
+        const ch = charge(order, 'approved', 4000);
+        const auth = authorized(ch.key);
+        const refund = `BEGIN; SET LOCAL ROLE service_role; ${ownerQ(refundQ(ch.id, refundEvidence(ch.id, auth)))} COMMIT;`;
+        const payQ2 = ownerQ(mpPaymentQ(ch.id));
+        const [first, second] = await contend(lockOrder(order), refundFirst ? [refund, payQ2] : [payQ2, refund]);
+        expect(lastOverlap).toBe(2);
+        const [refunded, paid] = refundFirst ? [first, second] : [second, first];
+        expect(paid).toBe('ok');
+        if (refundFirst) {
+          // Sem pagamento ainda: o estorno é recusado (é o fim verificado que estorna sem pagamento) e o pagamento entra.
+          expect(refunded).toMatch(/^recusado TF007: .*não tem pagamento registrado/);
+          expect(state(ch)).toBe('approved|APPROVED');
+          expect(orderState(order)).toBe('4000|6000|OPEN');
+        } else {
+          expect(refunded).toBe('ok');
+          expect(state(ch)).toBe('refunded|REFUNDED');
+          expect(orderState(order)).toBe('0|10000|OPEN');
+        }
+      }, 60_000);
+    }
+
+    it('dois estornos ao mesmo tempo (autorizações diferentes): um grava, o outro devolve a cobrança estornada; UM registro', async () => {
+      const order = withItems(100);
+      const ch = paidCharge(order, 5000);
+      const q = (a: string) => `BEGIN; SET LOCAL ROLE service_role; ${ownerQ(refundQ(ch.id, refundEvidence(ch.id, a)))} COMMIT;`;
+      const [a, b] = await contend(lockOrder(order), [q(authorized(ch.key)), q(authorized(ch.key))]);
+      expect(lastOverlap).toBe(2);
+      expect([a, b]).toEqual(['ok', 'ok']);
+      expect(refunds(ch)).toBe(1);
+      expect(state(ch)).toBe('refunded|REFUNDED');
+      expect(orderState(order)).toBe('0|10000|OPEN');
     });
   });
 });

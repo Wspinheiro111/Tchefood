@@ -30,6 +30,8 @@ export interface ClaimTerms {
   method: string;
   acquirer: string;
   amount_cents: number;
+  /** Reserva pedida depois, para um pagamento já registrado que a nuvem recusou sem reserva (claimRecovery). */
+  recovery?: true;
 }
 
 /** Segredo novo da reserva: 32 bytes aleatórios em hex (64 caracteres). */
