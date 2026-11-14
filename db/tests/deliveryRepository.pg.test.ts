@@ -297,7 +297,7 @@ function setup() {
 
   describe('alçada de gerente (tchefood_delivery_authorize)', () => {
     const DETAILS: Record<string, unknown> = {
-      DELIVERY_CANCEL: { code: '503' },
+      DELIVERY_CANCEL: { code: '503', reason: 'Item indisponível' },
       DELIVERY_DISPUTE: { kind: 'accept' },
       DELIVERY_PAUSE: { minutes: 30, description: 'Falta de gás' },
       DELIVERY_RESUME: { pauseId: 'p-1' },
@@ -331,13 +331,18 @@ function setup() {
       expect(again.body).toMatchObject({ status: 'OK', auditId, repeated: true, lastOutcome: null });
       expect((await authorize(TENANT, { p_external_order_id: other, p_request_id: requestId })).body).toEqual({ status: 'CONFLICT' });
       // O que o gerente aprovou fica gravado; reenvio com outro motivo do iFood ou outro motivo escrito é conflito.
-      expect(sql(`SELECT metadata->'details'->>'code' FROM audit_logs WHERE id = '${auditId}'`)).toBe('503');
-      expect((await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId, p_details: { code: '501' } })).body).toEqual({ status: 'CONFLICT' });
+      expect(sql(`SELECT (metadata->'details'->>'code') || '|' || (metadata->'details'->>'reason') FROM audit_logs WHERE id = '${auditId}'`)).toBe('503|Item indisponível');
+      expect((await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId, p_details: { code: '501', reason: 'Item indisponível' } })).body).toEqual({ status: 'CONFLICT' });
+      // Mesmo código com outro texto enviado ao iFood: conflito.
+      expect((await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId, p_details: { code: '503', reason: 'Acabou o pão' } })).body).toEqual({ status: 'CONFLICT' });
       expect((await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId, p_reason: 'Outro motivo qualquer' })).body).toEqual({ status: 'CONFLICT' });
       expect(sql(`SELECT count(*) FROM audit_logs WHERE metadata->>'delivery_request_id' = '${requestId}'`)).toBe('1');
       // Sem o que foi aprovado (ou com formato errado para a ação), nada é autorizado.
       expect((await authorize(TENANT, { p_external_order_id: id, p_details: null })).ok).toBe(false);
       expect((await authorize(TENANT, { p_external_order_id: id, p_details: { kind: 'accept' } })).ok).toBe(false);
+      // Cancelamento sem o texto enviado ao iFood (ou com texto que não é string): recusado.
+      expect((await authorize(TENANT, { p_external_order_id: id, p_details: { code: '503' } })).ok).toBe(false);
+      expect((await authorize(TENANT, { p_external_order_id: id, p_details: { code: '503', reason: 7 } })).ok).toBe(false);
       expect((await authorize(TENANT, { p_action: 'DELIVERY_PAUSE', p_merchant_external_id: merchantId, p_details: { minutes: 0, description: 'x' } })).ok).toBe(false);
 
       // Resultado: só o servidor grava; o app não chama a função.

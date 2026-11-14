@@ -5,7 +5,7 @@ import {
   type DeliveryOrderAction,
 } from "../marketplace";
 import { DeliveryRepositoryError, fetchWithDeadline, type RestFetch } from "../supabaseDeliveryRepository";
-import { IFOOD_POLLING_INTERVAL_MS, IfoodMerchantApi, isValidIfoodMerchantId } from "./ifoodMerchantApi";
+import { IFOOD_POLLING_INTERVAL_MS, ifoodCancellationText, IfoodMerchantApi, isValidIfoodMerchantId } from "./ifoodMerchantApi";
 
 // Servidor do iFood: um processo só, sempre ligado.
 //  - Polling a cada 30 s das lojas com integração ativa (é o polling que mantém a loja aberta no iFood). Um ciclo
@@ -419,16 +419,19 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
             return { status: 400, body: { error: "confirmUncertainRetry precisa ser true ou false." } };
           }
           const confirmUncertainRetry = body.confirmUncertainRetry === true;
+          // O registro do gerente leva o código e o texto exatos que vão ao iFood (o texto adicional ou, sem ele, a
+          // descrição do motivo); a chamada usa esse mesmo texto.
+          const sent = ifoodCancellationText(reason, typeof body.details === "string" ? body.details : undefined);
           const cancel = {
             ...manager,
             action: "DELIVERY_CANCEL" as const,
             externalOrderId: orderId,
             merchantExternalId: null,
-            details: { code: reason.code, ...(confirmUncertainRetry ? { confirmUncertainRetry } : {}) },
+            details: { code: reason.code, reason: sent, ...(confirmUncertainRetry ? { confirmUncertainRetry } : {}) },
           };
           return await withManager(token, cancel, async () => ({
             status: 200,
-            body: publicRecord(await options.inbox.requestCancellation("ifood", orderId, reason, text(body.details, 250) ?? undefined, { confirmUncertainRetry })),
+            body: publicRecord(await options.inbox.requestCancellation("ifood", orderId, reason, sent, { confirmUncertainRetry })),
           }));
         }
         if (request.method === "POST" && route === "dispute") {

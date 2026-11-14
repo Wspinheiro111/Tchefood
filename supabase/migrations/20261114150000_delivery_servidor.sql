@@ -239,8 +239,9 @@ END $$;
 -- merchantId precisa ser dessa loja, o PIN é de gerente/dono ativo e conta no mesmo bloqueio
 -- de 3 erros em 60 s de tchefood_authorize_manager (mesma trava e mesmos registros
 -- MANAGER_PIN_FAILED / MANAGER_PIN_LOCKOUT). A autorização vira um audit_log com gerente, com o
--- que o gerente aprovou em metadata.details (p_details: cancelamento {code}, negociação
--- {kind, alternativeId?}, pausa {minutes, description}, retomada {pauseId}).
+-- que o gerente aprovou em metadata.details (p_details: cancelamento {code, reason} com o texto
+-- exato enviado ao app, negociação {kind, alternativeId?}, pausa {minutes, description},
+-- retomada {pauseId}).
 -- Devolve {"status": "OK", "auditId", "repeated"} ou {"status": "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT"}.
 -- repeated = TRUE: reenvio de uma tentativa já autorizada; o servidor NÃO chama o app de novo.
 -- lastOutcome (só no reenvio): resultado já gravado da tentativa; "failed" = nada chegou ao app.
@@ -286,6 +287,7 @@ BEGIN
     END IF;
     IF p_details IS NULL OR jsonb_typeof(p_details) <> 'object' OR NOT COALESCE(CASE p_action
            WHEN 'DELIVERY_CANCEL' THEN jsonb_typeof(p_details->'code') = 'string'
+                AND jsonb_typeof(p_details->'reason') = 'string'
            WHEN 'DELIVERY_DISPUTE' THEN p_details->>'kind' IN ('accept', 'reject', 'alternative')
                 AND (p_details->>'kind' <> 'alternative' OR jsonb_typeof(p_details->'alternativeId') = 'string')
            WHEN 'DELIVERY_PAUSE' THEN jsonb_typeof(p_details->'minutes') = 'number'

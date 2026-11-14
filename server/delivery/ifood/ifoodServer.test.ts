@@ -37,6 +37,10 @@ function fakeApproval() {
       if (request.managerPin !== MANAGER_PIN) return { status: "PIN_FAILED", message: "PIN de gerente incorreto." };
       // Mesmo id da tentativa: devolve a autorização já gravada (como tchefood_delivery_authorize).
       const existing = byRequest.get(request.requestId);
+      // Mesmo id com outro alvo ou conteúdo: conflito (como a comparação de metadata.details no banco).
+      if (existing && JSON.stringify(authorized[Number(existing.slice("audit-".length)) - 1]) !== JSON.stringify(request)) {
+        return { status: "CONFLICT", message: "Esta autorização já foi usada para outra ação." };
+      }
       if (existing) {
         const last = [...results].reverse().find((result) => result.auditId === existing);
         return { status: "OK", auditId: existing, repeated: true, lastOutcome: (last?.outcome as ManagerOutcome | undefined) ?? null };
@@ -517,11 +521,54 @@ describe("servidor do iFood: alçada de gerente", () => {
     const created = await call("POST", `/ifood/merchants/${sandbox.merchantId}/pauses`, { description: "Falta de gás", minutes: 30, authorization: auth() });
     await call("DELETE", `/ifood/merchants/${sandbox.merchantId}/pauses/${(created.body as { id: string }).id}`, { authorization: auth() });
     expect(manager.authorized.map((request) => request.details)).toEqual([
-      { code: "503" },
+      { code: "503", reason: "Item indisponível" },
       { disputeId: otherDispute, kind: "reject", reason: "Pedido já saiu" },
       { minutes: 30, description: "Falta de gás" },
       { pauseId: (created.body as { id: string }).id },
     ]);
+  });
+
+  it("a autorização do cancelamento grava o código e o texto exatos que o iFood recebe; mesmo id com outro texto é conflito", async () => {
+    const manager = fakeApproval();
+    const sandbox = new IfoodSandbox(undefined, undefined, () => NOW);
+    const sent: Array<Record<string, unknown>> = [];
+    const fetchImpl: typeof sandbox.fetch = async (input, init = {}) => {
+      if (String(input).endsWith("/requestCancellation")) sent.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return sandbox.fetch(input, init);
+    };
+    const api = new IfoodMerchantApi({ credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret }, baseUrl: sandbox.baseUrl, fetchImpl });
+    const inbox = new DeliveryInbox({ adapters: [api], repository: new InMemoryDeliveryRepository(), now: () => NOW });
+    const poller = new IfoodPoller({ api, inbox, merchants: { activeMerchants: async () => [{ merchantExternalId: sandbox.merchantId }] }, now: () => NOW.getTime() });
+    const handle = createIfoodApiHandler({ inbox, api, authorizer: { canAccessOrder: async () => true, canAccessMerchant: async () => true }, approval: manager.approval, now: () => NOW });
+    const call = (path: string, body: unknown) => handle({ method: "POST", path, headers: { authorization: "Bearer loja-a" }, body: JSON.stringify(body) });
+    const id = sandbox.placeOrder({ items: ITEMS });
+    const plain = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    sandbox.autoAcceptCancellation = false;
+
+    // Texto adicional com espaços e mais de 250 caracteres (o corte cai num espaço): vai aparado e cortado, e o
+    // registro leva o mesmo texto.
+    const details = `  ${"a".repeat(249)} resto do texto  `;
+    const authorization = auth();
+    expect((await call(`/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", details, authorization })).status).toBe(200);
+    expect(sent).toHaveLength(1);
+    expect((sent[0]!.reason as string).length).toBeLessThanOrEqual(250);
+    expect(manager.authorized.at(-1)?.details).toEqual({ code: sent[0]!.cancellationCode, reason: sent[0]!.reason });
+    expect(sent[0]).toEqual({ cancellationCode: "503", reason: "a".repeat(249) });
+
+    // Mesmo id da tentativa com outro texto: 409 CONFLICT, sem chamar o iFood.
+    const spy = vi.spyOn(api, "requestCancellation");
+    const conflict = await call(`/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", details: "Outro texto", authorization });
+    expect(conflict).toMatchObject({ status: 409, body: { code: "CONFLICT" } });
+    expect(spy).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(1);
+    spy.mockRestore();
+
+    // Sem texto adicional: vai a descrição do motivo do iFood, e é ela que fica no registro.
+    expect((await call(`/ifood/orders/${plain}/cancellation`, { code: "503", description: "Item indisponível", details: "   ", authorization: auth() })).status).toBe(200);
+    expect(sent).toHaveLength(2);
+    expect(manager.authorized.at(-1)?.details).toEqual({ code: "503", reason: sent[1]!.reason });
+    expect(sent[1]!.reason).toBe("Item indisponível");
   });
 
   it("iFood aceitou e o banco falhou depois: resposta diz que foi enviado (não 'tente de novo') e o resultado fica como enviado", async () => {

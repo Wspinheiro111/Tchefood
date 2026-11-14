@@ -203,7 +203,7 @@ export class IfoodMerchantApi implements DeliveryMarketplaceAdapter, DeliverySto
   async requestCancellation(externalOrderId: string, reason: DeliveryCancellationReason, details?: string): Promise<void> {
     if (!reason.code.trim()) throw new DeliveryMarketplaceError("ifood", "invalid_request", "Escolha um motivo de cancelamento do iFood.");
     await this.request("POST", IFOOD_PATHS.orderAction(this.orderId(externalOrderId), "requestCancellation"), {
-      json: { reason: (details?.trim() || reason.description).slice(0, 250), cancellationCode: reason.code },
+      json: { reason: ifoodCancellationText(reason, details), cancellationCode: reason.code },
     });
   }
 
@@ -425,6 +425,13 @@ function describeIfoodError(status: number, text: string): string {
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+// Texto do campo reason de requestCancellation: o texto adicional, se houver, senão a descrição do motivo do iFood;
+// aparado e limitado a 250 caracteres. Aplicado ao próprio resultado devolve o mesmo texto: o servidor grava este
+// valor na autorização do gerente e o passa como details, e é ele que vai ao iFood.
+export function ifoodCancellationText(reason: DeliveryCancellationReason, details?: string): string {
+  return (details?.trim() || reason.description.trim()).slice(0, 250).trimEnd();
 }
 
 function optionalString(value: unknown): string | null {
