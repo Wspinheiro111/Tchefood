@@ -17,11 +17,13 @@ export default function Charges({ client, today, onOpenStore }: { client: AdminC
   async function gerar(ref: string) {
     setErro(null);
     setAviso(null);
-    if (!window.confirm(`Gerar a cobrança de ${monthBr(ref)} para todas as lojas ativas com mensalidade que ainda não têm?`)) return;
+    // O lote do banco cobra as lojas ativas com mensalidade e as em teste cujo teste terminou
+    // antes do primeiro dia do mês da cobrança.
+    if (!window.confirm(`Gerar a cobrança de ${monthBr(ref)} para as lojas ativas com mensalidade e as em teste que terminaram antes de ${monthBr(ref)}, que ainda não têm?`)) return;
     setGerando(true);
     try {
       const n = await client.generateMonth(ref);
-      setAviso(n === 0 ? `Nenhuma cobrança nova: todas as lojas ativas já têm a de ${monthBr(ref)}.` : `${n} cobrança(s) de ${monthBr(ref)} criada(s).`);
+      setAviso(n === 0 ? `Nenhuma cobrança nova: as lojas ativas com mensalidade e as em teste que terminaram antes de ${monthBr(ref)} já têm a de ${monthBr(ref)}.` : `${n} cobrança(s) de ${monthBr(ref)} criada(s).`);
       reload();
     } catch (e) {
       setErro(errorText(e));

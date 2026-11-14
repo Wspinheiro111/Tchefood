@@ -58,4 +58,17 @@ describe('cliente do painel', () => {
     expect(f.calls[3]!.body).toEqual({ tenant_id: 't', action: 'create', email: 'loja@x.com' });
     expect(cleanError('TCHEFOOD_ADMIN:  x ')).toBe('x');
   });
+
+  it('queda de rede vira AdminApiError(0) em português, na chamada e no login', async () => {
+    const down: FetchLike = async () => Promise.reject(new TypeError('Failed to fetch'));
+    const c = createAdminClient(CFG, async () => 'tok', down);
+    const e = (await c.me().catch((x: unknown) => x)) as AdminApiError;
+    expect(e).toBeInstanceOf(AdminApiError);
+    expect(e.status).toBe(0);
+    expect(e.message).toBe('Sem conexão com o servidor. Confira se a ação foi registrada antes de repetir.');
+    const l = (await signIn(CFG, 'a@b.com', 'x', down).catch((x: unknown) => x)) as AdminApiError;
+    expect(l).toBeInstanceOf(AdminApiError);
+    expect(l.status).toBe(0);
+    expect(l.message).toMatch(/^Sem conexão com o servidor/);
+  });
 });

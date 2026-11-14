@@ -272,6 +272,74 @@ describe('admin-device-account', () => {
     expect(f.db.opId).toBeNull();
   });
 
+  it('conta sem tenant_id (ex.: a de um admin da plataforma) com o id e o e-mail reservados: 409, nada muda no Auth', async () => {
+    const admin = () => ({ id: USER, email: EMAIL, app_metadata: { provider: 'email' } });
+    const authWrites = (calls: string[]) => calls.filter((c) => c.startsWith('updateUserById') || c.startsWith('createUser'));
+    // Trocar senha de conta pronta e retomar uma criação pendente.
+    for (const [deviceStatus, action] of [['READY', 'reset_password'], ['PENDING', 'create']] as const) {
+      const f = fake({ deviceStatus });
+      f.users.set(USER, admin());
+      const r = await handleDeviceAccount({ tenant_id: TENANT, action }, f.deps);
+      expect(r.status).toBe(409);
+      expect(authWrites(f.calls)).toEqual([]);
+      expect(f.users.get(USER)).toEqual(admin());
+      expect(f.db.opId).toBeNull();
+    }
+    // A conta aparece só depois do "already registered" do Auth: a conferência também recusa.
+    const f = fake({ deviceStatus: 'PENDING' });
+    let first = true;
+    const get = f.deps.auth.getUserById;
+    f.deps.auth.getUserById = async (id) => {
+      if (first) { first = false; return { user: null, error: { message: 'User not found', status: 404 } }; }
+      return get(id);
+    };
+    f.users.set(USER, admin());
+    f.deps.auth.createUser = async (a) => {
+      f.calls.push(`createUser ${a.id}`);
+      return { error: { message: 'A user with this email address has already been registered' } };
+    };
+    const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps);
+    expect(r.status).toBe(409);
+    expect(f.calls.some((c) => c.startsWith('updateUserById'))).toBe(false);
+    expect(f.users.get(USER)).toEqual(admin());
+  });
+
+  it('erro ao pegar a vez depois de o banco gravar (rede caiu na volta): devolve a vez da mesma operação', async () => {
+    const f = fake();
+    const rpc = f.deps.rpc;
+    f.deps.rpc = async (fn, args) => {
+      const r = await rpc(fn, args);
+      return fn === 'tchefood_admin_device_lock' ? { data: null, error: { message: 'TypeError: fetch failed' } } : r;
+    };
+    const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps);
+    expect(r.status).not.toBe(200);
+    const lockOp = JSON.parse(f.calls.find((c) => c.startsWith('tchefood_admin_device_lock '))!.slice('tchefood_admin_device_lock '.length)).p_op;
+    expect(f.calls.at(-1)).toBe(`tchefood_admin_device_unlock {"p_tenant":"${TENANT}","p_op":"${lockOp}"}`);
+    expect(f.calls.some((c) => c.startsWith('getUserById') || c.startsWith('tchefood_admin_reserve_device'))).toBe(false);
+    expect(f.db.opId).toBeNull();
+    // A próxima tentativa não fica travada.
+    f.deps.rpc = rpc;
+    expect((await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps)).status).toBe(200);
+  });
+
+  it('vez de outra operação (55P03), sessão vencida ou sem permissão ao pegar a vez: não chama o unlock', async () => {
+    const busy = fake();
+    busy.db.opId = 'op-da-outra';
+    expect((await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, busy.deps)).status).toBe(409);
+    expect(busy.db.opId).toBe('op-da-outra');
+    expect(busy.calls.some((c) => c.startsWith('tchefood_admin_device_unlock'))).toBe(false);
+    for (const [error, status] of [
+      [{ message: 'JWT expired', code: 'PGRST301' }, 401],
+      [{ message: 'TCHEFOOD_ADMIN: acesso restrito à equipe do Tchê Food', code: '42501' }, 403],
+    ] as const) {
+      const f = fake();
+      const rpc = f.deps.rpc;
+      f.deps.rpc = async (fn, args) => (fn === 'tchefood_admin_device_lock' ? (f.calls.push(fn), { data: null, error: { ...error } }) : rpc(fn, args));
+      expect((await handleDeviceAccount({ tenant_id: TENANT, action: 'create' }, f.deps)).status).toBe(status);
+      expect(f.calls.some((c) => c.startsWith('tchefood_admin_device_unlock'))).toBe(false);
+    }
+  });
+
   it('CNPJs alfanuméricos que só diferem nas letras ganham e-mails diferentes, sem conflito de reserva', async () => {
     const reserved = new Map<string, string>();
     const users = new Map<string, AuthUser & { password?: string }>();

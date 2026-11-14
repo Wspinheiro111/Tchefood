@@ -70,12 +70,19 @@ function sessionFrom(body: unknown, email: string, now: number): Session {
 }
 
 export async function signIn(cfg: AdminConfig, email: string, password: string, fetchFn: FetchLike, now = Date.now()): Promise<Session> {
-  const res = await fetchFn(`${normalizeUrl(cfg.url)}/auth/v1/token?grant_type=password`, {
-    method: 'POST',
-    headers: { apikey: cfg.anonKey, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: email.trim(), password }),
-  });
-  const body = await readJson(res);
+  let res: Awaited<ReturnType<FetchLike>>;
+  let body: unknown;
+  try {
+    res = await fetchFn(`${normalizeUrl(cfg.url)}/auth/v1/token?grant_type=password`, {
+      method: 'POST',
+      headers: { apikey: cfg.anonKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email.trim(), password }),
+    });
+    body = await readJson(res);
+  } catch {
+    // Queda de rede (ou endereço errado): o navegador só diz "Failed to fetch".
+    throw new AdminApiError('Sem conexão com o servidor. Confira a internet e o endereço do Supabase e tente de novo.', 0);
+  }
   if (!res.ok) throw new AdminApiError(res.status === 400 ? 'E-mail ou senha incorretos.' : errorMessage(body, 'Não foi possível entrar.'), res.status);
   return sessionFrom(body, email.trim().toLowerCase(), now);
 }
@@ -309,12 +316,20 @@ export function createAdminClient(cfg: AdminConfig, getToken: () => Promise<stri
 
   async function call<T>(path: string, args: Record<string, unknown>): Promise<T> {
     const token = await getToken();
-    const res = await fetchFn(`${base}${path}`, {
-      method: 'POST',
-      headers: { apikey: cfg.anonKey, Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(args),
-    });
-    const body = await readJson(res);
+    let res: Awaited<ReturnType<FetchLike>>;
+    let body: unknown;
+    try {
+      res = await fetchFn(`${base}${path}`, {
+        method: 'POST',
+        headers: { apikey: cfg.anonKey, Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(args),
+      });
+      body = await readJson(res);
+    } catch {
+      // Queda de rede: a chamada pode ter chegado ao banco antes de a resposta se perder.
+      // Status 0 não encerra a sessão (só 401 encerra).
+      throw new AdminApiError('Sem conexão com o servidor. Confira se a ação foi registrada antes de repetir.', 0);
+    }
     if (!res.ok) {
       const fallback = res.status === 401 ? 'Sessão expirada. Entre de novo.' : res.status === 403 ? 'Acesso restrito à equipe do Tchê Food.' : 'Falha na chamada ao servidor.';
       throw new AdminApiError(errorMessage(body, fallback), res.status);

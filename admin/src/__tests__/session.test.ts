@@ -112,6 +112,20 @@ describe('sessão do painel', () => {
     await expect(d).resolves.toEqual({ user_id: 'u' });
   });
 
+  it('queda de rede numa chamada (token válido) não encerra a sessão', async () => {
+    const f = manualFetch();
+    const expired = vi.fn();
+    const fresh: Session = { accessToken: 'a', refreshToken: 'r1', expiresAt: Date.now() + 3_600_000, email: 'will@x.com' };
+    saveSession(fresh);
+    const c = sessionClient(CFG, fresh, expired, f.fetch);
+    const a = c.me();
+    await flush();
+    f.calls.at(-1)!.resolve('network');
+    await expect(a).rejects.toMatchObject({ status: 0, message: 'Sem conexão com o servidor. Confira se a ação foi registrada antes de repetir.' });
+    expect(expired).not.toHaveBeenCalled();
+    expect(loadSession()?.refreshToken).toBe('r1');
+  });
+
   it('sair durante a renovação: a resposta que chega depois não devolve a sessão', async () => {
     const f = manualFetch();
     const expired = vi.fn();

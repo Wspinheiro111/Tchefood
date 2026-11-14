@@ -17,6 +17,7 @@ export default function StoreDetail({ client, tenantId, today, onBack }: { clien
         <ArrowLeft className="h-4 w-4" /> Lojas
       </button>
       <Erro>{error}</Erro>
+      {plans.error && <Erro>Não foi possível carregar os planos: {plans.error}</Erro>}
       {!data ? (
         !error && <p className="text-sm text-slate-500">Carregando…</p>
       ) : (
@@ -37,7 +38,7 @@ export default function StoreDetail({ client, tenantId, today, onBack }: { clien
             <Numero titulo="Pedidos em 30 dias" valor={String(data.orders_30d)} />
             <Numero titulo="Equipe ativa" valor={String(data.staff_active)} />
           </div>
-          <SubscriptionForm client={client} detail={data} plans={plans.data ?? []} onSaved={reload} />
+          <SubscriptionForm client={client} detail={data} plans={plans.data ?? []} onChanged={reload} />
           {data.subscription && <DeviceAccount client={client} detail={data} onChanged={reload} />}
           {data.subscription && <ChargesSection client={client} detail={data} today={today} onChanged={reload} />}
           <section className="card space-y-2">
@@ -74,7 +75,7 @@ const ACTION_LABEL: Record<string, string> = {
   DEVICE_PASSWORD_RESET: 'Senha do aparelho trocada',
 };
 
-function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminClient; detail: Detail; plans: Plan[]; onSaved: () => void }) {
+function SubscriptionForm({ client, detail, plans, onChanged }: { client: AdminClient; detail: Detail; plans: Plan[]; onChanged: () => void }) {
   const s = detail.subscription;
   const initial = () => ({
     planId: s?.plan_id ?? 'salao-pro',
@@ -89,6 +90,9 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
     reason: '',
   });
   const [f, setF] = useState(initial);
+  // updated_at da assinatura quando a edição começou (null = loja sem assinatura). Vai para o
+  // banco, que recusa salvar se a assinatura mudou nesse meio-tempo.
+  const [base, setBase] = useState<string | null>(s?.updated_at ?? null);
   const [aberto, setAberto] = useState(!s);
   const [erro, setErro] = useState<string | null>(null);
   const [enviando, setEnviando] = useState(false);
@@ -97,8 +101,18 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
   // loja e não pode apagar o que está sendo digitado.
   const editando = !s || aberto;
   useEffect(() => {
-    if (!editando) setF(initial());
+    if (editando) return;
+    setF(initial());
+    setBase(s?.updated_at ?? null);
   }, [detail]);
+  // A loja recarregou com a assinatura mudada (ex.: um pagamento a reativou): o que está no
+  // formulário partiu de valores velhos e o banco vai recusar.
+  const mudou = editando && (s?.updated_at ?? null) !== base;
+  const recomecar = () => {
+    setF(initial());
+    setBase(s?.updated_at ?? null);
+    setErro(null);
+  };
   const set = (k: keyof typeof f) => (e: { target: { value: string } }) => setF({ ...f, [k]: e.target.value });
   // Trocar o plano põe o preço do plano novo na mensalidade (dá para editar depois).
   const setPlano = (e: { target: { value: string } }) => {
@@ -117,11 +131,15 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
       await client.saveSubscription(detail.tenant_id, {
         planId: f.planId, monthlyPrice: price, status: f.status, billingDay: Number(f.billingDay), trialEndsOn: f.trialEndsOn || null,
         contactName: f.contactName, contactPhone: f.contactPhone, contactEmail: f.contactEmail, notes: f.notes, reason: f.reason,
+        expectedUpdatedAt: base,
       });
       setAberto(false);
-      onSaved();
+      onChanged();
     } catch (e) {
       setErro(errorText(e));
+      // Relê a loja (sem apagar o formulário): se a recusa foi porque a assinatura mudou,
+      // o aviso e o botão de descartar aparecem.
+      onChanged();
     } finally {
       setEnviando(false);
     }
@@ -146,7 +164,7 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
           type="button"
           className="btn-secundario"
           onClick={() => {
-            setF(initial());
+            recomecar();
             setAberto(true);
           }}
         >
@@ -160,6 +178,15 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
     <form onSubmit={salvar} className="card space-y-3">
       <h2 className="font-bold text-slate-900">{s ? 'Alterar assinatura' : 'Cadastrar assinatura'}</h2>
       {!s && <Aviso>Esta loja foi criada direto no Supabase e ainda não tem assinatura. Cadastre para cobrar e criar a conta do aparelho por aqui.</Aviso>}
+      {mudou && (
+        <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900" role="alert">
+          <p>
+            A assinatura desta loja mudou enquanto você editava (por exemplo, um pagamento registrado a reativou). Salvar vai ser recusado: descarte o que
+            digitou e recarregue os valores atuais antes de alterar.
+          </p>
+          <button type="button" className="btn-secundario" onClick={recomecar}>Descartar e recarregar</button>
+        </div>
+      )}
       <div className="grid gap-3 sm:grid-cols-3">
         <Campo rotulo="Plano">
           <select className="campo" aria-label="Plano" value={f.planId} onChange={setPlano}>
@@ -189,7 +216,7 @@ function SubscriptionForm({ client, detail, plans, onSaved }: { client: AdminCli
       <Erro>{erro}</Erro>
       <div className="flex gap-2">
         <button type="submit" className="btn-primario" disabled={enviando}>{enviando ? 'Salvando…' : 'Salvar'}</button>
-        {s && <button type="button" className="btn-secundario" onClick={() => { setF(initial()); setAberto(false); }}>Cancelar</button>}
+        {s && <button type="button" className="btn-secundario" onClick={() => { recomecar(); setAberto(false); }}>Cancelar</button>}
       </div>
     </form>
   );
@@ -204,10 +231,11 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
   const pronta = s.device_status === 'READY';
 
   async function run(action: 'create' | 'reset_password') {
+    // Desistiu da troca: a senha que está na tela (mostrada uma vez só) fica.
+    if (action === 'reset_password' && !window.confirm('Trocar a senha do aparelho? O aparelho da loja vai precisar entrar de novo em Retaguarda › Nuvem com a senha nova.')) return;
     // A senha de antes some já: nunca fica ao lado de um erro novo.
     setRes(null);
     setErro(null);
-    if (action === 'reset_password' && !window.confirm('Trocar a senha do aparelho? O aparelho da loja vai precisar entrar de novo em Retaguarda › Nuvem com a senha nova.')) return;
     setEnviando(true);
     try {
       const r = await client.deviceAccount(detail.tenant_id, action, action === 'create' ? email : undefined);
@@ -215,6 +243,8 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
       onChanged();
     } catch (e) {
       setErro(errorText(e));
+      // Relê a loja: os botões passam a refletir o estado real (ex.: 409 "já tem conta").
+      onChanged();
     } finally {
       setEnviando(false);
     }

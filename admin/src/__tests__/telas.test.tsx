@@ -12,6 +12,7 @@ import StoreDetail from '../components/StoreDetail';
 import NewStoreForm from '../components/NewStoreForm';
 import Login from '../components/Login';
 import Overview from '../components/Overview';
+import Charges from '../components/Charges';
 import App from '../App';
 
 afterEach(() => {
@@ -127,6 +128,115 @@ describe('detalhe da loja', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it('salvar assinatura manda o updated_at de quando a edição começou (null sem assinatura)', async () => {
+    const save = vi.fn(async (_t: string, _i: unknown) => SUB);
+    const client = fakeClient({ saveSubscription: save, store: async () => detail({ subscription: { ...SUB, updated_at: '2026-11-14T10:00:00Z' } }) });
+    render(<StoreDetail client={client} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    fireEvent.click(await screen.findByText('Alterar'));
+    fireEvent.change(input('Motivo'), { target: { value: 'troca' } });
+    fireEvent.click(screen.getByText('Salvar'));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    expect(save.mock.calls[0]![1]).toMatchObject({ expectedUpdatedAt: '2026-11-14T10:00:00Z', reason: 'troca' });
+    cleanup();
+
+    const save2 = vi.fn(async (_t: string, _i: unknown) => SUB);
+    render(<StoreDetail client={fakeClient({ saveSubscription: save2, store: async () => detail({ subscription: null, charges: [] }) })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    await screen.findByText('Cadastrar assinatura');
+    fireEvent.change(input('WhatsApp'), { target: { value: '(55) 99653-8255' } });
+    fireEvent.change(input('Motivo'), { target: { value: 'nova' } });
+    fireEvent.click(screen.getByText('Salvar'));
+    await waitFor(() => expect(save2).toHaveBeenCalledTimes(1));
+    expect(save2.mock.calls[0]![1]).toMatchObject({ expectedUpdatedAt: null });
+  });
+
+  it('assinatura mudou com o formulário aberto: avisa, mostra a recusa do banco e descartar recarrega os valores atuais', async () => {
+    const T1 = '2026-11-14T10:00:00Z';
+    const T2 = '2026-11-14T10:05:00Z';
+    let atual: Subscription = { ...SUB, status: 'SUSPENDED', updated_at: T1 };
+    const save = vi.fn(async (_t: string, i: { expectedUpdatedAt: string | null }) => {
+      if (i.expectedUpdatedAt !== atual.updated_at) throw new Error('a assinatura mudou enquanto o formulário estava aberto; recarregue a loja');
+      return atual;
+    });
+    const client = fakeClient({
+      saveSubscription: save,
+      store: async () => detail({ subscription: atual }),
+      deviceAccount: async () => ({ email: 'e', password: 'p1', user_id: 'u' }),
+    });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<StoreDetail client={client} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    fireEvent.click(await screen.findByText('Alterar'));
+    fireEvent.change(input('WhatsApp'), { target: { value: '(11) 3333-4444' } });
+    fireEvent.change(input('Motivo'), { target: { value: 'troca' } });
+    expect(screen.queryByText(/mudou enquanto você editava/)).toBeNull();
+
+    // Um pagamento reativou a loja; outra ação da tela recarrega a loja.
+    atual = { ...SUB, status: 'ACTIVE', contact_phone: '55996538255', updated_at: T2 };
+    fireEvent.click(screen.getByText('Trocar senha'));
+    expect(await screen.findByText(/mudou enquanto você editava/)).toBeTruthy();
+    expect(input('WhatsApp').value).toBe('(11) 3333-4444');
+
+    fireEvent.click(screen.getByText('Salvar'));
+    expect(await screen.findByText(/a assinatura mudou enquanto o formulário estava aberto/)).toBeTruthy();
+    expect(save.mock.calls[0]![1]).toMatchObject({ expectedUpdatedAt: T1 });
+
+    fireEvent.click(screen.getByText('Descartar e recarregar'));
+    expect(screen.queryByText(/mudou enquanto você editava/)).toBeNull();
+    expect(screen.queryByText(/a assinatura mudou enquanto o formulário estava aberto/)).toBeNull();
+    expect(input('WhatsApp').value).toBe('55996538255');
+    fireEvent.change(input('Motivo'), { target: { value: 'troca' } });
+    fireEvent.click(screen.getByText('Salvar'));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    expect(save.mock.calls[1]![1]).toMatchObject({ expectedUpdatedAt: T2 });
+  });
+
+  it('recusa do banco sem a tela saber da mudança: relê a loja e o aviso aparece', async () => {
+    let atual: Subscription = { ...SUB, updated_at: 'T1' };
+    const save = vi.fn(async () => {
+      atual = { ...SUB, updated_at: 'T2' };
+      throw new Error('a assinatura mudou enquanto o formulário estava aberto');
+    });
+    render(<StoreDetail client={fakeClient({ saveSubscription: save, store: async () => detail({ subscription: atual }) })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    fireEvent.click(await screen.findByText('Alterar'));
+    fireEvent.change(input('Motivo'), { target: { value: 'troca' } });
+    fireEvent.click(screen.getByText('Salvar'));
+    expect(await screen.findByText(/a assinatura mudou enquanto o formulário estava aberto/)).toBeTruthy();
+    expect(await screen.findByText('Descartar e recarregar')).toBeTruthy();
+    expect(input('Motivo').value).toBe('troca');
+  });
+
+  it('conta do aparelho: desistir da troca de senha não apaga a senha que está na tela', async () => {
+    const reset = vi.fn(async () => ({ email: 'e', password: 'senha-1', user_id: 'u' }));
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<StoreDetail client={fakeClient({ deviceAccount: reset })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    fireEvent.click(await screen.findByText('Trocar senha'));
+    await screen.findByText('senha-1');
+    confirm.mockReturnValue(false);
+    fireEvent.click(screen.getByText('Trocar senha'));
+    expect(screen.getByText('senha-1')).toBeTruthy();
+    expect(reset).toHaveBeenCalledTimes(1);
+  });
+
+  it('conta do aparelho: erro relê a loja e os botões mostram o estado real', async () => {
+    let lojas = 0;
+    const store = async () => {
+      lojas++;
+      return detail({ subscription: { ...SUB, device_status: lojas === 1 ? 'PENDING' : 'READY' } });
+    };
+    const create = vi.fn(async () => {
+      throw new Error('esta loja já tem conta do aparelho: use Trocar senha');
+    });
+    render(<StoreDetail client={fakeClient({ store, deviceAccount: create })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    fireEvent.click(await screen.findByText('Criar conta do aparelho'));
+    expect(await screen.findByText(/já tem conta do aparelho/)).toBeTruthy();
+    expect(await screen.findByText('Trocar senha')).toBeTruthy();
+    expect(screen.queryByText('Criar conta do aparelho')).toBeNull();
+  });
+
+  it('erro ao carregar os planos aparece na tela', async () => {
+    render(<StoreDetail client={fakeClient({ plans: async () => Promise.reject(new Error('planos fora do ar')) })} tenantId="t1" today="2026-11-14" onBack={() => {}} />);
+    expect(await screen.findByText(/planos fora do ar/)).toBeTruthy();
+  });
+
   it('cancelar cobrança: botão travado enquanto a chamada roda', async () => {
     let fim: () => void = () => {};
     const cancel = vi.fn(() => new Promise<void>((r) => (fim = r)));
@@ -191,6 +301,28 @@ describe('login e visão geral', () => {
     });
     render(<Overview client={fakeClient({ overview })} today="2026-11-14" irPara={() => {}} />);
     expect(await screen.findByText('3 com teste vencido · 1 terminam em até 7 dias')).toBeTruthy();
+  });
+
+  it('visão geral: "A receber" diz que inclui as vencidas', async () => {
+    const overview = async () => ({
+      today: '2026-11-14', stores: { trial: 0, active: 1, suspended: 0, cancelled: 0, without_subscription: 0 }, mrr: 0, open_amount: 300, open_count: 2,
+      overdue_amount: 100, overdue_count: 1, received_this_month: 0, trials_ending_7d: 0, trials_expired: 0,
+    });
+    render(<Overview client={fakeClient({ overview })} today="2026-11-14" irPara={() => {}} />);
+    expect(await screen.findByText('2 cobrança(s) em aberto, vencidas incluídas')).toBeTruthy();
+    expect(screen.getByText(/"A receber" soma todas as cobranças em aberto, vencidas incluídas/)).toBeTruthy();
+    expect(screen.queryByText(/Cobrança que ainda vai vencer conta em "A receber"/)).toBeNull();
+  });
+});
+
+describe('cobranças do dia', () => {
+  it('gerar o mês avisa que também cobra as lojas em teste que terminaram antes do mês', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const gen = vi.fn(async () => 0);
+    render(<Charges client={fakeClient({ chargesDue: async () => [], generateMonth: gen })} today="2026-11-14" onOpenStore={() => {}} />);
+    fireEvent.click(await screen.findByText(/Gerar cobranças de/));
+    expect(confirm.mock.calls[0]![0]).toMatch(/lojas ativas com mensalidade e as em teste que terminaram antes de/);
+    expect(await screen.findByText(/as em teste que terminaram antes de .* já têm/)).toBeTruthy();
   });
 });
 

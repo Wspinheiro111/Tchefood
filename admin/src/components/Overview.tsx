@@ -14,7 +14,7 @@ export default function Overview({ client, today, irPara }: { client: AdminClien
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Numero titulo="Receita mensal (lojas ativas)" valor={money(data.mrr)} destaque="verde" />
         <Numero titulo="Recebido neste mês" valor={money(data.received_this_month)} />
-        <Numero titulo="A receber" valor={money(data.open_amount)} detalhe={`${data.open_count} cobrança(s) em aberto`} />
+        <Numero titulo="A receber" valor={money(data.open_amount)} detalhe={`${data.open_count} cobrança(s) em aberto, vencidas incluídas`} />
         <Numero
           titulo="Vencidas"
           valor={money(data.overdue_amount)}
@@ -43,7 +43,7 @@ export default function Overview({ client, today, irPara }: { client: AdminClien
         </button>
       </div>
       <p className="text-xs text-slate-500">
-        Vencida = cobrança em aberto com vencimento antes de hoje. Cobrança que ainda vai vencer conta em "A receber". O painel ainda não bloqueia loja em atraso.
+        Vencida = cobrança em aberto com vencimento antes de hoje. "A receber" soma todas as cobranças em aberto, vencidas incluídas. O painel ainda não bloqueia loja em atraso.
       </p>
     </div>
   );

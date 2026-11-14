@@ -87,7 +87,7 @@ export function randomPasswordFrom(getRandomValues: (a: Uint8Array) => Uint8Arra
   return out;
 }
 
-/** A conta existente só é usada se for desta loja (ou ainda sem loja) e com o e-mail reservado. */
+/** A conta existente só é usada se for desta loja (tenant_id igual) e com o e-mail reservado. */
 function sameAccount(user: AuthUser, tenantId: string, email: string): boolean {
   const meta = user.app_metadata ?? {};
   const tenant = typeof meta.tenant_id === 'string' && meta.tenant_id ? meta.tenant_id : null;
@@ -116,9 +116,17 @@ export async function handleDeviceAccount(input: unknown, deps: DeviceAccountDep
 
   // 2) A vez da loja; qualquer saída sem sucesso devolve a vez.
   const opId = deps.newOpId();
-  const lock = await deps.rpc('tchefood_admin_device_lock', { p_tenant: tenantId, p_op: opId });
-  if (lock.error) return rpcFailure(lock.error);
   const unlock = () => deps.rpc('tchefood_admin_device_unlock', { p_tenant: tenantId, p_op: opId }).catch(() => undefined);
+  const lock = await deps.rpc('tchefood_admin_device_lock', { p_tenant: tenantId, p_op: opId });
+  if (lock.error) {
+    const failure = rpcFailure(lock.error);
+    // O erro pode ter chegado depois de o banco gravar a vez (ex.: a rede caiu na volta): sem devolver,
+    // a loja ficaria travada até a vez vencer. O unlock só solta a vez desta operação (p_op), então é
+    // inofensivo se ela não foi gravada. Não tenta quando a vez é de outra operação (55P03) nem com
+    // sessão vencida ou sem permissão, em que o banco recusou antes de gravar.
+    if (lock.error.code !== '55P03' && failure.status !== 401 && failure.status !== 403) await unlock();
+    return failure;
+  }
   let result: HandlerResult;
   try {
     result = await withLock(tenantId, action, email, detail.cnpj ?? '', opId, deps);
