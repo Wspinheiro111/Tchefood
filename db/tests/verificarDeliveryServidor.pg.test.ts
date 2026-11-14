@@ -32,9 +32,11 @@ function sql(q: string): string {
 
 type Linha = { item: string; esperado: string; encontrado: string; ok: string };
 
-// Roda o script como o SQL Editor rodaria e devolve as linhas (separador fora do texto do script).
-function conferir(): Linha[] {
-  const r = psql(target!, `\\pset fieldsep '\\x1f'\n${SCRIPT}`, DB);
+// Roda o script como o SQL Editor rodaria e devolve as linhas (separador fora do texto do script). Com `antes`, roda
+// esse SQL e o script numa transação desfeita no fim (para estragar algo que não dá para desfazer com um comando).
+function conferir(antes?: string): Linha[] {
+  const q = `\\pset fieldsep '\\x1f'\n${SCRIPT}`;
+  const r = psql(target!, antes ? `BEGIN;\n${antes}\n${q}\nROLLBACK;` : q, DB);
   if (!r.ok) throw new Error(r.message ?? 'script');
   return r.out
     .split('\n')
@@ -68,6 +70,9 @@ const opcional = (l: Linha) => l.item.includes('(rodada 3)');
       'CHECK delivery_integrations_merchant_format',
       'trigger trg_audit_logs_guard em audit_logs',
       'trigger trg_audit_logs_immutable em audit_logs',
+      'anon lê staff_users.pin_code',
+      'authenticated lê staff_users.pin_code',
+      'tchefood_delivery_authorize devolve lastOutcome no reenvio',
     ]));
   });
 
@@ -103,5 +108,38 @@ const opcional = (l: Linha) => l.item.includes('(rodada 3)');
            ALTER TABLE delivery_events ENABLE ROW LEVEL SECURITY;
            ALTER TABLE audit_logs ENABLE TRIGGER trg_audit_logs_immutable;`);
     }
+  });
+
+  it('trigger em modo replica (não roda nas sessões normais) faz a linha do trigger falhar', () => {
+    sql('ALTER TABLE audit_logs ENABLE REPLICA TRIGGER trg_audit_logs_guard;');
+    try {
+      const falhas = conferir().filter((l) => l.ok === 'NÃO');
+      expect(falhas).toEqual([expect.objectContaining({
+        item: 'trigger trg_audit_logs_guard em audit_logs',
+        encontrado: expect.stringContaining('só em réplica'),
+      })]);
+    } finally {
+      sql('ALTER TABLE audit_logs ENABLE TRIGGER trg_audit_logs_guard;');
+    }
+  });
+
+  it('GRANT SELECT em staff_users.pin_code para o app (anon ou authenticated) faz a linha falhar', () => {
+    sql('GRANT SELECT (pin_code) ON staff_users TO authenticated; GRANT SELECT ON staff_users TO anon;');
+    try {
+      const falhas = conferir().filter((l) => l.ok === 'NÃO').map((l) => l.item);
+      expect(falhas.sort()).toEqual(['anon lê staff_users.pin_code', 'authenticated lê staff_users.pin_code']);
+    } finally {
+      sql('REVOKE SELECT (pin_code) ON staff_users FROM authenticated; REVOKE SELECT ON staff_users FROM anon;');
+    }
+  });
+
+  it('tchefood_delivery_authorize antiga (mesma assinatura, sem lastOutcome) faz a linha falhar', () => {
+    const antiga = `CREATE OR REPLACE FUNCTION tchefood_delivery_authorize(
+        p_channel delivery_channel, p_action VARCHAR, p_external_order_id VARCHAR, p_merchant_external_id VARCHAR,
+        p_manager_pin VARCHAR, p_performed_by UUID, p_reason TEXT, p_request_id UUID, p_details JSONB
+    ) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+    BEGIN RETURN jsonb_build_object('status', 'OK', 'repeated', TRUE); END $f$;`;
+    const falhas = conferir(antiga).filter((l) => l.ok === 'NÃO');
+    expect(falhas).toEqual([expect.objectContaining({ item: 'tchefood_delivery_authorize devolve lastOutcome no reenvio' })]);
   });
 });

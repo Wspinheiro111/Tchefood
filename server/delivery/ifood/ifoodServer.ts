@@ -348,7 +348,9 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
       if (decision.lastOutcome === "failed") {
         return { status: 409, body: { error: "Nada foi enviado ao iFood nesta tentativa; faça uma nova tentativa.", code: "RETRY_WITH_NEW_ID" } };
       }
-      return { status: 409, body: { error: "Esta tentativa já foi enviada ao iFood (ou está sendo); confira o pedido ou a loja antes de repetir.", code: "ALREADY_SUBMITTED" } };
+      // Sem resultado gravado (lastOutcome null) não dá para saber se chegou ao iFood: a autorização pode ter gravado e
+      // só a resposta do banco se perdido. O texto não afirma que foi enviado, nem convida a repetir com o mesmo id.
+      return { status: 409, body: { error: "Esta tentativa já foi registrada: pode estar em andamento ou não ter chegado ao iFood. Confira o pedido ou a loja no Portal do Parceiro antes de tentar de novo, com uma nova tentativa.", code: "ALREADY_SUBMITTED" } };
     }
     const record = (outcome: ManagerOutcome, detail: string) =>
       options.approval.recordResult(decision.auditId, outcome, detail).catch((error: unknown) => {

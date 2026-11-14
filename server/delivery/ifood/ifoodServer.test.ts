@@ -432,6 +432,23 @@ describe("servidor do iFood: alçada de gerente", () => {
     expect(manager.results).toHaveLength(2);
   });
 
+  it("reenvio sem resultado gravado (resposta do banco perdida): não afirma que foi enviado ao iFood", async () => {
+    const { sandbox, poller, call, manager } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    // A autorização gravou, mas a resposta do banco não voltou: o app reenviou com o mesmo id e nada foi ao iFood.
+    manager.approval.authorize = async () => ({ status: "OK", auditId: "audit-perdida", repeated: true, lastOutcome: null });
+    const spy = vi.spyOn(IfoodMerchantApi.prototype, "requestCancellation");
+    const again = await call("POST", `/ifood/orders/${id}/cancellation`, { code: "503", description: "Item indisponível", authorization: auth() });
+    expect(again).toMatchObject({ status: 409, body: { code: "ALREADY_SUBMITTED" } });
+    const error = (again.body as { error: string }).error;
+    expect(error).not.toMatch(/já foi enviada/);
+    expect(error).toMatch(/registrada/);
+    expect(error).toMatch(/Portal do Parceiro/);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
   it("banco fora do ar antes do iFood: resultado 'failed' e o reenvio pede nova tentativa (nada foi enviado)", async () => {
     const { sandbox, poller, call, manager, repository } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });

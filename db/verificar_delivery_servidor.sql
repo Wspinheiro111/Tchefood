@@ -109,6 +109,11 @@ checks (grupo, ordem, item, esperado, encontrado, ok, opcional) AS (
            NOT EXISTS (SELECT 1 FROM todas
                         WHERE NOT EXISTS (SELECT 1 FROM unnest(COALESCE(proconfig, '{}')) c WHERE c LIKE 'search\_path=%')), FALSE
     UNION ALL
+    SELECT 3, 4, 'tchefood_delivery_authorize devolve lastOutcome no reenvio', 'sim',
+           CASE WHEN p.prosrc LIKE '%lastOutcome%' THEN 'sim' ELSE 'não (versão antiga, sem lastOutcome)' END,
+           p.prosrc LIKE '%lastOutcome%', FALSE
+      FROM f JOIN pg_proc p ON p.oid = f.oid WHERE f.ordem = 10
+    UNION ALL
     -- 4) O app só lê as tabelas delivery_*. has_any_column_privilege pega também GRANT por coluna.
     SELECT 4, ordem * 10 + 1, 'anon em ' || tab, 'nenhum privilégio',
            COALESCE(NULLIF(concat_ws(', ',
@@ -191,7 +196,8 @@ checks (grupo, ordem, item, esperado, encontrado, ok, opcional) AS (
                     WHERE c.conname = 'delivery_orders_version_positive' AND c.conrelid = to_regclass('public.delivery_orders')
                       AND c.contype = 'c' AND pg_get_constraintdef(c.oid) LIKE '%version >= 1%'), FALSE
     UNION ALL
-    -- 8) audit_logs: guarda de inserção (bloqueia DELIVERY_* vindos do app) e imutabilidade.
+    -- 8) audit_logs: guarda de inserção (bloqueia DELIVERY_* vindos do app) e imutabilidade. "Ligado" é tgenabled 'O'
+    --    (origem) ou 'A' (sempre); 'R' (ENABLE REPLICA TRIGGER) só roda em réplica, não nas sessões do app.
     SELECT 8, trg.ordem, 'trigger ' || trg.nome || ' em audit_logs',
            trg.quando || ', ligado, ' || trg.funcao || '()',
            COALESCE((SELECT CASE WHEN (g.tgtype & 2) > 0 THEN 'BEFORE' ELSE 'AFTER' END
@@ -199,13 +205,15 @@ checks (grupo, ordem, item, esperado, encontrado, ok, opcional) AS (
                             || CASE WHEN (g.tgtype & 16) > 0 THEN CASE WHEN (g.tgtype & 4) > 0 THEN ' OR' ELSE '' END || ' UPDATE' ELSE '' END
                             || CASE WHEN (g.tgtype & 8) > 0 THEN CASE WHEN (g.tgtype & 20) > 0 THEN ' OR' ELSE '' END || ' DELETE' ELSE '' END
                             || CASE WHEN (g.tgtype & 1) > 0 THEN ' FOR EACH ROW' ELSE ' FOR EACH STATEMENT' END
-                            || CASE WHEN g.tgenabled = 'D' THEN ', DESLIGADO, ' ELSE ', ligado, ' END
+                            || CASE WHEN g.tgenabled IN ('O', 'A') THEN ', ligado, '
+                                    WHEN g.tgenabled = 'R' THEN ', só em réplica (não roda nas sessões normais), '
+                                    ELSE ', DESLIGADO, ' END
                             || g.tgfoid::regproc::text || '()'
                        FROM pg_trigger g
                       WHERE g.tgrelid = to_regclass('public.audit_logs') AND g.tgname = trg.nome AND NOT g.tgisinternal), 'não existe'),
            EXISTS (SELECT 1 FROM pg_trigger g JOIN pg_proc p ON p.oid = g.tgfoid
                     WHERE g.tgrelid = to_regclass('public.audit_logs') AND g.tgname = trg.nome AND NOT g.tgisinternal
-                      AND g.tgenabled <> 'D' AND p.proname = trg.funcao
+                      AND g.tgenabled IN ('O', 'A') AND p.proname = trg.funcao
                       AND (g.tgtype & 1) > 0 AND (g.tgtype & 2) > 0
                       AND CASE trg.ordem WHEN 1 THEN (g.tgtype & 4) > 0
                                          ELSE (g.tgtype & 8) > 0 AND (g.tgtype & 16) > 0 END),
@@ -222,6 +230,15 @@ checks (grupo, ordem, item, esperado, encontrado, ok, opcional) AS (
            FALSE
       FROM (SELECT to_regprocedure('public.tchefood_guard_audit_insert()') AS oid) g
       LEFT JOIN pg_proc p ON p.oid = g.oid
+    UNION ALL
+    -- 9) O aparelho não lê o PIN da equipe (o PIN de gerente autoriza as ações do iFood): staff_users.pin_code
+    --    fica fora do GRANT SELECT por coluna de anon e authenticated.
+    SELECT 9, r.ordem, r.papel || ' lê staff_users.pin_code', 'não',
+           CASE WHEN s.oid IS NULL THEN 'tabela staff_users não existe'
+                WHEN has_column_privilege(r.papel, s.oid, 'pin_code', 'SELECT') THEN 'sim' ELSE 'não' END,
+           s.oid IS NOT NULL AND NOT has_column_privilege(r.papel, s.oid, 'pin_code', 'SELECT'), FALSE
+      FROM (VALUES (1, 'anon'), (2, 'authenticated')) r (ordem, papel)
+     CROSS JOIN (SELECT to_regclass('public.staff_users') AS oid) s
 )
 SELECT item, esperado, encontrado,
        CASE WHEN COALESCE(ok, FALSE) THEN 'sim' WHEN opcional THEN 'ainda não (opcional)' ELSE 'NÃO' END AS ok

@@ -34,7 +34,10 @@ UUID gerado pelo app por tentativa e motivo com 5 caracteres ou mais). O servido
 iFood; a autorização e o resultado da chamada ficam em `audit_logs`. Campos faltando: 400. PIN errado ou
 bloqueado: 403 com `code` (`PIN_FAILED`, `PIN_LOCKED`, `DENIED`); mesmo `requestId` reaproveitado em outra ação, alvo, pessoa, motivo
 ou conteúdo (código do cancelamento, resposta da negociação, duração da pausa): 409 `CONFLICT`. Reenvio idêntico (resposta
-perdida, toque repetido): 409 `ALREADY_SUBMITTED`, sem chamar o iFood de novo; a tela relê o pedido/loja. Se a
+perdida, toque repetido): 409 `ALREADY_SUBMITTED`, sem chamar o iFood de novo; a tela relê o pedido/loja. O texto não
+afirma que foi enviado (a autorização pode ter gravado e só a resposta do banco se perdido): diz que a tentativa já foi
+registrada, pode estar em andamento ou não ter chegado ao iFood, e pede conferir no Portal do Parceiro antes de tentar
+de novo com uma nova tentativa. Se a
 tentativa com esse id falhou antes de chegar ao iFood (banco fora do ar na reserva) ou o iFood recusou: 409
 `RETRY_WITH_NEW_ID` (nada foi enviado; a tela gera outro `requestId` e pede o PIN de novo). O que o gerente
 aprovou fica em `audit_logs.metadata.details`.
