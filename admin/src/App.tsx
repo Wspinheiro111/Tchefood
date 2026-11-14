@@ -112,13 +112,13 @@ function Painel({ client, email, onLogout }: { client: AdminClient; email: strin
         ) : !me.data ? (
           <p className="text-sm text-slate-500">Carregando…</p>
         ) : aba === 'visao' ? (
-          <Overview client={client} onOpenStore={abrirLoja} irPara={setAba} />
+          <Overview client={client} today={me.data.today} irPara={setAba} />
         ) : aba === 'cobrancas' ? (
           <Charges client={client} today={me.data.today} onOpenStore={abrirLoja} />
         ) : loja ? (
           <StoreDetail client={client} tenantId={loja} today={me.data.today} onBack={() => setLoja(null)} />
         ) : (
-          <Stores client={client} onOpenStore={setLoja} />
+          <Stores client={client} today={me.data.today} onOpenStore={setLoja} />
         )}
       </main>
     </div>

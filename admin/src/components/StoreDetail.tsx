@@ -8,7 +8,7 @@ import {
 import { Aviso, Campo, Erro, Numero, Selo, errorText, useLoad } from './ui';
 
 export default function StoreDetail({ client, tenantId, today, onBack }: { client: AdminClient; tenantId: string; today: string; onBack: () => void }) {
-  const { data, error, reload } = useLoad<Detail>(() => client.store(tenantId), [client, tenantId]);
+  const { data, error, reload } = useLoad<Detail>(() => client.store(tenantId), [client, tenantId, today]);
   const plans = useLoad<Plan[]>(() => client.plans(), [client]);
 
   return (

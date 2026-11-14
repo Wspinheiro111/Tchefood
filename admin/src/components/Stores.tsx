@@ -7,8 +7,8 @@ import { Erro, Selo, useLoad } from './ui';
 
 type Filtro = 'todas' | 'TRIAL' | 'ACTIVE' | 'SUSPENDED' | 'CANCELLED' | 'sem' | 'vencidas';
 
-export default function Stores({ client, onOpenStore }: { client: AdminClient; onOpenStore: (id: string) => void }) {
-  const { data, error, reload } = useLoad<StoreRow[]>(() => client.stores(), [client]);
+export default function Stores({ client, today, onOpenStore }: { client: AdminClient; today: string; onOpenStore: (id: string) => void }) {
+  const { data, error, reload } = useLoad<StoreRow[]>(() => client.stores(), [client, today]);
   const [filtro, setFiltro] = useState<Filtro>('todas');
   const [busca, setBusca] = useState('');
   const [criando, setCriando] = useState(false);

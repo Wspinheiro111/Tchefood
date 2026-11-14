@@ -2,8 +2,9 @@ import type { AdminClient, Overview as OverviewData } from '../lib/api';
 import { dateBr, money } from '../lib/format';
 import { Erro, Numero, useLoad } from './ui';
 
-export default function Overview({ client, irPara }: { client: AdminClient; onOpenStore: (id: string) => void; irPara: (aba: 'lojas' | 'cobrancas') => void }) {
-  const { data, error } = useLoad<OverviewData>(() => client.overview(), [client]);
+export default function Overview({ client, today, irPara }: { client: AdminClient; today: string; irPara: (aba: 'lojas' | 'cobrancas') => void }) {
+  // Valores com a data do servidor: relê quando o dia muda.
+  const { data, error } = useLoad<OverviewData>(() => client.overview(), [client, today]);
   if (error) return <Erro>{error}</Erro>;
   if (!data) return <p className="text-sm text-slate-500">Carregando…</p>;
   const s = data.stores;
