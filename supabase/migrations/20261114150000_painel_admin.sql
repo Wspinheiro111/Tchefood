@@ -653,14 +653,23 @@ $$;
 
 -- Reserva o id e o e-mail da conta do aparelho. Repetir devolve a mesma reserva (a função
 -- cria a conta no Auth com este id; se cair no meio, a próxima chamada continua dela).
-CREATE OR REPLACE FUNCTION tchefood_admin_reserve_device(p_tenant UUID, p_email TEXT) RETURNS JSONB
+-- p_replace_user_id troca uma reserva PENDING por outra (id e e-mail novos): a função
+-- admin-device-account só manda depois de conferir que a conta com o id reservado não
+-- existe no Auth (ex.: o e-mail já era de outra conta e a criação foi recusada). Só troca
+-- se a reserva ainda for a mesma e ainda estiver PENDING; conta pronta nunca é trocada.
+DROP FUNCTION IF EXISTS tchefood_admin_reserve_device(UUID, TEXT);
+CREATE OR REPLACE FUNCTION tchefood_admin_reserve_device(p_tenant UUID, p_email TEXT, p_replace_user_id UUID DEFAULT NULL) RETURNS JSONB
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE v_admin platform_admins%ROWTYPE; v_s store_subscriptions%ROWTYPE; v_email TEXT; v_id UUID;
 BEGIN
     v_admin := tchefood_admin_require();
     SELECT * INTO v_s FROM store_subscriptions WHERE tenant_id = p_tenant FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'TCHEFOOD_ADMIN: crie a assinatura da loja antes da conta do aparelho'; END IF;
-    IF v_s.device_user_id IS NOT NULL THEN
+    IF p_replace_user_id IS NOT NULL THEN
+        IF v_s.device_status IS DISTINCT FROM 'PENDING' OR v_s.device_user_id IS DISTINCT FROM p_replace_user_id THEN
+            RAISE EXCEPTION 'TCHEFOOD_ADMIN: a reserva da conta do aparelho mudou; abra a loja de novo';
+        END IF;
+    ELSIF v_s.device_user_id IS NOT NULL THEN
         RETURN jsonb_build_object('user_id', v_s.device_user_id, 'email', v_s.device_email, 'status', v_s.device_status);
     END IF;
     v_email := tchefood_admin_check_email(p_email);
@@ -672,7 +681,8 @@ BEGIN
     UPDATE store_subscriptions SET device_user_id = v_id, device_email = v_email, device_status = 'PENDING', updated_at = NOW()
      WHERE tenant_id = p_tenant;
     PERFORM tchefood_admin_log(v_admin.user_id, p_tenant, NULL, 'DEVICE_ACCOUNT_RESERVED', NULL,
-        jsonb_build_object('user_id', v_id, 'email', v_email));
+        jsonb_build_object('user_id', v_id, 'email', v_email,
+                           'replaced_user_id', p_replace_user_id, 'replaced_email', CASE WHEN p_replace_user_id IS NOT NULL THEN v_s.device_email END));
     RETURN jsonb_build_object('user_id', v_id, 'email', v_email, 'status', 'PENDING');
 EXCEPTION WHEN unique_violation THEN
     RAISE EXCEPTION 'TCHEFOOD_ADMIN: este e-mail já é de outra loja';
@@ -728,7 +738,7 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_admin_generate_month(DATE) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_record_payment(UUID, NUMERIC, DATE, TEXT, TEXT) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_cancel_charge(UUID, TEXT) FROM PUBLIC, anon;
-        REVOKE ALL ON FUNCTION tchefood_admin_reserve_device(UUID, TEXT) FROM PUBLIC, anon;
+        REVOKE ALL ON FUNCTION tchefood_admin_reserve_device(UUID, TEXT, UUID) FROM PUBLIC, anon;
         REVOKE ALL ON FUNCTION tchefood_admin_confirm_device(UUID, UUID, TEXT) FROM PUBLIC, anon;
         GRANT EXECUTE ON FUNCTION tchefood_admin_me() TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_plans() TO authenticated;
@@ -742,7 +752,7 @@ BEGIN
         GRANT EXECUTE ON FUNCTION tchefood_admin_generate_month(DATE) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_record_payment(UUID, NUMERIC, DATE, TEXT, TEXT) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_cancel_charge(UUID, TEXT) TO authenticated;
-        GRANT EXECUTE ON FUNCTION tchefood_admin_reserve_device(UUID, TEXT) TO authenticated;
+        GRANT EXECUTE ON FUNCTION tchefood_admin_reserve_device(UUID, TEXT, UUID) TO authenticated;
         GRANT EXECUTE ON FUNCTION tchefood_admin_confirm_device(UUID, UUID, TEXT) TO authenticated;
     END IF;
 END $$;

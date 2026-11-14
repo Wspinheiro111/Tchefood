@@ -256,9 +256,22 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     expect(r2.body.user_id).toBe(r1.body.user_id);
     // Outra loja não pega o mesmo e-mail.
     expect((await call('tchefood_admin_reserve_device', { p_tenant: HAND_TENANT, p_email: 'loja-12345678000195@aparelho.tchefood.com.br' })).body.message).toMatch(/já é de outra loja/);
+    // Troca da reserva pendente (e-mail recusado pelo Auth): só com o id reservado.
+    expect((await call('tchefood_admin_reserve_device', { p_tenant: active, p_email: 'novo@x.com', p_replace_user_id: OTHER_USER })).body.message).toMatch(/reserva da conta do aparelho mudou/);
+    const r3 = await call('tchefood_admin_reserve_device', { p_tenant: active, p_email: 'novo@x.com', p_replace_user_id: r1.body.user_id });
+    expect(r3.body).toMatchObject({ email: 'novo@x.com', status: 'PENDING' });
+    expect(r3.body.user_id).not.toBe(r1.body.user_id);
+    expect(sql(`SELECT details->>'replaced_email' FROM platform_admin_audit WHERE action = 'DEVICE_ACCOUNT_RESERVED' ORDER BY created_at DESC LIMIT 1`)).toBe('loja-12345678000195@aparelho.tchefood.com.br');
+    // O e-mail antigo fica livre para outra loja.
+    expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: r1.body.user_id, p_action: 'CREATED' })).body.message).toMatch(/não confere/);
+    const r4 = await call('tchefood_admin_reserve_device', { p_tenant: active, p_email: 'Loja-12345678000195@aparelho.tchefood.com.br', p_replace_user_id: r3.body.user_id });
+    expect(r4.body.email).toBe('loja-12345678000195@aparelho.tchefood.com.br');
+    r1.body.user_id = r4.body.user_id;
     expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: OTHER_USER, p_action: 'CREATED' })).body.message).toMatch(/não confere/);
     expect((await call('tchefood_admin_confirm_device', { p_tenant: active, p_user_id: r1.body.user_id, p_action: 'CREATED' })).status).toBe(200);
     expect((await admin().store(active)).subscription).toMatchObject({ device_status: 'READY', device_email: 'loja-12345678000195@aparelho.tchefood.com.br' });
+    // Conta pronta nunca é trocada.
+    expect((await call('tchefood_admin_reserve_device', { p_tenant: active, p_email: 'x@y.com', p_replace_user_id: r1.body.user_id })).body.message).toMatch(/reserva da conta do aparelho mudou/);
     // O token do aparelho não reserva conta.
     const dev = postgrestFetch(target!, DB, { role: 'authenticated', sub: 'device', tenant_id: active });
     const r = await dev('http://cloud.test/rest/v1/rpc/tchefood_admin_reserve_device', { method: 'POST', headers: {}, body: JSON.stringify({ p_tenant: active, p_email: 'a@b.com' }) });

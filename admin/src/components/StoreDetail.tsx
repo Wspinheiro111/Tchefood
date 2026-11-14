@@ -187,7 +187,7 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
     if (action === 'reset_password' && !window.confirm('Trocar a senha do aparelho? O aparelho da loja vai precisar entrar de novo em Retaguarda › Nuvem com a senha nova.')) return;
     setEnviando(true);
     try {
-      setRes(await client.deviceAccount(detail.tenant_id, action, action === 'create' && !s.device_email ? email : undefined));
+      setRes(await client.deviceAccount(detail.tenant_id, action, action === 'create' ? email : undefined));
       onChanged();
     } catch (e) {
       setErro(errorText(e));
@@ -205,8 +205,8 @@ function DeviceAccount({ client, detail, onChanged }: { client: AdminClient; det
           Conta: <strong>{s.device_email}</strong>
         </p>
       ) : (
-        <Campo rotulo="E-mail da conta" dica={s.device_email ? 'Reservado; toque em Criar conta para concluir.' : 'Não precisa receber e-mail; só identifica a loja.'}>
-          <input className="campo" value={email} disabled={!!s.device_email} onChange={(e) => setEmail(e.target.value)} />
+        <Campo rotulo="E-mail da conta" dica={s.device_email ? 'Reservado. Toque em Criar conta para concluir; se o e-mail já existia no Supabase, troque-o aqui.' : 'Não precisa receber e-mail; só identifica a loja.'}>
+          <input className="campo" value={email} onChange={(e) => setEmail(e.target.value)} />
         </Campo>
       )}
       {res && (

@@ -4,6 +4,7 @@ import { handleDeviceAccount, randomPasswordFrom, type AuthUser, type DeviceAcco
 const TENANT = '11111111-1111-4111-8111-111111111111';
 const USER = '33333333-3333-4333-8333-333333333333';
 const EMAIL = 'loja-11444777000161@aparelho.tchefood.com.br';
+const USER2 = '44444444-4444-4444-8444-444444444444';
 
 interface Fake {
   deps: DeviceAccountDeps;
@@ -14,6 +15,7 @@ interface Fake {
 function fake(opts: { deviceStatus?: 'PENDING' | 'READY' | null; storeError?: RpcResult['error']; subscription?: boolean; confirmError?: boolean; createError?: string } = {}): Fake {
   const calls: string[] = [];
   const users = new Map<string, AuthUser & { password?: string }>();
+  let reservation = { user_id: USER, email: EMAIL, status: 'PENDING' };
   const deps: DeviceAccountDeps = {
     rpc: async (fn, args) => {
       calls.push(`${fn} ${JSON.stringify(args)}`);
@@ -21,7 +23,13 @@ function fake(opts: { deviceStatus?: 'PENDING' | 'READY' | null; storeError?: Rp
         if (opts.storeError) return { data: null, error: opts.storeError };
         return { data: { cnpj: '11444777000161', subscription: opts.subscription === false ? null : { device_status: opts.deviceStatus ?? null } }, error: null };
       }
-      if (fn === 'tchefood_admin_reserve_device') return { data: { user_id: USER, email: EMAIL, status: 'PENDING' }, error: null };
+      if (fn === 'tchefood_admin_reserve_device') {
+        if (args.p_replace_user_id) {
+          if (args.p_replace_user_id !== reservation.user_id) return { data: null, error: { message: 'TCHEFOOD_ADMIN: a reserva da conta do aparelho mudou' } };
+          reservation = { user_id: USER2, email: String(args.p_email), status: 'PENDING' };
+        }
+        return { data: reservation, error: null };
+      }
       if (fn === 'tchefood_admin_confirm_device') return opts.confirmError ? { data: null, error: { message: 'x' } } : { data: '', error: null };
       throw new Error(fn);
     },
@@ -134,5 +142,20 @@ describe('admin-device-account', () => {
     expect(pw).toMatch(/^[A-HJ-NP-Za-km-z2-9]+$/);
     // Bytes no fim da faixa (>= 224 com 56 letras) são descartados.
     expect(randomPasswordFrom((a) => a.fill(250).map((_, i) => (i % 2 ? 250 : 0)))).toBe('A'.repeat(20));
+  });
+  it('e-mail já usado no Auth: com outro e-mail, a reserva pendente é trocada e a conta sai com o id novo', async () => {
+    const f = fake({ deviceStatus: 'PENDING' });
+    const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'create', email: 'Flip@Loja.com' }, f.deps);
+    expect(r).toMatchObject({ status: 200, body: { user_id: USER2, email: 'flip@loja.com' } });
+    expect(f.calls).toContain(`tchefood_admin_reserve_device {"p_tenant":"${TENANT}","p_email":"flip@loja.com","p_replace_user_id":"${USER}"}`);
+    expect(f.calls.some((c) => c.startsWith(`createUser ${USER2} flip@loja.com`))).toBe(true);
+  });
+
+  it('reserva pendente cuja conta já existe no Auth não é trocada, mesmo com outro e-mail', async () => {
+    const f = fake({ deviceStatus: 'PENDING' });
+    f.users.set(USER, { id: USER, email: EMAIL, app_metadata: { tenant_id: TENANT } });
+    const r = await handleDeviceAccount({ tenant_id: TENANT, action: 'create', email: 'outro@loja.com' }, f.deps);
+    expect(r).toMatchObject({ status: 200, body: { user_id: USER, email: EMAIL } });
+    expect(f.calls.some((c) => c.includes('p_replace_user_id'))).toBe(false);
   });
 });

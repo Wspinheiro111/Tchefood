@@ -107,17 +107,33 @@ export async function handleDeviceAccount(input: unknown, deps: DeviceAccountDep
     p_email: (typeof email === 'string' ? email.trim() : '') || suggestedDeviceEmail(detail.cnpj ?? ''),
   });
   if (reserve.error) return rpcFailure(reserve.error);
-  const r = (reserve.data ?? {}) as { user_id?: string; email?: string };
+  let r = (reserve.data ?? {}) as { user_id?: string; email?: string; status?: string };
   if (typeof r.user_id !== 'string' || !UUID.test(r.user_id) || typeof r.email !== 'string') return fail(500, 'Reserva da conta inválida.');
-  const userId = r.user_id;
-  const accountEmail = r.email;
 
   // 3) Auth, com a service role.
+  const lookup = async (id: string) => {
+    const res = await deps.auth.getUserById(id);
+    const missing = !res.user && (!res.error || res.error.status === 404 || /not found/i.test(res.error.message));
+    return { user: res.user, failed: !res.user && !missing };
+  };
+  let existing = await lookup(r.user_id);
+  if (existing.failed) return fail(502, 'Não foi possível consultar a conta no Supabase Auth. Tente de novo.');
+
+  // Reserva pendente com outro e-mail (a criação anterior foi recusada, ex.: e-mail já usado
+  // no Auth): troca por uma reserva nova, só se a conta do id reservado não existe no Auth.
+  const wanted = typeof email === 'string' ? email.trim().toLowerCase() : null;
+  if (action === 'create' && r.status === 'PENDING' && wanted && wanted !== r.email.toLowerCase() && !existing.user) {
+    const replaced = await deps.rpc('tchefood_admin_reserve_device', { p_tenant: tenantId, p_email: wanted, p_replace_user_id: r.user_id });
+    if (replaced.error) return rpcFailure(replaced.error);
+    r = (replaced.data ?? {}) as typeof r;
+    if (typeof r.user_id !== 'string' || !UUID.test(r.user_id) || typeof r.email !== 'string') return fail(500, 'Reserva da conta inválida.');
+    existing = await lookup(r.user_id);
+    if (existing.failed) return fail(502, 'Não foi possível consultar a conta no Supabase Auth. Tente de novo.');
+  }
+  const userId = r.user_id;
+  const accountEmail = r.email;
   const password = deps.randomPassword();
   const appMetadata = { tenant_id: tenantId };
-  const existing = await deps.auth.getUserById(userId);
-  const missing = !existing.user && (!existing.error || existing.error.status === 404 || /not found/i.test(existing.error.message));
-  if (!existing.user && !missing) return fail(502, 'Não foi possível consultar a conta no Supabase Auth. Tente de novo.');
 
   if (existing.user) {
     if (!sameAccount(existing.user, tenantId, accountEmail)) return fail(409, 'A conta reservada não confere com esta loja. Nada foi alterado.');
@@ -127,7 +143,7 @@ export async function handleDeviceAccount(input: unknown, deps: DeviceAccountDep
     if (action === 'reset_password') return fail(409, 'A conta do aparelho não existe mais no Supabase Auth. Fale com o suporte.');
     const created = await deps.auth.createUser({ id: userId, email: accountEmail, password, email_confirm: true, app_metadata: appMetadata });
     if (created.error) {
-      if (/already|exists|registered/i.test(created.error.message)) return fail(409, 'Já existe outra conta com este e-mail no Supabase Auth. Use outro e-mail.');
+      if (/already|exists|registered/i.test(created.error.message)) return fail(409, 'Já existe outra conta com este e-mail no Supabase Auth. Digite outro e-mail e toque em "Criar conta do aparelho" de novo.');
       return fail(502, 'Não foi possível criar a conta no Supabase Auth. Tente de novo.');
     }
   }
