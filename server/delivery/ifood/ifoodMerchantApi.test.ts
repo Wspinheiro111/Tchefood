@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { DeliveryMarketplaceError } from "../marketplace";
-import { IfoodMerchantApi, mapIfoodEventCode, mapIfoodOrder, parseIfoodEvent } from "./ifoodMerchantApi";
+import { IFOOD_PATHS, IfoodMerchantApi, mapIfoodEventCode, mapIfoodOrder, mapIfoodStoreStatus, parseIfoodEvent } from "./ifoodMerchantApi";
 import { IfoodSandbox } from "./ifoodSandbox";
 
 function makeApi(sandbox: IfoodSandbox, overrides: Partial<ConstructorParameters<typeof IfoodMerchantApi>[0]> = {}) {
@@ -25,7 +25,13 @@ describe("iFood: códigos de evento", () => {
     expect(mapIfoodEventCode("CAN")).toBe("cancelled");
     expect(mapIfoodEventCode("CAR")).toBe("cancellation_requested");
     expect(mapIfoodEventCode("CARF")).toBe("cancellation_denied");
-    expect(mapIfoodEventCode("HSD")).toBe("unknown");
+    expect(mapIfoodEventCode("PRS")).toBe("preparing");
+    expect(mapIfoodEventCode("CCR")).toBe("customer_cancellation_requested");
+    expect(mapIfoodEventCode("HSD")).toBe("dispute_opened");
+    expect(mapIfoodEventCode("HSS")).toBe("dispute_settled");
+    // Entregador, troca de endereço etc.: só histórico.
+    expect(mapIfoodEventCode("ADR")).toBe("unknown");
+    expect(mapIfoodEventCode("XYZ")).toBe("unknown");
   });
 
   it("recusa evento sem id ou sem pedido", () => {
@@ -46,7 +52,7 @@ describe("iFood: tradução do pedido", () => {
     });
     return api.getOrder(id).then((order) => {
       expect(order.items.map((item) => item.totalPriceCents)).toEqual([17980, 1450]);
-      expect(order.totals).toEqual({ itemsCents: 19430, deliveryFeeCents: 799, additionalFeesCents: 0, benefitsCents: 1000, orderCents: 19229 });
+      expect(order.totals).toEqual({ itemsCents: 19430, deliveryFeeCents: 799, additionalFeesCents: 0, benefitsCents: 1000, benefitsSponsoredByMarketplaceCents: 0, orderCents: 19229 });
       expect(order.payments).toEqual([{ method: "cash", prepaid: false, amountCents: 19229, cardBrand: null, changeForCents: 20000 }]);
       expect(order.pendingCents).toBe(19229);
       expect(order.address?.city).toBe("Santo Ângelo");
@@ -167,5 +173,144 @@ describe("iFood: chamadas HTTP", () => {
 
   it("não aceita credencial vazia", () => {
     expect(() => new IfoodMerchantApi({ credentials: { clientId: "", clientSecret: "x" } })).toThrow(/client_id/);
+  });
+});
+
+describe("iFood: conferência com a documentação oficial", () => {
+  it("evento sem pedido é confirmado e ignorado; sem id é descartado; um evento ruim não derruba o lote", async () => {
+    const sandbox = new IfoodSandbox();
+    const api = makeApi(sandbox);
+    sandbox.pushRawEvent({ id: "evt-sem-pedido", code: "PLC", createdAt: "2026-11-14T10:00:00Z", merchantId: sandbox.merchantId });
+    sandbox.pushRawEvent({ code: "PLC", orderId: "x" });
+    sandbox.placeOrder({ items: [PICANHA] });
+    const events = await api.pollEvents();
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ externalEventId: "evt-sem-pedido", externalOrderId: "", signal: "unknown" });
+    expect(events[1].signal).toBe("placed");
+  });
+
+  it("horário do evento sai sempre em UTC, mesmo com fuso ou sem milissegundos", () => {
+    const event = parseIfoodEvent({ id: "e1", code: "CFM", orderId: "o1", createdAt: "2026-11-14T07:00:00-03:00" });
+    expect(event.createdAt).toBe("2026-11-14T10:00:00.000Z");
+    expect(parseIfoodEvent({ id: "e2", code: "CFM", orderId: "o1" }).createdAt).toBe("1970-01-01T00:00:00.000Z");
+  });
+
+  it("pedido agendado traz janela, início de preparo, código de retirada e teste", async () => {
+    const sandbox = new IfoodSandbox();
+    const id = sandbox.placeOrder({
+      items: [PICANHA],
+      deliveredBy: "IFOOD",
+      pickupCode: "4821",
+      isTest: true,
+      schedule: { start: "2026-11-14T22:00:00.000Z", end: "2026-11-14T22:30:00.000Z", preparationStart: "2026-11-14T21:20:00.000Z" },
+    });
+    const order = await makeApi(sandbox).getOrder(id);
+    expect(order).toMatchObject({
+      scheduledFor: "2026-11-14T22:00:00.000Z",
+      scheduledUntil: "2026-11-14T22:30:00.000Z",
+      preparationStartAt: "2026-11-14T21:20:00.000Z",
+      pickupCode: "4821",
+      isTest: true,
+    });
+  });
+
+  it("pedido imediato não tem janela de agendamento", async () => {
+    const sandbox = new IfoodSandbox();
+    const order = await makeApi(sandbox).getOrder(sandbox.placeOrder({ items: [PICANHA] }));
+    expect(order.scheduledFor).toBeNull();
+    expect(order.scheduledUntil).toBeNull();
+    expect(order.isTest).toBe(false);
+  });
+
+  it("desconto pago pelo iFood fica separado do desconto da loja", async () => {
+    const sandbox = new IfoodSandbox();
+    const ifood = await makeApi(sandbox).getOrder(sandbox.placeOrder({ items: [PICANHA], benefits: 15, benefitsSponsor: "IFOOD" }));
+    expect(ifood.totals).toMatchObject({ benefitsCents: 1500, benefitsSponsoredByMarketplaceCents: 1500 });
+    const loja = await makeApi(sandbox).getOrder(sandbox.placeOrder({ items: [PICANHA], benefits: 15, benefitsSponsor: "MERCHANT" }));
+    expect(loja.totals).toMatchObject({ benefitsCents: 1500, benefitsSponsoredByMarketplaceCents: 0 });
+  });
+
+  it("patrocínio com valor inválido recusa o pedido em vez de inventar número", () => {
+    const base = {
+      id: "abc",
+      createdAt: "2026-11-09T12:00:00Z",
+      items: [{ id: "i1", name: "X", externalCode: "1", quantity: 1, unitPrice: 10, totalPrice: 10 }],
+      total: { subTotal: 10, benefits: 2, orderAmount: 8 },
+    };
+    expect(() => mapIfoodOrder({ ...base, benefits: [{ value: 2, sponsorshipValues: [{ name: "IFOOD", value: -2 }] }] })).toThrow(/inválido/);
+  });
+
+  it("complementos: totalPrice = price + optionsPrice (optionsPrice já soma todas as unidades)", async () => {
+    const sandbox = new IfoodSandbox();
+    const order = await makeApi(sandbox).getOrder(
+      sandbox.placeOrder({ items: [{ name: "Xis", externalCode: "301", quantity: 2, unitPrice: 30, options: [{ name: "Bacon", quantity: 1, unitPrice: 5 }] }] }),
+    );
+    expect(order.items[0]).toMatchObject({ unitPriceCents: 3000, optionsPriceCents: 1000, totalPriceCents: 7000 });
+    expect(order.totals.itemsCents).toBe(7000);
+    expect(order.warnings).toEqual([]);
+  });
+
+  it("negociação: lê o id e as propostas do evento e responde aceitar, recusar ou propor", async () => {
+    const sandbox = new IfoodSandbox();
+    const api = makeApi(sandbox);
+    const orderId = sandbox.placeOrder({ items: [PICANHA] });
+    await api.acknowledge(await api.pollEvents());
+    const disputeId = sandbox.openDispute(orderId, { alternatives: ["REFUND_PARTIAL"] });
+    const [event] = await api.pollEvents();
+    expect(event.signal).toBe("dispute_opened");
+    expect(event.dispute).toMatchObject({ id: disputeId, action: "CANCELLATION" });
+    expect(event.dispute?.alternatives[0]?.type).toBe("REFUND_PARTIAL");
+
+    await expect(api.respondToDispute(disputeId, { kind: "reject", reason: "  " })).rejects.toMatchObject({ code: "invalid_request" });
+    await api.respondToDispute(disputeId, { kind: "alternative", alternativeId: event.dispute!.alternatives[0]!.id });
+    expect(sandbox.eventHistory().at(-1)?.code).toBe("HSS");
+  });
+
+  it("negociação sem id utilizável não vira negociação respondível", () => {
+    const event = parseIfoodEvent({ id: "e1", code: "HSD", orderId: "o1", metadata: { action: "CANCELLATION" } });
+    expect(event.signal).toBe("dispute_opened");
+    expect(event.dispute).toBeNull();
+    expect(parseIfoodEvent({ id: "e2", code: "HSD", orderId: "o1", metadata: { disputeId: "../x" } }).dispute).toBeNull();
+  });
+
+  it("loja: status, pausa pelo período pedido e retomada", async () => {
+    const now = new Date("2026-11-14T15:00:00.000Z");
+    const sandbox = new IfoodSandbox(undefined, undefined, () => now);
+    const api = makeApi(sandbox);
+    expect((await api.getStoreStatus(sandbox.merchantId)).state).toBe("open");
+    const pause = await api.pauseStore(sandbox.merchantId, {
+      description: "Falta de gás",
+      start: "2026-11-14T15:00:00.000Z",
+      end: "2026-11-14T15:30:00.000Z",
+    });
+    expect(pause).toMatchObject({ description: "Falta de gás", end: "2026-11-14T15:30:00.000Z" });
+    const status = await api.getStoreStatus(sandbox.merchantId);
+    expect(status).toMatchObject({ state: "closed", message: "Loja fechada por pausa programada" });
+    expect(await api.listPauses(sandbox.merchantId)).toHaveLength(1);
+    await api.resumeStore(sandbox.merchantId, pause.id);
+    expect((await api.getStoreStatus(sandbox.merchantId)).state).toBe("open");
+  });
+
+  it("pausa com fim antes do início ou sem motivo não chama o iFood", async () => {
+    const sandbox = new IfoodSandbox();
+    const spy = vi.fn(sandbox.fetch);
+    const api = makeApi(sandbox, { fetchImpl: spy as unknown as typeof fetch });
+    await expect(api.pauseStore(sandbox.merchantId, { description: "x", start: "2026-11-14T15:00:00Z", end: "2026-11-14T14:00:00Z" })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(api.pauseStore(sandbox.merchantId, { description: " ", start: "2026-11-14T15:00:00Z", end: "2026-11-14T16:00:00Z" })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(api.resumeStore("../x", "p")).rejects.toMatchObject({ code: "invalid_request" });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("status da loja: aberta se alguma operação estiver OK, desconhecida sem dados", () => {
+    expect(mapIfoodStoreStatus([{ operation: "DELIVERY", state: "CLOSED" }, { operation: "TAKEOUT", state: "OK" }]).state).toBe("open");
+    expect(mapIfoodStoreStatus([{ operation: "DELIVERY", state: "CLOSED" }]).state).toBe("closed");
+    expect(mapIfoodStoreStatus([{ operation: "DELIVERY", state: "NOVO" }]).state).toBe("unknown");
+    expect(mapIfoodStoreStatus(null).state).toBe("unknown");
+  });
+
+  it("todas as rotas ficam num lugar só", () => {
+    expect(IFOOD_PATHS.polling).toBe("/order/v1.0/events:polling");
+    expect(IFOOD_PATHS.disputeAccept("d1")).toBe("/order/v1.0/disputes/d1/accept");
+    expect(IFOOD_PATHS.interruption("m1", "p1")).toBe("/merchant/v1.0/merchants/m1/interruptions/p1");
   });
 });

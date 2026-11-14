@@ -2,7 +2,18 @@
 // IfoodMerchantApi roda igual contra ele e contra o iFood real. Serve para testes e para a tela de
 // demonstração enquanto não existem credenciais de homologação. Nada aqui fala com a internet.
 
-type SandboxEvent = { id: string; code: string; fullCode: string; orderId: string; merchantId: string; createdAt: string };
+type SandboxEvent = {
+  id: string;
+  code: string;
+  fullCode: string;
+  orderId: string;
+  merchantId: string;
+  createdAt: string;
+  metadata?: Record<string, unknown>;
+};
+
+type SandboxDispute = { id: string; orderId: string; action: string; alternatives: string[]; open: boolean };
+type SandboxInterruption = { id: string; description: string; start: string; end: string };
 
 type SandboxOrder = {
   body: Record<string, unknown>;
@@ -16,6 +27,12 @@ export type IfoodSandboxOrderInput = {
   customerName?: string;
   orderType?: "DELIVERY" | "TAKEOUT";
   deliveredBy?: "IFOOD" | "MERCHANT";
+  // Pedido agendado: janela de entrega/retirada combinada com o cliente.
+  schedule?: { start: string; end: string; preparationStart?: string };
+  pickupCode?: string;
+  isTest?: boolean;
+  // Quem paga o desconto: IFOOD/EXTERNAL (vira pagamento para a loja) ou MERCHANT/CHAIN (desconto da loja).
+  benefitsSponsor?: "IFOOD" | "EXTERNAL" | "MERCHANT" | "CHAIN";
   items: Array<{
     name: string;
     externalCode?: string | null;
@@ -37,7 +54,14 @@ const CODE_NAMES: Readonly<Record<string, string>> = {
   DSP: "DISPATCHED",
   CON: "CONCLUDED",
   CAR: "CANCELLATION_REQUESTED",
+  CARF: "CANCELLATION_REQUEST_FAILED",
   CAN: "CANCELLED",
+  CCR: "CONSUMER_CANCELLATION_REQUESTED",
+  CCA: "CONSUMER_CANCELLATION_ACCEPTED",
+  CCD: "CONSUMER_CANCELLATION_DENIED",
+  HSD: "HANDSHAKE_DISPUTE",
+  HSS: "HANDSHAKE_SETTLEMENT",
+  ADR: "ASSIGN_DRIVER",
 };
 
 // Transições que o iFood aceita a partir do último evento do pedido. Ação fora de ordem = HTTP 400.
@@ -64,6 +88,11 @@ export class IfoodSandbox {
   private readonly pending: SandboxEvent[] = [];
   private readonly history: SandboxEvent[] = [];
   private readonly issuedTokens = new Set<string>();
+  private readonly disputes = new Map<string, SandboxDispute>();
+  private readonly interruptions: SandboxInterruption[] = [];
+  // Pedidos de cancelamento da loja ficam esperando o "iFood" decidir (acceptCancellation/denyCancellation),
+  // a não ser que o simulador esteja no modo automático (padrão, usado pela tela de demonstração).
+  autoAcceptCancellation = true;
   private sequence = 0;
   // Contadores úteis nos testes.
   readonly stats = { polls: 0, acks: 0, tokenRequests: 0 };
@@ -122,7 +151,9 @@ export class IfoodSandbox {
         unitPrice: option.unitPrice,
         price: round2(option.unitPrice * option.quantity),
       }));
-      const optionsPrice = round2(options.reduce((sum, option) => sum + option.price, 0));
+      // Documentação oficial: price = quantity x unitPrice; totalPrice = price + optionsPrice, com optionsPrice
+      // já somando os complementos de todas as unidades.
+      const optionsPrice = round2(options.reduce((sum, option) => sum + option.price, 0) * item.quantity);
       const price = round2(item.unitPrice * item.quantity);
       return {
         index: index + 1,
@@ -135,7 +166,7 @@ export class IfoodSandbox {
         unitPrice: item.unitPrice,
         optionsPrice,
         price,
-        totalPrice: round2(price + optionsPrice * item.quantity),
+        totalPrice: round2(price + optionsPrice),
         observations: item.observations,
         options,
       };
@@ -145,13 +176,33 @@ export class IfoodSandbox {
     const benefits = input.benefits ?? 0;
     const orderAmount = round2(subTotal + deliveryFee - benefits);
     const payment = input.payment ?? { method: "CREDIT", prepaid: true };
+    const sponsor = input.benefitsSponsor ?? "MERCHANT";
     const body: Record<string, unknown> = {
       id: orderId,
       displayId: input.displayId ?? String(1000 + this.sequence),
       orderType,
-      orderTiming: "IMMEDIATE",
+      orderTiming: input.schedule ? "SCHEDULED" : "IMMEDIATE",
       salesChannel: "IFOOD",
+      category: "FOOD",
+      isTest: input.isTest ?? false,
       createdAt,
+      ...(input.schedule
+        ? {
+            schedule: { deliveryDateTimeStart: input.schedule.start, deliveryDateTimeEnd: input.schedule.end },
+            preparationStartDateTime: input.schedule.preparationStart ?? input.schedule.start,
+          }
+        : { preparationStartDateTime: createdAt }),
+      ...(benefits > 0
+        ? {
+            benefits: [
+              {
+                value: benefits,
+                target: "CART",
+                sponsorshipValues: [{ name: sponsor, value: benefits, description: "Cupom" }],
+              },
+            ],
+          }
+        : {}),
       merchant: { id: this.merchantId, name: "Galpão Crioulo" },
       customer: {
         id: this.uuid(`customer-${this.sequence}`),
@@ -180,7 +231,8 @@ export class IfoodSandbox {
             delivery: {
               mode: "DEFAULT",
               deliveredBy,
-              deliveryDateTime: createdAt,
+              deliveryDateTime: input.schedule?.start ?? createdAt,
+              ...(input.pickupCode ? { pickupCode: input.pickupCode } : {}),
               deliveryAddress: {
                 streetName: "Rua Marechal Floriano",
                 streetNumber: "1200",
@@ -195,19 +247,54 @@ export class IfoodSandbox {
               },
             },
           }
-        : { takeout: { mode: "DEFAULT", takeoutDateTime: createdAt } }),
+        : { takeout: { mode: "DEFAULT", takeoutDateTime: input.schedule?.start ?? createdAt } }),
     };
     this.orders.set(orderId, { body, lastCode: "PLC", fulfillment: orderType, deliveredBy });
     this.emit(orderId, "PLC");
     return orderId;
   }
 
-  // Ações que só o iFood/cliente fazem (entregador concluiu, cliente cancelou...).
-  emitFromMarketplace(orderId: string, code: "CON" | "CAN" | "DSP"): void {
+  // Ações que só o iFood/cliente fazem (entregador concluiu, cliente cancelou, entregador designado...).
+  emitFromMarketplace(orderId: string, code: "CON" | "CAN" | "DSP" | "CCR" | "CCA" | "CCD" | "ADR"): void {
     const order = this.orders.get(orderId);
     if (!order) throw new Error(`Pedido inexistente no simulador: ${orderId}`);
-    order.lastCode = code;
+    if (["CON", "CAN", "DSP"].includes(code)) order.lastCode = code;
     this.emit(orderId, code);
+  }
+
+  // Decisão do iFood sobre um pedido de cancelamento da loja (modo manual: autoAcceptCancellation = false).
+  decideCancellation(orderId: string, accepted: boolean): void {
+    const order = this.orders.get(orderId);
+    if (!order) throw new Error(`Pedido inexistente no simulador: ${orderId}`);
+    if (accepted) order.lastCode = "CAN";
+    this.emit(orderId, accepted ? "CAN" : "CARF");
+  }
+
+  // Cliente abre uma negociação (ex.: pede o cancelamento depois de confirmado). Devolve o id da negociação.
+  openDispute(orderId: string, input: { action?: string; expiresAt?: string; alternatives?: string[] } = {}): string {
+    if (!this.orders.has(orderId)) throw new Error(`Pedido inexistente no simulador: ${orderId}`);
+    this.sequence += 1;
+    const id = this.uuid(`dispute-${this.sequence}`);
+    const alternatives = (input.alternatives ?? []).map((type, index) => ({ id: this.uuid(`alt-${this.sequence}-${index}`), type }));
+    this.disputes.set(id, { id, orderId, action: input.action ?? "CANCELLATION", alternatives: alternatives.map((alt) => alt.id), open: true });
+    this.emit(orderId, "HSD", {
+      disputeId: id,
+      action: input.action ?? "CANCELLATION",
+      message: "Cliente pediu o cancelamento",
+      expiresAt: input.expiresAt ?? new Date(this.clock().getTime() + 5 * 60_000).toISOString(),
+      alternatives: alternatives.map((alt) => ({ id: alt.id, type: alt.type, description: alt.type })),
+    });
+    return id;
+  }
+
+  // Evento cru (para testar evento incompleto ou estranho vindo do iFood).
+  pushRawEvent(raw: Record<string, unknown>): void {
+    this.pending.push(raw as SandboxEvent);
+  }
+
+  activeInterruptions(): readonly SandboxInterruption[] {
+    const now = this.clock().getTime();
+    return this.interruptions.filter((pause) => Date.parse(pause.start) <= now && now < Date.parse(pause.end));
   }
 
   // Reenvia um evento já entregue (o iFood garante "pelo menos uma vez", não "exatamente uma vez").
@@ -276,9 +363,11 @@ export class IfoodSandbox {
           return json(400, { error: { code: "BadRequest", message: "invalid cancellationCode" } });
         }
         this.emit(orderId, "CAR");
-        // No simulador o iFood aceita o cancelamento na hora; na vida real pode levar minutos ou ser negado.
-        order.lastCode = "CAN";
-        this.emit(orderId, "CAN");
+        // No modo automático o iFood aceita o cancelamento na hora; na vida real pode levar minutos ou ser negado.
+        if (this.autoAcceptCancellation) {
+          order.lastCode = "CAN";
+          this.emit(orderId, "CAN");
+        }
         return new Response(null, { status: 202 });
       }
       const rule = action ? ACTION_RULES[action] : undefined;
@@ -295,10 +384,65 @@ export class IfoodSandbox {
       }
     }
 
+    const dispute = /^\/order\/v1\.0\/disputes\/([^/]+)\/(accept|reject|alternatives)(?:\/([^/]+))?$/.exec(path);
+    if (dispute && method === "POST") {
+      const found = this.disputes.get(decodeURIComponent(dispute[1] ?? ""));
+      if (!found || !found.open) return json(404, { error: { code: "NotFound", message: "dispute not found" } });
+      const kind = dispute[2];
+      if (kind === "reject") {
+        const reason = (JSON.parse(String(init.body ?? "{}")) as { reason?: string }).reason;
+        if (!reason) return json(400, { error: { code: "BadRequest", message: "reason required" } });
+      }
+      if (kind === "alternatives" && !found.alternatives.includes(decodeURIComponent(dispute[3] ?? ""))) {
+        return json(400, { error: { code: "BadRequest", message: "invalid alternative" } });
+      }
+      found.open = false;
+      this.emit(found.orderId, "HSS", { disputeId: found.id, outcome: kind?.toUpperCase() });
+      if (kind === "accept" && found.action === "CANCELLATION") {
+        const order = this.orders.get(found.orderId);
+        if (order) order.lastCode = "CAN";
+        this.emit(found.orderId, "CAN");
+      }
+      return new Response(null, { status: 202 });
+    }
+
+    const merchant = /^\/merchant\/v1\.0\/merchants\/([^/]+)\/(status|interruptions)(?:\/([^/]+))?$/.exec(path);
+    if (merchant) {
+      if (decodeURIComponent(merchant[1] ?? "") !== this.merchantId) return json(403, { error: { code: "Forbidden", message: "merchant" } });
+      if (merchant[2] === "status" && method === "GET") {
+        const paused = this.activeInterruptions().length > 0;
+        return json(200, [
+          {
+            operation: "DELIVERY",
+            salesChannel: "IFOOD",
+            available: !paused,
+            state: paused ? "CLOSED" : "OK",
+            message: paused ? { title: "Loja fechada por pausa programada" } : { title: "Loja aberta" },
+          },
+        ]);
+      }
+      if (merchant[2] === "interruptions" && method === "GET" && !merchant[3]) return json(200, this.interruptions);
+      if (merchant[2] === "interruptions" && method === "POST" && !merchant[3]) {
+        const body = JSON.parse(String(init.body ?? "{}")) as Partial<SandboxInterruption>;
+        if (!body.id || !body.description || !body.start || !body.end || Date.parse(body.end) <= Date.parse(body.start)) {
+          return json(400, { error: { code: "BadRequest", message: "invalid interruption" } });
+        }
+        const pause = { id: body.id, description: body.description, start: body.start, end: body.end };
+        this.interruptions.push(pause);
+        return json(201, pause);
+      }
+      if (merchant[2] === "interruptions" && method === "DELETE" && merchant[3]) {
+        const index = this.interruptions.findIndex((pause) => pause.id === decodeURIComponent(merchant[3] ?? ""));
+        if (index < 0) return json(404, { error: { code: "NotFound", message: "interruption" } });
+        this.interruptions.splice(index, 1);
+        return new Response(null, { status: 204 });
+      }
+    }
+
     return json(404, { error: { code: "NotFound", message: `${method} ${path}` } });
   };
 
-  private emit(orderId: string, code: string): void {
+  private emit(orderId: string, code: string, metadata?: Record<string, unknown>): void {
     this.sequence += 1;
     const event: SandboxEvent = {
       id: this.uuid(`event-${this.sequence}`),
@@ -307,6 +451,7 @@ export class IfoodSandbox {
       orderId,
       merchantId: this.merchantId,
       createdAt: this.clock().toISOString(),
+      ...(metadata ? { metadata } : {}),
     };
     this.history.push(event);
     this.pending.push(event);

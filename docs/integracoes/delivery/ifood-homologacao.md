@@ -1,0 +1,110 @@
+# iFood: servidor de polling e homologação
+
+Este documento descreve o servidor que recebe os pedidos do iFood (`server/delivery/ifood/`), o que já foi conferido
+na documentação oficial e o que falta para a homologação. Atualizado em 14/11/2026.
+
+## Como funciona
+
+```
+iFood ──polling 30 s──> servidor (Node, 1 instância) ──service_role──> Supabase (delivery_orders / delivery_events)
+                              ▲                                              │
+                              └──── app (JWT da loja) chama as ações ────────┘ app lê pelo RLS
+```
+
+- **Um processo só** (`server/delivery/ifood/main.ts`). O iFood entrega cada evento "pelo menos uma vez"; duas
+  instâncias fariam polling em dobro. As gravações usam versão (`version`) e não se atropelam, mas rode uma só.
+- A cada 30 s o servidor lê as lojas ligadas (`delivery_integrations` ativas), manda `x-polling-merchants` com elas,
+  grava cada evento e só então faz o ack. Sem loja ligada, não faz polling.
+- **O app só lê** `delivery_orders` / `delivery_events` / `delivery_integrations`. Gravar é só pelo servidor, com as
+  funções `tchefood_delivery_*` (`db/schema_delivery_servidor.sql`), executáveis só por `service_role`. Um pedido do
+  iFood forjado pelo aparelho viraria venda e nota fiscal.
+- As ações da tela (confirmar, iniciar preparo, pronto, despachar, cancelar, responder negociação, pausar a loja)
+  passam pelo servidor. O app manda o JWT da sessão; o servidor confere no Supabase, com esse JWT e a chave anon, se o
+  RLS mostra o pedido ou o `merchantId` para aquela loja. Pedido de outra loja responde 404 sem tocar no iFood.
+- O `client_secret` do iFood e a `SUPABASE_SERVICE_ROLE_KEY` ficam só nas variáveis de ambiente do servidor.
+
+### API do servidor (para a tela, no item 5 do piloto)
+
+Todas exigem `Authorization: Bearer <JWT da sessão do app>`, menos `/health`.
+
+| Método e rota | O que faz |
+|---|---|
+| `GET /health` | Situação do polling (último ciclo, erro, número de lojas). Sem pedidos. |
+| `POST /ifood/orders/:id/actions/:acao` | `confirm`, `start_preparation`, `ready_for_pickup`, `dispatch` |
+| `GET /ifood/orders/:id/cancellation-reasons` | Motivos que o iFood aceita agora para o pedido |
+| `POST /ifood/orders/:id/cancellation` | `{code, description, details?}`; o código precisa estar na lista atual |
+| `POST /ifood/orders/:id/dispute` | `{kind: "accept"}`, `{kind: "reject", reason}` ou `{kind: "alternative", alternativeId}` |
+| `GET /ifood/merchants/:id/status` | Loja aberta/fechada no iFood |
+| `GET /ifood/merchants/:id/pauses` | Pausas ativas |
+| `POST /ifood/merchants/:id/pauses` | `{description, minutes}` (1 a 1440); início e fim pelo relógio do servidor |
+| `DELETE /ifood/merchants/:id/pauses/:pauseId` | Retoma a loja |
+
+## Rodar
+
+```
+npm run build:ifood
+IFOOD_CLIENT_ID=... IFOOD_CLIENT_SECRET=... \
+SUPABASE_URL=https://<ref>.supabase.co SUPABASE_SERVICE_ROLE_KEY=... SUPABASE_ANON_KEY=... \
+CORS_ORIGINS=https://app.tchefood.com.br PORT=8787 npm run start:ifood
+```
+
+- `IFOOD_BASE_URL` muda o endereço da API (padrão `https://merchant-api.ifood.com.br`).
+- `IFOOD_SANDBOX=1` sobe com o iFood simulado e gravação em memória (sem credenciais; qualquer token é aceito). Só
+  para testar a tela; nunca em produção.
+- Antes: aplicar as migrations no Supabase (`supabase db push`) e cadastrar a loja em `delivery_integrations`
+  (`tenant_id`, `channel = 'ifood'`, `merchant_external_id` = merchantId do Portal do Parceiro), pelo SQL Editor.
+
+## Conferido na documentação oficial (developer.ifood.com.br)
+
+Lido em 14/11/2026: eventos, detalhes do pedido, autenticação do app centralizado, limites de uso e boas práticas.
+Resumo em `/mnt/project-files/tche-food/ifood/conferencia-docs-oficiais.md` (pasta do projeto).
+
+- Eventos e o que o Tchê Food faz com cada um (`IFOOD_EVENT_SIGNALS` em `ifoodMerchantApi.ts`). Todo evento recebe
+  ack, inclusive os ignorados e os desconhecidos; evento sem pedido é confirmado e descartado.
+- `PRS` é início do preparo (`SPS`/`SPE` são só do iFood Mercado). `CON` pode chegar até 2 h depois da entrega.
+- Cancelamento pelo cliente (`CCR`, `CCA`, `CCD`) e plataforma de negociação (`HSD`, `HSS`, com
+  `POST /order/v1.0/disputes/{id}/accept | reject | alternatives/{id}`).
+- Pedido: `orderAmount = subTotal + deliveryFee + additionalFees − benefits`; `benefits[].sponsorshipValues` com
+  IFOOD/EXTERNAL é pago pelo iFood (entra como pagamento), MERCHANT/CHAIN é desconto da loja; agendado
+  (`orderTiming = SCHEDULED`, `schedule.deliveryDateTimeStart/End`, `preparationStartDateTime`); `isTest`;
+  `delivery.pickupCode`.
+- `confirm` responde 202: o pedido só fica confirmado quando o `CFM` chega no polling.
+- Token reaproveitado até perto de vencer (`/oauth/token` tem limite de 20/min); app centralizado não tem refresh token.
+- Rotas de loja: `GET /merchants/{id}/status`, `GET/POST /merchants/{id}/interruptions`,
+  `DELETE /merchants/{id}/interruptions/{id}`.
+
+## Ainda a confirmar (o portal não abriu para leitura automática)
+
+Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a confirmar" quando for o caso.
+
+- Prefixos de versão (`/order/v1.0`, `/merchant/v1.0`, `/authentication/v1.0`).
+- Nomes dos campos do token (`grantType`, `clientId`, `clientSecret`) e resposta (`accessToken`, `expiresIn`).
+- Rota de `cancellationReasons` e corpo de `requestCancellation`; corpo de `reject` da negociação.
+- Corpo de `interruptions` (`id`, `description`, `start`, `end`) e resposta de `status`.
+- Tamanho máximo do lote de ack.
+- **Checklist oficial de homologação, item a item.** Pedir ao Will o PDF da página do portal (logado) para fechar.
+
+## Mapeamento para a homologação
+
+| Item esperado | Situação |
+|---|---|
+| Polling a cada 30 s com `x-polling-merchants` | Pronto (`IfoodPoller`) |
+| Ack de todos os eventos, depois de gravar | Pronto; teste no Postgres |
+| Evento repetido não duplica | Pronto (`delivery_events` UNIQUE; teste no Postgres) |
+| Consultar o detalhe do pedido uma vez | Pronto |
+| Confirmar, iniciar preparo, pronto para retirada, despachar | Pronto (API do servidor) |
+| Cancelar pela loja com motivo da lista | Pronto; vale só quando o iFood confirma (`CAN`/`CARF`) |
+| Cancelamento pedido pelo cliente | Pronto (pendência para a loja conferir) |
+| Negociação (aceitar, recusar, alternativa) | Pronto (API do servidor) |
+| Pedido agendado | Pronto no adapter (horários e aviso); tela no item 5 |
+| Pausar e retomar a loja | Pronto (API do servidor) |
+| Mostrar código de retirada e se é pedido de teste | Dados prontos; tela no item 5 |
+| Tela, impressão, KDS e NFC-e do pedido iFood | Item 5 do piloto (tela congelada até lá) |
+
+## Limites conhecidos
+
+- A permissão das ações é por loja (quem tem sessão da loja pode cancelar ou pausar). Restringir por perfil
+  (gerente/dono) entra com as telas do item 5.
+- Não há bloqueio automático de consulta/atualização 8 h depois da entrega (o servidor só consulta o detalhe no
+  primeiro evento do pedido).
+- Não foi testado contra o iFood de verdade: depende das credenciais de teste do Portal do Desenvolvedor.

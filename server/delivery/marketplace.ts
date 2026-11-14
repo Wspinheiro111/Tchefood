@@ -113,9 +113,18 @@ export type DeliveryOrderStatus =
   | "cancelled"
   | "unknown";
 
-// O que um evento do app comunica: um novo status do pedido, ou o andamento de um pedido de cancelamento
-// (que não muda o status até o app confirmar com "cancelled").
-export type DeliveryEventSignal = DeliveryOrderStatus | "cancellation_requested" | "cancellation_denied";
+// O que um evento do app comunica: um novo status do pedido, o andamento de um pedido de cancelamento
+// (que não muda o status até o app confirmar com "cancelled"), o pedido de cancelamento feito pelo cliente, ou
+// uma negociação aberta pelo app (cliente pede cancelamento/reembolso e a loja aceita, recusa ou propõe outra coisa).
+export type DeliveryEventSignal =
+  | DeliveryOrderStatus
+  | "cancellation_requested"
+  | "cancellation_denied"
+  | "customer_cancellation_requested"
+  | "customer_cancellation_accepted"
+  | "customer_cancellation_denied"
+  | "dispute_opened"
+  | "dispute_settled";
 
 export type DeliveryFulfillment = "delivery" | "takeout" | "indoor";
 // Quem leva o pedido: entregador do app ou motoboy da própria loja.
@@ -175,7 +184,16 @@ export type DeliveryOrder = {
   status: DeliveryOrderStatus;
   fulfillment: DeliveryFulfillment;
   courier: DeliveryCourier;
+  // Pedido agendado: início da janela de entrega/retirada combinada com o cliente.
   scheduledFor: string | null;
+  // Fim da janela do agendado (null quando o app não informa).
+  scheduledUntil: string | null;
+  // Horário recomendado pelo app para começar o preparo (agendados e imediatos). Só informativo.
+  preparationStartAt: string | null;
+  // Código que o entregador/cliente mostra na retirada (iFood: delivery.pickupCode). Null = o app não exige.
+  pickupCode: string | null;
+  // Pedido de teste do app (loja de homologação): não vale como venda.
+  isTest: boolean;
   createdAt: string;
   customer: {
     name: string;
@@ -192,6 +210,9 @@ export type DeliveryOrder = {
     additionalFeesCents: number;
     // Descontos/cupons (valor positivo que abate do total).
     benefitsCents: number;
+    // Parte dos descontos paga pelo app ou por terceiros (iFood: patrocínio IFOOD/EXTERNAL). Para a loja ela
+    // funciona como pagamento, não como desconto; o restante (loja/rede) é desconto de verdade.
+    benefitsSponsoredByMarketplaceCents: number;
     orderCents: number;
   };
   payments: DeliveryOrderPayment[];
@@ -210,13 +231,30 @@ export type DeliveryEvent = {
   channel: DeliveryChannelKey;
   // Id do evento no app: é a chave de deduplicação e de confirmação (ack).
   externalEventId: string;
+  // Vazio quando o app manda um evento sem pedido (ex.: evento da loja): é confirmado e ignorado.
   externalOrderId: string;
   merchantExternalId: string;
   // Código bruto do app (ex.: "PLC"), mantido para auditoria.
   rawCode: string;
   signal: DeliveryEventSignal;
   createdAt: string;
+  // Negociação aberta pelo app (só nos eventos "dispute_opened").
+  dispute: DeliveryDispute | null;
 };
+
+// Negociação (iFood: plataforma de negociação / handshake). O cliente pede algo (cancelar, reembolso parcial...)
+// e a loja responde dentro do prazo; sem resposta, o app aplica a ação padrão dele.
+export type DeliveryDispute = {
+  id: string;
+  // O que o cliente pediu, no código do app (ex.: "CANCELLATION"). Só exibido.
+  action: string | null;
+  message: string | null;
+  expiresAt: string | null;
+  // Contrapropostas que a loja pode oferecer em vez de aceitar/recusar.
+  alternatives: Array<{ id: string; type: string | null; description: string | null }>;
+};
+
+export type DeliveryDisputeDecision = { kind: "accept" } | { kind: "reject"; reason: string } | { kind: "alternative"; alternativeId: string };
 
 export type DeliveryCancellationReason = {
   code: string;
@@ -236,6 +274,35 @@ export interface DeliveryMarketplaceAdapter {
   listCancellationReasons(externalOrderId: string): Promise<DeliveryCancellationReason[]>;
   // Pedido de cancelamento é assíncrono: só o evento "cancelled" confirma.
   requestCancellation(externalOrderId: string, reason: DeliveryCancellationReason, details?: string): Promise<void>;
+  // Resposta da loja a uma negociação aberta pelo app. Assíncrona: o evento "dispute_settled" fecha.
+  respondToDispute(disputeId: string, decision: DeliveryDisputeDecision): Promise<void>;
+}
+
+// Controle da loja no app (abrir/pausar). Separado do adapter de pedidos porque nem todo app oferece.
+export type DeliveryStoreState = "open" | "warning" | "closed" | "error" | "unknown";
+
+export type DeliveryStoreStatus = {
+  state: DeliveryStoreState;
+  // Texto do app explicando o estado (ex.: "Loja fechada por pausa programada").
+  message: string | null;
+  // Detalhes por operação (entrega, retirada...) vindos do app, só para exibir.
+  operations: Array<{ operation: string; state: DeliveryStoreState; available: boolean | null; message: string | null }>;
+};
+
+export type DeliveryStorePause = {
+  id: string;
+  description: string;
+  start: string;
+  end: string;
+};
+
+export interface DeliveryStoreControl {
+  readonly channel: DeliveryChannelKey;
+  getStoreStatus(merchantExternalId: string): Promise<DeliveryStoreStatus>;
+  listPauses(merchantExternalId: string): Promise<DeliveryStorePause[]>;
+  // Pausa a loja no app entre start e end (a loja some ou aparece fechada para o cliente).
+  pauseStore(merchantExternalId: string, pause: { description: string; start: string; end: string }): Promise<DeliveryStorePause>;
+  resumeStore(merchantExternalId: string, pauseId: string): Promise<void>;
 }
 
 export type DeliveryMarketplaceErrorCode =

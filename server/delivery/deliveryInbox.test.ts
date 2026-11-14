@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { DeliveryInbox, InMemoryDeliveryRepository, type DeliveryOrderRecord } from "./deliveryInbox";
+import { DeliveryConcurrencyError, DeliveryInbox, InMemoryDeliveryRepository, type DeliveryOrderRecord } from "./deliveryInbox";
 import { IfoodMerchantApi } from "./ifood/ifoodMerchantApi";
 import { IfoodSandbox } from "./ifood/ifoodSandbox";
 import { allowedDeliveryActions, mergeDeliveryStatus, type DeliveryEvent, type DeliveryOrder } from "./marketplace";
@@ -15,8 +15,8 @@ async function baseOrder(): Promise<DeliveryOrder> {
   return { ...order, externalId: "o1" };
 }
 
-function setup(options: { onNewOrder?: (record: DeliveryOrderRecord) => void | Promise<void> } = {}) {
-  const sandbox = new IfoodSandbox();
+function setup(options: { onNewOrder?: (record: DeliveryOrderRecord) => void | Promise<void>; now?: () => Date } = {}) {
+  const sandbox = new IfoodSandbox(undefined, undefined, options.now);
   const api = new IfoodMerchantApi({
     credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret },
     merchantIds: [sandbox.merchantId],
@@ -24,7 +24,7 @@ function setup(options: { onNewOrder?: (record: DeliveryOrderRecord) => void | P
     fetchImpl: sandbox.fetch,
   });
   const repository = new InMemoryDeliveryRepository();
-  const inbox = new DeliveryInbox({ adapters: [api], repository, onNewOrder: options.onNewOrder });
+  const inbox = new DeliveryInbox({ adapters: [api], repository, onNewOrder: options.onNewOrder, now: options.now });
   return { sandbox, api, repository, inbox };
 }
 
@@ -230,10 +230,11 @@ describe("caixa de entrada de delivery", () => {
       performAction: async () => undefined,
       listCancellationReasons: async () => [],
       requestCancellation: async () => undefined,
+      respondToDispute: async () => undefined,
     };
     const custom = new DeliveryInbox({ adapters: [adapter], repository });
     const event = (id: string, signal: DeliveryEvent["signal"], createdAt: string): DeliveryEvent => ({
-      channel: "ifood", externalEventId: id, externalOrderId: "o1", merchantExternalId: "m", rawCode: id, signal, createdAt,
+      channel: "ifood", externalEventId: id, externalOrderId: "o1", merchantExternalId: "m", rawCode: id, signal, createdAt, dispute: null,
     });
     adapter.queue.push(event("e1", "placed", "2026-11-09T10:00:00Z"), event("e3", "cancellation_denied", "2026-11-09T10:02:00Z"));
     await custom.runCycle();
@@ -248,7 +249,7 @@ describe("caixa de entrada de delivery", () => {
     const repository = new InMemoryDeliveryRepository();
     const queue: DeliveryEvent[] = [];
     const event = (id: string, signal: DeliveryEvent["signal"], createdAt: string): DeliveryEvent => ({
-      channel: "ifood", externalEventId: id, externalOrderId: "o1", merchantExternalId: "m", rawCode: id, signal, createdAt,
+      channel: "ifood", externalEventId: id, externalOrderId: "o1", merchantExternalId: "m", rawCode: id, signal, createdAt, dispute: null,
     });
     let inbox: DeliveryInbox;
     const adapter = {
@@ -262,6 +263,7 @@ describe("caixa de entrada de delivery", () => {
         queue.push(event("e2", "cancellation_requested", "2026-11-09T10:01:00Z"), event("e3", "cancellation_denied", "2026-11-09T10:02:00Z"));
         await inbox.runCycle();
       },
+      respondToDispute: async () => undefined,
     };
     inbox = new DeliveryInbox({ adapters: [adapter], repository });
     queue.push(event("e1", "placed", "2026-11-09T10:00:00Z"));
@@ -295,4 +297,143 @@ describe("caixa de entrada de delivery", () => {
     expect(report.error).toMatch(/500/);
     expect(report.acknowledged).toBe(0);
   });
+
+  it("evento sem pedido é confirmado sem buscar detalhe nem gravar nada", async () => {
+    const { sandbox, api, inbox } = setup();
+    const getOrder = vi.spyOn(api, "getOrder");
+    sandbox.pushRawEvent({ id: "evt-loja", code: "XYZ", createdAt: "2026-11-14T10:00:00Z", merchantId: sandbox.merchantId });
+    const [report] = await inbox.runCycle();
+    expect(report).toMatchObject({ received: 1, acknowledged: 1, deferred: 0 });
+    expect(getOrder).not.toHaveBeenCalled();
+    expect(await inbox.listOrders()).toEqual([]);
+    expect(sandbox.pendingEventCount()).toBe(0);
+  });
+
+  it("evento do entregador (desconhecido para o status) é confirmado e não muda o pedido", async () => {
+    const { sandbox, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    await inbox.performAction("ifood", id, "confirm");
+    await inbox.runCycle();
+    sandbox.emitFromMarketplace(id, "ADR");
+    const [report] = await inbox.runCycle();
+    expect(report.acknowledged).toBe(1);
+    expect((await inbox.listOrders())[0].order.status).toBe("confirmed");
+  });
+
+  it("cancelamento pedido pela loja e negado pelo iFood: pendência some e pedido segue", async () => {
+    const { sandbox, inbox } = setup();
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    expect((await inbox.requestCancellation("ifood", id, reason)).cancellationPending).toBe(true);
+    await inbox.runCycle();
+    expect((await inbox.listOrders())[0].cancellationPending).toBe(true);
+    sandbox.decideCancellation(id, false);
+    await inbox.runCycle();
+    const [record] = await inbox.listOrders();
+    expect(record.cancellationPending).toBe(false);
+    expect(record.order.status).toBe("placed");
+    expect(record.reviewReasons.join(" ")).toMatch(/recusou o pedido de cancelamento/);
+  });
+
+  it("cliente pede cancelamento: pedido vai para conferência sem mudar de status", async () => {
+    const { sandbox, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.emitFromMarketplace(id, "CCR");
+    await inbox.runCycle();
+    const [record] = await inbox.listOrders();
+    expect(record.order.status).toBe("placed");
+    expect(record.needsReview).toBe(true);
+    expect(record.reviewReasons.join(" ")).toMatch(/cliente pediu o cancelamento/);
+  });
+
+  it("negociação: aberta pelo app, respondida uma vez só, fechada pelo evento do app", async () => {
+    const { sandbox, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    await inbox.performAction("ifood", id, "confirm");
+    await inbox.runCycle();
+    const disputeId = sandbox.openDispute(id);
+    await inbox.runCycle();
+    let [record] = await inbox.listOrders();
+    expect(record.dispute).toMatchObject({ id: disputeId, respondedAt: null });
+    expect(record.reviewReasons.join(" ")).toMatch(/negociação/);
+
+    const answered = await inbox.respondToDispute("ifood", id, { kind: "accept" });
+    expect(answered.dispute?.respondedAt).not.toBeNull();
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
+
+    await inbox.runCycle();
+    [record] = await inbox.listOrders();
+    expect(record.dispute).toBeNull();
+    expect(record.order.status).toBe("cancelled");
+  });
+
+  it("negociação vencida ou proposta de outra negociação não chegam ao iFood", async () => {
+    let clock = new Date("2026-11-14T15:00:00.000Z");
+    const { sandbox, api, inbox } = setup({ now: () => clock });
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.openDispute(id, { expiresAt: "2026-11-14T15:05:00.000Z", alternatives: ["REFUND_PARTIAL"] });
+    await inbox.runCycle();
+    const respond = vi.spyOn(api, "respondToDispute");
+    await expect(inbox.respondToDispute("ifood", id, { kind: "alternative", alternativeId: "outra" })).rejects.toMatchObject({ code: "invalid_request" });
+    clock = new Date("2026-11-14T15:06:00.000Z");
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  it("pedido sem negociação aberta não aceita resposta", async () => {
+    const { sandbox, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("gravação de outro processo no meio: o evento fica sem ack e é reaplicado no próximo ciclo", async () => {
+    const { sandbox, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    await inbox.performAction("ifood", id, "confirm");
+    const saveOrder = repository.saveOrder.bind(repository);
+    vi.spyOn(repository, "saveOrder").mockImplementationOnce(async (record) => {
+      throw new DeliveryConcurrencyError(record.order.channel, record.order.externalId);
+    }).mockImplementation(saveOrder);
+    const [first] = await inbox.runCycle();
+    expect(first).toMatchObject({ acknowledged: 0, deferred: 1 });
+    const [second] = await inbox.runCycle();
+    expect(second).toMatchObject({ acknowledged: 1, deferred: 0 });
+    expect((await inbox.listOrders())[0].order.status).toBe("confirmed");
+  });
+
+  it("repositório recusa gravação com versão velha", async () => {
+    const { sandbox, repository, inbox } = setup();
+    sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const [record] = await inbox.listOrders();
+    const stale = structuredClone(record);
+    record.needsReview = true;
+    await repository.saveOrder(record);
+    await expect(repository.saveOrder(stale)).rejects.toBeInstanceOf(DeliveryConcurrencyError);
+    await expect(repository.saveOrder({ ...stale, version: 0 })).rejects.toBeInstanceOf(DeliveryConcurrencyError);
+  });
+
+  it("pedido de cancelamento relê e tenta de novo se o polling gravou no meio", async () => {
+    const { sandbox, repository, inbox } = setup();
+    sandbox.autoAcceptCancellation = false;
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const saveOrder = repository.saveOrder.bind(repository);
+    vi.spyOn(repository, "saveOrder").mockImplementationOnce(async (record) => {
+      throw new DeliveryConcurrencyError(record.order.channel, record.order.externalId);
+    }).mockImplementation(saveOrder);
+    const [reason] = await inbox.listCancellationReasons("ifood", id);
+    const result = await inbox.requestCancellation("ifood", id, reason);
+    expect(result.cancellationPending).toBe(true);
+    expect((await inbox.listOrders())[0].cancellationPending).toBe(true);
+  });
 });
+
