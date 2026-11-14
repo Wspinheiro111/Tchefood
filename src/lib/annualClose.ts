@@ -128,22 +128,33 @@ export function defaultYear(years: readonly number[], now: Date = new Date()): n
   return years[0]!;
 }
 
-/** O ano ainda não terminou: a "posição em 31/12" é a posição de agora. */
+/** O ano está em andamento (já começou e não terminou): a "posição em 31/12" é a posição de agora. */
 export function yearInProgress(p: YearPeriod, now: Date = new Date()): boolean {
-  return now.getTime() < p.to;
-}
-
-/** Até onde vale a "posição": fim do ano, ou agora se o ano ainda não terminou. */
-export function positionCutoff(p: YearPeriod, now: Date = new Date()): number {
-  return Math.min(p.to, now.getTime());
+  const t = now.getTime();
+  return t >= p.from && t < p.to;
 }
 
 /**
- * Registro do ano com data no instante do relatório ou depois (só acontece com o ano em
- * andamento: lançado depois de a tela abrir, ou relógio do aparelho errado). Fica fora
- * dos números e é contado para o aviso. Ano encerrado: o corte é 01/01 seguinte e nada conta.
+ * Relógio do aparelho antes do início do ano escolhido (ano com dados, mas que pelo
+ * relógio nem começou): o relógio está errado. O relatório vale para o ano inteiro e a
+ * tela avisa.
  */
-const afterCutoff = (t: number, p: YearPeriod, cutoff: number): boolean => t >= cutoff && t < p.to;
+export function clockBeforeYear(p: YearPeriod, now: Date = new Date()): boolean {
+  return !(now.getTime() >= p.from);
+}
+
+/** Até onde vale a "posição": agora, se o ano está em andamento; senão, o fim do ano. */
+export function positionCutoff(p: YearPeriod, now: Date = new Date()): number {
+  return yearInProgress(p, now) ? now.getTime() : p.to;
+}
+
+/**
+ * Registro com data no instante do relatório ou depois, inclusive em anos futuros (só
+ * acontece com o ano em andamento: lançado depois de a tela abrir, ou relógio do aparelho
+ * errado). Fica fora dos números e é contado para o aviso. Ano encerrado: o corte é
+ * 01/01 seguinte e nada conta (o que vem depois é de outro ano).
+ */
+const afterCutoff = (t: number, p: YearPeriod, cutoff: number): boolean => cutoff < p.to && t >= cutoff;
 
 /**
  * Dia do repasse no calendário de Brasília (00:00 de Brasília, em ms), com a mesma regra
@@ -821,7 +832,6 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
     // Emissão (dhEmi ou dEmi); sem ela (ou com ela inválida), a data da importação.
     const issued = invoiceDate(inv.issued_at);
     const t = issued ?? at(inv.imported_at);
-    if (issued === null && (inv.issued_at ?? '').trim() !== '' && t !== null && t >= p.from && t < cutoff) invalidIssueDates += 1;
     if (t === null) invalidDates += 1;
     if (!inPeriod(t)) continue;
     const when = new Date(t).toISOString();
@@ -829,6 +839,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
       homologation += 1;
       continue;
     }
+    if (issued === null && (inv.issued_at ?? '').trim() !== '') invalidIssueDates += 1;
     const sup = supplierById.get(inv.supplier_id);
     purchasesC += toCents(inv.invoice_amount);
     purchases.push({

@@ -5,7 +5,7 @@
  * no CSV contra fórmula (=, +, -, @) e no HTML contra marcação.
  */
 import type { ExpensesReport, InventoryReport, OpenPositionsReport, RevenueReport, YearPeriod } from './annualClose';
-import { brasiliaDate, brasiliaDateTime, METHOD_LABEL, positionCutoff } from './annualClose';
+import { brasiliaDate, brasiliaDateTime, METHOD_LABEL, positionCutoff, yearInProgress } from './annualClose';
 import { fromCents, toCents } from './money';
 import { parseIsoInstant } from './reports';
 
@@ -68,7 +68,7 @@ const invalid = (n: number, what: string): string[] =>
  */
 export const afterCutoffNote = (n: number, cutoff: number): string[] =>
   n > 0
-    ? [`ATENÇÃO: ${n} registro(s) com data depois de ${brasiliaDateTime(cutoff)} (instante deste relatório) ficaram de fora. Se foram lançados agora, atualize; se não, confira o relógio do aparelho.`]
+    ? [`ATENÇÃO: ${n} registro(s) com data a partir de ${brasiliaDateTime(cutoff)} (instante deste relatório) ficaram de fora. Se foram lançados agora, atualize; se não, confira o relógio do aparelho.`]
     : [];
 
 const qty = (v: number) => Math.round(v * 1000) / 1000;
@@ -83,7 +83,7 @@ const day = (iso: string) => {
  */
 export function periodLabel(kind: AnnualReportKind, p: YearPeriod, now: Date = new Date()): string {
   const first = `01/01/${p.year}`;
-  const partial = now.getTime() < p.to;
+  const partial = yearInProgress(p, now);
   const last = partial ? brasiliaDateTime(positionCutoff(p, now)) : `31/12/${p.year}`;
   if (kind === 'inventory' || kind === 'open') return partial ? `Posição em ${last} (ano em andamento)` : `Posição em ${last}`;
   return partial ? `${first} a ${last} (ano em andamento)` : `${first} a ${last}`;

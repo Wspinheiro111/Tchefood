@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { defaultYear, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { clockBeforeYear, defaultYear, positionCutoff, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { br, code, escapeHtml, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, revenueDoc, toCsv, toPrintableHtml, type ReportDoc } from '../lib/annualCloseExport';
 import type { FeeRule } from '../lib/cardFees';
 import type { CashMovement, CashSession, CourierSettlement, OwnDelivery, Payment, Product, PurchaseInvoice, StockMovement, Supplier } from '../types';
@@ -388,7 +388,7 @@ describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
   const at9 = '2026-11-14T09:00:00-03:00';
   const at11 = '2026-11-14T11:00:00-03:00';
   const base = { period: '', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g' };
-  const AVISO = (n: number) => `ATENÇÃO: ${n} registro(s) com data depois de 14/11/2026 10:00 (instante deste relatório) ficaram de fora`;
+  const AVISO = (n: number) => `ATENÇÃO: ${n} registro(s) com data a partir de 14/11/2026 10:00 (instante deste relatório) ficaram de fora`;
   const session = (s: Partial<CashSession>): CashSession =>
     ({ id: Math.random().toString(), status: 'CLOSED', opened_at: '2026-11-14T08:00:00-03:00', closed_at: at9, opened_by_user_id: null, closed_by_user_id: null, opening_float: 0, expected_cash: 0, counted_cash: 0, difference: 0, ...s }) as CashSession;
   const cashMov = (m: Partial<CashMovement>): CashMovement => ({ id: Math.random().toString(), type: 'SUPPLY', amount: 10, reason: 'troco', created_at: at9, ...m }) as CashMovement;
@@ -518,5 +518,47 @@ describe('rodada interna após a auditoria 2: nada some calado', () => {
     expect(r.invalidIssueDates).toBe(1);
     expect(r.purchases).toHaveLength(1);
     expect(toCsv(expensesDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('1 NF-e com data de emissão inválida');
+  });
+});
+
+describe('rodada interna 1: corte, futuro e HTML', () => {
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+  const P26 = yearPeriod(2026);
+  const base = { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+
+  it('ano em andamento: registro de ano futuro (relógio errado) também é avisado; ano encerrado não', () => {
+    const payments = [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 5, created_at: '2027-01-05T10:00:00-03:00' })];
+    expect(revenueByMethod({ ...emptyRevenueInput, payments }, P26, NOW).afterCutoff).toBe(1);
+    expect(revenueByMethod({ ...emptyRevenueInput, payments }, P, NOW).afterCutoff).toBe(0);
+    const inv = inventoryAt([product({})], [mov({ created_at: '2027-01-05T10:00:00-03:00' })], P26, new Set(), NOW);
+    expect([inv.rows.length, inv.afterCutoff]).toEqual([0, 1]);
+  });
+
+  it('relógio antes do ano: o ano vale inteiro e nada conta como depois do corte', () => {
+    const clock = new Date('1970-01-02T00:00:00Z');
+    expect(clockBeforeYear(P, clock)).toBe(true);
+    expect(yearInProgress(P, clock)).toBe(false);
+    expect(positionCutoff(P, clock)).toBe(P.to);
+    const r = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 5, created_at: '2025-06-01T10:00:00-03:00' }), pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 7, created_at: '2024-06-01T10:00:00-03:00' })] }, P, clock);
+    expect([r.totalGross, r.afterCutoff]).toEqual([5, 0]);
+    expect(periodLabel('open', P, clock)).toBe('Posição em 31/12/2025');
+  });
+
+  it('dinheiro depois do corte não entra no aviso de dinheiro fora de turno', () => {
+    const r = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'CASH', acquirer: 'CASH_DESK', amount: 9, created_at: '2026-11-14T11:00:00-03:00' })] }, P26, NOW);
+    expect([r.cashOutsideSessionsCount, r.afterCutoff]).toEqual([0, 1]);
+  });
+
+  it('NF-e de homologação com emissão inválida não entra no aviso de emissão inválida', () => {
+    const inv = { id: 'i1', supplier_id: 's1', access_key: '4325'.padEnd(44, '0'), number: '1', series: '1', issued_at: '2025-02-31', environment: 'HOMOLOGATION', invoice_amount: 10, imported_at: '2025-03-01T10:00:00-03:00' } as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P) }, P, NOW);
+    expect([r.invalidIssueDates, r.homologationInvoices]).toEqual([0, 1]);
+  });
+
+  it('os avisos de corte e de repasse desconhecido também saem no HTML para imprimir', () => {
+    const open = openPositionsAt({ payments: [pay({ amount: 12, method: 'CREDIT', acquirer: 'STONE', created_at: '2025-12-20T20:00:00-03:00' }), pay({ amount: 3, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2026-11-14T11:00:00-03:00' })], feeRules: [], ownDeliveries: [], courierSettlements: [], couriers: [], orders: [] }, P26, NOW);
+    const html = toPrintableHtml(openDoc(open, base));
+    expect(html).toContain('SITUAÇÃO DE REPASSE DESCONHECIDA: 1 venda(s)');
+    expect(html).toContain('1 registro(s) com data a partir de 14/11/2026 10:00');
   });
 });

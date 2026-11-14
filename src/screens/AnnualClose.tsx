@@ -11,7 +11,7 @@ import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTche
 import { useOwnerSettings } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import type { MarketplaceSale } from '../lib/ownerDashboard';
-import { brasiliaDateTime, defaultYear, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { brasiliaDateTime, clockBeforeYear, defaultYear, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, REPORT_TITLE, revenueDoc, toCsv, toPrintableHtml, type AnnualReportKind, type ReportDoc } from '../lib/annualCloseExport';
 
 /**
@@ -19,6 +19,13 @@ import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel,
  * iFood está em homologação), então nenhum pedido de app entra no fechamento.
  */
 const NO_MARKETPLACE: MarketplaceSale[] = [];
+/** Agora, no minuto cheio (o corte bate com o hh:mm mostrado). */
+const minuteNow = (): Date => {
+  const t = Date.now();
+  return new Date(t - (((t % 60_000) + 60_000) % 60_000));
+};
+/** Hora em que o arquivo foi gerado (pode ser depois do instante dos números, dito no período). */
+const generatedAtLabel = (): string => new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
 
 /**
  * No app Android (Smart POS / tablet) o WebView não salva arquivo nem imprime página:
@@ -75,6 +82,10 @@ export function AnnualClose() {
   const marketplace = NO_MARKETPLACE;
   const androidApp = inAndroidApp();
 
+  // "Agora" fixo enquanto a tela está aberta (no minuto cheio, para o rótulo hh:mm ser
+  // exatamente o corte): os quatro relatórios, a lista de anos, o título e as notas usam o
+  // mesmo instante. "Atualizar" e a troca de ano pegam um novo.
+  const [now, setNow] = useState(minuteNow);
   const years = useMemo(
     () =>
       yearsWithData([
@@ -88,13 +99,10 @@ export function AnnualClose() {
         ...courierSettlements.map((s) => s.created_at),
         ...cashMovements.map((m) => m.created_at),
         ...ownDeliveries.map((d) => d.delivered_at ?? d.created_at),
-      ]),
-    [payments, stockMovements, purchaseInvoices, cashSessions, courierSettlements, cashMovements, ownDeliveries],
+      ], now),
+    [payments, stockMovements, purchaseInvoices, cashSessions, courierSettlements, cashMovements, ownDeliveries, now],
   );
   const [picked, setPicked] = useState<number | null>(null);
-  // "Agora" fixo enquanto a tela está aberta: os quatro relatórios, o título e as notas usam o
-  // mesmo instante (o corte). "Atualizar" e a troca de ano pegam um novo.
-  const [now, setNow] = useState(() => new Date());
   // Relógio do aparelho fora de 2000–2100 deixa a lista sem o ano corrente; sem nenhum ano, usa 2000.
   const year = picked !== null && validYear(picked) && years.includes(picked) ? picked : defaultYear(years, now) ?? 2000;
   // Ano escolhido que sumiu da lista (sincronização): volta ao padrão e não pula de volta depois.
@@ -103,6 +111,7 @@ export function AnnualClose() {
   }, [picked, years]);
   const period = useMemo(() => yearPeriod(year), [year]);
   const partial = yearInProgress(period, now);
+  const clockWrong = clockBeforeYear(period, now);
 
   const testMovements = useMemo(() => testInvoiceMovementIds(stockMovements, purchaseInvoiceItems, purchaseInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices]);
   const inventory = useMemo(() => inventoryAt(products, stockMovements, period, testMovements, now), [products, stockMovements, period, testMovements, now]);
@@ -133,15 +142,23 @@ export function AnnualClose() {
       ['expenses', expenses.afterCutoff],
     ] as Array<[AnnualReportKind, number]>
   ).filter(([, n]) => n > 0);
-  // Cada registro inválido é contado em um relatório só (o pagamento, no de faturamento).
-  const invalidCount = inventory.invalidDates + revenue.invalidDates + open.invalidDates + expenses.invalidDates;
+  // Datas inválidas por relatório (cada relatório conta as suas fontes: uma sangria
+  // inválida aparece no faturamento e nas despesas).
+  const invalid = (
+    [
+      ['inventory', inventory.invalidDates],
+      ['revenue', revenue.invalidDates],
+      ['open', open.invalidDates],
+      ['expenses', expenses.invalidDates],
+    ] as Array<[AnnualReportKind, number]>
+  ).filter(([, n]) => n > 0);
   const appNote = 'Pedidos dos apps de delivery (iFood etc.) NÃO estão neste relatório: a integração ainda está em homologação. Informe o faturamento e as comissões pelo extrato do app.';
 
   const build = (kind: AnnualReportKind): ReportDoc => {
     const base = {
       period: periodLabel(kind, period, now),
       store: { name: tenant.name, legalName: tenant.legal_name, cnpj: tenant.cnpj, city: tenant.city, state: tenant.state },
-      generatedAt: new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }),
+      generatedAt: generatedAtLabel(),
     };
     switch (kind) {
       case 'inventory':
@@ -155,12 +172,21 @@ export function AnnualClose() {
     }
   };
 
+  // O ano terminou com a tela aberta: o relatório "em andamento" ficaria velho. Atualiza e
+  // pede para exportar de novo, em vez de gerar um arquivo que se contradiz.
+  const fresh = (): boolean => {
+    if (!partial || Date.now() < period.to) return true;
+    setNow(minuteNow());
+    window.alert(`O ano de ${year} terminou com a tela aberta: os números foram atualizados até 31/12. Exporte de novo.`);
+    return false;
+  };
+
   const actions = (kind: AnnualReportKind) => androidApp ? null : (
     <div className="flex flex-wrap gap-2">
-      <Btn variant="secondary" aria-label={`${REPORT_TITLE[kind]}: baixar Excel (CSV)`} onClick={() => download(fileName(kind, year, 'csv'), toCsv(build(kind)), 'text/csv;charset=utf-8')}>
+      <Btn variant="secondary" aria-label={`${REPORT_TITLE[kind]}: baixar Excel (CSV)`} onClick={() => fresh() && download(fileName(kind, year, 'csv'), toCsv(build(kind)), 'text/csv;charset=utf-8')}>
         <FileSpreadsheet className="h-4 w-4" /> Excel (CSV)
       </Btn>
-      <Btn variant="secondary" aria-label={`${REPORT_TITLE[kind]}: PDF ou imprimir`} onClick={() => printDoc(build(kind), fileName(kind, year, 'html'))}>
+      <Btn variant="secondary" aria-label={`${REPORT_TITLE[kind]}: PDF ou imprimir`} onClick={() => fresh() && printDoc(build(kind), fileName(kind, year, 'html'))}>
         <Printer className="h-4 w-4" /> PDF / imprimir
       </Btn>
     </div>
@@ -201,7 +227,7 @@ export function AnnualClose() {
           value={year}
           onChange={(e) => {
             setPicked(Number(e.target.value));
-            setNow(new Date());
+            setNow(minuteNow());
           }}
         >
           {years.map((y) => (
@@ -224,19 +250,24 @@ export function AnnualClose() {
             <span>
               {year} ainda não terminou: os números vão até {cutoffLabel} (horário de Brasília), quando a tela foi aberta ou atualizada. Gere de novo depois de 31/12.
             </span>
-            <Btn variant="secondary" aria-label="Atualizar os números até agora" onClick={() => setNow(new Date())}>
+            <Btn variant="secondary" aria-label="Atualizar os números até agora" onClick={() => setNow(minuteNow())}>
               <RefreshCw className="h-4 w-4" /> Atualizar
             </Btn>
           </div>
         )}
         {late.length > 0 && (
           <p role="alert" className="w-full rounded-xl bg-rose-100 p-3 text-sm">
-            Atenção: registros com data depois de {cutoffLabel} (instante deste relatório) ficaram de fora ({late.map(([k, n]) => `${REPORT_TITLE[k]}: ${n}`).join('; ')}). Se foram lançados agora, toque em Atualizar; se não, confira o relógio do aparelho.
+            Atenção: registros com data a partir de {cutoffLabel} (instante deste relatório) ficaram de fora ({late.map(([k, n]) => `${REPORT_TITLE[k]}: ${n}`).join('; ')}). Se foram lançados agora, toque em Atualizar; se não, confira o relógio do aparelho.
           </p>
         )}
-        {invalidCount > 0 && (
+        {clockWrong && (
           <p role="alert" className="w-full rounded-xl bg-rose-100 p-3 text-sm">
-            Atenção: {invalidCount} registro(s) com data inválida ficaram fora dos relatórios. Se forem deste ano, os totais estão menores: avise o suporte antes de enviar ao contador.
+            Atenção: o relógio deste aparelho está em {brasiliaDateTime(now.getTime())}, antes de {year} começar. Os relatórios mostram o ano inteiro, mas acerte a data e a hora do aparelho antes de enviar ao contador.
+          </p>
+        )}
+        {invalid.length > 0 && (
+          <p role="alert" className="w-full rounded-xl bg-rose-100 p-3 text-sm">
+            Atenção: registros com data inválida ficaram fora dos relatórios ({invalid.map(([k, n]) => `${REPORT_TITLE[k]}: ${n}`).join('; ')}). Se forem deste ano, os totais estão menores: avise o suporte antes de enviar ao contador.
           </p>
         )}
       </section>
@@ -263,6 +294,7 @@ export function AnnualClose() {
           {revenue.totalWithoutRule > 0 && line('Recebido sem taxa cadastrada', formatBRL(revenue.totalWithoutRule), '(taxa não descontada)')}
           {revenue.simulatorCount > 0 && line('Simulador de maquininha (fora do total)', formatBRL(revenue.simulatorAmount))}
           {line('Fechamentos de caixa', String(revenue.closings.length), revenue.closings.length > 0 ? `diferença somada ${formatBRL(revenue.closingsDifference)}` : undefined)}
+          {revenue.openSessions > 0 && line('Turnos de caixa abertos na posição', String(revenue.openSessions), '(o fechamento deles não está na lista)')}
           {revenue.cashOutsideSessionsCount > 0 && line('Dinheiro recebido sem caixa aberto', formatBRL(revenue.cashOutsideSessions), '(está no Dinheiro, fora dos fechamentos)')}
           <p className="mt-2 text-sm text-slate-500">Fora deste relatório: pedidos dos apps de delivery (informe pelo extrato do app) e estornos feitos na maquininha (abata pelo extrato da adquirente).</p>
         </>,
@@ -272,7 +304,7 @@ export function AnnualClose() {
         'open',
         <>
           {line(partial ? 'A receber de maquininha (repasse de hoje em diante)' : `A receber de maquininha (repasse depois de 31/12/${year})`, formatBRL(open.cardReceivablesNet), '(estimado)')}
-          {open.cardWithoutRuleCount > 0 && line('Situação de repasse desconhecida (sem taxa cadastrada)', formatBRL(open.cardWithoutRule), open.cardWithoutRulePriorYearsCount > 0 ? `(pode já ter caído; fora do A receber; inclui ${open.cardWithoutRulePriorYearsCount} venda(s) de anos anteriores, ${formatBRL(open.cardWithoutRulePriorYears)})` : '(pode já ter caído; fora do A receber)')}
+          {open.cardWithoutRuleCount > 0 && line('Situação de repasse desconhecida (sem taxa cadastrada)', formatBRL(open.cardWithoutRule), `(${open.cardWithoutRuleCount} venda(s); pode já ter caído; fora do A receber${open.cardWithoutRulePriorYearsCount > 0 ? `; inclui ${open.cardWithoutRulePriorYearsCount} venda(s) de anos anteriores, ${formatBRL(open.cardWithoutRulePriorYears)}` : ''})`)}
           {line('A receber: dinheiro com entregadores', formatBRL(open.courierCashTotal))}
           {line('A pagar a entregadores próprios', formatBRL(open.courierPayablesTotal))}
           <p className="mt-2 text-sm text-slate-500">Não registrados no Tchê Food (informe pelo seu controle): boletos de fornecedores, fiado/convênio de clientes e repasses pendentes dos apps.</p>
@@ -285,6 +317,7 @@ export function AnnualClose() {
           {expenses.rows.map((r) => line(r.label, r.amount === null ? 'não registrado' : formatBRL(r.amount), r.source === 'ESTIMATED' ? '(estimado)' : undefined))}
           {line('Total (só o registrado e o estimado)', formatBRL(expenses.total))}
           {expenses.withdrawals.length > 0 && line('Sangrias sem categoria (fora do total)', formatBRL(expenses.withdrawalsTotal))}
+          {expenses.invalidIssueDates > 0 && line('NF-e com data de emissão inválida', String(expenses.invalidIssueDates), '(contadas pela data da importação: confira o ano)')}
         </>,
       )}
     </div>
