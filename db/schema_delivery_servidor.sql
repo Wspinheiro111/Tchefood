@@ -201,6 +201,7 @@ END $$;
 -- {kind, alternativeId?}, pausa {minutes, description}, retomada {pauseId}).
 -- Devolve {"status": "OK", "auditId", "repeated"} ou {"status": "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT"}.
 -- repeated = TRUE: reenvio de uma tentativa já autorizada; o servidor NÃO chama o app de novo.
+-- lastOutcome (só no reenvio): resultado já gravado da tentativa; "failed" = nada chegou ao app.
 -- -----------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_audit_logs_delivery_request
     ON audit_logs (tenant_id, (metadata->>'delivery_request_id')) WHERE metadata ? 'delivery_request_id';
@@ -317,7 +318,13 @@ BEGIN
            AND v_existing.performed_by_user_id = p_performed_by
            AND v_existing.reason = trim(p_reason)
            AND v_existing.metadata->'details' IS NOT DISTINCT FROM p_details THEN
-            RETURN jsonb_build_object('status', 'OK', 'auditId', v_existing.id, 'repeated', TRUE);
+            -- Último resultado gravado desta tentativa (sent / failed / uncertain), ou NULL se a primeira
+            -- requisição ainda está chamando o app (ou não conseguiu gravar o resultado).
+            RETURN jsonb_build_object('status', 'OK', 'auditId', v_existing.id, 'repeated', TRUE,
+                'lastOutcome', (SELECT r.metadata->>'outcome' FROM audit_logs r
+                                 WHERE r.tenant_id = v_tenant AND r.action_type = 'DELIVERY_RESULT'
+                                   AND r.metadata->>'authorization_id' = v_existing.id::text
+                                 ORDER BY r.server_seq DESC LIMIT 1));
         END IF;
         RETURN jsonb_build_object('status', 'CONFLICT');
     END IF;

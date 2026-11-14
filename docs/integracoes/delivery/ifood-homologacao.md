@@ -34,7 +34,9 @@ UUID gerado pelo app por tentativa e motivo com 5 caracteres ou mais). O servido
 iFood; a autorização e o resultado da chamada ficam em `audit_logs`. Campos faltando: 400. PIN errado ou
 bloqueado: 403 com `code` (`PIN_FAILED`, `PIN_LOCKED`, `DENIED`); mesmo `requestId` reaproveitado em outra ação, alvo, pessoa, motivo
 ou conteúdo (código do cancelamento, resposta da negociação, duração da pausa): 409 `CONFLICT`. Reenvio idêntico (resposta
-perdida, toque repetido): 409 `ALREADY_SUBMITTED`, sem chamar o iFood de novo; a tela relê o pedido/loja. O que o gerente
+perdida, toque repetido): 409 `ALREADY_SUBMITTED`, sem chamar o iFood de novo; a tela relê o pedido/loja. Se a
+tentativa com esse id falhou antes de chegar ao iFood (banco fora do ar na reserva) ou o iFood recusou: 409
+`RETRY_WITH_NEW_ID` (nada foi enviado; a tela gera outro `requestId` e pede o PIN de novo). O que o gerente
 aprovou fica em `audit_logs.metadata.details`.
 
 Se o iFood aceitou e o banco falhou logo depois (cancelamento e negociação): 503 com `code: "sent_not_saved"` e "Enviado ao
@@ -119,7 +121,8 @@ abriu para leitura automática). Confirmado nela:
   `ALTERNATIVE_REPLIED`). Erros: 404 `DISPUTE_NOT_FOUND`, 422 `DISPUTE_ALREADY_ANSWERED`, 422
   `HANDSHAKE_ALREADY_CONCLUDED`, 400 `DISPUTE_ALTERNATIVE_INVALID`, `DISPUTE_ALTERNATIVE_TYPE_INVALID`,
   `HANDSHAKE_NEGOTIATION_TIME_INVALID_REASON`, `HANDSHAKE_NEGOTIATION_TIME_INVALID_TIME_IN_MINUTES`. O 422
-  `DISPUTE_ALREADY_ANSWERED` conta como resposta enviada (não libera nova tentativa) e vira pendência.
+  `DISPUTE_ALREADY_ANSWERED` (respondida por fora, ex.: Portal) não registra a resposta do PDV como enviada: a
+  negociação fica marcada como respondida (não libera nova tentativa), vira pendência e a API responde 409.
 - HSD: `metadata.disputeId`, `action` (CANCELLATION, PARTIAL_CANCELLATION, PROPOSED_AMOUNT_REFUND,
   PROPOSED_ADDITIONAL_TIME, VOID) e `handshakeType` (AFTER_DELIVERY, DELAY, PREPARATION_TIME, AFTER_DELIVERY_PARTIALLY)
   são campos diferentes; `timeoutAction` (ACCEPT_CANCELLATION, REJECT_CANCELLATION, VOID) e `expiresAt`.

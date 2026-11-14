@@ -1,4 +1,4 @@
-import { DeliveryConcurrencyError, DeliveryInbox, DeliverySentNotSavedError, type DeliveryCycleReport, type DeliveryOrderRecord } from "../deliveryInbox";
+import { DEFINITE_FAILURES, DeliveryConcurrencyError, DeliveryInbox, DeliverySentNotSavedError, type DeliveryCycleReport, type DeliveryOrderRecord } from "../deliveryInbox";
 import {
   DeliveryMarketplaceError,
   type DeliveryDisputeDecision,
@@ -205,7 +205,7 @@ export type ManagerRequest = {
 
 export type ManagerDecision =
   // repeated: o banco já tinha esta tentativa (reenvio): a ação já foi mandada, ou está sendo, por outra requisição.
-  | { status: "OK"; auditId: string; repeated?: boolean }
+  | { status: "OK"; auditId: string; repeated?: boolean; lastOutcome?: ManagerOutcome | null }
   | { status: "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT" | "DENIED"; message: string };
 
 export type ManagerOutcome = "sent" | "failed" | "uncertain";
@@ -261,7 +261,10 @@ export class SupabaseManagerApproval implements ManagerApproval {
       throw new DeliveryRepositoryError("Resposta da autorização não é JSON.");
     }
     const record = body !== null && typeof body === "object" ? (body as Record<string, unknown>) : {};
-    if (record.status === "OK" && typeof record.auditId === "string") return { status: "OK", auditId: record.auditId, repeated: record.repeated === true };
+    if (record.status === "OK" && typeof record.auditId === "string") {
+      const lastOutcome = record.lastOutcome === "sent" || record.lastOutcome === "failed" || record.lastOutcome === "uncertain" ? record.lastOutcome : null;
+      return { status: "OK", auditId: record.auditId, repeated: record.repeated === true, lastOutcome };
+    }
     if (record.status === "PIN_FAILED") return { status: "PIN_FAILED", message: "PIN de gerente incorreto." };
     if (record.status === "PIN_LOCKED") return { status: "PIN_LOCKED", message: "PIN de gerente bloqueado por 1 minuto (3 erros)." };
     if (record.status === "CONFLICT") return { status: "CONFLICT", message: "Esta autorização já foi usada para outra ação." };
@@ -339,7 +342,12 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
     // Reenvio da mesma tentativa (resposta perdida, toque duplo): a primeira requisição já chamou (ou está chamando)
     // o iFood. Chamar de novo mandaria um segundo cancelamento ou criaria outra pausa.
     if (decision.repeated) {
-      return { status: 409, body: { error: "Esta tentativa já foi enviada ao iFood; confira o pedido ou a loja antes de repetir.", code: "ALREADY_SUBMITTED" } };
+      // Tentativa que falhou antes de chegar ao iFood (ou que o iFood recusou): nada foi aplicado, mas o mesmo id não
+      // serve mais (a autorização gravada é dela); a tela gera outra tentativa e pede o PIN de novo.
+      if (decision.lastOutcome === "failed") {
+        return { status: 409, body: { error: "Nada foi enviado ao iFood nesta tentativa; faça uma nova tentativa.", code: "RETRY_WITH_NEW_ID" } };
+      }
+      return { status: 409, body: { error: "Esta tentativa já foi enviada ao iFood (ou está sendo); confira o pedido ou a loja antes de repetir.", code: "ALREADY_SUBMITTED" } };
     }
     const record = (outcome: ManagerOutcome, detail: string) =>
       options.approval.recordResult(decision.auditId, outcome, detail).catch((error: unknown) => {
@@ -350,7 +358,12 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
       await record("sent", `HTTP ${response.status}`);
       return response;
     } catch (error) {
-      const definite = error instanceof DeliveryMarketplaceError && ["invalid_request", "not_found", "conflict", "auth_failed", "rate_limited"].includes(error.code);
+      // Recusa clara do iFood, ou falha do banco ANTES da chamada (a reserva não gravou; a falha do banco depois do
+      // iFood aceitar chega como DeliverySentNotSavedError): nada foi aplicado.
+      const definite =
+        (error instanceof DeliveryMarketplaceError && DEFINITE_FAILURES.includes(error.code)) ||
+        error instanceof DeliveryRepositoryError ||
+        error instanceof DeliveryConcurrencyError;
       // O iFood aceitou e só a gravação local falhou: para a auditoria, foi enviado.
       const outcome: ManagerOutcome = error instanceof DeliverySentNotSavedError ? "sent" : definite ? "failed" : "uncertain";
       await record(outcome, error instanceof Error ? error.message : String(error));
@@ -413,9 +426,9 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
           const manager = parseManager(body.authorization);
           if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
           // Motivo do aceite, valor e prazo da proposta conferidos contra a negociação gravada antes do PIN.
-          await options.inbox.checkDisputeDecision("ifood", orderId, decision);
-          // O registro do gerente leva a resposta inteira (aceite com motivo, recusa, valor ou prazo da proposta).
-          const details = JSON.parse(JSON.stringify(decision)) as Record<string, unknown>;
+          const resolved = await options.inbox.checkDisputeDecision("ifood", orderId, decision);
+          // O registro do gerente leva a resposta como vai ao iFood (aceite com motivo, recusa, valor ou prazo da proposta).
+          const details = JSON.parse(JSON.stringify(resolved)) as Record<string, unknown>;
           return await withManager(token, { ...manager, action: "DELIVERY_DISPUTE", externalOrderId: orderId, merchantExternalId: null, details }, async () => ({
             status: 200,
             body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision)),

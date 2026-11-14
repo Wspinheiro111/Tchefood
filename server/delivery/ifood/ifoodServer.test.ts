@@ -10,6 +10,7 @@ import {
   SupabaseManagerApproval,
   type ApiRequest,
   type ManagerApproval,
+  type ManagerOutcome,
   type ManagerRequest,
   type TenantAuthorizer,
 } from "./ifoodServer";
@@ -36,7 +37,10 @@ function fakeApproval() {
       if (request.managerPin !== MANAGER_PIN) return { status: "PIN_FAILED", message: "PIN de gerente incorreto." };
       // Mesmo id da tentativa: devolve a autorização já gravada (como tchefood_delivery_authorize).
       const existing = byRequest.get(request.requestId);
-      if (existing) return { status: "OK", auditId: existing, repeated: true };
+      if (existing) {
+        const last = [...results].reverse().find((result) => result.auditId === existing);
+        return { status: "OK", auditId: existing, repeated: true, lastOutcome: (last?.outcome as ManagerOutcome | undefined) ?? null };
+      }
       authorized.push(request);
       byRequest.set(request.requestId, `audit-${authorized.length}`);
       return { status: "OK", auditId: `audit-${authorized.length}` };
@@ -68,7 +72,7 @@ function setup(options: { merchants?: string[]; authorizer?: TenantAuthorizer } 
   const handle = createIfoodApiHandler({ inbox, api, authorizer, approval: manager.approval, poller, now: () => NOW });
   const call = (method: string, path: string, body?: unknown, token = "loja-a") =>
     handle({ method, path, headers: { authorization: token ? `Bearer ${token}` : undefined }, body: body === undefined ? "" : JSON.stringify(body) } satisfies ApiRequest);
-  return { sandbox, api, inbox, poller, merchants, call, manager };
+  return { sandbox, api, inbox, poller, merchants, call, manager, repository };
 }
 
 describe("servidor do iFood: polling", () => {
@@ -403,6 +407,26 @@ describe("servidor do iFood: alçada de gerente", () => {
     expect(manager.results).toHaveLength(2);
   });
 
+  it("banco fora do ar antes do iFood: resultado 'failed' e o reenvio pede nova tentativa (nada foi enviado)", async () => {
+    const { sandbox, poller, call, manager, repository } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await poller.runOnce();
+    sandbox.autoAcceptCancellation = false;
+    const spy = vi.spyOn(IfoodMerchantApi.prototype, "requestCancellation");
+    // A reserva do cancelamento não grava: o iFood nunca é chamado.
+    const save = vi.spyOn(repository, "saveOrder").mockRejectedValueOnce(new DeliveryRepositoryError("Supabase fora do ar."));
+    const cancel = { code: "503", description: "Item indisponível", authorization: auth() };
+    expect((await call("POST", `/ifood/orders/${id}/cancellation`, cancel)).status).toBe(503);
+    expect(spy).not.toHaveBeenCalled();
+    expect(manager.results.at(-1)).toMatchObject({ outcome: "failed" });
+    expect(await call("POST", `/ifood/orders/${id}/cancellation`, cancel)).toMatchObject({ status: 409, body: { code: "RETRY_WITH_NEW_ID" } });
+    // Nova tentativa (outro id) segue normal.
+    save.mockRestore();
+    expect((await call("POST", `/ifood/orders/${id}/cancellation`, { ...cancel, authorization: auth() })).status).toBe(200);
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+  });
+
   it("a autorização leva o que o gerente aprovou (motivo do iFood, resposta, duração da pausa)", async () => {
     const { sandbox, poller, call, manager } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
@@ -448,12 +472,14 @@ describe("servidor do iFood: alçada de gerente", () => {
     };
     const approval = new SupabaseManagerApproval({ url: "https://x.supabase.co", anonKey: "anon", serviceRoleKey: "service", fetchImpl });
     const request: ManagerRequest = { action: "DELIVERY_PAUSE", externalOrderId: null, merchantExternalId: "m-1", details: { minutes: 10, description: "Gás" }, ...auth() };
-    expect(await approval.authorize("jwt-da-loja", request)).toEqual({ status: "OK", auditId: "x1", repeated: false });
+    expect(await approval.authorize("jwt-da-loja", request)).toEqual({ status: "OK", auditId: "x1", repeated: false, lastOutcome: null });
     expect(calls[0]!.url).toBe("https://x.supabase.co/rest/v1/rpc/tchefood_delivery_authorize");
     expect(calls[0]!.headers.authorization).toBe("Bearer jwt-da-loja");
     expect(JSON.parse(calls[0]!.body!)).toMatchObject({ p_action: "DELIVERY_PAUSE", p_merchant_external_id: "m-1", p_external_order_id: null, p_details: { minutes: 10, description: "Gás" } });
     reply = { ok: true, status: 200, text: '{"status":"OK","auditId":"x1","repeated":true}' };
-    expect(await approval.authorize("jwt", request)).toEqual({ status: "OK", auditId: "x1", repeated: true });
+    expect(await approval.authorize("jwt", request)).toEqual({ status: "OK", auditId: "x1", repeated: true, lastOutcome: null });
+    reply = { ok: true, status: 200, text: '{"status":"OK","auditId":"x1","repeated":true,"lastOutcome":"failed"}' };
+    expect(await approval.authorize("jwt", request)).toEqual({ status: "OK", auditId: "x1", repeated: true, lastOutcome: "failed" });
     reply = { ok: true, status: 200, text: '{"status":"PIN_LOCKED"}' };
     expect((await approval.authorize("jwt", request)).status).toBe("PIN_LOCKED");
     reply = { ok: false, status: 400, text: '{"message":"TCHEFOOD_ANTIFRAUDE: loja do app não pertence a esta loja."}' };

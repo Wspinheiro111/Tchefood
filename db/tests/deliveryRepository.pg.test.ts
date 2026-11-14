@@ -246,7 +246,7 @@ function setup() {
       expect(sql(`SELECT action_type || '|' || authorized_by_manager_id || '|' || performed_by_user_id || '|' || (metadata->>'external_order_id') FROM audit_logs WHERE id = '${auditId}'`))
         .toBe(`DELIVERY_CANCEL|${MANAGER}|${CASHIER}|${id}`);
       const again = await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId });
-      expect(again.body).toMatchObject({ status: 'OK', auditId, repeated: true });
+      expect(again.body).toMatchObject({ status: 'OK', auditId, repeated: true, lastOutcome: null });
       expect((await authorize(TENANT, { p_external_order_id: other, p_request_id: requestId })).body).toEqual({ status: 'CONFLICT' });
       // O que o gerente aprovou fica gravado; reenvio com outro motivo do iFood ou outro motivo escrito é conflito.
       expect(sql(`SELECT metadata->'details'->>'code' FROM audit_logs WHERE id = '${auditId}'`)).toBe('503');
@@ -269,6 +269,9 @@ function setup() {
       expect(recorded.ok).toBe(true);
       expect(sql(`SELECT metadata->>'outcome' || '|' || (metadata->>'action') FROM audit_logs WHERE action_type = 'DELIVERY_RESULT' AND metadata->>'authorization_id' = '${auditId}'`))
         .toBe('sent|DELIVERY_CANCEL');
+      // Reenvio depois do resultado: o servidor fica sabendo o que aconteceu com a tentativa.
+      expect((await authorize(TENANT, { p_external_order_id: id, p_request_id: requestId })).body)
+        .toMatchObject({ status: 'OK', auditId, repeated: true, lastOutcome: 'sent' });
     });
 
     it('PIN de caixa, motivo curto, pedido de outra loja e loja do app de outra loja não autorizam', async () => {

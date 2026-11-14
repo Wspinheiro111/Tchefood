@@ -158,7 +158,7 @@ export type DeliveryInboxOptions = {
 };
 
 // Falhas em que o app com certeza não aplicou o pedido.
-const DEFINITE_FAILURES: readonly string[] = ["invalid_request", "not_found", "conflict", "auth_failed", "rate_limited"];
+export const DEFINITE_FAILURES: readonly string[] = ["invalid_request", "not_found", "conflict", "auth_failed", "rate_limited"];
 
 // Detalhe do pedido que o app recusa entregar (403/404) em todo ciclo: depois de tantos ciclos seguidos o pedido
 // entra mesmo sem detalhe, para a loja ver e confirmar pelo portal antes que o app cancele por falta de confirmação.
@@ -338,9 +338,9 @@ export class DeliveryInbox {
 
   // Confere a resposta contra a negociação gravada sem gravar nada nem chamar o app (o servidor usa antes de pedir
   // o PIN de gerente). A mesma conferência roda de novo, já com a reserva, em respondToDispute.
-  async checkDisputeDecision(channel: DeliveryChannelKey, externalOrderId: string, decision: DeliveryDisputeDecision): Promise<void> {
+  async checkDisputeDecision(channel: DeliveryChannelKey, externalOrderId: string, decision: DeliveryDisputeDecision): Promise<DeliveryDisputeDecision> {
     const record = await this.requireOrder(channel, externalOrderId);
-    resolveDisputeDecision(channel, record, decision, this.now());
+    return resolveDisputeDecision(channel, record, decision, this.now());
   }
 
   // Resposta da loja a uma negociação aberta pelo app (cliente pediu cancelamento, reembolso...). A resposta é
@@ -366,16 +366,18 @@ export class DeliveryInbox {
       await adapter.respondToDispute(disputeId, resolved);
     } catch (error) {
       // O app diz que a negociação já tinha resposta (iFood: 422 DISPUTE_ALREADY_ANSWERED, ex.: respondida pelo
-      // Portal): nada mais pode ser enviado. Conta como enviada e o desfecho vem pelo evento do app.
+      // Portal). A resposta DESTA tentativa não foi aplicada: a reserva sai (não fica registrada como enviada), a
+      // negociação fica marcada como respondida (nada mais pode ser enviado) e o desfecho vem pelo evento do app.
       if (error instanceof DeliveryMarketplaceError && error.providerCode === "DISPUTE_ALREADY_ANSWERED") {
-        return this.updateOrder(channel, externalOrderId, (latest) => {
+        await this.updateOrder(channel, externalOrderId, (latest) => {
           const dispute = ours(latest);
           if (!dispute) return false;
-          dispute.response = { ...dispute.response!, state: "sent" };
+          dispute.response = null;
           dispute.respondedAt = this.now().toISOString();
-          flag(latest, "O app informou que a negociação já tinha sido respondida (talvez pelo Portal do Parceiro): confira o desfecho.");
+          flag(latest, "A negociação já tinha sido respondida por fora (talvez pelo Portal do Parceiro); a resposta do PDV não foi aplicada: confira o desfecho.");
           return true;
         });
+        throw new DeliveryMarketplaceError(channel, "conflict", "A negociação já tinha sido respondida por fora (Portal do Parceiro); a resposta do PDV não foi aplicada. Confira o desfecho.");
       }
       // Recusa clara do app (4xx, limite de uso): nada foi aplicado e a reserva é desfeita. Qualquer outra falha
       // (rede, 5xx, prazo) pode ter chegado: fica "incerta" e bloqueia novas tentativas.

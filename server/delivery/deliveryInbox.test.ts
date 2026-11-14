@@ -583,21 +583,24 @@ describe("caixa de entrada de delivery", () => {
     expect(record.dispute).toBeNull();
   });
 
-  it("negociação: 422 DISPUTE_ALREADY_ANSWERED conta como enviada e vira pendência", async () => {
+  it("negociação: 422 DISPUTE_ALREADY_ANSWERED não registra a resposta do PDV como enviada", async () => {
     const { sandbox, api, repository, inbox } = setup();
     const id = sandbox.placeOrder({ items: ITEMS });
     await inbox.runCycle();
     const disputeId = sandbox.openDispute(id, { alternatives: ["REFUND"] });
     await inbox.runCycle();
     const alternativeId = (await inbox.listOrders())[0]!.dispute!.alternatives[0]!.id;
-    // Alguém já respondeu por fora (ex.: Portal do Parceiro) antes do PDV.
+    // Alguém já respondeu por fora (ex.: Portal do Parceiro, R$ 5) antes do PDV (R$ 15).
     await api.respondToDispute(disputeId, { kind: "alternative", alternativeId, alternativeType: "REFUND", amountCents: 500 });
-    const record = await inbox.respondToDispute("ifood", id, { kind: "accept" });
-    expect(record.dispute?.response?.state).toBe("sent");
+    await expect(
+      inbox.respondToDispute("ifood", id, { kind: "alternative", alternativeId, amountCents: 1500 }),
+    ).rejects.toMatchObject({ code: "conflict", message: expect.stringMatching(/respondida por fora/) });
+    const record = (await repository.getOrder("ifood", id))!;
+    // Nada da resposta do PDV fica como enviada; a negociação fica marcada como respondida e vira pendência.
+    expect(record.dispute?.response).toBeNull();
     expect(record.dispute?.respondedAt).not.toBeNull();
-    expect(record.reviewReasons.join(" ")).toMatch(/já tinha sido respondida/);
+    expect(record.reviewReasons.join(" ")).toMatch(/não foi aplicada/);
     await expect(inbox.respondToDispute("ifood", id, { kind: "accept" })).rejects.toMatchObject({ code: "conflict" });
-    expect((await repository.getOrder("ifood", id))!.dispute?.response?.state).toBe("sent");
   });
 
   it("evento ilegível com pedido não se perde: entra no histórico do pedido e vira pendência", async () => {
