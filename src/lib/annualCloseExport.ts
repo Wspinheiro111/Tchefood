@@ -50,6 +50,13 @@ export interface ReportDoc {
 // Montagem dos documentos
 // ---------------------------------------------------------------------------
 
+/**
+ * Vendas, pagamentos, caixa e estoque ficam no aparelho que os gravou (a nuvem recebe,
+ * mas ainda não devolve; src/lib/sync/cloudPull.ts). Todo relatório diz isso.
+ */
+export const DEVICE_ONLY =
+  'SOMENTE os registros gravados NESTE aparelho. Vendas, pagamentos, caixa e estoque de outro aparelho da loja não estão aqui (a nuvem ainda não devolve esses dados). Com mais de um aparelho, gere o relatório em cada um.';
+
 /** Aviso de registros que ficaram de fora por data inválida (nunca somem calados). */
 const invalid = (n: number, what: string): string[] =>
   n > 0 ? [`ATENÇÃO: ${n} ${what} com data inválida (não dá para saber o ano) ficaram fora. Se for deste ano, o total está menor: avise o suporte antes de enviar ao contador.`] : [];
@@ -107,7 +114,7 @@ export function revenueDoc(r: RevenueReport, base: Omit<ReportDoc, 'title' | 'ta
       ...(r.totalWithoutRule > 0 ? [`R$ ${br(r.totalWithoutRule)} foram recebidos sem taxa cadastrada: a taxa deles NÃO foi descontada.`] : []),
       `Gorjetas no ano: R$ ${br(r.tips)}.`,
       ...(r.openSessions > 0 ? [`${r.openSessions} turno(s) de caixa aberto(s) no ano ainda não foram fechados.`] : []),
-      ...invalid(r.invalidDates, 'pagamento(s) ou pedido(s) de app'),
+      ...invalid(r.invalidDates, 'pagamento(s) ou fechamento(s) de caixa'),
       ...extraNotes,
     ],
     tables: [
@@ -151,7 +158,7 @@ export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 
       'A RECEBER de entregador: dinheiro de entregas pagas na entrega feitas até a posição e ainda não acertadas.',
       ...(r.cardWithoutRuleCount > 0 ? [`${r.cardWithoutRuleCount} venda(s) no ano na maquininha (R$ ${br(r.cardWithoutRule)}) sem taxa cadastrada: não dá para saber se já caíram.`] : []),
       'NÃO registrados no Tchê Food (informe pelo seu controle): contas a pagar de fornecedores (boletos/duplicatas), fiado e convênios de clientes, repasses pendentes dos apps de delivery.',
-      ...invalid(r.invalidDates, 'pagamento(s) ou entrega(s)'),
+      ...invalid(r.invalidDates, 'entrega(s)'),
       ...extraNotes,
     ],
     tables: [
@@ -246,6 +253,7 @@ export function toCsv(doc: ReportDoc): string {
   out.push(line([doc.period]));
   out.push(line([`${doc.store.legalName || doc.store.name} · CNPJ ${doc.store.cnpj || 'não cadastrado'} · ${doc.store.city}/${doc.store.state}`]));
   out.push(line([`Gerado em ${doc.generatedAt}`]));
+  out.push(line([`Obs.: ${DEVICE_ONLY}`]));
   for (const n of doc.notes) out.push(line([`Obs.: ${n}`]));
   for (const t of doc.tables) {
     out.push('');
@@ -300,7 +308,7 @@ export function toPrintableHtml(doc: ReportDoc): string {
 </style></head><body>
 <h1>${escapeHtml(doc.title)}</h1>
 <div class="meta"><strong>${escapeHtml(doc.period)}</strong> · ${escapeHtml(doc.store.legalName || doc.store.name)} · CNPJ ${escapeHtml(doc.store.cnpj || 'não cadastrado')} · ${escapeHtml(`${doc.store.city}/${doc.store.state}`)}<br>Gerado em ${escapeHtml(doc.generatedAt)} pelo Tchê Food</div>
-${notes ? `<ul>${notes}</ul>` : ''}
+<ul><li><strong>${escapeHtml(DEVICE_ONLY)}</strong></li>${notes}</ul>
 ${tables}
 </body></html>`;
 }

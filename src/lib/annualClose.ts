@@ -426,6 +426,7 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
       if (inYear(s.opened_at, p)) openSessions += 1;
       continue;
     }
+    if (at(s.closed_at) === null) invalidDates += 1;
     if (!inYear(s.closed_at, p)) continue;
     sessionIds.add(s.id);
     if (s.difference !== null) diffC += toCents(s.difference);
@@ -527,7 +528,7 @@ export interface OpenPositionsReport {
   courierPayablesTotal: number;
   /** Instante da posição: fim do ano, ou agora se o ano ainda não terminou. */
   cutoff: number;
-  /** Pagamentos e entregas com data inválida (ficaram de fora). */
+  /** Entregas com data inválida (ficaram de fora; pagamento inválido é avisado no faturamento). */
   invalidDates: number;
 }
 
@@ -553,12 +554,13 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
   for (const pay of input.payments) {
     if (pay.status !== 'APPROVED' || pay.method === 'CASH') continue;
     const t = at(pay.created_at);
-    if (t === null) invalidDates += 1;
+    // Pagamento com data inválida já é contado (e avisado) no relatório de faturamento.
     if (t === null || t >= cutoff) continue;
     const rule = ruleFor(pay, input.feeRules);
     if (!rule) {
       if ((pay.acquirer === 'STONE' || pay.acquirer === 'PAGBANK') && t >= p.from) {
-        noRuleC += toCents(pay.amount) + toCents(pay.tip_amount ?? 0);
+        // Mesmo critério do faturamento: valor da venda, sem a gorjeta.
+        noRuleC += toCents(pay.amount);
         noRuleCount += 1;
       }
       continue;

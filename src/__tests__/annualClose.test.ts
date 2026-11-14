@@ -92,6 +92,8 @@ describe('2. faturamento por forma', () => {
     expect(csv).toContain('Vale-refeição / alimentação;;não registrado;não registrado;não registrado;');
     expect(csv).toContain('Estorno feito na maquininha');
     expect(csv).toContain('sem turno de caixa aberto');
+    expect(csv).toContain('Obs.: SOMENTE os registros gravados NESTE aparelho');
+    expect(toPrintableHtml(revenueDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g' }))).toContain('NESTE aparelho');
     expect(by['APP:ifood']).toMatchObject({ gross: 80, fee: 9.6, count: 1, marketplace: true });
     expect(r.totalGross).toBe(260);
     expect(r.totalFee).toBe(12.9);
@@ -121,6 +123,8 @@ describe('2. faturamento por forma', () => {
     expect(inside.cashOutsideSessionsCount).toBe(0);
     expect(r.closingsDifference).toBe(-7.5);
     expect(r.openSessions).toBe(1);
+    // Fechamento com data inválida não some calado.
+    expect(revenueByMethod({ ...emptyRevenueInput, cashSessions: [session({ closed_at: 'ontem' })] }, P).invalidDates).toBe(1);
     expect([r.supplies, r.withdrawals]).toEqual([50, 70.5]);
   });
 });

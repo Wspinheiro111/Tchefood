@@ -3,9 +3,10 @@
  * Tela Retaguarda › Fechamento anual: só dono e gerente; ano escolhido; vale-refeição
  * sem registro aparece como "não registrado"; no app Android não oferece exportação.
  */
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AnnualClose } from '../screens/AnnualClose';
+import { useBackOfficeTabs } from '../screens/BackOffice';
 import { useTcheStore } from '../store/useTcheStore';
 import type { Payment, StaffUser } from '../types';
 
@@ -44,6 +45,19 @@ afterEach(() => {
 });
 
 describe('Fechamento anual (tela)', () => {
+  it('a aba só aparece para dono e gerente', () => {
+    setup('cx');
+    expect(renderHook(() => useBackOfficeTabs()).result.current.some((t) => t.key === 'annual')).toBe(false);
+    setup('own');
+    expect(renderHook(() => useBackOfficeTabs()).result.current.some((t) => t.key === 'annual')).toBe(true);
+  });
+
+  it('avisa que são só os registros deste aparelho', () => {
+    setup('own');
+    render(<AnnualClose />);
+    expect(screen.getByRole('note').textContent).toContain('NESTE aparelho');
+  });
+
   it('caixa não vê o faturamento do ano', () => {
     setup('cx', [pay(100, '2025-05-01T12:00:00')]);
     render(<AnnualClose />);

@@ -12,7 +12,7 @@ import { useOwnerSettings } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import type { MarketplaceSale } from '../lib/ownerDashboard';
 import { defaultYear, expensesByCategory, inventoryAt, openPositionsAt, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
-import { expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, REPORT_TITLE, revenueDoc, toCsv, toPrintableHtml, type AnnualReportKind, type ReportDoc } from '../lib/annualCloseExport';
+import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, REPORT_TITLE, revenueDoc, toCsv, toPrintableHtml, type AnnualReportKind, type ReportDoc } from '../lib/annualCloseExport';
 
 /**
  * Pedidos dos apps: a tela de Delivery do aparelho ainda é o simulador (o servidor do
@@ -115,6 +115,7 @@ export function AnnualClose() {
   if (!isManagerRole(user?.role)) return <p className="p-6">Só o proprietário e o gerente veem o fechamento anual.</p>;
 
   const partialNote = partial ? [`O ano de ${year} ainda não terminou: os números vão até agora, não até 31/12.`] : [];
+  // Cada registro inválido é contado em um relatório só (o pagamento, no de faturamento).
   const invalidCount = inventory.invalidDates + revenue.invalidDates + open.invalidDates + expenses.invalidDates;
   const appNote = 'Pedidos dos apps de delivery (iFood etc.) NÃO estão neste relatório: a integração ainda está em homologação. Informe o faturamento e as comissões pelo extrato do app.';
 
@@ -194,9 +195,12 @@ export function AnnualClose() {
         <span className="text-sm text-slate-500">{periodLabel('revenue', period, now)}, horário de Brasília.</span>
         {androidApp && (
           <p role="status" className="w-full rounded-xl bg-amarelo/15 p-3 text-sm">
-            O app Tchê Food para Android não salva planilha nem PDF. Para exportar, entre no Tchê Food pelo navegador do computador ou do celular com a loja ligada na nuvem.
+            O app Tchê Food para Android ainda não salva planilha nem PDF: confira os números aqui na tela. Exportar por outro aparelho não resolve, porque as vendas deste aparelho ficam nele.
           </p>
         )}
+        <p role="note" className="w-full rounded-xl bg-amarelo/15 p-3 text-sm font-semibold">
+          {DEVICE_ONLY}
+        </p>
         {partial && (
           <p role="status" className="w-full rounded-xl bg-amarelo/15 p-3 text-sm">
             {year} ainda não terminou: os números vão até agora. Gere de novo depois de 31/12.
