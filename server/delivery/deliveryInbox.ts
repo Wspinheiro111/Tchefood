@@ -579,7 +579,12 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
       // O resultado vale pelo status: se aceito, o evento "cancelled" chega em seguida.
       return;
     case "dispute_opened":
-      if (record.order.status === "cancelled" || record.order.status === "concluded") return;
+      // Pedido entregue (concluído) ainda pode ter negociação (iFood: AFTER_DELIVERY, reembolso depois da entrega):
+      // a negociação é gravada sem mexer no status. Pedido cancelado não tem o que negociar, mas não some calado.
+      if (record.order.status === "cancelled") {
+        flag(record, "O app abriu uma negociação num pedido já cancelado: confira no Portal do Parceiro.");
+        return;
+      }
       if (!event.dispute) {
         flag(record, "O app abriu uma negociação sem identificação: responda pelo Portal do Parceiro.");
         return;

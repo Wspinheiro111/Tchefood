@@ -882,4 +882,21 @@ describe("caixa de entrada de delivery", () => {
     await inbox.performAction("ifood", id, "start_preparation");
     expect(spy).toHaveBeenCalledTimes(2);
   });
+
+  it("negociação depois da entrega (AFTER_DELIVERY) num pedido concluído é gravada e pode ser respondida", async () => {
+    const { sandbox, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    sandbox.emitFromMarketplace(id, "CON");
+    await inbox.runCycle();
+    expect((await repository.getOrder("ifood", id))!.order.status).toBe("concluded");
+    sandbox.openDispute(id, { handshakeType: "AFTER_DELIVERY" });
+    await inbox.runCycle();
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record.order.status).toBe("concluded");
+    expect(record.dispute).not.toBeNull();
+    expect(record.reviewReasons.join(" ")).toMatch(/negociação/);
+    const answered = await inbox.respondToDispute("ifood", id, { kind: "accept" });
+    expect(answered.dispute?.response?.state).toBe("sent");
+  });
 });
