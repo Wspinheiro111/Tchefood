@@ -41,6 +41,24 @@ export function yearPeriod(year: number): YearPeriod {
 
 /** Instante do registro em ms, ou null se a data for inválida ou sem fuso. */
 const at = (iso: string | null | undefined): number | null => parseIsoInstant(iso);
+
+/**
+ * Data de emissão da NF-e: dhEmi (com fuso) ou dEmi (só a data, NF-e antiga). A data
+ * sozinha é um dia do calendário de Brasília: vale 12:00 daquele dia, longe das viradas.
+ */
+export function invoiceDate(iso: string | null | undefined): number | null {
+  if (typeof iso === 'string') {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+    if (m) {
+      const y = Number(m[1]);
+      const mo = Number(m[2]);
+      const d = Number(m[3]);
+      if (mo < 1 || mo > 12 || d < 1 || d > new Date(Date.UTC(y, mo, 0)).getUTCDate()) return null;
+      return brasiliaInstant(y, mo - 1, d, 12);
+    }
+  }
+  return at(iso);
+}
 const inYear = (iso: string | null | undefined, p: YearPeriod): boolean => {
   const t = at(iso);
   return t !== null && t >= p.from && t < p.to;
@@ -85,6 +103,12 @@ export function yearsWithData(dates: Iterable<string | null | undefined>, now: D
   for (const d of dates) {
     const y = brasiliaYear(d);
     if (y !== null && validYear(y) && (current === null || y <= current)) set.add(y);
+  }
+  // Ano sem movimento no meio também tem posição (estoque e contas que vêm de antes):
+  // do primeiro ano com dados até o mais novo, sem buracos.
+  if (set.size > 0) {
+    const max = Math.max(...set);
+    for (let y = Math.min(...set); y < max; y += 1) set.add(y);
   }
   return [...set].sort((a, b) => b - a);
 }
@@ -705,9 +729,11 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod): Expense
   let homologation = 0;
   let invalidDates = 0;
   for (const inv of input.purchaseInvoices) {
-    const when = at(inv.issued_at) !== null ? inv.issued_at! : inv.imported_at;
-    if (at(when) === null) invalidDates += 1;
-    if (!inYear(when, p)) continue;
+    // Emissão (dhEmi ou dEmi); sem ela, a data da importação.
+    const t = invoiceDate(inv.issued_at) ?? at(inv.imported_at);
+    if (t === null) invalidDates += 1;
+    if (t === null || t < p.from || t >= p.to) continue;
+    const when = new Date(t).toISOString();
     if (inv.environment !== 'PRODUCTION') {
       homologation += 1;
       continue;

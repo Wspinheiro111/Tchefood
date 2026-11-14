@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { defaultYear, expensesByCategory, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { defaultYear, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { br, code, escapeHtml, expensesDoc, fileName, inventoryDoc, periodLabel, revenueDoc, toCsv, toPrintableHtml, type ReportDoc } from '../lib/annualCloseExport';
 import type { FeeRule } from '../lib/cardFees';
 import type { CashMovement, CashSession, CourierSettlement, OwnDelivery, Payment, Product, PurchaseInvoice, StockMovement, Supplier } from '../types';
@@ -26,7 +26,7 @@ describe('ano do fechamento', () => {
     expect(validYear(2025.5)).toBe(false);
     expect(() => yearPeriod(3000)).toThrow();
     const now = new Date('2026-11-14T15:00:00-03:00');
-    expect(yearsWithData(['2024-12-31T23:30:00-03:00', '2025-01-01T01:00:00Z', 'lixo', null, '2031-01-01T00:00:00Z'], now)).toEqual([2026, 2024]);
+    expect(yearsWithData(['2024-12-31T23:30:00-03:00', '2025-01-01T01:00:00Z', 'lixo', null, '2031-01-01T00:00:00Z'], now)).toEqual([2026, 2025, 2024]);
     expect(yearInProgress(yearPeriod(2026), now)).toBe(true);
     expect(yearInProgress(yearPeriod(2025), now)).toBe(false);
   });
@@ -325,5 +325,21 @@ describe('rodada 1 de revisão', () => {
     expect(lines).toContain("'+5");
     expect(toPrintableHtml(doc)).not.toContain('NaN');
     expect(lines.every((l) => !/^[=+\-@]/.test(l))).toBe(true);
+  });
+});
+
+describe('revisão do Codex', () => {
+  it('ano sem movimento entre dois anos com dados também aparece no seletor', () => {
+    expect(yearsWithData(['2024-03-01T10:00:00-03:00'], new Date('2026-11-14T10:00:00-03:00'))).toEqual([2026, 2025, 2024]);
+  });
+
+  it('NF-e com dEmi (só a data) conta no ano da emissão, não no da importação', () => {
+    expect(invoiceDate('2025-12-31')).toBe(Date.parse('2025-12-31T12:00:00-03:00'));
+    expect(invoiceDate('2025-02-30')).toBeNull();
+    const inv = { id: 'n', supplier_id: 's', access_key: '1', number: '1', series: '1', issued_at: '2025-12-31', environment: 'PRODUCTION', invoice_amount: 80, imported_at: '2026-01-03T10:00:00-03:00' } as PurchaseInvoice;
+    const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P) };
+    expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).rows[0]!.amount).toBe(80);
+    expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, yearPeriod(2026)).rows[0]!.amount).toBe(0);
+    expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).purchases[0]!.date).toBe('2025-12-31T15:00:00.000Z');
   });
 });

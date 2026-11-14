@@ -11,7 +11,7 @@ import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTche
 import { useOwnerSettings } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import type { MarketplaceSale } from '../lib/ownerDashboard';
-import { defaultYear, expensesByCategory, inventoryAt, openPositionsAt, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { defaultYear, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, REPORT_TITLE, revenueDoc, toCsv, toPrintableHtml, type AnnualReportKind, type ReportDoc } from '../lib/annualCloseExport';
 
 /**
@@ -80,7 +80,10 @@ export function AnnualClose() {
       yearsWithData([
         ...payments.map((p) => p.created_at),
         ...stockMovements.map((m) => m.created_at),
-        ...purchaseInvoices.map((i) => i.issued_at ?? i.imported_at),
+        ...purchaseInvoices.map((i) => {
+          const t = invoiceDate(i.issued_at);
+          return t !== null ? new Date(t).toISOString() : i.imported_at;
+        }),
         ...cashSessions.map((s) => s.closed_at ?? s.opened_at),
         ...courierSettlements.map((s) => s.created_at),
         ...cashMovements.map((m) => m.created_at),
