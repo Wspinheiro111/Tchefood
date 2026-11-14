@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react';
 import { Copy, ExternalLink, FileJson, Printer, Receipt, RefreshCw } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
-import { buildNfce, formatAccessKey, isValidNfceQrCodeContent, serverNfceDocument, type NfceDocument } from '../lib/nfce';
-import { danfeLines } from '../lib/receipts';
+import { buildNfce, formatAccessKey, isValidNfceQrCodeContent, serverNfceDocument } from '../lib/nfce';
+import { danfeLines, type DanfeDoc } from '../lib/receipts';
 import { printDocument } from '../lib/payments/drivers';
 import { syncOnce } from '../lib/sync/useCloudSync';
 import { ordersWithPendingEvents } from '../lib/sync/nfceEmission';
@@ -36,15 +36,17 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
   const cloud = s.cloud !== null;
   const rec = (s.nfceCloud ?? {})[orderId];
 
-  // Demonstração: nota simulada a partir da comanda. Nuvem: só o que o servidor devolveu.
-  const doc = useMemo<NfceDocument | null>(() => {
+  // Demonstração: nota simulada a partir da comanda. Nuvem: só o que o servidor devolveu
+  // (payload transmitido + chave, protocolo, QR); nada do cadastro atual do aparelho.
+  const demoDoc = useMemo(() => {
+    if (!order || cloud) return null;
+    return buildNfce({ tenant: s.tenant, order, items: s.orderItems, payments: s.payments, products: s.products, tableLabel: table?.label ?? '' });
+  }, [order, cloud, s.tenant, s.orderItems, s.payments, s.products, table]);
+  const doc = useMemo<(DanfeDoc & { qr_url: string }) | null>(() => {
     if (!order) return null;
-    const tableLabel = table?.label ?? '';
-    if (!cloud) return buildNfce({ tenant: s.tenant, order, items: s.orderItems, payments: s.payments, products: s.products, tableLabel });
-    if (!rec?.access_key) return null;
-    const local = buildNfce({ tenant: s.tenant, order: { ...order, nfce_key: rec.access_key }, items: s.orderItems, payments: s.payments, products: s.products, tableLabel });
-    return local ? serverNfceDocument(local, rec) : null;
-  }, [order, cloud, rec, s.tenant, s.orderItems, s.payments, s.products, table]);
+    if (!cloud) return demoDoc;
+    return rec ? serverNfceDocument(rec) : null;
+  }, [order, cloud, rec, demoDoc]);
 
   if (!order) {
     return (
@@ -81,7 +83,9 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
           {rec?.environment && <div><b>Ambiente:</b> {rec.environment === 'producao' ? 'produção' : 'homologação (sem valor fiscal)'}</div>}
           {rec?.access_key && <div><b>Chave:</b> <span className="font-mono text-xs">{formatAccessKey(rec.access_key)}</span></div>}
           {rec?.message && <div className="rounded-xl bg-amber-50 p-2 text-amber-900">{rec.message}</div>}
-          {rec?.status === 'authorized' && !rec.qrcode_url && <div className="rounded-xl bg-rose-50 p-2 text-rose-700">Autorizada, mas o servidor não devolveu o QR Code assinado: o DANFE não é impresso aqui.</div>}
+          {(rec?.status === 'authorized' || rec?.status === 'contingency') && (
+            <div className="rounded-xl bg-rose-50 p-2 text-rose-700">O servidor não devolveu tudo o que o DANFE precisa (QR Code assinado, protocolo ou itens transmitidos): o DANFE não é impresso aqui. Use o DANFE da Focus.</div>
+          )}
           {rec?.environment && rec.danfe_path && (
             <a className="inline-flex items-center gap-1 font-bold text-verde underline" href={`${FOCUS_HOST[rec.environment]}${rec.danfe_path}`} target="_blank" rel="noreferrer">
               <ExternalLink className="h-4 w-4" /> Abrir DANFE da Focus
@@ -105,7 +109,7 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
   const environment = cloud ? rec?.environment ?? 'homologacao' : 'homologacao';
   // Nota real: os tributos aproximados do aparelho não foram enviados à SEFAZ, então não saem no DANFE.
   const danfe = danfeLines({ tenant: s.tenant, doc, environment, contingency, showTributos: !cloud });
-  const json = JSON.stringify(doc.payload, null, 2);
+  const json = JSON.stringify(demoDoc?.payload ?? null, null, 2);
   const qrValid = isValidNfceQrCodeContent(doc.qr_url, doc.access_key);
   const printDanfe = () => {
     if (!qrValid) return toast.error('QR Code da NFC-e não confere com a chave de acesso. DANFE não impresso.');

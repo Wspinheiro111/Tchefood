@@ -45,6 +45,8 @@ export interface NfceDocumentRow {
   transmissions: number;
   /** data_emissao do payload transmitido (lido de payload->>data_emissao); a tela imprime no DANFE. */
   issued_at: string | null;
+  /** Payload congelado que foi transmitido (itens, valores, pagamentos). */
+  payload: unknown;
 }
 
 export type NewNfceDocument = Pick<NfceDocumentRow, 'tenant_id' | 'order_id' | 'reference' | 'environment' | 'payload_hash'> & {
@@ -111,6 +113,11 @@ export interface EmitResponse {
     danfe_path: string | null;
     /** data_emissao enviada à SEFAZ (null antes da primeira transmissão). */
     issued_at: string | null;
+    /**
+     * Payload transmitido, só para nota com chave da SEFAZ (autorizada, contingência,
+     * cancelada): a tela imprime o DANFE com ele, nunca com o cadastro atual do aparelho.
+     */
+    payload: unknown;
     message: string | null;
   };
 }
@@ -142,6 +149,7 @@ function respond(doc: NfceDocumentRow, message?: string | null): EmitResponse {
       qrcode_url: doc.qrcode_url,
       danfe_path: doc.danfe_path,
       issued_at: doc.issued_at,
+      payload: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.payload ?? null : null,
       message: message ?? doc.sefaz_message,
     },
   };
@@ -163,6 +171,7 @@ function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict
       qrcode_url: null,
       danfe_path: null,
       issued_at: null,
+      payload: null,
       message,
     },
   };

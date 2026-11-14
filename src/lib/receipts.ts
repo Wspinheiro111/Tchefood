@@ -3,9 +3,8 @@
  * Usados tanto pelo simulador visual quanto pelos drivers reais
  * (PlugPag printText / Stone printer), por isso são texto puro.
  */
-import type { DiningTable, Order, OrderItem, Payment, Product, StaffUser, Tenant } from '../types';
+import type { DiningTable, NfceDanfePayload, Order, OrderItem, Payment, Product, StaffUser, Tenant } from '../types';
 import { formatBRL, formatQty } from './money';
-import type { NfceDocument } from './nfce';
 import { CONSULTA_URL_RS, formatAccessKey } from './nfce';
 
 export const COLS = 32;
@@ -148,10 +147,20 @@ function cardReceiptRaw(params: { tenant: Tenant; payment: Payment; tableLabel: 
   ];
 }
 
+/** O que o DANFE imprime: a nota simulada (NfceDocument) ou a real (serverNfceDocument). */
+export interface DanfeDoc {
+  access_key: string;
+  protocol: string;
+  issued_at: string;
+  tributos_federais: number;
+  tributos_estaduais: number;
+  payload: NfceDanfePayload & { numero: number; serie: number };
+}
+
 /** DANFE NFC-e simplificado (layout 58mm). O QR Code é desenhado à parte. */
 export function danfeLines(params: {
   tenant: Tenant;
-  doc: NfceDocument;
+  doc: DanfeDoc;
   /** Ambiente da nota; o aviso de homologação só sai em homologação. Padrão: homologação. */
   environment?: 'homologacao' | 'producao';
   /** Nota em contingência offline, ainda sem autorização da SEFAZ. */

@@ -755,6 +755,25 @@ export interface TrayItem {
 /** Situação do documento NFC-e no servidor (nfce_documents.status, emit-nfce). */
 export type NfceCloudStatus = 'processing' | 'authorized' | 'rejected' | 'contingency' | 'cancelled';
 
+/** Parte do payload transmitido que o DANFE da bobina imprime (conferida ao chegar). */
+export interface NfceDanfePayload {
+  items: Array<{
+    numero_item: number;
+    codigo_produto: string;
+    descricao: string;
+    unidade_comercial: string;
+    quantidade_comercial: number;
+    valor_unitario_comercial: number;
+    valor_bruto: number;
+  }>;
+  valor_produtos: number;
+  valor_desconto: number;
+  valor_outras_despesas: number;
+  valor_total: number;
+  formas_pagamento: Array<{ forma_pagamento: string; valor_pagamento: number }>;
+  cpf_destinatario?: string;
+}
+
 /** Resultado da última chamada à emit-nfce que não trouxe documento. */
 export type NfceCallProblem = 'invalid' | 'not_found' | 'conflict' | 'error' | 'network';
 
@@ -777,6 +796,8 @@ export interface NfceCloudRecord {
   danfe_path: string | null;
   /** data_emissao enviada à SEFAZ. */
   issued_at: ISODateTime | null;
+  /** Itens, valores e pagamentos como foram transmitidos (o DANFE sai daqui). */
+  payload: NfceDanfePayload | null;
   message: string | null;
   /** null = a última chamada trouxe o documento; senão, o que deu errado nela. */
   problem: NfceCallProblem | null;

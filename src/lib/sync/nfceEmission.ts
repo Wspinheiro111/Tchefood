@@ -16,7 +16,7 @@
  *  - Falha de rede ou do servidor não muda o status da nota: só a mensagem e a próxima
  *    tentativa.
  */
-import type { NfceCallProblem, NfceCloudRecord, NfceCloudStatus, Order, SyncEvent } from '../../types';
+import type { NfceCallProblem, NfceCloudRecord, NfceCloudStatus, NfceDanfePayload, Order, SyncEvent } from '../../types';
 import { toCents } from '../money';
 import { isValidNfceQrCodeContent } from '../nfce';
 import { recordKeys, type FetchLike, type SyncConfig } from './supabaseSync';
@@ -60,6 +60,7 @@ export interface NfceDocumentOutcome {
   qrcode_url: string | null;
   danfe_path: string | null;
   issued_at: string | null;
+  payload: NfceDanfePayload | null;
   message: string | null;
 }
 
@@ -75,6 +76,62 @@ const KEY_RE = /^\d{6}[0-9A-Z]{12}\d{26}$/;
 
 function text(value: unknown, max: number): string | null {
   return typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : null;
+}
+
+/** Valor em reais com no máximo 2 casas, finito e não negativo. */
+function money(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null;
+  return Math.abs(Math.round(value * 100) - value * 100) < 1e-6 ? value : null;
+}
+
+/**
+ * Payload transmitido, como o servidor devolveu. Só passa inteiro e coerente: soma dos
+ * itens = valor_produtos, produtos + outras despesas − desconto = total = soma dos
+ * pagamentos (em centavos). Qualquer coisa fora disso vira null e o DANFE não sai da bobina.
+ */
+export function parseDanfePayload(value: unknown): NfceDanfePayload | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const p = value as Record<string, unknown>;
+  if (!Array.isArray(p.items) || p.items.length === 0 || p.items.length > 990 || !Array.isArray(p.formas_pagamento) || p.formas_pagamento.length === 0) return null;
+  const items: NfceDanfePayload['items'] = [];
+  for (const raw of p.items) {
+    const it = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+    const numero = it.numero_item;
+    const qty = it.quantidade_comercial;
+    const codigo = text(it.codigo_produto, 60);
+    const descricao = text(it.descricao, 120);
+    const un = text(it.unidade_comercial, 6);
+    const unit = money(it.valor_unitario_comercial);
+    const bruto = money(it.valor_bruto);
+    if (typeof numero !== 'number' || !Number.isInteger(numero) || numero < 1) return null;
+    if (typeof qty !== 'number' || !Number.isFinite(qty) || qty <= 0) return null;
+    if (!codigo || !descricao || !un || unit === null || bruto === null) return null;
+    items.push({ numero_item: numero, codigo_produto: codigo, descricao, unidade_comercial: un, quantidade_comercial: qty, valor_unitario_comercial: unit, valor_bruto: bruto });
+  }
+  const formas: NfceDanfePayload['formas_pagamento'] = [];
+  for (const raw of p.formas_pagamento) {
+    const f = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+    const code = text(f.forma_pagamento, 2);
+    const amount = money(f.valor_pagamento);
+    if (!code || !/^\d{2}$/.test(code) || amount === null) return null;
+    formas.push({ forma_pagamento: code, valor_pagamento: amount });
+  }
+  const produtos = money(p.valor_produtos);
+  const desconto = money(p.valor_desconto);
+  const outras = money(p.valor_outras_despesas);
+  const total = money(p.valor_total);
+  if (produtos === null || desconto === null || outras === null || total === null) return null;
+  const c = (v: number) => Math.round(v * 100);
+  if (items.reduce((s, i) => s + c(i.valor_bruto), 0) !== c(produtos)) return null;
+  if (c(produtos) + c(outras) - c(desconto) !== c(total)) return null;
+  if (formas.reduce((s, f) => s + c(f.valor_pagamento), 0) !== c(total)) return null;
+  const out: NfceDanfePayload = { items, valor_produtos: produtos, valor_desconto: desconto, valor_outras_despesas: outras, valor_total: total, formas_pagamento: formas };
+  const cpf = text(p.cpf_destinatario, 11);
+  if (cpf !== null) {
+    if (!/^\d{11}$/.test(cpf)) return null;
+    out.cpf_destinatario = cpf;
+  }
+  return out;
 }
 
 /**
@@ -122,6 +179,7 @@ export function parseEmitResponse(httpStatus: number, body: string): NfceEmitOut
       // Caminho relativo da Focus (ex.: /notas_fiscais_consumidor/NFe...html); nada de outro host.
       danfe_path: danfeRaw && /^\/[A-Za-z0-9_./-]+$/.test(danfeRaw) && !danfeRaw.includes('..') && !danfeRaw.startsWith('//') ? danfeRaw : null,
       issued_at: issuedRaw && !Number.isNaN(Date.parse(issuedRaw)) ? issuedRaw : null,
+      payload: parseDanfePayload(r.payload),
       message: docMessage,
     };
   }
@@ -158,7 +216,7 @@ export function nfceBackoffMs(attempts: number): number {
   return Math.min(300_000, 10_000 * 2 ** Math.max(0, Math.min(attempts - 1, 10)));
 }
 
-/** Próximo registro a partir da resposta. Devolve null quando a resposta deve ser ignorada. */
+/** Próximo registro a partir da resposta (resposta que regrediria a situação só conta a tentativa). */
 export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefined, outcome: NfceEmitOutcome, nowMs: number): NfceCloudRecord {
   const attempts = (prev?.attempts ?? 0) + 1;
   const ts = new Date(nowMs).toISOString();
@@ -174,6 +232,7 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
     qrcode_url: null,
     danfe_path: null,
     issued_at: null,
+    payload: null,
     message: null,
     problem: null,
     attempts: 0,
@@ -202,6 +261,7 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
     qrcode_url: outcome.qrcode_url ?? base.qrcode_url,
     danfe_path: outcome.danfe_path ?? base.danfe_path,
     issued_at: outcome.issued_at ?? base.issued_at,
+    payload: outcome.payload ?? base.payload,
     message: outcome.message,
     problem: null,
     attempts,

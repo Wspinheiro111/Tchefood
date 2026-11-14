@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { useTcheStore, type CloudSession } from '../store/useTcheStore';
 import { dueNfceOrders, nextNfceRecord, parseEmitResponse, requestNfceEmission, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
 import { syncOnce } from '../lib/sync/useCloudSync';
-import { buildNfce, serverNfceDocument } from '../lib/nfce';
+import { serverNfceDocument } from '../lib/nfce';
 import { danfeLines } from '../lib/receipts';
 import type { FetchLike } from '../lib/sync/supabaseSync';
 
@@ -10,6 +10,17 @@ const st = () => useTcheStore.getState();
 const KEY = '43261112345678000195650010000000421000000427';
 const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF`;
 const ISSUED = '2026-11-14T10:00:00-03:00';
+
+const PAYLOAD = {
+  items: [
+    { numero_item: 1, codigo_produto: '311', descricao: 'X-SALADA TRANSMITIDO', unidade_comercial: 'UN', quantidade_comercial: 1, valor_unitario_comercial: 32, valor_bruto: 32 },
+  ],
+  valor_produtos: 32,
+  valor_desconto: 0,
+  valor_outras_despesas: 0,
+  valor_total: 32,
+  formas_pagamento: [{ forma_pagamento: '01', valor_pagamento: 32 }],
+};
 
 const authorizedBody = (over: Record<string, unknown> = {}) => ({
   status: 'authorized',
@@ -24,6 +35,7 @@ const authorizedBody = (over: Record<string, unknown> = {}) => ({
   qrcode_url: QR,
   danfe_path: '/notas_fiscais_consumidor/NFe43261112345678000195650010000000421000000427.html',
   issued_at: ISSUED,
+  payload: PAYLOAD,
   message: null,
   ...over,
 });
@@ -205,30 +217,66 @@ describe('fechamento da conta com a loja na nuvem', () => {
 });
 
 describe('DANFE da nota real', () => {
-  it('usa chave, protocolo, número, data e QR do servidor; sem QR válido não imprime', () => {
-    useTcheStore.setState({ cloud: session(st().tenant.id) });
-    const id = closeOrder();
-    const o = { ...order(id), nfce_key: KEY };
-    const local = buildNfce({ tenant: st().tenant, order: o, items: st().orderItems, payments: st().payments, products: st().products, tableLabel: 'Mesa 1' })!;
-    const server = { status: 'authorized' as const, access_key: KEY, protocol: '143260000000042', number: 42, series: '1', qrcode_url: QR, issued_at: ISSUED };
-    const d = serverNfceDocument(local, server)!;
+  const server = () => ({
+    status: 'authorized' as const,
+    access_key: KEY,
+    protocol: '143260000000042',
+    number: 42,
+    series: '1',
+    qrcode_url: QR,
+    issued_at: ISSUED,
+    payload: PAYLOAD,
+  });
+
+  it('sai só do que o servidor devolveu (payload transmitido, chave, protocolo, QR)', () => {
+    const d = serverNfceDocument(server())!;
     expect(d).toMatchObject({ access_key: KEY, protocol: '143260000000042', qr_url: QR, issued_at: ISSUED });
-    expect(d.payload.numero).toBe(42);
-    expect(serverNfceDocument(local, { ...server, qrcode_url: null })).toBeNull();
-    expect(serverNfceDocument(local, { ...server, protocol: null })).toBeNull();
-    expect(serverNfceDocument(local, { ...server, issued_at: null })).toBeNull();
-    expect(serverNfceDocument(local, { ...server, status: 'processing' })).toBeNull();
-    const cont = serverNfceDocument(local, { ...server, status: 'contingency', protocol: null })!;
+    expect(d.payload).toMatchObject({ numero: 42, serie: 1, valor_total: 32 });
+    expect(d.payload.items[0]?.descricao).toBe('X-SALADA TRANSMITIDO');
+    expect(serverNfceDocument({ ...server(), qrcode_url: null })).toBeNull();
+    expect(serverNfceDocument({ ...server(), protocol: null })).toBeNull();
+    expect(serverNfceDocument({ ...server(), issued_at: null })).toBeNull();
+    expect(serverNfceDocument({ ...server(), payload: null })).toBeNull();
+    expect(serverNfceDocument({ ...server(), status: 'processing' })).toBeNull();
+    const cont = serverNfceDocument({ ...server(), status: 'contingency', protocol: null })!;
     expect(cont.protocol).toBe('');
 
     const hom = danfeLines({ tenant: st().tenant, doc: d, environment: 'homologacao', showTributos: false }).top.join('\n');
     expect(hom).toContain('SEM VALOR FISCAL');
     expect(hom).toContain('143260000000042');
+    expect(hom).toContain('X-SALADA TRANSMITIDO');
     expect(hom).not.toContain('IBPT');
     const prod = danfeLines({ tenant: st().tenant, doc: d, environment: 'producao', showTributos: false }).top.join('\n');
     expect(prod).not.toContain('HOMOLOGACAO');
     const c = danfeLines({ tenant: st().tenant, doc: cont, environment: 'homologacao', contingency: true, showTributos: false }).top.join('\n');
     expect(c).toContain('EMITIDA EM CONTINGENCIA');
     expect(c).not.toContain('Protocolo de Autorizacao');
+  });
+
+  it('editar o cardápio depois da autorização não muda o DANFE', async () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const id = closeOrder();
+    useTcheStore.setState({ outbox: [], pullStatus: { last_pull_at: new Date().toISOString(), last_error: null, cloud_staff_unknown: 0 } });
+    const f: FetchLike = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(authorizedBody()) });
+    await syncOnce(f);
+    const before = danfeLines({ tenant: st().tenant, doc: serverNfceDocument(st().nfceCloud[id]!)!, environment: 'homologacao', showTributos: false }).top.join('\n');
+    useTcheStore.setState({ products: st().products.map((p) => ({ ...p, name: 'NOME NOVO', price: 999, ncm: '99999999' })) });
+    const after = danfeLines({ tenant: st().tenant, doc: serverNfceDocument(st().nfceCloud[id]!)!, environment: 'homologacao', showTributos: false }).top.join('\n');
+    expect(after).toBe(before);
+    expect(after).not.toContain('NOME NOVO');
+  });
+
+  it('payload incoerente ou malformado é descartado', () => {
+    const bad = (payload: unknown) => (doc(authorizedBody({ payload })) as { payload: unknown }).payload;
+    expect(bad(PAYLOAD)).toEqual(PAYLOAD);
+    expect(bad(null)).toBeNull();
+    expect(bad({ ...PAYLOAD, valor_total: 31 })).toBeNull();
+    expect(bad({ ...PAYLOAD, valor_produtos: 33 })).toBeNull();
+    expect(bad({ ...PAYLOAD, formas_pagamento: [{ forma_pagamento: '01', valor_pagamento: 30 }] })).toBeNull();
+    expect(bad({ ...PAYLOAD, items: [] })).toBeNull();
+    expect(bad({ ...PAYLOAD, items: [{ ...PAYLOAD.items[0], numero_item: 0 }] })).toBeNull();
+    expect(bad({ ...PAYLOAD, items: [{ ...PAYLOAD.items[0], valor_bruto: 32.001 }] })).toBeNull();
+    expect(bad({ ...PAYLOAD, cpf_destinatario: '123' })).toBeNull();
+    expect(bad({ ...PAYLOAD, cpf_destinatario: '12345678909' })).toMatchObject({ cpf_destinatario: '12345678909' });
   });
 });

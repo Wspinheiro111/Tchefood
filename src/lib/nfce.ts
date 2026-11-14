@@ -8,7 +8,8 @@
  * - Cada pagamento aprovado da rachadinha vira uma entrada em formas_pagamento
  *   com tipo_integracao = 1 (tpIntegra — pagamento integrado TEF/SmartPOS).
  */
-import type { Order, OrderItem, Payment, Product, Tenant } from '../types';
+import type { NfceDanfePayload, Order, OrderItem, Payment, Product, Tenant } from '../types';
+import type { DanfeDoc } from './receipts';
 import { allocateCents, fromCents, toCents } from './money';
 import { sha1Hex } from './sha1';
 
@@ -332,30 +333,33 @@ export interface ServerNfceFields {
   series: string | null;
   qrcode_url: string | null;
   issued_at: string | null;
+  payload: NfceDanfePayload | null;
 }
 
 /**
- * DANFE da NFC-e real: itens, valores e pagamentos da comanda (os mesmos que o servidor
- * leu do banco) com chave, protocolo, número, série, data de emissão e QR Code do
- * servidor. Nada fiscal é calculado aqui. Só para autorizada (com protocolo) ou
- * contingência, e só com QR Code da SEFAZ para esta chave; senão null (não imprime).
+ * DANFE da NFC-e real, montado só com o que o servidor devolveu: o payload transmitido
+ * (itens, valores, pagamentos, CPF) mais chave, protocolo, número, série, data de emissão
+ * e QR Code. Nada vem do cadastro atual do aparelho, que pode ter mudado depois da nota.
+ * Só para autorizada (com protocolo) ou contingência, com QR Code da SEFAZ para esta
+ * chave; senão null (não imprime). Tributos aproximados não foram enviados: ficam zero e o
+ * DANFE não os mostra (showTributos: false).
  */
-export function serverNfceDocument(local: NfceDocument, server: ServerNfceFields): NfceDocument | null {
+export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_url: string }) | null {
   const authorized = server.status === 'authorized';
   if (!authorized && server.status !== 'contingency') return null;
   const key = server.access_key;
-  if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key) || !server.issued_at) return null;
+  if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key) || !server.issued_at || !server.payload) return null;
   if (authorized && !server.protocol) return null;
   const parsed = parseAccessKey(key);
   return {
-    ...local,
     access_key: key,
     protocol: authorized ? server.protocol! : '',
     issued_at: server.issued_at,
     qr_url: server.qrcode_url!,
+    tributos_federais: 0,
+    tributos_estaduais: 0,
     payload: {
-      ...local.payload,
-      data_emissao: server.issued_at,
+      ...server.payload,
       numero: server.number ?? parsed.numero,
       serie: server.series ? Number(server.series) : parsed.serie,
     },

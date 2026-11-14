@@ -14,7 +14,7 @@ export interface SupabaseLike {
 }
 
 const DOC_COLUMNS =
-  'id, tenant_id, order_id, reference, environment, status, payload_hash, access_key, protocol, number, series, qrcode_url, danfe_path, xml_path, sefaz_status, sefaz_message, offline_contingency, transmissions, issued_at:payload->>data_emissao';
+  'id, tenant_id, order_id, reference, environment, status, payload_hash, access_key, protocol, number, series, qrcode_url, danfe_path, xml_path, sefaz_status, sefaz_message, offline_contingency, transmissions, payload, issued_at:payload->>data_emissao';
 
 function check(result: { data: Query; error: { message: string; code?: string } | null }, what: string): Query {
   if (result.error) throw new Error(`Falha ao ${what}: ${result.error.message}`);
