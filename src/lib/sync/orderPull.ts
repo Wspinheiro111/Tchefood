@@ -194,12 +194,16 @@ export function parseCloudOrders(body: unknown, tenantId: UUID): CloudOrders {
   return { tenant_id: tenantId, server_now: iso(b.server_now, 'server_now'), orders, orderItems, payments, tables };
 }
 
-/** Contas, itens, pagamentos e ocupação das mesas da loja do token, numa foto só do banco. */
-export async function fetchCloudOrders(cfg: SyncConfig, tenantId: UUID, fetchFn: FetchLike): Promise<CloudOrders> {
+/**
+ * Contas, itens, pagamentos e ocupação das mesas da loja do token, numa foto só do banco.
+ * `openHere`: contas em aberto neste aparelho; o banco as devolve mesmo encerradas há mais
+ * de 24 h (aparelho que ficou mais de um dia sem internet recebe o fechamento feito em outro).
+ */
+export async function fetchCloudOrders(cfg: SyncConfig, tenantId: UUID, fetchFn: FetchLike, openHere: UUID[] = []): Promise<CloudOrders> {
   const res = await fetchFn(`${cfg.url.replace(/\/+$/, '')}/rest/v1/rpc/tchefood_pull_orders`, {
     method: 'POST',
     headers: { apikey: cfg.anonKey, Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
-    body: '{}',
+    body: JSON.stringify({ p_order_ids: [...new Set(openHere)].slice(0, 500) }),
   });
   const text = await res.text().catch(() => '');
   if (!res.ok) {

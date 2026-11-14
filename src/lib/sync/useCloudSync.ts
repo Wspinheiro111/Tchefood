@@ -48,7 +48,8 @@ async function pullCatalog(cfg: SyncConfig, fetchFn: FetchLike): Promise<boolean
 async function pullOrders(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh: boolean): Promise<void> {
   const tenantId = useTcheStore.getState().tenant.id;
   try {
-    const snapshot = await fetchCloudOrders(cfg, tenantId, fetchFn);
+    const openHere = useTcheStore.getState().orders.filter((o) => o.status === 'OPEN' || o.status === 'PAYING').map((o) => o.id);
+    const snapshot = await fetchCloudOrders(cfg, tenantId, fetchFn, openHere);
     let st = useTcheStore.getState();
     if (!st.cloud || st.tenant.id !== tenantId) return;
     if (!catalogFresh && missingCatalog(snapshot, { productIds: st.products.map((p) => p.id), tableIds: st.tables.map((t) => t.id) })) {

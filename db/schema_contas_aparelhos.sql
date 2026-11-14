@@ -9,7 +9,8 @@
 -- fica com a versão dele enquanto tem mudança da conta ainda não aceita (fila ou recusa).
 --
 --  1. tchefood_pull_orders(): uma foto só (um SELECT) das contas em aberto, das
---     encerradas nas últimas 24 h, dos itens e pagamentos delas e da ocupação das mesas.
+--     encerradas nas últimas 24 h, das que o aparelho ainda tem em aberto (de qualquer
+--     data), dos itens e pagamentos delas e da ocupação das mesas.
 --     Roda com o papel de quem chama (a RLS da loja vale) e só devolve a loja do token.
 --  2. Duas contas na mesma mesa (dois aparelhos abriram a mesma mesa antes de um ver o
 --     outro): a segunda conta é recusada (TCHEFOOD_MESA_OCUPADA). O aparelho dela passa
@@ -34,15 +35,25 @@
 -- -----------------------------------------------------------------------------
 -- As colunas são as dos tipos em src/types.ts (Order, OrderItem, Payment): nada além
 -- delas desce, para o aparelho não reenviar numa atualização uma coluna que não conhece.
-CREATE OR REPLACE FUNCTION tchefood_pull_orders()
+--
+-- p_order_ids: contas que o aparelho tem em aberto. Elas descem como estão no banco mesmo
+-- encerradas há mais de 24 h: um aparelho que ficou mais de um dia sem internet recebe o
+-- fechamento feito em outro aparelho e libera a mesa (Codex no PR #54). Até 500 ids.
+DROP FUNCTION IF EXISTS tchefood_pull_orders();
+CREATE OR REPLACE FUNCTION tchefood_pull_orders(p_order_ids JSONB DEFAULT '[]'::jsonb)
 RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = public AS $$
-    WITH o AS (
+    WITH asked AS (
+        SELECT x::uuid AS id
+          FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(p_order_ids) = 'array' THEN p_order_ids ELSE '[]'::jsonb END) x
+         LIMIT 500
+    ), o AS (
         SELECT id, tenant_id, table_id, opened_by_user_id, status, customer_count, customer_cpf, subtotal_items,
                charge_service_fee, service_fee_pct, service_fee_amount, discount_amount, total_amount, paid_amount,
                remaining_balance, nfce_status, nfce_key, opened_at, closed_at, pickup_number, pickup_name, fulfillment_type
           FROM orders
          WHERE tenant_id = tchefood_tenant()
-           AND (status IN ('OPEN', 'PAYING') OR COALESCE(closed_at, opened_at) >= now() - interval '24 hours')
+           AND (status IN ('OPEN', 'PAYING') OR COALESCE(closed_at, opened_at) >= now() - interval '24 hours'
+                OR id IN (SELECT id FROM asked))
     ), i AS (
         SELECT it.id, it.order_id, it.product_id, it.waiter_id, it.quantity, it.unit_price, it.modifiers_unit_price,
                it.total_item_price, it.meat_doneness, it.notes, it.sector, it.status, it.is_paid, it.origin, it.created_at,
@@ -199,8 +210,8 @@ DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
         REVOKE ALL ON FUNCTION tchefood_order_closed_frees_table() FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_pull_orders() FROM PUBLIC, anon;
-        GRANT EXECUTE ON FUNCTION tchefood_pull_orders() TO authenticated;
+        REVOKE ALL ON FUNCTION tchefood_pull_orders(JSONB) FROM PUBLIC, anon;
+        GRANT EXECUTE ON FUNCTION tchefood_pull_orders(JSONB) TO authenticated;
         REVOKE ALL ON FUNCTION tchefood_order_table_free_guard() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_order_reserve_table() FROM PUBLIC, anon, authenticated;
         REVOKE ALL ON FUNCTION tchefood_table_occupancy_guard() FROM PUBLIC, anon, authenticated;

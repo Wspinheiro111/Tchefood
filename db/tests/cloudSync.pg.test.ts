@@ -3959,6 +3959,34 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().orders.find((o) => o.id === x)!.status).toBe('CANCELED');
     });
 
+    it('aparelho mais de 24 h sem internet: a conta aberta aqui e fechada em outro aparelho desce fechada e a mesa fica livre (Codex no PR #54)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(49);
+      await expectSynced('mesa 49');
+      const order = ok(st().openTable(mesa.id, 2, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await expectSynced('conta 49');
+      // B recebe a conta toda (o banco fecha e libera a mesa) e isso foi há mais de 24 h.
+      await bPaysCard(order.id, Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${order.id}'`)));
+      expect(sql(`SELECT status FROM orders WHERE id = '${order.id}'`)).toBe('CLOSED');
+      sql(`SET session_replication_role = replica;
+           UPDATE orders SET opened_at = now() - interval '3 days', closed_at = now() - interval '2 days' WHERE id = '${order.id}';
+           SET session_replication_role = origin;`);
+      // Sem pedir a conta pelo id, a leitura não a traria (fora das 24 h).
+      const plain = await fetchCloudOrders(cfgA(), TENANT, fetchA());
+      expect(plain.orders.some((o) => o.id === order.id)).toBe(false);
+      expect(st().orders.find((o) => o.id === order.id)!.status).toBe('OPEN');
+      // A rodada do laço pede as contas abertas aqui pelo id.
+      useTcheStore.setState({ pullStatus: { ...st().pullStatus, last_orders_pull_at: null } });
+      await syncOnce(fetchA());
+      expect(st().pullStatus.last_orders_pull_at).not.toBeNull();
+      expect(st().orders.find((o) => o.id === order.id)).toMatchObject({ status: 'CLOSED', remaining_balance: 0 });
+      expect(st().tables.find((t) => t.id === mesa.id)).toMatchObject({ status: 'FREE', current_order_id: null });
+      expect(st().orderItems.filter((i) => i.order_id === order.id).every((i) => i.is_paid)).toBe(true);
+    });
+
     it('a rodada de sincronização lê as contas a cada 10 s, com a fila vazia', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(46);
