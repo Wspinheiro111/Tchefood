@@ -83,7 +83,15 @@ describe('2. faturamento por forma', () => {
     expect(by.DEBIT).toMatchObject({ gross: 50, fee: 0, withoutRule: 50 });
     expect(by.CASH).toMatchObject({ gross: 30, fee: 0, withoutRule: 0 });
     expect(by.PIX).toMatchObject({ gross: 0, count: 0 });
-    expect(by.VOUCHER).toMatchObject({ gross: 0 });
+    // Nenhuma tela registra VR/VA hoje: a linha sai como "não registrado", não R$ 0,00.
+    expect(by.VOUCHER).toMatchObject({ gross: 0, notTracked: true });
+    expect(by.PIX!.notTracked).toBe(false);
+    // Dinheiro de 31/12 23:00 sem turno de caixa aberto.
+    expect([r.cashOutsideSessions, r.cashOutsideSessionsCount]).toEqual([30, 1]);
+    const csv = toCsv(revenueDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g' }));
+    expect(csv).toContain('Vale-refeição / alimentação;;não registrado;não registrado;não registrado;');
+    expect(csv).toContain('Estorno feito na maquininha');
+    expect(csv).toContain('sem turno de caixa aberto');
     expect(by['APP:ifood']).toMatchObject({ gross: 80, fee: 9.6, count: 1, marketplace: true });
     expect(r.totalGross).toBe(260);
     expect(r.totalFee).toBe(12.9);
@@ -109,6 +117,8 @@ describe('2. faturamento por forma', () => {
       P,
     );
     expect(r.closings.map((c) => [c.openedBy, c.difference])).toEqual([['Ana', 2.5], ['Ana', -10]]);
+    const inside = revenueByMethod({ ...emptyRevenueInput, cashSessions: [session({})], payments: [pay({ method: 'CASH', acquirer: 'CASH_DESK', created_at: '2025-05-01T20:00:00-03:00' })] }, P);
+    expect(inside.cashOutsideSessionsCount).toBe(0);
     expect(r.closingsDifference).toBe(-7.5);
     expect(r.openSessions).toBe(1);
     expect([r.supplies, r.withdrawals]).toEqual([50, 70.5]);

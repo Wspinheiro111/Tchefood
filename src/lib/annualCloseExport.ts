@@ -52,7 +52,7 @@ export interface ReportDoc {
 
 /** Aviso de registros que ficaram de fora por data inválida (nunca somem calados). */
 const invalid = (n: number, what: string): string[] =>
-  n > 0 ? [`ATENÇÃO: ${n} ${what} com data inválida ficaram FORA deste relatório. Avise o suporte antes de enviar ao contador.`] : [];
+  n > 0 ? [`ATENÇÃO: ${n} ${what} com data inválida (não dá para saber o ano) ficaram fora. Se for deste ano, o total está menor: avise o suporte antes de enviar ao contador.`] : [];
 
 const qty = (v: number) => Math.round(v * 1000) / 1000;
 const day = (iso: string) => {
@@ -100,6 +100,9 @@ export function revenueDoc(r: RevenueReport, base: Omit<ReportDoc, 'title' | 'ta
       'Pagamentos aprovados pela data do pagamento (recusados ficam fora). Dinheiro devolvido ao cliente por sangria NÃO abate daqui: está na lista de sangrias do relatório de despesas. Gorjeta não entra no faturamento.',
       'Entrega própria paga em dinheiro conta na data do acerto com o entregador (é quando o dinheiro entra no caixa).',
       'Taxa = estimativa pela taxa da maquininha cadastrada em Taxas e recebíveis, sobre conta + gorjeta (como a maquininha cobra). Confira com os extratos.',
+      'Estorno feito na maquininha NÃO chega ao Tchê Food: abata pelo extrato da adquirente.',
+      ...(r.rows.some((x) => x.key === 'VOUCHER' && x.notTracked) ? ['Vale-refeição/alimentação: o app ainda não registra esta forma; o que foi passado como VR/VA na maquininha está dentro de crédito/débito (com a taxa de crédito/débito). Separe pelo extrato da adquirente.'] : []),
+      ...(r.cashOutsideSessionsCount > 0 ? [`${r.cashOutsideSessionsCount} recebimento(s) em dinheiro (R$ ${br(r.cashOutsideSessions)}) foram feitos sem turno de caixa aberto: estão no Dinheiro, mas não aparecem nos fechamentos.`] : []),
       ...(r.simulatorCount > 0 ? [`${r.simulatorCount} pagamento(s) no simulador de maquininha (R$ ${br(r.simulatorAmount)}) ficaram de fora: não são dinheiro real.`] : []),
       ...(r.totalWithoutRule > 0 ? [`R$ ${br(r.totalWithoutRule)} foram recebidos sem taxa cadastrada: a taxa deles NÃO foi descontada.`] : []),
       `Gorjetas no ano: R$ ${br(r.tips)}.`,
@@ -111,13 +114,13 @@ export function revenueDoc(r: RevenueReport, base: Omit<ReportDoc, 'title' | 'ta
       {
         title: 'Faturamento por forma de recebimento',
         head: ['Forma de recebimento', 'Qtde', 'Bruto (R$)', 'Taxa estimada (R$)', 'Líquido (R$)', 'Sem taxa cadastrada (R$)'],
-        rows: r.rows.map((x) => [x.label, String(x.count), x.gross, x.fee, x.net, x.withoutRule]),
+        rows: r.rows.map((x) => (x.notTracked ? [x.label, '', 'não registrado', 'não registrado', 'não registrado', ''] : [x.label, String(x.count), x.gross, x.fee, x.net, x.withoutRule])),
         foot: ['Total', String(r.rows.reduce((a, x) => a + x.count, 0)), r.totalGross, r.totalFee, r.totalNet, r.totalWithoutRule],
       },
       {
         title: 'Bruto por mês (R$)',
         head: ['Forma', ...MONTHS, 'Total'],
-        rows: r.rows.map((x) => [x.label, ...(r.monthly[x.key] ?? []), x.gross]),
+        rows: r.rows.map((x) => (x.notTracked ? [x.label, ...MONTHS.map(() => ''), 'não registrado'] : [x.label, ...(r.monthly[x.key] ?? []), x.gross])),
         foot: ['Total', ...r.monthlyTotal, r.totalGross],
       },
       {
@@ -144,6 +147,7 @@ export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 
     title: REPORT_TITLE.open,
     notes: [
       'A RECEBER de maquininha: vendas até a posição com repasse previsto para depois dela, pelo prazo e taxa cadastrados (estimativa; feriado não conta; confira com a agenda da adquirente).',
+      'Estorno feito na maquininha NÃO chega ao Tchê Food: venda estornada ainda aparece aqui como a receber. Confira com a agenda da adquirente.',
       'A RECEBER de entregador: dinheiro de entregas pagas na entrega feitas até a posição e ainda não acertadas.',
       ...(r.cardWithoutRuleCount > 0 ? [`${r.cardWithoutRuleCount} venda(s) no ano na maquininha (R$ ${br(r.cardWithoutRule)}) sem taxa cadastrada: não dá para saber se já caíram.`] : []),
       'NÃO registrados no Tchê Food (informe pelo seu controle): contas a pagar de fornecedores (boletos/duplicatas), fiado e convênios de clientes, repasses pendentes dos apps de delivery.',

@@ -4,7 +4,7 @@
  * Só proprietário e gerente. Nada é inventado: o que o app não registra aparece como
  * "não registrado", e o que é estimativa vem marcado.
  */
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { FileSpreadsheet, Printer } from 'lucide-react';
 import { Btn, toast } from '../components/ui';
 import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
@@ -89,10 +89,16 @@ export function AnnualClose() {
     [payments, stockMovements, purchaseInvoices, cashSessions, courierSettlements, cashMovements, ownDeliveries],
   );
   const [picked, setPicked] = useState<number | null>(null);
+  // "Agora" fixo enquanto a tela está aberta: os números, o título e as notas usam o mesmo instante.
+  const [now, setNow] = useState(() => new Date());
   // Relógio do aparelho fora de 2000–2100 deixa a lista sem o ano corrente; sem nenhum ano, usa 2000.
-  const year = picked !== null && validYear(picked) && years.includes(picked) ? picked : defaultYear(years) ?? 2000;
+  const year = picked !== null && validYear(picked) && years.includes(picked) ? picked : defaultYear(years, now) ?? 2000;
+  // Ano escolhido que sumiu da lista (sincronização): volta ao padrão e não pula de volta depois.
+  useEffect(() => {
+    if (picked !== null && !years.includes(picked)) setPicked(null);
+  }, [picked, years]);
   const period = useMemo(() => yearPeriod(year), [year]);
-  const partial = yearInProgress(period);
+  const partial = yearInProgress(period, now);
 
   const testMovements = useMemo(() => testInvoiceMovementIds(stockMovements, purchaseInvoiceItems, purchaseInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices]);
   const inventory = useMemo(() => inventoryAt(products, stockMovements, period, testMovements), [products, stockMovements, period, testMovements]);
@@ -101,19 +107,20 @@ export function AnnualClose() {
     [payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff, period],
   );
   const open = useMemo(
-    () => openPositionsAt({ payments, feeRules, ownDeliveries, courierSettlements, couriers, orders }, period),
-    [payments, feeRules, ownDeliveries, courierSettlements, couriers, orders, period],
+    () => openPositionsAt({ payments, feeRules, ownDeliveries, courierSettlements, couriers, orders }, period, now),
+    [payments, feeRules, ownDeliveries, courierSettlements, couriers, orders, period, now],
   );
   const expenses = useMemo(() => expensesByCategory({ purchaseInvoices, suppliers, courierSettlements, cashMovements, revenue }, period), [purchaseInvoices, suppliers, courierSettlements, cashMovements, revenue, period]);
 
   if (!isManagerRole(user?.role)) return <p className="p-6">Só o proprietário e o gerente veem o fechamento anual.</p>;
 
   const partialNote = partial ? [`O ano de ${year} ainda não terminou: os números vão até agora, não até 31/12.`] : [];
+  const invalidCount = inventory.invalidDates + revenue.invalidDates + open.invalidDates + expenses.invalidDates;
   const appNote = 'Pedidos dos apps de delivery (iFood etc.) NÃO estão neste relatório: a integração ainda está em homologação. Informe o faturamento e as comissões pelo extrato do app.';
 
   const build = (kind: AnnualReportKind): ReportDoc => {
     const base = {
-      period: periodLabel(kind, period),
+      period: periodLabel(kind, period, now),
       store: { name: tenant.name, legalName: tenant.legal_name, cnpj: tenant.cnpj, city: tenant.city, state: tenant.state },
       generatedAt: new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }),
     };
@@ -131,10 +138,10 @@ export function AnnualClose() {
 
   const actions = (kind: AnnualReportKind) => androidApp ? null : (
     <div className="flex flex-wrap gap-2">
-      <Btn variant="secondary" onClick={() => download(fileName(kind, year, 'csv'), toCsv(build(kind)), 'text/csv;charset=utf-8')}>
+      <Btn variant="secondary" aria-label={`${REPORT_TITLE[kind]}: baixar Excel (CSV)`} onClick={() => download(fileName(kind, year, 'csv'), toCsv(build(kind)), 'text/csv;charset=utf-8')}>
         <FileSpreadsheet className="h-4 w-4" /> Excel (CSV)
       </Btn>
-      <Btn variant="secondary" onClick={() => printDoc(build(kind), fileName(kind, year, 'html'))}>
+      <Btn variant="secondary" aria-label={`${REPORT_TITLE[kind]}: PDF ou imprimir`} onClick={() => printDoc(build(kind), fileName(kind, year, 'html'))}>
         <Printer className="h-4 w-4" /> PDF / imprimir
       </Btn>
     </div>
@@ -145,7 +152,7 @@ export function AnnualClose() {
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="font-black">{REPORT_TITLE[kind]}</h3>
-          <p className="text-sm text-slate-500">{periodLabel(kind, period)}</p>
+          <p className="text-sm text-slate-500">{periodLabel(kind, period, now)}</p>
         </div>
         {actions(kind)}
       </div>
@@ -154,7 +161,7 @@ export function AnnualClose() {
   );
 
   const line = (label: string, value: string, hint?: string) => (
-    <div className="flex items-baseline justify-between gap-3 border-b border-slate-100 py-1 text-sm last:border-0">
+    <div key={label} className="flex items-baseline justify-between gap-3 border-b border-slate-100 py-1 text-sm last:border-0">
       <span>
         {label}
         {hint && <span className="ml-1 text-xs text-slate-500">{hint}</span>}
@@ -169,22 +176,35 @@ export function AnnualClose() {
         <label className="font-bold" htmlFor="annual-year">
           Ano do fechamento
         </label>
-        <select id="annual-year" className="min-h-touch rounded-xl border border-slate-300 bg-base px-3 font-bold" value={year} onChange={(e) => setPicked(Number(e.target.value))}>
+        <select
+          id="annual-year"
+          className="min-h-touch rounded-xl border border-slate-300 bg-base px-3 font-bold"
+          value={year}
+          onChange={(e) => {
+            setPicked(Number(e.target.value));
+            setNow(new Date());
+          }}
+        >
           {years.map((y) => (
             <option key={y} value={y}>
               {y}
             </option>
           ))}
         </select>
-        <span className="text-sm text-slate-500">01/01/{year} a 31/12/{year}, horário de Brasília.</span>
+        <span className="text-sm text-slate-500">{periodLabel('revenue', period, now)}, horário de Brasília.</span>
         {androidApp && (
           <p role="status" className="w-full rounded-xl bg-amarelo/15 p-3 text-sm">
-            O app da maquininha não salva planilha nem PDF. Para exportar, entre no Tchê Food pelo navegador do computador ou do celular com a loja ligada na nuvem.
+            O app Tchê Food para Android não salva planilha nem PDF. Para exportar, entre no Tchê Food pelo navegador do computador ou do celular com a loja ligada na nuvem.
           </p>
         )}
         {partial && (
           <p role="status" className="w-full rounded-xl bg-amarelo/15 p-3 text-sm">
             {year} ainda não terminou: os números vão até agora. Gere de novo depois de 31/12.
+          </p>
+        )}
+        {invalidCount > 0 && (
+          <p role="alert" className="w-full rounded-xl bg-rose-100 p-3 text-sm">
+            Atenção: {invalidCount} registro(s) com data inválida ficaram fora dos relatórios. Se forem deste ano, os totais estão menores: avise o suporte antes de enviar ao contador.
           </p>
         )}
       </section>
@@ -204,19 +224,22 @@ export function AnnualClose() {
       {card(
         'revenue',
         <>
-          {revenue.rows.map((r) => line(r.label, formatBRL(r.gross), r.fee > 0 ? `taxa estimada ${formatBRL(r.fee)}` : undefined))}
+          {revenue.rows.map((r) => line(r.label, r.notTracked ? 'não registrado' : formatBRL(r.gross), r.notTracked ? '(VR/VA está dentro de crédito/débito)' : r.fee > 0 ? `taxa estimada ${formatBRL(r.fee)}` : undefined))}
           {line('Total vendido', formatBRL(revenue.totalGross))}
-          {line('Líquido estimado (sem as taxas cadastradas)', formatBRL(revenue.totalNet))}
+          {line('Líquido estimado (já descontadas as taxas cadastradas)', formatBRL(revenue.totalNet))}
+          {line('Gorjetas (fora do total)', formatBRL(revenue.tips))}
           {revenue.totalWithoutRule > 0 && line('Recebido sem taxa cadastrada', formatBRL(revenue.totalWithoutRule), '(taxa não descontada)')}
           {revenue.simulatorCount > 0 && line('Simulador de maquininha (fora do total)', formatBRL(revenue.simulatorAmount))}
           {line('Fechamentos de caixa', String(revenue.closings.length), revenue.closings.length > 0 ? `diferença somada ${formatBRL(revenue.closingsDifference)}` : undefined)}
+          {revenue.cashOutsideSessionsCount > 0 && line('Dinheiro recebido sem caixa aberto', formatBRL(revenue.cashOutsideSessions), '(está no Dinheiro, fora dos fechamentos)')}
+          <p className="mt-2 text-sm text-slate-500">Fora deste relatório: pedidos dos apps de delivery (informe pelo extrato do app) e estornos feitos na maquininha (abata pelo extrato da adquirente).</p>
         </>,
       )}
 
       {card(
         'open',
         <>
-          {line('A receber de maquininha (repasse depois de 31/12)', formatBRL(open.cardReceivablesNet), '(estimado)')}
+          {line(partial ? 'A receber de maquininha (repasse de hoje em diante)' : `A receber de maquininha (repasse depois de 31/12/${year})`, formatBRL(open.cardReceivablesNet), '(estimado)')}
           {open.cardWithoutRuleCount > 0 && line('Vendas na maquininha sem taxa cadastrada', formatBRL(open.cardWithoutRule), '(não dá para saber se caíram)')}
           {line('A receber: dinheiro com entregadores', formatBRL(open.courierCashTotal))}
           {line('A pagar a entregadores próprios', formatBRL(open.courierPayablesTotal))}

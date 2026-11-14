@@ -46,21 +46,33 @@ const inYear = (iso: string | null | undefined, p: YearPeriod): boolean => {
   return t !== null && t >= p.from && t < p.to;
 };
 
+// Formatadores criados uma vez: criar um Intl.DateTimeFormat por registro trava a tela
+// com um ano de vendas (200 mil pagamentos ≈ 10 s).
+const YMD = new Intl.DateTimeFormat('en-US', { timeZone: SHIFT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+
+/** Y/M/D de Brasília do instante (m de 0 a 11). */
+function brasiliaYmd(t: number): { y: number; m: number; d: number } {
+  const parts = Object.fromEntries(YMD.formatToParts(new Date(t)).map((x) => [x.type, x.value]));
+  return { y: Number(parts.year), m: Number(parts.month) - 1, d: Number(parts.day) };
+}
+
 /** Ano de Brasília do instante. */
 export function brasiliaYear(iso: string | null | undefined): number | null {
   const t = at(iso);
   if (t === null) return null;
-  return Number(new Intl.DateTimeFormat('en-US', { timeZone: SHIFT_TIME_ZONE, year: 'numeric' }).format(new Date(t)));
+  return brasiliaYmd(t).y;
 }
 
 /** Mês (1 a 12) de Brasília do instante. */
 function brasiliaMonth(t: number): number {
-  return Number(new Intl.DateTimeFormat('en-US', { timeZone: SHIFT_TIME_ZONE, month: 'numeric' }).format(new Date(t)));
+  return brasiliaYmd(t).m + 1;
 }
+
+const DMY = new Intl.DateTimeFormat('pt-BR', { timeZone: SHIFT_TIME_ZONE, day: '2-digit', month: '2-digit', year: 'numeric' });
 
 /** "dd/mm/aaaa" no calendário de Brasília. */
 export function brasiliaDate(t: number | Date): string {
-  return new Date(t).toLocaleDateString('pt-BR', { timeZone: SHIFT_TIME_ZONE, day: '2-digit', month: '2-digit', year: 'numeric' });
+  return DMY.format(new Date(t));
 }
 
 /** Anos com algum registro, mais o ano corrente, do mais novo para o mais antigo. */
@@ -97,14 +109,6 @@ export function yearInProgress(p: YearPeriod, now: Date = new Date()): boolean {
 /** Até onde vale a "posição": fim do ano, ou agora se o ano ainda não terminou. */
 export function positionCutoff(p: YearPeriod, now: Date = new Date()): number {
   return Math.min(p.to, now.getTime());
-}
-
-/** Y/M/D de Brasília do instante. */
-function brasiliaYmd(t: number): { y: number; m: number; d: number } {
-  const parts = Object.fromEntries(
-    new Intl.DateTimeFormat('en-US', { timeZone: SHIFT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(t)).map((x) => [x.type, x.value]),
-  );
-  return { y: Number(parts.year), m: Number(parts.month) - 1, d: Number(parts.day) };
 }
 
 /**
@@ -279,6 +283,11 @@ export interface RevenueRow {
   /** Parte do bruto sem taxa/comissão cadastrada (a taxa dela NÃO foi descontada). */
   withoutRule: number;
   marketplace: boolean;
+  /**
+   * Forma que o app não tem como registrar hoje (vale-refeição/alimentação: o caixa
+   * escolhe crédito ou débito na maquininha). Sai como "não registrado", não como R$ 0,00.
+   */
+  notTracked: boolean;
 }
 
 export interface CashClosingRow {
@@ -315,6 +324,9 @@ export interface RevenueReport {
   /** Pagamentos do simulador de maquininha (MOCK) no ano: não são dinheiro real, ficam fora. */
   simulatorCount: number;
   simulatorAmount: number;
+  /** Dinheiro recebido fora de qualquer turno de caixa (não aparece nos fechamentos). */
+  cashOutsideSessions: number;
+  cashOutsideSessionsCount: number;
 }
 
 const zeros = () => Array.from({ length: 12 }, () => 0);
@@ -386,6 +398,7 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
     else row.fee += Math.round((sale.total_cents * pct) / 100);
   }
   const rows: RevenueRow[] = [...acc.entries()].map(([key, r]) => ({
+    notTracked: key === 'VOUCHER' && r.count === 0,
     key,
     label: r.label,
     gross: fromCents(r.gross),
@@ -429,6 +442,20 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
     });
   }
   closings.sort((a, b) => (at(a.closedAt) ?? 0) - (at(b.closedAt) ?? 0));
+  // Dinheiro fora de turno: pagamento em dinheiro sem nenhum turno de caixa aberto naquela hora.
+  const windows = input.cashSessions
+    .map((s) => ({ from: at(s.opened_at), to: s.status === 'CLOSED' ? at(s.closed_at) : Number.POSITIVE_INFINITY }))
+    .filter((w): w is { from: number; to: number } => w.from !== null && w.to !== null);
+  let outsideC = 0;
+  let outsideN = 0;
+  for (const pay of input.payments) {
+    if (pay.status !== 'APPROVED' || pay.method !== 'CASH' || pay.acquirer === 'MOCK') continue;
+    const t = at(pay.created_at);
+    if (t === null || t < p.from || t >= p.to) continue;
+    if (windows.some((w) => t >= w.from && t <= w.to)) continue;
+    outsideC += toCents(pay.amount);
+    outsideN += 1;
+  }
   let suppliesC = 0;
   let withdrawalsC = 0;
   for (const mv of input.cashMovements) {
@@ -455,6 +482,8 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod): RevenueRepo
     invalidDates,
     simulatorCount: simCount,
     simulatorAmount: fromCents(simC),
+    cashOutsideSessions: fromCents(outsideC),
+    cashOutsideSessionsCount: outsideN,
   };
 }
 
