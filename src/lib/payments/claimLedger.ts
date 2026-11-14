@@ -22,6 +22,14 @@ export interface LocalClaim {
   /** Leituras do servidor em que a reserva não apareceu (para limpar registros de cobranças que caíram). */
   absent_count?: number;
   absent_first_at?: number;
+  /** Termos da reserva pedida (o pagamento registrado com a chave precisa bater). Ausente em registros antigos. */
+  terms?: ClaimTerms;
+}
+
+export interface ClaimTerms {
+  method: string;
+  acquirer: string;
+  amount_cents: number;
 }
 
 /** Segredo novo da reserva: 32 bytes aleatórios em hex (64 caracteres). */
@@ -95,10 +103,10 @@ function persist() {
  * A reserva vai ser pedida; a cobrança vai começar. Gravado ANTES de chamar o servidor (com o segredo): se a
  * resposta se perder, o aparelho ainda consegue liberar a reserva que o servidor criou.
  */
-export function beginLocalClaim(key: string, orderId: string, releaseToken: string | null = null): void {
+export function beginLocalClaim(key: string, orderId: string, releaseToken: string | null = null, terms?: ClaimTerms): void {
   const l = load();
   active.add(key);
-  l.inFlight = [...l.inFlight.filter((c) => c.key !== key), { key, order_id: orderId, started_at: new Date().toISOString(), release_token: releaseToken, state: 'charging' }];
+  l.inFlight = [...l.inFlight.filter((c) => c.key !== key), { key, order_id: orderId, started_at: new Date().toISOString(), release_token: releaseToken, state: 'charging', ...(terms ? { terms } : {}) }];
   persist();
 }
 

@@ -242,11 +242,14 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
         return;
       }
       if (result.status === 'DECLINED') {
-        s.registerPayment({
-          orderId, amount, method, status: 'DECLINED', terminal_id: result.terminal_id, acquirer: result.acquirer, acquirer_cnpj: null,
-          card_brand: null, nsu: null, authorization_code: null, terminal_serial: result.terminal_serial, idempotency_key, item_ids: [],
-          charge_request_id: req.request_id,
-        });
+        // Point: recusa só vira pagamento recusado (com a chave da cobrança) quando o servidor disse que recusou.
+        if (result.acquirer !== 'MERCADO_PAGO' || result.server_confirmed) {
+          s.registerPayment({
+            orderId, amount, method, status: 'DECLINED', terminal_id: result.terminal_id, acquirer: result.acquirer, acquirer_cnpj: null,
+            card_brand: null, nsu: null, authorization_code: null, terminal_serial: result.terminal_serial, idempotency_key, item_ids: [],
+            charge_request_id: req.request_id,
+          });
+        }
         // Nada cobrado: a reserva sai.
         noCharge(`Maquininha recusou: ${result.reason}`);
         toast.error(`❌ Transação recusada: ${result.reason}`);

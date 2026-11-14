@@ -22,10 +22,11 @@
 --    conta é travada (FOR UPDATE) antes da soma: tchefood_open_terminal_charge trava a mesma
 --    linha, então cobrança nova e pagamento na mesma conta não passam juntos do saldo. Cobrança
 --    que termina (recusada, cancelada, expirada, estornada) deixa de reservar; nunca acontece o
---    contrário (nada volta a reservar sem passar pela trava da conta). Cobrança aprovada deixa de
---    reservar quando o pagamento do Mercado Pago dela é gravado e continua sem reservar se ele depois
---    for estornado ou recusado (REFUNDED, DECLINED): só o pagamento ainda PENDING não a libera
---    (segunda revisão independente, item 3).
+--    contrário (nada volta a reservar sem passar pela trava da conta). Cobrança aprovada só deixa de
+--    reservar com o pagamento APROVADO do Mercado Pago dela (conferido por trg_payments_mercado_pago) ou
+--    quando ela mesma sai de "approved" pela resolução (tchefood_resolve_point_charge: estornada). Pagamento
+--    PENDING, DECLINED ou REFUNDED com a chave não libera nada; o gatilho do Mercado Pago só aceita DECLINED
+--    com a cobrança recusada/cancelada/expirada e REFUNDED com a cobrança estornada (auditoria r7 P0-01).
 --    Auditoria r4 P0-01: o UPDATE também passa pela conferência quando o pagamento VIRA aprovado,
 --    quando o valor aprovado sobe, quando ele muda de conta, de loja, de chave ou de credenciadora.
 --    Conta de outra loja é recusada no UPDATE. No INSERT e no UPDATE, só o pagamento do Mercado Pago
@@ -60,7 +61,8 @@
 -- usada por outro pagamento, TF010 pagamento sem a reserva que o cobre (claim_required), TF011 reserva ainda em
 -- andamento no aparelho que a pediu (claim_active), TF012 saldo da conta abaixo do que está reservado
 -- (reserved_exceeds_balance), TF013 pagamento com a chave de uma reserva já liberada (claim_released).
--- 8. Revisão independente (P1-B, P2-A, P3): na loja com Point (tchefood_point_store) o próprio gatilho de payments
+-- 8. Revisão independente (P1-B, P2-A, P3): na loja com Point o próprio gatilho de payments (desde a auditoria r7, em
+--    toda loja: item 12)
 --    exige que o pagamento aprovado fora da Point tenha a reserva aberta da mesma conta, até o valor dela e com a
 --    mesma forma e credenciadora (TF010), sem confiar na lista de maquininhas do aparelho. Única exceção,
 --    conferida no banco: o dinheiro do entregador no acerto da senha paga na entrega. A reserva consumida fica
@@ -82,6 +84,12 @@
 --    cobranças da Point abertas ou aprovadas sem pagamento). Desconto, item cancelado ou 10% retirado depois da
 --    reserva deixaria o dinheiro já recebido (Point ou dinheiro reservado) sem saldo para virar pagamento. Todo
 --    recálculo do total passa por UPDATE em orders (tchefood_recalc_order), então o gatilho fica ali (TF012).
+-- 12. Auditoria r7 P1-01 (decisão do Will: toda loja na nuvem exige a reserva): o TF010 vale em toda loja, com ou sem
+--    Point. Todo pagamento aprovado fora do Mercado Pago precisa da reserva aberta que confere com ele (mesma conta,
+--    até o valor dela, mesma forma e credenciadora). Única exceção, conferida no banco: o dinheiro do entregador no
+--    acerto da senha paga na entrega. tchefood_point_store, que só servia para isso, sai.
+-- 13. Auditoria r7 P0-01: cobrança aprovada só deixa de reservar com o pagamento APROVADO do Mercado Pago dela ou com o
+--    estorno resolvido (item 2).
 -- =============================================================================
 
 -- Prazos da reserva, num lugar só. Prazo de atividade: quanto vale cada renovação do aparelho que cobra.
@@ -249,6 +257,12 @@ BEGIN
     IF EXISTS (SELECT 1 FROM payment_claims pc WHERE pc.idempotency_key = NEW.idempotency_key) THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a chave % já é de outro pagamento (dinheiro ou outra maquininha).', NEW.idempotency_key USING ERRCODE = 'TF009';
     END IF;
+    -- Revisão r8 (F1): chave que já tem pagamento gravado (de qualquer forma ou status) não vira cobrança. Senão o
+    -- pagamento antigo ocuparia a chave (única em payments) e o pagamento aprovado da cobrança nunca entraria.
+    IF EXISTS (SELECT 1 FROM payments p WHERE p.idempotency_key = NEW.idempotency_key) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: a chave % já é de um pagamento gravado.', NEW.idempotency_key
+            USING ERRCODE = 'TF009', DETAIL = 'key_in_use';
+    END IF;
     RETURN NEW;
 END;
 $$;
@@ -268,7 +282,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
        AND c.idempotency_key IS DISTINCT FROM p_exclude_key
        AND (c.status IN ('creating', 'pending', 'at_terminal', 'manual_review')
             OR (c.status = 'approved' AND NOT EXISTS (
-                SELECT 1 FROM payments p WHERE p.tenant_id = p_tenant AND p.idempotency_key = c.idempotency_key AND p.status <> 'PENDING'
+                SELECT 1 FROM payments p WHERE p.tenant_id = p_tenant AND p.idempotency_key = c.idempotency_key AND p.status = 'APPROVED'
                   AND p.acquirer::text = 'MERCADO_PAGO')));
 $$;
 
@@ -296,16 +310,9 @@ $$;
 -- -----------------------------------------------------------------------------
 -- 2. Gatilho em payments
 -- -----------------------------------------------------------------------------
--- Loja com Point (auditoria r5 P1-B), decidido no servidor: tem maquininha MERCADO_PAGO cadastrada ou já teve
--- cobrança da Point. pos_terminals não tem marca de ativa; a segunda condição fecha o caso da maquininha que
--- troca de credenciadora no cadastro com cobrança dela ainda reservando (a FK de terminal_charges não deixa
--- apagar a maquininha que já cobrou).
-CREATE OR REPLACE FUNCTION tchefood_point_store(p_tenant UUID)
-RETURNS BOOLEAN
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
-    SELECT EXISTS (SELECT 1 FROM pos_terminals t WHERE t.tenant_id = p_tenant AND t.acquirer::text = 'MERCADO_PAGO')
-        OR EXISTS (SELECT 1 FROM terminal_charges c WHERE c.tenant_id = p_tenant);
-$$;
+-- Auditoria r7 P1-01: a reserva vale em toda loja, então a função que dizia se a loja tinha Point
+-- (tchefood_point_store) não serve mais a ninguém e sai.
+DROP FUNCTION IF EXISTS tchefood_point_store(UUID);
 
 -- Dinheiro que o entregador trouxe da senha paga na entrega (acerto do entregador, settleCourier em
 -- src/store/useTcheStore.ts, chave "entrega-<id da entrega>"). Só vale com a entrega conferida no banco: da mesma
@@ -398,10 +405,11 @@ BEGIN
                 v_exclude := NEW.idempotency_key; -- é este pagamento que consome a própria reserva
             END IF;
         END IF;
-        -- Auditoria r5 P1-B: na loja com Point o servidor exige a reserva, sem confiar na lista de maquininhas do
-        -- aparelho. Única exceção, conferida no banco: o dinheiro do entregador no acerto de senha paga na entrega.
-        IF NOT v_claim_ok AND tchefood_point_store(NEW.tenant_id) AND NOT tchefood_courier_cash_payment(NEW) THEN
-            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: loja com Point: o pagamento fora dela precisa da reserva no servidor antes de receber (chave %). Nada foi gravado: peça a reserva e receba de novo.',
+        -- Auditoria r7 P1-01 (decisão do Will: toda loja na nuvem exige a reserva): em qualquer loja, todo pagamento
+        -- aprovado fora do Mercado Pago precisa da reserva aberta que confere com ele, sem confiar no aparelho.
+        -- Única exceção, conferida no banco: o dinheiro do entregador no acerto de senha paga na entrega.
+        IF NOT v_claim_ok AND NOT tchefood_courier_cash_payment(NEW) THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o pagamento precisa da reserva no servidor antes de receber (chave %). Nada foi gravado: peça a reserva e receba de novo.',
                 NEW.idempotency_key USING ERRCODE = 'TF010';
         END IF;
     END IF;
@@ -438,6 +446,26 @@ $$;
 
 -- CREATE OR REPLACE: reaplicar o arquivo não deixa a tabela um instante sem o gatilho (e troca a versão
 -- antiga, só de INSERT, por esta, que também confere o UPDATE).
+-- Revisão r8 (F2): o pagamento gravado não muda de chave, de conta nem de loja (qualquer credenciadora). Trocar a
+-- chave de um pagamento aprovado que já consumiu a reserva dele consumiria uma segunda reserva aberta; nenhum caminho
+-- do app faz isso (payments não tem UPDATE para o aparelho, e as funções do banco só inserem). Roda antes dos outros
+-- gatilhos BEFORE de payments (ordem alfabética: identity < mercado_pago < point_reservation).
+CREATE OR REPLACE FUNCTION tchefood_payment_identity_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+    IF NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key OR NEW.order_id IS DISTINCT FROM OLD.order_id
+       OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o pagamento gravado não muda de chave, de conta nem de loja.'
+            USING ERRCODE = 'TF007', DETAIL = 'payment_identity_immutable id=' || OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER trg_payments_identity_guard BEFORE UPDATE OF idempotency_key, order_id, tenant_id ON payments
+    FOR EACH ROW EXECUTE FUNCTION tchefood_payment_identity_guard();
+
 CREATE OR REPLACE TRIGGER trg_payments_point_reservation BEFORE INSERT OR UPDATE OF status, amount, order_id, tenant_id, idempotency_key, acquirer, method ON payments
     FOR EACH ROW EXECUTE FUNCTION tchefood_point_reservation_guard();
 
@@ -509,14 +537,16 @@ BEGIN
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
                'idempotency_key', c.idempotency_key, 'status', c.status, 'amount_cents', c.amount_cents,
                'raw_status_detail', c.raw_status_detail,
-               'has_payment', EXISTS (SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = c.idempotency_key))
+               -- Revisão r8 (F1): a mesma regra da soma e de point-charge (hasRegisteredPayment): só o APROVADO do Mercado Pago.
+               'has_payment', EXISTS (SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = c.idempotency_key
+                                         AND p.status = 'APPROVED' AND p.acquirer::text = 'MERCADO_PAGO'))
              ORDER BY c.created_at, c.idempotency_key), '[]'::jsonb)
       INTO v_charges
       FROM terminal_charges c
      WHERE c.tenant_id = v_tenant AND c.order_id = p_order
        AND (c.status IN ('creating', 'pending', 'at_terminal', 'manual_review')
             OR (c.status = 'approved' AND NOT EXISTS (
-                SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = c.idempotency_key AND p.status <> 'PENDING'
+                SELECT 1 FROM payments p WHERE p.tenant_id = v_tenant AND p.idempotency_key = c.idempotency_key AND p.status = 'APPROVED'
                   AND p.acquirer::text = 'MERCADO_PAGO')));
     -- Auditoria r5: as reservas de pagamento abertas da conta (presas de outro aparelho aparecem aqui para o
     -- gerente liberar com PIN).
@@ -1193,8 +1223,8 @@ BEGIN
         'tchefood_payment_claim_guard()',
         'tchefood_terminal_charge_key_guard()',
         'tchefood_payment_claim_consume()',
+        'tchefood_payment_identity_guard()',
         'tchefood_order_reserved_guard()',
-        'tchefood_point_store(UUID)',
         'tchefood_courier_cash_payment(payments)',
         'tchefood_point_reservation(UUID)',
         'tchefood_claim_payment(VARCHAR, UUID, VARCHAR, VARCHAR, BIGINT, BIGINT, UUID, TEXT)',

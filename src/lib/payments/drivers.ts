@@ -67,6 +67,11 @@ export interface TerminalDeclined {
   reason: string;
   terminal_serial: string;
   terminal_id: string | null;
+  /**
+   * Point (Mercado Pago): true só quando a recusa veio do servidor (point-charge respondeu DECLINED). Recusa
+   * local (nada foi mandado) não vira pagamento recusado com a chave da cobrança.
+   */
+  server_confirmed?: true;
 }
 
 /**

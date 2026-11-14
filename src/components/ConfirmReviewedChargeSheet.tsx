@@ -5,7 +5,11 @@ import { PinPad } from './PinPad';
 import { MIN_REASON_LENGTH, RECEIPT_CARD_BRANDS, useTcheStore, type PaymentOutcome } from '../store/useTcheStore';
 import { PointReviewSheet } from './PointReviewSheet';
 import { getReviewHoldByKey, reviewHoldKey, setReviewHold, type ReviewHold } from '../lib/payments/reviewHolds';
-import { checkHoldClaim, CLAIM_RELEASED_DURING_CHARGE, finishReclaim, reclaimForHold } from '../lib/payments/claimFlow';
+import { checkHoldClaim, CLAIM_RELEASED_DURING_CHARGE, finishReclaim, reclaimForHold, startPaymentClaim, type ClaimHandle } from '../lib/payments/claimFlow';
+import { localClaim } from '../lib/payments/claimLedger';
+import { uuid } from '../lib/ids';
+import { fetchPointReservation } from '../lib/sync/cloudPull';
+import { freshCloudConfig } from '../lib/sync/useCloudSync';
 import { requirePaymentClaim } from '../lib/payments/paymentClaim';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { formatBRL } from '../lib/money';
@@ -41,6 +45,21 @@ interface Props {
  * autorização do comprovante (nada é gerado nem preenchido sozinho), aprova com
  * o PIN e o pagamento entra sem nova cobrança. Fica em audit_logs.
  */
+export const ONLY_MANAGER_RELEASES = 'Só o gerente libera esta reserva (este aparelho não tem o código dela): use "Liberar reserva" na lista de reservas da conta e registre de novo.';
+export const CLAIM_READ_FAILED = 'Não consegui ler as reservas desta conta no servidor: tente de novo.';
+
+/** Chaves das reservas abertas da conta no servidor (sem renovar nada); null = sem leitura. */
+async function openClaimKeysOf(orderId: string): Promise<Set<string> | null> {
+  try {
+    const cfg = await freshCloudConfig();
+    if (!cfg) return null;
+    const r = await fetchPointReservation(cfg, (url, init) => fetch(url, init), orderId);
+    return new Set((r.claims ?? []).map((c) => c.idempotencyKey));
+  } catch {
+    return null;
+  }
+}
+
 export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSuccess, onReleased, onHoldChanged }: Props) {
   const [nsu, setNsu] = useState('');
   const [authCode, setAuthCode] = useState('');
@@ -82,6 +101,7 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
     if (!reasonOk) return setError(`Informe o motivo (mínimo ${MIN_REASON_LENGTH} caracteres).`);
     // Aparelho ligado à nuvem: antes de registrar, a reserva desta cobrança ainda está no servidor?
     let registerKey: string | undefined;
+    let freshClaim: ClaimHandle | null = null;
     const store = useTcheStore.getState();
     if (requirePaymentClaim(store)) {
       const current = getReviewHoldByKey(reviewHoldKey(hold)) ?? hold;
@@ -115,14 +135,39 @@ export function ConfirmReviewedChargeSheet({ open, onClose, hold, label, onSucce
         setChecking(true);
         const check = await checkHoldClaim(current.idempotency_key).finally(() => setChecking(false));
         if (!check.ok) return check.released ? released() : refuse(check.error);
+        // Sem a reserva desta chave neste aparelho (trava antiga, registro perdido): pede a reserva agora, com a
+        // chave, a forma, a maquininha e o valor do comprovante, antes de registrar (o servidor exige, TF010).
+        if (!current.idempotency_key || !localClaim(current.idempotency_key)) {
+          const key = current.idempotency_key ?? uuid();
+          setChecking(true);
+          const c = await startPaymentClaim(true, { orderId: current.order_id, key, method, acquirer, amount: current.amount }).finally(() => setChecking(false));
+          if (!c.ok && c.code === 'TF009' && current.idempotency_key) {
+            // A chave já tem reserva no servidor (a desta cobrança, sem o segredo aqui), ou teve e foi liberada:
+            // lê as reservas abertas da conta para saber qual.
+            setChecking(true);
+            const open = await openClaimKeysOf(current.order_id).finally(() => setChecking(false));
+            if (!open) return refuse(CLAIM_READ_FAILED);
+            if (open.has(current.idempotency_key)) return refuse(ONLY_MANAGER_RELEASES);
+            // Não está aberta: foi liberada (ou não vale mais). Não registra; a trava passa a pedir o estorno.
+            return released();
+          }
+          if (!c.ok) return refuse(c.error);
+          freshClaim = c.handle;
+          if (!current.idempotency_key) registerKey = key;
+        }
       }
     }
     const res = useTcheStore.getState().confirmReviewedCharge(
       { orderId: hold.order_id, nsu, authorization_code: authCode, card_brand: method === 'PIX' ? null : brand, method, acquirer, holdKey: reviewHoldKey(hold), ...(registerKey ? { registerKey } : {}) },
       { managerPin: pinValue, reason },
     );
-    if (!res.ok) return refuse(res.error);
-    if (registerKey) finishReclaim(hold.idempotency_key, registerKey);
+    if (!res.ok) {
+      // Nada registrado: a reserva pedida agora sai.
+      freshClaim?.noCharge(`Registro pelo comprovante recusado: ${res.error}`);
+      return refuse(res.error);
+    }
+    if (freshClaim) freshClaim.settle();
+    else if (registerKey) finishReclaim(hold.idempotency_key, registerKey);
     toast.success(`✅ ${formatBRL(res.data.payment.amount)} registrado pelo comprovante · NSU ${res.data.payment.nsu}`);
     toast.alert('🔔 Registrado em audit_logs e alerta enviado ao WhatsApp do proprietário.');
     onSuccess(res.data);

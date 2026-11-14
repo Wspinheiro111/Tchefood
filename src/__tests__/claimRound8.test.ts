@@ -6,7 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { seedId } from '../data/seed';
-import { useTcheStore } from '../store/useTcheStore';
+import { CLAIM_MISSING_REGISTER_ERROR, CLAIM_TERMS_REGISTER_ERROR, useTcheStore } from '../store/useTcheStore';
 import { cashSummary } from '../lib/cashRegister';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, getReviewHolds, setReviewHold } from '../lib/payments/reviewHolds';
 import { beginLocalClaim, localClaim, pendingRelease, resetClaimLedger, settleLocalClaim } from '../lib/payments/claimLedger';
@@ -227,6 +227,7 @@ describe('P1-C: comprovante de outra adquirente troca a reserva antes de registr
     useTcheStore.setState({ cloud: { url: 'https://x.supabase.co', anonKey: 'a' } as never });
     expect(st().confirmReviewedCharge(input, auth).ok).toBe(false);
     expect(getReviewHoldByKey('k-old')).not.toBeNull();
+    beginLocalClaim('k-new', id, NEW_TOKEN, { method: 'CREDIT', acquirer: 'PAGBANK', amount_cents: Math.round(amount * 100) });
     const r = st().confirmReviewedCharge({ ...input, registerKey: 'k-new' }, auth);
     expect(r.ok).toBe(true);
     expect(st().payments.find((p) => p.order_id === id && p.status === 'APPROVED')).toMatchObject({ idempotency_key: 'k-new', acquirer: 'PAGBANK' });
@@ -509,5 +510,58 @@ describe('P1-2: o fechamento causado pelo pagamento retirado sai junto', () => {
     // O que só o aparelho sabe não sobe.
     const pa = st().outbox.find((e) => e.table === 'payments')!;
     expect(sanitizePayload(pa)).not.toHaveProperty('paid_item_ids');
+  });
+});
+
+describe('TF010: todo pagamento aprovado (fora a Point) precisa da reserva feita aqui', () => {
+  const pay = (orderId: string, over: Partial<Parameters<typeof cash>[0] extends never ? never : Record<string, unknown>> = {}) => st().registerPayment({
+    orderId, amount: 10, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null,
+    nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'k-tf010', item_ids: [], ...over,
+  } as Parameters<ReturnType<typeof st>['registerPayment']>[0]);
+
+  it('com nuvem: sem reserva recusa; termos diferentes recusam; com a reserva certa registra', () => {
+    const id = openTableWith(['101']);
+    useTcheStore.setState({ cloud: { url: 'https://x.supabase.co' } as never });
+    expect(pay(id)).toEqual({ ok: false, error: CLAIM_MISSING_REGISTER_ERROR });
+    beginLocalClaim('k-tf010', id, OLD_TOKEN, { method: 'CASH', acquirer: 'CASH_DESK', amount_cents: 900 });
+    expect(pay(id)).toEqual({ ok: false, error: CLAIM_TERMS_REGISTER_ERROR });
+    beginLocalClaim('k-tf010', id, OLD_TOKEN, { method: 'CREDIT', acquirer: 'CASH_DESK', amount_cents: 1000 });
+    expect(pay(id)).toEqual({ ok: false, error: CLAIM_TERMS_REGISTER_ERROR });
+    beginLocalClaim('k-tf010', id, OLD_TOKEN, { method: 'CASH', acquirer: 'CASH_DESK', amount_cents: 1000 });
+    expect(pay(id).ok).toBe(true);
+  });
+
+  it('exceções: Point (o servidor reserva), dinheiro do entregador (entrega-<id>), recusado, e sem nuvem', () => {
+    const id = openTableWith(['101']);
+    useTcheStore.setState({ cloud: { url: 'https://x.supabase.co' } as never });
+    expect(pay(id, { method: 'CREDIT', acquirer: 'MERCADO_PAGO', idempotency_key: 'k-mp', nsu: '1', authorization_code: 'A', card_brand: 'VISA' }).ok).toBe(true);
+    expect(pay(id, { idempotency_key: 'entrega-d1' }).ok).toBe(true);
+    expect(pay(id, { status: 'DECLINED', idempotency_key: 'k-dec' }).ok).toBe(true);
+    useTcheStore.setState({ cloud: null } as never);
+    expect(pay(id, { idempotency_key: 'k-local' }).ok).toBe(true);
+  });
+
+  it('Point aprovada nunca vira estorno local (withdraw recusa)', () => {
+    const id = openTableWith(['101']);
+    expect(pay(id, { method: 'CREDIT', acquirer: 'MERCADO_PAGO', idempotency_key: 'k-mp2', nsu: '1', authorization_code: 'A', card_brand: 'VISA' }).ok).toBe(true);
+    expect(st().withdrawUnacceptedPayment('k-mp2', 'x').ok).toBe(false);
+    expect(st().payments.find((p) => p.idempotency_key === 'k-mp2')!.status).toBe('APPROVED');
+  });
+
+  it('startPaymentClaim grava os termos da reserva no registro local', async () => {
+    vi.resetModules();
+    vi.doMock('../lib/payments/paymentClaim', async (orig) => ({
+      ...(await orig<typeof import('../lib/payments/paymentClaim')>()),
+      claimPayment: async (i: { key: string }) => ({ ok: true, claim: { id: 'c', idempotency_key: i.key, status: 'open', amount_cents: 1250 } }),
+    }));
+    const { startPaymentClaim } = await import('../lib/payments/claimFlow');
+    const ledger = await import('../lib/payments/claimLedger');
+    ledger.resetClaimLedger();
+    const c = await startPaymentClaim(true, { orderId: 'o1', key: 'k-terms', method: 'DEBIT', acquirer: 'PAGBANK', amount: 12.5 });
+    expect(c.ok).toBe(true);
+    if (c.ok) c.handle.leave();
+    expect(ledger.localClaim('k-terms')?.terms).toEqual({ method: 'DEBIT', acquirer: 'PAGBANK', amount_cents: 1250 });
+    vi.doUnmock('../lib/payments/paymentClaim');
+    vi.resetModules();
   });
 });

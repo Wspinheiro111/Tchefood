@@ -87,6 +87,7 @@ import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, reviewHoldKey } from '../lib/payments/reviewHolds';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { reservationExceeds } from '../lib/payments/pointReservation';
+import { localClaim } from '../lib/payments/claimLedger';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
@@ -755,6 +756,23 @@ export function isRejectedItemPrice(r: RejectedSyncEvent): boolean {
   const message = r.message ?? '';
   return r.event.table === 'order_items' && r.event.op === 'INSERT'
     && /TCHEFOOD_PRECO:/.test(message) && !/não encontrado nesta loja/.test(message);
+}
+
+export const CLAIM_MISSING_REGISTER_ERROR = 'Este pagamento não tem a reserva no servidor feita neste aparelho: nada foi registrado. Tente de novo (a reserva é pedida antes de receber).';
+export const CLAIM_TERMS_REGISTER_ERROR = 'O pagamento não bate com a reserva feita no servidor (forma, maquininha ou valor): nada foi registrado.';
+
+/**
+ * Ligado à nuvem, pagamento aprovado que não é da Point precisa da reserva aberta com a mesma chave (feita
+ * aqui: claimFlow grava chave e termos no registro local antes de pedir). Exceção conferida no servidor: o
+ * dinheiro do entregador (chave entrega-<id>).
+ */
+function claimRequiredBlock(state: { cloud?: unknown }, input: Pick<PaymentInput, 'idempotency_key' | 'method' | 'acquirer'>, amount: number): string | null {
+  if (!state.cloud || input.acquirer === 'MERCADO_PAGO' || input.idempotency_key.startsWith('entrega-')) return null;
+  const c = localClaim(input.idempotency_key);
+  if (!c) return CLAIM_MISSING_REGISTER_ERROR;
+  const t = c.terms;
+  if (t && (t.method !== input.method || t.acquirer !== input.acquirer || t.amount_cents !== toCents(amount))) return CLAIM_TERMS_REGISTER_ERROR;
+  return null;
 }
 
 function managerAuthEvent(log: AuditLog, managerPin: string | null): SyncEvent {
@@ -1935,6 +1953,10 @@ export const useTcheStore = create<TcheState>()(
           if (get().payments.some((p) => p.idempotency_key === input.idempotency_key)) {
             return fail('Transação duplicada (idempotency_key já registrada).');
           }
+          // Ligado à nuvem: o servidor só aceita pagamento aprovado (fora a Point) com a reserva aberta da mesma
+          // chave, forma, credenciadora e valor (TF010). Sem a reserva feita aqui, nem registra.
+          const claimBlock = input.status === 'APPROVED' ? claimRequiredBlock(get(), input, amount) : null;
+          if (claimBlock) return fail(claimBlock);
           if (input.status === 'APPROVED' && toCents(amount) > toCents(order.remaining_balance)) {
             return fail('Valor maior que o saldo restante da mesa.');
           }
@@ -2198,6 +2220,8 @@ export const useTcheStore = create<TcheState>()(
           const state = get();
           const payment = state.payments.find((p) => p.idempotency_key === idempotencyKey && p.status === 'APPROVED');
           if (!payment) return fail('Pagamento aprovado não encontrado neste aparelho.');
+          // Point: quem diz se a cobrança vale é o servidor (point-charge); nunca vira estorno aqui.
+          if (payment.acquirer === 'MERCADO_PAGO') return fail('Pagamento da Point: só o servidor desfaz.');
           const isInsert = (e: SyncEvent) => e.table === 'payments' && e.op === 'INSERT' && e.row_id === payment.id;
           const insertEvent = state.outbox.find(isInsert) ?? (state.syncRejected ?? []).find((r) => isInsert(r.event))?.event;
           if (!insertEvent) return fail('Este pagamento já entrou no servidor: não pode ser retirado aqui.');
@@ -4817,6 +4841,19 @@ export const useTcheStore = create<TcheState>()(
               item_ids: [],
             });
             if (!r.ok) return fail(`Senha ${order.pickup_number ?? ''}: ${r.error} Acerto parado; as anteriores já foram recebidas.`);
+            // O servidor só aceita o dinheiro do entregador (entrega-<id>, sem reserva) com a entrega já DELIVERED
+            // lá: o pagamento espera a marcação de entregue que ainda está na fila (ou recusada).
+            const deliveredIds = [...get().outbox, ...(get().syncRejected ?? []).map((x) => x.event)]
+              .filter((e) => e.table === 'own_deliveries' && e.row_id === d.id && e.payload.status === 'DELIVERED')
+              .map((e) => e.id);
+            if (deliveredIds.length > 0) {
+              const payId = r.data.payment.id;
+              set((s) => ({
+                outbox: s.outbox.map((e) => (e.table === 'payments' && e.op === 'INSERT' && e.row_id === payId
+                  ? { ...e, depends_on_event_ids: [...new Set([...(e.depends_on_event_ids ?? []), ...deliveredIds])] }
+                  : e)),
+              }));
+            }
           }
           const keys = new Set(own.filter((d) => d.pay_on_delivery).map((d) => `entrega-${d.id}`));
           const cashCents = get().payments

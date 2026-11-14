@@ -63,11 +63,11 @@ export async function startPaymentClaim(
   required: boolean,
   input: Omit<ClaimInput, 'releaseToken'>,
   now: () => number = Date.now,
-): Promise<{ ok: true; handle: ClaimHandle } | { ok: false; error: string }> {
+): Promise<{ ok: true; handle: ClaimHandle } | { ok: false; code?: string; error: string }> {
   if (!required) return { ok: true, handle: NONE };
   // O segredo vive só aqui e no registro local; nunca vai para a tela nem para log.
   const token = generateReleaseToken();
-  beginLocalClaim(input.key, input.orderId, token);
+  beginLocalClaim(input.key, input.orderId, token, { method: input.method, acquirer: input.acquirer, amount_cents: Math.round(input.amount * 100) });
   const full: ClaimInput = { ...input, releaseToken: token };
   const attempt = async (): Promise<ClaimResult> => {
     try {
@@ -84,7 +84,7 @@ export async function startPaymentClaim(
     // Recusa do servidor: nada foi criado.
     if (c.offline) void releaseClaimAfterNoCharge(input.key, input.orderId, 'Reserva sem resposta do servidor: nada foi recebido', token, undefined, { unknownClaim: true });
     else endLocalClaim(input.key);
-    return { ok: false, error: c.error };
+    return { ok: false, ...(c.code ? { code: c.code } : {}), error: c.error };
   }
 
   const startedAt = now();
@@ -165,7 +165,7 @@ export async function reclaimForHold(hold: ReviewHold, method: ClaimInput['metho
   if (!oldKey || !oldToken) return { ok: false, error: 'Este aparelho não tem o código da reserva antiga: o gerente libera a reserva na lista e registra de novo.' };
   const newKey = hold.reclaim_key ?? uuid();
   const newToken = localClaim(newKey)?.release_token ?? generateReleaseToken();
-  beginLocalClaim(newKey, hold.order_id, newToken);
+  beginLocalClaim(newKey, hold.order_id, newToken, { method, acquirer, amount_cents: Math.round(hold.amount * 100) });
   if (hold.reclaim_key !== newKey) setReviewHold({ ...hold, reclaim_key: newKey });
   const input = { oldKey, oldToken, newKey, newToken, method, acquirer, amount: hold.amount };
   let r = await reclaimPayment(input);

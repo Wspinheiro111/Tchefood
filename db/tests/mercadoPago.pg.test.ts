@@ -1359,7 +1359,10 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
   });
 
   it('recusado do Mercado Pago e Stone aprovado seguem as regras de antes (a Stone, com a reserva dela: a loja tem Point)', () => {
-    expect(pay('chave-recusada', { status: 'DECLINED', nsu: null, authorization_code: null, card_brand: null }).ok).toBe(true);
+    // Revisão r8 (F1): recusado do Mercado Pago só com a cobrança da Point dele (aqui, recusada) no servidor.
+    expect(pay('chave-recusada', { status: 'DECLINED', nsu: null, authorization_code: null, card_brand: null }).ok).toBe(false);
+    const refused = charge({ status: 'rejected', external_payment_id: null, paid_amount_cents: null, card_brand: null, authorization_code: null });
+    expect(pay(refused, { status: 'DECLINED', nsu: null, authorization_code: null, card_brand: null }).ok).toBe(true);
     const stoneOver = { order_id: ORDER6, acquirer: 'STONE', acquirer_cnpj: '16501555000157', terminal_id: STONE_TERMINAL, terminal_serial: 'STONE-01', nsu: '784512', authorization_code: 'A12345' };
     // Revisão P1-B: sem a reserva no servidor, a Stone aprovada na loja com Point é recusada (TF010).
     expect(pay('stone-1', stoneOver)).toMatchObject({ ok: false, sqlstate: 'TF010' });
@@ -1689,12 +1692,12 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         // Aprovado → aprovado com o mesmo valor, ou outro campo: não reabre a conferência (nada sai da reserva).
         expect(update(cash, `status = 'APPROVED'`).ok).toBe(true);
         expect(update(cash, 'tip_amount = 5').ok).toBe(true);
-        // Pagamento aprovado de outra conta que muda para esta: recusado (a reserva dele é da outra conta, TF010).
+        // Pagamento aprovado de outra conta que muda para esta: recusado (revisão r8 F2: o pagamento não muda de conta).
         const other = withItems(100);
         const moved = insert(other, 10, 'APPROVED');
         const move = update(moved, `order_id = '${order}'`);
-        expect(move).toMatchObject({ ok: false, sqlstate: 'TF010' });
-        expect(move.message).toContain('é da reserva de pagamento de outra conta');
+        expect(move).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        expect(move.message).toContain('o pagamento gravado não muda de chave, de conta nem de loja');
         expect(sql(`SELECT order_id FROM payments WHERE id = '${moved}'`)).toBe(other);
         expect(approved(order)).toBe('40.00');
         // Cobrança encerrada: a reserva sai, e o pendente de R$ 60,00 que não cabia passa a caber.
@@ -1769,8 +1772,8 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
              INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key)
              VALUES ('${id}', '${order}', '${TENANT}', '${STAFF}', 10, 'CASH', 'APPROVED', 'CASH_DESK', '${id}');`);
         const r = psql(target!, `UPDATE payments SET tenant_id = '${OTHER}' WHERE id = '${id}';`, DB);
-        expect(r.ok).toBe(false);
-        expect(r.message).toContain('não é da loja dele');
+        expect(r).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        expect(r.message).toContain('o pagamento gravado não muda de chave, de conta nem de loja');
         expect(sql(`SELECT tenant_id FROM payments WHERE id = '${id}'`)).toBe(TENANT);
       });
 
@@ -1789,19 +1792,17 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
         };
         // Dinheiro aprovado de R$ 40,00 (cabe) que troca a chave pela da cobrança: recusado.
         const cash = insert(40, 'APPROVED');
+        // Revisão r8 (F2): o pagamento gravado não muda de chave (aprovado ou pendente, para a chave da cobrança ou outra).
         const swap = psql(target!, `UPDATE payments SET idempotency_key = '${key}' WHERE id = '${cash}';`, DB);
-        expect(swap.ok).toBe(false);
-        expect(swap.message).toContain(`a chave ${key} é de uma cobrança da Point`);
-        // Pendente que recebe a chave (ainda não conferido) e depois vira aprovado: recusado na aprovação.
+        expect(swap).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        expect(swap.message).toContain('o pagamento gravado não muda de chave, de conta nem de loja');
         const pending = insert(60, 'PENDING');
-        expect(psql(target!, `UPDATE payments SET idempotency_key = '${key}' WHERE id = '${pending}';`, DB).ok).toBe(true);
-        const promote = psql(target!, `UPDATE payments SET status = 'APPROVED' WHERE id = '${pending}';`, DB);
-        expect(promote.ok).toBe(false);
-        expect(promote.message).toContain('é de uma cobrança da Point');
-        // A reserva da cobrança continua inteira. Revisão P1-B: trocar para uma chave sem reserva também é recusado
-        // na loja com Point (TF010); o pagamento segue com a chave e a reserva dele.
+        expect(psql(target!, `UPDATE payments SET idempotency_key = '${key}' WHERE id = '${pending}';`, DB)).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        // Pendente que vira aprovado com a própria chave (sem reserva): recusado na aprovação (TF010).
+        expect(psql(target!, `UPDATE payments SET status = 'APPROVED' WHERE id = '${pending}';`, DB)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+        // A reserva da cobrança continua inteira; o pagamento segue com a chave e a reserva dele.
         expect(reservation(order).reserved_cents).toBe(6000);
-        expect(psql(target!, `UPDATE payments SET idempotency_key = 'r4-chave-livre' WHERE id = '${cash}';`, DB)).toMatchObject({ ok: false, sqlstate: 'TF010' });
+        expect(psql(target!, `UPDATE payments SET idempotency_key = 'r4-chave-livre' WHERE id = '${cash}';`, DB)).toMatchObject({ ok: false, sqlstate: 'TF007' });
         expect(sql(`SELECT idempotency_key FROM payments WHERE id = '${cash}'`)).toBe(cash);
         expect(balanceOf(order)).toBe('60.00|OPEN');
       });

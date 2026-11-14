@@ -218,6 +218,72 @@ describe('caixa da mesa (CheckoutScreen) numa loja com Point', () => {
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Cancelar cobrança' })).toBeNull());
   });
 
+  it('Point: recusa local (nada mandado) não vira pagamento recusado com a chave; recusa do servidor vira', async () => {
+    const id = openTable();
+    withPoint();
+    for (const [result, expected] of [
+      [declined('MERCADO_PAGO'), 0],
+      [{ ...declined('MERCADO_PAGO'), server_confirmed: true } as TerminalResult, 1],
+    ] as const) {
+      const driver = fakeDriver('MERCADO_PAGO', result);
+      createDriver.mockReturnValue(driver);
+      const view = render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+      fireEvent.click(screen.getByRole('button', { name: /Point Salão/ }));
+      await waitFor(() => expect((chargeButton() as HTMLButtonElement).disabled).toBe(false));
+      await act(async () => { fireEvent.click(chargeButton()); });
+      await waitFor(() => expect(driver.charge).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(payments(id).filter((x) => x.status === 'DECLINED')).toHaveLength(expected));
+      expect(payments(id).some((x) => x.status === 'APPROVED')).toBe(false);
+      view.unmount();
+    }
+  });
+
+  it('TF010: comprovante sem a reserva neste aparelho pede a reserva (chave, forma, maquininha, valor) antes de registrar', async () => {
+    const id = openTable();
+    withPoint();
+    const amount = st().orders.find((o) => o.id === id)!.remaining_balance;
+    setReviewHold({ order_id: id, amount, reason: 'Aprovado na maquininha, mas não registrado', code: 'REGISTER_FAILED', method: 'CREDIT', acquirer: 'STONE', terminal_id: null, terminal_serial: 'S1', idempotency_key: 'k-sem-reserva' });
+    claimPayment.mockResolvedValueOnce({ ok: false, code: 'TF003', error: 'O valor passa do saldo livre desta conta no servidor.' });
+    const view = render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    expect(await screen.findByText('O valor passa do saldo livre desta conta no servidor.')).toBeTruthy();
+    expect(payments(id)).toHaveLength(0);
+    expect(getReviewHold(id)).not.toBeNull();
+    view.unmount();
+    claimPayment.mockImplementation(async (input: { key: string; amount: number }) => CLAIM_OK(input.key, Math.round(input.amount * 100)));
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    await waitFor(() => expect(payments(id).filter((x) => x.status === 'APPROVED')).toHaveLength(1));
+    expect(claimPayment).toHaveBeenLastCalledWith(expect.objectContaining({ key: 'k-sem-reserva', method: 'CREDIT', acquirer: 'STONE', amount, orderId: id }));
+    expect(localClaim('k-sem-reserva')).toMatchObject({ state: 'settled' });
+    expect(getReviewHold(id)).toBeNull();
+  });
+
+  it('TF009 na reserva nova com a chave da trava: liberada no servidor vira estorno; aberta sem o código, só o gerente libera', async () => {
+    const id = openTable();
+    withPoint();
+    const amount = st().orders.find((o) => o.id === id)!.remaining_balance;
+    const hold = { order_id: id, amount, reason: 'Aprovado na maquininha, mas não registrado', code: 'REGISTER_FAILED', method: 'CREDIT' as const, acquirer: 'STONE' as const, terminal_id: null, terminal_serial: 'S1', idempotency_key: 'k-perdida' };
+    setReviewHold(hold);
+    claimPayment.mockResolvedValue({ ok: false, code: 'TF009', error: 'A chave deste pagamento já está em uso por outra cobrança.' });
+    // Aberta no servidor, e este aparelho sem o código: não registra, aponta o gerente.
+    fetchPointReservation.mockResolvedValue(claimsOf([{ key: 'k-perdida', cents: Math.round(amount * 100) }]));
+    const view = render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    expect(await screen.findByText(/Só o gerente libera esta reserva/)).toBeTruthy();
+    expect(getReviewHold(id)).toMatchObject({ code: 'REGISTER_FAILED' });
+    expect(payments(id)).toHaveLength(0);
+    view.unmount();
+    // Não está mais aberta (liberada): a trava vira CLAIM_RELEASED (estorno), sem registrar e sem repetir TF009.
+    fetchPointReservation.mockResolvedValue(NO_RESERVATION);
+    render(<CheckoutScreen orderId={id} onBack={() => undefined} onClosed={() => undefined} />);
+    await openReceiptAndSubmit();
+    await waitFor(() => expect(getReviewHold(id)).toMatchObject({ code: 'CLAIM_RELEASED', idempotency_key: 'k-perdida' }));
+    expect(payments(id)).toHaveLength(0);
+    expect(await screen.findByRole('button', { name: 'Estornei / devolvi' })).toBeTruthy();
+    expect(localClaim('k-perdida')).toBeNull();
+  });
+
   it('sem leitura da reserva na nuvem: mostra "Sem leitura da nuvem" e não recebe', async () => {
     const id = openTable();
     withPoint();
@@ -370,6 +436,14 @@ const claimsOf = (list: Array<{ key: string; cents: number; releasableAt?: strin
   reservedCents: list.reduce((a, c) => a + c.cents, 0), openCharges: 0, manualReview: false, claimsCents: list.reduce((a, c) => a + c.cents, 0), charges: [],
   claims: list.map((c) => ({ idempotencyKey: c.key, amountCents: c.cents, method: 'CASH', acquirer: 'CASH_DESK', createdAt: '2026-11-14T10:00:00Z', createdBy: 's1', createdByName: 'Tião', activeUntil: null, releasableAt: c.releasableAt ?? null })),
 });
+async function openReceiptAndSubmit() {
+  fireEvent.click(screen.getByRole('button', { name: 'Maquininha aprovou: registrar comprovante' }));
+  const dialog = screen.getByRole('dialog');
+  fireEvent.change(within(dialog).getByPlaceholderText('Só números'), { target: { value: '445566' } });
+  fireEvent.change(within(dialog).getByPlaceholderText('Letras e números'), { target: { value: 'AB12CD' } });
+  for (const d of '9999') fireEvent.click(within(dialog).getByRole('button', { name: d }));
+}
+
 function managerRelease(reason = 'Não recebi nenhum dinheiro', pin = '9999') {
   const dialog = screen.getByRole('dialog');
   fireEvent.change(within(dialog).getByLabelText('Motivo'), { target: { value: reason } });
@@ -404,6 +478,7 @@ describe('revisão independente: reservas presas, conferência do extrato, falha
   it('a lista não oferece a reserva com pagamento registrado aqui nem a da trava de conferência', async () => {
     const id = openTable();
     withPoint();
+    beginLocalClaim('k-pago', id, 'aa'.repeat(32), { method: 'CASH', acquirer: 'CASH_DESK', amount_cents: 100 });
     const p = st().registerPayment({ orderId: id, amount: 1, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'k-pago', item_ids: [] });
     expect(p.ok).toBe(true);
     setReviewHold({ order_id: id, amount: 2, reason: 'sem resposta', code: 'X', method: 'CREDIT', acquirer: 'STONE', terminal_id: null, terminal_serial: 'S', idempotency_key: 'k-trava' });
@@ -790,13 +865,6 @@ describe('r7 revisão: trava CLAIM_RELEASED, comprovante, adquirente, aviso e re
     clearReviewHold(sale.data.id);
   });
 
-  async function openReceiptAndSubmit() {
-    fireEvent.click(screen.getByRole('button', { name: 'Maquininha aprovou: registrar comprovante' }));
-    const dialog = screen.getByRole('dialog');
-    fireEvent.change(within(dialog).getByPlaceholderText('Só números'), { target: { value: '445566' } });
-    fireEvent.change(within(dialog).getByPlaceholderText('Letras e números'), { target: { value: 'AB12CD' } });
-    for (const d of '9999') fireEvent.click(within(dialog).getByRole('button', { name: d }));
-  }
 
   it('registrar comprovante confere a reserva antes: liberada vira CLAIM_RELEASED sem registrar; sem resposta recusa; aberta registra', async () => {
     const id = openTable();

@@ -104,15 +104,19 @@ Tchê Food (celular/tablet)          Edge Function point-charge           Mercad
 
 ## Auditoria r5 (decisões do Will, 14/11/2026)
 
-**Reserva antes de qualquer cobrança.** Loja com Point (`tchefood_point_store`: maquininha `MERCADO_PAGO`
-cadastrada ou alguma cobrança da Point já feita): todo pagamento fora do Mercado Pago (dinheiro, Stone, PagBank,
+**Reserva antes de qualquer cobrança.** Em toda loja na nuvem, com ou sem Point (auditoria r7 P1-01, decisão do
+Will; antes valia só na loja com Point): todo pagamento fora do Mercado Pago (dinheiro, Stone, PagBank,
 Pix manual, ficha rápida, retirada) pede antes a reserva no servidor (`tchefood_claim_payment`, conta travada,
 mesma chave do pagamento, saldo conferido). Sem internet ou sem resposta do servidor, o caixa avisa e não cobra.
 O banco também exige: pagamento aprovado fora do Mercado Pago sem reserva aberta da mesma conta, forma e
-credenciadora é recusado (TF010), mesmo de aparelho com a lista de maquininhas desatualizada. Única exceção: o
+credenciadora é recusado (TF010), em qualquer loja e mesmo de aparelho antigo que não pede reserva. Única exceção: o
 dinheiro do entregador de uma entrega paga na entrega que o banco confere (`tchefood_courier_cash_payment`).
 A reserva e as cobranças da Point somam uma reserva só (`tchefood_point_reserved_cents`), usada pela Point,
 pela reserva nova e pelo gatilho de payments.
+Cobrança aprovada só deixa de reservar com o pagamento APROVADO do Mercado Pago dela ou quando a própria cobrança
+é estornada pela resolução verificada (auditoria r7 P0-01). Pagamento do Mercado Pago recusado (DECLINED) com a
+chave de uma cobrança só entra com a cobrança recusada, cancelada ou expirada; estornado (REFUNDED), só com a
+cobrança estornada. PENDING segue como antes.
 
 Fim da reserva: o pagamento aprovado com a chave dela a consome de vez (`consumed`); recusa na maquininha ou
 desistência a libera (só quem pediu, sem PIN); reserva presa (aparelho fechou no meio, liberação sem rede) aparece
@@ -164,9 +168,29 @@ Recusa/cancelamento/expiração/estorno só liberam a reserva com a ordem ecoand
 estorno na conferência exige o pagamento provando o estorno. 409 desconhecido na criação = resultado desconhecido.
 A busca por referência termina no máximo em "agora"; recusa da busca tem mensagem própria.
 
-**Ordem de publicação.** Primeiro as migrations (`20261114130000_mercado_pago.sql`, `20261114140000_point_reserva.sql`,
-depois das de 14/11 da main), depois a Edge Function `point-charge`, depois o app. Aparelho com app antigo recebe
-42883 nas funções de reserva trocadas e não cobra (falha fechada) até atualizar.
+**Ordem de publicação (janela de manutenção, caixa fechado).** Migrations e app novo vão juntos: nenhum dos dois
+funciona com o outro na versão antiga.
+
+1. **Antes das migrations, todo aparelho sobe a fila** (Nuvem sem pendências: nenhum pagamento esperando para subir).
+   Pagamento sem reserva que ainda estiver na fila de um aparelho quando as migrations entrarem é recusado com TF010
+   em qualquer loja (com ou sem Point): o dinheiro foi recebido e o pagamento não fica registrado.
+2. Aplicar as migrations (`20261114130000_mercado_pago.sql`, `20261114140000_point_reserva.sql`, depois das de 14/11
+   da main).
+3. Publicar a Edge Function `point-charge`.
+4. Atualizar **todos** os aparelhos para o app novo, na mesma janela.
+5. Abrir o caixa.
+
+O que acontece fora dessa ordem:
+- **App antigo depois das migrations:** todo pagamento recebido sem a reserva (o app antigo não pede, ou pede pela
+  função antiga) é recusado com TF010, e o dinheiro recebido fica sem registro no servidor; as chamadas de reserva
+  com a assinatura antiga dão 42883 (função não existe).
+- **App novo antes das migrations:** as funções de reserva não existem (42883); o caixa não cobra (falha fechada)
+  até as migrations entrarem.
+
+**Dinheiro do entregador** (`entrega-<id>`, sem reserva): o servidor só aceita esse pagamento com a entrega já
+`DELIVERED` lá (`tchefood_courier_cash_payment`). Na fila do aparelho, a marcação de entregue entra antes do acerto
+(a fila sobe em ordem); o acerto liga o pagamento à marcação de entregue que ainda está na fila ou recusada
+(`depends_on_event_ids`), e o pagamento espera ela subir. Marcação recusada segura o pagamento até ser resolvida.
 
 ## Passo a passo para testar com uma Point Smart
 

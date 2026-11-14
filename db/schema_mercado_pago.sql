@@ -726,8 +726,34 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
     v_charge terminal_charges%ROWTYPE;
 BEGIN
-    IF NEW.acquirer::text <> 'MERCADO_PAGO' OR NEW.status <> 'APPROVED' THEN
+    IF NEW.acquirer::text <> 'MERCADO_PAGO' THEN
         RETURN NEW;
+    END IF;
+    -- Auditoria r7 P0-01: pagamento do Mercado Pago recusado ou estornado só entra (ou só vira isso) com a
+    -- chave de uma cobrança da Point quando a própria cobrança no servidor diz o mesmo: DECLINED só com a
+    -- cobrança recusada, cancelada ou expirada; REFUNDED só com a cobrança estornada. PENDING passa com a cobrança.
+    -- Revisão r8 (F1): pagamento do Mercado Pago só existe para uma cobrança da Point. Sem a cobrança com a chave
+    -- nesta loja, qualquer status é recusado (PENDING também): senão ele ocuparia a chave (única em payments) antes
+    -- de a cobrança nascer, e o pagamento aprovado dela nunca entraria.
+    -- Mexer em outro campo de um pagamento que já estava com o mesmo status e a mesma chave não reabre a conferência.
+    IF NEW.status <> 'APPROVED' THEN
+        IF TG_OP = 'UPDATE' AND OLD.status = NEW.status AND OLD.acquirer = NEW.acquirer
+           AND OLD.idempotency_key IS NOT DISTINCT FROM NEW.idempotency_key AND OLD.tenant_id IS NOT DISTINCT FROM NEW.tenant_id THEN
+            RETURN NEW;
+        END IF;
+        SELECT * INTO v_charge FROM terminal_charges c
+         WHERE c.idempotency_key = NEW.idempotency_key AND c.tenant_id = NEW.tenant_id
+         FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento do Mercado Pago sem a cobrança da Point no servidor (chave %).', NEW.idempotency_key;
+        END IF;
+        IF NEW.status = 'PENDING'
+           OR (NEW.status = 'DECLINED' AND v_charge.status IN ('rejected', 'cancelled', 'expired'))
+           OR (NEW.status = 'REFUNDED' AND v_charge.status = 'refunded') THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: pagamento do Mercado Pago "%" com a cobrança "%" no servidor (chave %): não confere. Recusado ou estornado só com a cobrança resolvida no servidor.',
+            NEW.status, v_charge.status, NEW.idempotency_key;
     END IF;
     -- FOR SHARE (auditoria r5 P1-01): o estorno verificado (tchefood_resolve_point_charge) trava a mesma
     -- cobrança antes de conferir que ela não tem pagamento. Pagamento e estorno juntos esperam um pelo outro:

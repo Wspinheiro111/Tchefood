@@ -236,7 +236,7 @@ export class MercadoPagoPointDriver implements IPaymentTerminalDriver {
 
   private toResult(reply: Reply, req: ChargeRequest): TerminalResult | null {
     if (reply.status === 'PENDING') return null;
-    if (reply.status === 'DECLINED') return this.declined(reply.reason);
+    if (reply.status === 'DECLINED') return { ...this.declined(reply.reason), server_confirmed: true } as TerminalResult;
     if (reply.status === 'MANUAL_REVIEW') return this.review(reply.reason, reply.code);
     const cents = Math.round(req.amount * 100);
     if (reply.amount_cents !== cents || reply.method !== req.method) {
