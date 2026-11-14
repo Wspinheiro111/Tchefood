@@ -1,4 +1,5 @@
 import {
+  DELIVERY_CHANNEL_CATALOG,
   DeliveryMarketplaceError,
   allowedDeliveryActions,
   mergeDeliveryStatus,
@@ -129,12 +130,21 @@ export type DeliveryInboxOptions = {
 // Falhas em que o app com certeza não aplicou o pedido.
 const DEFINITE_FAILURES: readonly string[] = ["invalid_request", "not_found", "conflict", "auth_failed", "rate_limited"];
 
+// Detalhe do pedido que o app recusa entregar (403/404) em todo ciclo: depois de tantos ciclos seguidos o pedido
+// entra mesmo sem detalhe, para a loja ver e confirmar pelo portal antes que o app cancele por falta de confirmação.
+// Falhas temporárias (fora do ar, limite de uso, tempo esgotado) não contam: só adiam.
+export const ORDER_DETAIL_MAX_FAILURES = 10;
+const PERSISTENT_DETAIL_FAILURES: readonly string[] = ["auth_failed", "not_found"];
+
 export class DeliveryInbox {
   private readonly adapters = new Map<DeliveryChannelKey, DeliveryMarketplaceAdapter>();
   private readonly now: () => Date;
   // Um ciclo por app por vez: polling sobreposto confirmaria eventos em dobro.
   private readonly running = new Set<DeliveryChannelKey>();
   private readonly orderLocks = new Map<string, Promise<void>>();
+  // Falhas seguidas do detalhe de pedido novo (auth_failed/not_found), por pedido. Só em memória: reiniciar o
+  // processo recomeça a conta, o que só atrasa (nunca perde) o registro mínimo.
+  private readonly detailFailures = new Map<string, number>();
 
   constructor(private readonly options: DeliveryInboxOptions) {
     for (const adapter of options.adapters) {
@@ -378,7 +388,12 @@ export class DeliveryInbox {
     if (!record) {
       // Primeiro evento deste pedido (normalmente "placed", mas pode ser qualquer um se o PDV ficou fora do ar):
       // busca o detalhe antes de gravar qualquer coisa, para que uma falha aqui deixe o evento sem ack.
-      const order = await adapter.getOrder(event.externalOrderId);
+      // Detalhe que o app manda mas não dá para ler (valor negativo, campo ou itens faltando) nunca melhora: o
+      // pedido entra com o mínimo que o evento traz e vai para conferência, em vez de ficar sem ack para sempre.
+      const fetched = await this.fetchNewOrder(adapter, event);
+      const order = fetched.order;
+      // Detalhe sem a loja: vale a do evento (é ela que a prova de loja e a pausa usam).
+      if (!order.merchantExternalId) order.merchantExternalId = event.merchantExternalId;
       record = {
         order,
         cancellationPending: false,
@@ -391,6 +406,12 @@ export class DeliveryInbox {
         dispute: null,
         version: 0,
       };
+      if (fetched.reason) {
+        flag(
+          record,
+          `Detalhe do pedido ilegível no ${DELIVERY_CHANNEL_CATALOG[event.channel].label} (${fetched.reason}): confira e confirme pelo Portal do Parceiro.`,
+        );
+      }
     }
     const isNew = !record.newOrderNotified;
 
@@ -398,13 +419,16 @@ export class DeliveryInbox {
     // passo falhar, o evento fica sem ack e é reprocessado inteiro; aplicar o mesmo evento de novo dá o mesmo
     // status (só anda para frente). O aviso pode repetir nesse caso, mas nunca se perde.
     applySignal(record, event);
+    // Pedido que já chega cancelado (o PDV só viu o pedido depois do CAN) não é pedido novo para a cozinha: fica
+    // marcado como avisado, sem imprimir nem tocar alerta.
+    const announce = isNew && record.order.status !== "cancelled";
     record.updatedAt = this.now().toISOString();
     // Conflito de versão (outro processo gravou o pedido no meio) sobe como erro: o evento fica sem ack e é
     // reaplicado no próximo ciclo em cima do pedido atualizado.
     record.version = await repository.saveOrder(record);
 
     // Falha no aviso (impressora, KDS) não desfaz o pedido gravado: vira pendência para o lojista.
-    const notify = isNew ? this.options.onNewOrder : this.options.onOrderUpdated;
+    const notify = announce ? this.options.onNewOrder : isNew ? undefined : this.options.onOrderUpdated;
     try {
       await notify?.(record);
     } catch (error) {
@@ -413,7 +437,30 @@ export class DeliveryInbox {
     if (isNew) record.newOrderNotified = true;
     if (isNew || record.needsReview) record.version = await repository.saveOrder(record);
     await repository.recordEvent(event);
-    return isNew ? "new_order" : "updated";
+    this.detailFailures.delete(`${event.channel}:${event.externalOrderId}`);
+    return announce ? "new_order" : "updated";
+  }
+
+  // Detalhe de um pedido que o PDV ainda não conhece. Devolve o pedido do app ou, quando o detalhe não tem
+  // conserto (ilegível, ou recusado em ORDER_DETAIL_MAX_FAILURES ciclos seguidos), um pedido mínimo e o motivo.
+  // Qualquer outra falha sobe: o evento fica sem ack e volta no próximo ciclo.
+  private async fetchNewOrder(
+    adapter: DeliveryMarketplaceAdapter,
+    event: DeliveryEvent,
+  ): Promise<{ order: DeliveryOrder; reason: string | null }> {
+    const key = `${event.channel}:${event.externalOrderId}`;
+    try {
+      return { order: await adapter.getOrder(event.externalOrderId), reason: null };
+    } catch (error) {
+      if (!(error instanceof DeliveryMarketplaceError)) throw error;
+      if (error.code !== "invalid_response") {
+        if (!PERSISTENT_DETAIL_FAILURES.includes(error.code)) throw error;
+        const failures = (this.detailFailures.get(key) ?? 0) + 1;
+        this.detailFailures.set(key, failures);
+        if (failures < ORDER_DETAIL_MAX_FAILURES) throw error;
+      }
+      return { order: minimalOrder(event), reason: error.message };
+    }
   }
 }
 
@@ -478,6 +525,43 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
       }
     }
   }
+}
+
+// Pedido com o que o evento traz, para quando o detalhe do app não dá para usar: sem itens nem valores (a loja
+// confere no portal) e com o status dado pelos eventos, como em qualquer pedido.
+function minimalOrder(event: DeliveryEvent): DeliveryOrder {
+  const label = DELIVERY_CHANNEL_CATALOG[event.channel].label;
+  return {
+    channel: event.channel,
+    externalId: event.externalOrderId,
+    displayId: event.externalOrderId.slice(0, 8),
+    merchantExternalId: event.merchantExternalId,
+    status: "placed",
+    fulfillment: "delivery",
+    courier: "unknown",
+    scheduledFor: null,
+    scheduledUntil: null,
+    preparationStartAt: null,
+    pickupCode: null,
+    // O evento não diz se é pedido de teste; a conferência no portal resolve.
+    isTest: false,
+    createdAt: event.createdAt,
+    customer: { name: `Cliente ${label}`, phone: null, phoneLocalizer: null, document: null },
+    address: null,
+    items: [],
+    totals: {
+      itemsCents: 0,
+      deliveryFeeCents: 0,
+      additionalFeesCents: 0,
+      benefitsCents: 0,
+      benefitsSponsoredByMarketplaceCents: 0,
+      orderCents: 0,
+    },
+    payments: [],
+    pendingCents: 0,
+    notes: null,
+    warnings: [],
+  };
 }
 
 function flag(record: DeliveryOrderRecord, reason: string): void {

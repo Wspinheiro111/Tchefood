@@ -105,7 +105,10 @@ export class SupabaseDeliveryRepository implements DeliveryRepository {
           accept: "application/json",
         },
         body: JSON.stringify(args),
-        // Sem o signal o abort do prazo não cancelaria a requisição: ela seguiria (e poderia gravar) em segundo plano.
+        // O signal libera a conexão quando o prazo vence. Não garante que nada foi gravado: se o Postgres já
+        // recebeu a chamada, ele termina a transação mesmo com o abort. Isso é seguro porque toda gravação é
+        // idempotente ou leva a versão lida (o evento tem id único; o pedido só grava com a versão esperada, e a
+        // repetição recebe conflito e relê), então refazer a chamada que "falhou" nunca duplica nem sobrescreve.
         signal: controller.signal,
       });
       return { status: response.status, ok: response.ok, text: await response.text() };
@@ -160,7 +163,8 @@ function toRecord(raw: unknown): DeliveryOrderRecord {
 }
 
 // Chamada ao Supabase com prazo: estourado o prazo, a requisição é cancelada (abort) e a chamada falha com
-// DeliveryRepositoryError. Devolve status e corpo já lidos.
+// DeliveryRepositoryError. Devolve status e corpo já lidos. O abort só libera a conexão: o que o banco já
+// recebeu ele termina (ver o comentário em rpc), então quem chama trata a falha como "pode ter gravado".
 export async function fetchWithDeadline(
   fetchImpl: RestFetch,
   url: string,

@@ -27,17 +27,24 @@ iFood ──polling 30 s──> servidor (Node, 1 instância) ──service_role
 
 Todas exigem `Authorization: Bearer <JWT da sessão do app>`, menos `/health`.
 
+Cancelar, responder negociação, pausar e retomar a loja são ações de gerente: o corpo leva também
+`authorization: {managerPin, performedBy, requestId, reason}` (PIN de gerente de 4 a 8 dígitos, UUID do operador,
+UUID gerado pelo app por tentativa e motivo com 5 caracteres ou mais). O servidor confere o PIN no banco
+(`tchefood_delivery_authorize`, com o mesmo bloqueio de 3 erros em 60 s do PIN de gerente) ANTES de chamar o
+iFood; a autorização e o resultado da chamada ficam em `audit_logs`. Campos faltando: 400. PIN errado ou
+bloqueado: 403 com `code` (`PIN_FAILED`, `PIN_LOCKED`, `DENIED`); mesmo `requestId` reaproveitado em outra ação, alvo ou pessoa: 409 (reenvio igual devolve a mesma autorização).
+
 | Método e rota | O que faz |
 |---|---|
-| `GET /health` | Situação do polling (último ciclo, erro, número de lojas). Sem pedidos. |
+| `GET /health` | Público: `ok`, `running`, `merchants`, `lastCycleAt` e `hasError` (sim/não). O texto do erro fica só no log. |
 | `POST /ifood/orders/:id/actions/:acao` | `confirm`, `start_preparation`, `ready_for_pickup`, `dispatch` |
 | `GET /ifood/orders/:id/cancellation-reasons` | Motivos que o iFood aceita agora para o pedido |
-| `POST /ifood/orders/:id/cancellation` | `{code, description, details?}`; o código precisa estar na lista atual |
-| `POST /ifood/orders/:id/dispute` | `{kind: "accept"}`, `{kind: "reject", reason}` ou `{kind: "alternative", alternativeId}` |
+| `POST /ifood/orders/:id/cancellation` | `{code, description, details?, authorization}`; o código precisa estar na lista atual |
+| `POST /ifood/orders/:id/dispute` | `{kind: "accept"}`, `{kind: "reject", reason}` ou `{kind: "alternative", alternativeId}`, mais `authorization` |
 | `GET /ifood/merchants/:id/status` | Loja aberta/fechada no iFood |
 | `GET /ifood/merchants/:id/pauses` | Pausas ativas |
-| `POST /ifood/merchants/:id/pauses` | `{description, minutes}` (1 a 1440); início e fim pelo relógio do servidor |
-| `DELETE /ifood/merchants/:id/pauses/:pauseId` | Retoma a loja |
+| `POST /ifood/merchants/:id/pauses` | `{description, minutes, authorization}` (1 a 1440 min); início e fim pelo relógio do servidor |
+| `DELETE /ifood/merchants/:id/pauses/:pauseId` | Retoma a loja; corpo `{authorization}` |
 
 ## Rodar
 
@@ -103,8 +110,8 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
 
 ## Limites conhecidos
 
-- A permissão das ações é por loja (quem tem sessão da loja pode cancelar ou pausar). Restringir por perfil
-  (gerente/dono) entra com as telas do item 5.
+- Confirmar, iniciar preparo, pronto e despachar valem para qualquer sessão da loja. Cancelar, negociação, pausar e
+  retomar exigem o PIN de gerente (ver "API do servidor"); a tela que pede o PIN entra com o item 5.
 - Não há bloqueio automático de consulta/atualização 8 h depois da entrega (o servidor só consulta o detalhe no
   primeiro evento do pedido).
 - Não foi testado contra o iFood de verdade: depende das credenciais de teste do Portal do Desenvolvedor.

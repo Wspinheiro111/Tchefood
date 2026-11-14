@@ -5,7 +5,7 @@ import {
   type DeliveryOrderAction,
 } from "../marketplace";
 import { DeliveryRepositoryError, fetchWithDeadline, type RestFetch } from "../supabaseDeliveryRepository";
-import { IFOOD_POLLING_INTERVAL_MS, IfoodMerchantApi } from "./ifoodMerchantApi";
+import { IFOOD_POLLING_INTERVAL_MS, IfoodMerchantApi, isValidIfoodMerchantId } from "./ifoodMerchantApi";
 
 // Servidor do iFood: um processo só, sempre ligado.
 //  - Polling a cada 30 s das lojas com integração ativa (é o polling que mantém a loja aberta no iFood). Um ciclo
@@ -35,13 +35,22 @@ export type IfoodPollerStatus = {
   lastCycleAt: string | null;
   lastReport: DeliveryCycleReport | null;
   lastError: string | null;
+  // Integrações ativas com merchantId inválido, deixadas fora do polling no último ciclo.
+  invalidMerchants: number;
 };
 
 export class IfoodPoller {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = true;
   private current: Promise<void> | null = null;
-  private readonly status: IfoodPollerStatus = { running: false, merchants: 0, lastCycleAt: null, lastReport: null, lastError: null };
+  private readonly status: IfoodPollerStatus = {
+    running: false,
+    merchants: 0,
+    lastCycleAt: null,
+    lastReport: null,
+    lastError: null,
+    invalidMerchants: 0,
+  };
 
   constructor(private readonly options: IfoodPollerOptions) {}
 
@@ -70,17 +79,27 @@ export class IfoodPoller {
     const now = this.options.now ?? Date.now;
     try {
       const merchants = await this.options.merchants.activeMerchants();
-      this.status.merchants = merchants.length;
+      // merchantId mal cadastrado (espaço no fim, colado errado) fica fora do polling, com log; as outras lojas
+      // seguem. Sem isso setMerchantIds lançaria e nenhuma loja receberia pedido.
+      const valid: string[] = [];
+      const invalid: string[] = [];
+      for (const { merchantExternalId } of merchants) {
+        (isValidIfoodMerchantId(merchantExternalId) ? valid : invalid).push(merchantExternalId);
+      }
+      for (const id of invalid) log(`[ifood] integração ativa com merchantId inválido, fora do polling: ${JSON.stringify(id)}`);
+      const invalidError = invalid.length > 0 ? `${invalid.length} integração(ões) ativa(s) com merchantId inválido fora do polling.` : null;
+      this.status.merchants = valid.length;
+      this.status.invalidMerchants = invalid.length;
       // Sem loja ligada não há polling: sem o header x-polling-merchants o iFood mandaria eventos de lojas que
       // ninguém grava, e eles voltariam para sempre.
-      if (merchants.length === 0) {
-        this.status.lastError = null;
+      if (valid.length === 0) {
+        this.status.lastError = invalidError;
         return null;
       }
-      this.options.api.setMerchantIds(merchants.map((merchant) => merchant.merchantExternalId));
+      this.options.api.setMerchantIds(valid);
       const report = await this.options.inbox.runChannel(this.options.api);
       this.status.lastReport = report;
-      this.status.lastError = report.error;
+      this.status.lastError = report.error ?? invalidError;
       if (report.received > 0 || report.error) {
         log(`[ifood] recebidos=${report.received} novos=${report.newOrders.length} ack=${report.acknowledged} adiados=${report.deferred}${report.error ? ` erro=${report.error}` : ""}`);
       }
@@ -330,8 +349,15 @@ export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRe
     const path = request.path.split("?")[0] ?? "";
     try {
       if (request.method === "GET" && path === "/health") {
+        // Rota pública: só o estado geral. O texto do erro (pode ter merchantId e resposta do iFood) fica no log.
         const status = options.poller?.snapshot() ?? null;
-        return { status: 200, body: { ok: true, poller: status && { running: status.running, merchants: status.merchants, lastCycleAt: status.lastCycleAt, lastError: status.lastError } } };
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            poller: status && { running: status.running, merchants: status.merchants, lastCycleAt: status.lastCycleAt, hasError: status.lastError !== null },
+          },
+        };
       }
 
       const token = /^Bearer\s+(\S+)$/i.exec(request.headers.authorization ?? "")?.[1];

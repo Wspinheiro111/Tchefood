@@ -61,6 +61,12 @@ const MAX_ACK_BATCH = 2_000;
 // Ids do iFood são UUIDs; o merchantId também.
 const ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
 
+// merchantId no formato que setMerchantIds aceita (o servidor filtra a lista antes, para uma integração mal
+// cadastrada não derrubar o polling das outras lojas).
+export function isValidIfoodMerchantId(id: string): boolean {
+  return ID_PATTERN.test(id);
+}
+
 // Código do evento -> sinal comum (lista oficial: /pt-BR/docs/guides/order/events). Código ausente desta tabela
 // (entregador, troca de endereço, alteração de itens etc.) vira "unknown": o evento é registrado e confirmado,
 // mas não mexe no pedido. SPS/SPE são só do iFood Mercado; ficam como "preparando" por segurança.

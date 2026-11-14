@@ -90,6 +90,30 @@ describe("servidor do iFood: polling", () => {
     expect(sandbox.pendingEventCount()).toBe(1);
   });
 
+  it("merchantId inválido numa integração não derruba o polling das outras lojas", async () => {
+    const log = vi.fn();
+    const sandbox = new IfoodSandbox(undefined, undefined, () => NOW);
+    const api = new IfoodMerchantApi({ credentials: { clientId: sandbox.clientId, clientSecret: sandbox.clientSecret }, baseUrl: sandbox.baseUrl, fetchImpl: sandbox.fetch });
+    const inbox = new DeliveryInbox({ adapters: [api], repository: new InMemoryDeliveryRepository(), now: () => NOW });
+    const merchants = { activeMerchants: async () => [{ merchantExternalId: `${sandbox.merchantId} ` }, { merchantExternalId: sandbox.merchantId }] };
+    const poller = new IfoodPoller({ api, inbox, merchants, log, now: () => NOW.getTime() });
+    sandbox.placeOrder({ items: ITEMS });
+    const report = await poller.runOnce();
+    expect(report).toMatchObject({ received: 1, acknowledged: 1 });
+    expect(poller.snapshot()).toMatchObject({ merchants: 1, invalidMerchants: 1 });
+    expect(poller.snapshot().lastError).toMatch(/merchantId inválido/);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`merchantId inválido, fora do polling: "${sandbox.merchantId} "`));
+  });
+
+  it("só merchantId inválido: não faz polling e o status mostra o erro", async () => {
+    const { sandbox, poller } = setup({ merchants: ["loja errada"] });
+    sandbox.placeOrder({ items: ITEMS });
+    expect(await poller.runOnce()).toBeNull();
+    expect(sandbox.stats.polls).toBe(0);
+    expect(poller.snapshot()).toMatchObject({ merchants: 0, invalidMerchants: 1 });
+    expect(poller.snapshot().lastError).toMatch(/merchantId inválido/);
+  });
+
   it("falha ao ler as lojas não derruba o servidor", async () => {
     const { poller, merchants } = setup();
     merchants.activeMerchants.mockRejectedValueOnce(new Error("banco fora do ar"));
@@ -245,6 +269,15 @@ describe("servidor do iFood: API do app", () => {
     const health = await call("GET", "/health", undefined, "");
     expect(health.status).toBe(200);
     expect(health.body).toMatchObject({ ok: true, poller: { merchants: 1 } });
+  });
+
+  it("health público não devolve o texto do erro (merchantId, resposta do iFood), só se há erro", async () => {
+    const { call, poller, merchants } = setup();
+    merchants.activeMerchants.mockRejectedValueOnce(new Error("iFood recusou a loja 11111111-2222-4333-8444-555555555555"));
+    await poller.runOnce();
+    const health = await call("GET", "/health", undefined, "");
+    expect(health.body).toEqual({ ok: true, poller: { running: false, merchants: 0, lastCycleAt: NOW.toISOString(), hasError: true } });
+    expect(JSON.stringify(health.body)).not.toMatch(/11111111/);
   });
 });
 

@@ -18,7 +18,8 @@ import {
 //   IFOOD_BASE_URL                         opcional (padrão https://merchant-api.ifood.com.br)
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY
 //   PORT                                   porta da API (padrão 8787)
-//   CORS_ORIGINS                           origens do app separadas por vírgula (padrão: qualquer uma; a API não usa cookie)
+//   CORS_ORIGINS                           origens do app separadas por vírgula (obrigatória; só no simulador
+//                                          pode faltar, e aí qualquer origem é aceita)
 //   IFOOD_SANDBOX=1                        roda contra o iFood simulado em memória, sem credenciais nem Supabase
 //                                          (só para testar o processo; nada é gravado de verdade)
 // Rodar exatamente UMA instância: o polling de duas instâncias não perde pedido (versão no banco), mas avisaria
@@ -94,6 +95,8 @@ function main(): void {
   const poller = new IfoodPoller({ api, inbox, merchants, log });
   const handle = createIfoodApiHandler({ inbox, api, authorizer, approval, poller, log });
   const origins = (process.env.CORS_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter(Boolean);
+  // Fora do simulador a API só responde ao navegador nas origens do app: sem a lista, o servidor não sobe.
+  if (origins.length === 0 && process.env.IFOOD_SANDBOX !== "1") required("CORS_ORIGINS");
 
   const server = createServer(async (request, response) => {
     const origin = request.headers.origin;

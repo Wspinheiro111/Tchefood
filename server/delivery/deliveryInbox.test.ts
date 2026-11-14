@@ -1,8 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { DeliveryConcurrencyError, DeliveryInbox, InMemoryDeliveryRepository, type DeliveryOrderRecord } from "./deliveryInbox";
+import {
+  DeliveryConcurrencyError,
+  DeliveryInbox,
+  InMemoryDeliveryRepository,
+  ORDER_DETAIL_MAX_FAILURES,
+  type DeliveryOrderRecord,
+} from "./deliveryInbox";
 import { IfoodMerchantApi } from "./ifood/ifoodMerchantApi";
 import { IfoodSandbox } from "./ifood/ifoodSandbox";
-import { allowedDeliveryActions, mergeDeliveryStatus, type DeliveryEvent, type DeliveryOrder } from "./marketplace";
+import { DeliveryMarketplaceError, allowedDeliveryActions, mergeDeliveryStatus, type DeliveryEvent, type DeliveryOrder } from "./marketplace";
 
 async function baseOrder(): Promise<DeliveryOrder> {
   const sandbox = new IfoodSandbox();
@@ -564,5 +570,75 @@ describe("caixa de entrada de delivery", () => {
     expect(result.cancellationPending).toBe(true);
     expect((await inbox.listOrders())[0].cancellationPending).toBe(true);
   });
-});
 
+  it("detalhe ilegível (valor negativo, sem itens): pedido entra mínimo, para conferência, e o evento recebe ack", async () => {
+    const onNewOrder = vi.fn();
+    const { sandbox, api, repository, inbox } = setup({ onNewOrder });
+    const id = sandbox.placeOrder({ items: ITEMS });
+    vi.spyOn(api, "getOrder").mockRejectedValue(new DeliveryMarketplaceError("ifood", "invalid_response", "Valor inválido no iFood: total.subTotal."));
+    const [report] = await inbox.runCycle();
+    expect(report).toMatchObject({ received: 1, acknowledged: 1, deferred: 0, newOrders: [id], error: null });
+    expect(sandbox.pendingEventCount()).toBe(0);
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record.order).toMatchObject({ status: "placed", items: [], merchantExternalId: sandbox.merchantId, isTest: false });
+    expect(record.order.totals.orderCents).toBe(0);
+    expect(record.needsReview).toBe(true);
+    expect(record.reviewReasons).toContain(
+      "Detalhe do pedido ilegível no iFood (Valor inválido no iFood: total.subTotal.): confira e confirme pelo Portal do Parceiro.",
+    );
+    expect(onNewOrder).toHaveBeenCalledOnce();
+    // Os eventos seguintes andam o status normalmente.
+    await inbox.performAction("ifood", id, "confirm");
+    await inbox.runCycle();
+    expect((await repository.getOrder("ifood", id))!.order.status).toBe("confirmed");
+  });
+
+  it(`detalhe recusado (403/404) em ${ORDER_DETAIL_MAX_FAILURES} ciclos seguidos: pedido entra mínimo; antes disso só adia`, async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    const getOrder = vi.spyOn(api, "getOrder").mockRejectedValue(new DeliveryMarketplaceError("ifood", "not_found", "Pedido não encontrado no iFood.", 404));
+    for (let cycle = 1; cycle < ORDER_DETAIL_MAX_FAILURES; cycle += 1) {
+      const [report] = await inbox.runCycle();
+      expect(report).toMatchObject({ acknowledged: 0, deferred: 1 });
+    }
+    expect(await repository.getOrder("ifood", id)).toBeNull();
+    const [last] = await inbox.runCycle();
+    expect(last).toMatchObject({ acknowledged: 1, newOrders: [id] });
+    expect(getOrder).toHaveBeenCalledTimes(ORDER_DETAIL_MAX_FAILURES);
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record.reviewReasons.join(" ")).toMatch(/Detalhe do pedido ilegível no iFood \(Pedido não encontrado no iFood\.\)/);
+  });
+
+  it("falha temporária do detalhe nunca vira pedido mínimo, por mais ciclos que passe", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    vi.spyOn(api, "getOrder").mockRejectedValue(new DeliveryMarketplaceError("ifood", "unavailable", "iFood indisponível (tempo esgotado)."));
+    for (let cycle = 0; cycle < ORDER_DETAIL_MAX_FAILURES + 2; cycle += 1) await inbox.runCycle();
+    expect(await repository.getOrder("ifood", id)).toBeNull();
+    expect(sandbox.pendingEventCount()).toBe(1);
+  });
+
+  it("detalhe sem merchant.id: vale a loja do evento", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    const getOrder = api.getOrder.bind(api);
+    vi.spyOn(api, "getOrder").mockImplementation(async (orderId) => ({ ...(await getOrder(orderId)), merchantExternalId: "" }));
+    await inbox.runCycle();
+    expect((await repository.getOrder("ifood", id))!.order.merchantExternalId).toBe(sandbox.merchantId);
+  });
+
+  it("pedido que o PDV só vê já cancelado não dispara aviso de pedido novo", async () => {
+    const onNewOrder = vi.fn();
+    const { sandbox, api, repository, inbox } = setup({ onNewOrder });
+    const id = sandbox.placeOrder({ items: ITEMS });
+    sandbox.emitFromMarketplace(id, "CAN");
+    // O PLC se perdeu (ack dado por outra instalação): o primeiro evento que chega é o CAN.
+    const poll = api.pollEvents.bind(api);
+    vi.spyOn(api, "pollEvents").mockImplementation(async () => (await poll()).filter((event) => event.rawCode !== "PLC"));
+    const [report] = await inbox.runCycle();
+    expect(report).toMatchObject({ acknowledged: 1, newOrders: [] });
+    expect(onNewOrder).not.toHaveBeenCalled();
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record).toMatchObject({ newOrderNotified: true, order: { status: "cancelled" } });
+  });
+});
