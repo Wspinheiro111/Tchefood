@@ -124,7 +124,8 @@ describe('2. faturamento por forma', () => {
     const inside = revenueByMethod({ ...emptyRevenueInput, cashSessions: [session({})], payments: [pay({ method: 'CASH', acquirer: 'CASH_DESK', created_at: '2025-05-01T20:00:00-03:00' })] }, P);
     expect(inside.cashOutsideSessionsCount).toBe(0);
     expect(r.closingsDifference).toBe(-7.5);
-    expect(r.openSessions).toBe(1);
+    // Aberto e ainda aberto + aberto em 2025 e fechado só em 2026: os dois estavam abertos na virada.
+    expect(r.openSessions).toBe(2);
     // Fechamento com data inválida não some calado.
     expect(revenueByMethod({ ...emptyRevenueInput, cashSessions: [session({ closed_at: 'ontem' })] }, P).invalidDates).toBe(1);
     expect([r.supplies, r.withdrawals]).toEqual([50, 70.5]);
@@ -423,7 +424,8 @@ describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
     );
     expect(r.totalGross).toBe(30);
     expect(r.closings).toHaveLength(1);
-    expect(r.openSessions).toBe(0);
+    // Fechado às 11h (depois do corte das 10h): estava aberto no instante do relatório.
+    expect(r.openSessions).toBe(1);
     expect(r.supplies).toBe(10);
     expect(r.afterCutoff).toBe(4); // pagamento, turno fechado, turno aberto, suprimento
     expect(toCsv(revenueDoc(r, base))).toContain(AVISO(4));
@@ -484,5 +486,37 @@ describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
     const exp = expensesByCategory({ purchaseInvoices: [invoice({ issued_at: last }), invoice({ issued_at: next })], suppliers: [], courierSettlements: [], cashMovements: [], revenue: rev }, P, NOW);
     expect([exp.rows[0]!.amount, exp.cutoff, exp.afterCutoff]).toEqual([80, P.to, 0]);
     for (const doc of [inventoryDoc(inv, base), revenueDoc(rev, base), openDoc(open, base), expensesDoc(exp, base)]) expect(toCsv(doc)).not.toContain('instante deste relatório');
+  });
+});
+
+describe('rodada interna após a auditoria 2: nada some calado', () => {
+  const session = (x: Partial<CashSession>): CashSession =>
+    ({ id: Math.random().toString(), tenant_id: 't', opened_by_user_id: 'u1', opened_at: '2025-05-01T10:00:00-03:00', opening_float: 100, status: 'CLOSED', closed_by_user_id: 'u1', closed_at: '2025-05-01T23:00:00-03:00', counted_cash: 0, expected_cash: 0, difference: 0, closing_notes: null, closing_authorized_by_manager_id: null, ...x }) as CashSession;
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+
+  it('turno aberto na virada conta no ano da posição, seja qual for o ano da abertura', () => {
+    const virada = session({ opened_at: '2025-12-31T18:00:00-03:00', closed_at: '2026-01-01T02:00:00-03:00' });
+    const antigo = session({ opened_at: '2024-03-01T10:00:00-03:00', status: 'OPEN', closed_at: null });
+    const r25 = revenueByMethod({ ...emptyRevenueInput, cashSessions: [virada, antigo] }, P, NOW);
+    expect(r25.openSessions).toBe(2);
+    expect(toCsv(revenueDoc(r25, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('2 turno(s) de caixa estavam abertos na posição');
+    // Em 2026 o da virada já fechou; o antigo continua aberto.
+    expect(revenueByMethod({ ...emptyRevenueInput, cashSessions: [virada, antigo] }, yearPeriod(2026), NOW).openSessions).toBe(1);
+    // Aberto depois do instante do relatório não conta como aberto.
+    expect(revenueByMethod({ ...emptyRevenueInput, cashSessions: [session({ opened_at: '2026-11-14T11:00:00-03:00', status: 'OPEN', closed_at: null })] }, yearPeriod(2026), NOW).openSessions).toBe(0);
+  });
+
+  it('suprimento ou sangria com data inválida é contado como data inválida', () => {
+    const r = revenueByMethod({ ...emptyRevenueInput, cashMovements: [{ id: 'm1', type: 'SUPPLY', amount: 50, created_at: 'lixo' } as CashMovement] }, P, NOW);
+    expect(r.invalidDates).toBe(1);
+    expect(r.supplies).toBe(0);
+  });
+
+  it('NF-e com data de emissão inválida vai pela importação e é avisada', () => {
+    const inv = { id: 'i1', supplier_id: 's1', access_key: '4325'.padEnd(44, '0'), number: '1', series: '1', issued_at: '2025-02-31', environment: 'PRODUCTION', invoice_amount: 10, imported_at: '2025-03-01T10:00:00-03:00' } as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW) }, P, NOW);
+    expect(r.invalidIssueDates).toBe(1);
+    expect(r.purchases).toHaveLength(1);
+    expect(toCsv(expensesDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('1 NF-e com data de emissão inválida');
   });
 });

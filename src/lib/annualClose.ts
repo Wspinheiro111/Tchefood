@@ -365,6 +365,7 @@ export interface RevenueReport {
   supplies: number;
   withdrawals: number;
   /** Turnos de caixa abertos no ano que ainda não foram fechados. */
+  /** Turnos de caixa abertos na posição (abertos antes do corte, de qualquer ano, e fechados só depois ou ainda abertos). */
   openSessions: number;
   /** Pagamentos aprovados e pedidos de app com data inválida (ficaram de fora). */
   invalidDates: number;
@@ -481,12 +482,18 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod, now: Date = 
   let openSessions = 0;
   const sessionIds = new Set<string>();
   for (const s of input.cashSessions) {
+    // Turno aberto na posição: aberto antes do corte (de qualquer ano) e ainda aberto,
+    // ou fechado só depois do corte (ex.: aberto em 31/12 e fechado em 01/01).
+    const opened = at(s.opened_at);
+    const closedT = s.status === 'CLOSED' ? at(s.closed_at) : null;
+    if (opened !== null && opened < cutoff && (s.status !== 'CLOSED' || (closedT !== null && closedT >= cutoff))) openSessions += 1;
     if (s.status !== 'CLOSED') {
-      if (inPeriod(at(s.opened_at))) openSessions += 1;
+      // Turno aberto depois do instante do relatório: fica de fora e é avisado.
+      if (opened !== null && afterCutoff(opened, p, cutoff)) late += 1;
       continue;
     }
-    if (at(s.closed_at) === null) invalidDates += 1;
-    if (!inPeriod(at(s.closed_at))) continue;
+    if (closedT === null) invalidDates += 1;
+    if (!inPeriod(closedT)) continue;
     sessionIds.add(s.id);
     if (s.difference !== null) diffC += toCents(s.difference);
     closings.push({
@@ -520,7 +527,9 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod, now: Date = 
   let suppliesC = 0;
   let withdrawalsC = 0;
   for (const mv of input.cashMovements) {
-    if (!inPeriod(at(mv.created_at))) continue;
+    const mt = at(mv.created_at);
+    if (mt === null) invalidDates += 1;
+    if (!inPeriod(mt)) continue;
     if (mv.type === 'SUPPLY') suppliesC += toCents(mv.amount);
     else if (mv.type === 'WITHDRAWAL') withdrawalsC += toCents(mv.amount);
   }
@@ -765,6 +774,8 @@ export interface ExpensesReport {
   purchases: PurchaseRow[];
   /** Notas de homologação (teste) no ano: não entram. */
   homologationInvoices: number;
+  /** NF-e com data de emissão inválida, contadas pela data da importação. */
+  invalidIssueDates: number;
   /** Sangrias do caixa no ano que não são acerto de entregador: sem categoria. */
   withdrawals: WithdrawalRow[];
   withdrawalsTotal: number;
@@ -805,9 +816,12 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
   let purchasesC = 0;
   let homologation = 0;
   let invalidDates = 0;
+  let invalidIssueDates = 0;
   for (const inv of input.purchaseInvoices) {
-    // Emissão (dhEmi ou dEmi); sem ela, a data da importação.
-    const t = invoiceDate(inv.issued_at) ?? at(inv.imported_at);
+    // Emissão (dhEmi ou dEmi); sem ela (ou com ela inválida), a data da importação.
+    const issued = invoiceDate(inv.issued_at);
+    const t = issued ?? at(inv.imported_at);
+    if (issued === null && (inv.issued_at ?? '').trim() !== '' && t !== null && t >= p.from && t < cutoff) invalidIssueDates += 1;
     if (t === null) invalidDates += 1;
     if (!inPeriod(t)) continue;
     const when = new Date(t).toISOString();
@@ -884,7 +898,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
     { key: 'OTHER', label: 'Outras despesas (luz, água, gás, internet, impostos)', amount: null, count: 0, source: 'NOT_TRACKED', note: NOT_TRACKED },
   ];
   const total = rows.reduce((a, r) => a + (r.amount === null ? 0 : toCents(r.amount)), 0);
-  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates, cutoff, afterCutoff: late };
+  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, invalidIssueDates, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates, cutoff, afterCutoff: late };
 }
 
 const fmt = (cents: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(fromCents(cents));

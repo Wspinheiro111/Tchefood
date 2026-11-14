@@ -272,7 +272,7 @@ export function AnnualClose() {
         'open',
         <>
           {line(partial ? 'A receber de maquininha (repasse de hoje em diante)' : `A receber de maquininha (repasse depois de 31/12/${year})`, formatBRL(open.cardReceivablesNet), '(estimado)')}
-          {open.cardWithoutRuleCount > 0 && line('Vendas na maquininha sem taxa cadastrada', formatBRL(open.cardWithoutRule), '(não dá para saber se caíram)')}
+          {open.cardWithoutRuleCount > 0 && line('Situação de repasse desconhecida (sem taxa cadastrada)', formatBRL(open.cardWithoutRule), open.cardWithoutRulePriorYearsCount > 0 ? `(pode já ter caído; fora do A receber; inclui ${open.cardWithoutRulePriorYearsCount} venda(s) de anos anteriores, ${formatBRL(open.cardWithoutRulePriorYears)})` : '(pode já ter caído; fora do A receber)')}
           {line('A receber: dinheiro com entregadores', formatBRL(open.courierCashTotal))}
           {line('A pagar a entregadores próprios', formatBRL(open.courierPayablesTotal))}
           <p className="mt-2 text-sm text-slate-500">Não registrados no Tchê Food (informe pelo seu controle): boletos de fornecedores, fiado/convênio de clientes e repasses pendentes dos apps.</p>

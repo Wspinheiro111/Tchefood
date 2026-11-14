@@ -127,8 +127,8 @@ export function revenueDoc(r: RevenueReport, base: Omit<ReportDoc, 'title' | 'ta
       ...(r.simulatorCount > 0 ? [`${r.simulatorCount} pagamento(s) no simulador de maquininha (R$ ${br(r.simulatorAmount)}) ficaram de fora: não são dinheiro real.`] : []),
       ...(r.totalWithoutRule > 0 ? [`R$ ${br(r.totalWithoutRule)} foram recebidos sem taxa cadastrada: a taxa deles NÃO foi descontada.`] : []),
       `Gorjetas no ano: R$ ${br(r.tips)}.`,
-      ...(r.openSessions > 0 ? [`${r.openSessions} turno(s) de caixa aberto(s) no ano ainda não foram fechados.`] : []),
-      ...invalid(r.invalidDates, 'pagamento(s) ou fechamento(s) de caixa'),
+      ...(r.openSessions > 0 ? [`${r.openSessions} turno(s) de caixa estavam abertos na posição (abertos antes e fechados depois dela, ou ainda abertos): o fechamento deles não está na lista abaixo.`] : []),
+      ...invalid(r.invalidDates, 'pagamento(s), fechamento(s) ou movimento(s) de caixa'),
       ...afterCutoffNote(r.afterCutoff, r.cutoff),
       ...extraNotes,
     ],
@@ -184,7 +184,7 @@ export function openDoc(r: OpenPositionsReport, base: Omit<ReportDoc, 'title' | 
     notes: [
       'A RECEBER de maquininha: vendas até a posição com repasse previsto para depois dela, pelo prazo e taxa cadastrados (estimativa; feriado não conta; confira com a agenda da adquirente).',
       'Estorno feito na maquininha NÃO chega ao Tchê Food: venda estornada ainda aparece aqui como a receber. Confira com a agenda da adquirente.',
-      'A RECEBER de entregador: dinheiro de entregas pagas na entrega feitas até a posição e ainda não acertadas.',
+      'A RECEBER de entregador: dinheiro de entregas pagas na entrega feitas até a posição e ainda não acertadas. O valor usa o total ATUAL do pedido menos o que foi pago até a posição: se o pedido foi alterado depois (desconto, item cancelado), o valor daquela data pode ser outro.',
       ...noRuleNote(r),
       'NÃO registrados no Tchê Food (informe pelo seu controle): contas a pagar de fornecedores (boletos/duplicatas), fiado e convênios de clientes, repasses pendentes dos apps de delivery.',
       ...invalid(r.invalidDates, 'entrega(s)'),
@@ -221,6 +221,7 @@ export function expensesDoc(r: ExpensesReport, base: Omit<ReportDoc, 'title' | '
     notes: [
       'Total = só o que o app registra ou estima. Folha, aluguel e outras despesas não são registradas no Tchê Food e ficam de fora.',
       ...(r.homologationInvoices > 0 ? [`${r.homologationInvoices} NF-e de homologação (teste) no ano ficaram de fora.`] : []),
+      ...(r.invalidIssueDates > 0 ? [`${r.invalidIssueDates} NF-e com data de emissão inválida foram contadas pela data da importação: confira o ano dessas notas.`] : []),
       ...invalid(r.invalidDates, 'nota(s), acerto(s) ou sangria(s)'),
       ...afterCutoffNote(r.afterCutoff, r.cutoff),
       ...(r.withdrawals.length > 0 ? [`Sangrias do caixa sem categoria (R$ ${br(r.withdrawalsTotal)}) estão listadas à parte e NÃO entram no total: classifique com o contador.`] : []),
