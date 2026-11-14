@@ -339,13 +339,32 @@ describe('revisão do Codex', () => {
   });
 
   it('NF-e com dEmi (só a data) conta no ano da emissão, não no da importação', () => {
-    expect(invoiceDate('2025-12-31')).toBe(Date.parse('2025-12-31T12:00:00-03:00'));
+    expect(invoiceDate('2025-12-31')).toBe(Date.parse('2025-12-31T00:00:00-03:00'));
+    expect(invoiceDate('2026-01-01')).toBe(Date.parse('2026-01-01T00:00:00-03:00'));
     expect(invoiceDate('2025-02-30')).toBeNull();
     const inv = { id: 'n', supplier_id: 's', access_key: Math.random().toString(), number: '1', series: '1', issued_at: '2025-12-31', environment: 'PRODUCTION', invoice_amount: 80, imported_at: '2026-01-03T10:00:00-03:00' } as PurchaseInvoice;
     const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P) };
     expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).rows[0]!.amount).toBe(80);
     expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, yearPeriod(2026)).rows[0]!.amount).toBe(0);
-    expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).purchases[0]!.date).toBe('2025-12-31T15:00:00.000Z');
+    expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).purchases[0]!.date).toBe('2025-12-31T03:00:00.000Z');
+  });
+
+  it('NF-e com dEmi de hoje entra no relatório do ano em andamento de manhã (Codex, 2012bb1)', () => {
+    const inv = { id: 'h', supplier_id: 's', access_key: 'k-hoje', number: '2', series: '1', issued_at: '2026-11-14', environment: 'PRODUCTION', invoice_amount: 55, imported_at: '2026-11-14T08:00:00-03:00' } as PurchaseInvoice;
+    const amanha = { ...inv, id: 'a', access_key: 'k-amanha', issued_at: '2026-11-15', invoice_amount: 7 } as PurchaseInvoice;
+    const nove = new Date('2026-11-14T09:00:00-03:00');
+    const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, yearPeriod(2026), nove) };
+    const r = expensesByCategory({ ...base, purchaseInvoices: [inv, amanha] }, yearPeriod(2026), nove);
+    expect(r.rows[0]!.amount).toBe(55);
+    expect(r.afterCutoff).toBe(1);
+  });
+
+  it('dEmi em dia de início do horário de verão antigo (meia-noite pulada) fica no mesmo dia', () => {
+    const t = invoiceDate('2018-11-04')!;
+    expect(new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date(t))).toBe('2018-11-04');
+    expect(t).toBe(Date.parse('2018-11-04T01:00:00-02:00'));
+    // Dia comum do horário de verão antigo: meia-noite local (-02:00), não -03:00 fixo.
+    expect(invoiceDate('2018-12-15')).toBe(Date.parse('2018-12-15T00:00:00-02:00'));
   });
 });
 

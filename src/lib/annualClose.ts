@@ -56,7 +56,10 @@ const at = (iso: string | null | undefined): number | null => {
 
 /**
  * Data de emissão da NF-e: dhEmi (com fuso) ou dEmi (só a data, NF-e antiga). A data
- * sozinha é um dia do calendário de Brasília: vale 12:00 daquele dia, longe das viradas.
+ * sozinha é um dia do calendário de Brasília: vale o começo daquele dia, para que uma
+ * nota de hoje entre no relatório do ano em andamento a qualquer hora (com 12:00, de
+ * manhã ela ficava "depois do instante do relatório"). Nos dias em que o horário de verão
+ * antigo pulava a meia-noite, vale 01:00, que ainda é o mesmo dia.
  */
 export function invoiceDate(iso: string | null | undefined): number | null {
   if (typeof iso === 'string') {
@@ -66,7 +69,9 @@ export function invoiceDate(iso: string | null | undefined): number | null {
       const mo = Number(m[2]);
       const d = Number(m[3]);
       if (mo < 1 || mo > 12 || d < 1 || d > new Date(Date.UTC(y, mo, 0)).getUTCDate()) return null;
-      const t = brasiliaInstant(y, mo - 1, d, 12);
+      let t = brasiliaInstant(y, mo - 1, d, 0);
+      const got = brasiliaYmd(t);
+      if (got.y !== y || got.m !== mo - 1 || got.d !== d) t = brasiliaInstant(y, mo - 1, d, 1);
       return inRange(t) ? t : null;
     }
   }
