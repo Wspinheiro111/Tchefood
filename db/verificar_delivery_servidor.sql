@@ -23,7 +23,8 @@ funcs (ordem, sig, servidor) AS (VALUES
     (7, 'public.tchefood_delivery_save_order(delivery_channel, integer, jsonb)', TRUE),
     (8, 'public.tchefood_delivery_record_event(jsonb)', TRUE),
     (9, 'public.tchefood_delivery_audit_result(uuid, varchar, text)', TRUE),
-    (10, 'public.tchefood_delivery_authorize(delivery_channel, varchar, varchar, varchar, varchar, uuid, text, uuid, jsonb)', FALSE)
+    (10, 'public.tchefood_delivery_authorize(delivery_channel, varchar, varchar, varchar, varchar, uuid, text, uuid, jsonb)', FALSE),
+    (11, 'public.tchefood_delivery_list_detail_pending(delivery_channel, integer)', TRUE)
 ),
 f AS (
     SELECT ordem, sig, servidor, to_regprocedure(sig) AS oid FROM funcs
