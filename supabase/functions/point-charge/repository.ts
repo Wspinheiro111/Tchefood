@@ -1,7 +1,7 @@
 /**
  * terminal_charges pela service role, sempre filtrado pelo tenant já provado pelo RLS em index.ts.
  */
-import { ChargeRefusedError, type ChargePatch, type ChargeStore, type NewChargeRow, type TerminalChargeRow } from './charge.ts';
+import { ChargeRefusedError, type ChargePatch, type ChargeStore, type NewChargeRow, type RefundRecord, type TerminalChargeRow } from './charge.ts';
 
 // O query builder do supabase-js é encadeável e muito tipado; aqui basta o contrato mínimo.
 // deno-lint-ignore no-explicit-any
@@ -261,6 +261,22 @@ export function supabaseChargeStore(db: SupabaseLike, tenantId: string): ChargeS
         'ler o pagamento da cobrança',
       );
       return Boolean(found);
+    },
+    async refundRecord(row: TerminalChargeRow): Promise<RefundRecord | null> {
+      // Um estorno por cobrança (approved → refunded só uma vez): o registro é o POINT_PAYMENT_REFUNDED com o id dela.
+      const found = check(
+        await db.from('audit_logs').select('id, authorized_by_manager_id, metadata').eq('tenant_id', tenantId).eq('action_type', 'POINT_PAYMENT_REFUNDED').eq('metadata->>charge_id', row.id).maybeSingle(),
+        'ler o registro do estorno',
+      ) as { id?: unknown; authorized_by_manager_id?: unknown; metadata?: unknown } | null;
+      if (!found || typeof found.id !== 'string') return null;
+      const meta = found.metadata && typeof found.metadata === 'object' ? (found.metadata as Record<string, unknown>) : {};
+      const evidence = meta.evidence && typeof meta.evidence === 'object' ? (meta.evidence as Record<string, unknown>) : {};
+      return {
+        refund_audit_id: found.id,
+        authorization_audit_id: typeof evidence.authorization_audit_id === 'string' ? evidence.authorization_audit_id : null,
+        manager_id: typeof found.authorized_by_manager_id === 'string' ? found.authorized_by_manager_id : null,
+        order_reopened: typeof meta.order_reopened === 'boolean' ? meta.order_reopened : null,
+      };
     },
     async resolve(row, toStatus, patch, audit): Promise<TerminalChargeRow> {
       // Uma transação no banco: só grava se o estado ainda for o lido, com UM audit_log. Devolve a linha atual.

@@ -8,8 +8,8 @@
  * noite que passa da meia-noite conta no dia em que começou.
  */
 import type { AuditLog, CashbackLedgerEntry, DiningTable, LoyaltyCustomer, Order, OrderItem, Payment, Product } from '../types';
-import { fromCents, toCents } from './money';
-import { brasiliaHour, shiftStartBrasilia, shiftStartDaysFrom } from './reports';
+import { allocateCents, fromCents, toCents } from './money';
+import { brasiliaHour, keptSaleCents, scaleToKept, shiftStartBrasilia, shiftStartDaysFrom, writeOffsByOrder } from './reports';
 
 export type DashboardPeriod = 'today' | 'yesterday' | '7d' | '30d';
 
@@ -329,17 +329,40 @@ export interface ProductSalesRow {
   sales: number;
 }
 
-/** Itens vendidos (não cancelados) lançados no período. Peso conta em kg; combos e partes como lançados. */
+/**
+ * Itens vendidos (não cancelados) lançados no período. Peso conta em kg; combos e partes como lançados. Conta encerrada
+ * como venda devolvida (ORDER_REFUNDED_WRITE_OFF): baixada por inteiro, os itens não contam como vendidos; em parte,
+ * o valor dos itens fica na proporção do que ficou pago (a quantidade, como lançada).
+ */
 export function productSales(ix: DashboardIndex, r: Range): ProductSalesRow[] {
   const acc = new Map<string, { qty: number; cents: number }>();
+  const writeOffs = writeOffsByOrder(ix.input.auditLogs);
+  const partial = new Map<string, OrderItem[]>();
   for (const i of ix.input.orderItems) {
     if (i.status === 'CANCELED' || !inRange(i.created_at, r)) continue;
     const order = ix.ordersById.get(i.order_id);
     if (!order || order.status === 'CANCELED') continue;
+    const kept = keptSaleCents(order, writeOffs);
+    if (kept.writtenOff && kept.keptCents <= 0) continue;
     const row = acc.get(i.product_id) ?? { qty: 0, cents: 0 };
     row.qty += i.quantity;
-    row.cents += toCents(i.total_item_price);
+    if (kept.writtenOff) {
+      const list = partial.get(order.id);
+      if (list) list.push(i);
+      else partial.set(order.id, [i]);
+    } else {
+      row.cents += toCents(i.total_item_price);
+    }
     acc.set(i.product_id, row);
+  }
+  // Baixa parcial: o valor que ficou pago repartido entre os itens da conta (maiores restos, sem perder centavo).
+  for (const [orderId, list] of partial) {
+    const kept = keptSaleCents(ix.ordersById.get(orderId)!, writeOffs);
+    const weights = list.map((i) => toCents(i.total_item_price));
+    const shares = allocateCents(scaleToKept(weights.reduce((a, b) => a + b, 0), kept), weights);
+    list.forEach((i, idx) => {
+      acc.get(i.product_id)!.cents += shares[idx]!;
+    });
   }
   return [...acc.entries()].map(([id, v]) => ({
     product_id: id,

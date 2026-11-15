@@ -252,6 +252,16 @@ describe('point-charge: repositório (auditoria r1 P0-02 e P1-02)', () => {
     expect(await supabaseChargeStore(fakeDb({ select: null }).db, TENANT).hasRegisteredPayment('k1')).toBe(false);
   });
 
+  it('r11: registro do estorno = o audit_log POINT_PAYMENT_REFUNDED da cobrança, na loja (gerente, autorização, conta reaberta)', async () => {
+    const found = fakeDb({ select: { id: 'a9', authorized_by_manager_id: 'm1', metadata: { evidence: { authorization_audit_id: 'a7' }, order_reopened: true } } });
+    expect(await supabaseChargeStore(found.db, TENANT).refundRecord(ROW)).toEqual({ refund_audit_id: 'a9', authorization_audit_id: 'a7', manager_id: 'm1', order_reopened: true });
+    expect(found.chains[0]).toEqual(['from:audit_logs', 'select:id, authorized_by_manager_id, metadata', `eq:tenant_id,${TENANT}`, 'eq:action_type,POINT_PAYMENT_REFUNDED', 'eq:metadata->>charge_id,r1']);
+    // Sem o campo (ou com tipo errado): null, nunca um palpite.
+    const partial = fakeDb({ select: { id: 'a9', authorized_by_manager_id: null, metadata: { evidence: {}, order_reopened: 'sim' } } });
+    expect(await supabaseChargeStore(partial.db, TENANT).refundRecord(ROW)).toEqual({ refund_audit_id: 'a9', authorization_audit_id: null, manager_id: null, order_reopened: null });
+    expect(await supabaseChargeStore(fakeDb({ select: null }).db, TENANT).refundRecord(ROW)).toBeNull();
+  });
+
   it('r6: os argumentos de cada RPC do repositório são os da assinatura em db/*.sql (sem banco)', async () => {
     const sqlText = ['schema_mercado_pago.sql', 'schema_point_reserva.sql'].map((f) => readFileSync(join(__dirname, '..', '..', '..', 'db', f), 'utf8')).join('\n');
     const params = (fn: string): string[] => {

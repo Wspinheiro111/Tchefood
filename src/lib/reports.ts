@@ -3,6 +3,7 @@
  */
 import type { AuditLog, DiningTable, Order, OrderItem, Payment, StaffUser } from '../types';
 import { allocateCents, fromCents, toCents } from './money';
+import type { ListPointPaymentsInput, ListPointPaymentsResult, ServerPointPayment } from './payments/pointPaymentsServer';
 
 export interface ShiftKpis {
   grossRevenue: number;
@@ -141,22 +142,65 @@ export function formatShiftStart(start: Date): string {
   return start.toLocaleString('pt-BR', { timeZone: SHIFT_TIME_ZONE, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
+/** Centavos baixados de um registro ORDER_REFUNDED_WRITE_OFF: `metadata.written_off_cents`, senão |amount_impact|. */
+export function writeOffCents(l: AuditLog): number {
+  const c = (l.metadata as Record<string, unknown> | null)?.written_off_cents;
+  if (typeof c === 'number' && Number.isSafeInteger(c) && c >= 0) return c;
+  const v = Math.abs(toCents(l.amount_impact));
+  return Number.isFinite(v) ? v : 0;
+}
+
+/**
+ * Conta encerrada pelo gerente como venda devolvida: centavos baixados por conta (ORDER_REFUNDED_WRITE_OFF). O valor
+ * baixado foi estornado e não é venda; só o que ficou pago conta. Mais de um registro da mesma conta: vale o maior.
+ */
+export function writeOffsByOrder(logs: readonly AuditLog[] | undefined): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const l of logs ?? []) {
+    if (l.action_type !== 'ORDER_REFUNDED_WRITE_OFF' || !l.order_id) continue;
+    out.set(l.order_id, Math.max(out.get(l.order_id) ?? 0, writeOffCents(l)));
+  }
+  return out;
+}
+
+/** Centavos da conta que seguem vendidos depois da baixa (total − baixado, nunca negativo); sem baixa, o total. */
+export function keptSaleCents(o: Order, writeOffs: ReadonlyMap<string, number>): { totalCents: number; keptCents: number; writtenOff: boolean } {
+  const totalCents = toCents(o.total_amount);
+  const w = writeOffs.get(o.id);
+  if (w === undefined || w <= 0) return { totalCents, keptCents: totalCents, writtenOff: false };
+  return { totalCents, keptCents: Math.max(0, totalCents - w), writtenOff: true };
+}
+
+/** `cents` na proporção do que ficou vendido da conta. */
+export function scaleToKept(cents: number, kept: { totalCents: number; keptCents: number; writtenOff: boolean }): number {
+  if (!kept.writtenOff) return cents;
+  if (kept.totalCents <= 0 || kept.keptCents <= 0) return 0;
+  return Math.round((cents * kept.keptCents) / kept.totalCents);
+}
+
 /**
  * KPIs do turno: faturamento, contas fechadas, ticket médio e 10% contam só o
  * que aconteceu no turno; o saldo em aberto no salão é sempre o atual. Com um
  * `ShiftPeriod`, usa o mesmo filtro [início, fim) da conciliação e do rateio;
- * com um `Date`, conta desde ele (comportamento anterior).
+ * com um `Date`, conta desde ele (comportamento anterior). Com `logs`, a conta encerrada como venda devolvida
+ * (ORDER_REFUNDED_WRITE_OFF) conta só a parte que ficou paga no ticket médio; baixada por inteiro não é conta fechada.
  */
-export function shiftKpis(orders: readonly Order[], payments: readonly Payment[], since: Date | ShiftPeriod = shiftStart()): ShiftKpis {
+export function shiftKpis(orders: readonly Order[], payments: readonly Payment[], since: Date | ShiftPeriod = shiftStart(), logs?: readonly AuditLog[]): ShiftKpis {
   const inShift =
     since instanceof Date
       ? (iso: string | null) => iso !== null && new Date(iso).getTime() >= since.getTime()
       : (iso: string | null) => inShiftPeriod(iso, since);
   const approved = payments.filter((p) => p.status === 'APPROVED' && inShift(p.created_at));
   const grossCents = approved.reduce((a, p) => a + toCents(p.amount), 0);
-  const closed = orders.filter((o) => o.status === 'CLOSED' && inShift(o.closed_at));
-  const closedTotalCents = closed.reduce((a, o) => a + toCents(o.total_amount), 0);
-  const feeCents = closed.reduce((a, o) => a + toCents(o.service_fee_amount), 0);
+  // Venda devolvida encerrada pelo gerente: só o que ficou pago; baixada por inteiro não é conta fechada.
+  // O total de 10% das contas fechadas segue como antes (não foi pedido mudar).
+  const writeOffs = writeOffsByOrder(logs);
+  const closedAll = orders.filter((o) => o.status === 'CLOSED' && inShift(o.closed_at));
+  const feeCents = closedAll.reduce((a, o) => a + toCents(o.service_fee_amount), 0);
+  const closed = closedAll
+    .map((o) => ({ o, kept: keptSaleCents(o, writeOffs) }))
+    .filter(({ kept }) => !kept.writtenOff || kept.keptCents > 0);
+  const closedTotalCents = closed.reduce((a, { kept }) => a + kept.keptCents, 0);
   const open = orders.filter((o) => o.status === 'OPEN' || o.status === 'PAYING');
   return {
     grossRevenue: fromCents(grossCents),
@@ -213,6 +257,9 @@ export function reconciliation(payments: readonly Payment[], period: ShiftPeriod
 }
 
 /**
+ * @deprecated A tela de conciliação usa `reconciliationMovements` (auditoria GPT r10, P2-02: a hora do registro
+ * local e a hora da venda não são a data do estorno). Fica só para quem ainda chama.
+ *
  * Estornos do Mercado Pago no turno (auditoria interna 2, P2-E): pagamentos da Point estornados, pela hora do registro
  * do estorno neste aparelho (audit_logs POINT_PAYMENT_REFUNDED) ou, sem ele, pela hora da venda. O extrato do Mercado
  * Pago mostra a venda e o estorno; a linha "Mercado Pago" da conciliação já não conta o estornado.
@@ -234,6 +281,153 @@ export function pointRefundsInShift(payments: readonly Payment[], logs: readonly
   return { total: fromCents(cents), count };
 }
 
+/** Bruto (vendas), estornos e líquido de uma célula da conciliação. */
+export interface MovementCell {
+  gross: number;
+  refunds: number;
+  net: number;
+}
+
+export interface MovementRow {
+  acquirer: ReconKey;
+  cnpj: string | null;
+  byMethod: Record<ReconMethod, MovementCell>;
+  gross: number;
+  refunds: number;
+  net: number;
+  salesCount: number;
+  refundsCount: number;
+}
+
+export interface ReconMovements {
+  rows: MovementRow[];
+  totals: { gross: number; refunds: number; net: number; salesCount: number; refundsCount: number };
+  /** Estornos sem data confirmada pelo servidor: não entram em turno nenhum (nem no da venda). */
+  undatedRefunds: { total: number; count: number; payments: Payment[] };
+  /** LOADED: datas de estorno do servidor lidas para o período; NOT_LOADED: sem leitura (fora da nuvem, erro, prazo). */
+  cloudRefunds: 'LOADED' | 'NOT_LOADED';
+  /** Vendas devolvidas encerradas pelo gerente (ORDER_REFUNDED_WRITE_OFF) no período: o saldo baixado. */
+  writeOffs: { total: number; count: number };
+}
+
+const ACQUIRER_CNPJ: Record<ReconKey, string | null> = { STONE: '16501555000157', PAGBANK: '08561701000101', MERCADO_PAGO: '10573521000191', CASH_DESK: null };
+const reconKey = (p: Payment): ReconKey => (p.acquirer === 'STONE' || p.acquirer === 'PAGBANK' || p.acquirer === 'MERCADO_PAGO' ? p.acquirer : 'CASH_DESK');
+
+/**
+ * Conciliação por movimento (auditoria GPT r10, P2-01 e P2-02). Venda e estorno são movimentos separados, cada um
+ * com a sua data, como no extrato da adquirente:
+ *  - venda: pagamento APROVADO ou ESTORNADO, no período da venda (created_at), qualquer que seja o status de hoje.
+ *    Pagamento retirado pelo gerente ("não aceito pela nuvem", `withdrawn_reason`) nunca foi recebido: fica de fora;
+ *  - estorno: no período da data do estorno no servidor (`refunded_at` de tchefood_list_point_payments). Sem essa data
+ *    (nuvem não lida, servidor sem data ou data inválida), vai para `undatedRefunds`, nunca para o período da venda nem
+ *    para a hora do registro neste aparelho. Só entra em `undatedRefunds` se a venda é anterior ao fim do período.
+ * `serverPayments` null/ausente = sem leitura da nuvem. Linhas do servidor sem pagamento neste aparelho não entram
+ * (a conciliação, como as outras telas, é a dos pagamentos daqui).
+ */
+export function reconciliationMovements(
+  payments: readonly Payment[],
+  period: ShiftPeriod = currentShiftPeriod(),
+  opts: { serverPayments?: readonly ServerPointPayment[] | null; logs?: readonly AuditLog[] } = {},
+): ReconMovements {
+  const keys: ReconKey[] = ['STONE', 'PAGBANK', 'MERCADO_PAGO', 'CASH_DESK'];
+  const methods: ReconMethod[] = ['CREDIT', 'DEBIT', 'PIX', 'CASH', 'VOUCHER'];
+  const zero = () => Object.fromEntries(methods.map((m) => [m, 0])) as Record<ReconMethod, number>;
+  const sales = Object.fromEntries(keys.map((k) => [k, zero()])) as Record<ReconKey, Record<ReconMethod, number>>;
+  const refunds = Object.fromEntries(keys.map((k) => [k, zero()])) as Record<ReconKey, Record<ReconMethod, number>>;
+  const counts = Object.fromEntries(keys.map((k) => [k, { sales: 0, refunds: 0 }])) as Record<ReconKey, { sales: number; refunds: number }>;
+  const server = new Map<string, ServerPointPayment>();
+  for (const r of opts.serverPayments ?? []) server.set(r.payment_id, r);
+  const loaded = opts.serverPayments !== null && opts.serverPayments !== undefined;
+  const undated: Payment[] = [];
+  let undatedCents = 0;
+  for (const p of payments) {
+    if (p.withdrawn_reason !== undefined) continue;
+    if (p.status !== 'APPROVED' && p.status !== 'REFUNDED') continue;
+    const k = reconKey(p);
+    const cents = toCents(p.amount);
+    if (inShiftPeriod(p.created_at, period)) {
+      sales[k][p.method] += cents;
+      counts[k].sales += 1;
+    }
+    const s = server.get(p.id);
+    const refunded = p.status === 'REFUNDED' || s?.status === 'REFUNDED' || (s?.refunded_at ?? null) !== null;
+    if (!refunded) continue;
+    const refundedAt = parseIsoInstant(s?.refunded_at ?? null);
+    if (refundedAt === null) {
+      const sold = parseIsoInstant(p.created_at);
+      if (sold !== null && sold < period.end.getTime()) {
+        undated.push(p);
+        undatedCents += cents;
+      }
+      continue;
+    }
+    if (refundedAt >= period.start.getTime() && refundedAt < period.end.getTime()) {
+      refunds[k][p.method] += cents;
+      counts[k].refunds += 1;
+    }
+  }
+  const rows: Record<ReconKey, MovementRow> = {} as Record<ReconKey, MovementRow>;
+  const tot = { gross: 0, refunds: 0, salesCount: 0, refundsCount: 0 };
+  for (const k of keys) {
+    let g = 0;
+    let r = 0;
+    const byMethod = {} as Record<ReconMethod, MovementCell>;
+    for (const m of methods) {
+      byMethod[m] = { gross: fromCents(sales[k][m]), refunds: fromCents(refunds[k][m]), net: fromCents(sales[k][m] - refunds[k][m]) };
+      g += sales[k][m];
+      r += refunds[k][m];
+    }
+    rows[k] = { acquirer: k, cnpj: ACQUIRER_CNPJ[k], byMethod, gross: fromCents(g), refunds: fromCents(r), net: fromCents(g - r), salesCount: counts[k].sales, refundsCount: counts[k].refunds };
+    tot.gross += g;
+    tot.refunds += r;
+    tot.salesCount += counts[k].sales;
+    tot.refundsCount += counts[k].refunds;
+  }
+  let woCents = 0;
+  let woCount = 0;
+  for (const l of opts.logs ?? []) {
+    if (l.action_type !== 'ORDER_REFUNDED_WRITE_OFF' || !inShiftPeriod(l.created_at, period)) continue;
+    woCents += writeOffCents(l);
+    woCount += 1;
+  }
+  // Linha do Mercado Pago só quando houve venda ou estorno na Point no período.
+  const mp = rows.MERCADO_PAGO.salesCount + rows.MERCADO_PAGO.refundsCount > 0;
+  return {
+    rows: mp ? [rows.STONE, rows.PAGBANK, rows.MERCADO_PAGO, rows.CASH_DESK] : [rows.STONE, rows.PAGBANK, rows.CASH_DESK],
+    totals: { gross: fromCents(tot.gross), refunds: fromCents(tot.refunds), net: fromCents(tot.gross - tot.refunds), salesCount: tot.salesCount, refundsCount: tot.refundsCount },
+    undatedRefunds: { total: fromCents(undatedCents), count: undated.length, payments: undated },
+    cloudRefunds: loaded ? 'LOADED' : 'NOT_LOADED',
+    writeOffs: { total: fromCents(woCents), count: woCount },
+  };
+}
+
+/** Quantos dias antes do período a leitura do servidor começa: estorno no turno de uma venda antiga (a tela de estorno vai até 30 dias). */
+export const SERVER_REFUND_LOOKBACK_DAYS = 31;
+const SERVER_REFUND_MAX_PAGES = 50;
+
+/**
+ * Pagamentos da Point no servidor (tchefood_list_point_payments) de SERVER_REFUND_LOOKBACK_DAYS dias antes do período
+ * até o fim dele, todas as páginas. Qualquer página com erro (rede, prazo, resposta estranha) lança: a conciliação
+ * mostra "estornos da nuvem não carregados" em vez de uma lista pela metade.
+ */
+export async function loadServerPointPayments(
+  period: ShiftPeriod,
+  list: (input: ListPointPaymentsInput) => Promise<ListPointPaymentsResult>,
+): Promise<ServerPointPayment[]> {
+  const from = new Date(period.start.getTime() - SERVER_REFUND_LOOKBACK_DAYS * 86_400_000).toISOString();
+  const to = period.end.toISOString();
+  const out: ServerPointPayment[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < SERVER_REFUND_MAX_PAGES; page += 1) {
+    const r = await list({ from, to, search: null, cursor, limit: 200 });
+    if (r.kind !== 'ok') throw new Error(r.error);
+    out.push(...r.items);
+    if (r.nextCursor === null) return out;
+    cursor = r.nextCursor;
+  }
+  throw new Error(`Pagamentos da Point do servidor: mais de ${SERVER_REFUND_MAX_PAGES} páginas no período.`);
+}
+
 /** Transações recusadas dentro do período do turno [start, end), mesmo filtro da conciliação. */
 export function declinedInShift(payments: readonly Payment[], period: ShiftPeriod = currentShiftPeriod()): Payment[] {
   return payments.filter((p) => p.status === 'DECLINED' && inShiftPeriod(p.created_at, period));
@@ -251,27 +445,33 @@ export interface WaiterRow {
  * cobrada é distribuída entre os garçons proporcionalmente ao valor que cada
  * um lançou (maiores restos → Σ comissões == Σ taxas, sem perder centavo).
  */
-export function waiterSplit(orders: readonly Order[], items: readonly OrderItem[], staff: readonly StaffUser[], period: ShiftPeriod = currentShiftPeriod()): WaiterRow[] {
+export function waiterSplit(orders: readonly Order[], items: readonly OrderItem[], staff: readonly StaffUser[], period: ShiftPeriod = currentShiftPeriod(), logs?: readonly AuditLog[]): WaiterRow[] {
   const sales = new Map<string, { cents: number; qty: number; commission: number }>();
   const bump = (id: string) => {
     if (!sales.has(id)) sales.set(id, { cents: 0, qty: 0, commission: 0 });
     return sales.get(id)!;
   };
+  const writeOffs = writeOffsByOrder(logs);
   for (const o of orders) {
     // Só contas fechadas dentro do turno [start, end) entram no rateio.
     if (o.status !== 'CLOSED' || o.closed_at === null || !inShiftPeriod(o.closed_at, period)) continue;
+    // Venda devolvida encerrada pelo gerente: baixada por inteiro não entra; em parte, só a proporção que ficou paga.
+    const kept = keptSaleCents(o, writeOffs);
+    if (kept.writtenOff && kept.keptCents <= 0) continue;
     const valid = items.filter((i) => i.order_id === o.id && i.status !== 'CANCELED');
     const perWaiter = new Map<string, number>();
     for (const i of valid) {
       perWaiter.set(i.waiter_id, (perWaiter.get(i.waiter_id) ?? 0) + toCents(i.total_item_price));
-      const row = bump(i.waiter_id);
-      row.cents += toCents(i.total_item_price);
-      row.qty += i.quantity;
+      bump(i.waiter_id).qty += i.quantity;
     }
     const ids = [...perWaiter.keys()];
-    const shares = allocateCents(toCents(o.service_fee_amount), ids.map((id) => perWaiter.get(id)!));
+    const weights = ids.map((id) => perWaiter.get(id)!);
+    const soldShares = kept.writtenOff ? allocateCents(scaleToKept(weights.reduce((a, b) => a + b, 0), kept), weights) : weights;
+    const shares = allocateCents(scaleToKept(toCents(o.service_fee_amount), kept), weights);
     ids.forEach((id, idx) => {
-      bump(id).commission += shares[idx]!;
+      const row = bump(id);
+      row.cents += soldShares[idx]!;
+      row.commission += shares[idx]!;
     });
   }
   return [...sales.entries()]
@@ -310,6 +510,8 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   PRICE_OVERRIDE: 'Preço diferente do cadastro aceito pelo gerente',
   CLAIM_RELEASED_REFUNDED: 'Reserva liberada com a maquininha aprovada: estornado na maquininha',
   POINT_PAYMENT_REFUNDED: 'Pagamento da Point estornado (confirmado no Mercado Pago)',
+  ORDER_REFUNDED_WRITE_OFF: 'Conta encerrada como venda devolvida (saldo baixado)',
+  NFCE_ALREADY_ISSUED: 'NFC-e já emitida para esta venda (pagamento mudou)',
 };
 
 /** Texto do alerta enviado ao WhatsApp do proprietário. */

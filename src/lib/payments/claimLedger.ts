@@ -65,7 +65,17 @@ interface Ledger {
   pendingReleases: PendingRelease[];
 }
 
-const STORAGE_KEY = 'tchefood.paymentClaims.v1';
+/**
+ * Uma chave do localStorage por entrada (auditoria GPT r10, "a verificar 1"): ler a lista inteira, mudar e regravar
+ * numa chave só não é atômico entre abas (duas abas gravando juntas, a última apagava a reserva da outra, com o
+ * segredo). Com uma chave por reserva, cada gravação só troca a própria entrada; a operação continua síncrona (a
+ * reserva é gravada antes de chamar o servidor), sem depender de navigator.locks.
+ */
+const PREFIX = 'tchefood.paymentClaims.v2:';
+const CLAIM_PREFIX = `${PREFIX}c:`;
+const RELEASE_PREFIX = `${PREFIX}r:`;
+/** Formato anterior: o registro inteiro numa chave (migrado na leitura; só sai depois de gravado no novo). */
+const LEGACY_KEY = 'tchefood.paymentClaims.v1';
 const active = new Set<string>();
 let ledger: Ledger | null = null;
 
@@ -99,6 +109,84 @@ function overlay<T extends { key: string }>(list: T[], unsaved: Map<string, T | 
   return out;
 }
 
+const isEntry = (v: unknown, key: string): boolean =>
+  typeof v === 'object' && v !== null && (v as { key?: unknown }).key === key && typeof (v as { order_id?: unknown }).order_id === 'string';
+
+/** Ordem estável entre abas (a ordem das chaves do localStorage não é a da gravação). */
+function byTime<T>(list: T[], at: (x: T) => string): T[] {
+  return list
+    .map((x, i) => [x, i] as const)
+    .sort(([a, i], [b, j]) => at(a).localeCompare(at(b)) || i - j)
+    .map(([x]) => x);
+}
+
+/** Lê as entradas gravadas (uma chave cada). Lança se o acesso falhar. Entrada corrompida: a da última leitura. */
+function readStored(st: Storage): Ledger {
+  const prevClaims = new Map((ledger?.inFlight ?? []).map((c) => [c.key, c]));
+  const prevReleases = new Map((ledger?.pendingReleases ?? []).map((r) => [r.key, r]));
+  const out = emptyLedger();
+  const keys: string[] = [];
+  for (let i = 0; i < st.length; i++) {
+    const k = st.key(i);
+    if (k && k.startsWith(PREFIX)) keys.push(k);
+  }
+  for (const k of keys) {
+    const isClaim = k.startsWith(CLAIM_PREFIX);
+    if (!isClaim && !k.startsWith(RELEASE_PREFIX)) continue;
+    const key = k.slice(isClaim ? CLAIM_PREFIX.length : RELEASE_PREFIX.length);
+    const raw = st.getItem(k);
+    if (raw === null) continue; // outra aba apagou entre a lista e a leitura
+    let v: unknown = null;
+    try {
+      v = JSON.parse(raw);
+    } catch {
+      v = null;
+    }
+    if (!isEntry(v, key)) v = (isClaim ? prevClaims.get(key) : prevReleases.get(key)) ?? null;
+    if (!v) continue;
+    if (isClaim) out.inFlight.push(v as LocalClaim);
+    else out.pendingReleases.push(v as PendingRelease);
+  }
+  migrateLegacy(st, out);
+  return out;
+}
+
+/**
+ * Registro no formato antigo (uma chave só; também o de uma aba que ainda roda a versão anterior): cada entrada que
+ * não existe no formato novo é gravada nele; a chave antiga só sai depois que todas foram gravadas.
+ */
+function migrateLegacy(st: Storage, out: Ledger) {
+  const raw = st.getItem(LEGACY_KEY);
+  if (raw === null) return;
+  let parsed: Partial<Ledger>;
+  try {
+    parsed = JSON.parse(raw) as Partial<Ledger>;
+  } catch {
+    return; // corrompido: fica onde está
+  }
+  let all = true;
+  const move = <T extends { key: string }>(list: unknown, have: T[], prefix: string) => {
+    if (!Array.isArray(list)) return;
+    for (const e of list as T[]) {
+      if (!e || typeof e.key !== 'string' || !isEntry(e, e.key) || have.some((x) => x.key === e.key)) continue;
+      have.push(e);
+      try {
+        st.setItem(prefix + e.key, JSON.stringify(e));
+      } catch {
+        all = false; // vale pela leitura; tenta de novo na próxima
+      }
+    }
+  };
+  move(parsed?.inFlight, out.inFlight, CLAIM_PREFIX);
+  move(parsed?.pendingReleases, out.pendingReleases, RELEASE_PREFIX);
+  if (!all) return;
+  try {
+    st.removeItem(LEGACY_KEY);
+  } catch {
+    // fica para a próxima leitura (as entradas já existem no formato novo e não são copiadas de novo)
+  }
+}
+
 /**
  * O registro como está guardado agora, com as mudanças desta aba que não foram gravadas por cima. Lido do
  * armazenamento a cada uso (não de uma cópia desta aba): outra aba pode ter gravado uma reserva no meio.
@@ -110,18 +198,16 @@ function load(): Ledger {
   let base = emptyLedger();
   if (a.kind === 'ok') {
     try {
-      const raw = a.st.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as Partial<Ledger>;
-        base.inFlight = Array.isArray(parsed.inFlight) ? parsed.inFlight : [];
-        base.pendingReleases = Array.isArray(parsed.pendingReleases) ? parsed.pendingReleases : [];
-      }
+      base = readStored(a.st);
     } catch {
-      // Conteúdo corrompido ou leitura bloqueada: a última leitura (o servidor ainda lista as reservas abertas).
+      // Leitura bloqueada: a última leitura (o servidor ainda lista as reservas abertas).
       base = ledger ? { inFlight: [...ledger.inFlight], pendingReleases: [...ledger.pendingReleases] } : emptyLedger();
     }
   }
-  const out = { inFlight: overlay(base.inFlight, unsavedClaims), pendingReleases: overlay(base.pendingReleases, unsavedReleases) };
+  const out = {
+    inFlight: byTime(overlay(base.inFlight, unsavedClaims), (c) => c.started_at ?? ''),
+    pendingReleases: byTime(overlay(base.pendingReleases, unsavedReleases), (r) => r.created_at ?? ''),
+  };
   ledger = out;
   return out;
 }
@@ -130,18 +216,41 @@ function byKey<T extends { key: string }>(list: T[]): Map<string, string> {
   return new Map(list.map((x) => [x.key, JSON.stringify(x)]));
 }
 
-function noteChanges<T extends { key: string }>(before: Map<string, string>, after: T[], unsaved: Map<string, T | null>) {
+function noteChanges<T extends { key: string }>(before: Map<string, string>, after: T[], unsaved: Map<string, T | null>, changed: Set<string>) {
   const now = new Map(after.map((x) => [x.key, x]));
-  for (const [k, v] of now) if (before.get(k) !== JSON.stringify(v)) unsaved.set(k, v);
-  for (const k of before.keys()) if (!now.has(k)) unsaved.set(k, null);
+  for (const [k, v] of now) {
+    if (before.get(k) !== JSON.stringify(v)) {
+      unsaved.set(k, v);
+      changed.add(k);
+    }
+  }
+  for (const k of before.keys()) {
+    if (!now.has(k)) {
+      unsaved.set(k, null);
+      changed.add(k);
+    }
+  }
+}
+
+/** Grava (ou apaga) cada entrada pendente na própria chave; a que grava sai de `unsaved`. */
+function flush<T>(st: Storage, prefix: string, unsaved: Map<string, T | null>) {
+  for (const [k, v] of [...unsaved]) {
+    try {
+      if (v) st.setItem(prefix + k, JSON.stringify(v));
+      else st.removeItem(prefix + k);
+      unsaved.delete(k);
+    } catch {
+      // Cheio ou bloqueado: fica por cima, em memória, e tenta de novo na próxima mudança.
+    }
+  }
 }
 
 /**
- * Lê, muda uma entrada e grava, no mesmo passo síncrono: nunca regrava o registro inteiro a partir de uma cópia
- * antiga desta aba (duas abas abertas não apagam o segredo uma da outra). Síncrono de propósito: a reserva é
- * gravada antes da chamada ao servidor, e navigator.locks só existe assíncrono.
+ * Lê, muda e grava SÓ as entradas que mudaram, cada uma na própria chave, no mesmo passo síncrono: duas abas
+ * mudando reservas diferentes ao mesmo tempo não apagam uma a outra (o segredo de cada uma fica). Síncrono de
+ * propósito: a reserva é gravada antes da chamada ao servidor.
  * Gravação que falha: a mudança fica por cima do que for lido (unsaved*) e a próxima mudança tenta de novo.
- * Devolve se ficou gravado (fora do navegador, sempre true: não há onde gravar).
+ * Devolve se as entradas mudadas agora ficaram gravadas (fora do navegador, sempre true: não há onde gravar).
  */
 function mutate<T>(change: (l: Ledger) => T): { value: T; durable: boolean } {
   const l = load();
@@ -151,19 +260,16 @@ function mutate<T>(change: (l: Ledger) => T): { value: T; durable: boolean } {
   ledger = l;
   const a = access();
   if (a.kind === 'none') return { value, durable: true };
-  noteChanges(beforeClaims, l.inFlight, unsavedClaims);
-  noteChanges(beforeReleases, l.pendingReleases, unsavedReleases);
+  const changedClaims = new Set<string>();
+  const changedReleases = new Set<string>();
+  noteChanges(beforeClaims, l.inFlight, unsavedClaims, changedClaims);
+  noteChanges(beforeReleases, l.pendingReleases, unsavedReleases, changedReleases);
   if (a.kind === 'ok') {
-    try {
-      a.st.setItem(STORAGE_KEY, JSON.stringify(l));
-      unsavedClaims.clear();
-      unsavedReleases.clear();
-      return { value, durable: true };
-    } catch {
-      // Cheio ou bloqueado: fica por cima, em memória, e tenta de novo na próxima mudança.
-    }
+    flush(a.st, CLAIM_PREFIX, unsavedClaims);
+    flush(a.st, RELEASE_PREFIX, unsavedReleases);
   }
-  return { value, durable: false };
+  const durable = a.kind === 'ok' && ![...changedClaims].some((k) => unsavedClaims.has(k)) && ![...changedReleases].some((k) => unsavedReleases.has(k));
+  return { value, durable };
 }
 
 /**

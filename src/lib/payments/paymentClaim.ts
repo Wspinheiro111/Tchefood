@@ -137,14 +137,14 @@ function parseObject(text: string): Record<string, unknown> | null {
   }
 }
 
-type RpcOutcome =
+export type RpcOutcome =
   | { kind: 'ok'; body: Record<string, unknown> | null; text: string }
   | { kind: 'offline' }
   /** details: o DETAIL do PostgreSQL (ex.: TF007 claim_open / claim_consumed), quando vem. */
   | { kind: 'refused'; code: string | null; message: string; details?: string | null };
 
 /** POST numa RPC do PostgREST com prazo. Rede, prazo, 401, 408, 429 e 5xx = sem resposta do servidor. */
-async function callRpc(cfg: SyncConfig, fn: string, body: Record<string, unknown>, deps: ClaimDeps): Promise<RpcOutcome> {
+export async function callRpc(cfg: SyncConfig, fn: string, body: Record<string, unknown>, deps: ClaimDeps): Promise<RpcOutcome> {
   // Prazo vencido: cancela o pedido (não fica rodando por trás; o resultado já é tratado como sem resposta).
   const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
   const out = await within((async () => {

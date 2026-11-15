@@ -328,9 +328,9 @@ describe('auditoria 2 — telas', () => {
     await waitFor(() => expect((chargeButton() as HTMLButtonElement).disabled).toBe(false));
     await act(async () => { fireEvent.click(chargeButton()); });
     const key = (driver.charge.mock.calls[0]![0] as { idempotency_key: string }).idempotency_key;
-    expect(localStorage.getItem('tchefood:point-charges-here')).toContain(key);
+    expect(localStorage.getItem(`tchefood:point-charges-here:${key}`)).toContain(key);
     await act(async () => { finish({ status: 'DECLINED', acquirer: 'MERCADO_PAGO', reason: 'Transação recusada.', terminal_serial: 'MP-SERIAL', terminal_id: 'mp-term', server_confirmed: true } as TerminalResult); });
-    expect(localStorage.getItem('tchefood:point-charges-here') ?? '').not.toContain(key);
+    expect(localStorage.getItem(`tchefood:point-charges-here:${key}`)).toBeNull();
   });
 
   it('P2-4: motivo de 5-9 letras deixa o estorno da Point desligado e o PIN fica', async () => {

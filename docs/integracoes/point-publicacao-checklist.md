@@ -19,6 +19,9 @@ dinheiro do entregador (`entrega-<id>`, com a entrega já `DELIVERED` no servido
       Database › Migrations): nenhuma migration da main pendente.
 - [ ] Gerar o build do app novo e deixá-lo pronto para instalar em **todos** os aparelhos (caixa, garçons,
       totem, KDS, entregas).
+- [ ] Só com Point: emitir NFC-e de venda Point em homologação e conferir tPag/tpIntegra/CNPJ/cAut no XML
+      (crédito `03` / débito `04`, `tpIntegra` 1, CNPJ `10573521000191` do Mercado Pago, `cAut` = código de
+      autorização da venda). Ver "NFC-e da venda na Point" em `mercado-pago-point.md`.
 - [ ] Ter o token `APP_USR-...` e o `terminal_id` da Point, se a loja vai usar a Point (passo a passo em
       `mercado-pago-point.md`). Sem Point a publicação vale do mesmo jeito: a reserva vale em toda loja.
 
@@ -62,6 +65,7 @@ As migrations podem ser reaplicadas sem erro (conferido no teste) se a primeira 
 ## 3. Edge Function
 
 - [ ] `supabase functions deploy point-charge` (CLI atual: a função importa `server/payments/`).
+- [ ] `supabase functions deploy emit-nfce` (o `payload.ts` mudou neste PR: sem esse deploy a NFC-e da venda na Point não sai como pagamento integrado).
 - [ ] Só com Point: gravar o token em `payment_provider_secrets` e cadastrar a maquininha em `pos_terminals`
       (SQL em `mercado-pago-point.md`).
 

@@ -176,7 +176,19 @@ export async function pointPaymentOnServer(orderId: string, idempotencyKey: stri
  */
 export type RefundOutcome =
   /** paymentRegistered: o servidor diz se há pagamento do Mercado Pago gravado com a chave (ausente = não disse). */
-  | { kind: 'refunded'; paymentRegistered?: boolean }
+  | {
+    kind: 'refunded';
+    paymentRegistered?: boolean;
+    /**
+     * GPT r10 (a verificar 4), quando a resposta traz (UUID; outro valor é ignorado): o registro POINT_PAYMENT_REFUNDED
+     * do servidor (refund_audit_id), o da autorização do gerente (authorization_audit_id) e o gerente (manager_id).
+     */
+    serverAuditId?: string;
+    authorizationAuditId?: string;
+    managerId?: string;
+    /** O servidor reabriu a conta fechada (order_reopened; só quando é booleano). */
+    orderReopened?: boolean;
+  }
   | { kind: 'not_proven'; code: string; error: string }
   | { kind: 'pin'; error: string }
   | { kind: 'refused'; error: string }
@@ -188,6 +200,8 @@ export interface RefundInput {
   manager_pin: string;
   reason_text: string;
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const REFUND_UNKNOWN = 'Sem resposta conclusiva do servidor: não dá para saber se o estorno foi registrado. Tente de novo (repetir não registra duas vezes).';
 
@@ -224,7 +238,18 @@ export async function refundPointPayment(input: RefundInput, deps: ReconcileDeps
       // Resposta de outra cobrança não prova nada sobre esta.
       const reply = parsed && parsed.idempotency_key === input.idempotency_key ? parsed : null;
       if (reply?.status === 'DECLINED' && obj?.code === 'REFUNDED') {
-        return typeof obj.payment_registered === 'boolean' ? { kind: 'refunded', paymentRegistered: obj.payment_registered } : { kind: 'refunded' };
+        const uuidOf = (v: unknown) => (typeof v === 'string' && UUID_RE.test(v) ? v : undefined);
+        const auditId = uuidOf(obj.refund_audit_id);
+        const authorizationAuditId = uuidOf(obj.authorization_audit_id);
+        const managerId = uuidOf(obj.manager_id);
+        return {
+          kind: 'refunded',
+          ...(typeof obj.payment_registered === 'boolean' ? { paymentRegistered: obj.payment_registered } : {}),
+          ...(auditId ? { serverAuditId: auditId } : {}),
+          ...(authorizationAuditId ? { authorizationAuditId } : {}),
+          ...(managerId ? { managerId } : {}),
+          ...(typeof obj.order_reopened === 'boolean' ? { orderReopened: obj.order_reopened } : {}),
+        };
       }
       if (reply?.status === 'MANUAL_REVIEW') return { kind: 'not_proven', code: reply.code, error: reply.reason };
       // APPROVED, DECLINED sem REFUNDED, PENDING ou resposta ilegível: não é a resposta deste pedido.

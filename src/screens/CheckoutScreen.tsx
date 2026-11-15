@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Banknote, CheckCircle2, CreditCard, Divide, ListChecks, QrCode as QrIcon, Radio, Smartphone, Wallet } from 'lucide-react';
-import { useTcheStore } from '../store/useTcheStore';
+import { NFCE_ALREADY_ISSUED, useTcheStore } from '../store/useTcheStore';
 import type { ActionResult, OperationMode, Payment } from '../types';
 import { computeEqualShare, computeItemsShare, formatBRL, round2, toCents } from '../lib/money';
 import { createDriver, useTerminalBus, type Chassis, type ChargeRequest, type IPaymentTerminalDriver } from '../lib/payments/drivers';
@@ -199,6 +199,14 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
   const description =
     mode === 'EQUAL' ? `Cota ${order.customer_count - peopleLeft + 1} de ${order.customer_count}` : mode === 'FREE' ? 'Valor parcial livre' : `${selected.length} item(ns) consumido(s)`;
 
+  /** Conta fechada aqui; se já tinha NFC-e (reaberta pelo estorno), avisa que não houve nota nova. */
+  const closedHere = () => {
+    const st = useTcheStore.getState();
+    const o = st.orders.find((x) => x.id === order.id);
+    if (o?.closed_at && st.auditLogs.some((l) => l.order_id === order.id && l.action_type === 'NFCE_ALREADY_ISSUED' && l.created_at >= o.closed_at!)) toast.alert(NFCE_ALREADY_ISSUED);
+    setClosedOrderId(order.id);
+  };
+
   const afterApproved = (payment: Payment, closed: boolean, pan: string | null, driver: IPaymentTerminalDriver | null) => {
     if (payment.method !== 'CASH' && driver) {
       // Bobina da própria maquininha quando há ponte nativa; no navegador, o simulador visual.
@@ -210,7 +218,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     setSelected([]);
     setFreeRaw('');
     setCashGiven('');
-    if (closed) setClosedOrderId(order.id);
+    if (closed) closedHere();
   };
 
   const charge = async () => {
@@ -355,7 +363,7 @@ export function CheckoutScreen({ orderId, onBack, onClosed }: { orderId: string;
     setSelected([]);
     setFreeRaw('');
     setCashGiven('');
-    if (outcome.closed) setClosedOrderId(order.id);
+    if (outcome.closed) closedHere();
   };
 
   const requestCancel = (managerPin: string, reason: string): ActionResult<void> => {

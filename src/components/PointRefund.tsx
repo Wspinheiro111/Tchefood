@@ -1,10 +1,14 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Btn, toast } from './ui';
 import { ManagerAuthSheet, SERVER_REASON_MIN_LENGTH } from './ManagerAuthSheet';
 import { useTcheStore } from '../store/useTcheStore';
 import { formatBRL } from '../lib/money';
 import { defaultReconcileDeps, refundPointPayment, type ReconcileDeps } from '../lib/payments/pointReconcile';
-import type { ActionResult, Payment } from '../types';
+import { closeRefundedOrder, listPointPayments, type ServerPointPayment } from '../lib/payments/pointPaymentsServer';
+import type { ClaimDeps } from '../lib/payments/paymentClaim';
+import { toCents } from '../lib/money';
+import { uuid } from '../lib/ids';
+import type { ActionResult, Order, Payment } from '../types';
 
 /**
  * Estorno de pagamento da Point já registrado (auditoria GPT r9, P1-01): a venda foi estornada na maquininha ou no app
@@ -21,24 +25,59 @@ export const POINT_REFUND_NFCE = 'Este pagamento tinha NFC-e emitida: confira o 
  */
 export const POINT_REFUND_ITEMS_PAID = 'Os itens dessa venda continuam marcados como pagos: cobre o saldo por valor (por pessoa ou valor livre), não por item.';
 
-/** Pede o estorno ao servidor e, gravado lá, espelha aqui (pagamento REFUNDED, saldo, trava da chave). */
-export async function submitPointRefund(payment: Payment, managerPin: string, reason: string, deps: ReconcileDeps = defaultReconcileDeps()): Promise<ActionResult<{ nfceIssued: boolean; itemsStayPaid: boolean }>> {
-  const key = payment.idempotency_key;
-  if (!key || payment.acquirer !== 'MERCADO_PAGO') return { ok: false, error: 'Só pagamento da Point (Mercado Pago) tem estorno registrado aqui.' };
+/** Pagamento da Point a estornar: o local (Payment) ou a linha do servidor (sem pagamento neste aparelho). */
+export interface PointRefundTarget {
+  idempotency_key: string | null;
+  order_id: string;
+  amount: number;
+  acquirer?: Payment['acquirer'];
+}
+
+export interface PointRefundOutcome {
+  nfceIssued: boolean;
+  itemsStayPaid: boolean;
+  /** GPT r10 (P1-01): a conta estava fechada e reabriu (servidor e aqui): cobrar de novo ou encerrar como venda devolvida. */
+  reopened: boolean;
+  /** Havia a conta ou o pagamento neste aparelho e o estorno foi espelhado aqui. */
+  mirrored: boolean;
+}
+
+/** Estorno registrado e a conta fechada reaberta: os próximos passos. */
+export const POINT_REFUND_REOPENED = 'A conta estava encerrada e foi reaberta com o saldo estornado. Cobre de novo ou encerre como venda devolvida (PIN do gerente) em Conciliação › Contas reabertas pelo estorno.';
+/** Estorno de pagamento que este aparelho não tem: nada muda aqui até a próxima leitura da nuvem. */
+export const POINT_REFUND_REMOTE = 'Estorno registrado no servidor. Este aparelho não tem essa conta: ela aparece aqui na próxima leitura da nuvem.';
+
+/**
+ * Pede o estorno ao servidor e, gravado lá, espelha aqui (pagamento REFUNDED, saldo, conta reaberta, trava da chave) se
+ * a conta ou o pagamento existem neste aparelho (GPT r10, P1-02: o pagamento pode ser de outro aparelho, lido do
+ * servidor; então nada muda aqui).
+ */
+export async function submitPointRefund(target: PointRefundTarget, managerPin: string, reason: string, deps: ReconcileDeps = defaultReconcileDeps()): Promise<ActionResult<PointRefundOutcome>> {
+  const key = target.idempotency_key;
+  if (!key || (target.acquirer !== undefined && target.acquirer !== 'MERCADO_PAGO')) return { ok: false, error: 'Só pagamento da Point (Mercado Pago) tem estorno registrado aqui.' };
   const staff = useTcheStore.getState().currentUserId;
   if (!staff) return { ok: false, error: 'Entre com o seu usuário antes de registrar o estorno.' };
   const out = await refundPointPayment({ idempotency_key: key, staff_id: staff, manager_pin: managerPin, reason_text: reason }, deps);
   if (out.kind !== 'refunded') return { ok: false, error: out.error };
+  const before = useTcheStore.getState();
+  const local = before.payments.some((p) => p.idempotency_key === key && p.acquirer === 'MERCADO_PAGO') || before.orders.some((o) => o.id === target.order_id);
+  if (!local) return { ok: true, data: { nfceIssued: false, itemsStayPaid: false, reopened: false, mirrored: false } };
   // Auditoria interna 2 (P1-A): o servidor diz se tem o pagamento; sem ele, o espelho desfaz as consequências daqui.
-  const mirrored = useTcheStore.getState().mirrorServerPointRefund(key, reason, out.paymentRegistered === undefined ? undefined : { paymentRegistered: out.paymentRegistered });
+  // GPT r10 (a verificar 4): o registro do servidor e o gerente que autorizou vão no registro local.
+  const mirrored = before.mirrorServerPointRefund(key, reason, {
+    ...(out.paymentRegistered === undefined ? {} : { paymentRegistered: out.paymentRegistered }),
+    serverAuditId: out.serverAuditId ?? null,
+    authorizationAuditId: out.authorizationAuditId ?? null,
+    managerId: out.managerId ?? null,
+  });
   if (!mirrored.ok) return { ok: false, error: mirrored.error };
   const st = useTcheStore.getState();
-  const order = st.orders.find((o) => o.id === payment.order_id);
-  const itemsStayPaid = order?.status !== 'CLOSED' && st.orderItems.some((i) => i.order_id === payment.order_id && i.status !== 'CANCELED' && i.is_paid);
-  return { ok: true, data: { nfceIssued: mirrored.data.nfceIssued, itemsStayPaid } };
+  const order = st.orders.find((o) => o.id === target.order_id);
+  const itemsStayPaid = order?.status !== 'CLOSED' && st.orderItems.some((i) => i.order_id === target.order_id && i.status !== 'CANCELED' && i.is_paid);
+  return { ok: true, data: { nfceIssued: mirrored.data.nfceIssued, itemsStayPaid, reopened: mirrored.data.reopened, mirrored: true } };
 }
 
-export function PointRefundButton({ payment, label }: { payment: Payment; label: string }) {
+export function PointRefundButton({ payment, label, onRefunded }: { payment: PointRefundTarget; label: string; onRefunded?: (out: PointRefundOutcome) => void }) {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -56,47 +95,217 @@ export function PointRefundButton({ payment, label }: { payment: Payment; label:
         onSuccess={(data) => {
           if (data.nfceIssued) toast.alert(POINT_REFUND_NFCE);
           if (data.itemsStayPaid) toast.alert(POINT_REFUND_ITEMS_PAID);
+          if (data.reopened) toast.alert(POINT_REFUND_REOPENED);
+          if (!data.mirrored) toast.info(POINT_REFUND_REMOTE);
+          onRefunded?.(data);
         }}
       />
     </>
   );
 }
 
-/** Quantos dias para trás a lista de estorno mostra (auditoria interna 2, P2-E: estorno da venda de ontem). */
-export const POINT_REFUND_LIST_DAYS = 30;
-/** Linhas mostradas de uma vez (a busca acha as outras). */
-const POINT_REFUND_LIST_MAX = 50;
+/** Linha da lista de estorno: do servidor, ou deste aparelho e ainda não enviada. */
+interface RefundRow {
+  key: string;
+  orderId: string;
+  amount: number;
+  nsu: string | null;
+  authorizationCode: string | null;
+  createdAt: string;
+  status: string;
+  refundedAt: string | null;
+  /** Só neste aparelho: a inclusão ainda está na fila ou nos recusados. */
+  pending: boolean;
+  acquirer?: Payment['acquirer'];
+}
+
+/** Dia (aaaa-mm-dd, horário de Brasília) → ISO do começo do dia; vazio = sem limite. */
+function dayStart(day: string, plusDays = 0): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  const d = new Date(`${day}T00:00:00-03:00`);
+  return new Date(d.getTime() + plusDays * 86_400_000).toISOString();
+}
+
+const when = (iso: string) => new Date(iso).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+function matches(r: RefundRow, q: string): boolean {
+  if (!q) return true;
+  const text = `${when(r.createdAt)} ${r.nsu ?? ''} ${r.authorizationCode ?? ''} ${formatBRL(r.amount)} ${r.amount.toFixed(2)} ${r.amount.toFixed(2).replace('.', ',')}`.toLowerCase();
+  return text.includes(q.toLowerCase());
+}
 
 /**
- * Pagamentos da Point aprovados neste aparelho nos últimos POINT_REFUND_LIST_DAYS dias (o servidor pode ainda não ter
- * algum), com busca por NSU, valor, bandeira ou data, e o pedido de estorno.
+ * Pagamentos da Point para estorno (GPT r10, P1-02): os do servidor, em páginas ("Carregar mais"), com período e busca
+ * (NSU, valor, data, operação), sem limite de dias; mais os deste aparelho que ainda não subiram ("ainda não subiu").
+ * Sem nuvem: só os deste aparelho.
  */
-export function PointRefunds({ payments, nowMs = Date.now() }: { payments: readonly Payment[]; nowMs?: number }) {
+export function PointRefunds({ payments, listDeps }: { payments: readonly Payment[]; listDeps?: ClaimDeps }) {
+  const cloud = useTcheStore((s) => s.cloud !== null);
+  const outbox = useTcheStore((s) => s.outbox);
+  const rejected = useTcheStore((s) => s.syncRejected);
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
   const [query, setQuery] = useState('');
-  const recent = useMemo(() => {
-    const since = nowMs - POINT_REFUND_LIST_DAYS * 24 * 60 * 60 * 1000;
-    return payments
-      .filter((p) => p.acquirer === 'MERCADO_PAGO' && p.status === 'APPROVED' && p.idempotency_key && Date.parse(p.created_at) >= since)
-      .sort((x, y) => Date.parse(y.created_at) - Date.parse(x.created_at));
-  }, [payments, nowMs]);
-  const label = (p: Payment) => `${new Date(p.created_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })} · ${p.card_brand ?? 'cartão'} · NSU ${p.nsu ?? '?'}`;
-  const q = query.trim().toLowerCase();
-  const rows = (q ? recent.filter((p) => `${label(p)} ${formatBRL(p.amount)} ${p.amount.toFixed(2)} ${p.authorization_code ?? ''}`.toLowerCase().includes(q)) : recent).slice(0, POINT_REFUND_LIST_MAX);
-  if (recent.length === 0) return null;
+  const [applied, setApplied] = useState({ from: '', to: '', query: '' });
+  const [server, setServer] = useState<ServerPointPayment[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [refundedKeys, setRefundedKeys] = useState<string[]>([]);
+
+  const load = async (next: string | null, filters = applied) => {
+    setLoading(true);
+    setError(null);
+    const out = await listPointPayments({ from: dayStart(filters.from), to: dayStart(filters.to, 1), search: filters.query || null, cursor: next }, listDeps);
+    setLoading(false);
+    if (out.kind !== 'ok') return setError(out.error);
+    setServer((cur) => (next ? [...cur, ...out.items.filter((i) => !cur.some((c) => c.payment_id === i.payment_id))] : out.items));
+    setCursor(out.nextCursor);
+  };
+  useEffect(() => {
+    if (cloud) void load(null);
+  }, [cloud]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const search = () => {
+    const filters = { from, to, query: query.trim() };
+    setApplied(filters);
+    if (cloud) void load(null, filters);
+  };
+
+  const pendingIds = useMemo(() => new Set([...outbox, ...(rejected ?? []).map((r) => r.event)]
+    .filter((e) => e.table === 'payments' && e.op === 'INSERT').map((e) => e.row_id)), [outbox, rejected]);
+  const rows = useMemo(() => {
+    const fromIso = dayStart(applied.from);
+    const toIso = dayStart(applied.to, 1);
+    const inPeriod = (iso: string) => (!fromIso || iso >= fromIso) && (!toIso || iso < toIso);
+    const serverKeys = new Set(server.map((r) => r.idempotency_key));
+    // Deste aparelho: com nuvem, só os que ainda não subiram (o resto vem do servidor); sem nuvem, todos.
+    const local: RefundRow[] = payments
+      .filter((p) => p.acquirer === 'MERCADO_PAGO' && p.status === 'APPROVED' && p.idempotency_key && !serverKeys.has(p.idempotency_key) && (!cloud || pendingIds.has(p.id)))
+      .map((p) => ({ key: p.idempotency_key!, orderId: p.order_id, amount: p.amount, nsu: p.nsu, authorizationCode: p.authorization_code, createdAt: p.created_at, status: 'APPROVED', refundedAt: null, pending: cloud, acquirer: p.acquirer }))
+      .filter((r) => inPeriod(new Date(r.createdAt).toISOString()) && matches(r, applied.query));
+    const remote: RefundRow[] = server.map((r) => ({ key: r.idempotency_key, orderId: r.order_id, amount: r.amount, nsu: r.nsu, authorizationCode: r.authorization_code, createdAt: r.created_at, status: r.status, refundedAt: r.refunded_at, pending: false }));
+    return [...local, ...remote].sort((x, y) => Date.parse(y.createdAt) - Date.parse(x.createdAt));
+  }, [payments, server, pendingIds, applied, cloud]);
+
+  if (!cloud && rows.length === 0 && !applied.query && !applied.from && !applied.to) return null;
   return (
     <div className="rounded-2xl border border-slate-200 bg-surface p-4 text-sm">
-      <div className="mb-1 font-bold">Pagamentos da Point aprovados neste aparelho (Mercado Pago, últimos {POINT_REFUND_LIST_DAYS} dias)</div>
-      <p className="mb-2 text-xs text-slate-500">Lista deste aparelho: algum pode ainda não ter chegado ao servidor. Estornou uma venda na maquininha ou no app do Mercado Pago? Registre aqui com o PIN do gerente; o servidor confere a cobrança no Mercado Pago.</p>
-      <label htmlFor="point-refund-search" className="mb-1 block text-xs font-semibold text-slate-600">Buscar (NSU, valor, bandeira ou data)</label>
-      <input id="point-refund-search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Ex.: 123456 ou 50,00" className="mb-2 min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
-      {rows.length === 0 && <p className="py-2 text-slate-500">Nenhum pagamento da Point com essa busca.</p>}
-      {rows.map((p) => (
-        <div key={p.id} className="flex items-center justify-between gap-2 border-t border-slate-200 py-2">
-          <span className="text-slate-600">{label(p)} · {formatBRL(p.amount)}</span>
-          <PointRefundButton payment={p} label={label(p)} />
+      <div className="mb-1 font-bold">Pagamentos da Point (Mercado Pago)</div>
+      <p className="mb-2 text-xs text-slate-500">{cloud ? 'Lista do servidor, mais os deste aparelho que ainda não subiram.' : 'Lista deste aparelho.'} Estornou uma venda na maquininha ou no app do Mercado Pago? Registre aqui com o PIN do gerente; o servidor confere a cobrança no Mercado Pago.</p>
+      <form className="mb-2 grid gap-2 sm:grid-cols-[1fr_auto_auto_auto]" onSubmit={(e) => { e.preventDefault(); search(); }}>
+        <div>
+          <label htmlFor="point-refund-search" className="mb-1 block text-xs font-semibold text-slate-600">Buscar (NSU, valor, data ou operação)</label>
+          <input id="point-refund-search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Ex.: 123456 ou 50,00" className="min-h-touch w-full rounded-xl border border-slate-300 bg-base px-3 outline-none focus:border-ouro" />
         </div>
-      ))}
-      {!q && recent.length > rows.length && <p className="pt-2 text-xs text-slate-500">Mostrando os {rows.length} mais recentes de {recent.length}: use a busca para achar outro.</p>}
+        <div>
+          <label htmlFor="point-refund-from" className="mb-1 block text-xs font-semibold text-slate-600">De</label>
+          <input id="point-refund-from" type="date" value={from} onChange={(e) => setFrom(e.target.value)} className="min-h-touch rounded-xl border border-slate-300 bg-base px-2" />
+        </div>
+        <div>
+          <label htmlFor="point-refund-to" className="mb-1 block text-xs font-semibold text-slate-600">Até</label>
+          <input id="point-refund-to" type="date" value={to} onChange={(e) => setTo(e.target.value)} className="min-h-touch rounded-xl border border-slate-300 bg-base px-2" />
+        </div>
+        <Btn type="submit" variant="secondary" className="self-end" disabled={loading}>Buscar</Btn>
+      </form>
+      {error && <p role="alert" className="mb-2 rounded-lg bg-brasa/10 p-2 text-rose-700">{error}</p>}
+      {rows.length === 0 && !loading && !error && <p className="py-2 text-slate-500">Nenhum pagamento da Point com essa busca.</p>}
+      {rows.map((r) => {
+        const label = `${when(r.createdAt)} · NSU ${r.nsu ?? '?'}`;
+        const refunded = r.status === 'REFUNDED' || refundedKeys.includes(r.key);
+        return (
+          <div key={`${r.pending ? 'l' : 's'}-${r.key}`} className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 py-2">
+            <span className="text-slate-600">
+              {label} · {formatBRL(r.amount)}
+              {r.pending && <span className="ml-2 rounded bg-ouro/20 px-1 text-xs font-bold text-brasa">ainda não subiu</span>}
+            </span>
+            {refunded
+              ? <span className="text-xs font-semibold text-slate-500">estornado{r.refundedAt ? ` em ${when(r.refundedAt)}` : ''}</span>
+              : r.status === 'APPROVED' && (
+                <PointRefundButton
+                  payment={{ idempotency_key: r.key, order_id: r.orderId, amount: r.amount, ...(r.acquirer ? { acquirer: r.acquirer } : {}) }}
+                  label={label}
+                  onRefunded={() => setRefundedKeys((k) => [...k, r.key])}
+                />
+              )}
+          </div>
+        );
+      })}
+      {cloud && cursor && (
+        <Btn variant="secondary" block className="mt-2" disabled={loading} onClick={() => void load(cursor)}>{loading ? 'Carregando…' : 'Carregar mais'}</Btn>
+      )}
+      {loading && !cursor && <p className="py-2 text-xs text-slate-500">Carregando…</p>}
+    </div>
+  );
+}
+
+/** Conta reaberta pelo estorno da Point: fechada antes (NFC-e emitida), com pagamento da Point estornado e saldo. */
+export function isRefundReopenedOrder(order: Order, payments: readonly Payment[]): boolean {
+  return order.status !== 'CLOSED' && Boolean(order.nfce_key) && toCents(order.remaining_balance) > 0
+    && payments.some((p) => p.order_id === order.id && p.acquirer === 'MERCADO_PAGO' && p.status === 'REFUNDED');
+}
+
+export const WRITE_OFF_HELP = 'Encerra a conta sem cobrar o saldo estornado: a venda fica registrada como devolvida, com o valor baixado. Só com o PIN do gerente, conferido no servidor.';
+
+/** Pede ao servidor o encerramento como venda devolvida; só com a resposta dele a conta fecha aqui. */
+export async function submitRefundedWriteOff(orderId: string, managerPin: string, reason: string, deps?: ClaimDeps, clientAuditId: string = uuid()): Promise<ActionResult<{ writtenOff: number }>> {
+  const staffId = useTcheStore.getState().currentUserId;
+  if (!staffId) return { ok: false, error: 'Entre com o seu usuário antes de encerrar a conta.' };
+  const out = await closeRefundedOrder({ orderId, staffId, managerPin, reason, clientAuditId }, deps);
+  if (out.kind !== 'closed') return { ok: false, error: out.error };
+  return useTcheStore.getState().mirrorRefundedOrderWriteOff(orderId, out, reason);
+}
+
+export function WriteOffRefundedButton({ orderId, label, onClosed, deps }: { orderId: string; label: string; onClosed?: () => void; deps?: ClaimDeps }) {
+  const [open, setOpen] = useState(false);
+  // O mesmo id em todas as tentativas desta conta: depois de "sem resposta", repetir devolve o mesmo encerramento.
+  const [clientAuditId] = useState(() => uuid());
+  const balance = useTcheStore((s) => s.orders.find((o) => o.id === orderId)?.remaining_balance ?? 0);
+  return (
+    <>
+      <Btn variant="secondary" onClick={() => setOpen(true)}>Encerrar como venda devolvida</Btn>
+      <ManagerAuthSheet
+        open={open}
+        onClose={() => setOpen(false)}
+        title="Encerrar como venda devolvida"
+        summary={<span>{label} · saldo {formatBRL(balance)} · {WRITE_OFF_HELP}</span>}
+        confirmLabel="Encerrar"
+        minReason={SERVER_REASON_MIN_LENGTH}
+        quickReasons={['Venda estornada, cliente não vai pagar', 'Devolução ao cliente']}
+        successMessage="Conta encerrada no servidor como venda devolvida."
+        onSubmit={(pin, reason) => submitRefundedWriteOff(orderId, pin, reason, deps, clientAuditId)}
+        onSuccess={(data) => {
+          toast.alert(`Conta encerrada como venda devolvida: ${formatBRL(data.writtenOff)} baixado.`);
+          onClosed?.();
+        }}
+      />
+    </>
+  );
+}
+
+/** Contas reabertas pelo estorno da Point, com os próximos passos (GPT r10, P1-01). */
+export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?: (orderId: string) => void; deps?: ClaimDeps }) {
+  const orders = useTcheStore((s) => s.orders);
+  const payments = useTcheStore((s) => s.payments);
+  const tables = useTcheStore((s) => s.tables);
+  const list = orders.filter((o) => isRefundReopenedOrder(o, payments));
+  if (list.length === 0) return null;
+  return (
+    <div role="alert" className="rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
+      <div className="mb-1 font-black text-brasa">Contas reabertas pelo estorno</div>
+      <p className="mb-2 text-slate-800">A venda foi estornada depois de a conta fechar: o saldo voltou a dever. Cobre de novo ou encerre como venda devolvida.</p>
+      {list.map((o) => {
+        const label = tables.find((t) => t.id === o.table_id)?.label ?? 'Conta';
+        return (
+          <div key={o.id} className="flex flex-wrap items-center justify-between gap-2 border-t border-ouro/40 py-2">
+            <span><b>{label}</b> · saldo {formatBRL(o.remaining_balance)}</span>
+            <span className="flex flex-wrap gap-2">
+              {onOpenCheckout && <Btn variant="gold" onClick={() => onOpenCheckout(o.id)}>Cobrar de novo</Btn>}
+              <WriteOffRefundedButton orderId={o.id} label={label} deps={deps} />
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }

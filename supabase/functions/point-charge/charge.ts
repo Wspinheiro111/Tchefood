@@ -189,6 +189,11 @@ export interface ChargeStore {
   /** Há pagamento do Mercado Pago gravado com a chave desta cobrança, em qualquer status (aprovado ou já estornado)? */
   hasPaymentRecord(idempotencyKey: string): Promise<boolean>;
   /**
+   * O registro do estorno desta cobrança (audit_log POINT_PAYMENT_REFUNDED de tchefood_refund_point_payment): id dele,
+   * a autorização do gerente usada, o gerente e se a conta fechada foi reaberta. null = não há (estorno pela conferência).
+   */
+  refundRecord(row: TerminalChargeRow): Promise<RefundRecord | null>;
+  /**
    * Fim verificado (tchefood_resolve_point_charge, só service role): grava `toStatus` e `patch` só se a cobrança ainda
    * estiver em `row.status`, com UM audit_log (quem, motivo, o que foi lido no Mercado Pago). Devolve a linha atual:
    * com `toStatus` se gravou, ou como estava se outra chamada passou na frente (nada gravado).
@@ -201,6 +206,14 @@ export interface ChargeStore {
    * cobrança e o pagamento. Já estornada: devolve a linha sem gravar. Recusa: ChargeRefusedError (nada gravado).
    */
   refundPayment(row: TerminalChargeRow, patch: ChargePatch, audit: { staff: string; reason: string; evidence: Record<string, unknown> }): Promise<TerminalChargeRow>;
+}
+
+/** Campo ausente ou de tipo inesperado no registro = null (nunca um palpite). */
+export interface RefundRecord {
+  refund_audit_id: string;
+  authorization_audit_id: string | null;
+  manager_id: string | null;
+  order_reopened: boolean | null;
 }
 
 /** Pagamento do Mercado Pago (GET /v1/payments/{id}), só os campos conferidos. */
@@ -271,8 +284,14 @@ export type ChargeReply =
       method: PointMethod;
     }
   /** code REFUNDED: o Mercado Pago provou o estorno (houve cobrança e o dinheiro voltou), não "nada foi cobrado". */
-  /** payment_registered (só na ação refund): há pagamento do Mercado Pago gravado no servidor com esta chave. */
-  | { status: 'DECLINED'; idempotency_key: string; reason: string; code?: 'REFUNDED'; payment_registered?: boolean }
+  /**
+   * Só na ação refund: payment_registered (há pagamento do Mercado Pago gravado no servidor com esta chave) e o registro
+   * do estorno (authorization_audit_id, refund_audit_id, manager_id, order_reopened; null = não há ou não foi lido).
+   */
+  | {
+      status: 'DECLINED'; idempotency_key: string; reason: string; code?: 'REFUNDED'; payment_registered?: boolean;
+      authorization_audit_id?: string | null; refund_audit_id?: string | null; manager_id?: string | null; order_reopened?: boolean | null;
+    }
   | { status: 'MANUAL_REVIEW'; idempotency_key: string; reason: string; code: string };
 
 export class ChargeInputError extends Error {
@@ -1349,10 +1368,27 @@ export async function refundCharge(ctx: ChargeContext, input: ReconcileInput): P
   return withPaymentRecord(ctx, saved, reconcileReply(saved));
 }
 
-/** Estorno confirmado (DECLINED REFUNDED): diz ao aparelho se há pagamento gravado no servidor (como espelhar). */
+/**
+ * Estorno confirmado (DECLINED REFUNDED): diz ao aparelho se há pagamento gravado no servidor e o registro do estorno
+ * (para o aparelho que não tem o pagamento guardar o mesmo registro). O estorno já está gravado: falha ao ler o
+ * registro não desfaz a resposta, só deixa os campos null.
+ */
 async function withPaymentRecord(ctx: ChargeContext, row: TerminalChargeRow, reply: ChargeReply): Promise<ChargeReply> {
   if (reply.status !== 'DECLINED' || reply.code !== 'REFUNDED') return reply;
-  return { ...reply, payment_registered: await ctx.store.hasPaymentRecord(row.idempotency_key) };
+  let record: RefundRecord | null = null;
+  try {
+    record = await ctx.store.refundRecord(row);
+  } catch {
+    record = null;
+  }
+  return {
+    ...reply,
+    payment_registered: await ctx.store.hasPaymentRecord(row.idempotency_key),
+    authorization_audit_id: record?.authorization_audit_id ?? null,
+    refund_audit_id: record?.refund_audit_id ?? null,
+    manager_id: record?.manager_id ?? null,
+    order_reopened: record?.order_reopened ?? null,
+  };
 }
 
 async function reconcileReview(ctx: ChargeContext, row: TerminalChargeRow, auth: ReconcileAuth): Promise<ChargeReply> {

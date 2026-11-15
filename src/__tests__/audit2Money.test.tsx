@@ -112,27 +112,44 @@ describe('P1-A: estorno espelhado de pagamento que o servidor nunca recebeu', ()
     payPoint(orderId, order.remaining_balance, 'k-q');
     const r = await submitPointRefund(st().payments.find((p) => p.idempotency_key === 'k-q')!, '9999', 'venda estornada na maquininha', refundDeps(true));
     expect(r.ok).toBe(true);
-    expect(st().orders.find((o) => o.id === orderId)!.status).toBe('CLOSED');
+    // GPT r10 (P1-01): a conta fechada reabre (como no servidor); o pagamento estornado fica (não desfaz).
+    expect(st().orders.find((o) => o.id === orderId)).toMatchObject({ status: 'PAYING', closed_at: null });
+    expect(st().payments.find((p) => p.idempotency_key === 'k-q')!.status).toBe('REFUNDED');
   });
 
-  it('payment_registered=true: o servidor tem o pagamento; conta fechada segue fechada (como antes)', () => {
+  it('payment_registered=true: o servidor tem o pagamento; conta fechada reabre (GPT r10, P1-01)', () => {
     const orderId = openWithItems();
     const order = st().orders.find((o) => o.id === orderId)!;
     useTcheStore.setState({ outbox: [] });
     payPoint(orderId, order.remaining_balance, 'k-t');
-    st().mirrorServerPointRefund('k-t', 'venda estornada', { paymentRegistered: true });
-    expect(st().orders.find((o) => o.id === orderId)!.status).toBe('CLOSED');
+    const m = st().mirrorServerPointRefund('k-t', 'venda estornada', { paymentRegistered: true });
+    expect(m.ok && m.data.reopened).toBe(true);
+    expect(st().orders.find((o) => o.id === orderId)).toMatchObject({ status: 'PAYING', closed_at: null });
   });
 });
 
-describe('P2-B: itens do pagamento estornado seguem pagos', () => {
-  it('o estorno avisa e o "por item" mostra o aviso', async () => {
+describe('P2-B (GPT r10): itens do pagamento estornado voltam a não pagos, como no servidor', () => {
+  it('com paid_item_ids: os itens voltam a dever e não há aviso', async () => {
     const orderId = openWithItems(1, true);
     const order = st().orders.find((o) => o.id === orderId)!;
     const items = st().orderItems.filter((i) => i.order_id === orderId);
     const share = computeItemsShare(order, [items[0]!], items).share;
     payPoint(orderId, share, 'k-b', [items[0]!.id]);
     useTcheStore.setState({ outbox: [] }); // já no servidor
+    const r = await submitPointRefund(st().payments.find((p) => p.idempotency_key === 'k-b')!, '9999', 'venda estornada na maquininha', refundDeps(true));
+    expect(r.ok && r.data.itemsStayPaid).toBe(false);
+    expect(st().orderItems.find((i) => i.id === items[0]!.id)!.is_paid).toBe(false);
+    render(<CheckoutScreen orderId={orderId} onBack={() => undefined} onClosed={() => undefined} />);
+    fireEvent.click(screen.getByRole('button', { name: /Por item/ }));
+    expect(screen.queryByText(POINT_REFUND_ITEMS_PAID)).toBeNull();
+  });
+
+  it('pagamento antigo (sem paid_item_ids): os itens seguem pagos e o "por item" mostra o aviso', async () => {
+    const orderId = openWithItems(1, true);
+    const order = st().orders.find((o) => o.id === orderId)!;
+    const items = st().orderItems.filter((i) => i.order_id === orderId);
+    payPoint(orderId, computeItemsShare(order, [items[0]!], items).share, 'k-b', [items[0]!.id]);
+    useTcheStore.setState({ outbox: [], payments: st().payments.map((p) => (p.idempotency_key === 'k-b' ? { ...p, paid_item_ids: undefined } : p)) });
     const r = await submitPointRefund(st().payments.find((p) => p.idempotency_key === 'k-b')!, '9999', 'venda estornada na maquininha', refundDeps(true));
     expect(r.ok && r.data.itemsStayPaid).toBe(true);
     expect(st().orderItems.find((i) => i.id === items[0]!.id)!.is_paid).toBe(true);
@@ -144,12 +161,12 @@ describe('P2-B: itens do pagamento estornado seguem pagos', () => {
 });
 
 describe('P2-B na tela de estorno', () => {
-  it('o estorno com itens que seguem pagos avisa o operador', async () => {
+  it('o estorno com itens que seguem pagos (pagamento antigo, sem paid_item_ids) avisa o operador', async () => {
     const orderId = openWithItems(1, true);
     const order = st().orders.find((o) => o.id === orderId)!;
     const items = st().orderItems.filter((i) => i.order_id === orderId);
     payPoint(orderId, computeItemsShare(order, [items[0]!], items).share, 'k-bt', [items[0]!.id]);
-    useTcheStore.setState({ outbox: [] });
+    useTcheStore.setState({ outbox: [], payments: st().payments.map((p) => (p.idempotency_key === 'k-bt' ? { ...p, paid_item_ids: undefined } : p)) });
     useToast.setState({ toasts: [] } as never);
     hoisted.deps = refundDeps(true);
     try {
@@ -172,11 +189,12 @@ describe('P2-E: estorno de venda de outro dia e conciliação', () => {
     created_at: new Date(Date.now() - daysAgo * 86_400_000).toISOString(), ...over,
   } as Payment);
 
-  it('lista os últimos 30 dias, com busca', () => {
+  it('sem nuvem: lista os deste aparelho, sem limite de dias (GPT r10, P1-02), com busca', () => {
     render(<PointRefunds payments={[mp('ontem', 1), mp('velho', 40), mp('hoje', 0, { amount: 12.34 })]} />);
-    expect(screen.getAllByRole('button', { name: 'Registrar estorno' })).toHaveLength(2);
-    expect(screen.queryByText(/NSUvelho/)).toBeNull();
+    expect(screen.getAllByRole('button', { name: 'Registrar estorno' })).toHaveLength(3);
+    expect(screen.getByText(/NSUvelho/)).toBeTruthy();
     fireEvent.change(screen.getByLabelText(/Buscar/), { target: { value: 'NSUontem' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Buscar' }));
     expect(screen.getAllByRole('button', { name: 'Registrar estorno' })).toHaveLength(1);
     expect(screen.getByText(/NSUontem/)).toBeTruthy();
   });

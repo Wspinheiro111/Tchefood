@@ -138,7 +138,7 @@ describe('espelho do estorno gravado no servidor', () => {
     setReviewHold({ order_id: orderId, amount: 5, reason: 'outra', code: 'CLAIM_UNCONFIRMED', idempotency_key: OTHER, acquirer: 'MERCADO_PAGO' });
     const { d } = deps(REFUNDED);
     const r = await submitPointRefund(payment, '1234', 'venda estornada na maquininha', d);
-    expect(r).toEqual({ ok: true, data: { nfceIssued: false, itemsStayPaid: false } });
+    expect(r).toEqual({ ok: true, data: { nfceIssued: false, itemsStayPaid: false, reopened: false, mirrored: true } });
     expect(st().payments.find((p) => p.id === payment.id)!.status).toBe('REFUNDED');
     const after = st().orders.find((o) => o.id === orderId)!;
     expect(after.remaining_balance).toBeCloseTo(before.remaining_balance + 20, 2);
@@ -158,11 +158,12 @@ describe('espelho do estorno gravado no servidor', () => {
     expect(after.remaining_balance).toBeCloseTo(withPayment + 20, 2);
   });
 
-  it('conta fechada segue fechada (como no servidor)', async () => {
+  it('conta fechada reabre para PAYING, sem closed_at (como no servidor; GPT r10, P1-01)', async () => {
     const payment = seedPointPayment();
     useTcheStore.setState({ orders: st().orders.map((o) => (o.id === orderId ? { ...o, status: 'CLOSED', closed_at: '2026-11-14T12:00:00.000Z' } : o)) });
-    await submitPointRefund(payment, '1234', 'venda estornada na maquininha', deps(REFUNDED).d);
-    expect(st().orders.find((o) => o.id === orderId)).toMatchObject({ status: 'CLOSED', closed_at: '2026-11-14T12:00:00.000Z' });
+    const r = await submitPointRefund(payment, '1234', 'venda estornada na maquininha', deps(REFUNDED).d);
+    expect(r.ok && r.data.reopened).toBe(true);
+    expect(st().orders.find((o) => o.id === orderId)).toMatchObject({ status: 'PAYING', closed_at: null });
     expect(st().payments.find((p) => p.id === payment.id)!.status).toBe('REFUNDED');
   });
 

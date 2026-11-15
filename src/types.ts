@@ -460,7 +460,12 @@ export type AuditActionType =
   | 'CLAIM_RELEASED_REFUNDED'
   // Estorno da cobrança da Point com pagamento já registrado, provado no Mercado Pago pelo servidor
   // (tchefood_refund_point_payment grava o do servidor; o deste aparelho fica só aqui).
-  | 'POINT_PAYMENT_REFUNDED';
+  | 'POINT_PAYMENT_REFUNDED'
+  // Conta reaberta pelo estorno da Point encerrada pelo gerente como venda devolvida, com o saldo baixado
+  // (tchefood_close_refunded_order grava o do servidor; o deste aparelho tem o mesmo id e fica só aqui).
+  | 'ORDER_REFUNDED_WRITE_OFF'
+  // Conta reaberta pelo estorno e fechada de novo: a NFC-e autorizada da venda fica; não se emite outra.
+  | 'NFCE_ALREADY_ISSUED';
 
 export interface AuditLog {
   id: UUID;

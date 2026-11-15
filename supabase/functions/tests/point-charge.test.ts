@@ -36,6 +36,7 @@ const terminal: TerminalRecord = { id: TERMINAL_UUID, tenant_id: TENANT, serial_
 const FINAL_STATES = new Set(['approved', 'rejected', 'cancelled', 'expired', 'refunded']);
 
 const MANAGER_PIN = '9999';
+const MANAGER_ID = '66666666-6666-4666-8666-666666666666';
 
 type StoreMethod = 'findByKey' | 'claimDispatch' | 'beginDispatch' | 'attachOrder' | 'rejectFirstSend' | 'voidUndispatched' | 'settleDispatch' | 'requestTimeoutCancel' | 'update';
 
@@ -78,6 +79,13 @@ class MemoryStore implements ChargeStore {
   refundedPayments = new Set<string>();
   /** NSU e valor (centavos) do pagamento registrado com a chave, quando diferem da cobrança (padrão: os da cobrança). */
   registeredPaymentData = new Map<string, { nsu: string | null; amountCents: number }>();
+  /** Registro de cada estorno gravado, pelo id da cobrança (o audit_log POINT_PAYMENT_REFUNDED). */
+  refundRecords = new Map<string, { refund_audit_id: string; authorization_audit_id: string | null; manager_id: string | null; order_reopened: boolean | null }>();
+  /** A conta da cobrança está fechada (o estorno a reabre). */
+  orderClosed = false;
+  async refundRecord(row: TerminalChargeRow) {
+    return this.refundRecords.get(row.id) ?? null;
+  }
   /** Recusa que o próximo refundPayment devolve (como o banco), antes de qualquer conferência. */
   refundRefusal: ChargeRefusedError | null = null;
   private enter(method: StoreMethod | 'insertVoid' | 'insert' | 'authorizeCancel' | 'authorizeReconcile' | 'resolve' | 'refundPayment') {
@@ -327,6 +335,9 @@ class MemoryStore implements ChargeStore {
     }
     this.refunds.push({ key: r.idempotency_key, patch, ...audit });
     this.audits.push({ key: r.idempotency_key, action: 'POINT_PAYMENT_REFUNDED', performed_by: audit.staff, reason: audit.reason });
+    // Como o banco: conta fechada reabre (PAYING) com o saldo devolvido, e o registro diz se reabriu.
+    this.refundRecords.set(r.id, { refund_audit_id: `audit-${this.audits.length}`, authorization_audit_id: String(e.authorization_audit_id), manager_id: MANAGER_ID, order_reopened: this.orderClosed });
+    this.orderClosed = false;
     Object.assign(r, patch, { status: 'refunded' as ChargeStatus });
     this.registeredPayments.delete(r.idempotency_key);
     this.refundedPayments.add(r.idempotency_key);
@@ -3074,7 +3085,8 @@ describe('point-charge: auditoria r5', () => {
     it('o Mercado Pago mostra o pagamento estornado: grava cobrança refunded + pagamento REFUNDED com a prova lida', async () => {
       const { ctx, store, calls } = setup({ payment: async () => refundedPayment({ statusDetail: 'refunded', orderId: 'ORD01' }) });
       registered(store);
-      expect(await refundCharge(ctx, REFUND)).toEqual({ status: 'DECLINED', idempotency_key: KEY, code: 'REFUNDED', reason: 'O Mercado Pago confirmou o estorno: nada fica cobrado nesta cobrança.', payment_registered: true });
+      expect(await refundCharge(ctx, REFUND)).toEqual({ status: 'DECLINED', idempotency_key: KEY, code: 'REFUNDED', reason: 'O Mercado Pago confirmou o estorno: nada fica cobrado nesta cobrança.', payment_registered: true,
+        authorization_audit_id: 'audit-1', refund_audit_id: 'audit-2', manager_id: MANAGER_ID, order_reopened: false });
       expect(calls.payment).toEqual(['123456789']);
       expect(calls.get).toHaveLength(0);
       expect(store.rows[0]).toMatchObject({ status: 'refunded', raw_status: 'payment_refunded', raw_status_detail: 'PAYMENT_REFUNDED', external_payment_id: '123456789', authorization_code: 'A1B2C3' });
@@ -3153,6 +3165,43 @@ describe('point-charge: auditoria r5', () => {
       registered(store);
       expect(await refundCharge(ctx, REFUND)).toMatchObject({ status: 'DECLINED', code: 'REFUNDED', payment_registered: true });
       expect(await refundCharge(ctx, REFUND)).toMatchObject({ status: 'DECLINED', code: 'REFUNDED', payment_registered: true });
+    });
+
+    it('r11: o estorno gravado devolve a autorização, o registro do estorno, o gerente e se a conta reabriu (também na repetição)', async () => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment() });
+      registered(store);
+      store.orderClosed = true;
+      const first = await refundCharge(ctx, REFUND);
+      expect(first).toEqual({
+        status: 'DECLINED', idempotency_key: KEY, code: 'REFUNDED', reason: 'O Mercado Pago confirmou o estorno: nada fica cobrado nesta cobrança.',
+        payment_registered: true, authorization_audit_id: 'audit-1', refund_audit_id: 'audit-2', manager_id: MANAGER_ID, order_reopened: true,
+      });
+      expect(store.refunds[0]!.evidence.authorization_audit_id).toBe('audit-1');
+      // Repetição (outro aparelho, sem nada local): os mesmos dados do estorno gravado.
+      expect(await refundCharge(ctx, REFUND)).toEqual(first);
+    });
+
+    it('r11: conta aberta: order_reopened false', async () => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment() });
+      registered(store);
+      expect(await refundCharge(ctx, REFUND)).toMatchObject({ order_reopened: false, refund_audit_id: 'audit-2' });
+    });
+
+    it('r11: estornada sem registro de estorno (pela conferência) ou registro ilegível: os campos vêm null, o estorno continua confirmado', async () => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment() });
+      seed(store, { ...approvedRow, status: 'refunded' });
+      expect(await refundCharge(ctx, REFUND)).toMatchObject({ status: 'DECLINED', code: 'REFUNDED', authorization_audit_id: null, refund_audit_id: null, manager_id: null, order_reopened: null });
+      const broken = setup({ payment: async () => refundedPayment() });
+      registered(broken.store);
+      broken.store.refundRecord = async () => { throw new Error('banco fora do ar'); };
+      expect(await refundCharge(broken.ctx, REFUND)).toMatchObject({ status: 'DECLINED', code: 'REFUNDED', refund_audit_id: null, order_reopened: null });
+      expect(broken.store.rows[0]!.status).toBe('refunded');
+    });
+
+    it('r11: o pedido só precisa do que a lista do servidor dá (chave, operador, PIN, motivo): nada do aparelho', async () => {
+      const { ctx, store } = setup({ payment: async () => refundedPayment() });
+      registered(store);
+      expect(await refundCharge(ctx, { idempotency_key: KEY, staff_id: STAFF, manager_pin: MANAGER_PIN, reason_text: 'estornado no app do Mercado Pago' })).toMatchObject({ status: 'DECLINED', code: 'REFUNDED' });
     });
 
     it('auditoria interna 1 (5): estornada sem pagamento no servidor (estorno pela conferência): payment_registered false', async () => {

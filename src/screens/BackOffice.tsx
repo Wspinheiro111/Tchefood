@@ -1,12 +1,13 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { AlertTriangle, BarChart3, Bike, CreditCard, Gauge, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
 import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
-import { AUDIT_LABEL, declinedInShift, formatShiftStart, pointRefundsInShift, reconciliation, shiftKpis, waiterSplit, whatsappAlertText } from '../lib/reports';
-import { PointRefunds } from '../components/PointRefund';
+import { AUDIT_LABEL, declinedInShift, formatShiftStart, loadServerPointPayments, reconciliation, reconciliationMovements, shiftKpis, waiterSplit, whatsappAlertText, type ShiftPeriod } from '../lib/reports';
+import { listPointPayments, type ServerPointPayment } from '../lib/payments/pointPaymentsServer';
+import { PointRefunds, RefundReopenedOrders } from '../components/PointRefund';
 import { useShiftPeriod } from '../lib/useShiftStart';
 import { Badge, Btn, toast } from '../components/ui';
 import { NfceViewer } from './NfceViewer';
@@ -74,7 +75,7 @@ export function useBackOfficeTabs(): typeof TABS {
 /** Telas fora da Retaguarda que um aviso do Painel do dono pode abrir. */
 export type BackOfficeExit = 'delivery' | 'pickup' | 'map' | 'caixa';
 
-export function BackOffice({ onExit }: { onExit?: (view: BackOfficeExit) => void } = {}) {
+export function BackOffice({ onExit, onOpenCheckout }: { onExit?: (view: BackOfficeExit) => void; onOpenCheckout?: (orderId: string) => void } = {}) {
   const tabs = useBackOfficeTabs();
   const [picked, setTab] = useState<Tab>('owner');
   const navigate = (target: DashboardNavTarget) => {
@@ -103,7 +104,7 @@ export function BackOffice({ onExit }: { onExit?: (view: BackOfficeExit) => void
       {tab === 'fees' && <FeesReceivables />}
       {tab === 'entrega' && <OwnDeliveryAdmin />}
       {tab === 'dash' && <Dashboard />}
-      {tab === 'recon' && <Reconciliation />}
+      {tab === 'recon' && <Reconciliation {...(onOpenCheckout ? { onOpenCheckout } : {})} />}
       {tab === 'waiters' && <WaiterSplit />}
       {tab === 'audit' && <AuditCenter />}
       {tab === 'chopp' && <KegMonitorScreen compact />}
@@ -140,10 +141,12 @@ export function Dashboard() {
   const orders = useTcheStore((s) => s.orders);
   const payments = useTcheStore((s) => s.payments);
   const tables = useTcheStore((s) => s.tables);
+  const logs = useTcheStore((s) => s.auditLogs);
   // Um só período para todos os números e a legenda: muda na virada das 05:00,
   // a cada minuto (registro que deixou de estar no futuro) e quando os dados mudam.
   const period = useShiftPeriod([orders, payments]);
-  const k = useMemo(() => shiftKpis(orders, payments, period), [orders, payments, period]);
+  // Venda devolvida encerrada pelo gerente (ORDER_REFUNDED_WRITE_OFF): só a parte que ficou paga.
+  const k = useMemo(() => shiftKpis(orders, payments, period, logs), [orders, payments, period, logs]);
   const occupied = tables.filter((t) => t.status !== 'FREE' && t.status !== 'DIRTY').length;
   const recon = useMemo(() => reconciliation(payments, period), [payments, period]);
   const max = Math.max(1, ...recon.map((r) => r.total));
@@ -171,55 +174,121 @@ export function Dashboard() {
   );
 }
 
-export function Reconciliation() {
+const ACQUIRER_NAME = { STONE: 'Stone', PAGBANK: 'PagBank', MERCADO_PAGO: 'Mercado Pago', CASH_DESK: 'Dinheiro / Caixa' } as const;
+
+type ServerRefunds = { state: 'IDLE' | 'LOADING' | 'FAILED' } | { state: 'LOADED'; items: ServerPointPayment[] };
+
+/**
+ * Datas de estorno do servidor para o período (tchefood_list_point_payments), com o prazo da leitura da nuvem.
+ * Sem nuvem: IDLE (nada a ler). Erro ou prazo: FAILED.
+ */
+function useServerRefunds(cloud: boolean, period: ShiftPeriod): ServerRefunds {
+  const [state, setState] = useState<ServerRefunds>({ state: cloud ? 'LOADING' : 'IDLE' });
+  const startMs = period.start.getTime();
+  const endMs = period.end.getTime();
+  useEffect(() => {
+    if (!cloud) {
+      setState({ state: 'IDLE' });
+      return;
+    }
+    let alive = true;
+    setState((s) => (s.state === 'LOADED' ? s : { state: 'LOADING' }));
+    loadServerPointPayments({ start: new Date(startMs), end: new Date(endMs) }, (input) => listPointPayments(input))
+      .then((items) => alive && setState({ state: 'LOADED', items }))
+      .catch(() => alive && setState({ state: 'FAILED' }));
+    return () => {
+      alive = false;
+    };
+  }, [cloud, startMs, endMs]);
+  return state;
+}
+
+export function Reconciliation({ onOpenCheckout }: { onOpenCheckout?: (orderId: string) => void } = {}) {
   const payments = useTcheStore((s) => s.payments);
+  const logs = useTcheStore((s) => s.auditLogs);
+  const cloud = useTcheStore((s) => Boolean(s.cloud));
   const period = useShiftPeriod([payments]);
-  const rows = useMemo(() => reconciliation(payments, period), [payments, period]);
+  const server = useServerRefunds(cloud, period);
+  const serverItems = server.state === 'LOADED' ? server.items : null;
+  // Auditoria GPT r10 (P2-01, P2-02): venda no turno da venda, estorno no turno da data do estorno no servidor.
+  const recon = useMemo(() => reconciliationMovements(payments, period, { serverPayments: serverItems, logs }), [payments, period, serverItems, logs]);
+  const rows = recon.rows;
   const methods = ['CREDIT', 'DEBIT', 'PIX', 'CASH'] as const;
   const label = { CREDIT: 'Crédito', DEBIT: 'Débito', PIX: 'Pix', CASH: 'Dinheiro' } as const;
-  const totals = methods.map((m) => rows.reduce((a, r) => a + r.byMethod[m], 0));
+  const totals = methods.map((m) => rows.reduce((a, r) => ({ gross: a.gross + r.byMethod[m].gross, refunds: a.refunds + r.byMethod[m].refunds, net: a.net + r.byMethod[m].net }), { gross: 0, refunds: 0, net: 0 }));
   const declined = useMemo(() => declinedInShift(payments, period), [payments, period]);
-  const logs = useTcheStore((s) => s.auditLogs);
-  const mpRefunds = useMemo(() => pointRefundsInShift(payments, logs, period), [payments, logs, period]);
+  const cell = (c: { gross: number; refunds: number; net: number }) => (
+    <>
+      <div>{formatBRL(c.gross)}</div>
+      {c.refunds !== 0 && <div className="text-xs text-rose-600">−{formatBRL(c.refunds)}</div>}
+      {c.refunds !== 0 && <div className="text-xs font-bold">{formatBRL(c.net)}</div>}
+    </>
+  );
   return (
     <div className="space-y-4">
+      {cloud && server.state !== 'LOADED' && (
+        <div role="status" className="rounded-2xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+          {server.state === 'LOADING' ? 'Lendo os estornos da nuvem…' : 'Estornos da nuvem não carregados: sem a data do servidor, os estornos deste aparelho ficam à parte (sem data) até a leitura voltar.'}
+        </div>
+      )}
       <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-surface">
-        <table className="w-full min-w-[640px] text-sm">
+        <table className="w-full min-w-[760px] text-sm">
           <thead className="bg-base text-left text-xs uppercase text-slate-500">
-            <tr><th className="p-3">Adquirente</th>{methods.map((m) => <th key={m} className="p-3 text-right">{label[m]}</th>)}<th className="p-3 text-right">Total</th><th className="p-3 text-right">Transações</th></tr>
+            <tr>
+              <th className="p-3">Adquirente</th>
+              {methods.map((m) => <th key={m} className="p-3 text-right">{label[m]}</th>)}
+              <th className="p-3 text-right">Bruto (vendas)</th>
+              <th className="p-3 text-right">Estornos</th>
+              <th className="p-3 text-right">Líquido</th>
+              <th className="p-3 text-right">Transações</th>
+            </tr>
           </thead>
           <tbody>
             {rows.map((r) => (
               <tr key={r.acquirer} className="border-t border-slate-200">
                 <td className="p-3">
-                  <div className="font-bold">{r.acquirer === 'STONE' ? 'Stone' : r.acquirer === 'PAGBANK' ? 'PagBank' : r.acquirer === 'MERCADO_PAGO' ? 'Mercado Pago' : 'Dinheiro / Caixa'}</div>
+                  <div className="font-bold">{ACQUIRER_NAME[r.acquirer]}</div>
                   <div className="text-xs text-slate-500">{r.cnpj ? `CNPJ ${r.cnpj.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5')}` : 'Gaveta do caixa'}</div>
                 </td>
-                {methods.map((m) => <td key={m} className="p-3 text-right tabular-nums">{formatBRL(r.byMethod[m])}</td>)}
-                <td className="p-3 text-right font-bold tabular-nums">{formatBRL(r.total)}</td>
-                <td className="p-3 text-right">{r.count}</td>
+                {methods.map((m) => <td key={m} className="p-3 text-right tabular-nums">{cell(r.byMethod[m])}</td>)}
+                <td className="p-3 text-right tabular-nums" data-testid={`recon-gross-${r.acquirer}`}>{formatBRL(r.gross)}</td>
+                <td className="p-3 text-right tabular-nums text-rose-600" data-testid={`recon-refunds-${r.acquirer}`}>{r.refunds ? `−${formatBRL(r.refunds)}` : formatBRL(0)}</td>
+                <td className="p-3 text-right font-bold tabular-nums" data-testid={`recon-net-${r.acquirer}`}>{formatBRL(r.net)}</td>
+                <td className="p-3 text-right">{r.salesCount}{r.refundsCount ? ` + ${r.refundsCount} estorno(s)` : ''}</td>
               </tr>
             ))}
             <tr className="border-t-2 border-ouro font-black">
               <td className="p-3">Total</td>
-              {totals.map((t, i) => <td key={i} className="p-3 text-right tabular-nums">{formatBRL(t)}</td>)}
-              <td className="p-3 text-right tabular-nums text-brasa">{formatBRL(rows.reduce((a, r) => a + r.total, 0))}</td>
-              <td className="p-3 text-right">{rows.reduce((a, r) => a + r.count, 0)}</td>
+              {totals.map((t, i) => <td key={i} className="p-3 text-right tabular-nums">{cell(t)}</td>)}
+              <td className="p-3 text-right tabular-nums">{formatBRL(recon.totals.gross)}</td>
+              <td className="p-3 text-right tabular-nums text-rose-600">{recon.totals.refunds ? `−${formatBRL(recon.totals.refunds)}` : formatBRL(0)}</td>
+              <td className="p-3 text-right tabular-nums text-brasa">{formatBRL(recon.totals.net)}</td>
+              <td className="p-3 text-right">{recon.totals.salesCount}{recon.totals.refundsCount ? ` + ${recon.totals.refundsCount}` : ''}</td>
             </tr>
           </tbody>
         </table>
+        <p className="p-3 text-xs text-slate-500">Como no extrato da adquirente: a venda conta no turno em que foi feita, mesmo estornada depois; o estorno conta no turno da data do estorno no servidor.</p>
       </div>
+      {recon.undatedRefunds.count > 0 && (
+        <div className="rounded-2xl border border-amber-300 bg-surface p-4 text-sm">
+          <div className="flex justify-between font-bold"><span>Estorno sem data confirmada</span><span className="tabular-nums text-rose-600">−{formatBRL(recon.undatedRefunds.total)} ({recon.undatedRefunds.count})</span></div>
+          <p className="mt-1 text-xs text-slate-500">Estornados sem a data do estorno no servidor: não entram no líquido de turno nenhum. Confira a data no extrato da adquirente.</p>
+          {recon.undatedRefunds.payments.map((p) => (
+            <div key={p.id} className="text-slate-500">venda {new Date(p.created_at).toLocaleString('pt-BR')} · {ACQUIRER_NAME[p.acquirer === 'STONE' || p.acquirer === 'PAGBANK' || p.acquirer === 'MERCADO_PAGO' ? p.acquirer : 'CASH_DESK']} · NSU {p.nsu ?? '—'} · {formatBRL(p.amount)}</div>
+          ))}
+        </div>
+      )}
+      {recon.writeOffs.count > 0 && (
+        <div className="rounded-2xl border border-slate-200 bg-surface p-4 text-sm">
+          <div className="flex justify-between font-bold"><span>Vendas devolvidas encerradas pelo gerente</span><span className="tabular-nums">{formatBRL(recon.writeOffs.total)} ({recon.writeOffs.count})</span></div>
+          <p className="mt-1 text-xs text-slate-500">Saldo baixado de contas reabertas por estorno e encerradas sem nova cobrança. Não é entrada de dinheiro.</p>
+        </div>
+      )}
       <div className="rounded-2xl border border-slate-200 bg-surface p-4 text-sm">
         <div className="mb-1 font-bold">Transações recusadas no turno: {declined.length}</div>
         {declined.map((p) => <div key={p.id} className="text-slate-500">{new Date(p.created_at).toLocaleTimeString('pt-BR')} · {p.acquirer} · {p.terminal_serial} · {formatBRL(p.amount)}</div>)}
       </div>
-      {mpRefunds.count > 0 && (
-        // Auditoria interna 2 (P2-E): o extrato do Mercado Pago traz a venda e o estorno; a linha acima já não conta o estornado.
-        <div className="rounded-2xl border border-slate-200 bg-surface p-4 text-sm">
-          <div className="flex justify-between font-bold"><span>Estornos Mercado Pago no turno</span><span className="tabular-nums text-rose-600">−{formatBRL(mpRefunds.total)} ({mpRefunds.count})</span></div>
-          <p className="mt-1 text-xs text-slate-500">No extrato do Mercado Pago cada estorno aparece como a venda e a devolução. A linha Mercado Pago acima conta só os pagamentos que seguem aprovados.</p>
-        </div>
-      )}
+      <RefundReopenedOrders {...(onOpenCheckout ? { onOpenCheckout } : {})} />
       <PointRefunds payments={payments} />
     </div>
   );
@@ -229,8 +298,10 @@ export function WaiterSplit() {
   const orders = useTcheStore((s) => s.orders);
   const items = useTcheStore((s) => s.orderItems);
   const staff = useTcheStore((s) => s.staff);
+  const logs = useTcheStore((s) => s.auditLogs);
   const period = useShiftPeriod([orders, items, staff]);
-  const rows = useMemo(() => waiterSplit(orders, items, staff, period), [orders, items, staff, period]);
+  // Venda devolvida encerrada pelo gerente: sem comissão sobre o valor baixado.
+  const rows = useMemo(() => waiterSplit(orders, items, staff, period, logs), [orders, items, staff, period, logs]);
   const total = rows.reduce((a, r) => a + r.commission, 0);
   return (
     <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-surface">

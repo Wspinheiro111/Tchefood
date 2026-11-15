@@ -318,7 +318,7 @@ describe('P1/P2-D: várias travas por conta', () => {
     const fresh = await import('../lib/payments/reviewHolds');
     expect(fresh.getReviewHold('oV1')).toMatchObject({ code: 'WRAPPER_EXCEPTION', amount: 3 });
     expect(localStorage.getItem('tchefood.paymentReviewHolds.v1')).toBeNull();
-    expect(JSON.parse(localStorage.getItem('tchefood.paymentReviewHolds.v2')!)).toEqual(expect.arrayContaining([expect.objectContaining({ order_id: 'oV1' })]));
+    expect(JSON.parse(localStorage.getItem('tchefood.paymentReviewHolds.v3:order:oV1')!)).toMatchObject({ order_id: 'oV1' });
     fresh.clearReviewHold('oV1');
     vi.resetModules();
   });

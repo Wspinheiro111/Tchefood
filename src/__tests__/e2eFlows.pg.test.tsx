@@ -42,6 +42,8 @@ const { superviseSettledClaims, resetClaimSupervisor } = await import('../lib/pa
 const ledger = await import('../lib/payments/claimLedger');
 const { clearReviewHold, getReviewHold } = await import('../lib/payments/reviewHolds');
 const { useToast } = await import('../components/ui');
+const { submitRefundedWriteOff, isRefundReopenedOrder } = await import('../components/PointRefund');
+const { listPointPayments } = await import('../lib/payments/pointPaymentsServer');
 /** Mensagens de toast desde o começo do teste (o que o operador viu). */
 const toastLog: string[] = [];
 useToast.subscribe((s: { toasts: Array<{ id: unknown; kind: string; text: string }> }, prev: { toasts: Array<{ id: unknown }> }) => {
@@ -544,8 +546,7 @@ function freeValue(v: string) {
     await waitFor(() => expect(ledger.pendingRelease(key)?.last_error ?? null).not.toBeNull(), { timeout: 10_000 });
     expect(serverClaims(o.id).map((c) => c.status)).toEqual(['open']);
     // "Reabrir o app": o registro está no armazenamento do aparelho, com o segredo.
-    const raw = JSON.parse(localStorage.getItem('tchefood.paymentClaims.v1') ?? '{}') as { pendingReleases?: Array<{ key: string; release_token: string | null; final?: boolean }> };
-    const saved = raw.pendingReleases?.find((x) => x.key === key);
+    const saved = JSON.parse(localStorage.getItem(`tchefood.paymentClaims.v2:r:${key}`) ?? 'null') as { key: string; release_token: string | null; final?: boolean } | null;
     expect(saved?.release_token).toMatch(/^[0-9a-f]{64}$/);
     expect(saved?.final).toBe(false);
     // O DECLINED espera a liberação (o servidor recusaria com TF010 com a reserva aberta).
@@ -787,5 +788,52 @@ function freeValue(v: string) {
     await waitFor(() => expect(st().orders.find((x) => x.id === id)!.status, toasts().join(' | ')).toBe('CLOSED'));
     await expectSynced('conta paga depois do estorno');
     await waitFor(() => expect(serverOrder(id)).toBe('CLOSED 0.00'));
+  }, 60_000);
+  it('GPT r10 (P1-01/P1-02): conta com o saldo só do estorno da Point: a lista do servidor mostra o estornado, o gerente encerra como venda devolvida e a conta fecha nos dois lados', async () => {
+    login(OWNER_PIN);
+    if (!st().tables.some((t) => t.number === 11)) ok(st().saveTable({ number: 11, label: 'Mesa 11', area: 'Salão', capacity: 4, active: true }));
+    const id = openTableWith(11);
+    await expectSynced('conta da Point (venda devolvida)');
+    const o = st().orders.find((x) => x.id === id)!;
+    const cents = Math.round(o.remaining_balance * 100);
+    const termId = crypto.randomUUID();
+    const key = crypto.randomUUID();
+    sql(`INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${termId}', '${TENANT}', 'Point E2E 2', 'MP-E2E-2', 'MERCADO_PAGO');`);
+    useTcheStore.setState((s) => ({ terminals: [...s.terminals, { id: termId, tenant_id: TENANT, name: 'Point E2E 2', serial_number: 'MP-E2E-2', acquirer: 'MERCADO_PAGO', mode: 'TEF_POS_WIRELESS', online: true, battery_level: 90 } as never] }));
+    net.down = true;
+    ok(st().registerPayment({
+      orderId: id, amount: o.remaining_balance, method: 'CREDIT', status: 'APPROVED', terminal_id: termId, acquirer: 'MERCADO_PAGO',
+      acquirer_cnpj: '10573521000191', card_brand: 'VISA', nsu: 'PE2E2', authorization_code: 'AUT2', terminal_serial: 'MP-E2E-2', idempotency_key: key, item_ids: [],
+    }));
+    sql(`BEGIN; SET LOCAL session_replication_role = replica;
+         INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status, external_order_id, external_payment_id, paid_amount_cents, card_brand, authorization_code)
+         VALUES ('${TENANT}', '${key}', '${id}', '${termId}', 'mercado_pago_point', 'MP-E2E-2', 'CREDIT', ${cents}, 'refunded', 'ORD-${key}', 'PE2E2', ${cents}, 'VISA', 'AUT2'); COMMIT;`);
+    expect(st().mirrorServerPointRefund(key, 'Venda estornada na maquininha', { paymentRegistered: false }).ok).toBe(true);
+    net.down = false;
+    await expectSynced('estorno espelhado (venda devolvida)');
+    // Fechou aqui (NFC-e) e reabriu com o estorno: aparece em "Contas reabertas pelo estorno".
+    expect(isRefundReopenedOrder(st().orders.find((x) => x.id === id)!, st().payments)).toBe(true);
+    // P1-02: a lista do servidor acha o pagamento estornado pelo NSU, com o estado de lá.
+    const listed = await listPointPayments({ from: null, to: null, search: 'PE2E2', cursor: null });
+    expect(listed).toMatchObject({ kind: 'ok', nextCursor: null, items: [{ idempotency_key: key, order_id: id, status: 'REFUNDED', nsu: 'PE2E2' }] });
+    // PIN errado: nada muda (nem lá, nem aqui).
+    const wrong = await submitRefundedWriteOff(id, '0000', 'Cliente não vai pagar de novo', undefined, crypto.randomUUID());
+    expect(wrong.ok).toBe(false);
+    expect(st().orders.find((x) => x.id === id)!.status).toBe('PAYING');
+    expect(serverOrder(id)).not.toMatch(/^CLOSED/);
+    // P1-01: o gerente encerra como venda devolvida.
+    const client = crypto.randomUUID();
+    const r = await submitRefundedWriteOff(id, MANAGER_PIN, 'Cliente não vai pagar de novo', undefined, client);
+    expect(r).toEqual({ ok: true, data: { writtenOff: o.remaining_balance } });
+    expect(serverOrder(id)).toMatch(/^CLOSED/);
+    const audit = sql(`SELECT id || ' ' || (metadata->>'written_off_cents') || ' ' || (metadata->>'client_audit_id') FROM audit_logs WHERE order_id = '${id}' AND action_type = 'ORDER_REFUNDED_WRITE_OFF'`);
+    const [auditId, writtenCents, clientId] = audit.split(' ');
+    expect([Number(writtenCents), clientId]).toEqual([cents, client]);
+    expect(st().orders.find((x) => x.id === id)!.status).toBe('CLOSED');
+    expect(st().auditLogs.find((l) => l.action_type === 'ORDER_REFUNDED_WRITE_OFF')!.id).toBe(auditId);
+    // Repetir com o mesmo id: o servidor devolve o mesmo registro e nada muda aqui.
+    expect((await submitRefundedWriteOff(id, MANAGER_PIN, 'Cliente não vai pagar de novo', undefined, client))).toEqual({ ok: true, data: { writtenOff: 0 } });
+    await expectSynced('venda devolvida');
+    expect(serverOrder(id)).toMatch(/^CLOSED/);
   }, 60_000);
 });

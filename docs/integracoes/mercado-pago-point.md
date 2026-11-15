@@ -128,9 +128,23 @@ provado no Mercado Pago (mesmo pagamento, valor e referência; `refunded` com o 
 contestação nunca; autorização de até 10 min, pedida com a cobrança já aprovada; motivo de 10 a 500 caracteres). Numa
 transação, com as travas na ordem PIN, conta, cobrança, pagamento: a cobrança vira `refunded`, o pagamento REFUNDED, a
 conta é recalculada e fica UM registro `POINT_PAYMENT_REFUNDED` (gerente, motivo, prova). Conta ainda aberta: o saldo
-volta. Conta já fechada: continua fechada, mostrando o saldo devolvido (como na main, a conta encerrada não reabre).
+volta. Conta já fechada (GPT r10 P1-01, decisão: o estorno total reabre a conta): volta a PAYING, `closed_at` NULL,
+com o saldo devolvido; o mesmo `POINT_PAYMENT_REFUNDED` guarda `order_reopened: true` (false quando a conta não estava fechada) e `previous_closed_at`, e é ele que
+deixa `tchefood_order_close_guard` aceitar a reabertura (fora disso, como na main, a conta encerrada não reabre). A
+mesa não muda: a conta reaberta é cobrada pela lista de contas (a mesa já está livre ou com outra conta). Depois, o
+caixa cobra de novo (reserva e pagamento de sempre) ou o gerente encerra como venda devolvida:
+`tchefood_close_refunded_order(p_order, p_staff, p_manager_pin, p_reason, p_client_audit_id)` (aparelho; PIN de
+gerente com o bloqueio de sempre; motivo de 10 a 500; só com o saldo inteiro coberto pelos pagamentos estornados do
+Mercado Pago da conta e nada reservado). Ela grava `ORDER_REFUNDED_WRITE_OFF` (valor baixado em `amount_impact` e
+`metadata.written_off_cents`, para os relatórios) e fecha a conta com esse saldo; reenvio com o mesmo
+`p_client_audit_id` devolve o mesmo resultado. Conta fechada com saldo só existe com esse registro.
 UPDATE direto do pagamento para REFUNDED é recusado (TF007), mesmo com a cobrança estornada. Repetir devolve a
 cobrança estornada sem gravar de novo.
+
+**Lista dos pagamentos da Point (GPT r10 P1-02).** `tchefood_list_point_payments(p_from, p_to, p_search, p_cursor,
+p_limit)` (aparelho, só leitura, loja do token): os pagamentos do Mercado Pago no período (sem prazo escondido), com
+busca por NSU, chave, ordem do Mercado Pago ou valor, do mais novo ao mais antigo em páginas (`next_cursor`), e, no
+estornado, `refunded_at` (hora do servidor do registro do estorno), `refund_audit_id` e `refunded_by_manager_id`.
 Quem chama é a ação `refund` da point-charge (`refundCharge`), pedida na retaguarda (Conciliação → "Pagamentos da
 Point" → "Registrar estorno", PIN de gerente e motivo). Antes do PIN ela confere que a cobrança está aprovada com o
 pagamento registrado (senão 409; a aprovada sem pagamento segue pela conferência). Depois do PIN lê só o próprio
@@ -301,11 +315,25 @@ O que acontece fora dessa ordem:
 
 Respostas reais conferidas com os parsers de produção: [`scripts/point-smoke.mjs`](../../scripts/point-smoke.mjs) (`node scripts/point-smoke.mjs --help`).
 
+## NFC-e da venda na Point
+
+O cartão cobrado pela Point sai na NFC-e como **pagamento integrado** (`tpIntegra` 1), como Stone e PagBank. Motivo:
+no grupo de cartão da NFC-e (NT 2015.002, campo `tpIntegra`), 1 é o pagamento integrado com o sistema de automação da
+empresa (TEF, POS integrado) e 2 é o não integrado (a maquininha avulsa, em que o operador digita o valor nela). Na
+Point o valor, a referência e a maquininha saem do nosso sistema pela API do Mercado Pago, e a aprovação volta para
+ele com o código de autorização: é integrado.
+
+Salvaguardas (`supabase/functions/emit-nfce/payload.ts`, `paymentGroup`): só sai 1 com o pagamento gravado com o
+adquirente `MERCADO_PAGO`, o CNPJ da credenciadora gravado igual ao do Mercado Pago (`10573521000191`, o mesmo de
+`src/lib/payments/drivers.ts`; um teste confere que as duas listas são iguais), CNPJ com dígito válido e código de
+autorização presente. Faltou qualquer um (por exemplo, pagamento registrado à mão sem o CNPJ): sai 2, sem CNPJ e
+sem autorização; nada é inventado. Antes de publicar: emitir uma NFC-e de venda Point em homologação e conferir
+tPag/tpIntegra/CNPJ/cAut no XML (checklist de publicação).
+
 ## Ainda não
 
 - Pix pela Point (ordem `qr`), crédito parcelado e outras bandeiras (Amex, Hipercard).
 - Webhook "Order (Mercado Pago)": por ora o app consulta.
-- NFC-e integrada (CNPJ da credenciadora Mercado Pago no `emit-nfce`): a nota sai como pagamento não integrado.
 - Taxa do cartão por adquirente (`cardFees`) para o Mercado Pago.
 - Comprovante impresso na Point: a ordem vai com `no_ticket`; o comprovante da loja sai pela impressora do app.
 

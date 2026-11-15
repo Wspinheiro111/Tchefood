@@ -1495,8 +1495,13 @@ $$;
 --     transação tchefood.point_resolution com o id dele (os gatilhos da cobrança e do pagamento conferem o
 --     registro: UPDATE isolado ou forjado continua recusado), grava a cobrança "refunded" e o pagamento
 --     REFUNDED. O recálculo da conta (gatilho de payments) tira o valor do pago.
--- Conta já fechada: continua fechada (no servidor a conta encerrada não reabre: tchefood_order_close_guard), com o
--- saldo devolvido em remaining_balance e o registro do estorno. Conta aberta: o saldo volta e ela segue aberta.
+-- Conta aberta: o saldo volta e ela segue aberta. GPT r10 P1-01 (decisão: o estorno total reabre a conta fechada):
+-- conta FECHADA volta a PAYING (closed_at NULL), com o saldo devolvido em remaining_balance; o mesmo registro
+-- POINT_PAYMENT_REFUNDED guarda order_reopened = true e previous_closed_at, e é ele (marca tchefood.point_resolution) que
+-- deixa o gatilho de fechamento (tchefood_order_close_guard, abaixo) aceitar a reabertura. A mesa não muda: a conta
+-- reaberta é cobrada pela lista de contas (a mesa já está livre ou com outra conta). Depois, o caixa cobra de novo
+-- (reserva e pagamento de sempre) ou o gerente encerra como venda devolvida (tchefood_close_refunded_order).
+-- Conta cancelada não muda (não há pagamento aprovado em conta cancelada pelos caminhos do sistema).
 CREATE OR REPLACE FUNCTION tchefood_refund_point_payment(
     p_tenant UUID, p_id UUID, p_staff UUID, p_reason TEXT, p_patch JSONB, p_evidence JSONB)
 RETURNS terminal_charges
@@ -1511,6 +1516,8 @@ DECLARE
     v_authorization UUID;
     v_manager UUID;
     v_rows INT;
+    v_order_status VARCHAR;
+    v_closed_at TIMESTAMPTZ;
 BEGIN
     -- Auditoria interna 1: motivo de 10 a 500 caracteres (texto livre gravado em audit_logs).
     IF p_reason IS NULL OR length(trim(p_reason)) < 10 OR length(trim(p_reason)) > 500 THEN
@@ -1550,7 +1557,7 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: cobrança não encontrada nesta loja.' USING ERRCODE = 'TF005';
     END IF;
-    PERFORM 1 FROM orders o WHERE o.id = v_order AND o.tenant_id = p_tenant FOR UPDATE;
+    SELECT o.status, o.closed_at INTO v_order_status, v_closed_at FROM orders o WHERE o.id = v_order AND o.tenant_id = p_tenant FOR UPDATE;
     SELECT * INTO v_charge FROM terminal_charges WHERE id = p_id AND tenant_id = p_tenant FOR UPDATE;
     IF v_charge.status = 'refunded' THEN
         RETURN v_charge; -- já estornada: a repetição devolve a mesma linha e não grava nada
@@ -1598,7 +1605,8 @@ BEGIN
     VALUES (p_tenant, v_order, p_staff, v_manager, 'POINT_PAYMENT_REFUNDED', 0, trim(p_reason),
             jsonb_build_object('charge_id', v_charge.id, 'payment_id', v_payment.id, 'idempotency_key', v_charge.idempotency_key,
                                'amount_cents', v_charge.amount_cents, 'from', 'approved', 'to', 'refunded', 'patch', v_patch,
-                               'evidence', p_evidence, 'server_verified', true))
+                               'evidence', p_evidence, 'server_verified', true,
+                               'order_reopened', v_order_status = 'CLOSED', 'previous_closed_at', v_closed_at))
     RETURNING id INTO v_audit;
     PERFORM set_config('tchefood.point_resolution', v_audit::text, true);
     UPDATE terminal_charges
@@ -1613,7 +1621,12 @@ BEGIN
         UPDATE payments SET status = 'REFUNDED' WHERE id = v_payment.id AND status = 'APPROVED';
         GET DIAGNOSTICS v_rows = ROW_COUNT;
     END IF;
-    -- A marca vale só para estas duas gravações.
+    -- GPT r10 P1-01: a conta fechada reabre (o recálculo do gatilho de payments já devolveu o saldo).
+    IF v_rows = 1 AND v_order_status = 'CLOSED' THEN
+        UPDATE orders SET status = 'PAYING', closed_at = NULL WHERE id = v_order AND tenant_id = p_tenant AND status = 'CLOSED';
+        GET DIAGNOSTICS v_rows = ROW_COUNT;
+    END IF;
+    -- A marca vale só para estas gravações.
     PERFORM set_config('tchefood.point_resolution', '', true);
     IF v_rows <> 1 THEN
         RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o estorno não foi gravado na cobrança e no pagamento.' USING ERRCODE = 'TF007';
@@ -1628,9 +1641,12 @@ $$;
 -- O pagamento APROVADO do Mercado Pago pode virar REFUNDED (tchefood_refund_point_payment). O aparelho que perdeu
 -- a resposta do INSERT e reenvia o mesmo pagamento (mesmo id, APROVADO) depois do estorno recebia "já existe outro
 -- pagamento com este id" para sempre. Esse caso exato é reenvio: a linha gravada está REFUNDED com o registro
--- POINT_PAYMENT_REFUNDED dela, e o reenvio traz o mesmo id, conta, forma, credenciadora, valor, NSU e chave:
--- devolve o id sem gravar nada. Fora disso, as regras de sempre de db/schema_dinheiro_servidor.sql (mesma loja,
--- conta, valor e status). tchefood_register_payment é a de lá, só com essa conferência trocada.
+-- POINT_PAYMENT_REFUNDED dela, e o reenvio traz o mesmo id, conta, forma, credenciadora, valor, NSU, chave e
+-- maquininha (terminal_id e terminal_serial, GPT r10): devolve o id sem gravar nada. Fora disso, as regras de sempre
+-- de db/schema_dinheiro_servidor.sql (mesma loja, conta, valor e status) e, no reenvio com o mesmo status (GPT r10,
+-- a verificar 5), também a mesma chave, forma, credenciadora, NSU, autorização e maquininha (senão TF006
+-- replay_mismatch; na main esses campos não eram comparados). tchefood_register_payment é a de lá, só com essa
+-- conferência trocada.
 CREATE OR REPLACE FUNCTION tchefood_payment_replay_ok(p_existing payments, p_incoming payments, p_tenant UUID)
 RETURNS BOOLEAN
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
@@ -1639,6 +1655,19 @@ BEGIN
         RETURN FALSE;
     END IF;
     IF p_existing.status = p_incoming.status THEN
+        -- GPT r10 (a verificar 5): o mesmo id com outro pagamento (outra chave, forma, credenciadora, NSU, autorização
+        -- ou maquininha) não é reenvio: recusa (TF006, replay_mismatch), para o aparelho não achar que o pagamento
+        -- diferente dele foi gravado. Vazio, só espaço e NULL são o mesmo (o aparelho manda null).
+        IF NULLIF(btrim(p_incoming.idempotency_key), '') IS DISTINCT FROM NULLIF(btrim(p_existing.idempotency_key), '')
+           OR p_incoming.method IS DISTINCT FROM p_existing.method
+           OR p_incoming.acquirer IS DISTINCT FROM p_existing.acquirer
+           OR NULLIF(btrim(p_incoming.nsu), '') IS DISTINCT FROM NULLIF(btrim(p_existing.nsu), '')
+           OR NULLIF(btrim(p_incoming.authorization_code), '') IS DISTINCT FROM NULLIF(btrim(p_existing.authorization_code), '')
+           OR p_incoming.terminal_id IS DISTINCT FROM p_existing.terminal_id
+           OR NULLIF(btrim(p_incoming.terminal_serial), '') IS DISTINCT FROM NULLIF(btrim(p_existing.terminal_serial), '') THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: já existe outro pagamento com este id (chave, forma, credenciadora, NSU, autorização ou maquininha diferente).'
+                USING ERRCODE = 'TF006', DETAIL = 'replay_mismatch';
+        END IF;
         RETURN TRUE;
     END IF;
     RETURN p_existing.status = 'REFUNDED' AND p_incoming.status = 'APPROVED'
@@ -1646,6 +1675,9 @@ BEGIN
        AND p_incoming.method IS NOT DISTINCT FROM p_existing.method
        AND p_incoming.nsu IS NOT DISTINCT FROM p_existing.nsu
        AND p_incoming.idempotency_key IS NOT DISTINCT FROM p_existing.idempotency_key
+       -- GPT r10 (a verificar 5): a mesma maquininha também.
+       AND p_incoming.terminal_id IS NOT DISTINCT FROM p_existing.terminal_id
+       AND p_incoming.terminal_serial IS NOT DISTINCT FROM p_existing.terminal_serial
        AND EXISTS (SELECT 1 FROM audit_logs a
                     WHERE a.tenant_id = p_tenant AND a.action_type = 'POINT_PAYMENT_REFUNDED'
                       AND a.metadata->>'payment_id' = p_existing.id::text);
@@ -1754,6 +1786,270 @@ $$;
 
 
 -- -----------------------------------------------------------------------------
+-- 7e. Conta estornada: reabertura e encerramento como venda devolvida (GPT r10 P1-01)
+-- -----------------------------------------------------------------------------
+-- Decisão (estorno total reabre a conta): tchefood_refund_point_payment devolve a conta FECHADA a PAYING. O caixa cobra
+-- de novo, ou o gerente encerra como venda devolvida (tchefood_close_refunded_order): a conta fecha com saldo e o
+-- valor baixado fica no registro ORDER_REFUNDED_WRITE_OFF (amount_impact e metadata.written_off_cents), que os
+-- relatórios somam. Fora dessas duas exceções, a regra da main (db/schema_dinheiro_servidor.sql): conta só fecha ou
+-- cancela com saldo zero e conta encerrada não reabre (o UPDATE é ignorado).
+--   * CLOSED → PAYING só com tchefood.point_resolution apontando para o registro POINT_PAYMENT_REFUNDED desta conta
+--     com order_reopened = true (gravado na mesma transação pelo estorno) e saldo maior que zero;
+--   * OPEN/PAYING → CLOSED com saldo só com tchefood.order_write_off apontando para o registro ORDER_REFUNDED_WRITE_OFF
+--     desta conta com written_off_cents igual ao saldo (o aparelho não grava esse registro: tchefood_guard_point_audit).
+CREATE OR REPLACE FUNCTION tchefood_order_close_guard()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    v_subtotal NUMERIC(10,2);
+    v_fee      NUMERIC(10,2);
+    v_discount NUMERIC(10,2);
+    v_paid     NUMERIC(10,2);
+    v_remaining NUMERIC(10,2);
+    v_flag TEXT;
+BEGIN
+    IF NEW.status IN ('CLOSED', 'CANCELED') AND OLD.status IN ('OPEN', 'PAYING') THEN
+        -- O mesmo UPDATE que encerra a conta pode trazer a taxa de serviço ou o desconto novos
+        -- (quitar com a gorjeta dispensada, por exemplo). Os totais gravados só são refeitos DEPOIS
+        -- (trg_orders_flags), então o saldo é calculado aqui com os valores que estão chegando,
+        -- pela mesma regra de tchefood_recalc_order.
+        SELECT COALESCE(SUM(total_item_price), 0) INTO v_subtotal
+          FROM order_items WHERE order_id = OLD.id AND status <> 'CANCELED';
+        v_fee := CASE WHEN NEW.charge_service_fee THEN round(v_subtotal * NEW.service_fee_pct / 100, 2) ELSE 0 END;
+        v_discount := LEAST(GREATEST(NEW.discount_amount, 0), v_subtotal + v_fee);
+        SELECT COALESCE(SUM(amount), 0) INTO v_paid FROM payments WHERE order_id = OLD.id AND status = 'APPROVED';
+        v_remaining := GREATEST(v_subtotal + v_fee - v_discount - v_paid, 0);
+        IF v_remaining <> 0 AND NEW.status = 'CLOSED' THEN
+            -- GPT r10 P1-01: venda devolvida, encerrada pelo gerente (tchefood_close_refunded_order).
+            v_flag := COALESCE(current_setting('tchefood.order_write_off', true), '');
+            IF v_flag ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+               AND EXISTS (SELECT 1 FROM audit_logs a
+                            WHERE a.id = v_flag::uuid AND a.tenant_id = OLD.tenant_id AND a.order_id = OLD.id
+                              AND a.action_type = 'ORDER_REFUNDED_WRITE_OFF'
+                              AND a.metadata->>'written_off_cents' = round(v_remaining * 100)::BIGINT::text) THEN
+                RETURN NEW;
+            END IF;
+        END IF;
+        IF v_remaining <> 0 THEN
+            RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: a conta % ainda deve R$ % no servidor e não pode ser %.',
+                OLD.id, v_remaining, CASE NEW.status WHEN 'CLOSED' THEN 'fechada' ELSE 'cancelada' END;
+        END IF;
+    END IF;
+    IF OLD.status IN ('CLOSED', 'CANCELED') AND NEW.status IN ('OPEN', 'PAYING') THEN
+        -- GPT r10 P1-01: a conta fechada reaberta pelo estorno total do pagamento da Point.
+        IF OLD.status = 'CLOSED' AND NEW.status = 'PAYING' AND OLD.remaining_balance > 0 THEN
+            v_flag := COALESCE(current_setting('tchefood.point_resolution', true), '');
+            IF v_flag ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+               AND EXISTS (SELECT 1 FROM audit_logs a
+                            WHERE a.id = v_flag::uuid AND a.tenant_id = OLD.tenant_id AND a.order_id = OLD.id
+                              AND a.action_type = 'POINT_PAYMENT_REFUNDED' AND a.metadata->>'order_reopened' = 'true') THEN
+                RETURN NEW;
+            END IF;
+        END IF;
+        -- Não reabre. Em vez de recusar com erro, o UPDATE é ignorado: o reenvio de um evento antigo da
+        -- fila (o aparelho caiu antes de confirmar o lote) volta a ser inofensivo e não trava os eventos
+        -- seguintes da conta; quem tenta reabrir de propósito continua sem conseguir.
+        RAISE NOTICE 'TCHEFOOD_ANTIFRAUDE: a conta % já foi encerrada e não reabre (atualização ignorada).', OLD.id;
+        RETURN NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+-- Encerramento da venda devolvida (aparelho, loja do token), com PIN de gerente:
+-- tchefood_close_refunded_order(p_order, p_staff, p_manager_pin, p_reason, p_client_audit_id) RETURNS JSONB
+-- {audit_id, order_id, status: 'CLOSED', written_off_cents}; PIN errado ou bloqueado: NULL (MANAGER_PIN_FAILED /
+-- MANAGER_PIN_LOCKOUT, as regras de tchefood_authorize_manager: gerente ou dono ativo, 3 erros em 60 s pelo relógio de
+-- agora, trava do PIN da loja antes de qualquer linha). Ordem: motivo de 10 a 500 e p_client_audit_id (TF006);
+-- operador da equipe ativa (TF004); trava do PIN; conta desta loja (TF005); reenvio (o mesmo p_client_audit_id nesta
+-- conta já encerrou): depois do PIN conferido devolve o mesmo resultado, sem gravar nada; senão, antes do PIN (não
+-- gasta tentativa): conta OPEN/PAYING (TF007 order_not_open), saldo maior que zero (TF007 nothing_to_write_off), nada
+-- reservado (reserva aberta ou cobrança da Point em andamento: TF012 reserved), e o saldo inteiro coberto pelos
+-- pagamentos ESTORNADOS do Mercado Pago da conta (saldo <= soma deles; senão TF007 balance_not_refunded). Grava
+-- ORDER_REFUNDED_WRITE_OFF (amount_impact = valor baixado, metadata written_off_cents, refunded_cents,
+-- client_audit_id, manager_name) e encerra a conta CLOSED com o saldo (marca tchefood.order_write_off só nesta
+-- transação); a mesa da conta, se ainda for dela, fica livre, como no fechamento automático.
+CREATE OR REPLACE FUNCTION tchefood_close_refunded_order(
+    p_order UUID, p_staff UUID, p_manager_pin TEXT, p_reason TEXT, p_client_audit_id UUID)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_order orders%ROWTYPE;
+    v_manager staff_users%ROWTYPE;
+    v_failures INT;
+    v_checked_at TIMESTAMPTZ;
+    v_replay audit_logs%ROWTYPE;
+    v_remaining BIGINT;
+    v_refunded BIGINT;
+    v_audit UUID;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
+    END IF;
+    IF p_reason IS NULL OR length(trim(p_reason)) < 10 OR length(trim(p_reason)) > 500 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: motivo obrigatório (de 10 a 500 caracteres).' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_client_audit_id IS NULL OR p_order IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: falta a conta ou o id do registro do aparelho.' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_staff IS NULL OR NOT EXISTS (SELECT 1 FROM staff_users u WHERE u.id = p_staff AND u.tenant_id = v_tenant AND u.active) THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: operador não é da equipe ativa desta loja.' USING ERRCODE = 'TF004';
+    END IF;
+    -- Trava do PIN da loja antes de qualquer linha (regra da main, #50), depois a conta.
+    PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || v_tenant::text));
+    SELECT * INTO v_order FROM orders WHERE id = p_order AND tenant_id = v_tenant FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: conta não encontrada nesta loja.' USING ERRCODE = 'TF005';
+    END IF;
+    SELECT * INTO v_replay FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.order_id = p_order AND a.action_type = 'ORDER_REFUNDED_WRITE_OFF'
+       AND a.metadata->>'client_audit_id' = p_client_audit_id::text
+     ORDER BY a.server_seq LIMIT 1;
+    IF NOT FOUND THEN
+        IF v_order.status NOT IN ('OPEN', 'PAYING') THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a conta já está %.', CASE v_order.status WHEN 'CLOSED' THEN 'fechada' ELSE 'cancelada' END
+                USING ERRCODE = 'TF007', DETAIL = 'order_not_open';
+        END IF;
+        v_remaining := round(v_order.remaining_balance * 100)::BIGINT;
+        IF v_remaining <= 0 THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: a conta não tem saldo a baixar.' USING ERRCODE = 'TF007', DETAIL = 'nothing_to_write_off';
+        END IF;
+        IF tchefood_point_reserved_cents(v_tenant, p_order, NULL) > 0 THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: há pagamento em andamento nesta conta (reserva ou cobrança da Point); conclua ou libere antes.'
+                USING ERRCODE = 'TF012', DETAIL = 'reserved';
+        END IF;
+        SELECT COALESCE(SUM(round(p.amount * 100)), 0)::BIGINT INTO v_refunded FROM payments p
+         WHERE p.tenant_id = v_tenant AND p.order_id = p_order AND p.status = 'REFUNDED' AND p.acquirer::text = 'MERCADO_PAGO';
+        IF v_remaining > v_refunded THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o saldo da conta (R$ %) não é só do estorno da Point (R$ % estornado); cobre o restante.',
+                to_char(v_remaining / 100.0, 'FM999999990.00'), to_char(v_refunded / 100.0, 'FM999999990.00')
+                USING ERRCODE = 'TF007', DETAIL = 'balance_not_refunded';
+        END IF;
+    END IF;
+    v_checked_at := clock_timestamp();
+    SELECT count(*) INTO v_failures FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.action_type = 'MANAGER_PIN_FAILED'
+       AND a.created_at >= v_checked_at - INTERVAL '60 seconds' AND a.created_at <= v_checked_at;
+    IF v_failures >= 3 THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata, created_at)
+        VALUES (v_tenant, p_order, p_staff, 'MANAGER_PIN_LOCKOUT', 'PIN de gerente bloqueado por excesso de tentativas',
+                jsonb_build_object('attempted_action', 'ORDER_REFUNDED_WRITE_OFF'), v_checked_at);
+        RETURN NULL;
+    END IF;
+    SELECT * INTO v_manager FROM staff_users m
+     WHERE m.tenant_id = v_tenant AND m.pin_code = p_manager_pin AND m.active AND m.role IN ('MANAGER', 'OWNER');
+    IF NOT FOUND THEN
+        INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata, created_at)
+        VALUES (v_tenant, p_order, p_staff, 'MANAGER_PIN_FAILED', 'PIN de gerente incorreto',
+                jsonb_build_object('attempted_action', 'ORDER_REFUNDED_WRITE_OFF'), v_checked_at);
+        RETURN NULL;
+    END IF;
+    IF v_replay.id IS NOT NULL THEN
+        RETURN jsonb_build_object('audit_id', v_replay.id, 'order_id', p_order, 'status', v_order.status,
+                                  'written_off_cents', (v_replay.metadata->>'written_off_cents')::BIGINT);
+    END IF;
+    INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
+    VALUES (v_tenant, p_order, p_staff, v_manager.id, 'ORDER_REFUNDED_WRITE_OFF', v_remaining / 100.0, trim(p_reason),
+            jsonb_build_object('written_off_cents', v_remaining, 'refunded_cents', v_refunded, 'client_audit_id', p_client_audit_id,
+                               'previous_status', v_order.status, 'manager_name', v_manager.name, 'server_verified', true))
+    RETURNING id INTO v_audit;
+    PERFORM set_config('tchefood.order_write_off', v_audit::text, true);
+    UPDATE orders SET status = 'CLOSED', closed_at = NOW() WHERE id = p_order AND tenant_id = v_tenant;
+    PERFORM set_config('tchefood.order_write_off', '', true);
+    UPDATE dining_tables SET status = 'FREE', current_order_id = NULL, updated_at = NOW()
+     WHERE id = v_order.table_id AND current_order_id = p_order;
+    RETURN jsonb_build_object('audit_id', v_audit, 'order_id', p_order, 'status', 'CLOSED', 'written_off_cents', v_remaining);
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- 7f. Lista dos pagamentos da Point (GPT r10 P1-02), só leitura, loja do token
+-- -----------------------------------------------------------------------------
+-- tchefood_list_point_payments(p_from, p_to, p_search, p_cursor, p_limit) RETURNS JSONB {items, next_cursor}:
+-- só pagamentos do Mercado Pago (acquirer MERCADO_PAGO) da loja do token, de p_from (inclusive) a p_to (exclusive),
+-- qualquer um NULL = sem limite (sem prazo escondido: pagamento de meses atrás aparece). p_search (opcional) acha
+-- por parte do NSU, da chave ou do id da ordem do Mercado Pago (external_order_id da cobrança), ou pelo valor
+-- (12.50 ou 12,50). Ordem: created_at e id, do mais novo; p_cursor é o next_cursor da página anterior
+-- ("<created_at ISO>|<id>"; inválido: TF006). p_limit de 1 a 200 (padrão 50; fora disso: TF006). items: payment_id,
+-- order_id, charge_id, idempotency_key, amount, method, nsu, authorization_code, status, created_at e, para o
+-- estornado, refunded_at (hora do servidor do registro POINT_PAYMENT_REFUNDED), refund_audit_id e
+-- refunded_by_manager_id. Nada de segredo (nem token de reserva, nem dados do Mercado Pago além desses).
+CREATE OR REPLACE FUNCTION tchefood_list_point_payments(
+    p_from TIMESTAMPTZ, p_to TIMESTAMPTZ, p_search TEXT, p_cursor TEXT, p_limit INT DEFAULT 50)
+RETURNS JSONB
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_limit INT := COALESCE(p_limit, 50);
+    v_cursor_at TIMESTAMPTZ;
+    v_cursor_id UUID;
+    v_search TEXT := NULLIF(trim(COALESCE(p_search, '')), '');
+    v_like TEXT;
+    v_amount TEXT;
+    v_rows JSONB;
+    v_count INT;
+    v_last JSONB;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
+    END IF;
+    IF v_limit < 1 OR v_limit > 200 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: p_limit de 1 a 200.' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_cursor IS NOT NULL AND p_cursor <> '' THEN
+        BEGIN
+            v_cursor_at := split_part(p_cursor, '|', 1)::TIMESTAMPTZ;
+            v_cursor_id := split_part(p_cursor, '|', 2)::UUID;
+        EXCEPTION WHEN others THEN
+            v_cursor_at := NULL;
+        END;
+        IF v_cursor_at IS NULL OR v_cursor_id IS NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: cursor inválido.' USING ERRCODE = 'TF006';
+        END IF;
+    END IF;
+    IF v_search IS NOT NULL THEN
+        IF length(v_search) > 100 THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: busca de até 100 caracteres.' USING ERRCODE = 'TF006';
+        END IF;
+        v_like := '%' || replace(replace(replace(v_search, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+        v_amount := replace(v_search, ',', '.');
+    END IF;
+    WITH page AS (
+        SELECT p.id, p.order_id, p.idempotency_key, p.amount, p.method, p.nsu, p.authorization_code, p.status, p.created_at,
+               c.id AS charge_id, r.id AS refund_audit_id, r.created_at AS refunded_at, r.authorized_by_manager_id AS refunded_by_manager_id
+          FROM payments p
+          LEFT JOIN terminal_charges c ON c.tenant_id = p.tenant_id AND c.idempotency_key = p.idempotency_key
+          LEFT JOIN LATERAL (SELECT a.id, a.created_at, a.authorized_by_manager_id FROM audit_logs a
+                              WHERE a.tenant_id = p.tenant_id AND a.action_type = 'POINT_PAYMENT_REFUNDED'
+                                AND a.metadata->>'payment_id' = p.id::text
+                              ORDER BY a.server_seq LIMIT 1) r ON p.status = 'REFUNDED'
+         WHERE p.tenant_id = v_tenant AND p.acquirer::text = 'MERCADO_PAGO'
+           AND (p_from IS NULL OR p.created_at >= p_from)
+           AND (p_to IS NULL OR p.created_at < p_to)
+           AND (v_cursor_at IS NULL OR (p.created_at, p.id) < (v_cursor_at, v_cursor_id))
+           AND (v_search IS NULL
+                OR p.nsu ILIKE v_like OR p.idempotency_key ILIKE v_like OR c.external_order_id ILIKE v_like
+                OR to_char(p.amount, 'FM999999990.00') = v_amount OR p.amount::text = v_amount)
+         ORDER BY p.created_at DESC, p.id DESC
+         LIMIT v_limit + 1)
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+               'payment_id', id, 'order_id', order_id, 'charge_id', charge_id, 'idempotency_key', idempotency_key,
+               'amount', amount, 'method', method, 'nsu', nsu, 'authorization_code', authorization_code, 'status', status,
+               'created_at', created_at, 'refunded_at', refunded_at, 'refund_audit_id', refund_audit_id,
+               'refunded_by_manager_id', refunded_by_manager_id) ORDER BY created_at DESC, id DESC), '[]'::jsonb), count(*)
+      INTO v_rows, v_count
+      FROM page;
+    IF v_count > v_limit THEN
+        v_rows := v_rows - v_limit; -- tira o item a mais (só servia para saber se há próxima página)
+        v_last := v_rows->(v_limit - 1);
+        RETURN jsonb_build_object('items', v_rows,
+                                  'next_cursor', (v_last->>'created_at') || '|' || (v_last->>'payment_id'));
+    END IF;
+    RETURN jsonb_build_object('items', v_rows, 'next_cursor', NULL);
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
 -- Permissões
 -- -----------------------------------------------------------------------------
 -- Aparelho (authenticated, loja do token): ler a reserva da conta, pedir e liberar reserva de pagamento.
@@ -1782,7 +2078,9 @@ BEGIN
         'tchefood_authorize_claim_refunded(VARCHAR, UUID, VARCHAR, TEXT, JSONB)',
         'tchefood_resolve_point_charge(UUID, UUID, VARCHAR, VARCHAR, JSONB, UUID, TEXT, JSONB)',
         'tchefood_refund_point_payment(UUID, UUID, UUID, TEXT, JSONB, JSONB)',
-        'tchefood_payment_replay_ok(payments, payments, UUID)'] LOOP
+        'tchefood_payment_replay_ok(payments, payments, UUID)',
+        'tchefood_close_refunded_order(UUID, UUID, TEXT, TEXT, UUID)',
+        'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
             EXECUTE format('REVOKE ALL ON FUNCTION %s FROM anon', v_fn);
@@ -1798,7 +2096,9 @@ BEGIN
         'tchefood_release_payment_claim_manager(VARCHAR, UUID, VARCHAR, TEXT)',
         'tchefood_touch_payment_claim(VARCHAR, UUID, TEXT)',
         'tchefood_reclaim_payment(VARCHAR, TEXT, VARCHAR, TEXT, VARCHAR, VARCHAR, BIGINT, UUID)',
-        'tchefood_authorize_claim_refunded(VARCHAR, UUID, VARCHAR, TEXT, JSONB)'] LOOP
+        'tchefood_authorize_claim_refunded(VARCHAR, UUID, VARCHAR, TEXT, JSONB)',
+        'tchefood_close_refunded_order(UUID, UUID, TEXT, TEXT, UUID)',
+        'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)'] LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
             EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO authenticated', v_fn);
         END IF;

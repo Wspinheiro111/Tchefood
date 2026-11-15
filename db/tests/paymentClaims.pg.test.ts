@@ -2567,14 +2567,14 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(orderState(order)).toBe('0|10000|OPEN');
     });
 
-    it('conta já fechada pelo pagamento: continua fechada, com o saldo devolvido e o registro do estorno (no servidor a conta encerrada não reabre)', () => {
+    it('conta já fechada pelo pagamento: reabre (PAYING) com o saldo devolvido e o registro do estorno (GPT r10 P1-01)', () => {
       const order = withItems(60);
       const ch = paidCharge(order, 6000);
       expect(orderState(order)).toBe('6000|0|CLOSED');
       const r = refundPoint(ch.id);
       expect(r.ok, r.message ?? '').toBe(true);
       expect(state(ch)).toBe('refunded|REFUNDED');
-      expect(orderState(order)).toBe('0|6000|CLOSED');
+      expect(orderState(order)).toBe('0|6000|PAYING');
       expect(refunds(ch)).toBe(1);
     });
 
@@ -2946,6 +2946,310 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(cancel).toMatchObject({ ok: false, sqlstate: 'TF006' });
       expect(cancel.message).toContain('500');
       expect(audits('POINT_CHARGE_CANCELED', 'idempotency_key', ch.key)).toBe(0);
+    });
+  });
+
+  describe('GPT r10: conta estornada reabre, venda devolvida, lista dos pagamentos da Point e reenvio do pagamento', () => {
+    const orderState = (order: string) => sql(`SELECT round(paid_amount * 100)::bigint || '|' || round(remaining_balance * 100)::bigint || '|' || status FROM orders WHERE id = '${order}'`);
+    const paidCharge = (order: string, cents: number) => {
+      const ch = charge(order, 'approved', cents);
+      const r = mpPayment(ch.id);
+      expect(r.ok, r.message ?? '').toBe(true);
+      return ch;
+    };
+    /** Conta de R$ 100 paga inteira na Point, fechada, e estornada (reaberta). */
+    const refundedOrder = () => {
+      const order = withItems(100);
+      const ch = paidCharge(order, 10000);
+      expect(orderState(order)).toBe('10000|0|CLOSED');
+      const r = refundPoint(ch.id);
+      expect(r.ok, r.message ?? '').toBe(true);
+      return { order, ch };
+    };
+    const closeQ = (order: string, client: string, pin = MANAGER_PIN, reason = 'venda devolvida ao cliente', staff = STAFF) =>
+      `SELECT COALESCE(tchefood_close_refunded_order('${order}', '${staff}', '${pin}', '${reason}', '${client}')::text, 'null')`;
+    const writeOffs = (order: string) => Number(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'ORDER_REFUNDED_WRITE_OFF' AND order_id = '${order}'`));
+    /** Como o aparelho, numa transação desfeita no fim (as falhas de PIN não bloqueiam os outros testes). */
+    const inRollback = (q: string, post = 'SELECT 1') =>
+      sql(`BEGIN; SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true);
+           ${q}; RESET ROLE; ${post}; ROLLBACK;`).split('\n').filter((l) => l !== '' && l !== 'SET' && !l.startsWith('{"tenant_id"')).slice(-2);
+
+    it('P1-01 aceite: pagamento total → fecha → estorno total → PAYING com saldo 100 → reserva + dinheiro → CLOSED 0; a mesa não muda', () => {
+      const order = withItems(100);
+      const ch = paidCharge(order, 10000);
+      expect(orderState(order)).toBe('10000|0|CLOSED');
+      const closedAt = sql(`SELECT closed_at FROM orders WHERE id = '${order}'`);
+      expect(closedAt).not.toBe('');
+      const table = sql(`SELECT status || '|' || COALESCE(current_order_id::text, '-') FROM dining_tables WHERE id = '${TABLE}'`);
+      const r = refundPoint(ch.id);
+      expect(r.ok, r.message ?? '').toBe(true);
+      expect(orderState(order)).toBe('0|10000|PAYING');
+      expect(sql(`SELECT closed_at IS NULL FROM orders WHERE id = '${order}'`)).toBe('t');
+      const meta = JSON.parse(sql(`SELECT metadata::text FROM audit_logs WHERE action_type = 'POINT_PAYMENT_REFUNDED' AND metadata->>'charge_id' = '${ch.id}'`)) as Record<string, unknown>;
+      expect(meta.order_reopened).toBe(true);
+      expect(new Date(String(meta.previous_closed_at)).getTime()).toBe(new Date(sql(`SELECT to_jsonb('${closedAt}'::timestamptz) #>> '{}'`)).getTime());
+      expect(sql(`SELECT status || '|' || COALESCE(current_order_id::text, '-') FROM dining_tables WHERE id = '${TABLE}'`)).toBe(table);
+      // O caixa cobra de novo: reserva + dinheiro, e a conta fecha no zero.
+      const paid = pay(payment(order, 100, { idempotency_key: key('r10a') }));
+      expect(paid.ok, paid.message ?? '').toBe(true);
+      expect(orderState(order)).toBe('10000|0|CLOSED');
+      expect(sql(`SELECT closed_at IS NOT NULL FROM orders WHERE id = '${order}'`)).toBe('t');
+    });
+
+    it('P1-01: a conta encerrada continua sem reabrir por UPDATE direto ou com a marca de outro registro; conta aberta estornada segue aberta', () => {
+      const order = withItems(50);
+      paidCharge(order, 5000);
+      expect(orderState(order)).toBe('5000|0|CLOSED');
+      sql(`UPDATE orders SET status = 'PAYING' WHERE id = '${order}'`);
+      expect(orderState(order)).toBe('5000|0|CLOSED');
+      // Marca apontando para um estorno de outra conta (order_reopened = true): ignorado.
+      const other = refundedOrder();
+      const foreign = sql(`SELECT id FROM audit_logs WHERE action_type = 'POINT_PAYMENT_REFUNDED' AND order_id = '${other.order}'`);
+      sql(`BEGIN; SELECT set_config('tchefood.point_resolution', '${foreign}', true); UPDATE orders SET status = 'PAYING' WHERE id = '${order}'; COMMIT;`);
+      expect(orderState(order)).toBe('5000|0|CLOSED');
+      const open = withItems(100);
+      const ch = paidCharge(open, 4000);
+      expect(refundPoint(ch.id).ok).toBe(true);
+      expect(orderState(open)).toBe('0|10000|OPEN');
+      expect(sql(`SELECT metadata->>'order_reopened' FROM audit_logs WHERE action_type = 'POINT_PAYMENT_REFUNDED' AND metadata->>'charge_id' = '${ch.id}'`)).toBe('false');
+    });
+
+    it('P1-02 (venda devolvida): o gerente encerra a conta estornada com saldo; registro ORDER_REFUNDED_WRITE_OFF; reenvio devolve o mesmo', () => {
+      const { order } = refundedOrder();
+      const client = crypto.randomUUID();
+      const out = JSON.parse(last(asDevice(closeQ(order, client)))) as Record<string, unknown>;
+      expect(out).toMatchObject({ order_id: order, status: 'CLOSED', written_off_cents: 10000 });
+      expect(orderState(order)).toBe('0|10000|CLOSED');
+      expect(sql(`SELECT closed_at IS NOT NULL FROM orders WHERE id = '${order}'`)).toBe('t');
+      expect(sql(`SELECT performed_by_user_id || '|' || authorized_by_manager_id || '|' || amount_impact || '|' || reason || '|' || (metadata->>'written_off_cents') || '|' || (metadata->>'client_audit_id')
+                  FROM audit_logs WHERE id = '${String(out.audit_id)}'`)).toBe(`${STAFF}|${MANAGER}|100.00|venda devolvida ao cliente|10000|${client}`);
+      // Reenvio (a resposta se perdeu): o mesmo resultado, sem outro registro.
+      expect(JSON.parse(last(asDevice(closeQ(order, client))))).toEqual(out);
+      expect(writeOffs(order)).toBe(1);
+      // Outro id do aparelho na conta já encerrada: TF007.
+      expect(asDevice(closeQ(order, crypto.randomUUID()))).toMatchObject({ ok: false, sqlstate: 'TF007' });
+      // O aparelho não grava esse registro direto, nem fecha outra conta com saldo apontando para ele.
+      expect(asDevice(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata) VALUES ('${TENANT}', '${order}', '${STAFF}', 'ORDER_REFUNDED_WRITE_OFF', 'forjado', '{"written_off_cents":10000}')`).ok).toBe(false);
+      const second = refundedOrder();
+      sql(`BEGIN; SELECT set_config('tchefood.order_write_off', '${String(out.audit_id)}', true); COMMIT;`);
+      const forged = psql(target!, `BEGIN; SELECT set_config('tchefood.order_write_off', '${String(out.audit_id)}', true); UPDATE orders SET status = 'CLOSED' WHERE id = '${second.order}'; COMMIT;`, DB);
+      expect(forged).toMatchObject({ ok: false });
+      expect(forged.message).toContain('ainda deve');
+      expect(orderState(second.order)).toBe('0|10000|PAYING');
+    });
+
+    it('P1-02: PIN errado (NULL, nada muda, falha registrada), bloqueio depois de 3 erros, outra loja, operador inativo e motivo', () => {
+      const { order } = refundedOrder();
+      const wrong = inRollback(closeQ(order, crypto.randomUUID(), '0000'),
+        `SELECT status || '|' || (SELECT count(*) FROM audit_logs WHERE action_type = 'MANAGER_PIN_FAILED' AND order_id = '${order}') FROM orders WHERE id = '${order}'`);
+      expect(wrong).toEqual(['null', 'PAYING|1']);
+      const locked = inRollback(`${closeQ(order, crypto.randomUUID(), '0000')}; ${closeQ(order, crypto.randomUUID(), '0001')}; ${closeQ(order, crypto.randomUUID(), '0002')}; ${closeQ(order, crypto.randomUUID())}`,
+        `SELECT status || '|' || (SELECT count(*) FROM audit_logs WHERE action_type = 'MANAGER_PIN_LOCKOUT' AND order_id = '${order}') || '|' || (SELECT count(*) FROM audit_logs WHERE action_type = 'ORDER_REFUNDED_WRITE_OFF' AND order_id = '${order}') FROM orders WHERE id = '${order}'`);
+      expect(locked).toEqual(['null', 'PAYING|1|0']);
+      expect(asDevice(closeQ(order, crypto.randomUUID(), MANAGER_PIN, 'venda devolvida ao cliente', OTHER_STAFF), OTHER)).toMatchObject({ ok: false, sqlstate: 'TF005' });
+      expect(asDevice(closeQ(order, crypto.randomUUID(), MANAGER_PIN, 'venda devolvida ao cliente', INACTIVE))).toMatchObject({ ok: false, sqlstate: 'TF004' });
+      expect(asDevice(closeQ(order, crypto.randomUUID(), MANAGER_PIN, 'curto'))).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(asDevice(closeQ(order, crypto.randomUUID(), MANAGER_PIN, 'x'.repeat(501)))).toMatchObject({ ok: false, sqlstate: 'TF006' });
+      expect(orderState(order)).toBe('0|10000|PAYING');
+      expect(writeOffs(order)).toBe(0);
+      // Só o aparelho (authenticated) e a service role chamam; anon não.
+      expect(asRole('anon', closeQ(order, crypto.randomUUID()))).toMatchObject({ ok: false, sqlstate: '42501' });
+    });
+
+    it('P1-02: saldo que não é só do estorno da Point, conta sem saldo e conta com reserva aberta: recusado antes do PIN', () => {
+      // Pagou 60 de 100 na Point e estornou: o saldo de 100 tem 40 que nunca foram pagos.
+      const partial = withItems(100);
+      const ch = paidCharge(partial, 6000);
+      expect(refundPoint(ch.id).ok).toBe(true);
+      expect(detailOf(closeQ(partial, crypto.randomUUID()))).toBe('TF007|balance_not_refunded');
+      // Conta sem estorno nenhum.
+      expect(detailOf(closeQ(withItems(100), crypto.randomUUID()))).toBe('TF007|balance_not_refunded');
+      // Conta estornada com reserva aberta.
+      const { order } = refundedOrder();
+      expect(cash(key('r10r'), order, 1000).ok).toBe(true);
+      expect(detailOf(closeQ(order, crypto.randomUUID()))).toBe('TF012|reserved');
+      expect(sql(`SELECT count(*) FROM audit_logs WHERE action_type = 'MANAGER_PIN_FAILED' AND order_id IN ('${partial}', '${order}')`)).toBe('0');
+      expect(orderState(order)).toBe('0|10000|PAYING');
+    });
+
+    const lockOrder = (order: string) => `SELECT 1 FROM orders WHERE id = '${order}' FOR UPDATE`;
+    for (const closeFirst of [true, false]) {
+      it(`P1-02 concorrência: venda devolvida e reserva na mesma conta (${closeFirst ? 'encerramento' : 'reserva'} primeiro): só um entra`, async () => {
+        const { order } = refundedOrder();
+        const k = key('r10c');
+        const close = deviceQ(closeQ(order, crypto.randomUUID()));
+        const claimIt = deviceQ(claimQ(k, order, 'CASH', 'CASH_DESK', 1000, 10000));
+        const [first, second] = await contend(lockOrder(order), closeFirst ? [close, claimIt] : [claimIt, close]);
+        expect(lastOverlap).toBe(2);
+        const [closed, claimed] = closeFirst ? [first, second] : [second, first];
+        if (closeFirst) {
+          expect(closed).toBe('ok');
+          expect(claimed).toMatch(/^recusado TF002: /);
+          expect(orderState(order)).toBe('0|10000|CLOSED');
+          expect(sql(`SELECT count(*) FROM payment_claims WHERE idempotency_key = '${k}'`)).toBe('0');
+        } else {
+          expect(claimed).toBe('ok');
+          expect(closed).toMatch(/^recusado TF012: /);
+          expect(orderState(order)).toBe('0|10000|PAYING');
+          expect(writeOffs(order)).toBe(0);
+        }
+      }, 60_000);
+    }
+
+    it('P1-01: nenhum caminho de estorno deixa conta fechada com saldo sem o registro da venda devolvida', () => {
+      // Também os caminhos que não mexem no pago: fim verificado aprovada → estornada sem pagamento e o espelho REFUNDED.
+      const order = withItems(30);
+      const ch = paidCharge(order, 3000);
+      expect(orderState(order)).toBe('3000|0|CLOSED');
+      const bare = charge(withItems(10), 'approved', 1000);
+      expect(resolve(bare.id, 'approved', 'refunded', '{"raw_status":"refunded"}').ok).toBe(true);
+      expect(mpPayment(bare.id, 'REFUNDED').ok).toBe(true);
+      expect(refundPoint(ch.id).ok).toBe(true);
+      expect(sql(`SELECT count(*) FROM orders o
+                   WHERE o.status = 'CLOSED' AND o.remaining_balance > 0
+                     AND (EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.id AND p.status = 'REFUNDED')
+                          OR EXISTS (SELECT 1 FROM audit_logs a WHERE a.order_id = o.id AND a.action_type = 'POINT_PAYMENT_REFUNDED'))
+                     AND NOT EXISTS (SELECT 1 FROM audit_logs a WHERE a.order_id = o.id AND a.action_type = 'ORDER_REFUNDED_WRITE_OFF'
+                                       AND (a.metadata->>'written_off_cents')::bigint = round(o.remaining_balance * 100))`)).toBe('0');
+    });
+
+    describe('P1-02: tchefood_list_point_payments', () => {
+      const LIST_TERMINAL = '68686868-6868-4868-8868-686868686868';
+      type Item = { payment_id: string; order_id: string; charge_id: string | null; idempotency_key: string; amount: number; method: string; nsu: string | null;
+        authorization_code: string | null; status: string; created_at: string; refunded_at: string | null; refund_audit_id: string | null; refunded_by_manager_id: string | null };
+      type Page = { items: Item[]; next_cursor: string | null };
+      const listQ = (args: { from?: string; to?: string; search?: string; cursor?: string | null; limit?: number }) =>
+        `SELECT tchefood_list_point_payments(${args.from ? `'${args.from}'` : 'NULL'}, ${args.to ? `'${args.to}'` : 'NULL'}, ${args.search ? `'${args.search}'` : 'NULL'}, ${args.cursor ? `'${args.cursor}'` : 'NULL'}${args.limit !== undefined ? `, ${args.limit}` : ''})`;
+      const list = (args: Parameters<typeof listQ>[0], tenant = LATE_TENANT) => json<Page>(asDevice(listQ(args), tenant));
+      /** Pagamento do Mercado Pago gravado direto (o leitor não confere a origem), com a hora pedida. */
+      const seed = (order: string, ago: string, amount: number, status = 'APPROVED', k = key('lp'), nsu = `N${crypto.randomUUID().slice(0, 6)}`) => {
+        const id = crypto.randomUUID();
+        sql(`BEGIN; SET LOCAL session_replication_role = replica;
+             INSERT INTO payments (id, order_id, tenant_id, waiter_id, terminal_id, amount, method, status, acquirer, nsu, authorization_code, idempotency_key, created_at)
+             VALUES ('${id}', '${order}', '${LATE_TENANT}', '${LATE_STAFF}', '${LIST_TERMINAL}', ${amount}, 'CREDIT', '${status}', 'MERCADO_PAGO', '${nsu}', 'AUTL', '${k}', clock_timestamp() - INTERVAL '${ago}');
+             COMMIT;`);
+        return { id, key: k, nsu };
+      };
+      let order = '';
+      let rows: { id: string; key: string; nsu: string }[] = [];
+      let refunded: { id: string; key: string; nsu: string };
+      let refundAudit = '';
+      let chargeId = '';
+
+      beforeAll(() => {
+        sql(`INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${LIST_TERMINAL}', '${LATE_TENANT}', 'Point da lista', 'LIST-POINT', 'MERCADO_PAGO') ON CONFLICT (id) DO NOTHING;`);
+        order = withItems(1000, LATE_TENANT, LATE_TABLE, LATE_STAFF);
+        rows = [seed(order, '1 hour', 10), seed(order, '2 hours', 12.5), seed(order, '3 hours', 13), seed(order, '45 days', 14), seed(order, '90 days', 15)];
+        refunded = seed(order, '30 minutes', 16, 'REFUNDED', 'lp-estornado-xyz', 'NSU-ESTORNO-1');
+        chargeId = sql(`BEGIN; SET LOCAL session_replication_role = replica;
+          INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status, external_order_id, external_payment_id)
+          VALUES ('${LATE_TENANT}', '${refunded.key}', '${order}', '${LIST_TERMINAL}', 'mercado_pago_point', 'LIST-POINT', 'CREDIT', 1600, 'refunded', 'ORD-LISTA-777', 'NSU-ESTORNO-1') RETURNING id; COMMIT;`).split('\n').filter((l) => /^[0-9a-f-]{36}$/.test(l))[0]!;
+        refundAudit = sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, reason, metadata)
+          VALUES ('${LATE_TENANT}', '${order}', '${LATE_STAFF}', '${LATE_STAFF}', 'POINT_PAYMENT_REFUNDED', 'estorno conferido', '{"payment_id":"${refunded.id}"}') RETURNING id;`);
+        // Pagamento fora do Mercado Pago (não aparece) e pagamento do Mercado Pago de outra loja (não aparece).
+        sql(`BEGIN; SET LOCAL session_replication_role = replica;
+             INSERT INTO payments (order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key) VALUES ('${order}', '${LATE_TENANT}', '${LATE_STAFF}', 5, 'CASH', 'APPROVED', 'CASH_DESK', '${key('lpc')}');
+             COMMIT;`);
+      });
+
+      it('só os pagamentos do Mercado Pago da loja do token, do mais novo ao mais antigo, inclusive de meses atrás; o estornado traz quando e quem', () => {
+        const page = list({ limit: 200 });
+        expect(page.next_cursor).toBeNull();
+        expect(page.items.map((i) => i.payment_id)).toEqual([refunded.id, ...rows.map((r) => r.id)]);
+        const r = page.items[0]!;
+        expect(r).toMatchObject({ order_id: order, charge_id: chargeId, idempotency_key: refunded.key, amount: 16, method: 'CREDIT', nsu: 'NSU-ESTORNO-1',
+          authorization_code: 'AUTL', status: 'REFUNDED', refund_audit_id: refundAudit, refunded_by_manager_id: LATE_STAFF });
+        expect(r.refunded_at).toBe(sql(`SELECT to_jsonb(created_at) #>> '{}' FROM audit_logs WHERE id = '${refundAudit}'`));
+        expect(page.items[1]).toMatchObject({ refunded_at: null, refund_audit_id: null, refunded_by_manager_id: null, charge_id: null });
+        expect(Object.keys(r).sort()).toEqual(['amount', 'authorization_code', 'charge_id', 'created_at', 'idempotency_key', 'method', 'nsu', 'order_id',
+          'payment_id', 'refund_audit_id', 'refunded_at', 'refunded_by_manager_id', 'status']);
+        // Outra loja não vê nenhum deles.
+        const theirs = list({ limit: 200 }, OTHER).items.map((i) => i.payment_id);
+        for (const id of [refunded.id, ...rows.map((x) => x.id)]) expect(theirs).not.toContain(id);
+        // Período: de 50 dias atrás até 2 dias atrás, só o de 45 dias.
+        const day = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString();
+        expect(list({ from: day(50), to: day(2) }).items.map((i) => i.payment_id)).toEqual([rows[3]!.id]);
+        expect(asRole('anon', listQ({}))).toMatchObject({ ok: false, sqlstate: '42501' });
+      });
+
+      it('páginas por (created_at, id), sem repetir nem pular; cursor inválido e limite fora de 1..200: TF006', () => {
+        const all = list({ limit: 200 }).items.map((i) => i.payment_id);
+        const seen: string[] = [];
+        let cursor: string | null = null;
+        for (let i = 0; i < 10; i += 1) {
+          const page: Page = list({ limit: 2, cursor });
+          seen.push(...page.items.map((x) => x.payment_id));
+          expect(page.items.length).toBeLessThanOrEqual(2);
+          cursor = page.next_cursor;
+          if (!cursor) break;
+        }
+        expect(seen).toEqual(all);
+        expect(list({}).items.length).toBe(all.length); // padrão 50
+        for (const bad of [listQ({ cursor: 'lixo' }), listQ({ limit: 0 }), listQ({ limit: 201 })]) {
+          expect(asDevice(bad, LATE_TENANT)).toMatchObject({ ok: false, sqlstate: 'TF006' });
+        }
+      });
+
+      it('busca por NSU, chave, ordem do Mercado Pago e valor (com ponto ou vírgula); curingas são texto', () => {
+        const ids = (search: string) => list({ search, limit: 200 }).items.map((i) => i.payment_id);
+        expect(ids('ESTORNO-1')).toEqual([refunded.id]);
+        expect(ids('estornado-xy')).toEqual([refunded.id]);
+        expect(ids('LISTA-777')).toEqual([refunded.id]);
+        expect(ids('12,50')).toEqual([rows[1]!.id]);
+        expect(ids('12.50')).toEqual([rows[1]!.id]);
+        expect(ids(rows[2]!.nsu)).toEqual([rows[2]!.id]);
+        expect(ids('%')).toEqual([]);
+        expect(ids('_')).toEqual([]);
+      });
+    });
+
+    describe('a verificar 5: reenvio do pagamento com o mesmo id (tchefood_payment_replay_ok)', () => {
+      const row = (id: string) => JSON.parse(sql(`SELECT row_to_json(p)::text FROM payments p WHERE id = '${id}'`)) as Record<string, unknown>;
+      const replay = (base: Record<string, unknown>, over: Record<string, unknown>) => register(JSON.stringify({ ...base, ...over }));
+      const variants: [string, Record<string, unknown>][] = [
+        ['chave', { idempotency_key: 'outra-chave' }], ['forma', { method: 'DEBIT' }], ['credenciadora', { acquirer: 'STONE' }],
+        ['NSU', { nsu: 'OUTRO-NSU' }], ['maquininha', { terminal_id: STONE_TERMINAL }], ['série da maquininha', { terminal_serial: 'OUTRA' }],
+      ];
+
+      it('mesmo status: só o mesmo pagamento devolve o gravado; chave, forma, credenciadora, NSU, autorização ou maquininha diferentes: TF006 replay_mismatch', () => {
+        const order = withItems(100);
+        const ch = paidCharge(order, 3000);
+        const id = sql(`SELECT id FROM payments WHERE idempotency_key = '${ch.key}'`);
+        const base = row(id);
+        const before = sql(`SELECT row_to_json(p)::text FROM payments p WHERE id = '${id}'`);
+        expect(last(replay(base, {}))).toBe(id);
+        // Campos que não identificam o pagamento (hora, gorjeta, campos só do aparelho) não contam.
+        expect(last(replay(base, { created_at: new Date().toISOString(), paid_item_ids: [], withdrawn_reason: null }))).toBe(id);
+        const regQ = (over: Record<string, unknown>) => `SELECT tchefood_register_payment('${JSON.stringify({ ...base, ...over })}'::jsonb)`;
+        for (const [label, over] of [...variants, ['autorização', { authorization_code: 'OUTRA' }], ['sem NSU', { nsu: null }]] as [string, Record<string, unknown>][]) {
+          expect(detailOf(regQ(over)), label).toBe('TF006|replay_mismatch');
+        }
+        expect(sql(`SELECT row_to_json(p)::text FROM payments p WHERE id = '${id}'`)).toBe(before);
+        for (const [label, over] of [['conta', { order_id: withItems(10) }], ['valor', { amount: 29.99 }], ['status', { status: 'DECLINED' }]] as const) {
+          expect(replay(base, over), label).toMatchObject({ ok: false });
+        }
+        // Vazio e NULL são o mesmo (o aparelho manda null; texto vazio ou só espaço vale igual).
+        const cashOrder = withItems(100);
+        const cashJ = payment(cashOrder, 10, { idempotency_key: key('rpl') });
+        expect(pay(cashJ).ok).toBe(true);
+        const cashId = (JSON.parse(cashJ) as { id: string }).id;
+        expect(last(register(JSON.stringify({ ...JSON.parse(cashJ), nsu: '', authorization_code: '  ', terminal_serial: '' })))).toBe(cashId);
+        expect(last(register(cashJ))).toBe(cashId);
+      });
+
+      it('estornado reenviado como aprovado: só o mesmo pagamento (conta, valor, forma, credenciadora, NSU, chave e maquininha)', () => {
+        const order = withItems(100);
+        const ch = paidCharge(order, 3000);
+        const id = sql(`SELECT id FROM payments WHERE idempotency_key = '${ch.key}'`);
+        const base = row(id);
+        expect(refundPoint(ch.id).ok).toBe(true);
+        const approved = { ...base, status: 'APPROVED' };
+        expect(last(replay(approved, {}))).toBe(id);
+        for (const [label, over] of [...variants, ['conta', { order_id: withItems(10) }], ['valor', { amount: 29.99 }]] as [string, Record<string, unknown>][]) {
+          expect(replay(approved, over), label).toMatchObject({ ok: false });
+        }
+        expect(sql(`SELECT status FROM payments WHERE id = '${id}'`)).toBe('REFUNDED');
+      });
     });
   });
 });

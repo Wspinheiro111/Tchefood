@@ -153,7 +153,7 @@ export default function App() {
         {view.name === 'chopp' && <KegMonitorScreen />}
         {view.name === 'delivery' && <DeliveryScreen />}
         {view.name === 'board' && <OrderBoardScreen />}
-        {view.name === 'backoffice' && <BackOffice onExit={(name) => setView({ name } as View)} />}
+        {view.name === 'backoffice' && <BackOffice onExit={(name) => setView({ name } as View)} onOpenCheckout={(orderId) => setView({ name: 'checkout', orderId })} />}
       </main>
 
       {nav.length > 1 && (

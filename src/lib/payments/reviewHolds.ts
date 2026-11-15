@@ -46,8 +46,14 @@ export function holdAcquirer(acquirer: string): 'STONE' | 'PAGBANK' | 'MERCADO_P
   return acquirer === 'PAGBANK' || acquirer === 'MERCADO_PAGO' ? acquirer : 'STONE';
 }
 
-const STORAGE_KEY = 'tchefood.paymentReviewHolds.v2';
-/** Formato antigo: uma trava por comanda (migrado na primeira leitura). */
+/**
+ * Uma chave do localStorage por trava (auditoria GPT r10, "a verificar 1"): ler a lista inteira, mudar e regravar
+ * numa chave só não é atômico entre abas (duas abas gravando juntas, a última apagava a trava da outra). Com uma
+ * chave por trava, cada gravação só troca a própria trava.
+ */
+const PREFIX = 'tchefood.paymentReviewHolds.v3:';
+/** Formatos anteriores: a lista inteira numa chave (v2) e uma trava por comanda (v1). Migrados na leitura. */
+const LEGACY_LIST_KEY = 'tchefood.paymentReviewHolds.v2';
 const LEGACY_KEY = 'tchefood.paymentReviewHolds.v1';
 const memory = new Map<string, ReviewHold>();
 /**
@@ -84,48 +90,105 @@ function storage(): Storage | null {
   }
 }
 
-function read(key: string): ReviewHold[] | null {
+const isHold = (h: unknown): h is ReviewHold => typeof h === 'object' && h !== null && typeof (h as ReviewHold).order_id === 'string';
+
+/** Lista no formato antigo (v1/v2). null = leitura bloqueada ou conteúdo corrompido. */
+function readList(key: string): ReviewHold[] | null {
   try {
     const st = storage();
     if (!st) return null;
     const raw = st.getItem(key);
     const list = raw ? (JSON.parse(raw) as unknown) : [];
-    return Array.isArray(list) ? (list as ReviewHold[]).filter((h) => h && typeof h.order_id === 'string') : [];
+    return Array.isArray(list) ? list.filter(isHold) : [];
   } catch {
-    // Conteúdo corrompido ou leitura bloqueada: fica com a cópia em memória.
+    return null;
+  }
+}
+
+/** As travas gravadas (uma chave cada). null = leitura bloqueada: fica com a cópia em memória. */
+function readStored(): Map<string, ReviewHold> | null {
+  const st = storage();
+  if (!st) return null;
+  try {
+    const out = new Map<string, ReviewHold>();
+    const keys: string[] = [];
+    for (let i = 0; i < st.length; i++) {
+      const k = st.key(i);
+      if (k && k.startsWith(PREFIX)) keys.push(k);
+    }
+    for (const k of keys) {
+      const key = k.slice(PREFIX.length);
+      const raw = st.getItem(k);
+      if (raw === null) continue; // outra aba tirou entre a lista e a leitura
+      let h: unknown = null;
+      try {
+        h = JSON.parse(raw);
+      } catch {
+        h = null;
+      }
+      // Corrompida: a cópia da última leitura (se houver).
+      const v = isHold(h) && reviewHoldKey(h) === key ? h : memory.get(key);
+      if (v) out.set(key, v);
+    }
+    return out;
+  } catch {
     return null;
   }
 }
 
 /**
- * Atualiza a cópia em memória com o que está guardado agora (outra aba pode ter gravado uma trava). Toda
- * mudança chama isto e grava no mesmo passo síncrono: nunca regrava a lista inteira a partir de uma cópia
- * antiga desta aba.
+ * Atualiza a cópia em memória com o que está guardado agora (outra aba pode ter gravado uma trava). Lido a cada
+ * uso; cada mudança grava só a trava que mudou, na própria chave.
  */
 function load() {
-  const stored = read(STORAGE_KEY);
+  const stored = readStored();
   if (stored) {
     memory.clear();
-    for (const h of stored) memory.set(reviewHoldKey(h), h);
+    for (const [k, h] of stored) memory.set(k, h);
     for (const [k, h] of unsaved) {
       if (h) memory.set(k, h);
       else memory.delete(k);
     }
+    migrateLegacy(LEGACY_LIST_KEY);
   }
   if (loaded) return;
   loaded = true;
   listenOtherTabs();
-  const legacy = read(LEGACY_KEY) ?? [];
+  migrateLegacy(LEGACY_KEY);
+}
+
+/**
+ * Travas no formato antigo (também as de uma aba que ainda roda a versão anterior): cada uma que não existe no
+ * formato novo é gravada nele; a chave antiga só sai depois que todas foram gravadas (sem isso a trava se perderia
+ * ao reabrir o app).
+ */
+function migrateLegacy(legacyKey: string) {
+  try {
+    if (storage()?.getItem(legacyKey) == null) return;
+  } catch {
+    return;
+  }
+  const legacy = readList(legacyKey);
+  if (!legacy || legacy.length === 0) {
+    if (legacy) {
+      try {
+        storage()?.removeItem(legacyKey);
+      } catch {
+        // Sem armazenamento.
+      }
+    }
+    return;
+  }
   const migrated: Array<[string, ReviewHold]> = [];
   for (const h of legacy) {
-    if (memory.has(reviewHoldKey(h))) continue;
-    memory.set(reviewHoldKey(h), h);
-    migrated.push([reviewHoldKey(h), h]);
+    const k = reviewHoldKey(h);
+    if (memory.has(k) || unsaved.has(k)) continue;
+    memory.set(k, h);
+    migrated.push([k, h]);
   }
-  // A versão antiga só sai depois que a nova foi gravada (sem isso a trava se perderia ao reabrir o app).
-  if (legacy.length > 0 && !persist(migrated)) return;
+  if (!persist(migrated)) return;
   try {
-    storage()?.removeItem(LEGACY_KEY);
+    storage()?.removeItem(legacyKey);
   } catch {
     // Sem armazenamento.
   }
@@ -135,7 +198,7 @@ function load() {
 function listenOtherTabs() {
   if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
   window.addEventListener('storage', (e) => {
-    if (e.key !== STORAGE_KEY && e.key !== null) return;
+    if (e.key !== null && !e.key.startsWith(PREFIX) && e.key !== LEGACY_LIST_KEY) return;
     const before = new Set([...memory.values()].map((h) => h.order_id));
     load();
     for (const h of memory.values()) before.add(h.order_id);
@@ -143,19 +206,24 @@ function listenOtherTabs() {
   });
 }
 
-/** true = gravado. `changed`: as travas mudadas agora (ficam por cima, em memória, se a gravação falhar). */
+/**
+ * Grava as travas mudadas agora (`changed`) e as que ficaram sem gravar antes, cada uma na própria chave.
+ * true = as mudadas agora ficaram gravadas (as que falham ficam por cima, em memória, e a próxima mudança tenta).
+ */
 function persist(changed: Array<[string, ReviewHold | null]> = []): boolean {
   for (const [k, h] of changed) unsaved.set(k, h);
-  try {
-    const st = storage();
-    if (!st) return false;
-    st.setItem(STORAGE_KEY, JSON.stringify([...memory.values()]));
-    unsaved.clear();
-    return true;
-  } catch {
-    // Cheio ou bloqueado: a trava continua em memória (por cima do que for lido) e a próxima mudança tenta de novo.
-    return false;
+  const st = storage();
+  if (!st) return false;
+  for (const [k, h] of [...unsaved]) {
+    try {
+      if (h) st.setItem(PREFIX + k, JSON.stringify(h));
+      else st.removeItem(PREFIX + k);
+      unsaved.delete(k);
+    } catch {
+      // Cheio ou bloqueado: a trava continua em memória (por cima do que for lido) e a próxima mudança tenta de novo.
+    }
   }
+  return changed.every(([k]) => !unsaved.has(k));
 }
 
 /** Contas com trava não gravada neste aparelho (para o aviso dizer quais). */
