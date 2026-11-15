@@ -451,6 +451,12 @@ interface DeviceSlice {
    */
   cloudSkippedOrderIds?: UUID[];
   /**
+   * Vendas de balcão (Ficha Rápida) que chegaram pagas pela leitura da nuvem: foram recebidas em
+   * outro aparelho, que imprime as fichas delas. Este aparelho não as imprime, porque não tem as
+   * fichas já entregues ao cliente e imprimiria outro jogo de códigos (Codex, PR #54). Ausente = [].
+   */
+  cloudClosedCounterOrderIds?: UUID[];
+  /**
    * Acertos mandados à nuvem sem resposta (podem ter sido gravados): o quadro da entrega oferece
    * "tentar de novo" com o mesmo id e os mesmos termos. Da loja: sai na troca de loja. Ausente
    * nas versões antigas (= []) (auditoria interna, rodada 8 do PR #54).
@@ -760,6 +766,7 @@ function initialDevice(): DeviceSlice {
     // Os caixas da nuvem são da loja: resetDemo não leva os da loja anterior (auditoria interna, rodada 8 do PR #54).
     cloudCashRanges: [],
     cloudSkippedOrderIds: [],
+    cloudClosedCounterOrderIds: [],
     // Os acertos do entregador pendentes são da loja (auditoria interna, rodada 8 do PR #54).
     courierSettlePending: [],
     courierSettleFollowUps: [],
@@ -890,6 +897,23 @@ export const DELIVERY_REFUSAL_DROPPED =
  * fica no estado persistido (courierSettlePending; auditoria interna, rodada 8 do PR #54).
  */
 const courierSettleInFlight = new Set<UUID>();
+
+/**
+ * Vendas de balcão fechadas por outro aparelho (chegaram pagas pela leitura, sem estarem pagas
+ * aqui antes): as fichas delas são impressas lá. A lista guarda só as que ainda estão no aparelho.
+ */
+function cloudClosedCounter(before: TcheState, orders: readonly Order[], tables: readonly DiningTable[]): UUID[] {
+  const counter = new Set(tables.filter((t) => t.kind === 'COUNTER').map((t) => t.id));
+  const prev = new Set(before.cloudClosedCounterOrderIds ?? []);
+  const out: UUID[] = [];
+  for (const o of orders) {
+    if (o.status !== 'CLOSED' || !counter.has(o.table_id)) continue;
+    const local = before.orders.find((x) => x.id === o.id);
+    const closedHere = local?.status === 'CLOSED' && !prev.has(o.id);
+    if (!closedHere) out.push(o.id);
+  }
+  return out;
+}
 
 const TABLE_EDIT_FIELDS: readonly TableEditField[] = ['number', 'label', 'area', 'capacity', 'active'];
 
@@ -2710,6 +2734,9 @@ export const useTcheStore = create<TcheState>()(
           if (order.status !== 'CLOSED' || toCents(order.remaining_balance) !== 0) return fail('Ficha só é impressa depois da venda paga.');
           const existing = s0.eventTickets.filter((t) => t.order_id === orderId);
           if (existing.length > 0) return { ok: true, data: existing };
+          if ((s0.cloudClosedCounterOrderIds ?? []).includes(orderId)) {
+            return fail('Esta venda foi paga em outro aparelho: as fichas dela saem lá. Para reimprimir, use o aparelho que recebeu o pagamento.');
+          }
           const payment = [...s0.payments].reverse().find((p) => p.order_id === orderId && p.status === 'APPROVED') ?? null;
           const ts = nowISO();
           const used = new Set(s0.eventTickets.map((t) => t.barcode_token));
@@ -3883,6 +3910,7 @@ export const useTcheStore = create<TcheState>()(
             cloudCashRanges: [],
             lateItemsOrderIds: [],
             cloudSkippedOrderIds: [],
+            cloudClosedCounterOrderIds: [],
             // Acertos do entregador pendentes da loja anterior (auditoria interna, rodada 8 do PR #54).
             courierSettlePending: [],
             courierSettleFollowUps: [],
@@ -3980,6 +4008,7 @@ export const useTcheStore = create<TcheState>()(
             cloudCashRanges: [],
             lateItemsOrderIds: [],
             cloudSkippedOrderIds: [],
+            cloudClosedCounterOrderIds: [],
             // Acertos do entregador pendentes da loja anterior (auditoria interna, rodada 8 do PR #54).
             courierSettlePending: [],
             courierSettleFollowUps: [],
@@ -4087,6 +4116,7 @@ export const useTcheStore = create<TcheState>()(
             // Contas deixadas de lado nesta leitura (valor que esta versão não conhece): não são
             // cobradas aqui até o app ser atualizado (auditoria interna, rodada 8 do PR #54).
             cloudSkippedOrderIds: [...(snapshot.skippedOrderIds ?? [])],
+            cloudClosedCounterOrderIds: cloudClosedCounter(state, merged.orders, merged.tables),
             pullStatus: {
               ...(state.pullStatus ?? EMPTY_PULL_STATUS),
               last_orders_pull_at: nowISO(),

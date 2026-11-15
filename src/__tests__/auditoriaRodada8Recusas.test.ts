@@ -324,3 +324,39 @@ describe('conta segurada atrás de um recusado de outro registro (auditoria inte
     if (!r.ok) expect(r.error).not.toMatch(/esperando na fila|recusados/);
   });
 });
+
+describe('fichas da venda de balcão paga em outro aparelho (Codex, PR #54)', () => {
+  beforeEach(() => {
+    st().resetDemo();
+    useTcheStore.setState({ cloud: session(st().tenant.id), outbox: [], syncRejected: [] });
+  });
+  const counter = () => st().tables.find((t) => t.kind === 'COUNTER')!;
+  const product = () => st().products.find((p) => p.active && !p.is_combo)!;
+  const paidCounterSale = (id: string): CloudOrders => {
+    const p = product();
+    const o = order(id, counter().id, {
+      status: 'CLOSED', charge_service_fee: false, service_fee_pct: 0, service_fee_amount: 0, subtotal_items: p.price, total_amount: p.price,
+      paid_amount: p.price, remaining_balance: 0, closed_at: NOW,
+    });
+    return cloud({ orders: [o], orderItems: [item(`i-${id}`, id, { product_id: p.id, unit_price: p.price, total_item_price: p.price, is_paid: true })] });
+  };
+
+  it('venda que chegou paga pela leitura: este aparelho não imprime outro jogo de fichas', () => {
+    expect(st().applyCloudOrders(paidCounterSale(O2)).ok).toBe(true);
+    expect(st().orders.find((o) => o.id === O2)!.status).toBe('CLOSED');
+    expect(st().issueEventTickets(O2)).toMatchObject({ ok: false, error: expect.stringMatching(/paga em outro aparelho/) });
+    expect(st().eventTickets.some((t) => t.order_id === O2)).toBe(false);
+    // A leitura seguinte não "esquece" a venda (continua fechada lá).
+    expect(st().applyCloudOrders(paidCounterSale(O2)).ok).toBe(true);
+    expect(st().issueEventTickets(O2).ok).toBe(false);
+  });
+
+  it('venda paga aqui e confirmada pela leitura: as fichas saem normalmente', () => {
+    const local = paidCounterSale(O2);
+    useTcheStore.setState({ orders: [...st().orders, ...local.orders], orderItems: [...st().orderItems, ...local.orderItems] });
+    expect(st().applyCloudOrders(paidCounterSale(O2)).ok).toBe(true);
+    const t = st().issueEventTickets(O2);
+    if (!t.ok) throw new Error(t.error);
+    expect(t.data.length).toBeGreaterThan(0);
+  });
+});
