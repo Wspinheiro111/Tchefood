@@ -108,7 +108,7 @@ describe('moveLateItemsToNewOrder: taxa e mudança da mesa (auditoria interna, r
 
   it('o nome da mesa mudado aqui com a conta aberta continua subindo, sem a ocupação velha', () => {
     const { free } = setup([]);
-    const rename = ev('dining_tables', free.id, { ...free, label: 'Varanda 1', status: 'OCCUPIED', current_order_id: O1 }, { id: 'e-mesa' });
+    const rename = ev('dining_tables', free.id, { ...free, label: 'Varanda 1', status: 'OCCUPIED', current_order_id: O1 }, { id: 'e-mesa', table_edit_fields: ['label'] });
     useTcheStore.setState({ outbox: [rename] });
     const r = st().moveLateItemsToNewOrder('e-cerveja');
     if (!r.ok) throw new Error(r.error);
@@ -117,6 +117,26 @@ describe('moveLateItemsToNewOrder: taxa e mudança da mesa (auditoria interna, r
     expect(kept!.payload).toMatchObject({ label: 'Varanda 1' });
     expect(kept!.payload).not.toHaveProperty('status');
     expect(kept!.payload).not.toHaveProperty('current_order_id');
+    // Lugares, área e número eram cópia: não sobem, para não regravar o que outro aparelho mudou
+    // depois (GPT, rodada 8 do PR #54).
+    for (const k of ['capacity', 'area', 'number', 'active']) expect(kept!.payload).not.toHaveProperty(k);
+  });
+
+  it('evento da mesa só de ocupação (nada do cadastro mudado aqui) sai da fila (GPT, rodada 8 do PR #54)', () => {
+    const { free } = setup([]);
+    const occupy = ev('dining_tables', free.id, { ...free, status: 'OCCUPIED', current_order_id: O1 }, { id: 'e-ocupa' });
+    useTcheStore.setState({ outbox: [occupy] });
+    const r = st().moveLateItemsToNewOrder('e-cerveja');
+    if (!r.ok) throw new Error(r.error);
+    expect(st().outbox.some((e) => e.id === 'e-ocupa')).toBe(false);
+  });
+
+  it('o cadastro da mesa manda só os campos mudados (GPT, rodada 8 do PR #54)', () => {
+    st().login('9999');
+    const t = st().tables.find((x) => x.kind === 'TABLE')!;
+    const r = st().saveTable({ id: t.id, number: t.number, label: 'Varanda 9', area: t.area, capacity: t.capacity, active: t.active });
+    if (!r.ok) throw new Error(r.error);
+    expect(st().outbox.at(-1)).toMatchObject({ table: 'dining_tables', op: 'UPDATE', table_edit_fields: ['label'] });
   });
 });
 

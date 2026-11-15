@@ -400,7 +400,7 @@ describe('moveRejectedOrderToTableOrder (mesa ocupada por outra conta)', () => {
   it('a mudança da mesa que estava na fila continua, sem voltar atrás a ocupação da nuvem (GPT, rodada 1, e auditoria interna, rodada 8, do PR #54)', () => {
     const { insert, free } = setup();
     const tableEvent = st().outbox.find((e) => e.table === 'dining_tables' && e.row_id === free.id)!;
-    useTcheStore.setState((s) => ({ outbox: s.outbox.map((e) => (e.id === tableEvent.id ? { ...e, payload: { ...e.payload, label: 'Mesa da varanda' } } : e)) }));
+    useTcheStore.setState((s) => ({ outbox: s.outbox.map((e) => (e.id === tableEvent.id ? { ...e, payload: { ...e.payload, label: 'Mesa da varanda' }, table_edit_fields: ['label' as const] } : e)) }));
     expect(st().moveRejectedOrderToTableOrder(insert.id).ok).toBe(true);
     const kept = st().outbox.find((e) => e.id === tableEvent.id)!;
     expect(kept.payload).toMatchObject({ label: 'Mesa da varanda' });
@@ -408,6 +408,8 @@ describe('moveRejectedOrderToTableOrder (mesa ocupada por outra conta)', () => {
     // leva a situação da hora da abertura.
     expect('status' in kept.payload).toBe(false);
     expect('current_order_id' in kept.payload).toBe(false);
+    // Só o campo mudado aqui sobe: lugares, área e número eram cópia (GPT, rodada 8 do PR #54).
+    expect(Object.keys(kept.payload).sort()).toEqual(['id', 'label', 'tenant_id', 'updated_at']);
   });
 
   it('sem a conta da mesa vinda da nuvem neste aparelho: pede para sincronizar', () => {
@@ -432,12 +434,10 @@ describe('moveRejectedOrderToTableOrder (mesa ocupada por outra conta)', () => {
     expect(moved.length).toBe(oldIds.length);
     expect(moved.some((i) => oldIds.includes(i.id))).toBe(false);
     expect(st().outbox.every((e) => e.row_id !== y.id && e.payload.order_id !== y.id && e.payload.current_order_id !== y.id)).toBe(true);
-    // A atualização da mesa continua na fila, sem a ocupação: a conta que ficou já ocupa a mesa na
-    // nuvem, e a situação da hora da abertura voltaria atrás a mesa aguardando conta ou pagando.
-    const tableEv = st().outbox.find((e) => e.table === 'dining_tables' && e.row_id === free.id)!;
-    expect(tableEv).toBeDefined();
-    expect('status' in tableEv.payload).toBe(false);
-    expect('current_order_id' in tableEv.payload).toBe(false);
+    // A atualização da mesa da abertura só tinha a ocupação (nenhum campo do cadastro mudado aqui):
+    // sai da fila. A conta que ficou já ocupa a mesa na nuvem, e a cópia do cadastro regravaria o
+    // que outro aparelho mudou (GPT, rodada 8 do PR #54).
+    expect(st().outbox.some((e) => e.table === 'dining_tables' && e.row_id === free.id)).toBe(false);
     expect(st().outbox.filter((e) => e.table === 'order_items' && e.op === 'INSERT' && e.payload.order_id === O2)).toHaveLength(moved.length);
     expect(st().syncRejected).toHaveLength(0);
     expect(st().tables.find((t) => t.id === free.id)!.current_order_id).toBe(O2);

@@ -762,6 +762,9 @@ export interface TrayItem {
 }
 
 /** Evento da fila offline-first, pronto para ser enviado ao Supabase. */
+/** Campos do cadastro da mesa que a pessoa edita (saveTable). */
+export type TableEditField = 'number' | 'label' | 'area' | 'capacity' | 'active';
+
 export interface SyncEvent {
   id: UUID;
   table:
@@ -848,6 +851,13 @@ export interface SyncEvent {
    * recusada da mesma torneira (recordKeys). Não vai para o banco.
    */
   keg_tap_id?: UUID;
+  /**
+   * Só na atualização da mesa feita no cadastro (saveTable): os campos do cadastro que a pessoa
+   * mudou. Quando a ocupação velha sai do evento (recuperação de conta recusada ou de itens
+   * atrasados), só esses campos sobem; os outros eram cópia e regravariam o que outro aparelho
+   * mudou depois (GPT, rodada 8 do PR #54). Não vai para o banco.
+   */
+  table_edit_fields?: TableEditField[];
   /** Só no proprietário da loja nova: sobe por tchefood_start_store, com o usuário do QR. */
   store_start?: StoreStartSync;
   /**

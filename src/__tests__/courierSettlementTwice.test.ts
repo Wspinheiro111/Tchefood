@@ -384,6 +384,89 @@ describe('acerto gravado na nuvem com pendência neste aparelho (auditoria inter
   });
 });
 
+describe('aparelho interrompido depois de a nuvem gravar o acerto (GPT, rodada 8 do PR #54)', () => {
+  const KEYS = ['orders', 'payments', 'cashMovements', 'auditLogs', 'outbox', 'courierSettleFollowUps', 'courierSettlePending', 'courierSettlements', 'ownDeliveries'] as const;
+  type Saved = Pick<ReturnType<typeof st>, (typeof KEYS)[number]>;
+  const save = (): Saved => Object.fromEntries(KEYS.map((k) => [k, st()[k]])) as Saved;
+
+  it('em qualquer ponto depois da resposta da nuvem há pendência para terminar, e terminar não recebe nem sangra em dobro', async () => {
+    expect(st().openCashSession(100).ok).toBe(true);
+    const a = deliveredOrder();
+    const c = deliveredOrder();
+    connectCloud();
+    const calls: Call[] = [];
+    // Cada gravação no aparelho é um ponto em que o app pode fechar (o estado salvo é o da última).
+    const saved: Saved[] = [save()];
+    const unsub = useTcheStore.subscribe(() => saved.push(save()));
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: true, auth: MANAGER, fetchFn: cloudFn(calls) });
+    unsub();
+    if (!r.ok) throw new Error(r.error);
+    const settlementId = calls[0]!.body.p_id as string;
+    const keys = [a, c].map((x) => `entrega-${x.delivery.id}`);
+    const done = (x: Saved) =>
+      keys.every((k) => x.payments.some((p) => p.idempotency_key === k))
+      && x.auditLogs.some((l) => l.action_type === 'CASH_WITHDRAWAL' && (l.metadata as Record<string, unknown>).courier_settlement_id === settlementId);
+    // Depois da resposta da nuvem: o acerto pendente sai na mesma gravação que cria a pendência.
+    const after = saved.filter((x) => x.courierSettlements.some((y) => y.id === settlementId));
+    expect(after.length).toBeGreaterThan(2);
+    for (const x of saved) {
+      const pendingGone = !(x.courierSettlePending ?? []).some((p) => p.id === settlementId);
+      const settled = x.courierSettlements.some((y) => y.id === settlementId);
+      if (settled || pendingGone) {
+        if (saved.indexOf(x) === 0) continue;
+        expect(settled && pendingGone).toBe(true);
+        expect(done(x) || (x.courierSettleFollowUps ?? []).some((f) => f.settlement_id === settlementId)).toBe(true);
+      }
+    }
+    // Reinício em cada ponto: termina pela pendência; nada sai em dobro.
+    for (const x of after) {
+      useTcheStore.setState({ ...x });
+      const f = (st().courierSettleFollowUps ?? []).find((y) => y.settlement_id === settlementId);
+      if (f && f.missing_payments.length > 0) st().finishCourierSettleFollowUp(settlementId, { kind: 'payments' });
+      if (f && f.missing_withdrawal) st().finishCourierSettleFollowUp(settlementId, { kind: 'withdrawal', auth: MANAGER });
+      for (const k of keys) expect(st().payments.filter((p) => p.idempotency_key === k)).toHaveLength(1);
+      expect(drawerOut()).toHaveLength(1);
+      expect(st().courierSettleFollowUps ?? []).toEqual([]);
+    }
+  });
+
+  it('o app fecha logo depois da sangria, antes de tirá-la da pendência: terminar não sangra de novo', async () => {
+    expect(st().openCashSession(100).ok).toBe(true);
+    const a = deliveredOrder(false);
+    connectCloud();
+    const calls: Call[] = [];
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: true, auth: MANAGER, fetchFn: cloudFn(calls) });
+    if (!r.ok) throw new Error(r.error);
+    const id = calls[0]!.body.p_id as string;
+    // A pendência como estava antes da sangria (a gravação que a tiraria não chegou ao disco).
+    useTcheStore.setState({ courierSettleFollowUps: [{
+      settlement_id: id, courier_id: a.courier.id, courier_name: a.courier.name, delivery_ids: [a.delivery.id], cash_collected: 0,
+      courier_fees: a.delivery.courier_fee ?? 0, missing_payments: [], missing_withdrawal: { amount: a.delivery.courier_fee ?? 0, error: 'Acerto interrompido antes deste passo.' }, created_at: '2026-11-14T12:00:00Z',
+    }] });
+    const w = st().finishCourierSettleFollowUp(id, { kind: 'withdrawal', auth: MANAGER });
+    if (!w.ok) throw new Error(w.error);
+    expect(drawerOut()).toHaveLength(1);
+    expect(st().courierSettleFollowUps).toEqual([]);
+  });
+
+  it('sangria já registrada e o operador escolhe "pago por fora": avisa, sem apagar nem repetir a sangria', async () => {
+    expect(st().openCashSession(100).ok).toBe(true);
+    const a = deliveredOrder(false);
+    connectCloud();
+    const calls: Call[] = [];
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: true, auth: MANAGER, fetchFn: cloudFn(calls) });
+    if (!r.ok) throw new Error(r.error);
+    const id = calls[0]!.body.p_id as string;
+    useTcheStore.setState({ courierSettleFollowUps: [{
+      settlement_id: id, courier_id: a.courier.id, courier_name: a.courier.name, delivery_ids: [a.delivery.id], cash_collected: 0,
+      courier_fees: a.delivery.courier_fee ?? 0, missing_payments: [], missing_withdrawal: { amount: a.delivery.courier_fee ?? 0, error: 'Acerto interrompido antes deste passo.' }, created_at: '2026-11-14T12:00:00Z',
+    }] });
+    expect(st().finishCourierSettleFollowUp(id, { kind: 'paid_outside' })).toMatchObject({ ok: false, error: expect.stringMatching(/já está registrada no caixa/) });
+    expect(drawerOut()).toHaveLength(1);
+    expect(st().courierSettleFollowUps).toEqual([]);
+  });
+});
+
 describe('acerto sem resposta da nuvem (auditoria interna, rodada 8 do PR #54)', () => {
   it('fica guardado (persistido) e é repetido com as mesmas entregas e valores, à parte das entregas novas', async () => {
     expect(st().openCashSession(100).ok).toBe(true);

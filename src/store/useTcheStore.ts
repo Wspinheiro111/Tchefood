@@ -29,6 +29,7 @@ import type {
   OwnDelivery,
   Category,
   DiningTable,
+  TableEditField,
   EventTicket,
   KegHistory,
   KegTap,
@@ -650,7 +651,12 @@ interface Actions {
   /** Nota do cliente (1 a 5) para uma conta já paga. Uma por conta. */
   addReview: (orderId: UUID, score: number, comment: string, source: ReviewSource) => ActionResult<Review>;
   /** Sangria: dinheiro que sai da gaveta. PIN de gerente + motivo; nunca mais do que há na gaveta. */
-  addCashWithdrawal: (amount: number, auth: ManagerAuthInput) => ActionResult<CashMovement>;
+  /**
+   * Sangria com PIN de gerente. `meta` entra na autorização gravada (na mesma gravação da sangria):
+   * o acerto do entregador usa `courier_settlement_id` para saber, depois de uma interrupção, que a
+   * sangria dele já foi feita.
+   */
+  addCashWithdrawal: (amount: number, auth: ManagerAuthInput, meta?: { courier_settlement_id: UUID }) => ActionResult<CashMovement>;
   /**
    * Fechamento cego: recebe só o que foi contado. Com diferença (sobra ou falta),
    * só fecha com PIN de gerente + motivo (auth); sem auth devolve o erro com a diferença.
@@ -885,18 +891,32 @@ export const DELIVERY_REFUSAL_DROPPED =
  */
 const courierSettleInFlight = new Set<UUID>();
 
-/** A autorização da sangria cita o acerto (só para consulta): no registro e no evento da fila. */
-function tagWithdrawalWithSettlement(s: TcheState, movementId: UUID, settlementId: UUID): Pick<TcheState, 'auditLogs' | 'outbox'> {
-  const ofWithdrawal = (meta: unknown) => (meta as Record<string, unknown> | null)?.movement_id === movementId;
-  const withSettlement = (meta: unknown) => ({ ...((meta as Record<string, unknown> | null) ?? {}), courier_settlement_id: settlementId });
-  return {
-    auditLogs: s.auditLogs.map((l) => (l.action_type === 'CASH_WITHDRAWAL' && ofWithdrawal(l.metadata) ? { ...l, metadata: withSettlement(l.metadata) } : l)),
-    outbox: s.outbox.map((e) =>
-      e.table === 'audit_logs' && e.payload.action_type === 'CASH_WITHDRAWAL' && ofWithdrawal(e.payload.metadata)
-        ? { ...e, payload: { ...e.payload, metadata: withSettlement(e.payload.metadata) } }
-        : e,
-    ),
-  };
+const TABLE_EDIT_FIELDS: readonly TableEditField[] = ['number', 'label', 'area', 'capacity', 'active'];
+
+/** Atualização da mesa pelo cadastro, com os campos que a pessoa mudou (table_edit_fields). */
+function tableEditEvent(before: DiningTable, after: DiningTable): SyncEvent {
+  return { ...syncEvent('dining_tables', 'UPDATE', after), table_edit_fields: TABLE_EDIT_FIELDS.filter((k) => before[k] !== after[k]) };
+}
+
+/**
+ * Evento da mesa que apontava para uma conta que não vai existir na nuvem (recuperação de conta
+ * recusada ou de itens atrasados): sai a ocupação, e do cadastro sobem só os campos que a pessoa
+ * mudou aqui (table_edit_fields). Nome, área e lugares que eram cópia não sobem, para não regravar
+ * o que outro aparelho mudou depois. Evento só de ocupação (sem campo mudado): sai da fila (null).
+ * O PATCH só grava as colunas que vão nele (GPT, rodada 8 do PR #54).
+ */
+function tableEditOnly(e: SyncEvent): SyncEvent | null {
+  const fields = e.table_edit_fields ?? [];
+  if (fields.length === 0) return null;
+  const payload: Record<string, unknown> = {};
+  for (const f of ['id', 'tenant_id', 'updated_at', ...fields]) if (e.payload[f] !== undefined) payload[f] = e.payload[f];
+  return { ...e, payload };
+}
+
+/** Sangria do acerto já feita neste aparelho (a autorização dela cita o acerto). */
+function settlementWithdrawalDone(s: TcheState, settlementId: UUID): boolean {
+  return s.auditLogs.some((l) => l.action_type === 'CASH_WITHDRAWAL'
+    && (l.metadata as Record<string, unknown> | null)?.courier_settlement_id === settlementId);
 }
 
 /** Troca (ou tira, quando nada sobrou) a pendência do acerto na lista. */
@@ -3556,7 +3576,7 @@ export const useTcheStore = create<TcheState>()(
               };
           set((s) => ({
             tables: existing ? s.tables.map((t) => (t.id === row.id ? row : t)) : [...s.tables, row],
-            outbox: [...s.outbox, syncEvent('dining_tables', existing ? 'UPDATE' : 'INSERT', row)],
+            outbox: [...s.outbox, existing ? tableEditEvent(existing, row) : syncEvent('dining_tables', 'INSERT', row)],
           }));
           return { ok: true, data: row };
         },
@@ -4045,17 +4065,16 @@ export const useTcheStore = create<TcheState>()(
               retaken.set(t.id, t.current_order_id);
             }
           }
-          const freeTable = (e: SyncEvent): SyncEvent => {
+          const freeTable = (e: SyncEvent): SyncEvent | null => {
             const late = e.table === 'dining_tables' && e.op === 'UPDATE' ? retaken.get(e.row_id) : undefined;
             if (!late || e.payload.current_order_id !== late) return e;
-            const { status: _st, current_order_id: _co, ...rest } = e.payload;
-            return { ...e, payload: rest };
+            return tableEditOnly(e);
           };
           set({
             ...(retaken.size > 0
               ? {
-                  outbox: state.outbox.map(freeTable),
-                  syncRejected: (state.syncRejected ?? []).map((r) => ({ ...r, event: freeTable(r.event) })),
+                  outbox: state.outbox.flatMap((e) => freeTable(e) ?? []),
+                  syncRejected: (state.syncRejected ?? []).flatMap((r) => { const ev = freeTable(r.event); return ev ? [{ ...r, event: ev }] : []; }),
                 }
               : {}),
             orders: merged.orders,
@@ -4156,11 +4175,10 @@ export const useTcheStore = create<TcheState>()(
           // abertura (ocupada) voltaria atrás a mesa que lá já está aguardando conta ou pagando
           // (GPT, rodada 1, e auditoria interna, rodada 8, do PR #54). O PATCH só grava as colunas
           // que vão nele. O resto (a conta e os itens dela) sai da fila.
-          const retarget = (e: SyncEvent): SyncEvent => {
+          const retarget = (e: SyncEvent): SyncEvent | null => {
             if (e.table !== 'dining_tables' || e.payload.current_order_id !== orderId) return e;
             if (e.op !== 'UPDATE') return { ...e, payload: { ...e.payload, current_order_id: target.id, status: e.payload.status === 'FREE' ? 'OCCUPIED' : e.payload.status } };
-            const { status: _st, current_order_id: _co, ...rest } = e.payload;
-            return { ...e, payload: rest };
+            return tableEditOnly(e);
           };
           const dropped = new Set(touching.filter((e) => e.table !== 'dining_tables').map((e) => e.id));
           const orderItems = [...s.orderItems.filter((i) => i.order_id !== orderId), ...moved];
@@ -4175,8 +4193,8 @@ export const useTcheStore = create<TcheState>()(
                 ? { ...t, current_order_id: target.id, status: t.status === 'FREE' ? 'OCCUPIED' : t.status }
                 : t,
             ),
-            outbox: [...s.outbox.filter((e) => !dropped.has(e.id)).map(retarget), ...moved.map((i) => itemEvent('INSERT', i, s.kegTapProducts))],
-            syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)).map((r) => ({ ...r, event: retarget(r.event) })),
+            outbox: [...s.outbox.filter((e) => !dropped.has(e.id)).flatMap((e) => retarget(e) ?? []), ...moved.map((i) => itemEvent('INSERT', i, s.kegTapProducts))],
+            syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)).flatMap((r) => { const ev = retarget(r.event); return ev ? [{ ...r, event: ev }] : []; }),
           });
           return { ok: true, data: { targetOrderId: target.id, items: moved.length } };
         },
@@ -4288,10 +4306,9 @@ export const useTcheStore = create<TcheState>()(
           // liberou ou deu a outra conta. Igual ao retarget de moveRejectedOrderToTableOrder
           // (auditoria interna, rodada 8 do PR #54). A mesa só gera INSERT na criação, sem conta,
           // então na prática só o UPDATE chega aqui; o INSERT, se vier, sobe do mesmo jeito.
-          const stripTable = (e: SyncEvent): SyncEvent => {
-            if (e.table !== 'dining_tables' || e.payload.current_order_id !== order.id) return e;
-            const { status: _st, current_order_id: _co, ...rest } = e.payload;
-            return { ...e, payload: rest };
+          const stripTable = (e: SyncEvent): SyncEvent | null => {
+            if (e.table !== 'dining_tables' || e.op !== 'UPDATE' || e.payload.current_order_id !== order.id) return e;
+            return tableEditOnly(e);
           };
           const orderItems = [...s.orderItems.filter((i) => !(i.order_id === order.id && unsent.has(i.id))), ...moved];
           const opened = applyOrderTotals(fresh, orderItems, s.payments);
@@ -4305,11 +4322,11 @@ export const useTcheStore = create<TcheState>()(
             tray: s.tray.map((t) => (t.order_id === order.id ? { ...t, order_id: fresh.id } : t)),
             tables: s.tables.map((t) => (t.id === table.id ? updatedTable : t)),
             outbox: [
-              ...s.outbox.filter((e) => !dropped.has(e.id)).map(stripTable),
+              ...s.outbox.filter((e) => !dropped.has(e.id)).flatMap((e) => stripTable(e) ?? []),
               syncEvent('orders', 'INSERT', fresh),
               ...moved.map((i) => itemEvent('INSERT', i, s.kegTapProducts)),
             ],
-            syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)).map((r) => ({ ...r, event: stripTable(r.event) })),
+            syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)).flatMap((r) => { const ev = stripTable(r.event); return ev ? [{ ...r, event: ev }] : []; }),
             lateItemsOrderIds: [...(s.lateItemsOrderIds ?? []), fresh.id].slice(-200),
           });
           return { ok: true, data: { newOrderId: fresh.id, items: moved.length } };
@@ -4364,10 +4381,9 @@ export const useTcheStore = create<TcheState>()(
           // A mudança da mesa feita aqui (nome, área, lugares) continua subindo, sem a ocupação por
           // esta conta, como nas junções. O resto (a conta e os itens dela) sai da fila e dos recusados:
           // a nuvem nunca gravou a conta, então nada foi cobrado.
-          const strip = (e: SyncEvent): SyncEvent => {
-            if (e.table !== 'dining_tables' || e.payload.current_order_id !== orderId) return e;
-            const { status: _st, current_order_id: _co, ...rest } = e.payload;
-            return { ...e, payload: rest };
+          const strip = (e: SyncEvent): SyncEvent | null => {
+            if (e.table !== 'dining_tables' || e.op !== 'UPDATE' || e.payload.current_order_id !== orderId) return e;
+            return tableEditOnly(e);
           };
           const dropped = new Set(touching.filter((e) => e.table !== 'dining_tables').map((e) => e.id));
           // Chopp: a venda baixou o barril aqui, e o item nunca chegou ao banco. O volume volta ao
@@ -4412,10 +4428,10 @@ export const useTcheStore = create<TcheState>()(
             // a conta que a ocupa lá.
             tables: s.tables.map((t) => (t.current_order_id === orderId ? { ...t, status: 'FREE' as const, current_order_id: null } : t)),
             outbox: [
-              ...s.outbox.filter((e) => !dropped.has(e.id)).map(strip),
+              ...s.outbox.filter((e) => !dropped.has(e.id)).flatMap((e) => strip(e) ?? []),
               syncEvent('audit_logs', 'INSERT', log),
             ],
-            syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)).map((r) => ({ ...r, event: strip(r.event) })),
+            syncRejected: (s.syncRejected ?? []).filter((r) => !dropped.has(r.event.id)).flatMap((r) => { const ev = strip(r.event); return ev ? [{ ...r, event: ev }] : []; }),
             lateItemsOrderIds: (s.lateItemsOrderIds ?? []).filter((id) => id !== orderId),
           });
           return { ok: true, data: { orderId, items: list } };
@@ -5051,7 +5067,7 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: movement };
         },
 
-        addCashWithdrawal: (amount, auth) => {
+        addCashWithdrawal: (amount, auth, meta) => {
           const user = currentUser();
           if (!user) return fail('Sessão expirada. Faça login novamente.');
           if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário movimenta o caixa.');
@@ -5084,7 +5100,7 @@ export const useTcheStore = create<TcheState>()(
             amount_impact: -movement.amount,
             reason: movement.reason,
             whatsapp_alert_sent: false,
-            metadata: { movement_id: movement.id, session_id: open.id },
+            metadata: { movement_id: movement.id, session_id: open.id, ...(meta ? { courier_settlement_id: meta.courier_settlement_id } : {}) },
             created_at: ts,
           };
           set((s) => ({
@@ -5497,61 +5513,43 @@ export const useTcheStore = create<TcheState>()(
             }
             return fail(`${result.message} Nada saiu da gaveta; tente de novo em "Acerto sem resposta da nuvem", no quadro da entrega.`);
           }
-          dropPending();
           const settlement = result.settlement;
+          const pay = opts.payFromDrawer && feesCents > 0;
 
-          // 2) O acerto vale: entra aqui como a nuvem gravou. Não sobe de novo (a nuvem já tem o
-          // acerto e as entregas marcadas); a leitura traz as mesmas entregas. Leitura lida antes
-          // do acerto não as devolve para "sem acerto" (courierSettledRecently).
+          // 2) O acerto vale: entra aqui como a nuvem gravou, NA MESMA gravação que tira o acerto
+          // pendente e cria a pendência com tudo o que ainda falta fazer neste aparelho (cada senha
+          // paga na entrega e a sangria). Se o app fechar ou o aparelho reiniciar a qualquer momento
+          // daqui para a frente, o quadro mostra "Acerto gravado na nuvem com pendência" para
+          // terminar; cada passo é conferido antes de ser refeito (pagamento pela chave
+          // `entrega-<id>`, sangria pela autorização que cita o acerto), então nada sai em dobro
+          // (GPT, rodada 8 do PR #54). Não sobe de novo (a nuvem já tem o acerto e as entregas
+          // marcadas); leitura lida antes do acerto não as devolve para "sem acerto".
           const at = Date.now();
+          const NOT_DONE = 'Acerto interrompido antes deste passo.';
+          const planned: CourierSettleFollowUp = {
+            settlement_id: settlement.id, courier_id: courierId, courier_name: courier.name, delivery_ids: deliveryIds,
+            cash_collected: settlement.cash_collected, courier_fees: settlement.courier_fees,
+            missing_payments: toCollect.map(({ d, order, amount }) => ({ delivery_id: d.id, order_id: order.id, pickup_number: order.pickup_number ?? null, amount, error: NOT_DONE })),
+            missing_withdrawal: pay ? { amount: fromCentsLocal(feesCents), error: NOT_DONE } : null,
+            created_at: nowISO(),
+          };
           set((s) => ({
+            courierSettlePending: (s.courierSettlePending ?? []).filter((p) => p.id !== id),
             courierSettlements: s.courierSettlements.some((x) => x.id === settlement.id) ? s.courierSettlements : [settlement, ...s.courierSettlements],
             ownDeliveries: s.ownDeliveries.map((d) => (ownIds.has(d.id) ? { ...d, settlement_id: settlement.id } : d)),
             courierSettledRecently: [
               ...(s.courierSettledRecently ?? []).filter((x) => at - x.at <= COURIER_SETTLED_KEEP_MS && x.settlement_id !== settlement.id),
               { settlement_id: settlement.id, delivery_ids: deliveryIds, at },
             ],
+            courierSettleFollowUps: withFollowUp(s.courierSettleFollowUps, planned),
           }));
-          const pay = opts.payFromDrawer && feesCents > 0;
-          // 3) O dinheiro que o entregador trouxe vira o pagamento de cada senha paga na entrega.
-          // Todas são tentadas; a que falhar fica na pendência do acerto, com o erro.
-          const missingPayments: CourierSettleFollowUp['missing_payments'] = [];
-          for (const { d, order } of toCollect) {
-            const current = get().orders.find((o) => o.id === order.id);
-            if (!current || current.status !== 'PAYING' || !(current.remaining_balance > 0)) continue;
-            if (get().payments.some((p) => p.idempotency_key === `entrega-${d.id}`)) continue;
-            const r = get().registerPayment({
-              orderId: current.id,
-              amount: current.remaining_balance,
-              method: 'CASH',
-              status: 'APPROVED',
-              terminal_id: null,
-              acquirer: 'CASH_DESK',
-              acquirer_cnpj: null,
-              card_brand: null,
-              nsu: null,
-              authorization_code: null,
-              terminal_serial: null,
-              idempotency_key: `entrega-${d.id}`,
-              item_ids: [],
-            });
-            if (!r.ok) missingPayments.push({ delivery_id: d.id, order_id: current.id, pickup_number: current.pickup_number ?? null, amount: current.remaining_balance, error: r.error });
-          }
-          // 4) O ganho sai da gaveta: sangria comum, com PIN de gerente, depois de a nuvem aceitar o
-          // acerto (mesmo se alguma senha falhou). A autorização cita o acerto (só para consulta).
-          let missingWithdrawal: CourierSettleFollowUp['missing_withdrawal'] = null;
-          if (pay) {
-            const wd = get().addCashWithdrawal(fromCentsLocal(feesCents), withdrawalAuth!);
-            if (wd.ok) set((s) => tagWithdrawalWithSettlement(s, wd.data.id, settlement.id));
-            else missingWithdrawal = { amount: fromCentsLocal(feesCents), error: wd.error };
-          }
-          if (missingPayments.length > 0 || missingWithdrawal) {
-            const follow: CourierSettleFollowUp = {
-              settlement_id: settlement.id, courier_id: courierId, courier_name: courier.name, delivery_ids: deliveryIds,
-              cash_collected: settlement.cash_collected, courier_fees: settlement.courier_fees,
-              missing_payments: missingPayments, missing_withdrawal: missingWithdrawal, created_at: nowISO(),
-            };
-            set((s) => ({ courierSettleFollowUps: withFollowUp(s.courierSettleFollowUps, follow) }));
+          // 3) O dinheiro que o entregador trouxe vira o pagamento de cada senha paga na entrega, e
+          // 4) o ganho sai da gaveta (sangria comum, com o PIN de gerente dado agora). Os passos são
+          // os mesmos de "terminar a pendência"; o que falhar fica nela, com o erro.
+          if (planned.missing_payments.length > 0) get().finishCourierSettleFollowUp(settlement.id, { kind: 'payments' });
+          if (pay) get().finishCourierSettleFollowUp(settlement.id, { kind: 'withdrawal', auth: withdrawalAuth! });
+          const follow = (get().courierSettleFollowUps ?? []).find((x) => x.settlement_id === settlement.id);
+          if (follow) {
             return fail(`Acerto gravado na nuvem, com pendência neste aparelho. ${followUpText(follow)} Termine em "Acerto gravado na nuvem com pendência", no quadro da entrega.`);
           }
           return { ok: true, data: get().courierSettlements.find((x) => x.id === settlement.id) ?? settlement };
@@ -5596,17 +5594,24 @@ export const useTcheStore = create<TcheState>()(
             return { ok: true, data: next };
           }
           if (!f.missing_withdrawal) return fail('A sangria deste acerto já foi resolvida.');
+          // Sangria já feita (o app fechou antes de tirar da pendência): não sai de novo, e "pago por
+          // fora" não deixa uma sangria registrada que não aconteceu sem avisar.
+          if (settlementWithdrawalDone(get(), settlementId)) {
+            save({ ...f, missing_withdrawal: null });
+            return step.kind === 'paid_outside'
+              ? fail('A sangria deste acerto já está registrada no caixa (feita antes de o app fechar). Confira a gaveta: se o dinheiro não saiu dela, registre um suprimento do valor.')
+              : { ok: true, data: (get().courierSettleFollowUps ?? []).find((x) => x.settlement_id === settlementId) ?? null };
+          }
           if (step.kind === 'paid_outside') return { ok: true, data: save({ ...f, missing_withdrawal: null }) };
           const auth = {
             managerPin: step.auth.managerPin,
             reason: step.auth.reason.trim().length >= MIN_REASON_LENGTH ? step.auth.reason : `Acerto do entregador ${f.courier_name}`,
           };
-          const wd = get().addCashWithdrawal(f.missing_withdrawal.amount, auth);
+          const wd = get().addCashWithdrawal(f.missing_withdrawal.amount, auth, { courier_settlement_id: settlementId });
           if (!wd.ok) {
             save({ ...f, missing_withdrawal: { ...f.missing_withdrawal, error: wd.error } });
             return fail(`Sangria não feita: ${wd.error}`);
           }
-          set((s) => tagWithdrawalWithSettlement(s, wd.data.id, settlementId));
           return { ok: true, data: save({ ...f, missing_withdrawal: null }) };
         },
 

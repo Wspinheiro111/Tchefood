@@ -112,7 +112,7 @@ describe('conta de itens atrasados recusada com mesa ocupada (auditoria interna,
 
   it('descartar: a prévia lista os itens sem mudar nada; o descarte tira a conta e os eventos dela', () => {
     const { free, freshId, insert, beer } = lateRefused();
-    const rename = ev('dining_tables', free.id, { ...free, label: 'Varanda 1', status: 'OCCUPIED', current_order_id: freshId }, { id: 'e-mesa' });
+    const rename = ev('dining_tables', free.id, { ...free, label: 'Varanda 1', status: 'OCCUPIED', current_order_id: freshId }, { id: 'e-mesa', table_edit_fields: ['label'] });
     useTcheStore.setState({ outbox: [...st().outbox, rename] });
     // Só quem cuida da nuvem (SYNC_MANAGE, a permissão da tela Retaguarda › Nuvem): o garçom não descarta.
     expect(st().discardLateItemsOrder(insert.id, { preview: true })).toMatchObject({ ok: false, error: expect.stringMatching(/Conectar o aparelho à nuvem/) });
@@ -161,7 +161,7 @@ describe('conta de itens atrasados recusada com mesa ocupada (auditoria interna,
   it('a leitura que dá a mesa à conta da nuvem tira a ocupação por L do evento da mesa na fila', () => {
     const { free, freshId } = lateRefused();
     // "Pagando" na mesa com a conta L (startCheckout feito antes da recusa) e a mudança de nome.
-    const paying = ev('dining_tables', free.id, { label: 'Varanda 1', status: 'PAYING', current_order_id: freshId }, { id: 'e-pagando' });
+    const paying = ev('dining_tables', free.id, { label: 'Varanda 1', status: 'PAYING', current_order_id: freshId }, { id: 'e-pagando', table_edit_fields: ['label'] });
     useTcheStore.setState({ outbox: [...st().outbox, paying] });
     const held = () => heldRecordKeys(st().outbox, (st().syncRejected ?? []).map((r) => r.event));
     expect(held().has(`dining_tables:${free.id}`)).toBe(true);
