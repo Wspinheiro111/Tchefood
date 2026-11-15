@@ -100,11 +100,14 @@ $$;
 CREATE OR REPLACE FUNCTION tchefood_delivery_list_orders(p_channel delivery_channel, p_limit INTEGER)
 RETURNS JSONB
 LANGUAGE sql STABLE SET search_path = public AS $$
-    SELECT COALESCE(jsonb_agg(tchefood_delivery_record_json(q) ORDER BY q.placed_at DESC), '[]'::jsonb)
-      FROM (SELECT * FROM delivery_orders o
+    -- Horário do pedido no app; sem ele (o app não mandou e virou 1970), vale a chegada ao servidor (received_at).
+    SELECT COALESCE(jsonb_agg(tchefood_delivery_record_json(q.o) ORDER BY q.listed_at DESC, (q.o).external_id), '[]'::jsonb)
+      FROM (SELECT o, COALESCE(NULLIF(o.placed_at, 'epoch'::timestamptz), o.received_at) AS listed_at
+              FROM delivery_orders o
              WHERE o.channel = p_channel
-               AND (o.status NOT IN ('concluded', 'cancelled') OR o.placed_at > NOW() - INTERVAL '24 hours')
-             ORDER BY o.placed_at DESC
+               AND (o.status NOT IN ('concluded', 'cancelled')
+                    OR COALESCE(NULLIF(o.placed_at, 'epoch'::timestamptz), o.received_at) > NOW() - INTERVAL '24 hours')
+             ORDER BY listed_at DESC, o.external_id
              LIMIT LEAST(GREATEST(COALESCE(p_limit, 200), 1), 500)) q
 $$;
 

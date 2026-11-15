@@ -20,7 +20,7 @@ import {
   UNCERTAIN_CANCELLATION_RETRIED,
   type DeliveryOrderRecord,
 } from "./deliveryInbox";
-import { deliverySaleBlockers } from "./deliverySaleGuard";
+import { CANCELLATION_EVENT_UNORDERED_REASON, deliverySaleBlockers } from "./deliverySaleGuard";
 import { IfoodMerchantApi } from "./ifood/ifoodMerchantApi";
 import { IfoodSandbox } from "./ifood/ifoodSandbox";
 import { DeliveryMarketplaceError, allowedDeliveryActions, mergeDeliveryStatus, type DeliveryEvent, type DeliveryOrder } from "./marketplace";
@@ -266,30 +266,77 @@ describe("caixa de entrada de delivery", () => {
     expect(allowedDeliveryActions(record.order, record.cancellationPending)).toContain("confirm");
   });
 
-  it("cancelamento sem horário do evento (1970) não é descartado depois de um evento com horário", async () => {
-    const repository = new InMemoryDeliveryRepository();
-    const adapter = {
-      channel: "ifood" as const,
-      queue: [] as DeliveryEvent[],
-      pollEvents: async () => adapter.queue.splice(0),
-      acknowledge: async () => undefined,
-      getOrder: async () => ({ ...(await baseOrder()), status: "placed" as const }),
-      performAction: async () => undefined,
-      listCancellationReasons: async () => [],
-      requestCancellation: async () => undefined,
-      respondToDispute: async () => undefined,
-    };
-    const custom = new DeliveryInbox({ adapters: [adapter], repository });
-    const event = (id: string, signal: DeliveryEvent["signal"], createdAt: string): DeliveryEvent => ({
-      channel: "ifood", externalEventId: id, externalOrderId: "o1", merchantExternalId: "m", rawCode: id, signal, createdAt, dispute: null,
+  describe("evento de cancelamento sem horário (rodada 5)", () => {
+    const UNKNOWN = "1970-01-01T00:00:00.000Z";
+    function unorderedSetup() {
+      const repository = new InMemoryDeliveryRepository();
+      const adapter = {
+        channel: "ifood" as const,
+        queue: [] as DeliveryEvent[],
+        pollEvents: async () => adapter.queue.splice(0),
+        acknowledge: async () => undefined,
+        getOrder: async () => ({ ...(await baseOrder()), status: "placed" as const }),
+        performAction: async () => undefined,
+        listCancellationReasons: async () => [],
+        requestCancellation: async () => undefined,
+        respondToDispute: async () => undefined,
+      };
+      const inbox = new DeliveryInbox({ adapters: [adapter], repository });
+      const event = (id: string, signal: DeliveryEvent["signal"], createdAt: string): DeliveryEvent => ({
+        channel: "ifood", externalEventId: id, externalOrderId: "o1", merchantExternalId: "m", rawCode: id, signal, createdAt, dispute: null,
+      });
+      return { adapter, inbox, event };
+    }
+
+    it("pedido de cancelamento antigo sem horário não reabre a recusa já gravada", async () => {
+      const { adapter, inbox, event } = unorderedSetup();
+      adapter.queue.push(
+        event("e1", "placed", "2026-11-09T10:00:00Z"),
+        event("e2", "cancellation_requested", "2026-11-09T10:01:00Z"),
+        event("e3", "cancellation_denied", "2026-11-09T10:02:00Z"),
+      );
+      await inbox.runCycle();
+      adapter.queue.push(event("e4", "cancellation_requested", UNKNOWN));
+      await inbox.runCycle();
+      const [record] = await inbox.listOrders();
+      expect(record.cancellationPending).toBe(false);
+      expect(record.lastCancellationEventAt).toBe("2026-11-09T10:02:00Z");
+      expect(record.reviewReasons).toContain(CANCELLATION_EVENT_UNORDERED_REASON);
+      expect(deliverySaleBlockers(record)).toContain(CANCELLATION_EVENT_UNORDERED_REASON);
+      // O mesmo evento de novo é duplicado: nada muda e a pendência não se repete.
+      adapter.queue.push(event("e4", "cancellation_requested", UNKNOWN));
+      const [again] = await inbox.runCycle();
+      expect(again!.duplicates).toBe(1);
+      const [same] = await inbox.listOrders();
+      expect(same.reviewReasons.filter((reason) => reason === CANCELLATION_EVENT_UNORDERED_REASON)).toHaveLength(1);
+      expect(same.cancellationPending).toBe(false);
     });
-    adapter.queue.push(event("e1", "placed", "2026-11-09T10:00:00Z"), event("e3", "cancellation_denied", "2026-11-09T10:02:00Z"));
-    await custom.runCycle();
-    adapter.queue.push(event("e2", "cancellation_requested", "1970-01-01T00:00:00.000Z"));
-    await custom.runCycle();
-    const [record] = await custom.listOrders();
-    expect(record.cancellationPending).toBe(true);
-    expect(record.lastCancellationEventAt).toBe("2026-11-09T10:02:00Z");
+
+    it("recusa antiga sem horário não libera o pedido de cancelamento com horário", async () => {
+      const { adapter, inbox, event } = unorderedSetup();
+      adapter.queue.push(event("e1", "placed", "2026-11-09T10:00:00Z"), event("e2", "cancellation_requested", "2026-11-09T10:01:00Z"));
+      await inbox.runCycle();
+      adapter.queue.push(event("e3", "cancellation_denied", UNKNOWN));
+      await inbox.runCycle();
+      const [record] = await inbox.listOrders();
+      expect(record.cancellationPending).toBe(true);
+      expect(record.lastCancellationEventAt).toBe("2026-11-09T10:01:00Z");
+      expect(deliverySaleBlockers(record)).toEqual(
+        expect.arrayContaining([CANCELLATION_EVENT_UNORDERED_REASON, "Pedido de cancelamento em análise no app: aguarde a resposta."]),
+      );
+    });
+
+    it("evento sem horário antes de qualquer decisão vale como chegou, mas a venda fica bloqueada até a conferência", async () => {
+      const { adapter, inbox, event } = unorderedSetup();
+      adapter.queue.push(event("e1", "placed", "2026-11-09T10:00:00Z"), event("e2", "cancellation_requested", UNKNOWN));
+      await inbox.runCycle();
+      adapter.queue.push(event("e3", "cancellation_denied", "2026-11-09T10:02:00Z"));
+      await inbox.runCycle();
+      const [record] = await inbox.listOrders();
+      expect(record.cancellationPending).toBe(false);
+      // A recusa com horário não apaga a dúvida sobre o evento sem horário: só a conferência libera a venda.
+      expect(deliverySaleBlockers(record)).toEqual([CANCELLATION_EVENT_UNORDERED_REASON]);
+    });
   });
 
   it("recusa de cancelamento recebida durante a chamada não é desfeita", async () => {

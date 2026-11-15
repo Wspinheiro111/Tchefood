@@ -25,10 +25,16 @@
 //    aconteceu; o que a negociação muda é o valor que a loja recebe do app (reembolso), não se houve venda.
 //    Travar a NFC-e de um pedido entregue não protege nada; o aviso pede para conferir o valor.
 
+// Evento de cancelamento do app sem horário quando não dá para ordenar com as outras respostas (ver applySignal em
+// deliveryInbox.ts). Bloqueia até a conferência: a tela do item 5 deve pedir a reconciliação com o Portal do Parceiro.
+export const CANCELLATION_EVENT_UNORDERED_REASON =
+  "Evento de cancelamento do app sem horário: não dá para saber se o cancelamento segue em análise; confira no Portal do Parceiro antes de lançar.";
+
 export type DeliverySaleGuardInput = {
   order: { isTest: boolean; status: string };
   detailPending?: boolean;
   needsReview: boolean;
+  reviewReasons?: string[];
   cancellationPending: boolean;
   cancellationRequest: { state: string } | null;
   dispute: {
@@ -56,6 +62,7 @@ export function deliverySaleBlockers(record: DeliverySaleGuardInput): string[] {
     motivos.push("Pedido gravado sem o detalhe do app (itens e valores): confira pelo Portal do Parceiro antes de lançar.");
   }
   if (record.order.status === "cancelled") motivos.push("Pedido cancelado no app.");
+  if (record.reviewReasons?.includes(CANCELLATION_EVENT_UNORDERED_REASON)) motivos.push(CANCELLATION_EVENT_UNORDERED_REASON);
   if (record.cancellationPending) motivos.push("Pedido de cancelamento em análise no app: aguarde a resposta.");
   if (record.cancellationRequest) {
     motivos.push(

@@ -286,6 +286,13 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
   `detailPending = true`, ou seja bloqueado pela guarda para sempre. Só uma liberação manual, com o PIN de gerente,
   pode destravar (lançando itens e valores conferidos no Portal do Parceiro); essa liberação é trabalho do item 5 e
   ainda não existe.
+- Evento de cancelamento do app (CAR/CARF) sem horário (vira 1970): não dá para ordenar com as outras respostas.
+  Se já há resposta com horário, ela não é revertida; sem nenhuma, o evento vale como chegou. Nos dois casos o pedido
+  ganha a pendência "Evento de cancelamento do app sem horário..." (`CANCELLATION_EVENT_UNORDERED_REASON`), que a guarda
+  bloqueia até a conferência no Portal do Parceiro. A liberação (PIN de gerente, depois de conferir) também é trabalho
+  do item 5.
+- Lista de pedidos (`tchefood_delivery_list_orders`): pedido sem horário do app usa a chegada ao servidor
+  (`received_at`) na janela de 24 h dos concluídos/cancelados e na ordem.
 - `newOrderNotified` não prova que alguém foi avisado: o servidor marca o campo depois de tentar o aviso, e o
   `main.ts` não passa `onNewOrder` para a caixa de entrada, então hoje ele fica verdadeiro sem aviso nenhum. O
   alerta/KDS do item 5 não pode depender desse campo para saber se o pedido já tocou na loja.

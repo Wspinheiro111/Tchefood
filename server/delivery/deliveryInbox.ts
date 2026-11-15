@@ -1,3 +1,4 @@
+import { CANCELLATION_EVENT_UNORDERED_REASON } from "./deliverySaleGuard";
 import {
   DELIVERY_CHANNEL_CATALOG,
   DeliveryMarketplaceError,
@@ -282,7 +283,7 @@ export const DETAIL_OTHER_STORE_RETRY_SECONDS = 60 * 60;
 export const DETAIL_RECOVERED_REASON = "Detalhe do pedido recuperado do app: confira itens e valores.";
 // Detalhe buscado de novo num pedido que já tinha itens (o app alterou o pedido depois de gravado).
 export const DETAIL_REFRESHED_REASON = "Detalhe do pedido atualizado pelo app (itens e valores novos): confira antes de lançar.";
-// Pedido sem detalhe mais velho que isto sai da recuperação (o banco filtra pelo horário do pedido).
+// Pedido sem detalhe recebido pelo servidor há mais que isto sai da recuperação (o banco filtra por received_at).
 export const DETAIL_PENDING_MAX_AGE_DAYS = 7;
 export const ORDER_PATCHED_REASON = "O app alterou o pedido: itens e valores serão buscados de novo; confira antes de lançar.";
 export const PARTIAL_CANCELLATION_APPLIED_REASON = "Cancelamento parcial aplicado pelo app: itens e valores mudaram; confira antes de lançar.";
@@ -931,11 +932,17 @@ function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
   if (event.createdAt > record.lastEventAt) record.lastEventAt = event.createdAt;
   const isCancellationSignal = event.signal === "cancellation_requested" || event.signal === "cancellation_denied";
   if (isCancellationSignal) {
-    // Evento de cancelamento atrasado (ex.: o pedido chegando depois da recusa) não reabre nada. Evento sem horário
-    // (vira 1970) não dá para ordenar: vale como chegou e não mexe no último horário conhecido.
-    const unknownTime = event.createdAt === UNKNOWN_EVENT_TIME;
-    if (!unknownTime && record.lastCancellationEventAt !== null && event.createdAt < record.lastCancellationEventAt) return;
-    if (!unknownTime) record.lastCancellationEventAt = event.createdAt;
+    // Evento de cancelamento atrasado (ex.: o pedido chegando depois da recusa) não reabre nada.
+    if (event.createdAt === UNKNOWN_EVENT_TIME) {
+      // Sem horário (vira 1970) não dá para saber se veio antes ou depois das outras respostas do app. Fica a
+      // pendência de reconciliação, que bloqueia venda/NFC-e (deliverySaleBlockers) até a conferência no Portal do
+      // Parceiro. Se já há decisão com horário, ela não é revertida; sem nenhuma, o evento vale como chegou.
+      flag(record, CANCELLATION_EVENT_UNORDERED_REASON);
+      if (record.lastCancellationEventAt !== null) return;
+    } else {
+      if (record.lastCancellationEventAt !== null && event.createdAt < record.lastCancellationEventAt) return;
+      record.lastCancellationEventAt = event.createdAt;
+    }
     // O app respondeu (CAR = recebeu o pedido, CARF = recusou): a reserva do pedido da loja acabou.
     record.cancellationRequest = null;
   }

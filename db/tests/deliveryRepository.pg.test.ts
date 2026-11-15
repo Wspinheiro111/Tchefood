@@ -249,6 +249,27 @@ function setup() {
     expect(sql(`SELECT status || '|' || version FROM delivery_orders WHERE external_id = '${cancelled}'`)).toBe(`cancelled|${record.version}`);
   });
 
+  it('lista de pedidos: horário do app ausente (1970) usa a chegada ao servidor na janela de 24 h e na ordem (rodada 5)', async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const spy = vi.spyOn(api, 'getOrder').mockRejectedValue(new DeliveryMarketplaceError('ifood', 'invalid_response', 'Valor inválido no iFood: total.subTotal.'));
+    const [recent, old, oldOpen] = [sandbox.placeOrder({ items: ITEMS }), sandbox.placeOrder({ items: ITEMS }), sandbox.placeOrder({ items: ITEMS })];
+    await inbox.runChannel(api);
+    spy.mockRestore();
+    sql(`UPDATE delivery_orders SET placed_at = 'epoch' WHERE external_id IN ('${recent}', '${old}', '${oldOpen}');
+         UPDATE delivery_orders SET status = 'concluded' WHERE external_id IN ('${recent}', '${old}');
+         UPDATE delivery_orders SET received_at = NOW() - INTERVAL '25 hours' WHERE external_id IN ('${old}', '${oldOpen}');`);
+    expect(sql(`SELECT string_agg(status || ':' || detail_pending, ',' ORDER BY external_id = '${recent}' DESC, external_id = '${old}' DESC) FROM delivery_orders WHERE external_id IN ('${recent}', '${old}', '${oldOpen}')`))
+      .toBe('concluded:true,concluded:true,placed:true');
+    const listed = (await repository.listOrders()).map((r) => r.order.externalId);
+    // Recebido agora e concluído sem o detalhe: continua na lista para a conferência.
+    expect(listed).toContain(recent);
+    // Recebido há mais de 24 h: concluído sai da lista, aberto continua.
+    expect(listed).not.toContain(old);
+    expect(listed).toContain(oldOpen);
+    // Ordem pela chegada ao servidor (o mais recente primeiro), não por 1970.
+    expect(listed.indexOf(recent)).toBeLessThan(listed.indexOf(oldOpen));
+  });
+
   it('rodízio do detalhe: adiado sai da lista até o prazo, nunca adiado vem primeiro, adiar não muda a versão', async () => {
     const { sandbox, api, repository, inbox } = setup();
     const spy = vi.spyOn(api, 'getOrder').mockRejectedValue(new DeliveryMarketplaceError('ifood', 'invalid_response', 'Valor inválido no iFood: total.subTotal.'));
