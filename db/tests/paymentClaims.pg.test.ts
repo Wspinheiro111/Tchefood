@@ -3194,9 +3194,9 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
 
     it('GPT r12 P1-02/P1-03: tchefood_order_snapshot e tchefood_list_refund_reopened_orders dão o estado oficial, só da loja do token', () => {
       const { order, ch } = refundedOrder();
-      const listed = json<Array<Record<string, unknown>>>(asDevice('SELECT tchefood_list_refund_reopened_orders()'));
+      const listed = json<Array<Record<string, unknown>>>(asDevice("SELECT tchefood_list_refund_reopened_orders()->'items'"));
       expect(listed.find((x) => x.order_id === order)).toMatchObject({ status: 'PAYING', remaining_balance: 100 });
-      expect(json<Array<Record<string, unknown>>>(asDevice('SELECT tchefood_list_refund_reopened_orders()', OTHER)).some((x) => x.order_id === order)).toBe(false);
+      expect(json<Array<Record<string, unknown>>>(asDevice("SELECT tchefood_list_refund_reopened_orders()->'items'", OTHER)).some((x) => x.order_id === order)).toBe(false);
       const snap = json<{ order: Record<string, unknown>; items: unknown[]; payments: Array<Record<string, unknown>>; audits: Array<Record<string, unknown>> }>(asDevice(`SELECT tchefood_order_snapshot('${order}')`));
       expect(snap.order).toMatchObject({ id: order, status: 'PAYING', remaining_balance: 100 });
       expect(snap.items.length).toBeGreaterThan(0);
@@ -3206,10 +3206,96 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(asRole('anon', `SELECT tchefood_order_snapshot('${order}')`)).toMatchObject({ ok: false, sqlstate: '42501' });
       // Encerrada como venda devolvida: sai da lista e o retrato traz o registro da baixa.
       asDevice(closeQ(order, crypto.randomUUID()));
-      expect(json<Array<Record<string, unknown>>>(asDevice('SELECT tchefood_list_refund_reopened_orders()')).some((x) => x.order_id === order)).toBe(false);
+      expect(json<Array<Record<string, unknown>>>(asDevice("SELECT tchefood_list_refund_reopened_orders()->'items'")).some((x) => x.order_id === order)).toBe(false);
       const after = json<{ order: Record<string, unknown>; audits: Array<Record<string, unknown>> }>(asDevice(`SELECT tchefood_order_snapshot('${order}')`));
       expect(after.order.status).toBe('CLOSED');
       expect(after.audits.map((x) => x.action_type)).toEqual(['POINT_PAYMENT_REFUNDED', 'ORDER_REFUNDED_WRITE_OFF']);
+    });
+
+    it('GPT r15 P2-01: 201 contas reabertas por estorno: a lista paginada (cursor refunded_at|order_id) devolve todas, sem repetir nem pular, mesmo com a mesma hora de estorno', () => {
+      // Loja própria, gravada direto (o leitor não confere a origem): 201 contas PAYING com saldo e o registro do estorno
+      // que as reabriu; metade com a MESMA hora de estorno (o desempate é o id da conta).
+      const T = 'a1a1a1a1-0000-4000-8000-000000000a15';
+      sql(`BEGIN; SET LOCAL session_replication_role = replica;
+           DELETE FROM audit_logs WHERE tenant_id = '${T}'; DELETE FROM orders WHERE tenant_id = '${T}';
+           INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id, status, total_amount, paid_amount, remaining_balance)
+             SELECT ('b1b1b1b1-0000-4000-8000-' || lpad(g::text, 12, '0'))::uuid, '${T}', '${TABLE}', '${STAFF}', 'PAYING', 10, 0, 10 FROM generate_series(1, 201) g;
+           INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata, created_at)
+             SELECT '${T}', ('b1b1b1b1-0000-4000-8000-' || lpad(g::text, 12, '0'))::uuid, '${STAFF}', 'POINT_PAYMENT_REFUNDED', 'venda estornada',
+                    jsonb_build_object('order_reopened', true, 'previous_closed_at', NOW() - INTERVAL '1 hour'),
+                    CASE WHEN g <= 100 THEN TIMESTAMPTZ '2026-11-15 10:00:00+00' ELSE TIMESTAMPTZ '2026-11-15 10:00:00+00' + (g || ' seconds')::interval END
+               FROM generate_series(1, 201) g;
+           COMMIT;`);
+      type Page = { items: Array<{ order_id: string; refunded_at: string }>; next_cursor: string | null };
+      const page = (cursor: string | null, limit?: number) => json<Page>(asDevice(`SELECT tchefood_list_refund_reopened_orders(${cursor ? `'${cursor}'` : 'NULL'}${limit ? `, ${limit}` : ''})`, T));
+      const first = page(null);
+      expect(first.items).toHaveLength(200);
+      expect(first.next_cursor).toBeTruthy();
+      const second = page(first.next_cursor);
+      expect(second.items).toHaveLength(1);
+      expect(second.next_cursor).toBeNull();
+      const ids = [...first.items, ...second.items].map((i) => i.order_id);
+      expect(new Set(ids).size).toBe(201);
+      // Páginas pequenas (cortando no meio das 100 com a mesma hora): as mesmas 201, na mesma ordem.
+      const small: string[] = [];
+      let cursor: string | null = null;
+      for (let i = 0; i < 10; i += 1) {
+        const pg: Page = page(cursor, 37);
+        small.push(...pg.items.map((x) => x.order_id));
+        cursor = pg.next_cursor;
+        if (!cursor) break;
+      }
+      expect(small).toEqual(ids);
+      // Limite e cursor inválidos: recusa; outra loja não vê nada desta.
+      expect(detailOf(`SELECT tchefood_list_refund_reopened_orders(NULL, 0)`, T)).toMatch(/^TF006/);
+      expect(detailOf(`SELECT tchefood_list_refund_reopened_orders(NULL, 201)`, T)).toMatch(/^TF006/);
+      expect(detailOf(`SELECT tchefood_list_refund_reopened_orders('nada', 10)`, T)).toMatch(/^TF006/);
+      expect(json<Page>(asDevice('SELECT tchefood_list_refund_reopened_orders()', OTHER)).items.some((x) => ids.includes(x.order_id))).toBe(false);
+      expect(asRole('anon', 'SELECT tchefood_list_refund_reopened_orders()')).toMatchObject({ ok: false, sqlstate: '42501' });
+    });
+
+    it('GPT r15 P1-01: tchefood_list_refund_order_changes traz a conta estornada e já encerrada (venda devolvida ou quitada), por sequência, só da loja do token', () => {
+      type Change = { order_id: string; status: string; remaining_balance: number; last_seq: number; last_audit_id: string };
+      type Out = { items: Change[]; next_seq: number; safe_seq: number; has_more: boolean };
+      const changes = (after: number, limit?: number, tenant = TENANT) => json<Out>(asDevice(`SELECT tchefood_list_refund_order_changes(${after}${limit ? `, ${limit}` : ''})`, tenant));
+      const start = Number(sql('SELECT COALESCE(max(server_seq), 0) FROM audit_logs'));
+      // Conta 1: estornada e encerrada como venda devolvida. Conta 2: estornada e quitada em dinheiro. Conta 3: só estornada.
+      const one = refundedOrder();
+      asDevice(closeQ(one.order, crypto.randomUUID()));
+      const two = refundedOrder();
+      const paid = pay(payment(two.order, 100, { idempotency_key: key('r15c') }));
+      expect(paid.ok, paid.message ?? '').toBe(true);
+      const three = refundedOrder();
+      const out = changes(start);
+      const by = (id: string) => out.items.find((i) => i.order_id === id)!;
+      expect(out.items.map((i) => i.order_id)).toEqual([one.order, two.order, three.order]);
+      expect(by(one.order)).toMatchObject({ status: 'CLOSED', remaining_balance: 100 });
+      expect(by(one.order).last_audit_id).toBe(sql(`SELECT id FROM audit_logs WHERE order_id = '${one.order}' AND action_type = 'ORDER_REFUNDED_WRITE_OFF'`));
+      expect(by(two.order)).toMatchObject({ status: 'CLOSED', remaining_balance: 0 });
+      expect(by(three.order)).toMatchObject({ status: 'PAYING', remaining_balance: 100 });
+      expect(out.has_more).toBe(false);
+      expect(out.next_seq).toBe(by(three.order).last_seq);
+      // Registros de agora: o aparelho ainda não guarda como lido (voltam na próxima leitura).
+      expect(out.safe_seq).toBe(start);
+      // Paginado, em ordem de sequência; depois da última, nada.
+      const p1 = changes(start, 2);
+      expect(p1.items.map((i) => i.order_id)).toEqual([one.order, two.order]);
+      expect(p1).toMatchObject({ has_more: true, next_seq: by(two.order).last_seq });
+      expect(changes(p1.next_seq, 2)).toMatchObject({ items: [{ order_id: three.order }], has_more: false });
+      expect(changes(out.next_seq)).toMatchObject({ items: [], next_seq: out.next_seq, safe_seq: out.next_seq, has_more: false });
+      // Mais de 10 minutos depois: tudo conta como lido.
+      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE audit_logs SET created_at = created_at - INTERVAL '11 minutes' WHERE server_seq > ${start} AND action_type IN ('POINT_PAYMENT_REFUNDED', 'ORDER_REFUNDED_WRITE_OFF'); COMMIT;`);
+      expect(changes(start).safe_seq).toBe(out.next_seq);
+      // Nova alteração numa conta já lida (2º fechamento): volta com a sequência nova.
+      asDevice(closeQ(three.order, crypto.randomUUID()));
+      const again = changes(out.next_seq);
+      expect(again.items).toMatchObject([{ order_id: three.order, status: 'CLOSED', remaining_balance: 100 }]);
+      expect(again.safe_seq).toBe(out.next_seq);
+      // Outra loja, anônimo e argumentos inválidos.
+      expect(changes(start, undefined, OTHER).items.some((i) => [one.order, two.order, three.order].includes(i.order_id))).toBe(false);
+      expect(asRole('anon', 'SELECT tchefood_list_refund_order_changes(0)')).toMatchObject({ ok: false, sqlstate: '42501' });
+      expect(detailOf('SELECT tchefood_list_refund_order_changes(-1)')).toMatch(/^TF006/);
+      expect(detailOf('SELECT tchefood_list_refund_order_changes(0, 201)')).toMatch(/^TF006/);
     });
 
     describe('P1-02: tchefood_list_point_payments', () => {

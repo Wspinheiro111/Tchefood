@@ -12,11 +12,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { NFCE_ALREADY_ISSUED, useTcheStore } from '../store/useTcheStore';
 import { clearReviewHold } from '../lib/payments/reviewHolds';
 import { computeItemsShare } from '../lib/money';
-import { closeRefundedOrder, listPointPayments, type ServerPointPayment } from '../lib/payments/pointPaymentsServer';
+import { closeRefundedOrder, listPointPayments, listRefundReopenedOrders, type ServerPointPayment } from '../lib/payments/pointPaymentsServer';
 import type { ClaimDeps } from '../lib/payments/paymentClaim';
 import { refundPointPayment, type ReconcileDeps } from '../lib/payments/pointReconcile';
 import { PointRefunds, RefundReopenedOrders, isRefundReopenedOrder, submitPointRefund, submitRefundedWriteOff } from '../components/PointRefund';
-import { currentShiftPeriod, reconciliation, shiftKpis, waiterSplit } from '../lib/reports';
+import { currentShiftPeriod, keptSaleCents, reconciliation, shiftKpis, waiterSplit } from '../lib/reports';
 import { indexDashboard, salesCents } from '../lib/ownerDashboard';
 import type { OrderItem, Payment } from '../types';
 
@@ -29,6 +29,7 @@ const SERVER_WRITE_OFF = '3e5a7c9e-1a3c-4e5a-9c1e-6a8c0e2a4c6e';
 const CLOUD = { url: 'https://x.supabase.co', anon_key: 'anon', email: 'a@b', access_token: 'jwt', refresh_token: 'r', expires_at: 9_999_999_999, tenant_id: 't' };
 
 type Reply = { status: number; body: unknown } | 'network';
+const NO_CHANGES = { status: 200, body: { items: [], next_seq: 0, safe_seq: 0, has_more: false } };
 /** ClaimDeps de PostgREST falso: cada chamada grava função e corpo; `answer` decide a resposta. */
 function rpcDeps(answer: (fn: string, body: Record<string, unknown>) => Reply) {
   const calls: { fn: string; body: Record<string, unknown> }[] = [];
@@ -479,8 +480,8 @@ describe('GPT r14 P1-01: conta reaberta no servidor com evento desta conta pende
       audits: [{ id: REFUND_AUDIT, order_id: orderId, performed_by_user_id: st().currentUserId, authorized_by_manager_id: MANAGER, action_type: 'POINT_PAYMENT_REFUNDED', amount_impact: 0,
         reason: 'venda estornada na maquininha', metadata: { order_reopened: true, payment_id: pay.id }, created_at: new Date().toISOString() }],
     };
-    const { d, calls } = rpcDeps((fn) => (fn === 'tchefood_list_refund_reopened_orders'
-      ? { status: 200, body: [{ order_id: orderId, table_id: local.table_id, status: 'PAYING', remaining_balance: local.total_amount, total_amount: local.total_amount, refunded_at: new Date().toISOString() }] }
+    const { d, calls } = rpcDeps((fn) => (fn === 'tchefood_list_refund_order_changes' ? NO_CHANGES : fn === 'tchefood_list_refund_reopened_orders'
+      ? { status: 200, body: { items: [{ order_id: orderId, table_id: local.table_id, status: 'PAYING', remaining_balance: local.total_amount, total_amount: local.total_amount, refunded_at: new Date().toISOString() }], next_cursor: null } }
       : { status: 200, body: snapshot }));
     render(<RefundReopenedOrders onOpenCheckout={() => undefined} deps={d} />);
     const row = await screen.findByTestId(`reopened-blocked-${orderId}`);
@@ -504,11 +505,151 @@ describe('GPT r14 P1-01: conta reaberta no servidor com evento desta conta pende
     payPoint(orderId, order.remaining_balance, 'k-fila');
     const local = st().orders.find((o) => o.id === orderId)!;
     useTcheStore.setState({ cloud: CLOUD });
-    const { d } = rpcDeps((fn) => (fn === 'tchefood_list_refund_reopened_orders'
-      ? { status: 200, body: [{ order_id: orderId, table_id: local.table_id, status: 'PAYING', remaining_balance: local.total_amount, total_amount: local.total_amount, refunded_at: new Date().toISOString() }] }
+    const { d } = rpcDeps((fn) => (fn === 'tchefood_list_refund_order_changes' ? NO_CHANGES : fn === 'tchefood_list_refund_reopened_orders'
+      ? { status: 200, body: { items: [{ order_id: orderId, table_id: local.table_id, status: 'PAYING', remaining_balance: local.total_amount, total_amount: local.total_amount, refunded_at: new Date().toISOString() }], next_cursor: null } }
       : { status: 200, body: { order: { ...local, status: 'PAYING', closed_at: null }, items: [], payments: [], audits: [] } }));
     render(<RefundReopenedOrders deps={d} />);
     expect((await screen.findByTestId(`reopened-blocked-${orderId}`)).textContent).toMatch(/aguarde a sincronização/);
     expect(st().orders.find((o) => o.id === orderId)!.status).toBe('CLOSED');
+  });
+});
+
+/** Corpo da lista de contas reabertas do servidor (r16: página com cursor). */
+const reopenedBody = (items: unknown[], next: string | null = null): unknown => ({ items, next_cursor: next });
+
+describe('GPT r15 P1-01: venda estornada e encerrada como devolvida em outro aparelho entre duas leituras deste', () => {
+  it('a conta daqui (fechada, paga) fica com o estornado, a baixa e os relatórios do servidor; o ponto de leitura só anda com tudo aplicado', async () => {
+    localStorage.clear();
+    const orderId = openWithItems();
+    const order = st().orders.find((o) => o.id === orderId)!;
+    payPoint(orderId, order.remaining_balance, 'k-r15');
+    const local = st().orders.find((o) => o.id === orderId)!;
+    expect(local.status).toBe('CLOSED');
+    const pay = st().payments.find((p) => p.idempotency_key === 'k-r15')!;
+    const total = Math.round(local.total_amount * 100);
+    const logsOf = () => new Map([[orderId, st().auditLogs.filter((l) => l.order_id === orderId && l.action_type === 'ORDER_REFUNDED_WRITE_OFF').reduce((n, l) => n + Number(l.metadata?.written_off_cents), 0)]].filter(([, n]) => n !== 0) as [string, number][]);
+    // Este aparelho vê a venda inteira como recebida.
+    expect(keptSaleCents(local, logsOf())).toMatchObject({ keptCents: total, writtenOff: false });
+    // No servidor (outro aparelho): estornou, reabriu e o gerente já encerrou como venda devolvida. Fechada de novo.
+    const now = new Date().toISOString();
+    const snapshot = {
+      order: { ...local, status: 'CLOSED', paid_amount: 0, remaining_balance: local.total_amount },
+      items: st().orderItems.filter((i) => i.order_id === orderId).map((i) => ({ ...i, is_paid: false })),
+      payments: [{ ...pay, status: 'REFUNDED' }],
+      audits: [
+        { id: REFUND_AUDIT, order_id: orderId, performed_by_user_id: st().currentUserId, authorized_by_manager_id: MANAGER, action_type: 'POINT_PAYMENT_REFUNDED', amount_impact: 0,
+          reason: 'venda estornada na maquininha', metadata: { order_reopened: true, payment_id: pay.id }, created_at: now },
+        { id: SERVER_WRITE_OFF, order_id: orderId, performed_by_user_id: st().currentUserId, authorized_by_manager_id: MANAGER, action_type: 'ORDER_REFUNDED_WRITE_OFF', amount_impact: local.total_amount,
+          reason: 'cliente não vai pagar de novo', metadata: { written_off_cents: total, cumulative_written_off_cents: total, client_audit_id: 'outro' }, created_at: now },
+      ],
+    };
+    const ev = st().outbox.find((e) => e.table === 'orders' && e.row_id === orderId)!;
+    useTcheStore.setState({ outbox: [], syncRejected: [{ event: ev, message: 'recusado', rejected_at: now } as never], cloud: CLOUD });
+    const { d, calls } = rpcDeps((fn) => (fn === 'tchefood_list_refund_order_changes'
+      ? { status: 200, body: { items: [{ order_id: orderId, status: 'CLOSED', remaining_balance: local.total_amount, last_seq: 42, last_audit_id: SERVER_WRITE_OFF }], next_seq: 42, safe_seq: 42, has_more: false } }
+      : fn === 'tchefood_list_refund_reopened_orders' ? { status: 200, body: reopenedBody([]) } : { status: 200, body: snapshot }));
+    // Com alteração desta conta recusada aqui: nada muda e o ponto de leitura não anda (volta na próxima).
+    render(<RefundReopenedOrders deps={d} />);
+    await waitFor(() => expect(calls.some((c) => c.fn === 'tchefood_order_snapshot')).toBe(true));
+    expect(st().payments.find((p) => p.id === pay.id)!.status).toBe('APPROVED');
+    expect(localStorage.getItem(`tchefood.refundChangesSeq.v1:${st().tenant.id}`)).toBe('41');
+    cleanup();
+    // Resolvido: a próxima leitura traz a conta.
+    useTcheStore.setState({ syncRejected: [] });
+    render(<RefundReopenedOrders deps={d} />);
+    await waitFor(() => expect(st().payments.find((p) => p.id === pay.id)!.status).toBe('REFUNDED'));
+    const after = st().orders.find((o) => o.id === orderId)!;
+    expect(after).toMatchObject({ status: 'CLOSED', paid_amount: 0, remaining_balance: local.total_amount });
+    expect(st().auditLogs.filter((l) => l.order_id === orderId).map((l) => l.action_type).sort()).toEqual(expect.arrayContaining(['ORDER_REFUNDED_WRITE_OFF', 'POINT_PAYMENT_REFUNDED']));
+    // Relatórios: a venda devolvida não fica como recebida.
+    expect(keptSaleCents(after, logsOf())).toMatchObject({ keptCents: 0, writtenOff: true });
+    await waitFor(() => expect(localStorage.getItem(`tchefood.refundChangesSeq.v1:${st().tenant.id}`)).toBe('42'));
+    // Já aplicado: outra leitura com o mesmo registro não busca a conta de novo.
+    cleanup();
+    localStorage.clear();
+    const before = calls.filter((c) => c.fn === 'tchefood_order_snapshot').length;
+    render(<RefundReopenedOrders deps={d} />);
+    await waitFor(() => expect(localStorage.getItem(`tchefood.refundChangesSeq.v1:${st().tenant.id}`)).toBe('42'));
+    expect(calls.filter((c) => c.fn === 'tchefood_order_snapshot').length).toBe(before);
+  });
+});
+
+describe('GPT r15 P2-01: a lista de contas reabertas lê todas as páginas', () => {
+  it('201 contas em duas páginas: todas, sem repetir; cursor da página anterior; página ruim = falha (não esconde)', async () => {
+    const row = (n: number) => ({ order_id: `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`, table_id: null, status: 'PAYING', remaining_balance: 10, total_amount: 10, refunded_at: '2026-11-15T10:00:00Z' });
+    const all = Array.from({ length: 201 }, (_x, i) => row(i + 1));
+    const { d, calls } = rpcDeps((_fn, b) => (b.p_cursor === null
+      ? { status: 200, body: reopenedBody(all.slice(0, 200), 'c1') }
+      : { status: 200, body: reopenedBody([all[199], all[200]]) }));
+    const out = await listRefundReopenedOrders(d);
+    expect(out.kind).toBe('ok');
+    if (out.kind !== 'ok') return;
+    expect(out.items.map((i) => i.order_id)).toEqual(all.map((r) => r.order_id));
+    expect(calls.map((c) => c.body)).toEqual([{ p_cursor: null, p_limit: 200 }, { p_cursor: 'c1', p_limit: 200 }]);
+    // Segunda página falha: nada de lista pela metade.
+    expect((await listRefundReopenedOrders(rpcDeps((_fn, b) => (b.p_cursor === null ? { status: 200, body: reopenedBody(all.slice(0, 200), 'c1') } : { status: 500, body: 'erro' })).d)).kind).toBe('error');
+    // Cursor que não anda: falha em vez de laço.
+    expect((await listRefundReopenedOrders(rpcDeps(() => ({ status: 200, body: reopenedBody([], 'c1') })).d)).kind).toBe('error');
+  });
+});
+
+describe('GPT r15 P2-02: encerramento recusado porque a conta já fechou', () => {
+  const snapOf = (orderId: string, over: Record<string, unknown>, audits: unknown[] = []) => {
+    const o = st().orders.find((x) => x.id === orderId)!;
+    return { order: { ...o, status: 'CLOSED', closed_at: new Date().toISOString(), ...over }, items: [], payments: [], audits };
+  };
+  const refused: Reply = { status: 400, body: { code: 'TF007', message: 'TCHEFOOD_PAGAMENTO: a conta já está fechada.', details: 'order_not_open' } };
+
+  it('quitada por pagamento em outro aparelho: não é venda devolvida; diz que foi quitada e atualiza a conta', async () => {
+    const orderId = await reopenedOrder();
+    const o = st().orders.find((x) => x.id === orderId)!;
+    const { d } = rpcDeps((fn) => (fn === 'tchefood_close_refunded_order' ? refused : { status: 200, body: snapOf(orderId, { paid_amount: o.total_amount, remaining_balance: 0 }) }));
+    const r = await submitRefundedWriteOff(orderId, '9999', 'cliente não vai pagar de novo', d);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/quitada por pagamento/);
+    expect(st().orders.find((x) => x.id === orderId)).toMatchObject({ status: 'CLOSED', remaining_balance: 0 });
+    expect(st().auditLogs.some((l) => l.order_id === orderId && l.action_type === 'ORDER_REFUNDED_WRITE_OFF')).toBe(false);
+  });
+
+  it('encerrada como venda devolvida por outro aparelho (registro da baixa com o total igual ao saldo): sucesso com o total do servidor', async () => {
+    const orderId = await reopenedOrder();
+    const o = st().orders.find((x) => x.id === orderId)!;
+    const cents = Math.round(o.remaining_balance * 100);
+    const audit = { id: SERVER_WRITE_OFF, order_id: orderId, performed_by_user_id: st().currentUserId, authorized_by_manager_id: MANAGER, action_type: 'ORDER_REFUNDED_WRITE_OFF', amount_impact: o.remaining_balance,
+      reason: 'cliente não vai pagar de novo', metadata: { written_off_cents: cents, cumulative_written_off_cents: cents, client_audit_id: 'outro' }, created_at: new Date().toISOString() };
+    const { d } = rpcDeps((fn) => (fn === 'tchefood_close_refunded_order' ? refused : { status: 200, body: snapOf(orderId, {}, [audit]) }));
+    expect(await submitRefundedWriteOff(orderId, '9999', 'cliente não vai pagar de novo', d)).toEqual({ ok: true, data: { writtenOff: o.remaining_balance } });
+  });
+
+  it('fechada com saldo e sem registro de baixa que confira: não afirma nada', async () => {
+    const orderId = await reopenedOrder();
+    const { d } = rpcDeps((fn) => (fn === 'tchefood_close_refunded_order' ? refused : { status: 200, body: snapOf(orderId, {}) }));
+    const r = await submitRefundedWriteOff(orderId, '9999', 'cliente não vai pagar de novo', d);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/sem o registro desta baixa/);
+  });
+
+  it('id de tentativa já usado num encerramento anterior (conta reaberta por outro estorno): o id gasto sai e a tentativa é refeita com id novo', async () => {
+    localStorage.clear();
+    const orderId = await reopenedOrder();
+    const o = st().orders.find((x) => x.id === orderId)!;
+    const cents = Math.round(o.remaining_balance * 100);
+    localStorage.setItem(`tchefood.writeOffAttempt.v1:${orderId}`, 'id-antigo');
+    const old = { id: AUTH_AUDIT, order_id: orderId, performed_by_user_id: st().currentUserId, authorized_by_manager_id: MANAGER, action_type: 'ORDER_REFUNDED_WRITE_OFF', amount_impact: o.remaining_balance,
+      reason: 'cliente não vai pagar de novo', metadata: { written_off_cents: cents, cumulative_written_off_cents: cents, client_audit_id: 'id-antigo' }, created_at: new Date().toISOString() };
+    const { d, calls } = rpcDeps((fn, b) => (fn === 'tchefood_order_snapshot'
+      ? { status: 200, body: { order: { ...o }, items: [], payments: [], audits: [old] } }
+      : b.p_client_audit_id === 'id-antigo'
+        // Reenvio: o servidor devolve o encerramento antigo, com o status de agora (reaberta).
+        ? { status: 200, body: { audit_id: AUTH_AUDIT, order_id: orderId, status: 'PAYING', written_off_cents: cents, cumulative_written_off_cents: cents } }
+        : { status: 200, body: { audit_id: SERVER_WRITE_OFF, status: 'CLOSED', order_id: b.p_order, written_off_cents: 0, cumulative_written_off_cents: cents } }));
+    const r = await submitRefundedWriteOff(orderId, '9999', 'cliente não vai pagar de novo', d);
+    expect(r).toEqual({ ok: true, data: { writtenOff: o.remaining_balance } });
+    const ids = calls.filter((c) => c.fn === 'tchefood_close_refunded_order').map((c) => c.body.p_client_audit_id);
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).toBe('id-antigo');
+    expect(ids[1]).not.toBe('id-antigo');
+    expect(st().orders.find((x) => x.id === orderId)!.status).toBe('CLOSED');
+    expect(localStorage.getItem(`tchefood.writeOffAttempt.v1:${orderId}`)).toBeNull();
   });
 });

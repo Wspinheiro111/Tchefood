@@ -53,6 +53,14 @@ async function pullOnce(cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
   } catch (e) {
     useTcheStore.getState().setPullError((e as Error).message);
   }
+  // GPT r15 P1-01: estornos da Point e encerramentos como venda devolvida feitos em outro aparelho (também com este
+  // fechado): a conta daqui fica com o estado do servidor. Import tardio: o módulo usa este para a sessão.
+  try {
+    const [m, c] = await Promise.all([import('../payments/refundOrdersPull'), import('../payments/paymentClaim')]);
+    await m.pullRefundOrders({ ...c.defaultClaimDeps(), config: async () => cfg, fetch: fetchFn });
+  } catch {
+    // Sem leitura agora: tenta de novo na próxima rodada.
+  }
 }
 
 /**

@@ -4,11 +4,14 @@ import { ManagerAuthSheet, SERVER_REASON_MIN_LENGTH } from './ManagerAuthSheet';
 import { useTcheStore } from '../store/useTcheStore';
 import { formatBRL } from '../lib/money';
 import { defaultReconcileDeps, refundPointPayment, type ReconcileDeps } from '../lib/payments/pointReconcile';
-import { closeRefundedOrder, getOrderSnapshot, listPointPayments, listRefundReopenedOrders, type ServerPointPayment, type ServerReopenedOrder } from '../lib/payments/pointPaymentsServer';
-import { defaultClaimDeps, type ClaimDeps } from '../lib/payments/paymentClaim';
+import { closeRefundedOrder, getOrderSnapshot, listPointPayments, type ServerOrderSnapshot, type ServerPointPayment, type ServerReopenedOrder } from '../lib/payments/pointPaymentsServer';
+import { isRefundReopenedOrder, pullRefundOrders, syncOrderFromServer, type BlockedReason } from '../lib/payments/refundOrdersPull';
+
+export { isRefundReopenedOrder, syncOrderFromServer };
+import type { ClaimDeps } from '../lib/payments/paymentClaim';
 import { toCents } from '../lib/money';
 import { uuid } from '../lib/ids';
-import type { ActionResult, AuditLog, Order, Payment } from '../types';
+import type { ActionResult, Payment } from '../types';
 
 /**
  * Estorno de pagamento da Point já registrado (auditoria GPT r9, P1-01): a venda foi estornada na maquininha ou no app
@@ -49,19 +52,6 @@ export const POINT_REFUND_REOPENED = 'A conta estava encerrada e foi reaberta co
  * A conta reaberta aparece em "Contas reabertas pelo estorno" (lista do servidor) quando a leitura voltar.
  */
 export const POINT_REFUND_REMOTE = 'Estorno registrado no servidor. Não deu para trazer a conta para este aparelho agora: ela aparece em Conciliação › Contas reabertas pelo estorno quando a leitura da nuvem voltar.';
-
-/**
- * GPT r12 (P1-02): traz a conta do servidor para este aparelho (tchefood_order_snapshot). 'applied': este aparelho
- * ficou com o estado do servidor; 'pending': há alteração desta conta na fila daqui (nada mudou); 'rejected': há
- * alteração desta conta recusada pela nuvem (nada mudou até resolver); 'failed': sem leitura.
- */
-export async function syncOrderFromServer(orderId: string, deps: ClaimDeps = defaultClaimDeps()): Promise<'applied' | 'pending' | 'rejected' | 'missing' | 'failed'> {
-  const snap = await getOrderSnapshot(orderId, deps);
-  if (snap.kind === 'missing') return 'missing';
-  if (snap.kind !== 'ok') return 'failed';
-  const r = useTcheStore.getState().applyServerOrderSnapshot(snap.snapshot);
-  return r.ok ? r.data.kind : 'failed';
-}
 
 /**
  * Pede o estorno ao servidor e, gravado lá, espelha aqui (pagamento REFUNDED, saldo, conta reaberta, trava da chave) se
@@ -269,16 +259,6 @@ export function PointRefunds({ payments, listDeps, onRefunded }: { payments: rea
   );
 }
 
-/** Conta reaberta pelo estorno da Point: fechada antes (registro do estorno com order_reopened), com pagamento da Point estornado e saldo. */
-export function isRefundReopenedOrder(order: Order, payments: readonly Payment[], logs: readonly AuditLog[] = []): boolean {
-  if (order.status === 'CLOSED' || order.status === 'CANCELED' || toCents(order.remaining_balance) <= 0) return false;
-  if (!payments.some((p) => p.order_id === order.id && p.acquirer === 'MERCADO_PAGO' && p.status === 'REFUNDED')) return false;
-  // GPT r12 (P1-01): a conta é identificada pelo estado financeiro e pelo registro do estorno que a reabriu
-  // (POINT_PAYMENT_REFUNDED com order_reopened, o mesmo critério do servidor), nunca pela NFC-e: a nota só decide as
-  // providências fiscais (aviso de conferir o cancelamento).
-  return logs.some((l) => l.order_id === order.id && l.action_type === 'POINT_PAYMENT_REFUNDED' && l.metadata?.order_reopened === true);
-}
-
 export const WRITE_OFF_HELP = 'Encerra a conta sem cobrar o saldo estornado: a venda fica registrada como devolvida, com o valor baixado. Só com o PIN do gerente, conferido no servidor.';
 
 /**
@@ -306,7 +286,7 @@ function clearWriteOffAttempt(orderId: string): void {
 }
 
 /** Pede ao servidor o encerramento como venda devolvida; só com a resposta dele a conta fecha aqui. */
-export async function submitRefundedWriteOff(orderId: string, managerPin: string, reason: string, deps?: ClaimDeps, clientAuditId: string = writeOffAttemptId(orderId)): Promise<ActionResult<{ writtenOff: number }>> {
+export async function submitRefundedWriteOff(orderId: string, managerPin: string, reason: string, deps?: ClaimDeps, clientAuditId: string = writeOffAttemptId(orderId), retried = false): Promise<ActionResult<{ writtenOff: number }>> {
   const staffId = useTcheStore.getState().currentUserId;
   if (!staffId) return { ok: false, error: 'Entre com o seu usuário antes de encerrar a conta.' };
   const out = await closeRefundedOrder({ orderId, staffId, managerPin, reason, clientAuditId }, deps);
@@ -323,13 +303,47 @@ export async function submitRefundedWriteOff(orderId: string, managerPin: string
     const applied = useTcheStore.getState().applyServerOrderSnapshot(snap.snapshot);
     if (applied.ok && applied.data.kind === 'applied') {
       clearWriteOffAttempt(orderId);
-      const mine = snap.snapshot.audits.find((a) => a.action_type === 'ORDER_REFUNDED_WRITE_OFF' && (a.metadata as Record<string, unknown> | null)?.client_audit_id === clientAuditId);
-      const meta = mine?.metadata as Record<string, unknown> | undefined;
-      const cents = Number(meta?.cumulative_written_off_cents ?? meta?.written_off_cents);
-      return { ok: true, data: { writtenOff: Number.isInteger(cents) && cents > 0 ? cents / 100 : 0 } };
+      const how = closedHow(snap.snapshot);
+      // GPT r15 P2-02: só é venda devolvida com o registro da baixa no servidor. Conta quitada por pagamento (outro
+      // operador recebeu) não é baixa: diz o que aconteceu.
+      if (how.kind === 'written_off') return { ok: true, data: { writtenOff: how.cents / 100 } };
+      if (how.kind === 'paid') return { ok: false, error: WRITE_OFF_ALREADY_PAID };
+      return { ok: false, error: WRITE_OFF_CLOSED_UNKNOWN };
     }
   }
+  // O id desta tentativa já fechou esta conta antes (resposta perdida, a conta foi reaberta por outro estorno e o id
+  // ficou guardado aqui): o servidor devolve o encerramento antigo e não encerra de novo. O id gasto sai e a
+  // tentativa é refeita uma vez com um id novo (o servidor confere tudo de novo, PIN inclusive).
+  if (snap.kind === 'ok' && (snap.snapshot.order.status === 'PAYING' || snap.snapshot.order.status === 'OPEN')
+    && snap.snapshot.audits.some((a) => a.action_type === 'ORDER_REFUNDED_WRITE_OFF' && (a.metadata as Record<string, unknown> | null)?.client_audit_id === clientAuditId)) {
+    clearWriteOffAttempt(orderId);
+    if (!retried) return submitRefundedWriteOff(orderId, managerPin, reason, deps, writeOffAttemptId(orderId), true);
+  }
   return { ok: false, error: out.error };
+}
+
+export const WRITE_OFF_ALREADY_PAID = 'Esta conta já foi quitada por pagamento (recebido em outro aparelho). Nada foi baixado: ela não é venda devolvida. A conta foi atualizada aqui.';
+export const WRITE_OFF_CLOSED_UNKNOWN = 'A conta já está fechada no servidor, mas sem o registro desta baixa. Nada foi baixado por esta tentativa; confira a conta na conciliação.';
+
+/**
+ * Como a conta fechada no servidor fechou, para a tentativa de encerramento que ficou sem resposta ou foi recusada
+ * (GPT r15 P2-02): 'written_off' só com a conta fechada devendo exatamente o total baixado no último registro de baixa
+ * do servidor (esta tentativa, com a resposta perdida, ou outro aparelho); 'paid': fechada sem saldo;
+ * 'unknown': o resto.
+ */
+export function closedHow(snapshot: ServerOrderSnapshot): { kind: 'written_off'; cents: number } | { kind: 'paid' } | { kind: 'unknown' } {
+  const total = (a: Record<string, unknown>) => {
+    const meta = a.metadata as Record<string, unknown> | null | undefined;
+    const cents = Number(meta?.cumulative_written_off_cents ?? meta?.written_off_cents);
+    return Number.isInteger(cents) && cents > 0 ? cents : null;
+  };
+  const writeOffs = snapshot.audits.filter((a) => a.action_type === 'ORDER_REFUNDED_WRITE_OFF');
+  const remaining = toCents(Number(snapshot.order.remaining_balance));
+  const last = writeOffs[writeOffs.length - 1];
+  // O servidor devolve os registros em ordem (server_seq): o último é o que fechou a conta.
+  if (remaining > 0 && last && total(last) === remaining) return { kind: 'written_off', cents: remaining };
+  if (remaining === 0) return { kind: 'paid' };
+  return { kind: 'unknown' };
 }
 
 export function WriteOffRefundedButton({ orderId, label, onClosed, deps }: { orderId: string; label: string; onClosed?: () => void; deps?: ClaimDeps }) {
@@ -347,7 +361,12 @@ export function WriteOffRefundedButton({ orderId, label, onClosed, deps }: { ord
         minReason={SERVER_REASON_MIN_LENGTH}
         quickReasons={['Venda estornada, cliente não vai pagar', 'Devolução ao cliente']}
         successMessage="Conta encerrada no servidor como venda devolvida."
-        onSubmit={(pin, reason) => submitRefundedWriteOff(orderId, pin, reason, deps)}
+        onSubmit={async (pin, reason) => {
+          const r = await submitRefundedWriteOff(orderId, pin, reason, deps);
+          // A conta fechou de outro jeito e sai desta lista (a folha fecha junto): o aviso fica na tela.
+          if (!r.ok && (r.error === WRITE_OFF_ALREADY_PAID || r.error === WRITE_OFF_CLOSED_UNKNOWN)) toast.alert(r.error);
+          return r;
+        }}
         onSuccess={(data) => {
           toast.alert(`Conta encerrada como venda devolvida: ${formatBRL(data.writtenOff)} baixado no total da conta.`);
           onClosed?.();
@@ -380,7 +399,7 @@ export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?
   const [readAt, setReadAt] = useState<Date | null>(null);
   const [failed, setFailed] = useState(false);
   // GPT r14 P1-01: contas reabertas no servidor que não puderam vir para cá (alteração desta conta na fila ou recusada).
-  const [blocked, setBlocked] = useState<Record<string, 'pending' | 'rejected' | 'failed'>>({});
+  const [blocked, setBlocked] = useState<Record<string, BlockedReason>>({});
   // Muda quando a fila ou os recusados de uma conta bloqueada mudam: lê o servidor de novo na hora (sem esperar o minuto).
   const blockedKey = useMemo(() => Object.keys(blocked).sort().map((id) => {
     const touches = (e: { row_id: string; payload?: unknown }) => e.row_id === id || (e.payload as Record<string, unknown> | undefined)?.order_id === id;
@@ -390,25 +409,13 @@ export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?
     if (!cloud) return;
     let alive = true;
     const read = async () => {
-      const out = await listRefundReopenedOrders(deps);
+      // A mesma leitura do laço da nuvem (GPT r15 P1-01): estornos e encerramentos feitos em outro aparelho, e as
+      // contas reabertas que ainda devem.
+      const out = await pullRefundOrders(deps);
       if (!alive) return;
-      if (out.kind !== 'ok') return setFailed(true);
-      const st = useTcheStore.getState();
-      const onServer = new Set(out.items.map((i) => i.order_id));
-      // Diferente da daqui (falta a conta, outro status ou outro saldo): o estado oficial vem do servidor.
-      const differs = out.items.filter((i) => {
-        const o = st.orders.find((x) => x.id === i.order_id);
-        return !o || o.status !== 'PAYING' || toCents(o.remaining_balance) !== toCents(i.remaining_balance) || !isRefundReopenedOrder(o, st.payments, st.auditLogs);
-      }).map((i) => i.order_id);
-      const stale = st.orders.filter((o) => isRefundReopenedOrder(o, st.payments, st.auditLogs) && !onServer.has(o.id)).map((o) => o.id);
-      const next: Record<string, 'pending' | 'rejected' | 'failed'> = {};
-      for (const id of [...differs, ...stale]) {
-        const r = await syncOrderFromServer(id, deps);
-        if (!alive) return;
-        if (onServer.has(id) && (r === 'pending' || r === 'rejected' || r === 'failed')) next[id] = r;
-      }
-      setServer(out.items);
-      setBlocked(next);
+      if (!out.reopened) return setFailed(true);
+      setServer(out.reopened);
+      setBlocked(out.blocked);
       setFailed(false);
       setReadAt(new Date());
     };

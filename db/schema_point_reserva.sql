@@ -2181,32 +2181,122 @@ BEGIN
 END;
 $$;
 
--- tchefood_list_refund_reopened_orders() RETURNS JSONB [{order_id, table_id, status, remaining_balance, total_amount,
--- opened_at, previous_closed_at, refunded_at}]: as contas da loja reabertas por estorno da Point que ainda devem
--- (PAYING com saldo), as 200 mais recentes. Cada aparelho acha a conta reaberta mesmo sem tê-la (GPT r12 P1-02).
-CREATE OR REPLACE FUNCTION tchefood_list_refund_reopened_orders()
+-- tchefood_list_refund_reopened_orders(p_cursor, p_limit) RETURNS JSONB {items, next_cursor}: as contas da loja
+-- reabertas por estorno da Point que ainda devem (PAYING com saldo). Cada aparelho acha a conta reaberta mesmo sem
+-- tê-la (GPT r12 P1-02). GPT r15 P2-01: paginada, sem esconder nenhuma: ordem refunded_at e order_id, do mais novo;
+-- p_cursor é o next_cursor da página anterior ("<refunded_at ISO>|<order_id>"; inválido: TF006); p_limit de 1 a 200
+-- (padrão 200; fora disso: TF006). items: order_id, table_id, status, remaining_balance, total_amount, opened_at,
+-- previous_closed_at, refunded_at. next_cursor NULL = última página.
+DROP FUNCTION IF EXISTS tchefood_list_refund_reopened_orders();
+CREATE OR REPLACE FUNCTION tchefood_list_refund_reopened_orders(p_cursor TEXT DEFAULT NULL, p_limit INT DEFAULT 200)
 RETURNS JSONB
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
 DECLARE
     v_tenant UUID := tchefood_tenant();
+    v_limit INT := COALESCE(p_limit, 200);
+    v_cursor_at TIMESTAMPTZ;
+    v_cursor_id UUID;
+    v_rows JSONB;
+    v_count INT;
+    v_last JSONB;
 BEGIN
     IF v_tenant IS NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
     END IF;
-    RETURN COALESCE((
-        SELECT jsonb_agg(row_to_json(x)::jsonb ORDER BY x.refunded_at DESC)
-          FROM (SELECT o.id AS order_id, o.table_id, o.status, o.remaining_balance, o.total_amount, o.opened_at,
-                       r.previous_closed_at, r.refunded_at
-                  FROM orders o
-                  JOIN LATERAL (SELECT min((a.metadata->>'previous_closed_at')::TIMESTAMPTZ) AS previous_closed_at,
-                                       max(a.created_at) AS refunded_at
-                                  FROM audit_logs a
-                                 WHERE a.tenant_id = o.tenant_id AND a.order_id = o.id
-                                   AND a.action_type = 'POINT_PAYMENT_REFUNDED' AND a.metadata->>'order_reopened' = 'true') r
-                    ON r.refunded_at IS NOT NULL
-                 WHERE o.tenant_id = v_tenant AND o.status = 'PAYING' AND o.remaining_balance > 0
-                 ORDER BY r.refunded_at DESC
-                 LIMIT 200) x), '[]'::jsonb);
+    IF v_limit < 1 OR v_limit > 200 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: p_limit de 1 a 200.' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_cursor IS NOT NULL AND p_cursor <> '' THEN
+        BEGIN
+            v_cursor_at := split_part(p_cursor, '|', 1)::TIMESTAMPTZ;
+            v_cursor_id := split_part(p_cursor, '|', 2)::UUID;
+        EXCEPTION WHEN others THEN
+            v_cursor_at := NULL;
+        END;
+        IF v_cursor_at IS NULL OR v_cursor_id IS NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: cursor inválido.' USING ERRCODE = 'TF006';
+        END IF;
+    END IF;
+    WITH page AS (
+        SELECT o.id AS order_id, o.table_id, o.status, o.remaining_balance, o.total_amount, o.opened_at,
+               r.previous_closed_at, r.refunded_at
+          FROM orders o
+          JOIN LATERAL (SELECT min((a.metadata->>'previous_closed_at')::TIMESTAMPTZ) AS previous_closed_at,
+                               max(a.created_at) AS refunded_at
+                          FROM audit_logs a
+                         WHERE a.tenant_id = o.tenant_id AND a.order_id = o.id
+                           AND a.action_type = 'POINT_PAYMENT_REFUNDED' AND a.metadata->>'order_reopened' = 'true') r
+            ON r.refunded_at IS NOT NULL
+         WHERE o.tenant_id = v_tenant AND o.status = 'PAYING' AND o.remaining_balance > 0
+           AND (v_cursor_at IS NULL OR (r.refunded_at, o.id) < (v_cursor_at, v_cursor_id))
+         ORDER BY r.refunded_at DESC, o.id DESC
+         LIMIT v_limit + 1)
+    SELECT COALESCE(jsonb_agg(row_to_json(page)::jsonb ORDER BY refunded_at DESC, order_id DESC), '[]'::jsonb), count(*)
+      INTO v_rows, v_count
+      FROM page;
+    IF v_count > v_limit THEN
+        v_rows := v_rows - v_limit; -- tira o item a mais (só servia para saber se há próxima página)
+        v_last := v_rows->(v_limit - 1);
+        RETURN jsonb_build_object('items', v_rows, 'next_cursor', (v_last->>'refunded_at') || '|' || (v_last->>'order_id'));
+    END IF;
+    RETURN jsonb_build_object('items', v_rows, 'next_cursor', NULL);
+END;
+$$;
+
+-- tchefood_list_refund_order_changes(p_after_seq, p_limit) RETURNS JSONB {items, next_seq, safe_seq, has_more}
+-- (GPT r15 P1-01): as contas da loja mexidas por estorno da Point ou por encerramento como venda devolvida
+-- (POINT_PAYMENT_REFUNDED, ORDER_REFUNDED_WRITE_OFF) depois de p_after_seq (audit_logs.server_seq; NULL = 0), em
+-- qualquer status: a conta estornada e já encerrada em outro aparelho também aparece. Uma linha por conta, pela
+-- última dessas alterações (last_seq, last_audit_id), em ordem de last_seq; status e saldo atuais da conta.
+-- p_limit de 1 a 200 (padrão 100; fora disso ou p_after_seq negativo: TF006). next_seq: de onde ler a próxima página
+-- (has_more). safe_seq: até onde o aparelho pode guardar como lido: a sequência é dada na gravação e uma transação
+-- ainda aberta pode gravar uma sequência menor que outra já visível, então só conta como lido o que tem mais de
+-- 10 minutos (nenhuma destas transações dura tanto); o que é mais novo volta na próxima leitura (repetir é inofensivo).
+CREATE OR REPLACE FUNCTION tchefood_list_refund_order_changes(p_after_seq BIGINT DEFAULT 0, p_limit INT DEFAULT 100)
+RETURNS JSONB
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_after BIGINT := COALESCE(p_after_seq, 0);
+    v_limit INT := COALESCE(p_limit, 100);
+    v_rows JSONB;
+    v_count INT;
+    v_next BIGINT;
+    v_safe BIGINT;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
+    END IF;
+    IF v_limit < 1 OR v_limit > 200 OR v_after < 0 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: p_limit de 1 a 200 e p_after_seq maior ou igual a zero.' USING ERRCODE = 'TF006';
+    END IF;
+    WITH ch AS (
+        SELECT a.order_id, max(a.server_seq) AS last_seq
+          FROM audit_logs a
+         WHERE a.tenant_id = v_tenant AND a.order_id IS NOT NULL AND a.server_seq > v_after
+           AND a.action_type IN ('POINT_PAYMENT_REFUNDED', 'ORDER_REFUNDED_WRITE_OFF')
+         GROUP BY a.order_id
+         ORDER BY last_seq
+         LIMIT v_limit + 1),
+    page AS (
+        SELECT ch.order_id, ch.last_seq, l.id AS last_audit_id, o.status, o.remaining_balance,
+               row_number() OVER (ORDER BY ch.last_seq) AS n
+          FROM ch
+          JOIN orders o ON o.id = ch.order_id AND o.tenant_id = v_tenant
+          JOIN audit_logs l ON l.server_seq = ch.last_seq)
+    SELECT COALESCE(jsonb_agg(jsonb_build_object('order_id', order_id, 'status', status, 'remaining_balance', remaining_balance,
+                                                 'last_seq', last_seq, 'last_audit_id', last_audit_id) ORDER BY last_seq)
+                      FILTER (WHERE n <= v_limit), '[]'::jsonb),
+           count(*), max(last_seq) FILTER (WHERE n <= v_limit)
+      INTO v_rows, v_count, v_next
+      FROM page;
+    v_next := COALESCE(v_next, v_after);
+    SELECT COALESCE(max(a.server_seq), v_after) INTO v_safe
+      FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.server_seq > v_after AND a.server_seq <= v_next
+       AND a.action_type IN ('POINT_PAYMENT_REFUNDED', 'ORDER_REFUNDED_WRITE_OFF')
+       AND a.created_at < NOW() - INTERVAL '10 minutes';
+    RETURN jsonb_build_object('items', v_rows, 'next_seq', v_next, 'safe_seq', v_safe, 'has_more', v_count > v_limit);
 END;
 $$;
 
@@ -2244,7 +2334,8 @@ BEGIN
         'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)',
         'tchefood_list_point_refunds(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT)',
         'tchefood_order_snapshot(UUID)',
-        'tchefood_list_refund_reopened_orders()'] LOOP
+        'tchefood_list_refund_reopened_orders(TEXT, INT)',
+        'tchefood_list_refund_order_changes(BIGINT, INT)'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
             EXECUTE format('REVOKE ALL ON FUNCTION %s FROM anon', v_fn);
@@ -2265,7 +2356,8 @@ BEGIN
         'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)',
         'tchefood_list_point_refunds(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT)',
         'tchefood_order_snapshot(UUID)',
-        'tchefood_list_refund_reopened_orders()'] LOOP
+        'tchefood_list_refund_reopened_orders(TEXT, INT)',
+        'tchefood_list_refund_order_changes(BIGINT, INT)'] LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
             EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO authenticated', v_fn);
         END IF;

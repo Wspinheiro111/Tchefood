@@ -214,25 +214,96 @@ export interface ServerReopenedOrder {
 
 export type ReopenedOrdersResult = { kind: 'ok'; items: ServerReopenedOrder[] } | { kind: 'error'; error: string };
 
+/** Páginas lidas de uma vez (200 contas cada): o bastante para qualquer loja; acima disso a leitura falha, não esconde. */
+const MAX_PAGES = 50;
+
+/** GPT r15 P2-01: lê todas as páginas (cursor refunded_at|order_id); nenhuma conta reaberta fica escondida. */
 export async function listRefundReopenedOrders(deps: ClaimDeps = defaultClaimDeps()): Promise<ReopenedOrdersResult> {
   const failed = { kind: 'error' as const, error: 'Não foi possível ler as contas reabertas no servidor.' };
   try {
     const cfg = await deps.config();
     if (!cfg) return failed;
-    const out = await callRpc(cfg, 'tchefood_list_refund_reopened_orders', {}, deps);
-    if (out.kind !== 'ok') return failed;
-    const list: unknown = JSON.parse(out.text);
-    if (!Array.isArray(list)) return failed;
     const items: ServerReopenedOrder[] = [];
-    for (const v of list) {
-      const r = isRecord(v) ? v : {};
-      const orderId = str(r.order_id);
-      const refundedAt = str(r.refunded_at);
-      const balance = Number(r.remaining_balance);
-      if (!orderId || !UUID_RE.test(orderId) || !refundedAt || !Number.isFinite(balance) || balance <= 0) return failed;
-      items.push({ order_id: orderId, table_id: str(r.table_id), remaining_balance: balance, total_amount: Number(r.total_amount) || 0, refunded_at: refundedAt });
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const out = await callRpc(cfg, 'tchefood_list_refund_reopened_orders', { p_cursor: cursor, p_limit: 200 }, deps);
+      if (out.kind !== 'ok' || !out.body || !Array.isArray(out.body.items)) return failed;
+      for (const v of out.body.items as unknown[]) {
+        const r = isRecord(v) ? v : {};
+        const orderId = str(r.order_id);
+        const refundedAt = str(r.refunded_at);
+        const balance = Number(r.remaining_balance);
+        if (!orderId || !UUID_RE.test(orderId) || !refundedAt || !Number.isFinite(balance) || balance <= 0) return failed;
+        if (seen.has(orderId)) continue;
+        seen.add(orderId);
+        items.push({ order_id: orderId, table_id: str(r.table_id), remaining_balance: balance, total_amount: Number(r.total_amount) || 0, refunded_at: refundedAt });
+      }
+      const next = out.body.next_cursor;
+      if (next === null || next === undefined) return { kind: 'ok', items };
+      if (typeof next !== 'string' || next === '' || next === cursor) return failed;
+      cursor = next;
     }
-    return { kind: 'ok', items };
+    return failed;
+  } catch {
+    return failed;
+  }
+}
+
+/** Uma conta mexida por estorno da Point ou por encerramento como venda devolvida (tchefood_list_refund_order_changes). */
+export interface ServerRefundOrderChange {
+  order_id: string;
+  status: string;
+  remaining_balance: number;
+  last_seq: number;
+  last_audit_id: string;
+}
+
+export type RefundOrderChangesResult =
+  /** safeSeq: até onde o aparelho pode guardar como lido (o servidor segura o que é recente demais). */
+  | { kind: 'ok'; items: ServerRefundOrderChange[]; safeSeq: number }
+  | { kind: 'error'; error: string };
+
+/**
+ * GPT r15 P1-01: as contas estornadas ou encerradas como venda devolvida depois de afterSeq, em qualquer status (a
+ * conta estornada e já encerrada em outro aparelho também vem). Lê todas as páginas.
+ */
+export async function listRefundOrderChanges(afterSeq: number, deps: ClaimDeps = defaultClaimDeps()): Promise<RefundOrderChangesResult> {
+  const failed = { kind: 'error' as const, error: 'Não foi possível ler os estornos e encerramentos no servidor.' };
+  try {
+    const cfg = await deps.config();
+    if (!cfg) return failed;
+    const byOrder = new Map<string, ServerRefundOrderChange>();
+    let after = afterSeq;
+    let safe: number | null = null;
+    let lastSafe = afterSeq;
+    const sorted = () => [...byOrder.values()].sort((x, y) => x.last_seq - y.last_seq);
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const out = await callRpc(cfg, 'tchefood_list_refund_order_changes', { p_after_seq: after, p_limit: 200 }, deps);
+      const b = out.kind === 'ok' ? out.body : null;
+      if (!b || !Array.isArray(b.items)) return failed;
+      const nextSeq = Number(b.next_seq);
+      const safeSeq = Number(b.safe_seq);
+      if (!Number.isSafeInteger(nextSeq) || !Number.isSafeInteger(safeSeq) || nextSeq < after || safeSeq < after || safeSeq > nextSeq) return failed;
+      for (const v of b.items as unknown[]) {
+        const r = isRecord(v) ? v : {};
+        const orderId = str(r.order_id);
+        const auditId = str(r.last_audit_id);
+        const status = str(r.status);
+        const seq = Number(r.last_seq);
+        const balance = Number(r.remaining_balance);
+        if (!orderId || !UUID_RE.test(orderId) || !auditId || !UUID_RE.test(auditId) || !status || !Number.isSafeInteger(seq) || seq <= after || !Number.isFinite(balance)) return failed;
+        byOrder.set(orderId, { order_id: orderId, status, remaining_balance: balance, last_seq: seq, last_audit_id: auditId });
+      }
+      // Só a primeira parada do "seguro" vale: depois de um registro recente, nada adiante conta como lido.
+      if (safe === null && safeSeq < nextSeq) safe = safeSeq;
+      lastSafe = safeSeq;
+      if (b.has_more !== true) return { kind: 'ok', items: sorted(), safeSeq: safe ?? safeSeq };
+      if (nextSeq === after) return failed;
+      after = nextSeq;
+    }
+    // Histórico maior que uma leitura (aparelho que nunca leu): aplica o que veio e continua daqui na próxima.
+    return { kind: 'ok', items: sorted(), safeSeq: safe ?? lastSafe };
   } catch {
     return failed;
   }
