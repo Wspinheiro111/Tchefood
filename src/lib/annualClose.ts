@@ -1044,16 +1044,20 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
     return cutoff < p.to && imported !== null && imported >= cutoff;
   };
   const visible = input.purchaseInvoices.filter((inv) => !importedLate(inv));
-  const visibleKeys = new Set(visible.map((inv) => (inv.access_key ?? '').trim()).filter((k) => k !== ''));
+  // Só uma cópia de PRODUÇÃO que já estava aqui conta no lugar da que chegou depois: a de
+  // homologação nunca entra nas compras, então não dispensa o aviso da de produção.
+  const visibleProductionKeys = new Set(
+    visible.filter((inv) => inv.environment === 'PRODUCTION').map((inv) => (inv.access_key ?? '').trim()).filter((k) => k !== ''),
+  );
   const lateSeen = new Set<string>();
   for (const inv of input.purchaseInvoices) {
     if (!importedLate(inv)) continue;
-    const key = (inv.access_key ?? '').trim();
-    // Outra cópia já estava aqui (ela conta), ou esta chave já foi avisada.
-    if (key !== '' && (visibleKeys.has(key) || lateSeen.has(key))) continue;
-    if (key !== '') lateSeen.add(key);
-    // Homologação nunca conta: atualizar não a traria, então não avisa.
+    // Homologação nunca conta: atualizar não a traria, então não avisa (nem ocupa a chave).
     if (inv.environment !== 'PRODUCTION') continue;
+    const key = (inv.access_key ?? '').trim();
+    // Outra cópia de produção já estava aqui (ela conta), ou esta chave já foi avisada.
+    if (key !== '' && (visibleProductionKeys.has(key) || lateSeen.has(key))) continue;
+    if (key !== '') lateSeen.add(key);
     const t = invoiceDate(inv.issued_at) ?? at(inv.imported_at);
     if (t === null || t < p.from) continue;
     late += 1;

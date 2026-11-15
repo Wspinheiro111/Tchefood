@@ -859,3 +859,25 @@ describe('auditoria GPT rodada 4 (435c529)', () => {
     expect([r25.purchases.length, r25.rows[0]!.amount]).toEqual([1, 500]);
   });
 });
+
+describe('auditoria GPT rodada 5 (f9f2022)', () => {
+  it('P2-01: cópia de homologação não esconde o aviso da NF-e de produção importada depois do corte', () => {
+    const P26 = yearPeriod(2026);
+    const key = '4326'.padEnd(44, '3');
+    const a = { id: 'a', supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: '2026-11-14T08:00:00-03:00', environment: 'HOMOLOGATION', invoice_amount: 500, imported_at: '2026-11-14T08:00:00-03:00' } as PurchaseInvoice;
+    const b = { ...a, id: 'b', environment: 'PRODUCTION', imported_at: '2026-11-14T11:00:00-03:00' } as PurchaseInvoice;
+    const run = (list: PurchaseInvoice[], now: Date) => expensesByCategory({ purchaseInvoices: list, suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, now) }, P26, now);
+    const nove = new Date('2026-11-14T09:00:00-03:00');
+    const doze = new Date('2026-11-14T12:00:00-03:00');
+    for (const list of [[a, b], [b, a]]) {
+      const r9 = run(list, nove);
+      expect([r9.purchases.length, r9.afterCutoff, r9.importedAfterCutoff]).toEqual([0, 1, 1]);
+      const r12 = run(list, doze);
+      expect([r12.purchases.length, r12.rows[0]!.amount, r12.afterCutoff, r12.importedAfterCutoff]).toEqual([1, 500, 0, 0]);
+    }
+    // Duas cópias chegaram depois: a de homologação vista primeiro não ocupa a chave da de produção.
+    const aLate = { ...a, imported_at: '2026-11-14T10:00:00-03:00' } as PurchaseInvoice;
+    const rl = run([aLate, b], nove);
+    expect([rl.purchases.length, rl.afterCutoff, rl.importedAfterCutoff]).toEqual([0, 1, 1]);
+  });
+});
