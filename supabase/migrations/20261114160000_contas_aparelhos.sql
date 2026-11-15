@@ -79,7 +79,13 @@ RETURNS JSONB LANGUAGE sql STABLE SECURITY INVOKER SET search_path = public AS $
           FROM orders
          WHERE tenant_id = tchefood_tenant()
            AND (status IN ('OPEN', 'PAYING') OR COALESCE(closed_at, opened_at) >= now() - interval '24 hours'
-                OR id IN (SELECT id FROM asked))
+                OR id IN (SELECT id FROM asked)
+                -- Entrega que saiu e ainda não foi acertada com o entregador desce com a conta em
+                -- qualquer data: um aparelho que entra na loja depois (sem nada guardado para pedir
+                -- pelo id) precisa dela no acerto do entregador (Codex no PR #54).
+                OR id IN (SELECT od.order_id FROM own_deliveries od
+                           WHERE od.tenant_id = tchefood_tenant() AND od.settlement_id IS NULL
+                             AND od.status IN ('OUT', 'DELIVERED')))
     ), i AS (
         SELECT it.id, it.order_id, it.product_id, it.waiter_id, it.quantity, it.unit_price, it.modifiers_unit_price,
                it.total_item_price, it.meat_doneness, it.notes, it.sector, it.status, it.is_paid, it.origin, it.created_at,
@@ -123,6 +129,9 @@ $$;
 -- Índice para as contas encerradas nas últimas 24 h da leitura acima (a mesma expressão do
 -- filtro); as abertas usam idx_orders_tenant_status (auditoria interna, rodada 8 do PR #54).
 CREATE INDEX IF NOT EXISTS idx_orders_tenant_recent ON orders (tenant_id, (COALESCE(closed_at, opened_at)));
+-- Entregas ainda sem acerto da leitura acima (poucas: o acerto é feito no mesmo dia).
+CREATE INDEX IF NOT EXISTS idx_own_deliveries_unsettled ON own_deliveries (tenant_id)
+    WHERE settlement_id IS NULL AND status IN ('OUT', 'DELIVERED');
 
 -- -----------------------------------------------------------------------------
 -- 2. Uma conta aberta por mesa

@@ -4026,6 +4026,32 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().orderItems.filter((i) => i.order_id === order.id).every((i) => i.is_paid)).toBe(true);
     });
 
+    it('aparelho que entra na loja recebe a entrega ainda sem acerto, com a conta encerrada há mais de 24 h (Codex no PR #54)', async () => {
+      const courier = crypto.randomUUID(), o1 = crypto.randomUUID(), d1 = crypto.randomUUID(), o2 = crypto.randomUUID(), d2 = crypto.randomUUID();
+      const staff = crypto.randomUUID();
+      // Duas entregas entregues há 2 dias: a primeira sem acerto, a segunda já acertada.
+      sql(`SET session_replication_role = replica;
+           INSERT INTO couriers (id, tenant_id, name, fee_per_delivery) VALUES ('${courier}', '${TENANT}', 'Entregador antigo', 3);
+           INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id, status, pickup_number, fulfillment_type, opened_at, closed_at) VALUES
+             ('${o1}', '${TENANT}', gen_random_uuid(), '${staff}', 'CLOSED', 71, 'DELIVERY', now() - interval '3 days', now() - interval '2 days'),
+             ('${o2}', '${TENANT}', gen_random_uuid(), '${staff}', 'CLOSED', 72, 'DELIVERY', now() - interval '3 days', now() - interval '2 days');
+           INSERT INTO own_deliveries (id, tenant_id, order_id, customer_name, customer_phone, address, zone_id, zone_name, delivery_fee, pay_on_delivery, status, courier_id, courier_fee, out_at, delivered_at, settlement_id) VALUES
+             ('${d1}', '${TENANT}', '${o1}', 'Rosa', '53988880310', 'Rua 1, 10', gen_random_uuid(), 'Centro', 5, FALSE, 'DELIVERED', '${courier}', 3, now() - interval '3 days', now() - interval '2 days', NULL),
+             ('${d2}', '${TENANT}', '${o2}', 'Rosa', '53988880310', 'Rua 1, 11', gen_random_uuid(), 'Centro', 5, FALSE, 'DELIVERED', '${courier}', 3, now() - interval '3 days', now() - interval '2 days', gen_random_uuid());
+           SET session_replication_role = origin;`);
+      // Leitura sem ids (aparelho novo, sem nada guardado): a entrega sem acerto desce com a conta;
+      // a já acertada fica de fora, como as outras contas antigas.
+      const plain = await fetchCloudOrders(cfgA(), TENANT, fetchA());
+      expect(plain.orders.some((o) => o.id === o1)).toBe(true);
+      expect(plain.ownDeliveries.find((d) => d.id === d1)).toMatchObject({ status: 'DELIVERED', settlement_id: null, courier_id: courier });
+      expect(plain.orders.some((o) => o.id === o2)).toBe(false);
+      expect(plain.ownDeliveries.some((d) => d.id === d2)).toBe(false);
+      sql(`SET session_replication_role = replica;
+           DELETE FROM own_deliveries WHERE id IN ('${d1}', '${d2}'); DELETE FROM orders WHERE id IN ('${o1}', '${o2}');
+           DELETE FROM couriers WHERE id = '${courier}';
+           SET session_replication_role = origin;`);
+    });
+
     it('item lançado em A depois de B receber a conta toda: recusado, e vai para uma conta nova da mesa (Codex no PR #54)', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(50);
