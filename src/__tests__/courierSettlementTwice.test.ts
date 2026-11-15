@@ -609,3 +609,45 @@ describe('PIN do gerente com confirmação assíncrona (auditoria interna, rodad
     expect(onSubmit).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('troca de loja com acerto do entregador em andamento (Codex, PR #54)', () => {
+  const newStore = () => {
+    const owner = st().staff.find((u) => u.role === 'OWNER')!;
+    st().logout();
+    expect(st().login(owner.pin_code).ok).toBe(true);
+    useTcheStore.setState({ orders: st().orders.filter((o) => o.status !== 'OPEN' && o.status !== 'PAYING') });
+    return st().startNewStore(
+      {
+        tenant: { name: 'Bar do Zé', legal_name: 'Zé Comércio de Alimentos Ltda', cnpj: '11.222.333/0001-81', state_registration: null, city: 'Pelotas', state: 'rs', default_service_fee_pct: 10 },
+        owner_name: 'Zé', owner_pin: '4826',
+      },
+      { managerPin: owner.pin_code, reason: 'Começar loja nova' },
+    );
+  };
+
+  it('esperando a resposta da nuvem: a troca de loja espera; com pendência a terminar, também', async () => {
+    expect(st().openCashSession(100).ok).toBe(true);
+    const a = deliveredOrder(false);
+    connectCloud();
+    const calls: Call[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const inner = cloudFn(calls);
+    const slow: FetchLike = async (url, init) => { await gate; return inner(url, init); };
+    const running = st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: slow });
+    await Promise.resolve();
+    const tenant = st().tenant.id;
+    expect(newStore()).toMatchObject({ ok: false, error: expect.stringMatching(/esperando a resposta da nuvem/) });
+    expect(st().tenant.id).toBe(tenant);
+    release();
+    expect((await running).ok).toBe(true);
+
+    useTcheStore.setState({ courierSettleFollowUps: [{
+      settlement_id: 's1', courier_id: a.courier.id, courier_name: a.courier.name, delivery_ids: [a.delivery.id], cash_collected: 0,
+      courier_fees: 7, missing_payments: [], missing_withdrawal: { amount: 7, error: 'x' }, created_at: '2026-11-14T12:00:00Z',
+    }] });
+    expect(newStore()).toMatchObject({ ok: false, error: expect.stringMatching(/acerto com o entregador para terminar/) });
+    useTcheStore.setState({ courierSettleFollowUps: [], outbox: [] });
+    expect(newStore().ok).toBe(true);
+  });
+});

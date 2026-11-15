@@ -899,6 +899,19 @@ export const DELIVERY_REFUSAL_DROPPED =
 const courierSettleInFlight = new Set<UUID>();
 
 /**
+ * Acerto com o entregador em andamento ou com algo a terminar (sem resposta da nuvem, ou gravado
+ * com pendência): a troca de loja espera, porque apagaria o que falta fazer e a resposta da nuvem
+ * entraria na loja nova (Codex, PR #54).
+ */
+function courierSettleBlocksStoreChange(s: TcheState): string | null {
+  if (courierSettleInFlight.size > 0) return 'Há um acerto com o entregador esperando a resposta da nuvem. Aguarde antes de trocar a loja deste aparelho.';
+  if ((s.courierSettlePending ?? []).length > 0 || (s.courierSettleFollowUps ?? []).length > 0) {
+    return 'Há acerto com o entregador para terminar no quadro da entrega ("sem resposta da nuvem" ou "com pendência"). Termine antes de trocar a loja deste aparelho.';
+  }
+  return null;
+}
+
+/**
  * Vendas de balcão fechadas por outro aparelho (chegaram pagas pela leitura, sem estarem pagas
  * aqui antes): as fichas delas são impressas lá. A lista guarda só as que ainda estão no aparelho.
  */
@@ -3802,6 +3815,8 @@ export const useTcheStore = create<TcheState>()(
           if (state.cloud && rejectedCount > 0) {
             return fail(`Há ${rejectedCount} evento(s) recusado(s) pela nuvem. Resolva e reenvie antes de iniciar uma loja nova.`);
           }
+          const settling = courierSettleBlocksStoreChange(state);
+          if (settling) return fail(settling);
           const check = validateTenantDraft(input.tenant);
           if (!check.ok) return check;
           const authRes = authorizeManager(auth, { orderId: null, action: 'STORE_RESET' });
@@ -3952,6 +3967,8 @@ export const useTcheStore = create<TcheState>()(
           if (state.cloud && (state.syncRejected ?? []).length > 0) {
             return fail('Há eventos recusados pela nuvem. Resolva e reenvie antes de trocar a loja deste aparelho.');
           }
+          const settling = courierSettleBlocksStoreChange(state);
+          if (settling) return fail(settling);
           const tenantId = snapshot.tenant.id;
           if (session.tenant_id !== tenantId) return fail('Os dados baixados não são da loja desta conta.');
           if (staff.some((u) => u.tenant_id !== tenantId)) return fail('A equipe baixada não é da loja desta conta.');
@@ -5411,6 +5428,7 @@ export const useTcheStore = create<TcheState>()(
 
         settleCourierOnline: async (courierId, opts) => {
           const cloud = get().cloud;
+          const tenantAtStart = get().tenant.id;
           if (!cloud) return get().settleCourier(courierId, opts);
           const user = currentUser();
           if (!user) return fail('Sessão expirada. Faça login novamente.');
@@ -5544,6 +5562,11 @@ export const useTcheStore = create<TcheState>()(
             return fail(`${result.message} Nada saiu da gaveta; tente de novo em "Acerto sem resposta da nuvem", no quadro da entrega.`);
           }
           const settlement = result.settlement;
+          // A loja não troca com o acerto em andamento (courierSettleBlocksStoreChange); se ainda
+          // assim mudou, nada da resposta entra na loja de agora.
+          if (get().tenant.id !== tenantAtStart || get().cloud?.tenant_id !== cloud.tenant_id) {
+            return fail('A loja deste aparelho mudou durante o acerto. O acerto ficou gravado na nuvem da loja anterior; confira lá.');
+          }
           const pay = opts.payFromDrawer && feesCents > 0;
 
           // 2) O acerto vale: entra aqui como a nuvem gravou, NA MESMA gravação que tira o acerto
