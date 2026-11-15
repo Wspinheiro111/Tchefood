@@ -123,11 +123,13 @@ export function postgrestFetch(t: PgTarget, db: string, claims: Record<string, u
     columnsCache.set(table, cols);
     return cols;
   };
+  // Papel da requisição: o do JWT (authenticated no app, service_role no servidor), como no PostgREST.
+  const role = claims.role === 'service_role' || claims.role === 'anon' ? claims.role : 'authenticated';
   const run = (stmt: string) =>
     psql(
       t,
       `BEGIN;
-       SET LOCAL ROLE authenticated;
+       SET LOCAL ROLE ${role};
        SELECT set_config('request.jwt.claims', ${lit(JSON.stringify(claims))}, true) \\g /dev/null
        ${stmt}
        COMMIT;`,

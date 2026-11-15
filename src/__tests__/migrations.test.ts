@@ -21,7 +21,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_pin_equipe_trava.sql', 'schema_pin_gerente_trava.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_pin_equipe_trava.sql', 'schema_pin_gerente_trava.sql', 'schema_delivery_servidor.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -77,7 +77,20 @@ describe('supabase/migrations', () => {
     // Versão depois da última já publicada na main (a do PIN da equipe, #53): uma migration com
     // data anterior à última aplicada fica fora do `supabase db push` normal (P2-01 da rodada 3
     // do GPT no PR #50).
-    expect(idx('schema_pin_gerente_trava.sql')).toBe(files.length - 1);
+    expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_pin_equipe_trava.sql'));
+    // A gravação de delivery pelo servidor (#iFood) vem depois da última já publicada na main (#50): data
+    // anterior à última aplicada fica fora do `supabase db push` normal.
+    expect(idx('schema_delivery_servidor.sql')).toBe(files.length - 1);
+    expect(idx('schema_delivery_servidor.sql')).toBeGreaterThan(idx('schema_pin_gerente_trava.sql'));
+    // O delivery refaz o guarda dos audit_logs (versão da conciliação do cashback + o bloqueio de DELIVERY_*):
+    // é a última que o define e mantém todos os bloqueios anteriores.
+    const guardOf = (f: string) => /CREATE OR REPLACE FUNCTION tchefood_guard_audit_insert\(\)[\s\S]*?\n\$\$;/.exec(readFileSync(f, 'utf8'))?.[0] ?? '';
+    const definesGuard = files.filter((f) => guardOf(join(MIGRATIONS, f)) !== '');
+    expect(definesGuard.at(-1)).toBe(files[idx('schema_delivery_servidor.sql')]);
+    const previousGuard = guardOf(join(ROOT, 'db', 'schema_cashback_conciliacao.sql'));
+    for (const block of previousGuard.split('\n').filter((line) => line.trim().startsWith('IF ') || line.trim().startsWith('RAISE '))) {
+      expect(guardOf(join(ROOT, 'db', 'schema_delivery_servidor.sql')), block).toContain(block);
+    }
     expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_pin_equipe_trava.sql'));
     // A trava do PIN da equipe refaz tchefood_check_pin, tchefood_save_staff e tchefood_start_store
     // (versão de schema_equipe.sql) e usa a mesma chave da conciliação do cashback: é a última que as define.
