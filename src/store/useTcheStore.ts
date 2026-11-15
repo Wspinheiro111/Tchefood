@@ -993,11 +993,28 @@ export function cloudLinkedStore(s: Pick<TcheState, 'cloud' | 'cloudLinkedTenant
     || s.pullStatus?.last_orders_pull_at || (s.syncRejected ?? []).length > 0);
 }
 
-/** Sangria do acerto já feita neste aparelho (a autorização dela cita o acerto). */
-function settlementWithdrawalDone(s: TcheState, settlementId: UUID): boolean {
+/**
+ * Sangria do acerto já feita neste aparelho: a autorização cita o acerto e tira da gaveta
+ * exatamente o ganho devido (em centavos). Sangria de outro valor citando o acerto não resolve a
+ * pendência (GPT, rodada 12 do PR #54; a nuvem recusa essa sangria).
+ */
+function settlementWithdrawalDone(s: TcheState, settlementId: UUID, amount: number): boolean {
   return s.auditLogs.some((l) => l.action_type === 'CASH_WITHDRAWAL'
-    && (l.metadata as Record<string, unknown> | null)?.courier_settlement_id === settlementId);
+    && (l.metadata as Record<string, unknown> | null)?.courier_settlement_id === settlementId
+    && toCents(-l.amount_impact) === toCents(amount));
 }
+
+/**
+ * Recusa da nuvem que diz que o passo do acerto já foi feito por outro registro (sangria ou "pago
+ * por fora" do mesmo acerto, senha já resolvida, em outro aparelho): o passo não volta à
+ * pendência, para ninguém pagar o ganho de novo (GPT, rodada 12 do PR #54).
+ */
+const COURIER_STEP_ALREADY_DONE = /já está registrad|já foi pago por fora|idx_audit_logs_courier_(settlement|resolved)_once/;
+
+/** Aviso quando a sangria do acerto daqui foi recusada porque o ganho já foi pago em outro registro. */
+export const COURIER_WITHDRAWAL_DUPLICATE_NOTICE =
+  'A sangria do acerto com o entregador não foi aceita: o ganho já foi pago em outro registro (outro aparelho ou pago por fora). '
+  + 'A sangria saiu deste caixa; se o dinheiro saiu da gaveta, devolva-o com um suprimento do mesmo valor.';
 
 /** Troca (ou tira, quando nada sobrou) a pendência do acerto na lista. */
 function withFollowUp(list: readonly CourierSettleFollowUp[] | undefined, f: CourierSettleFollowUp): CourierSettleFollowUp[] {
@@ -1020,12 +1037,17 @@ function restoreFollowUpOnRejection(
   if (event.table === 'payments' && event.op === 'INSERT') return restorePaymentOnRejection(s, event, message);
   if (event.table !== 'audit_logs' || event.op !== 'INSERT') return null;
   const action = event.payload.action_type;
-  if (action !== 'COURIER_PAID_OUTSIDE' && action !== 'COURIER_PAYMENT_RESOLVED') return null;
   const meta = (event.payload.metadata ?? {}) as Record<string, unknown>;
   const settlementId = typeof meta.courier_settlement_id === 'string' ? meta.courier_settlement_id : null;
-  const amount = Number(meta.amount);
+  const isWithdrawal = action === 'CASH_WITHDRAWAL' && settlementId !== null;
+  if (action !== 'COURIER_PAID_OUTSIDE' && action !== 'COURIER_PAYMENT_RESOLVED' && !isWithdrawal) return null;
+  // Sangria do acerto: o valor é o que ela tirou da gaveta.
+  const amount = isWithdrawal ? -Number(event.payload.amount_impact) : Number(meta.amount);
   if (!settlementId || !Number.isFinite(amount)) return null;
-  const error = `A nuvem recusou o registro do gerente: ${message}`;
+  if (COURIER_STEP_ALREADY_DONE.test(message)) return null;
+  const error = isWithdrawal
+    ? `A nuvem recusou a sangria do acerto: ${message} A sangria saiu deste caixa. Se o dinheiro já saiu da gaveta, refaça a sangria com o PIN do gerente sem tirar o dinheiro de novo.`
+    : `A nuvem recusou o registro do gerente: ${message}`;
   const settlement = s.courierSettlements.find((x) => x.id === settlementId);
   const courierId = String(meta.courier_id ?? settlement?.courier_id ?? '');
   const base: CourierSettleFollowUp = (s.courierSettleFollowUps ?? []).find((x) => x.settlement_id === settlementId) ?? {
@@ -1039,7 +1061,7 @@ function restoreFollowUpOnRejection(
     missing_withdrawal: null,
     created_at: nowISO(),
   };
-  if (action === 'COURIER_PAID_OUTSIDE') {
+  if (action === 'COURIER_PAID_OUTSIDE' || isWithdrawal) {
     if (base.missing_withdrawal) return null;
     return withFollowUp(s.courierSettleFollowUps, { ...base, missing_withdrawal: { amount, error } });
   }
@@ -4676,18 +4698,37 @@ export const useTcheStore = create<TcheState>()(
               const back = restoreFollowUpOnRejection({ ...s, courierSettleFollowUps: followUps }, e, byId.get(e.id)!.message);
               if (back) followUps = back;
             }
+            // Sangria do acerto recusada pela nuvem (GPT, rodada 12 do PR #54): a autorização e o
+            // movimento saem deste aparelho (a nuvem não os tem; o caixa daqui não conta uma saída
+            // que a nuvem não aceitou), e o passo volta à pendência acima. Refazer com o gerente
+            // registra uma sangria só; nada sai da gaveta sozinho.
+            const refusedWithdrawals = refused.filter((e) => e.table === 'audit_logs' && e.payload.action_type === 'CASH_WITHDRAWAL'
+              && typeof (e.payload.metadata as Record<string, unknown> | null)?.courier_settlement_id === 'string');
+            const logIds = new Set(refusedWithdrawals.map((e) => e.row_id));
+            const movementIds = new Set(refusedWithdrawals
+              .map((e) => (e.payload.metadata as Record<string, unknown>).movement_id)
+              .filter((m): m is string => typeof m === 'string'));
+            const isMovement = (e: SyncEvent) => e.table === 'cash_movements' && movementIds.has(e.row_id);
+            const duplicate = refusedWithdrawals.find((e) => COURIER_STEP_ALREADY_DONE.test(byId.get(e.id)!.message));
+            const notice = duplicate
+              ? `${COURIER_WITHDRAWAL_DUPLICATE_NOTICE} (${byId.get(duplicate.id)!.message})`
+              : dropped.length > 0 ? `${DELIVERY_REFUSAL_DROPPED} (${byId.get(dropped[0]!.id)!.message})` : null;
             return {
               ...(followUps !== s.courierSettleFollowUps ? { courierSettleFollowUps: followUps } : {}),
-              outbox: s.outbox.filter((e) => !byId.has(e.id)),
+              ...(logIds.size > 0
+                ? {
+                    auditLogs: s.auditLogs.filter((l) => !logIds.has(l.id)),
+                    cashMovements: s.cashMovements.filter((m) => !movementIds.has(m.id)),
+                  }
+                : {}),
+              outbox: s.outbox.filter((e) => !byId.has(e.id) && !isMovement(e)),
               syncRejected: [
-                ...(s.syncRejected ?? []),
+                ...(s.syncRejected ?? []).filter((r) => !isMovement(r.event)),
                 ...refused
-                  .filter((e) => !dropped.includes(e))
+                  .filter((e) => !dropped.includes(e) && !logIds.has(e.row_id) && !isMovement(e))
                   .map((event) => ({ event, status: byId.get(event.id)!.status, message: byId.get(event.id)!.message, rejected_at: at })),
               ],
-              ...(dropped.length > 0
-                ? { syncStatus: { ...s.syncStatus, last_error: `${DELIVERY_REFUSAL_DROPPED} (${byId.get(dropped[0]!.id)!.message})`, last_error_at: at } }
-                : {}),
+              ...(notice ? { syncStatus: { ...s.syncStatus, last_error: notice, last_error_at: at } } : {}),
             };
           });
         },
@@ -6027,7 +6068,7 @@ export const useTcheStore = create<TcheState>()(
           if (!f.missing_withdrawal) return fail('A sangria deste acerto já foi resolvida.');
           // Sangria já feita (o app fechou antes de tirar da pendência): não sai de novo, e "pago por
           // fora" não deixa uma sangria registrada que não aconteceu sem avisar.
-          if (settlementWithdrawalDone(get(), settlementId)) {
+          if (settlementWithdrawalDone(get(), settlementId, f.missing_withdrawal.amount)) {
             save({ ...f, missing_withdrawal: null });
             return step.kind === 'paid_outside'
               ? fail('A sangria deste acerto já está registrada no caixa (feita antes de o app fechar). Confira a gaveta: se o dinheiro não saiu dela, registre um suprimento do valor.')

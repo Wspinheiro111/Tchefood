@@ -5409,6 +5409,8 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
   const D1 = '22222222-0000-4000-8000-000000000021';
   const D2 = '22222222-0000-4000-8000-000000000022';
   const S = (n: number) => `22222222-0000-4000-8000-0000000001${String(n).padStart(2, '0')}`;
+  const OTHER_TENANT = '33333333-3333-4333-8333-333333333333';
+  const OTHER_SETTLEMENT = '33333333-0000-4000-8000-000000000101';
   const sql2 = (q: string): string => {
     const r = psql(target!, q, DB2);
     if (!r.ok) throw new Error(r.message ?? 'sql');
@@ -5421,9 +5423,9 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     p_audit_id: crypto.randomUUID(), p_action: 'COURIER_PAID_OUTSIDE', p_settlement_id: S(1), p_performed_by: CASHIER2,
     p_manager_pin: MANAGER_PIN, p_reason: 'Pago em pix pela loja', p_metadata: {}, ...over,
   });
-  const withdrawal = (settlementId: string) => call('tchefood_authorize_manager', {
+  const withdrawal = (settlementId: string, amount = 12) => call('tchefood_authorize_manager', {
     p_order_id: null, p_action_type: 'CASH_WITHDRAWAL', p_manager_pin: MANAGER_PIN, p_performed_by: CASHIER2,
-    p_reason: 'Acerto do entregador Nico', p_amount_impact: -12,
+    p_reason: 'Acerto do entregador Nico', p_amount_impact: -amount,
     p_metadata: { movement_id: crypto.randomUUID(), session_id: crypto.randomUUID(), courier_settlement_id: settlementId, client_audit_id: crypto.randomUUID() },
   });
   const count = (action: string, settlementId: string) =>
@@ -5446,7 +5448,9 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       INSERT INTO courier_settlements (id, tenant_id, courier_id, deliveries, cash_collected, courier_fees, settled_by_user_id, delivery_ids)
         SELECT ('22222222-0000-4000-8000-0000000001' || lpad(n::text, 2, '0'))::uuid, '${T2}', '${COURIER2}', 2, 0, 12, '${CASHIER2}',
                ARRAY['${D1}', '${D2}']::uuid[]
-          FROM generate_series(1, 6) n;`);
+          FROM generate_series(1, 10) n;
+      INSERT INTO courier_settlements (id, tenant_id, courier_id, deliveries, cash_collected, courier_fees, settled_by_user_id, delivery_ids)
+        VALUES ('${OTHER_SETTLEMENT}', '${OTHER_TENANT}', '${COURIER2}', 1, 0, 12, '${CASHIER2}', ARRAY['${D1}']::uuid[]);`);
   });
 
   it('o mesmo acerto não é pago por fora duas vezes (outro id), e o reenvio do mesmo id devolve o registro', async () => {
@@ -5520,5 +5524,49 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await followup({ ...base, p_action: 'COURIER_PAID_OUTSIDE', p_metadata: {} })).body).toMatch(/outro registro com este id/);
     expect(count('COURIER_PAYMENT_RESOLVED', S(6))).toBe('1');
     expect(count('COURIER_PAID_OUTSIDE', S(6))).toBe('0');
+  });
+
+  // GPT, rodada 12 do PR #54: o ganho do acerto sai da gaveta uma vez só, com o valor do ganho.
+  it('duas sangrias do mesmo acerto ao mesmo tempo, com ids diferentes e PIN certo: só uma entra (R$ 12)', async () => {
+    const [a, b] = await Promise.all([withdrawal(S(7)), withdrawal(S(7))]);
+    expect([a.status, b.status].filter((x) => x === 200)).toHaveLength(1);
+    expect([a, b].find((x) => x.status !== 200)!.body).toMatch(/sangria deste acerto já está registrada/);
+    expect(count('CASH_WITHDRAWAL', S(7))).toBe('1');
+    expect(sql2(`SELECT sum(-amount_impact) FROM audit_logs WHERE tenant_id = '${T2}' AND action_type = 'CASH_WITHDRAWAL'
+                 AND metadata->>'courier_settlement_id' = '${S(7)}'`)).toBe('12.00');
+    // Depois, outra sangria do mesmo acerto também não entra.
+    expect((await withdrawal(S(7))).body).toMatch(/sangria deste acerto já está registrada/);
+    // Mesmo sem os gatilhos (gravação à mão), o índice único segura a segunda.
+    const raw = psql(target!, `SET session_replication_role = replica;
+      INSERT INTO audit_logs (tenant_id, performed_by_user_id, action_type, amount_impact, reason, metadata)
+      VALUES ('${T2}', '${CASHIER2}', 'CASH_WITHDRAWAL', -12, 'Sangria à mão', '{"courier_settlement_id": "${S(7)}"}'::jsonb);`, DB2);
+    expect(raw.ok).toBe(false);
+    expect(raw.message).toMatch(/idx_audit_logs_courier_settlement_once/);
+  });
+
+  it('sangria citando o acerto com valor diferente do ganho, acerto inexistente ou de outra loja: recusada', async () => {
+    for (const amount of [5, 12.01, 11.99]) {
+      const r = await withdrawal(S(8), amount);
+      expect(r.status, String(amount)).toBeGreaterThanOrEqual(400);
+      expect(r.body).toMatch(/exatamente o ganho do entregador/);
+    }
+    expect(count('CASH_WITHDRAWAL', S(8))).toBe('0');
+    for (const sid of [crypto.randomUUID(), OTHER_SETTLEMENT]) {
+      const r = await withdrawal(sid);
+      expect(r.status).toBeGreaterThanOrEqual(400);
+      expect(r.body).toMatch(/não é desta loja/);
+    }
+    expect((await withdrawal('não-é-uuid')).body).toMatch(/acerto com o entregador inválido/);
+    // O valor certo passa.
+    expect((await withdrawal(S(8), 12)).status).toBe(200);
+  });
+
+  it('a mesma senha do acerto não é resolvida duas vezes com ids diferentes', async () => {
+    const base = { p_action: 'COURIER_PAYMENT_RESOLVED', p_settlement_id: S(9), p_reason: 'Recebido no caixa por outro meio', p_metadata: { delivery_id: D2 } };
+    expect((await followup({ ...base, p_audit_id: crypto.randomUUID() })).status).toBe(200);
+    expect((await followup({ ...base, p_audit_id: crypto.randomUUID() })).body).toMatch(/já está registrada como resolvida/);
+    expect(count('COURIER_PAYMENT_RESOLVED', S(9))).toBe('1');
+    // A outra senha do mesmo acerto continua podendo ser resolvida.
+    expect((await followup({ ...base, p_audit_id: crypto.randomUUID(), p_metadata: { delivery_id: D1 } })).status).toBe(200);
   });
 });

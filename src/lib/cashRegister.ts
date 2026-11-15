@@ -86,6 +86,21 @@ export function cashOutsideSessions(
   return { amount: fromCents(outside.reduce((a, p) => a + toCents(p.amount), 0)), count: outside.length };
 }
 
+/**
+ * Conferência do painel do dono: roda quando há caixa daqui ou da nuvem (outro aparelho). Sem
+ * nenhum caixa conhecido não há o que comparar (undefined). Aparelho do dono que nunca abriu caixa
+ * também confere pelos horários dos caixas dos outros aparelhos (GPT, rodada 12 do PR #54).
+ */
+export function ownerCashOutside(
+  payments: readonly Payment[],
+  sessions: readonly CashSession[],
+  since: Date,
+  now: Date,
+  cloudRanges: readonly CashRange[],
+): { amount: number; count: number } | undefined {
+  return sessions.length > 0 || cloudRanges.length > 0 ? cashOutsideSessions(payments, sessions, since, now, cloudRanges) : undefined;
+}
+
 /** Valor digitado na tela ("1.234,56" ou "1234.56") em reais; NaN se não for número. */
 export function parseMoneyInput(raw: string): number {
   const t = raw.trim().replace(/\s|R\$/g, '');

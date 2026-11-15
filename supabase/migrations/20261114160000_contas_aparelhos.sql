@@ -955,6 +955,13 @@ BEGIN
             RAISE EXCEPTION 'TCHEFOOD_ENTREGA: o ganho deste acerto já está registrado como pago por fora.';
         END IF;
     ELSE
+        -- A senha deste acerto já foi resolvida com o gerente (outro registro, outro aparelho).
+        IF EXISTS (SELECT 1 FROM audit_logs a
+                    WHERE a.tenant_id = v_tenant AND a.action_type = 'COURIER_PAYMENT_RESOLVED'
+                      AND a.metadata->>'courier_settlement_id' = p_settlement_id::text
+                      AND a.metadata->>'delivery_id' = v_delivery::text) THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: esta senha do acerto já está registrada como resolvida com o gerente.';
+        END IF;
         SELECT d.order_id INTO v_order FROM own_deliveries d WHERE d.id = v_delivery AND d.tenant_id = v_tenant;
         SELECT o.pickup_number INTO v_pickup FROM orders o WHERE o.id = v_order AND o.tenant_id = v_tenant;
     END IF;
@@ -1014,21 +1021,47 @@ BEGIN
     END IF;
 END $$;
 
--- A sangria que cita um acerto já pago por fora é recusada (o contrário da conferência em
--- tchefood_courier_followup_audit): o ganho sairia duas vezes, uma por fora e outra da gaveta.
+-- A sangria que cita um acerto (metadata.courier_settlement_id) paga o ganho do entregador da
+-- gaveta, uma vez só (GPT, rodada 12 do PR #54):
+--  - o acerto existe nesta loja e o valor da sangria é exatamente o ganho dele, em centavos
+--    (ganho zero não tem sangria);
+--  - o acerto não tem outra sangria (outro id, outro aparelho) nem "pago por fora" (o contrário
+--    da conferência em tchefood_courier_followup_audit): o ganho sairia duas vezes.
 -- Pega a trava do PIN da loja antes de conferir: tchefood_authorize_manager já está com ela ao
 -- gravar a sangria (a trava é reentrante) e tchefood_courier_followup_audit confere a sangria com
--- ela, então uma das duas sempre vê a outra. Roda depois de trg_audit_logs_courier_guard e antes
--- de trg_audit_logs_guard (ordem alfabética dos gatilhos BEFORE INSERT).
+-- ela, então uma sempre vê a outra. O índice único idx_audit_logs_courier_settlement_once
+-- (abaixo) segura a mesma regra mesmo sem a trava. Roda depois de trg_audit_logs_courier_guard e
+-- antes de trg_audit_logs_guard (ordem alfabética dos gatilhos BEFORE INSERT).
 CREATE OR REPLACE FUNCTION tchefood_courier_withdrawal_guard()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    v_sid UUID;
+    v_fees NUMERIC;
 BEGIN
     IF NEW.action_type = 'CASH_WITHDRAWAL' AND (NEW.metadata->>'courier_settlement_id') IS NOT NULL THEN
         PERFORM pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || NEW.tenant_id::text));
+        BEGIN
+            v_sid := (NEW.metadata->>'courier_settlement_id')::uuid;
+        EXCEPTION WHEN others THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: a sangria cita um acerto com o entregador inválido.';
+        END;
+        SELECT s.courier_fees INTO v_fees FROM courier_settlements s WHERE s.id = v_sid AND s.tenant_id = NEW.tenant_id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: a sangria cita um acerto com o entregador que não é desta loja.';
+        END IF;
+        IF v_fees IS NULL OR round(v_fees * 100) <= 0
+           OR NEW.amount_impact IS NULL OR round(-NEW.amount_impact * 100) <> round(v_fees * 100) THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: a sangria do acerto precisa ser exatamente o ganho do entregador (R$ %).', COALESCE(v_fees, 0);
+        END IF;
         IF EXISTS (SELECT 1 FROM audit_logs a
                     WHERE a.tenant_id = NEW.tenant_id AND a.action_type = 'COURIER_PAID_OUTSIDE'
-                      AND a.metadata->>'courier_settlement_id' = NEW.metadata->>'courier_settlement_id') THEN
+                      AND a.metadata->>'courier_settlement_id' = v_sid::text) THEN
             RAISE EXCEPTION 'TCHEFOOD_ENTREGA: o ganho deste acerto já foi pago por fora; a sangria não sai da gaveta.';
+        END IF;
+        IF EXISTS (SELECT 1 FROM audit_logs a
+                    WHERE a.tenant_id = NEW.tenant_id AND a.action_type = 'CASH_WITHDRAWAL'
+                      AND a.metadata->>'courier_settlement_id' = v_sid::text) THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: a sangria deste acerto já está registrada no caixa; o ganho não sai duas vezes.';
         END IF;
     END IF;
     RETURN NEW;
@@ -1038,14 +1071,19 @@ DROP TRIGGER IF EXISTS trg_audit_logs_courier_withdrawal_guard ON audit_logs;
 CREATE TRIGGER trg_audit_logs_courier_withdrawal_guard BEFORE INSERT ON audit_logs
     FOR EACH ROW EXECUTE FUNCTION tchefood_courier_withdrawal_guard();
 
--- Índices das conferências acima: reenvio pelo id do aparelho e acerto citado pela sangria ou
--- pelo "pago por fora" (sem eles, cada conferência lia a auditoria inteira da loja).
+-- Índices das conferências acima: reenvio pelo id do aparelho, e um só pagamento do ganho por
+-- acerto (sangria ou "pago por fora", nunca dois), único na loja.
 CREATE INDEX IF NOT EXISTS idx_audit_logs_courier_followup_client
     ON audit_logs (tenant_id, (metadata->>'client_audit_id'))
     WHERE action_type IN ('COURIER_PAID_OUTSIDE', 'COURIER_PAYMENT_RESOLVED');
-CREATE INDEX IF NOT EXISTS idx_audit_logs_courier_settlement
+DROP INDEX IF EXISTS idx_audit_logs_courier_settlement;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_logs_courier_settlement_once
     ON audit_logs (tenant_id, (metadata->>'courier_settlement_id'))
-    WHERE action_type IN ('CASH_WITHDRAWAL', 'COURIER_PAID_OUTSIDE');
+    WHERE action_type IN ('CASH_WITHDRAWAL', 'COURIER_PAID_OUTSIDE') AND (metadata->>'courier_settlement_id') IS NOT NULL;
+-- Uma resolução do gerente por senha do acerto (outro id, outro aparelho: recusada).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_logs_courier_resolved_once
+    ON audit_logs (tenant_id, (metadata->>'courier_settlement_id'), (metadata->>'delivery_id'))
+    WHERE action_type = 'COURIER_PAYMENT_RESOLVED';
 
 DO $$
 BEGIN

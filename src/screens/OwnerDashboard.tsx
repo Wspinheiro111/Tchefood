@@ -23,7 +23,7 @@ import {
   type HourPoint,
   type MarketplaceSale,
 } from '../lib/ownerDashboard';
-import { cashOutsideSessions, type CashRange } from '../lib/cashRegister';
+import { ownerCashOutside, type CashRange } from '../lib/cashRegister';
 import { leftover, type LeftoverReport } from '../lib/cardFees';
 import { reviewSummary, type ReviewSummary } from '../lib/reviews';
 import { ownerAlerts, type AlertTarget, type OwnerAlert } from '../lib/ownerAlerts';
@@ -122,7 +122,7 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
         // Dependência de app: olha sempre o dia de hoje, não o período escolhido.
         channels: channelMix(ix, periodRanges('today', now).current),
         // Só avisa em loja que já usa o caixa; quem nunca abriu um não recebe o aviso todo dia.
-        cashOutside: cashSessions.length ? cashOutsideSessions(payments, cashSessions, shiftStartBrasilia(now), now, cloudCashRanges) : undefined,
+        cashOutside: ownerCashOutside(payments, cashSessions, shiftStartBrasilia(now), now, cloudCashRanges),
       }),
     [now, orders, tables, products, kegTaps, deliveryErrors, marketplace, cloud, rejected, outbox, syncStatus, ix, payments, cashSessions, cloudCashRanges],
   );
