@@ -812,7 +812,7 @@ function freeValue(v: string) {
     net.down = false;
     await expectSynced('estorno espelhado (venda devolvida)');
     // Fechou aqui (NFC-e) e reabriu com o estorno: aparece em "Contas reabertas pelo estorno".
-    expect(isRefundReopenedOrder(st().orders.find((x) => x.id === id)!, st().payments)).toBe(true);
+    expect(isRefundReopenedOrder(st().orders.find((x) => x.id === id)!, st().payments, st().auditLogs)).toBe(true);
     // P1-02: a lista do servidor acha o pagamento estornado pelo NSU, com o estado de lá.
     const listed = await listPointPayments({ from: null, to: null, search: 'PE2E2', cursor: null });
     expect(listed).toMatchObject({ kind: 'ok', nextCursor: null, items: [{ idempotency_key: key, order_id: id, status: 'REFUNDED', nsu: 'PE2E2' }] });
@@ -890,6 +890,9 @@ function freeValue(v: string) {
     const server = { status: 'PAYING', remaining: o.remaining_balance, payments: [`${key}:REFUNDED`], paidItems: Number(sql(`SELECT count(*) FROM order_items WHERE order_id = '${id}' AND is_paid`)) };
     const onB = fin();
     expect(onB).toMatchObject({ ...server, closedAt: null, reopened: true });
+    // GPT r12 P1-01: no servidor a conta não tem NFC-e e mesmo assim é reconhecida como reaberta.
+    expect(sql(`SELECT COALESCE(nfce_key, '-') FROM orders WHERE id = '${id}'`)).toBe('-');
+    expect(st().orders.find((x) => x.id === id)!.nfce_key).toBeNull();
     // Aparelho A (ainda com a conta fechada e o pagamento aprovado): a lista de contas reabertas lê o servidor e traz.
     without();
     useTcheStore.setState((s) => ({ orders: [...deviceA.orders, ...s.orders], payments: [...s.payments, ...deviceA.payments], orderItems: [...s.orderItems, ...deviceA.orderItems], auditLogs: [...deviceA.auditLogs, ...s.auditLogs] }));
@@ -898,6 +901,7 @@ function freeValue(v: string) {
     await waitFor(() => expect(fin().status).toBe('PAYING'), { timeout: 10_000 });
     expect(fin()).toEqual(onB);
     await screen.findByText(/Servidor lido às/);
+    expect(screen.getByRole('button', { name: 'Encerrar como venda devolvida' })).toBeTruthy();
     cleanup();
     // Recarregar a página: o que ficou gravado no aparelho é o estado do servidor.
     await useTcheStore.persist.rehydrate();

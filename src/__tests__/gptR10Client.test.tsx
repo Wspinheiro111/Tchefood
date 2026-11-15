@@ -229,7 +229,7 @@ describe('P1-01: conta reaberta pelo estorno: cobrar de novo ou encerrar como ve
     const orderId = await reopenedOrder();
     const order = st().orders.find((o) => o.id === orderId)!;
     expect(order).toMatchObject({ status: 'PAYING', closed_at: null });
-    expect(isRefundReopenedOrder(order, st().payments)).toBe(true);
+    expect(isRefundReopenedOrder(order, st().payments, st().auditLogs)).toBe(true);
     const opened: string[] = [];
     render(<RefundReopenedOrders onOpenCheckout={(id) => opened.push(id)} />);
     fireEvent.click(screen.getByRole('button', { name: 'Cobrar de novo' }));
@@ -433,5 +433,29 @@ describe('itens do pagamento estornado: o PATCH sobe; conta paga por valor segue
     expect(st().nfceSeq).toBe(seq);
     const log = st().auditLogs.find((l) => l.order_id === orderId && l.action_type === 'NFCE_ALREADY_ISSUED')!;
     expect(st().outbox.some((e) => e.table === 'audit_logs' && e.row_id === log.id)).toBe(true);
+  });
+});
+
+describe('GPT r12 P1-01: conta sem NFC-e, fechada na Point e estornada', () => {
+  it('aparece em "Contas reabertas" com "Cobrar de novo" e "Encerrar como venda devolvida"; a NFC-e não decide nada', async () => {
+    const orderId = openWithItems();
+    const order = st().orders.find((o) => o.id === orderId)!;
+    payPoint(orderId, order.remaining_balance, 'k-sem-nota');
+    // Conta encerrada sem NFC-e emitida.
+    useTcheStore.setState({ outbox: [], orders: st().orders.map((o) => (o.id === orderId ? { ...o, nfce_key: null, nfce_status: null } : o)) });
+    expect(st().orders.find((o) => o.id === orderId)).toMatchObject({ status: 'CLOSED', nfce_key: null });
+    const r = await submitPointRefund(st().payments.find((p) => p.idempotency_key === 'k-sem-nota')!, '9999', 'venda estornada na maquininha', refundDeps({ payment_registered: true }));
+    expect(r).toMatchObject({ ok: true, data: { reopened: true, nfceIssued: false } });
+    const reopened = st().orders.find((o) => o.id === orderId)!;
+    expect(reopened).toMatchObject({ status: 'PAYING', nfce_key: null });
+    expect(isRefundReopenedOrder(reopened, st().payments, st().auditLogs)).toBe(true);
+    const opened: string[] = [];
+    render(<RefundReopenedOrders onOpenCheckout={(id) => opened.push(id)} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Cobrar de novo' }));
+    expect(opened).toEqual([orderId]);
+    expect(screen.getByRole('button', { name: 'Encerrar como venda devolvida' })).toBeTruthy();
+    // E com NFC-e, mas sem o registro do estorno que reabriu: não é conta reaberta (a nota não basta).
+    const withNote = { ...reopened, nfce_key: '4326' };
+    expect(isRefundReopenedOrder(withNote, st().payments, [])).toBe(false);
   });
 });

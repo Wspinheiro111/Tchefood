@@ -268,14 +268,14 @@ export function PointRefunds({ payments, listDeps, onRefunded }: { payments: rea
   );
 }
 
-/** Conta reaberta pelo estorno da Point: fechada antes (NFC-e emitida), com pagamento da Point estornado e saldo. */
+/** Conta reaberta pelo estorno da Point: fechada antes (registro do estorno com order_reopened), com pagamento da Point estornado e saldo. */
 export function isRefundReopenedOrder(order: Order, payments: readonly Payment[], logs: readonly AuditLog[] = []): boolean {
   if (order.status === 'CLOSED' || order.status === 'CANCELED' || toCents(order.remaining_balance) <= 0) return false;
   if (!payments.some((p) => p.order_id === order.id && p.acquirer === 'MERCADO_PAGO' && p.status === 'REFUNDED')) return false;
-  // GPT r12: a conta é identificada pelo registro do estorno que a reabriu (order_reopened), com ou sem NFC-e; a nota
-  // emitida continua valendo como sinal de conta que já fechou (registro antigo, sem a marca).
-  return Boolean(order.nfce_key)
-    || logs.some((l) => l.order_id === order.id && l.action_type === 'POINT_PAYMENT_REFUNDED' && l.metadata?.order_reopened === true);
+  // GPT r12 (P1-01): a conta é identificada pelo estado financeiro e pelo registro do estorno que a reabriu
+  // (POINT_PAYMENT_REFUNDED com order_reopened, o mesmo critério do servidor), nunca pela NFC-e: a nota só decide as
+  // providências fiscais (aviso de conferir o cancelamento).
+  return logs.some((l) => l.order_id === order.id && l.action_type === 'POINT_PAYMENT_REFUNDED' && l.metadata?.order_reopened === true);
 }
 
 export const WRITE_OFF_HELP = 'Encerra a conta sem cobrar o saldo estornado: a venda fica registrada como devolvida, com o valor baixado. Só com o PIN do gerente, conferido no servidor.';
