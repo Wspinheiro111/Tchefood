@@ -11,7 +11,7 @@ import { idbStorage } from '../lib/idbStorage';
 import { round2 } from '../lib/money';
 import { validateFeeRule, type FeeRule } from '../lib/cardFees';
 import { nowISO, uuid } from '../lib/ids';
-import { useTcheStore } from './useTcheStore';
+import { isManagerRole, selectCurrentUser, useTcheStore } from './useTcheStore';
 import { DEFAULT_WINBACK_TEMPLATE, normalizeCouponCode, validateCampaign, type WinbackCampaign, type WinbackContact } from '../lib/winback';
 
 /** 0 = domingo … 6 = sábado (Date.getDay()). Null = sem meta naquele dia. */
@@ -45,8 +45,15 @@ interface OwnerSettingsState {
    * valor diferente fica nas antigas, à vista, até a gerência resolver; a igual não duplica.
    */
   adoptLegacyFees: (tenantId: string) => string | null;
-  /** Descarta as taxas antigas que sobraram (só as que conflitam com as da loja). */
-  discardLegacyFees: () => void;
+  /**
+   * Tira as taxas antigas da lista de pendentes, sem apagar: vão para `legacyArchive`, de onde
+   * a gerência pode restaurar (não se sabe de qual loja são; outra loja pode precisar delas).
+   */
+  discardLegacyFees: () => string | null;
+  /** Taxas antigas tiradas da lista (mais recente por último), guardadas para restaurar. */
+  legacyArchive: StoreFees[];
+  /** Volta as últimas taxas antigas tiradas para a lista de pendentes. */
+  restoreLegacyFees: () => string | null;
   /** Grava (novo ou edição) uma regra de taxa DA LOJA ATUAL. Devolve o erro, ou null. */
   saveFeeRule: (rule: Omit<FeeRule, 'id'> & { id?: string }) => string | null;
   removeFeeRule: (id: string) => void;
@@ -74,6 +81,10 @@ const NO_FEES: StoreFees = { feeRules: NO_FEE_RULES, appCommissionPct: NO_COMMIS
 export function storeFees(s: Pick<OwnerSettingsState, 'feesByTenant'>, tenantId: string): StoreFees {
   return s.feesByTenant[tenantId] ?? NO_FEES;
 }
+
+/** Só gerente ou proprietário mexe nas taxas antigas (sem loja definida). */
+const NOT_MANAGER = 'Só gerente ou proprietário revisa as taxas antigas.';
+const currentIsManager = (): boolean => isManagerRole(selectCurrentUser(useTcheStore.getState())?.role);
 
 /** Loja que está neste aparelho agora (quem grava uma taxa grava para ela). */
 const currentTenantId = (): string => useTcheStore.getState().tenant.id;
@@ -138,6 +149,7 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
       feesByTenant: {},
       legacyFees: null,
       adoptLegacyFees: (tenantId) => {
+        if (!currentIsManager()) return NOT_MANAGER;
         let err: string | null = null;
         set((s) => {
           if (!hasAnyFee(s.legacyFees)) {
@@ -149,7 +161,36 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
         });
         return err;
       },
-      discardLegacyFees: () => set({ legacyFees: null }),
+      legacyArchive: [],
+      discardLegacyFees: () => {
+        if (!currentIsManager()) return NOT_MANAGER;
+        let err: string | null = null;
+        set((s) => {
+          if (!hasAnyFee(s.legacyFees)) {
+            err = 'Não há taxas antigas para tirar da lista.';
+            return {};
+          }
+          return { legacyArchive: [...s.legacyArchive, s.legacyFees!], legacyFees: null };
+        });
+        return err;
+      },
+      restoreLegacyFees: () => {
+        if (!currentIsManager()) return NOT_MANAGER;
+        let err: string | null = null;
+        set((s) => {
+          const last = s.legacyArchive[s.legacyArchive.length - 1];
+          if (!last) {
+            err = 'Não há taxas antigas guardadas para restaurar.';
+            return {};
+          }
+          if (hasAnyFee(s.legacyFees)) {
+            err = 'Resolva antes as taxas antigas que estão na lista.';
+            return {};
+          }
+          return { legacyFees: last, legacyArchive: s.legacyArchive.slice(0, -1) };
+        });
+        return err;
+      },
       saveFeeRule: (input) => {
         const rule: FeeRule = {
           id: input.id ?? uuid(),
@@ -212,6 +253,7 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
         dailyGoals: s.dailyGoals,
         feesByTenant: s.feesByTenant,
         legacyFees: s.legacyFees,
+        legacyArchive: s.legacyArchive,
         winbackCampaign: s.winbackCampaign,
         winbackContacts: s.winbackContacts,
       }),
@@ -228,6 +270,7 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
           const legacy: StoreFees = { feeRules: oldRules, appCommissionPct: oldCommissions };
           out.legacyFees = hasAnyFee(legacy) ? legacy : null;
         }
+        if (!Array.isArray(out.legacyArchive)) out.legacyArchive = [];
         if (typeof out.winbackCampaign !== 'object' || out.winbackCampaign === null) out.winbackCampaign = DEFAULT_CAMPAIGN;
         if (!Array.isArray(out.winbackContacts)) out.winbackContacts = [];
         return out as unknown as OwnerSettingsState;

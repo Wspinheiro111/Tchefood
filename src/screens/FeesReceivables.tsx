@@ -60,11 +60,14 @@ export function FeesReceivables() {
 
   const edit = (r: FeeRule) => setDraft({ id: r.id, acquirer: r.acquirer, method: r.method, brand: r.brand, pct: String(r.pct).replace('.', ','), fixed: String(r.fixed).replace('.', ','), days: String(r.days), businessDays: r.businessDays });
 
-  // Taxas antigas (de antes da separação por loja) ficam à vista enquanto existirem, mesmo
-  // que a loja já tenha cadastrado as suas: nada fica guardado sem a gerência ver.
+  // Taxas antigas (de antes da separação por loja): não se sabe de qual loja são, então só a
+  // gerência vê e decide, e só depois de abrir a revisão. O caixa não vê nada delas.
+  const legacyArchiveCount = useOwnerSettings((s) => s.legacyArchive.length);
+  const [reviewLegacy, setReviewLegacy] = useState(false);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
   const legacyReview = useMemo(
-    () => (legacyFees ? mergeLegacyFees({ feeRules: rules, appCommissionPct: commissions }, legacyFees) : null),
-    [legacyFees, rules, commissions],
+    () => (canEdit && legacyFees ? mergeLegacyFees({ feeRules: rules, appCommissionPct: commissions }, legacyFees) : null),
+    [canEdit, legacyFees, rules, commissions],
   );
   const conflictRule = new Set(legacyReview?.conflicts.rules.map((r) => r.id) ?? []);
   const conflictChannel = new Set(legacyReview?.conflicts.channels ?? []);
@@ -72,57 +75,97 @@ export function FeesReceivables() {
   const legacyTotal = (legacyFees?.feeRules.length ?? 0) + legacyChannels.length;
   const onlyConflicts = legacyTotal > 0 && legacyTotal === conflictRule.size + conflictChannel.size;
   const channelLabel = (key: string) => (DELIVERY_CHANNEL_CATALOG as Readonly<Record<string, { label: string }>>)[key]?.label ?? key;
+  const ruleTerms = (r: FeeRule) => `${String(r.pct).replace('.', ',')}% + ${formatBRL(r.fixed)}, D+${r.days} ${r.businessDays ? 'útil' : 'corrido'}`;
+  const storeRuleFor = (r: FeeRule) => rules.find((x) => x.acquirer === r.acquirer && x.method === r.method && x.brand === r.brand);
 
   return (
     <div className="space-y-4">
-      {legacyFees && (
+      {canEdit && legacyFees && (
         <section role="alert" aria-label="Taxas antigas" className="space-y-2 rounded-2xl bg-amarelo/15 p-4 text-sm">
           <p>
-            Taxas e comissões cadastradas antes de o app separar as taxas por loja. Não se sabe de qual loja são, então não valem para esta loja até você trazê-las. O que já existe na loja com valor diferente não é trocado: fica aqui marcado como conflito.
+            Há {legacyTotal} taxa(s) ou comissão(ões) cadastrada(s) antes de o app separar as taxas por loja. Não se sabe de qual loja são, então não valem para esta loja até você revisar e trazer. O que já existe na loja com valor diferente não é trocado.
           </p>
-          <ul className="list-disc pl-5">
-            {legacyFees.feeRules.map((r) => (
-              <li key={r.id}>
-                {FEE_ACQUIRER_LABEL[r.acquirer]} · {FEE_METHOD_LABEL[r.method]} · {r.brand ?? 'todas as bandeiras'}: {String(r.pct).replace('.', ',')}% + {formatBRL(r.fixed)}, D+{r.days}
-                {conflictRule.has(r.id) && <strong> (conflito: a loja já tem outra taxa para esta maquininha, forma e bandeira)</strong>}
-              </li>
-            ))}
-            {legacyChannels.map(([ch, v]) => (
-              <li key={ch}>
-                Comissão {channelLabel(ch)}: {String(v).replace('.', ',')}%
-                {conflictChannel.has(ch) && <strong> (conflito: a loja já tem outra comissão para este app)</strong>}
-              </li>
-            ))}
-          </ul>
-          {canEdit && (
-            <div className="flex flex-wrap gap-2">
-              {!onlyConflicts && (
-                <Btn
-                  variant="secondary"
-                  aria-label="As taxas são desta loja"
-                  onClick={() => {
-                    const err = useOwnerSettings.getState().adoptLegacyFees(tenantId);
-                    if (err) toast.error(err);
-                    else toast.success(pendingLegacyFees(useOwnerSettings.getState()) ? 'Taxas trazidas. As que conflitam ficaram marcadas para você conferir.' : 'Taxas trazidas para esta loja.');
-                  }}
-                >
-                  As taxas são desta loja
-                </Btn>
-              )}
-              {onlyConflicts && (
-                <Btn
-                  variant="secondary"
-                  aria-label="Descartar as taxas antigas em conflito"
-                  onClick={() => {
-                    useOwnerSettings.getState().discardLegacyFees();
-                    toast.success('Taxas antigas descartadas. Valem as cadastradas para esta loja.');
-                  }}
-                >
-                  Descartar as antigas em conflito
-                </Btn>
-              )}
-            </div>
+          {!reviewLegacy ? (
+            <Btn variant="secondary" aria-label="Revisar taxas antigas" onClick={() => setReviewLegacy(true)}>
+              Revisar taxas antigas
+            </Btn>
+          ) : (
+            <>
+              <ul className="list-disc pl-5">
+                {legacyFees.feeRules.map((r) => {
+                  const cur = conflictRule.has(r.id) ? storeRuleFor(r) : undefined;
+                  return (
+                    <li key={r.id}>
+                      {FEE_ACQUIRER_LABEL[r.acquirer]} · {FEE_METHOD_LABEL[r.method]} · {r.brand ?? 'todas as bandeiras'}: antiga {ruleTerms(r)}
+                      {cur && <strong> (conflito: na loja {ruleTerms(cur)})</strong>}
+                    </li>
+                  );
+                })}
+                {legacyChannels.map(([ch, v]) => (
+                  <li key={ch}>
+                    Comissão {channelLabel(ch)}: antiga {String(v).replace('.', ',')}%
+                    {conflictChannel.has(ch) && <strong> (conflito: na loja {String(commissions[ch]).replace('.', ',')}%)</strong>}
+                  </li>
+                ))}
+              </ul>
+              <div className="flex flex-wrap gap-2">
+                {!onlyConflicts && (
+                  <Btn
+                    variant="secondary"
+                    aria-label="As taxas são desta loja"
+                    onClick={() => {
+                      const err = useOwnerSettings.getState().adoptLegacyFees(tenantId);
+                      if (err) toast.error(err);
+                      else toast.success(pendingLegacyFees(useOwnerSettings.getState()) ? 'Taxas trazidas. As que conflitam ficaram marcadas para você conferir.' : 'Taxas trazidas para esta loja.');
+                    }}
+                  >
+                    As taxas são desta loja
+                  </Btn>
+                )}
+                {onlyConflicts && !confirmDiscard && (
+                  <Btn variant="secondary" aria-label="Tirar as taxas antigas em conflito da lista" onClick={() => setConfirmDiscard(true)}>
+                    Tirar as antigas em conflito da lista
+                  </Btn>
+                )}
+                {onlyConflicts && confirmDiscard && (
+                  <>
+                    <span>As antigas saem da lista mas ficam guardadas neste aparelho; dá para restaurar depois.</span>
+                    <Btn
+                      variant="secondary"
+                      aria-label="Confirmar: tirar da lista"
+                      onClick={() => {
+                        const err = useOwnerSettings.getState().discardLegacyFees();
+                        setConfirmDiscard(false);
+                        if (err) toast.error(err);
+                        else toast.success('Taxas antigas guardadas fora da lista. Valem as cadastradas para esta loja.');
+                      }}
+                    >
+                      Confirmar
+                    </Btn>
+                    <Btn variant="secondary" aria-label="Cancelar" onClick={() => setConfirmDiscard(false)}>
+                      Cancelar
+                    </Btn>
+                  </>
+                )}
+              </div>
+            </>
           )}
+        </section>
+      )}
+      {canEdit && !legacyFees && legacyArchiveCount > 0 && (
+        <section aria-label="Taxas antigas guardadas" className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-slate-200 p-4 text-sm">
+          <span>Há taxas antigas (sem loja definida) tiradas da lista e guardadas neste aparelho.</span>
+          <Btn
+            variant="secondary"
+            aria-label="Restaurar taxas antigas"
+            onClick={() => {
+              const err = useOwnerSettings.getState().restoreLegacyFees();
+              if (err) toast.error(err);
+              else setReviewLegacy(false);
+            }}
+          >
+            Restaurar taxas antigas
+          </Btn>
         </section>
       )}
       <section className="rounded-2xl border border-slate-200 bg-base p-4">
