@@ -1,6 +1,7 @@
 /**
  * Pagamentos da Point lidos do servidor e a conta reaberta pelo estorno (GPT r10, P1-01 e P1-02).
  *  - listPointPayments: tchefood_list_point_payments, em páginas (cursor), com período e busca;
+ *  - listPointRefunds: tchefood_list_point_refunds, os estornos pela data do estorno;
  *  - closeRefundedOrder: tchefood_close_refunded_order, o gerente encerra a conta reaberta como venda devolvida.
  */
 import { callRpc, defaultClaimDeps, type ClaimDeps } from './paymentClaim';
@@ -55,13 +56,11 @@ function parseItem(v: unknown): ServerPointPayment | null {
     refunded_at: str(r.refunded_at), refund_audit_id: str(r.refund_audit_id), refunded_by_manager_id: str(r.refunded_by_manager_id),
   };}
 
-export async function listPointPayments(input: ListPointPaymentsInput, deps: ClaimDeps = defaultClaimDeps()): Promise<ListPointPaymentsResult> {
+async function listRpc(fn: string, body: Record<string, unknown>, deps: ClaimDeps): Promise<ListPointPaymentsResult> {
   try {
     const cfg = await deps.config();
     if (!cfg) return { kind: 'error', error: 'Sem sessão da nuvem: conecte a loja para ver os pagamentos da Point do servidor.' };
-    const out = await callRpc(cfg, 'tchefood_list_point_payments', {
-      p_from: input.from, p_to: input.to, p_search: input.search?.trim() || null, p_cursor: input.cursor, p_limit: input.limit ?? POINT_PAYMENTS_PAGE,
-    }, deps);
+    const out = await callRpc(cfg, fn, body, deps);
     if (out.kind !== 'ok' || !out.body) return { kind: 'error', error: LIST_FAILED };
     const items = out.body.items;
     if (!Array.isArray(items)) return { kind: 'error', error: LIST_FAILED };
@@ -72,6 +71,28 @@ export async function listPointPayments(input: ListPointPaymentsInput, deps: Cla
   } catch {
     return { kind: 'error', error: LIST_FAILED };
   }
+}
+
+export async function listPointPayments(input: ListPointPaymentsInput, deps: ClaimDeps = defaultClaimDeps()): Promise<ListPointPaymentsResult> {
+  return listRpc('tchefood_list_point_payments', {
+    p_from: input.from, p_to: input.to, p_search: input.search?.trim() || null, p_cursor: input.cursor, p_limit: input.limit ?? POINT_PAYMENTS_PAGE,
+  }, deps);
+}
+
+export interface ListPointRefundsInput {
+  /** Período [from, to) da data do estorno no servidor, em ISO; null = sem limite. */
+  from: string | null;
+  to: string | null;
+  cursor: string | null;
+  limit?: number;
+}
+
+/** tchefood_list_point_refunds: estornos da Point pela data do estorno (qualquer idade da venda). */
+export async function listPointRefunds(input: ListPointRefundsInput, deps: ClaimDeps = defaultClaimDeps()): Promise<ListPointPaymentsResult> {
+  const r = await listRpc('tchefood_list_point_refunds', { p_from: input.from, p_to: input.to, p_cursor: input.cursor, p_limit: input.limit ?? 200 }, deps);
+  // Linha de estorno sem a data do estorno não prova nada: recusa a página.
+  if (r.kind === 'ok' && r.items.some((i) => i.refunded_at === null)) return { kind: 'error', error: LIST_FAILED };
+  return r;
 }
 
 export interface CloseRefundedInput {

@@ -13,8 +13,8 @@ import {
   shiftStartBrasilia,
   type ShiftPeriod,
 } from '../lib/reports';
-import type { ListPointPaymentsInput, ListPointPaymentsResult, ServerPointPayment } from '../lib/payments/pointPaymentsServer';
-import { Reconciliation } from '../screens/BackOffice';
+import type { ListPointPaymentsInput, ListPointPaymentsResult, ListPointRefundsInput, ServerPointPayment } from '../lib/payments/pointPaymentsServer';
+import { Dashboard, Reconciliation } from '../screens/BackOffice';
 import { useTcheStore } from '../store/useTcheStore';
 import type { AuditLog, Payment } from '../types';
 
@@ -124,29 +124,83 @@ describe('P2-02: a data do estorno é a do servidor', () => {
   });
 });
 
-describe('loadServerPointPayments: tchefood_list_point_payments do período, todas as páginas', () => {
+describe('loadServerPointPayments: vendas do período e estornos do período (pela data do estorno), todas as páginas', () => {
   const sale = pay('s5', '2026-11-14T20:00:00');
   const item = server(sale, '2026-11-15T13:00:00');
+  const noRefunds = async (): Promise<ListPointPaymentsResult> => ({ kind: 'ok', items: [], nextCursor: null });
 
-  it('lê todas as páginas, desde 31 dias antes do turno (estorno de venda antiga) até o fim do turno', async () => {
+  it('vendas: todas as páginas com a venda no período; estornos: todas as páginas com o estorno no período', async () => {
     const calls: ListPointPaymentsInput[] = [];
+    const rcalls: ListPointRefundsInput[] = [];
     const list = async (input: ListPointPaymentsInput): Promise<ListPointPaymentsResult> => {
       calls.push(input);
       return input.cursor === null ? { kind: 'ok', items: [item], nextCursor: 'c2' } : { kind: 'ok', items: [{ ...item, payment_id: 'other' }], nextCursor: null };
     };
-    const out = await loadServerPointPayments(DAY15, list);
-    expect(out.map((r) => r.payment_id)).toEqual(['s5', 'other']);
-    expect(calls[0]).toMatchObject({ from: new Date(DAY15.start.getTime() - 31 * 86_400_000).toISOString(), to: DAY15.end.toISOString(), search: null, cursor: null });
+    const old = server(pay('old', '2026-10-01T20:00:00'), '2026-11-15T10:00:00');
+    const refunds = async (input: ListPointRefundsInput): Promise<ListPointPaymentsResult> => {
+      rcalls.push(input);
+      return input.cursor === null ? { kind: 'ok', items: [old], nextCursor: 'r2' } : { kind: 'ok', items: [], nextCursor: null };
+    };
+    const out = await loadServerPointPayments(DAY15, list, refunds);
+    expect(out.map((r) => r.payment_id)).toEqual(['s5', 'other', 'old']);
+    expect(calls[0]).toMatchObject({ from: DAY15.start.toISOString(), to: DAY15.end.toISOString(), search: null, cursor: null });
     expect(calls[1]).toMatchObject({ cursor: 'c2' });
+    expect(rcalls[0]).toMatchObject({ from: DAY15.start.toISOString(), to: DAY15.end.toISOString(), cursor: null });
+    expect(rcalls[1]).toMatchObject({ cursor: 'r2' });
   });
 
-  it('erro em qualquer página ou cursor que não acaba: lança (a tela mostra "não carregados")', async () => {
-    await expect(loadServerPointPayments(DAY15, async () => ({ kind: 'error', error: 'sem rede' }))).rejects.toThrow(/sem rede/);
+  it('erro em qualquer página (vendas ou estornos) ou cursor que não acaba: lança (a tela mostra "não carregados")', async () => {
+    await expect(loadServerPointPayments(DAY15, async () => ({ kind: 'error', error: 'sem rede' }), noRefunds)).rejects.toThrow(/sem rede/);
+    await expect(loadServerPointPayments(DAY15, noRefunds, async () => ({ kind: 'error', error: 'estornos fora' }))).rejects.toThrow(/estornos fora/);
     let n = 0;
     const second = async (): Promise<ListPointPaymentsResult> => (n++ === 0 ? { kind: 'ok', items: [item], nextCursor: 'x' } : { kind: 'error', error: 'caiu' });
-    await expect(loadServerPointPayments(DAY15, second)).rejects.toThrow(/caiu/);
-    const endless = async (input: ListPointPaymentsInput): Promise<ListPointPaymentsResult> => ({ kind: 'ok', items: [], nextCursor: `${input.cursor ?? ''}x` });
-    await expect(loadServerPointPayments(DAY15, endless)).rejects.toThrow(/páginas/);
+    await expect(loadServerPointPayments(DAY15, second, noRefunds)).rejects.toThrow(/caiu/);
+    const endless = async (input: { cursor: string | null }): Promise<ListPointPaymentsResult> => ({ kind: 'ok', items: [], nextCursor: `${input.cursor ?? ''}x` });
+    await expect(loadServerPointPayments(DAY15, endless, noRefunds)).rejects.toThrow(/páginas/);
+  });
+});
+
+describe('GPT r11 P2-01: venda antiga estornada hoje', () => {
+  const OLD = shiftOf('2026-10-06T12:00:00'); // 40 dias antes do dia 15
+  const refundRow = (p: Payment) => server(p, '2026-11-15T13:00:00');
+
+  it('venda de 40 dias estornada hoje (aqui já REFUNDED ou ainda APPROVED): hoje estorno 100 e líquido −100; no dia da venda continua a venda', () => {
+    for (const status of ['REFUNDED', 'APPROVED'] as const) {
+      const old = pay(`v40-${status}`, '2026-10-06T20:00:00', { status });
+      const today = reconciliationMovements([old], DAY15, { serverPayments: [refundRow(old)] });
+      expect(mpRow(today), status).toMatchObject({ gross: 0, refunds: 100, net: -100, refundsCount: 1 });
+      expect(today.undatedRefunds.count).toBe(0);
+      // No dia da venda: a leitura daquele dia traz a venda (com a data do estorno, que é de outro dia).
+      const thatDay = reconciliationMovements([old], OLD, { serverPayments: [refundRow(old)] });
+      expect(mpRow(thatDay), status).toMatchObject({ gross: 100, refunds: 0, net: 100 });
+    }
+  });
+
+  it('com a nuvem lida, estornado daqui de venda antiga que o servidor não listou (estorno de outro dia) não vira "sem data" todo dia', () => {
+    const old = pay('v40-b', '2026-10-06T20:00:00', { status: 'REFUNDED' });
+    const r = reconciliationMovements([old], DAY15, { serverPayments: [] });
+    expect(mpRow(r)?.refunds ?? 0).toBe(0);
+    expect(r.undatedRefunds.count).toBe(0);
+    // Venda do próprio período estornada aqui e ausente do servidor (não subiu): sem data, à vista.
+    const fresh = pay('v-fresh', '2026-11-15T10:00:00', { status: 'REFUNDED' });
+    expect(reconciliationMovements([fresh], DAY15, { serverPayments: [] }).undatedRefunds.count).toBe(1);
+  });
+});
+
+describe('GPT r11 P2-03: pagamento que só o servidor tem', () => {
+  it('venda e estorno de outro aparelho entram uma vez; depois que o pagamento chega aqui, não duplica', () => {
+    const other = pay('remote', '2026-11-15T10:00:00', { status: 'REFUNDED' });
+    const rows = [server(other, null, 'APPROVED'), server(other, '2026-11-15T13:00:00')]; // das duas leituras
+    const before = reconciliationMovements([], DAY15, { serverPayments: rows });
+    expect(mpRow(before)).toMatchObject({ gross: 100, refunds: 100, net: 0, salesCount: 1, refundsCount: 1 });
+    const after = reconciliationMovements([other], DAY15, { serverPayments: rows });
+    expect(mpRow(after)).toMatchObject({ gross: 100, refunds: 100, net: 0, salesCount: 1, refundsCount: 1 });
+    // Venda antiga de outro aparelho estornada hoje: só o estorno, hoje.
+    const old = pay('remote-old', '2026-10-06T20:00:00');
+    expect(mpRow(reconciliationMovements([], DAY15, { serverPayments: [server(old, '2026-11-15T13:00:00')] }))).toMatchObject({ gross: 0, refunds: 100, net: -100 });
+    // Estornado no servidor sem data: sem data confirmada, uma vez.
+    const nodate = { ...server(pay('remote-nd', '2026-11-15T09:00:00'), null, 'REFUNDED') };
+    expect(reconciliationMovements([], DAY15, { serverPayments: [nodate] }).undatedRefunds).toMatchObject({ count: 1, total: 100 });
   });
 });
 
@@ -186,4 +240,40 @@ describe('Tela de conciliação: bruto, estornos e líquido', () => {
     expect(screen.queryByText(/estorno sem data confirmada/i)).toBeNull();
     expect(screen.queryByText(/estornos da nuvem não carregados/i)).toBeNull();
   });
+
+  it('GPT r11 P2-02: tela aberta, estorno espelhado aqui: recarrega a nuvem e mostra o estorno com a data do servidor, sem fechar a tela', async () => {
+    const sale = { ...nowSale(), status: 'APPROVED' as const };
+    const refundedAt = new Date(new Date(sale.created_at).getTime() + 60_000).toISOString();
+    let refunded = false;
+    const fetchMock = vi.fn(async (url: string) => {
+      const row = refunded ? { ...server(sale, null, 'REFUNDED'), refunded_at: refundedAt } : server(sale, null, 'APPROVED');
+      const items = String(url).includes('tchefood_list_point_refunds') ? (refunded ? [row] : []) : [row];
+      return { ok: true, status: 200, text: async () => JSON.stringify({ items, next_cursor: null }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    useTcheStore.setState({ payments: [sale], auditLogs: [], cloud: CLOUD });
+    render(<Reconciliation />);
+    await waitFor(() => expect(screen.getByTestId('recon-net-MERCADO_PAGO').textContent).toMatch(/^R\$\s100,00$/));
+    const calls = fetchMock.mock.calls.length;
+    // O estorno foi registrado no servidor e espelhado aqui (o status local muda).
+    refunded = true;
+    useTcheStore.setState({ payments: [{ ...sale, status: 'REFUNDED' }] });
+    await waitFor(() => expect(screen.getByTestId('recon-refunds-MERCADO_PAGO').textContent).toMatch(/^−R\$\s100,00$/));
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(calls);
+    expect(screen.getByTestId('recon-net-MERCADO_PAGO').textContent).toMatch(/^R\$\s0,00$/);
+    expect(screen.queryByText(/estorno sem data confirmada/i)).toBeNull();
+  });
+
+  it('painel do turno: venda antiga estornada hoje reduz o faturamento de hoje (mesma regra da conciliação)', async () => {
+    const period = currentShiftPeriod();
+    const old = pay('dash-old', '2026-10-01T20:00:00', { status: 'REFUNDED' });
+    const refundedAt = new Date(period.start.getTime() + 60_000).toISOString();
+    const row = { ...server(old, null, 'REFUNDED'), refunded_at: refundedAt };
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => ({ ok: true, status: 200, text: async () => JSON.stringify({ items: String(url).includes('tchefood_list_point_refunds') ? [row] : [], next_cursor: null }) })));
+    useTcheStore.setState({ payments: [old], orders: [], auditLogs: [], cloud: CLOUD });
+    render(<Dashboard />);
+    await waitFor(() => expect(screen.getByText(/estornos R\$\s100,00/)).toBeTruthy());
+    expect(screen.getAllByText(/^-\s?R\$\s100,00$|^−R\$\s100,00$|^R\$\s-100,00$/).length).toBeGreaterThan(0);
+  });
 });
+

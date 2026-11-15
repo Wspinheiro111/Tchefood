@@ -5,8 +5,8 @@ import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../st
 import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
-import { AUDIT_LABEL, declinedInShift, formatShiftStart, loadServerPointPayments, reconciliation, reconciliationMovements, shiftKpis, waiterSplit, whatsappAlertText, type ShiftPeriod } from '../lib/reports';
-import { listPointPayments, type ServerPointPayment } from '../lib/payments/pointPaymentsServer';
+import { AUDIT_LABEL, declinedInShift, formatShiftStart, loadServerPointPayments, reconciliationMovements, shiftKpis, waiterSplit, whatsappAlertText, type ShiftPeriod } from '../lib/reports';
+import { listPointPayments, listPointRefunds, type ServerPointPayment } from '../lib/payments/pointPaymentsServer';
 import { PointRefunds, RefundReopenedOrders } from '../components/PointRefund';
 import { useShiftPeriod } from '../lib/useShiftStart';
 import { Badge, Btn, toast } from '../components/ui';
@@ -21,7 +21,7 @@ import { OwnDeliveryAdmin } from './admin/OwnDeliveryAdmin';
 import { OwnerDashboard, type DashboardNavTarget } from './OwnerDashboard';
 import { CardsAdmin, StaffAdmin, TablesAdmin } from './admin/TablesStaffAdmin';
 import { CloudAdmin, StoreAdmin } from './admin/StoreCloudAdmin';
-import type { Permission } from '../types';
+import type { Payment, Permission } from '../types';
 
 type Tab = 'owner' | 'fees' | 'entrega' | 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 'nfce' | 'purchases' | 'menu' | 'tables' | 'staff' | 'store' | 'cloud' | 'printers' | 'config';
 
@@ -148,12 +148,23 @@ export function Dashboard() {
   // Venda devolvida encerrada pelo gerente (ORDER_REFUNDED_WRITE_OFF): só a parte que ficou paga.
   const k = useMemo(() => shiftKpis(orders, payments, period, logs), [orders, payments, period, logs]);
   const occupied = tables.filter((t) => t.status !== 'FREE' && t.status !== 'DIRTY').length;
-  const recon = useMemo(() => reconciliation(payments, period), [payments, period]);
-  const max = Math.max(1, ...recon.map((r) => r.total));
+  // Entradas do turno com a mesma regra da conciliação (GPT r11): venda no turno da venda, estorno no turno da data
+  // do estorno no servidor (venda antiga estornada hoje reduz hoje; o dia da venda continua com a venda).
+  const cloud = useTcheStore((s) => Boolean(s.cloud));
+  const server = useServerRefunds(cloud, period, usePointState(payments));
+  const serverItems = server.state === 'LOADED' ? server.items : null;
+  const moves = useMemo(() => reconciliationMovements(payments, period, { serverPayments: serverItems, logs }), [payments, period, serverItems, logs]);
+  const recon = moves.rows.map((r) => ({ acquirer: r.acquirer, total: r.net }));
+  const max = Math.max(1, ...recon.map((r) => Math.abs(r.total)));
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi label="Faturamento bruto do turno" value={formatBRL(k.grossRevenue)} hint={`Σ aprovados desde ${formatShiftStart(period.start)}`} tone="text-verde" />
+        <Kpi
+          label="Faturamento do turno"
+          value={formatBRL(moves.totals.net)}
+          hint={`vendas ${formatBRL(moves.totals.gross)} − estornos ${formatBRL(moves.totals.refunds)} desde ${formatShiftStart(period.start)}${moves.undatedRefunds.count > 0 ? ` · ${moves.undatedRefunds.count} estorno(s) sem data` : ''}${cloud && server.state === 'FAILED' ? ' · estornos da nuvem não carregados' : ''}`}
+          tone="text-verde"
+        />
         <Kpi label="Ticket médio por mesa" value={formatBRL(k.averageTicket)} hint={`${k.closedOrders} conta(s) fechada(s)`} />
         <Kpi label="Taxa de serviço (10%)" value={formatBRL(k.serviceFeeTotal)} hint="Contas fechadas" tone="text-brasa" />
         <Kpi label="Mesas atendidas" value={String(k.tablesServed)} hint={`${occupied} ocupada(s) agora`} />
@@ -165,7 +176,7 @@ export function Dashboard() {
           {recon.map((r) => (
             <div key={r.acquirer} className="mb-2">
               <div className="flex justify-between text-sm"><span>{r.acquirer === 'CASH_DESK' ? 'Dinheiro / Caixa' : r.acquirer === 'STONE' ? 'Stone' : r.acquirer === 'MERCADO_PAGO' ? 'Mercado Pago' : 'PagBank'}</span><span className="tabular-nums">{formatBRL(r.total)}</span></div>
-              <div className="h-3 rounded-full bg-base"><div className={`h-3 rounded-full ${r.acquirer === 'STONE' ? 'bg-stone' : r.acquirer === 'PAGBANK' ? 'bg-pagbank' : r.acquirer === 'MERCADO_PAGO' ? 'bg-sky-500' : 'bg-slate-400'}`} style={{ width: `${(r.total / max) * 100}%` }} /></div>
+              <div className="h-3 rounded-full bg-base"><div className={`h-3 rounded-full ${r.acquirer === 'STONE' ? 'bg-stone' : r.acquirer === 'PAGBANK' ? 'bg-pagbank' : r.acquirer === 'MERCADO_PAGO' ? 'bg-sky-500' : 'bg-slate-400'}`} style={{ width: `${(Math.max(0, r.total) / max) * 100}%` }} /></div>
             </div>
           ))}
         </div>
@@ -179,28 +190,39 @@ const ACQUIRER_NAME = { STONE: 'Stone', PAGBANK: 'PagBank', MERCADO_PAGO: 'Merca
 type ServerRefunds = { state: 'IDLE' | 'LOADING' | 'FAILED' } | { state: 'LOADED'; items: ServerPointPayment[] };
 
 /**
- * Datas de estorno do servidor para o período (tchefood_list_point_payments), com o prazo da leitura da nuvem.
- * Sem nuvem: IDLE (nada a ler). Erro ou prazo: FAILED.
+ * Movimentos da Point do servidor para o período (vendas do período e estornos do período, pela data do estorno),
+ * com o prazo da leitura da nuvem. Sem nuvem: IDLE. Erro ou prazo: FAILED. Recarrega quando o período muda, quando
+ * um pagamento da Point muda de status aqui (estorno espelhado ou trazido pela sincronização) e a cada `refresh`
+ * (estorno registrado nesta tela, mesmo de pagamento que não está neste aparelho). Dados de outro período nunca
+ * contam como carregados (GPT r11 P2-02).
  */
-function useServerRefunds(cloud: boolean, period: ShiftPeriod): ServerRefunds {
-  const [state, setState] = useState<ServerRefunds>({ state: cloud ? 'LOADING' : 'IDLE' });
+/** Estado dos pagamentos da Point deste aparelho (id:status): muda quando um estorno é espelhado ou sincronizado. */
+function usePointState(payments: readonly Payment[]): string {
+  return useMemo(() => payments.filter((p) => p.acquirer === 'MERCADO_PAGO').map((p) => `${p.id}:${p.status}`).sort().join(','), [payments]);
+}
+
+function useServerRefunds(cloud: boolean, period: ShiftPeriod, refresh: string): ServerRefunds {
   const startMs = period.start.getTime();
   const endMs = period.end.getTime();
+  const periodKey = `${startMs}|${endMs}`;
+  const [state, setState] = useState<{ key: string; value: ServerRefunds }>({ key: periodKey, value: { state: cloud ? 'LOADING' : 'IDLE' } });
   useEffect(() => {
     if (!cloud) {
-      setState({ state: 'IDLE' });
+      setState({ key: periodKey, value: { state: 'IDLE' } });
       return;
     }
     let alive = true;
-    setState((s) => (s.state === 'LOADED' ? s : { state: 'LOADING' }));
-    loadServerPointPayments({ start: new Date(startMs), end: new Date(endMs) }, (input) => listPointPayments(input))
-      .then((items) => alive && setState({ state: 'LOADED', items }))
-      .catch(() => alive && setState({ state: 'FAILED' }));
+    // Mesmo período: mantém os dados já lidos enquanto recarrega; outro período: "lendo".
+    setState((s) => (s.key === periodKey && s.value.state === 'LOADED' ? s : { key: periodKey, value: { state: 'LOADING' } }));
+    loadServerPointPayments({ start: new Date(startMs), end: new Date(endMs) }, (input) => listPointPayments(input), (input) => listPointRefunds(input))
+      .then((items) => alive && setState({ key: periodKey, value: { state: 'LOADED', items } }))
+      .catch(() => alive && setState({ key: periodKey, value: { state: 'FAILED' } }));
     return () => {
       alive = false;
     };
-  }, [cloud, startMs, endMs]);
-  return state;
+  }, [cloud, startMs, endMs, periodKey, refresh]);
+  if (!cloud) return { state: 'IDLE' };
+  return state.key === periodKey ? state.value : { state: 'LOADING' };
 }
 
 export function Reconciliation({ onOpenCheckout }: { onOpenCheckout?: (orderId: string) => void } = {}) {
@@ -208,7 +230,9 @@ export function Reconciliation({ onOpenCheckout }: { onOpenCheckout?: (orderId: 
   const logs = useTcheStore((s) => s.auditLogs);
   const cloud = useTcheStore((s) => Boolean(s.cloud));
   const period = useShiftPeriod([payments]);
-  const server = useServerRefunds(cloud, period);
+  // Recarrega a nuvem quando um pagamento da Point muda de status aqui, ou depois de um estorno nesta tela.
+  const [refundBump, setRefundBump] = useState(0);
+  const server = useServerRefunds(cloud, period, `${usePointState(payments)}#${refundBump}`);
   const serverItems = server.state === 'LOADED' ? server.items : null;
   // Auditoria GPT r10 (P2-01, P2-02): venda no turno da venda, estorno no turno da data do estorno no servidor.
   const recon = useMemo(() => reconciliationMovements(payments, period, { serverPayments: serverItems, logs }), [payments, period, serverItems, logs]);
@@ -289,7 +313,7 @@ export function Reconciliation({ onOpenCheckout }: { onOpenCheckout?: (orderId: 
         {declined.map((p) => <div key={p.id} className="text-slate-500">{new Date(p.created_at).toLocaleTimeString('pt-BR')} · {p.acquirer} · {p.terminal_serial} · {formatBRL(p.amount)}</div>)}
       </div>
       <RefundReopenedOrders {...(onOpenCheckout ? { onOpenCheckout } : {})} />
-      <PointRefunds payments={payments} />
+      <PointRefunds payments={payments} onRefunded={() => setRefundBump((n) => n + 1)} />
     </div>
   );
 }

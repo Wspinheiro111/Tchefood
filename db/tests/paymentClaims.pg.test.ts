@@ -3203,6 +3203,71 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       });
     });
 
+    describe('GPT r11 P2-01: tchefood_list_point_refunds (pela data do estorno)', () => {
+      const RT = '69696969-6969-4969-8969-696969696969';
+      type Page = { items: { payment_id: string; refunded_at: string; refund_audit_id: string; status: string; created_at: string; amount: number }[]; next_cursor: string | null };
+      const q = (from: string | null, to: string | null, cursor: string | null = null, limit?: number) =>
+        `SELECT tchefood_list_point_refunds(${from ? `'${from}'` : 'NULL'}, ${to ? `'${to}'` : 'NULL'}, ${cursor ? `'${cursor}'` : 'NULL'}${limit !== undefined ? `, ${limit}` : ''})`;
+      const page = (from: string | null, to: string | null, cursor: string | null = null, limit?: number, tenant = LATE_TENANT) => json<Page>(asDevice(q(from, to, cursor, limit), tenant));
+      const seed = (ago: string, status: string, refundAgo: string | null) => {
+        const id = crypto.randomUUID();
+        const order = withItems(1000, LATE_TENANT, LATE_TABLE, LATE_STAFF);
+        sql(`BEGIN; SET LOCAL session_replication_role = replica;
+             INSERT INTO payments (id, order_id, tenant_id, waiter_id, terminal_id, amount, method, status, acquirer, nsu, authorization_code, idempotency_key, created_at)
+             VALUES ('${id}', '${order}', '${LATE_TENANT}', '${LATE_STAFF}', '${RT}', 100, 'CREDIT', '${status}', 'MERCADO_PAGO', 'N-${id.slice(0, 6)}', 'A', '${key('lr')}', clock_timestamp() - INTERVAL '${ago}');
+             COMMIT;`);
+        let audit: string | null = null;
+        if (refundAgo) {
+          audit = sql(`BEGIN; SET LOCAL session_replication_role = replica;
+            INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, reason, metadata, created_at)
+            VALUES ('${LATE_TENANT}', '${order}', '${LATE_STAFF}', '${LATE_STAFF}', 'POINT_PAYMENT_REFUNDED', 'estorno conferido', '{"payment_id":"${id}"}', clock_timestamp() - INTERVAL '${refundAgo}') RETURNING id; COMMIT;`)
+            .split('\n').filter((l) => /^[0-9a-f-]{36}$/.test(l))[0]!;
+        }
+        return { id, audit };
+      };
+      let old40: { id: string; audit: string | null };
+      let recent: { id: string; audit: string | null };
+      let yesterday: { id: string; audit: string | null };
+      beforeAll(() => {
+        sql(`INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${RT}', '${LATE_TENANT}', 'Point estornos', 'REF-POINT', 'MERCADO_PAGO') ON CONFLICT (id) DO NOTHING;`);
+        old40 = seed('40 days', 'REFUNDED', '1 hour'); // venda de 40 dias, estornada hoje
+        recent = seed('3 hours', 'REFUNDED', '2 hours');
+        yesterday = seed('10 days', 'REFUNDED', '30 hours');
+        seed('5 hours', 'APPROVED', null);
+      });
+
+      it('venda de 40 dias estornada hoje aparece no período de hoje (pela hora do estorno no servidor); a de ontem não; outra loja não vê; anon 42501', () => {
+        const from = new Date(Date.now() - 20 * 3_600_000).toISOString();
+        const items = page(from, null).items;
+        const ids = items.map((i) => i.payment_id);
+        expect(ids).toContain(old40.id);
+        expect(ids).toContain(recent.id);
+        expect(ids).not.toContain(yesterday.id);
+        const o = items.find((i) => i.payment_id === old40.id)!;
+        expect(o).toMatchObject({ status: 'REFUNDED', refund_audit_id: old40.audit, amount: 100 });
+        expect(o.refunded_at).toBe(sql(`SELECT to_jsonb(created_at) #>> '{}' FROM audit_logs WHERE id = '${old40.audit}'`));
+        expect(Date.parse(o.created_at)).toBeLessThan(Date.now() - 39 * 86_400_000);
+        expect(page(from, null, null, 200, OTHER).items.map((i) => i.payment_id)).not.toContain(old40.id);
+        expect(asRole('anon', q(null, null))).toMatchObject({ ok: false, sqlstate: '42501' });
+      });
+
+      it('páginas por (refunded_at, id do registro) sem repetir nem pular; cursor e limite inválidos: TF006', () => {
+        const all = page(null, null).items.map((i) => i.payment_id);
+        const seen: string[] = [];
+        let cursor: string | null = null;
+        for (let i = 0; i < 50; i += 1) {
+          const p: Page = page(null, null, cursor, 1);
+          seen.push(...p.items.map((x) => x.payment_id));
+          cursor = p.next_cursor;
+          if (!cursor) break;
+        }
+        expect(seen).toEqual(all);
+        for (const bad of [q(null, null, 'lixo'), q(null, null, null, 0), q(null, null, null, 201)]) {
+          expect(asDevice(bad, LATE_TENANT)).toMatchObject({ ok: false, sqlstate: 'TF006' });
+        }
+      });
+    });
+
     describe('a verificar 5: reenvio do pagamento com o mesmo id (tchefood_payment_replay_ok)', () => {
       const row = (id: string) => JSON.parse(sql(`SELECT row_to_json(p)::text FROM payments p WHERE id = '${id}'`)) as Record<string, unknown>;
       const replay = (base: Record<string, unknown>, over: Record<string, unknown>) => register(JSON.stringify({ ...base, ...over }));

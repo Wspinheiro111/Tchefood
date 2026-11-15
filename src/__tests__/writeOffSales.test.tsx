@@ -87,8 +87,9 @@ describe('venda devolvida não é venda', () => {
     expect(v.kpis.grossRevenue).toBe(0);
     expect(v.kpis.closedOrders).toBe(0);
     expect(v.kpis.averageTicket).toBe(0);
-    // O total dos 10% das contas fechadas não mudou (fora do pedido).
-    expect(v.kpis.serviceFeeTotal).toBe(st().orders.find((o) => o.id === orderId)!.service_fee_amount);
+    // GPT r11 P2-04: baixa integral não soma os 10% no indicador do turno.
+    expect(st().orders.find((o) => o.id === orderId)!.service_fee_amount).toBeGreaterThan(0);
+    expect(v.kpis.serviceFeeTotal).toBe(0);
     expect(v.split.reduce((a, r) => a + r.sales + r.commission + r.itemsSold, 0)).toBe(0);
     expect(v.products.find((p) => p.product_id === productId)?.sales ?? 0).toBe(0);
     expect(v.products.find((p) => p.product_id === productId)?.quantity ?? 0).toBe(0);
@@ -102,7 +103,10 @@ describe('venda devolvida não é venda', () => {
     expect(v.kpis.closedOrders).toBe(1);
     expect(v.kpis.averageTicket).toBe(10);
     const fee = st().orders.find((o) => o.id === orderId)!.service_fee_amount;
-    expect(v.kpis.serviceFeeTotal).toBe(fee);
+    // GPT r11 P2-04: indicador e rateio na mesma proporção, centavo por centavo.
+    const commission = v.split.reduce((a, r) => a + Math.round(r.commission * 100), 0);
+    expect(Math.round(v.kpis.serviceFeeTotal * 100)).toBe(commission);
+    expect(v.kpis.serviceFeeTotal).toBeCloseTo(fee * share, 2);
     expect(v.split.reduce((a, r) => a + r.commission, 0)).toBeCloseTo(fee * share, 2);
     const items = st().orderItems.filter((i) => i.order_id === orderId).reduce((a, i) => a + i.total_item_price, 0);
     expect(v.split.reduce((a, r) => a + r.sales, 0)).toBeCloseTo(items * share, 2);

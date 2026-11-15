@@ -139,7 +139,7 @@ function matches(r: RefundRow, q: string): boolean {
  * (NSU, valor, data, operação), sem limite de dias; mais os deste aparelho que ainda não subiram ("ainda não subiu").
  * Sem nuvem: só os deste aparelho.
  */
-export function PointRefunds({ payments, listDeps }: { payments: readonly Payment[]; listDeps?: ClaimDeps }) {
+export function PointRefunds({ payments, listDeps, onRefunded }: { payments: readonly Payment[]; listDeps?: ClaimDeps; onRefunded?: () => void }) {
   const cloud = useTcheStore((s) => s.cloud !== null);
   const outbox = useTcheStore((s) => s.outbox);
   const rejected = useTcheStore((s) => s.syncRejected);
@@ -225,7 +225,10 @@ export function PointRefunds({ payments, listDeps }: { payments: readonly Paymen
                 <PointRefundButton
                   payment={{ idempotency_key: r.key, order_id: r.orderId, amount: r.amount, ...(r.acquirer ? { acquirer: r.acquirer } : {}) }}
                   label={label}
-                  onRefunded={() => setRefundedKeys((k) => [...k, r.key])}
+                  onRefunded={() => {
+                    setRefundedKeys((k) => [...k, r.key]);
+                    onRefunded?.();
+                  }}
                 />
               )}
           </div>

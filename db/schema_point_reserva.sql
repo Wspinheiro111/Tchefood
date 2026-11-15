@@ -63,7 +63,8 @@
 --    fora do Mercado Pago (Stone, PagBank, dinheiro) não tem caminho no sistema, como na main; fica decisão do Will.
 -- 7b. GPT r9 P1-01: aprovada COM pagamento registrado é estornada por tchefood_refund_point_payment (só a service
 --    role, PIN de gerente pela conferência e estorno provado no Mercado Pago): cobrança e pagamento juntos, com UM
---    registro POINT_PAYMENT_REFUNDED; a conta fechada continua fechada, com o saldo devolvido.
+--    registro POINT_PAYMENT_REFUNDED; a conta fechada é reaberta para receber (r11, decisão do Will), e o gerente
+--    pode encerrá-la como venda devolvida (tchefood_close_refunded_order).
 --
 -- Códigos (SQLSTATE) das funções novas: TF001 conta não está no servidor, TF002 conta encerrada,
 -- TF003 passa do saldo livre, TF004 operador fora da equipe ativa, TF005 não encontrada, TF006 dado
@@ -2050,6 +2051,75 @@ END;
 $$;
 
 -- -----------------------------------------------------------------------------
+-- 7g. Estornos da Point pela data do estorno (GPT r11 P2-01), só leitura, loja do token
+-- -----------------------------------------------------------------------------
+-- tchefood_list_point_refunds(p_from, p_to, p_cursor, p_limit) RETURNS JSONB {items, next_cursor}: os estornos da
+-- Point (registro POINT_PAYMENT_REFUNDED, hora do servidor) de p_from (inclusive) a p_to (exclusive), qualquer que
+-- seja a idade da venda. items têm o mesmo formato de tchefood_list_point_payments (com refunded_at preenchido).
+-- Ordem: refunded_at e id do registro, do mais novo; p_cursor = "<refunded_at ISO>|<refund_audit_id>" (inválido:
+-- TF006); p_limit de 1 a 200 (padrão 200).
+CREATE OR REPLACE FUNCTION tchefood_list_point_refunds(
+    p_from TIMESTAMPTZ, p_to TIMESTAMPTZ, p_cursor TEXT, p_limit INT DEFAULT 200)
+RETURNS JSONB
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_limit INT := COALESCE(p_limit, 200);
+    v_cursor_at TIMESTAMPTZ;
+    v_cursor_id UUID;
+    v_rows JSONB;
+    v_count INT;
+    v_last JSONB;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
+    END IF;
+    IF v_limit < 1 OR v_limit > 200 THEN
+        RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: p_limit de 1 a 200.' USING ERRCODE = 'TF006';
+    END IF;
+    IF p_cursor IS NOT NULL AND p_cursor <> '' THEN
+        BEGIN
+            v_cursor_at := split_part(p_cursor, '|', 1)::TIMESTAMPTZ;
+            v_cursor_id := split_part(p_cursor, '|', 2)::UUID;
+        EXCEPTION WHEN others THEN
+            v_cursor_at := NULL;
+        END;
+        IF v_cursor_at IS NULL OR v_cursor_id IS NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: cursor inválido.' USING ERRCODE = 'TF006';
+        END IF;
+    END IF;
+    WITH page AS (
+        SELECT p.id, p.order_id, p.idempotency_key, p.amount, p.method, p.nsu, p.authorization_code, p.status, p.created_at,
+               c.id AS charge_id, a.id AS refund_audit_id, a.created_at AS refunded_at,
+               a.authorized_by_manager_id AS refunded_by_manager_id
+          FROM audit_logs a
+          JOIN payments p ON p.tenant_id = a.tenant_id AND p.id::text = a.metadata->>'payment_id'
+          LEFT JOIN terminal_charges c ON c.tenant_id = p.tenant_id AND c.idempotency_key = p.idempotency_key
+         WHERE a.tenant_id = v_tenant AND a.action_type = 'POINT_PAYMENT_REFUNDED'
+           AND p.acquirer::text = 'MERCADO_PAGO' AND p.status = 'REFUNDED'
+           AND (p_from IS NULL OR a.created_at >= p_from)
+           AND (p_to IS NULL OR a.created_at < p_to)
+           AND (v_cursor_at IS NULL OR (a.created_at, a.id) < (v_cursor_at, v_cursor_id))
+         ORDER BY a.created_at DESC, a.id DESC
+         LIMIT v_limit + 1)
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+               'payment_id', id, 'order_id', order_id, 'charge_id', charge_id, 'idempotency_key', idempotency_key,
+               'amount', amount, 'method', method, 'nsu', nsu, 'authorization_code', authorization_code, 'status', status,
+               'created_at', created_at, 'refunded_at', refunded_at, 'refund_audit_id', refund_audit_id,
+               'refunded_by_manager_id', refunded_by_manager_id) ORDER BY refunded_at DESC, refund_audit_id DESC), '[]'::jsonb), count(*)
+      INTO v_rows, v_count
+      FROM page;
+    IF v_count > v_limit THEN
+        v_rows := v_rows - v_limit;
+        v_last := v_rows->(v_limit - 1);
+        RETURN jsonb_build_object('items', v_rows,
+                                  'next_cursor', (v_last->>'refunded_at') || '|' || (v_last->>'refund_audit_id'));
+    END IF;
+    RETURN jsonb_build_object('items', v_rows, 'next_cursor', NULL);
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
 -- Permissões
 -- -----------------------------------------------------------------------------
 -- Aparelho (authenticated, loja do token): ler a reserva da conta, pedir e liberar reserva de pagamento.
@@ -2080,7 +2150,8 @@ BEGIN
         'tchefood_refund_point_payment(UUID, UUID, UUID, TEXT, JSONB, JSONB)',
         'tchefood_payment_replay_ok(payments, payments, UUID)',
         'tchefood_close_refunded_order(UUID, UUID, TEXT, TEXT, UUID)',
-        'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)'] LOOP
+        'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)',
+        'tchefood_list_point_refunds(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT)'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
             EXECUTE format('REVOKE ALL ON FUNCTION %s FROM anon', v_fn);
@@ -2098,7 +2169,8 @@ BEGIN
         'tchefood_reclaim_payment(VARCHAR, TEXT, VARCHAR, TEXT, VARCHAR, VARCHAR, BIGINT, UUID)',
         'tchefood_authorize_claim_refunded(VARCHAR, UUID, VARCHAR, TEXT, JSONB)',
         'tchefood_close_refunded_order(UUID, UUID, TEXT, TEXT, UUID)',
-        'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)'] LOOP
+        'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)',
+        'tchefood_list_point_refunds(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT)'] LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
             EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO authenticated', v_fn);
         END IF;

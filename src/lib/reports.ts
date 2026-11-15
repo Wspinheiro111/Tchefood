@@ -3,7 +3,7 @@
  */
 import type { AuditLog, DiningTable, Order, OrderItem, Payment, StaffUser } from '../types';
 import { allocateCents, fromCents, toCents } from './money';
-import type { ListPointPaymentsInput, ListPointPaymentsResult, ServerPointPayment } from './payments/pointPaymentsServer';
+import type { ListPointPaymentsInput, ListPointPaymentsResult, ListPointRefundsInput, ServerPointPayment } from './payments/pointPaymentsServer';
 
 export interface ShiftKpis {
   grossRevenue: number;
@@ -192,14 +192,14 @@ export function shiftKpis(orders: readonly Order[], payments: readonly Payment[]
       : (iso: string | null) => inShiftPeriod(iso, since);
   const approved = payments.filter((p) => p.status === 'APPROVED' && inShift(p.created_at));
   const grossCents = approved.reduce((a, p) => a + toCents(p.amount), 0);
-  // Venda devolvida encerrada pelo gerente: só o que ficou pago; baixada por inteiro não é conta fechada.
-  // O total de 10% das contas fechadas segue como antes (não foi pedido mudar).
+  // Venda devolvida encerrada pelo gerente: só o que ficou pago; baixada por inteiro não é conta fechada. Os 10%
+  // seguem a mesma regra do rateio (GPT r11 P2-04): baixa integral não soma taxa; parcial, na proporção do que ficou pago.
   const writeOffs = writeOffsByOrder(logs);
-  const closedAll = orders.filter((o) => o.status === 'CLOSED' && inShift(o.closed_at));
-  const feeCents = closedAll.reduce((a, o) => a + toCents(o.service_fee_amount), 0);
-  const closed = closedAll
-    .map((o) => ({ o, kept: keptSaleCents(o, writeOffs) }))
-    .filter(({ kept }) => !kept.writtenOff || kept.keptCents > 0);
+  const closedAll = orders
+    .filter((o) => o.status === 'CLOSED' && inShift(o.closed_at))
+    .map((o) => ({ o, kept: keptSaleCents(o, writeOffs) }));
+  const feeCents = closedAll.reduce((a, { o, kept }) => a + scaleToKept(toCents(o.service_fee_amount), kept), 0);
+  const closed = closedAll.filter(({ kept }) => !kept.writtenOff || kept.keptCents > 0);
   const closedTotalCents = closed.reduce((a, { kept }) => a + kept.keptCents, 0);
   const open = orders.filter((o) => o.status === 'OPEN' || o.status === 'PAYING');
   return {
@@ -299,11 +299,20 @@ export interface MovementRow {
   refundsCount: number;
 }
 
+/** Pagamento com estorno sem data confirmada (deste aparelho ou só do servidor). */
+export interface UndatedRefund {
+  id: string;
+  created_at: string;
+  acquirer: ReconKey;
+  nsu: string | null;
+  amount: number;
+}
+
 export interface ReconMovements {
   rows: MovementRow[];
   totals: { gross: number; refunds: number; net: number; salesCount: number; refundsCount: number };
   /** Estornos sem data confirmada pelo servidor: não entram em turno nenhum (nem no da venda). */
-  undatedRefunds: { total: number; count: number; payments: Payment[] };
+  undatedRefunds: { total: number; count: number; payments: UndatedRefund[] };
   /** LOADED: datas de estorno do servidor lidas para o período; NOT_LOADED: sem leitura (fora da nuvem, erro, prazo). */
   cloudRefunds: 'LOADED' | 'NOT_LOADED';
   /** Vendas devolvidas encerradas pelo gerente (ORDER_REFUNDED_WRITE_OFF) no período: o saldo baixado. */
@@ -314,15 +323,19 @@ const ACQUIRER_CNPJ: Record<ReconKey, string | null> = { STONE: '16501555000157'
 const reconKey = (p: Payment): ReconKey => (p.acquirer === 'STONE' || p.acquirer === 'PAGBANK' || p.acquirer === 'MERCADO_PAGO' ? p.acquirer : 'CASH_DESK');
 
 /**
- * Conciliação por movimento (auditoria GPT r10, P2-01 e P2-02). Venda e estorno são movimentos separados, cada um
- * com a sua data, como no extrato da adquirente:
+ * Conciliação por movimento (auditoria GPT r10 P2-01/P2-02 e r11 P2-01/P2-03). Venda e estorno são movimentos
+ * separados, cada um com a sua data, como no extrato da adquirente:
  *  - venda: pagamento APROVADO ou ESTORNADO, no período da venda (created_at), qualquer que seja o status de hoje.
  *    Pagamento retirado pelo gerente ("não aceito pela nuvem", `withdrawn_reason`) nunca foi recebido: fica de fora;
- *  - estorno: no período da data do estorno no servidor (`refunded_at` de tchefood_list_point_payments). Sem essa data
- *    (nuvem não lida, servidor sem data ou data inválida), vai para `undatedRefunds`, nunca para o período da venda nem
- *    para a hora do registro neste aparelho. Só entra em `undatedRefunds` se a venda é anterior ao fim do período.
- * `serverPayments` null/ausente = sem leitura da nuvem. Linhas do servidor sem pagamento neste aparelho não entram
- * (a conciliação, como as outras telas, é a dos pagamentos daqui).
+ *  - estorno: no período da data do estorno no servidor (`refunded_at`), qualquer que seja a idade da venda.
+ * `serverPayments` (de loadServerPointPayments) traz, do servidor, TODOS os pagamentos da Point feitos no período e
+ * TODOS os estornos da Point feitos no período. Pagamento que só o servidor tem (feito ou estornado em outro aparelho)
+ * entra também, uma vez só (mesmo id do pagamento em todos os aparelhos).
+ * Estorno sem data confirmada (`undatedRefunds`, nunca no período da venda nem na hora do registro deste aparelho):
+ *  - sem leitura da nuvem: todo estornado deste aparelho com venda anterior ao fim do período;
+ *  - com leitura: o servidor diz estornado sem data válida, ou o estornado daqui com venda no período não está no
+ *    servidor (ainda não subiu). Estornado daqui com venda antiga e fora da lista do servidor foi estornado em outro
+ *    período (a lista de estornos do período o traria): não entra.
  */
 export function reconciliationMovements(
   payments: readonly Payment[],
@@ -336,35 +349,53 @@ export function reconciliationMovements(
   const refunds = Object.fromEntries(keys.map((k) => [k, zero()])) as Record<ReconKey, Record<ReconMethod, number>>;
   const counts = Object.fromEntries(keys.map((k) => [k, { sales: 0, refunds: 0 }])) as Record<ReconKey, { sales: number; refunds: number }>;
   const server = new Map<string, ServerPointPayment>();
-  for (const r of opts.serverPayments ?? []) server.set(r.payment_id, r);
+  for (const r of opts.serverPayments ?? []) {
+    const prev = server.get(r.payment_id);
+    // A mesma linha pode vir das duas leituras (venda do período estornada no período): fica a que tem a data do estorno.
+    if (!prev || (prev.refunded_at === null && r.refunded_at !== null)) server.set(r.payment_id, r);
+  }
   const loaded = opts.serverPayments !== null && opts.serverPayments !== undefined;
-  const undated: Payment[] = [];
+  const startMs = period.start.getTime();
+  const endMs = period.end.getTime();
+  const undated: UndatedRefund[] = [];
   let undatedCents = 0;
-  for (const p of payments) {
-    if (p.withdrawn_reason !== undefined) continue;
-    if (p.status !== 'APPROVED' && p.status !== 'REFUNDED') continue;
-    const k = reconKey(p);
-    const cents = toCents(p.amount);
-    if (inShiftPeriod(p.created_at, period)) {
-      sales[k][p.method] += cents;
+  const visit = (m: { id: string; acquirer: ReconKey; method: ReconMethod; cents: number; createdAt: string; nsu: string | null; amount: number; refundedHere: boolean }) => {
+    const k = m.acquirer;
+    if (inShiftPeriod(m.createdAt, period)) {
+      sales[k][m.method] += m.cents;
       counts[k].sales += 1;
     }
-    const s = server.get(p.id);
-    const refunded = p.status === 'REFUNDED' || s?.status === 'REFUNDED' || (s?.refunded_at ?? null) !== null;
-    if (!refunded) continue;
+    const s = server.get(m.id);
+    const refunded = m.refundedHere || s?.status === 'REFUNDED' || (s?.refunded_at ?? null) !== null;
+    if (!refunded) return;
     const refundedAt = parseIsoInstant(s?.refunded_at ?? null);
-    if (refundedAt === null) {
-      const sold = parseIsoInstant(p.created_at);
-      if (sold !== null && sold < period.end.getTime()) {
-        undated.push(p);
-        undatedCents += cents;
+    if (refundedAt !== null) {
+      if (refundedAt >= startMs && refundedAt < endMs) {
+        refunds[k][m.method] += m.cents;
+        counts[k].refunds += 1;
       }
-      continue;
+      return;
     }
-    if (refundedAt >= period.start.getTime() && refundedAt < period.end.getTime()) {
-      refunds[k][p.method] += cents;
-      counts[k].refunds += 1;
-    }
+    const sold = parseIsoInstant(m.createdAt);
+    if (sold === null || sold >= endMs) return;
+    // Com a leitura da nuvem, estornado daqui de venda antiga que o servidor não listou: estorno de outro período.
+    if (loaded && !s && sold < startMs) return;
+    undated.push({ id: m.id, created_at: m.createdAt, acquirer: k, nsu: m.nsu, amount: m.amount });
+    undatedCents += m.cents;
+  };
+  const here = new Set<string>();
+  for (const p of payments) {
+    here.add(p.id);
+    if (p.withdrawn_reason !== undefined) continue;
+    if (p.status !== 'APPROVED' && p.status !== 'REFUNDED') continue;
+    visit({ id: p.id, acquirer: reconKey(p), method: p.method, cents: toCents(p.amount), createdAt: p.created_at, nsu: p.nsu, amount: p.amount, refundedHere: p.status === 'REFUNDED' });
+  }
+  // Pagamento da Point que só o servidor tem (outro aparelho): entra uma vez, pelo id.
+  for (const r of server.values()) {
+    if (here.has(r.payment_id)) continue;
+    if (r.status !== 'APPROVED' && r.status !== 'REFUNDED') continue;
+    if (!(methods as string[]).includes(r.method)) continue;
+    visit({ id: r.payment_id, acquirer: 'MERCADO_PAGO', method: r.method as ReconMethod, cents: toCents(r.amount), createdAt: r.created_at, nsu: r.nsu, amount: r.amount, refundedHere: false });
   }
   const rows: Record<ReconKey, MovementRow> = {} as Record<ReconKey, MovementRow>;
   const tot = { gross: 0, refunds: 0, salesCount: 0, refundsCount: 0 };
@@ -401,31 +432,43 @@ export function reconciliationMovements(
   };
 }
 
-/** Quantos dias antes do período a leitura do servidor começa: estorno no turno de uma venda antiga (a tela de estorno vai até 30 dias). */
-export const SERVER_REFUND_LOOKBACK_DAYS = 31;
 const SERVER_REFUND_MAX_PAGES = 50;
 
-/**
- * Pagamentos da Point no servidor (tchefood_list_point_payments) de SERVER_REFUND_LOOKBACK_DAYS dias antes do período
- * até o fim dele, todas as páginas. Qualquer página com erro (rede, prazo, resposta estranha) lança: a conciliação
- * mostra "estornos da nuvem não carregados" em vez de uma lista pela metade.
- */
-export async function loadServerPointPayments(
-  period: ShiftPeriod,
-  list: (input: ListPointPaymentsInput) => Promise<ListPointPaymentsResult>,
+async function allPages(
+  load: (cursor: string | null) => Promise<ListPointPaymentsResult>,
+  what: string,
 ): Promise<ServerPointPayment[]> {
-  const from = new Date(period.start.getTime() - SERVER_REFUND_LOOKBACK_DAYS * 86_400_000).toISOString();
-  const to = period.end.toISOString();
   const out: ServerPointPayment[] = [];
   let cursor: string | null = null;
   for (let page = 0; page < SERVER_REFUND_MAX_PAGES; page += 1) {
-    const r = await list({ from, to, search: null, cursor, limit: 200 });
+    const r = await load(cursor);
     if (r.kind !== 'ok') throw new Error(r.error);
     out.push(...r.items);
     if (r.nextCursor === null) return out;
     cursor = r.nextCursor;
   }
-  throw new Error(`Pagamentos da Point do servidor: mais de ${SERVER_REFUND_MAX_PAGES} páginas no período.`);
+  throw new Error(`${what} do servidor: mais de ${SERVER_REFUND_MAX_PAGES} páginas no período.`);
+}
+
+/**
+ * Movimentos da Point no servidor para o período, todas as páginas (auditoria GPT r11 P2-01):
+ *  - vendas: tchefood_list_point_payments com a venda (created_at) no período;
+ *  - estornos: tchefood_list_point_refunds com o estorno (hora do servidor) no período, qualquer que seja a idade da venda.
+ * Qualquer página com erro (rede, prazo, resposta estranha) lança: a conciliação mostra "estornos da nuvem não
+ * carregados" em vez de uma lista pela metade.
+ */
+export async function loadServerPointPayments(
+  period: ShiftPeriod,
+  list: (input: ListPointPaymentsInput) => Promise<ListPointPaymentsResult>,
+  listRefunds: (input: ListPointRefundsInput) => Promise<ListPointPaymentsResult>,
+): Promise<ServerPointPayment[]> {
+  const from = period.start.toISOString();
+  const to = period.end.toISOString();
+  const [sold, refunded] = await Promise.all([
+    allPages((cursor) => list({ from, to, search: null, cursor, limit: 200 }), 'Pagamentos da Point'),
+    allPages((cursor) => listRefunds({ from, to, cursor, limit: 200 }), 'Estornos da Point'),
+  ]);
+  return [...sold, ...refunded];
 }
 
 /** Transações recusadas dentro do período do turno [start, end), mesmo filtro da conciliação. */
