@@ -21,7 +21,7 @@ export interface CourierSettleRequest {
 }
 
 /** A nuvem não aceitou o PIN de quem acertou (ou está bloqueado por tentativas). */
-export const COURIER_SETTLE_PIN_REFUSED = 'PIN de quem acertou não confere na nuvem (ou está bloqueado por tentativas).';
+export const COURIER_SETTLE_PIN_REFUSED = 'A nuvem recusou o PIN de quem está acertando. Saia e entre de novo com o seu PIN atual.';
 
 export type CourierSettleResult =
   | { ok: true; settlement: CourierSettlement }
@@ -47,6 +47,13 @@ export interface CourierSettlePendingEntry {
   /** Os termos mandados (entregas, ganho e dinheiro): a repetição manda exatamente estes. */
   terms: string;
   created_at: string;
+  /**
+   * O que a primeira tentativa ia receber de cada senha paga na entrega (valor em reais, exato em
+   * centavos). A repetição recebe isto, não o saldo de agora; ausente em pendentes antigas.
+   */
+  planned?: { delivery_id: UUID; order_id: UUID; pickup_number: number | null; amount: number }[];
+  /** Quem fez a primeira tentativa: a repetição vai no nome dele (ausente em pendentes antigas). */
+  staff_id?: UUID;
 }
 
 /**
@@ -107,7 +114,10 @@ function parseDetail(raw: unknown): { delivery_id?: UUID; settlement_id?: UUID }
 export const COURIER_SETTLE_OFFLINE =
   'Acerto do entregador precisa da internet nesta loja: a nuvem confirma antes de sair dinheiro da gaveta.';
 
-const num = (v: unknown): number => (typeof v === 'number' ? v : Number(v));
+// Só número ou texto numérico: null, '', booleano e lista viram NaN (Number(null) === 0 aceitaria
+// um acerto sem valor como zero).
+const num = (v: unknown): number =>
+  typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : Number.NaN;
 
 /** Linha devolvida pela função (to_jsonb de courier_settlements) no formato do aparelho. */
 export function parseSettlementRow(body: unknown): CourierSettlement | null {
@@ -156,22 +166,27 @@ export async function settleCourierInCloud(cfg: SyncConfig, req: CourierSettleRe
   const text = await res.text().catch(() => '');
   if (!res.ok) {
     let raw = '';
+    let pgCode = '';
     let detail: { delivery_id?: UUID; settlement_id?: UUID } | undefined;
     try {
-      const body = JSON.parse(text) as { message?: unknown; details?: unknown };
+      const body = JSON.parse(text) as { message?: unknown; details?: unknown; code?: unknown };
       raw = typeof body.message === 'string' ? body.message : '';
+      pgCode = typeof body.code === 'string' && /^[A-Z0-9]{1,12}$/.test(body.code) ? body.code : '';
       detail = parseDetail(body.details);
     } catch {
-      // resposta sem JSON: fica o texto
+      // resposta sem JSON: fica o texto (só serve se trouxer o código TCHEFOOD_)
       raw = text;
     }
     const code = /^\s*(TCHEFOOD_[A-Z_]+):/.exec(raw)?.[1];
     // 4xx é a recusa do banco (definitiva); 5xx e afins, a nuvem não respondeu direito.
     const refused = res.status >= 400 && res.status < 500 && res.status !== 401 && res.status !== 408 && res.status !== 429;
     if (!refused) return { ok: false, refused, message: `A nuvem não confirmou o acerto (erro ${res.status}).` };
+    // Sem código TCHEFOOD_ o texto é do PostgREST/Postgres (em inglês, técnico): não vai ao
+    // operador; fica só o status e o código, para o suporte.
+    const generic = `Erro ${res.status}${pgCode ? ` (${pgCode})` : ''} da nuvem. Atualize o aplicativo ou fale com o suporte.`;
     const message = code === 'TCHEFOOD_ENTREGA_JA_ACERTADA'
       ? 'Uma das entregas já foi acertada com o entregador (em outro aparelho).'
-      : cleanCloudMessage(raw) || `Erro ${res.status}.`;
+      : (code ? cleanCloudMessage(raw) : '') || generic;
     return { ok: false, refused, message, ...(code ? { code } : {}), ...(detail ? { detail } : {}) };
   }
   let body: unknown = null;

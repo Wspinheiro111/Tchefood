@@ -976,6 +976,52 @@ function withFollowUp(list: readonly CourierSettleFollowUp[] | undefined, f: Cou
   return f.missing_payments.length === 0 && f.missing_withdrawal === null ? rest : [...rest, f];
 }
 
+/**
+ * Registro do gerente da pendência do acerto ("pago por fora" ou senha resolvida) recusado pela
+ * nuvem (PIN não conferiu, acerto não encontrado, sangria já registrada): o passo volta à
+ * pendência, com o motivo, para o operador ver e refazer com o PIN certo. Sem isso o aparelho
+ * dava por resolvido o que a nuvem não tem (auditoria interna do PR #54). Os dados vêm do próprio
+ * registro (metadata) e do acerto; o que já está na pendência não entra de novo.
+ */
+function restoreFollowUpOnRejection(
+  s: Pick<TcheState, 'courierSettleFollowUps' | 'courierSettlements' | 'couriers'>,
+  event: SyncEvent,
+  message: string,
+): CourierSettleFollowUp[] | null {
+  if (event.table !== 'audit_logs' || event.op !== 'INSERT') return null;
+  const action = event.payload.action_type;
+  if (action !== 'COURIER_PAID_OUTSIDE' && action !== 'COURIER_PAYMENT_RESOLVED') return null;
+  const meta = (event.payload.metadata ?? {}) as Record<string, unknown>;
+  const settlementId = typeof meta.courier_settlement_id === 'string' ? meta.courier_settlement_id : null;
+  const amount = Number(meta.amount);
+  if (!settlementId || !Number.isFinite(amount)) return null;
+  const error = `A nuvem recusou o registro do gerente: ${message}`;
+  const settlement = s.courierSettlements.find((x) => x.id === settlementId);
+  const courierId = String(meta.courier_id ?? settlement?.courier_id ?? '');
+  const base: CourierSettleFollowUp = (s.courierSettleFollowUps ?? []).find((x) => x.settlement_id === settlementId) ?? {
+    settlement_id: settlementId,
+    courier_id: courierId,
+    courier_name: String(meta.courier_name ?? s.couriers.find((c) => c.id === courierId)?.name ?? 'Entregador'),
+    delivery_ids: settlement?.delivery_ids ?? [],
+    cash_collected: settlement?.cash_collected ?? 0,
+    courier_fees: settlement?.courier_fees ?? 0,
+    missing_payments: [],
+    missing_withdrawal: null,
+    created_at: nowISO(),
+  };
+  if (action === 'COURIER_PAID_OUTSIDE') {
+    if (base.missing_withdrawal) return null;
+    return withFollowUp(s.courierSettleFollowUps, { ...base, missing_withdrawal: { amount, error } });
+  }
+  const deliveryId = typeof meta.delivery_id === 'string' ? meta.delivery_id : null;
+  if (!deliveryId || typeof meta.order_id !== 'string' || base.missing_payments.some((m) => m.delivery_id === deliveryId)) return null;
+  const pickup = meta.pickup_number == null ? null : Number(meta.pickup_number);
+  return withFollowUp(s.courierSettleFollowUps, {
+    ...base,
+    missing_payments: [...base.missing_payments, { delivery_id: deliveryId, order_id: meta.order_id, pickup_number: pickup, amount, error }],
+  });
+}
+
 /** O que falta na pendência do acerto, para o operador (cada senha e a sangria, com o erro). */
 function followUpText(f: CourierSettleFollowUp): string {
   const parts = f.missing_payments.map((m) => `Senha ${m.pickup_number ?? ''} (${formatBRL(m.amount)}) não recebida: ${m.error}`.replace('Senha  (', 'Senha ('));
@@ -4538,7 +4584,14 @@ export const useTcheStore = create<TcheState>()(
             const refused = s.outbox.filter((e) => byId.has(e.id));
             // Entrega já acertada ou cancelada na nuvem: a mudança daqui sai (não fica na lista).
             const dropped = refused.filter((e) => isFinalDeliveryRefusal(e, byId.get(e.id)!.message));
+            // Registro do gerente da pendência do acerto recusado: o passo volta à pendência.
+            let followUps = s.courierSettleFollowUps;
+            for (const e of refused) {
+              const back = restoreFollowUpOnRejection({ ...s, courierSettleFollowUps: followUps }, e, byId.get(e.id)!.message);
+              if (back) followUps = back;
+            }
             return {
+              ...(followUps !== s.courierSettleFollowUps ? { courierSettleFollowUps: followUps } : {}),
               outbox: s.outbox.filter((e) => !byId.has(e.id)),
               syncRejected: [
                 ...(s.syncRejected ?? []),
@@ -5453,7 +5506,6 @@ export const useTcheStore = create<TcheState>()(
           if (!user) return fail('Sessão expirada. Faça login novamente.');
           if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário acerta com o entregador.');
           const courier = get().couriers.find((c) => c.id === courierId);
-          if (!courier) return fail('Entregador não encontrado.');
           if (courierSettleInFlight.has(courierId)) return fail('O acerto deste entregador já está sendo confirmado pela nuvem. Aguarde.');
           // Acerto sem resposta da nuvem (pode ter sido gravado): é repetido só pela ação dele, com
           // o mesmo id e os mesmos termos, e nunca se mistura com entregas novas. As entregas dele
@@ -5461,6 +5513,9 @@ export const useTcheStore = create<TcheState>()(
           const pendingList = (get().courierSettlePending ?? []).filter((p) => p.courier_id === courierId);
           const pending = opts.pendingId !== undefined ? pendingList.find((p) => p.id === opts.pendingId) ?? null : null;
           if (opts.pendingId !== undefined && !pending) return fail('Este acerto sem resposta da nuvem já foi resolvido. Confira o quadro da entrega.');
+          // A repetição não depende do entregador ainda estar neste aparelho: o nome vem da pendente.
+          if (!pending && !courier) return fail('Entregador não encontrado.');
+          const courierName = pending ? pending.courier_name : courier!.name;
           const inPending = new Set(pendingList.flatMap((p) => p.delivery_ids));
           let own: OwnDelivery[];
           if (pending) {
@@ -5510,32 +5565,74 @@ export const useTcheStore = create<TcheState>()(
             if (!opts.auth) return fail('Pagar o entregador pelo caixa é sangria: precisa do PIN do gerente.');
           }
           // Tudo o que pode parar o acerto no meio é conferido antes da nuvem: depois dela, o acerto já vale.
-          const toCollect: { d: OwnDelivery; order: Order; amount: number }[] = [];
-          for (const d of own) {
-            if (!d.pay_on_delivery) continue;
-            const order = get().orders.find((o) => o.id === d.order_id);
-            if (!order || order.status !== 'PAYING' || !(order.remaining_balance > 0)) continue;
-            if (get().payments.some((p) => p.idempotency_key === `entrega-${d.id}`)) continue;
+          // Plano do recebimento: o que cada senha paga na entrega recebe do dinheiro trazido. A
+          // primeira tentativa o guarda na pendente; a repetição recebe o guardado, e senha cujo saldo
+          // mudou entre as tentativas fica na pendência com o erro (finishCourierSettleFollowUp), nunca
+          // recebe outro valor nem some calada (rodada 11 do PR #54).
+          type PlanItem = NonNullable<CourierSettlePendingEntry['planned']>[number];
+          const entregaPays = (deliveryId: UUID) => get().payments.filter((p) => p.idempotency_key === `entrega-${deliveryId}`);
+          const checkCollect = (order: Order, deliveryId: UUID): string | null => {
+            // Recebimento da entrega não aprovado: a nuvem contaria o dinheiro e aqui ele não entraria.
+            if (entregaPays(deliveryId).length > 0) {
+              const who = order.pickup_number != null ? `A senha ${order.pickup_number}` : 'Uma senha deste acerto';
+              return `${who} tem um recebimento na entrega não aprovado. Resolva no caixa antes do acerto.`;
+            }
             const block = chargeBlock(order.id) ?? (activeCharge(order.id) ? CHARGE_LOCK_ERROR : null)
               ?? (get().tray.some((t) => t.order_id === order.id) ? 'Há itens na bandeja não enviados. Envie ou remova antes de cobrar.' : null);
-            if (block) return fail(`Senha ${order.pickup_number ?? ''}: ${block}`);
-            toCollect.push({ d, order, amount: order.remaining_balance });
-          }
+            return block ? `Senha ${order.pickup_number ?? ''}: ${block}` : null;
+          };
+          const approvedEntrega = (deliveryId: UUID) => entregaPays(deliveryId).some((p) => p.status === 'APPROVED');
           const keys = new Set(own.filter((d) => d.pay_on_delivery).map((d) => `entrega-${d.id}`));
           const alreadyCents = get().payments
             .filter((p) => p.status === 'APPROVED' && p.idempotency_key !== null && keys.has(p.idempotency_key))
             .reduce((a, p) => a + toCents(p.amount), 0);
+          let plan: PlanItem[] = [];
+          let collectedCents = 0;
+          if (pending?.planned) {
+            plan = pending.planned.map((m) => ({ ...m }));
+            for (const m of plan) {
+              const order = get().orders.find((o) => o.id === m.order_id);
+              // Conta fora do plano (sumiu, recebida, saldo outro): fica na pendência com o erro.
+              if (!order || order.status !== 'PAYING' || toCents(order.remaining_balance) !== toCents(m.amount)) continue;
+              // Recebimento da entrega já existe: aprovado, a senha está paga; não aprovado, a nuvem
+              // pode já ter o acerto, então a repetição não para aqui e a senha fica na pendência.
+              if (entregaPays(m.delivery_id).length > 0) continue;
+              const err = checkCollect(order, m.delivery_id);
+              if (err) return fail(err);
+              collectedCents += toCents(m.amount);
+            }
+          } else {
+            for (const d of own) {
+              if (!d.pay_on_delivery) continue;
+              const order = get().orders.find((o) => o.id === d.order_id);
+              if (!order || order.status !== 'PAYING' || !(order.remaining_balance > 0)) continue;
+              if (approvedEntrega(d.id)) continue;
+              const err = checkCollect(order, d.id);
+              if (err) return fail(err);
+              const amount = fromCentsLocal(toCents(order.remaining_balance));
+              plan.push({ delivery_id: d.id, order_id: order.id, pickup_number: order.pickup_number ?? null, amount });
+              collectedCents += toCents(amount);
+            }
+          }
           // A repetição manda o dinheiro da tentativa sem resposta, não o recalculado agora.
-          const cashCents = pending ? toCents(pending.cash_collected) : alreadyCents + toCollect.reduce((a, x) => a + toCents(x.amount), 0);
+          const cashCents = pending ? toCents(pending.cash_collected) : alreadyCents + collectedCents;
+          // Pendente antiga (sem plano) cujo dinheiro não bate com os saldos de agora: toda senha paga
+          // na entrega sem recebimento aprovado fica na pendência, com o motivo, sem receber sozinha.
+          const planMismatch = pending !== null && !pending.planned && alreadyCents + collectedCents !== cashCents;
+          if (planMismatch) {
+            plan = own.filter((d) => d.pay_on_delivery && !approvedEntrega(d.id)).map((d) => {
+              const order = get().orders.find((o) => o.id === d.order_id);
+              return { delivery_id: d.id, order_id: d.order_id, pickup_number: order?.pickup_number ?? null, amount: fromCentsLocal(toCents(order?.remaining_balance ?? 0)) };
+            });
+          }
           const withdrawalAuth = opts.payFromDrawer && feesCents > 0
             ? {
                 managerPin: opts.auth!.managerPin,
-                reason: opts.auth!.reason.trim().length >= MIN_REASON_LENGTH ? opts.auth!.reason : `Acerto do entregador ${courier.name}`,
+                reason: opts.auth!.reason.trim().length >= MIN_REASON_LENGTH ? opts.auth!.reason : `Acerto do entregador ${courierName}`,
               }
             : null;
           if (withdrawalAuth) {
             const inDrawer = cashSummary(open!, get().payments, get().cashMovements).expected;
-            const collectedCents = toCollect.reduce((a, x) => a + toCents(x.amount), 0);
             if (feesCents > toCents(inDrawer) + collectedCents) {
               return fail(`Não há o ganho do entregador na gaveta. Esperado depois do acerto: ${formatBRL(fromCentsLocal(toCents(inDrawer) + collectedCents))}.`);
             }
@@ -5566,15 +5663,21 @@ export const useTcheStore = create<TcheState>()(
             // Antes de mandar: sem resposta, o acerto fica guardado (persistido) para ser repetido igual.
             if (!pending) {
               const entry: CourierSettlePendingEntry = {
-                id, courier_id: courierId, courier_name: courier.name, delivery_ids: deliveryIds,
+                id, courier_id: courierId, courier_name: courierName, delivery_ids: deliveryIds,
                 cash_collected: fromCentsLocal(cashCents), courier_fees: fromCentsLocal(feesCents), terms, created_at: nowISO(),
+                planned: plan.map((m) => ({ ...m })),
+                staff_id: user.id,
               };
               set((s) => ({ courierSettlePending: [...(s.courierSettlePending ?? []), entry] }));
             }
+            // A pendente fica gravada no aparelho antes de o pedido sair (auditoria interna, rodada 11).
+            await awaitPersisted();
             result = await settleCourierInCloud(
               { url: session.url, anonKey: session.anon_key, accessToken: session.access_token },
-              // A nuvem confere o PIN de quem acertou (GPT, rodada 10 do PR #54).
-              { id, courier_id: courierId, delivery_ids: deliveryIds, cash_collected: fromCentsLocal(cashCents), courier_fees: fromCentsLocal(feesCents), staff_id: user.id, staff_pin: user.pin_code },
+              // A nuvem confere o PIN de quem acertou (GPT, rodada 10 do PR #54). A repetição vai em
+              // nome de quem fez a primeira tentativa: a nuvem devolve o acerto gravado antes de
+              // conferir o PIN, e só confere o PIN se não houver acerto com este id.
+              { id, courier_id: courierId, delivery_ids: deliveryIds, cash_collected: fromCentsLocal(cashCents), courier_fees: fromCentsLocal(feesCents), staff_id: pending?.staff_id ?? user.id, staff_pin: user.pin_code },
               fetchFn,
             );
           } finally {
@@ -5584,6 +5687,12 @@ export const useTcheStore = create<TcheState>()(
             // Recusa da nuvem: definitiva, nada saiu da gaveta. Sem resposta: fica no quadro como
             // "acerto sem resposta da nuvem", para tentar de novo com o mesmo id e os mesmos termos.
             if (result.refused) {
+              // A nuvem procura o acerto com este id ANTES de qualquer recusa (rodada 11): recusa na
+              // repetição prova que a primeira tentativa não foi gravada, e a pendente sai. A exceção
+              // é "outro acerto com este id" (gravado com outros termos): fica, para conferir.
+              if (pending && /outro acerto com este id/.test(result.message)) {
+                return fail(`A nuvem recusou a repetição do acerto: ${result.message} O acerto continua pendente. Confira o acerto na nuvem antes de mexer no dinheiro.`);
+              }
               dropPending();
               return fail(`A nuvem recusou o acerto: ${result.message} Nada saiu da gaveta.`);
             }
@@ -5608,9 +5717,14 @@ export const useTcheStore = create<TcheState>()(
           const at = Date.now();
           const NOT_DONE = 'Acerto interrompido antes deste passo.';
           const planned: CourierSettleFollowUp = {
-            settlement_id: settlement.id, courier_id: courierId, courier_name: courier.name, delivery_ids: deliveryIds,
+            settlement_id: settlement.id, courier_id: courierId, courier_name: courierName, delivery_ids: deliveryIds,
             cash_collected: settlement.cash_collected, courier_fees: settlement.courier_fees,
-            missing_payments: toCollect.map(({ d, order, amount }) => ({ delivery_id: d.id, order_id: order.id, pickup_number: order.pickup_number ?? null, amount, error: NOT_DONE })),
+            missing_payments: plan.map((m) => ({
+              ...m,
+              error: planMismatch
+                ? `O dinheiro deste acerto (${formatBRL(fromCentsLocal(cashCents))}) não bate com os saldos de agora (${formatBRL(fromCentsLocal(alreadyCents + collectedCents))}): confira no caixa antes de receber.`
+                : NOT_DONE,
+            })),
             missing_withdrawal: pay ? { amount: fromCentsLocal(feesCents), error: NOT_DONE } : null,
             created_at: nowISO(),
           };
@@ -5627,7 +5741,8 @@ export const useTcheStore = create<TcheState>()(
           // 3) O dinheiro que o entregador trouxe vira o pagamento de cada senha paga na entrega, e
           // 4) o ganho sai da gaveta (sangria comum, com o PIN de gerente dado agora). Os passos são
           // os mesmos de "terminar a pendência"; o que falhar fica nela, com o erro.
-          if (planned.missing_payments.length > 0) get().finishCourierSettleFollowUp(settlement.id, { kind: 'payments' });
+          // Pendente antiga que não bate: nada é recebido sozinho, a pendência mostra o motivo.
+          if (planned.missing_payments.length > 0 && !planMismatch) get().finishCourierSettleFollowUp(settlement.id, { kind: 'payments' });
           if (pay) get().finishCourierSettleFollowUp(settlement.id, { kind: 'withdrawal', auth: withdrawalAuth! });
           const follow = (get().courierSettleFollowUps ?? []).find((x) => x.settlement_id === settlement.id);
           if (follow) {
@@ -5888,6 +6003,25 @@ export const useTcheStore = create<TcheState>()(
     },
   ),
 );
+
+/**
+ * Grava agora o estado atual no aparelho (IndexedDB) e espera a gravação terminar. O persist
+ * grava a cada set() sem esperar; antes de uma chamada à nuvem que não pode se perder (acerto com
+ * o entregador), espere esta para o app fechado logo depois não perder o que foi guardado
+ * (auditoria interna do PR #54). A transação nova fica atrás das anteriores no IndexedDB.
+ * Devolve false se a gravação falhou (nunca lança).
+ */
+export async function awaitPersisted(): Promise<boolean> {
+  try {
+    const o = useTcheStore.persist.getOptions();
+    if (!o.storage || !o.name) return false;
+    const state = o.partialize ? o.partialize(useTcheStore.getState()) : useTcheStore.getState();
+    await o.storage.setItem(o.name, { state, version: o.version });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function migratePersisted(persisted: unknown, version: number): unknown {
   if (!persisted || typeof persisted !== 'object') return persisted;

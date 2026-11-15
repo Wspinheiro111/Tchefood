@@ -53,7 +53,7 @@ describe('acerto pela nuvem: PIN de quem acertou (GPT, rodada 10 do PR #54)', ()
     const r = await st().settleCourierOnline(courier.id, { payFromDrawer: false, auth: null, fetchFn });
     expect(bodies).toHaveLength(1);
     expect(bodies[0]).toMatchObject({ p_staff: st().currentUserId, p_staff_pin: pin });
-    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/PIN de quem acertou não confere na nuvem.*Nada saiu da gaveta/) });
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/A nuvem recusou o PIN de quem está acertando\. Saia e entre de novo com o seu PIN atual\..*Nada saiu da gaveta/) });
     expect(st().courierSettlePending ?? []).toEqual([]);
     expect(st().payments).toHaveLength(payments);
     expect(st().ownDeliveries.find((x) => x.id === d.id)!.settlement_id).toBeNull();

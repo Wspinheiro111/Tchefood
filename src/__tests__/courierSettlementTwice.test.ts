@@ -512,9 +512,10 @@ describe('acerto sem resposta da nuvem (auditoria interna, rodada 8 do PR #54)',
     // Muda o que o aparelho calcularia agora (o saldo da conta).
     useTcheStore.setState((s) => ({ orders: s.orders.map((o) => (o.id === a.order.id ? { ...o, remaining_balance: o.remaining_balance - 1 } : o)) }));
     const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, pendingId, fetchFn: db.fn });
-    if (!r.ok) throw new Error(r.error);
     expect(calls[1]!.body).toMatchObject({ p_id: pendingId, p_cash_collected: calls[0]!.body.p_cash_collected });
-    expect(r.data.id).toBe(pendingId);
+    // O saldo mudou desde o acerto gravado: a senha fica na pendência, não é recebida calada (rodada 11).
+    expect(r.ok).toBe(false);
+    expect(st().courierSettleFollowUps!.find((f) => f.settlement_id === pendingId)!.missing_payments).toHaveLength(1);
   });
 
   it('o quadro mostra a pendente e a pendência, com os valores delas', () => {
