@@ -80,7 +80,7 @@ export function OwnDeliveryBoard() {
       : { name: target.entry.courier_name, count: target.entry.delivery_ids.length, cash: target.entry.cash_collected, fees: target.entry.courier_fees };
   const settle = (t: SettleTarget, payFromDrawer: boolean, auth: { managerPin: string; reason: string } | null) =>
     t.kind === 'new'
-      ? useTcheStore.getState().settleCourierOnline(t.courierId, { payFromDrawer, auth, deliveryIds: t.deliveryIds })
+      ? useTcheStore.getState().settleCourierOnline(t.courierId, { payFromDrawer, auth, deliveryIds: t.deliveryIds, expected: { cash: t.cash, fees: t.fees } })
       : useTcheStore.getState().settleCourierOnline(t.entry.courier_id, { payFromDrawer, auth, pendingId: t.entry.id });
   const closeSettle = () => {
     setPayAuthOpen(false);

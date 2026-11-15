@@ -701,6 +701,8 @@ interface Actions {
       pendingId?: UUID;
       /** As entregas que o operador viu ao abrir o acerto: se mudaram, não acerta. */
       deliveryIds?: UUID[];
+      /** Os valores que o operador viu (dinheiro a receber das senhas e ganho): se mudaram, não acerta. */
+      expected?: { cash: number; fees: number };
       fetchFn?: FetchLike;
     },
   ) => Promise<ActionResult<CourierSettlement>>;
@@ -984,10 +986,11 @@ function withFollowUp(list: readonly CourierSettleFollowUp[] | undefined, f: Cou
  * registro (metadata) e do acerto; o que já está na pendência não entra de novo.
  */
 function restoreFollowUpOnRejection(
-  s: Pick<TcheState, 'courierSettleFollowUps' | 'courierSettlements' | 'couriers'>,
+  s: Pick<TcheState, 'courierSettleFollowUps' | 'courierSettlements' | 'couriers' | 'orders'>,
   event: SyncEvent,
   message: string,
 ): CourierSettleFollowUp[] | null {
+  if (event.table === 'payments' && event.op === 'INSERT') return restorePaymentOnRejection(s, event, message);
   if (event.table !== 'audit_logs' || event.op !== 'INSERT') return null;
   const action = event.payload.action_type;
   if (action !== 'COURIER_PAID_OUTSIDE' && action !== 'COURIER_PAYMENT_RESOLVED') return null;
@@ -1019,6 +1022,47 @@ function restoreFollowUpOnRejection(
   return withFollowUp(s.courierSettleFollowUps, {
     ...base,
     missing_payments: [...base.missing_payments, { delivery_id: deliveryId, order_id: meta.order_id, pickup_number: pickup, amount, error }],
+  });
+}
+
+/**
+ * Recebimento `entrega-<id>` de um acerto recusado pela nuvem (conta recebida em outro aparelho,
+ * saldo menor): a senha volta à pendência do acerto com o motivo, e só sai com o gerente
+ * ("Resolver com gerente"). Sem isso o acerto parecia terminado com o dinheiro trazido fora da
+ * nuvem (Codex, rodada 11 do PR #54).
+ */
+function restorePaymentOnRejection(
+  s: Pick<TcheState, 'courierSettleFollowUps' | 'courierSettlements' | 'couriers' | 'orders'>,
+  event: SyncEvent,
+  message: string,
+): CourierSettleFollowUp[] | null {
+  const key = event.payload.idempotency_key;
+  if (typeof key !== 'string' || !key.startsWith('entrega-')) return null;
+  const deliveryId = key.slice('entrega-'.length);
+  const settlement = s.courierSettlements.find((x) => (x.delivery_ids ?? []).includes(deliveryId));
+  if (!settlement) return null;
+  const orderId = String(event.payload.order_id ?? '');
+  const amount = Number(event.payload.amount);
+  if (!orderId || !Number.isFinite(amount)) return null;
+  const base: CourierSettleFollowUp = (s.courierSettleFollowUps ?? []).find((x) => x.settlement_id === settlement.id) ?? {
+    settlement_id: settlement.id,
+    courier_id: settlement.courier_id,
+    courier_name: s.couriers.find((c) => c.id === settlement.courier_id)?.name ?? 'Entregador',
+    delivery_ids: settlement.delivery_ids ?? [],
+    cash_collected: settlement.cash_collected,
+    courier_fees: settlement.courier_fees,
+    missing_payments: [],
+    missing_withdrawal: null,
+    created_at: nowISO(),
+  };
+  if (base.missing_payments.some((m) => m.delivery_id === deliveryId)) return null;
+  const pickup = s.orders.find((o) => o.id === orderId)?.pickup_number ?? null;
+  return withFollowUp(s.courierSettleFollowUps, {
+    ...base,
+    missing_payments: [...base.missing_payments, {
+      delivery_id: deliveryId, order_id: orderId, pickup_number: pickup, amount,
+      error: `A nuvem recusou o recebimento desta senha: ${message} Confira no caixa e resolva com o gerente.`,
+    }],
   });
 }
 
@@ -5628,6 +5672,11 @@ export const useTcheStore = create<TcheState>()(
           }
           // A repetição manda o dinheiro da tentativa sem resposta, não o recalculado agora.
           const cashCents = pending ? toCents(pending.cash_collected) : alreadyCents + collectedCents;
+          // O operador confirma os valores que viu: pagamento de outro aparelho no meio do caminho
+          // muda o saldo sem mudar as entregas, e não entra calado (Codex, rodada 11 do PR #54).
+          if (!pending && opts.expected && (toCents(opts.expected.cash) !== collectedCents || toCents(opts.expected.fees) !== feesCents)) {
+            return fail(`Os valores deste acerto mudaram desde que ele foi aberto (dinheiro das senhas agora: ${formatBRL(fromCentsLocal(collectedCents))}, ganho: ${formatBRL(fromCentsLocal(feesCents))}). Confira e acerte de novo.`);
+          }
           // Pendente antiga (sem plano) cujo dinheiro não bate com os saldos de agora: toda senha paga
           // na entrega sem recebimento aprovado fica na pendência, com o motivo, sem receber sozinha.
           const planMismatch = pending !== null && !pending.planned && alreadyCents + collectedCents !== cashCents;
@@ -5783,7 +5832,9 @@ export const useTcheStore = create<TcheState>()(
               const plannedCents = toCents(m.amount);
               const existing = get().payments.find((p) => p.idempotency_key === key);
               if (existing) {
-                if (existing.status !== 'APPROVED') {
+                if ((get().syncRejected ?? []).some((r) => r.event.table === 'payments' && r.event.row_id === existing.id)) {
+                  still.push({ ...m, error: 'A nuvem recusou o recebimento desta senha: confira no caixa e resolva com o gerente.' });
+                } else if (existing.status !== 'APPROVED') {
                   still.push({ ...m, error: 'Há um recebimento desta entrega que não está aprovado: confira no caixa.' });
                 } else if (toCents(existing.amount) !== plannedCents) {
                   still.push({ ...m, error: `Já há um recebimento desta entrega com outro valor (${formatBRL(existing.amount)}): confira no caixa.` });

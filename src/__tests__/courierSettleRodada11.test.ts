@@ -255,3 +255,35 @@ describe('5: acerto incerto e desconectar da nuvem (Codex, rodada 11)', () => {
     expect(st().courierSettlements).toEqual([]);
   });
 });
+
+describe('6: valores vistos e recebimento recusado (Codex, rodada 11)', () => {
+  it('o saldo muda com o acerto aberto (pagamento de outro aparelho): não acerta outro valor calado', async () => {
+    const a = deliveredOrder();
+    connectCloud();
+    const shownCash = a.order.remaining_balance;
+    // Outro aparelho recebe parte da conta; a leitura muda o saldo, as entregas são as mesmas.
+    useTcheStore.setState((s) => ({ orders: s.orders.map((o) => (o.id === a.order.id ? { ...o, remaining_balance: o.remaining_balance - 4 } : o)) }));
+    const fn = vi.fn(cloudFn([]));
+    const r = await st().settleCourierOnline(a.courier.id, {
+      payFromDrawer: false, auth: null, fetchFn: fn, deliveryIds: [a.delivery.id], expected: { cash: shownCash, fees: a.delivery.courier_fee ?? 0 },
+    });
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/valores deste acerto mudaram/) });
+    expect(fn).not.toHaveBeenCalled();
+    expect(st().courierSettlePending).toEqual([]);
+  });
+
+  it('a nuvem recusa o recebimento da senha depois do acerto: a senha volta à pendência e "Receber" não a tira', async () => {
+    const a = deliveredOrder();
+    connectCloud();
+    const r = await settle(a.courier.id, cloudFn([]));
+    if (!r.ok) throw new Error(r.error);
+    expect(st().courierSettleFollowUps ?? []).toEqual([]);
+    const ev = st().outbox.find((e) => e.table === 'payments' && e.payload.idempotency_key === `entrega-${a.delivery.id}`)!;
+    expect(ev).toBeTruthy();
+    st().rejectSyncEvents([{ eventId: ev.id, status: 400, message: 'conta já encerrada.' }]);
+    const f = st().courierSettleFollowUps!.find((x) => x.settlement_id === r.data.id)!;
+    expect(f.missing_payments).toEqual([expect.objectContaining({ delivery_id: a.delivery.id, order_id: a.order.id, error: expect.stringMatching(/recusou o recebimento/) })]);
+    st().finishCourierSettleFollowUp(r.data.id, { kind: 'payments' });
+    expect(st().courierSettleFollowUps!.find((x) => x.settlement_id === r.data.id)!.missing_payments).toHaveLength(1);
+  });
+});
