@@ -1,0 +1,439 @@
+// @vitest-environment jsdom
+/**
+ * Tela Retaguarda › Fechamento anual: só dono e gerente; ano escolhido; vale-refeição
+ * sem registro aparece como "não registrado"; no app Android não oferece exportação.
+ */
+import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AnnualClose } from '../screens/AnnualClose';
+import { useBackOfficeTabs } from '../screens/BackOffice';
+import { useTcheStore } from '../store/useTcheStore';
+import { storeFees, useOwnerSettings } from '../store/useOwnerSettings';
+import type { Payment, StaffUser } from '../types';
+
+const staff = [
+  { id: 'own', name: 'Dono', role: 'OWNER', active: true },
+  { id: 'cx', name: 'Caixa', role: 'CASHIER', active: true },
+] as unknown as StaffUser[];
+const pay = (amount: number, at: string, method = 'PIX') =>
+  ({ id: `${amount}-${at}`, order_id: 'o', amount, tip_amount: 0, method, status: 'APPROVED', acquirer: 'CASH_DESK', card_brand: null, created_at: `${at}-03:00`, tenant_id: useTcheStore.getState().tenant.id }) as unknown as Payment;
+
+function setup(userId: string, payments: Payment[] = []) {
+  act(() => {
+    useTcheStore.setState({
+      staff,
+      currentUserId: userId,
+      payments,
+      stockMovements: [],
+      purchaseInvoices: [],
+      purchaseInvoiceItems: [],
+      cashSessions: [],
+      cashMovements: [],
+      ownDeliveries: [],
+      courierSettlements: [],
+    } as never);
+  });
+}
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+});
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+  delete (window as unknown as Record<string, unknown>).SmartPosNative;
+});
+
+describe('Fechamento anual (tela)', () => {
+  it('a aba só aparece para dono e gerente', () => {
+    setup('cx');
+    expect(renderHook(() => useBackOfficeTabs()).result.current.some((t) => t.key === 'annual')).toBe(false);
+    setup('own');
+    expect(renderHook(() => useBackOfficeTabs()).result.current.some((t) => t.key === 'annual')).toBe(true);
+  });
+
+  it('avisa que são só os registros deste aparelho', () => {
+    setup('own');
+    render(<AnnualClose />);
+    expect(screen.getByRole('note').textContent).toContain('NESTE aparelho');
+  });
+
+  it('caixa não vê o faturamento do ano', () => {
+    setup('cx', [pay(100, '2025-05-01T12:00:00')]);
+    render(<AnnualClose />);
+    expect(screen.getAllByText(/Só o proprietário e o gerente/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Total recebido/)).toBeNull();
+  });
+
+  it('dono: em fevereiro abre o ano que terminou, troca de ano e mostra VR/VA como não registrado', () => {
+    setup('own', [pay(100, '2025-05-01T12:00:00'), pay(40, '2026-01-15T12:00:00')]);
+    render(<AnnualClose />);
+    const select = screen.getByLabelText('Ano do fechamento') as HTMLSelectElement;
+    expect(select.value).toBe('2025');
+    const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(100));
+    expect(screen.getByText('Vale-refeição / alimentação').parentElement!.parentElement!.textContent).toContain('não registrado');
+    expect(screen.getAllByRole('button', { name: /baixar Excel/ })).toHaveLength(4);
+    fireEvent.change(select, { target: { value: '2026' } });
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(40));
+    expect(screen.getAllByText(/2026 ainda não terminou/).length).toBeGreaterThan(0);
+  });
+
+  it('sem dados não quebra; no app Android não oferece exportar', () => {
+    (window as unknown as Record<string, unknown>).SmartPosNative = {};
+    setup('own');
+    render(<AnnualClose />);
+    expect(screen.getAllByText(/não salva planilha nem PDF/).length).toBeGreaterThan(0);
+    expect(screen.queryAllByRole('button', { name: /baixar Excel/ })).toHaveLength(0);
+  });
+});
+
+describe('Fechamento anual (tela): corte único no ano em andamento (auditoria P2-02)', () => {
+  const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+  beforeEach(() => {
+    vi.setSystemTime(new Date('2026-11-14T10:00:00-03:00'));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('às 10:00, o registro das 09:00 entra e o das 11:00 fica fora com aviso na tela e no CSV; Atualizar pega o novo instante', async () => {
+    setup('own', [pay(30, '2026-11-14T09:00:00'), pay(70, '2026-11-14T11:00:00')]);
+    act(() => {
+      useTcheStore.setState({
+        stockMovements: [
+          { id: 'm9', tenant_id: useTcheStore.getState().tenant.id, product_id: 'p1', type: 'PURCHASE_IN', quantity: 1, unit_cost: 1, balance_after: 1, avg_cost_after: 1, purchase_invoice_item_id: null, performed_by_user_id: 'own', created_at: '2026-11-14T11:00:00-03:00' },
+        ],
+      } as never);
+    });
+    render(<AnnualClose />);
+    expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2026');
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 10:00:00 \(ano em andamento\)/)).toHaveLength(2);
+    expect(screen.getAllByText(/os números vão até 14\/11\/2026 10:00/).length).toBeGreaterThan(0);
+    const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
+    expect(alert.textContent).toContain('a partir de 14/11/2026 10:00:00');
+    expect(alert.textContent).toContain('Inventário de insumos e mercadorias: 1');
+    expect(alert.textContent).toContain('Fechamento de caixa e formas de pagamento: 1');
+    expect(alert.textContent).toContain('Contas a pagar e a receber em aberto: 1');
+
+    // Exportação: o CSV leva o mesmo corte e o mesmo aviso.
+    let blob: Blob | null = null;
+    Object.assign(URL, { createObjectURL: vi.fn((b: Blob) => ((blob = b), 'blob:x')), revokeObjectURL: vi.fn() });
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    fireEvent.click(screen.getByRole('button', { name: /Fechamento de caixa e formas de pagamento: baixar Excel/ }));
+    // Blob do jsdom não tem .text(): lê pelo FileReader.
+    const csv = await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.readAsText(blob as unknown as Blob);
+    });
+    expect(csv).toContain('01/01/2026 a 14/11/2026 10:00:00 (ano em andamento)');
+    expect(csv).toContain('1 registro(s) com data a partir de 14/11/2026 10:00:00 (instante deste relatório) ficaram de fora');
+
+    // Duas horas depois, "Atualizar" traz o registro das 11:00 e o aviso some.
+    vi.setSystemTime(new Date('2026-11-14T12:00:00-03:00'));
+    fireEvent.click(screen.getByRole('button', { name: 'Atualizar os números até agora' }));
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(100));
+    expect(screen.getAllByText(/os números vão até 14\/11\/2026 12:00/).length).toBeGreaterThan(0);
+    expect(screen.queryAllByRole('alert').some((a) => a.textContent!.includes('instante deste relatório'))).toBe(false);
+  });
+
+  it('ano encerrado: sem botão Atualizar nem aviso de corte; 01/01 00:00 fica no ano seguinte', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    setup('own', [pay(30, '2025-12-31T23:59:00'), pay(70, '2026-01-01T00:00:00')]);
+    render(<AnnualClose />);
+    expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2025');
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.queryByRole('button', { name: 'Atualizar os números até agora' })).toBeNull();
+    expect(screen.queryAllByRole('alert')).toHaveLength(0);
+  });
+});
+
+describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
+  const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+
+  it('o instante fica fixo até Atualizar: relógio andando e dado novo não mudam o corte dos quatro relatórios', () => {
+    vi.setSystemTime(new Date('2026-11-14T10:00:30-03:00'));
+    setup('own', [pay(30, '2026-11-14T09:00:00')]);
+    render(<AnnualClose />);
+    // Corte no instante real, com segundos (auditoria GPT rodada 3, P2-02).
+    expect(screen.getAllByText(/os números vão até 14\/11\/2026 10:00:30 /).length).toBeGreaterThan(0);
+    vi.setSystemTime(new Date('2026-11-14T12:00:00-03:00'));
+    act(() => {
+      useTcheStore.setState({
+        payments: [pay(30, '2026-11-14T09:00:00'), pay(70, '2026-11-14T11:00:00')],
+        stockMovements: [{ id: 'm11', tenant_id: useTcheStore.getState().tenant.id, product_id: 'p1', type: 'PURCHASE_IN', quantity: 1, unit_cost: 1, balance_after: 1, avg_cost_after: 1, purchase_invoice_item_id: null, performed_by_user_id: 'own', created_at: '2026-11-14T11:00:00-03:00' }],
+        cashMovements: [{ id: 'w11', tenant_id: useTcheStore.getState().tenant.id, type: 'WITHDRAWAL', amount: 5, reason: 'gelo', created_at: '2026-11-14T11:00:00-03:00' }],
+      } as never);
+    });
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.getByText('Itens com saldo').parentElement!.textContent).toContain('0');
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 10:00:30 \(ano em andamento\)/)).toHaveLength(2);
+    // Auditoria GPT r7 (P1-01): o dado que chegou depois não muda a foto; a tela avisa.
+    expect(screen.getByText(/Chegaram dados novos neste aparelho depois de 14\/11\/2026 10:00:30/)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText('Atualizar com os dados novos'));
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(100));
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 12:00:00 \(ano em andamento\)/)).toHaveLength(2);
+    expect(screen.queryByText(/Chegaram dados novos/)).toBeNull();
+  });
+
+  it('venda sem taxa de dezembro do ano anterior aparece na tela com valor e quantidade', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    setup('own', [pay(10, '2025-05-01T12:00:00'), { ...pay(123.45, '2024-12-20T20:00:00', 'CREDIT'), acquirer: 'STONE' } as Payment]);
+    render(<AnnualClose />);
+    expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2025');
+    const row = screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)').parentElement!.parentElement!;
+    expect(row.textContent).toContain(fmt(123.45));
+    expect(row.textContent).toContain('1 venda(s)');
+    expect(row.textContent).toContain(`inclui 1 venda(s) de anos anteriores, ${fmt(123.45)}`);
+  });
+
+  it('relógio do aparelho antes do ano: mostra o ano inteiro e avisa', () => {
+    vi.setSystemTime(new Date('1970-01-02T10:00:00-03:00'));
+    setup('own', [pay(30, '2025-05-01T12:00:00'), pay(70, '2025-12-31T23:00:00')]);
+    render(<AnnualClose />);
+    expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2025');
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(100));
+    expect(screen.getAllByRole('alert').some((a) => a.textContent!.includes('antes de 2025 começar'))).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Atualizar os números até agora' })).toBeNull();
+  });
+});
+
+describe('Fechamento anual (tela): rodada interna 2', () => {
+  it('registros de outra loja ficam fora e a tela avisa', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    setup('own', [pay(30, '2025-05-01T12:00:00'), { ...pay(70, '2025-06-01T12:00:00'), tenant_id: 'outra-loja' } as Payment]);
+    render(<AnnualClose />);
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain('30,00');
+    expect(screen.getAllByText(/1 registro\(s\) de outra loja/).length).toBeGreaterThan(0);
+  });
+});
+
+describe('Fechamento anual (tela): rodada interna 3', () => {
+  it('no último minuto do ano o relatório continua "em andamento" (não arredonda para 01/01)', () => {
+    vi.setSystemTime(new Date('2026-12-31T23:59:30-03:00'));
+    setup('own', [pay(30, '2026-12-31T23:59:10')]);
+    render(<AnnualClose />);
+    expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2026');
+    expect(screen.getAllByText(/2026 ainda não terminou/).length).toBeGreaterThan(0);
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain('30,00');
+  });
+
+  it('a tela mostra as mesmas observações da exportação (quem não exporta lê tudo)', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    setup('own', [pay(30, '2025-05-01T12:00:00')]);
+    render(<AnnualClose />);
+    expect(screen.getAllByText('Observações deste relatório')).toHaveLength(4);
+    expect(screen.getAllByText(/venda estornada ainda aparece aqui como a receber/).length).toBe(1);
+    expect(screen.getAllByText(/não lance estas taxas de novo/).length).toBe(1);
+  });
+});
+
+describe('Fechamento anual (tela): auditoria GPT rodada 3', () => {
+  const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+
+  it('P2-02: com o relógio em 10:00:01, o das 10:00:00 entra e o das 10:00:40 fica fora e é avisado', () => {
+    vi.setSystemTime(new Date('2026-11-14T10:00:01-03:00'));
+    setup('own', [pay(30, '2026-11-14T10:00:00'), pay(70, '2026-11-14T10:00:40')]);
+    render(<AnnualClose />);
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.getAllByText(/os números vão até 14\/11\/2026 10:00:01 /).length).toBeGreaterThan(0);
+    const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
+    expect(alert.textContent).toContain('Fechamento de caixa e formas de pagamento: 1');
+  });
+});
+
+describe('Fechamento anual (tela): Codex em 1fbc385', () => {
+  it('NF-e recusada aqui, mas a cópia aceita foi importada em 2026: o inventário de 2025 mantém as entradas daqui e avisa', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    const s = useTcheStore.getState();
+    const tenant_id = s.tenant.id;
+    const product_id = s.products[0]!.id;
+    const key = '4325'.padEnd(44, '6');
+    const inv = (id: string, imported_at: string) => ({ id, tenant_id, supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: '2025-12-31T09:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 50, imported_at });
+    setup('own');
+    act(() => {
+      useTcheStore.setState({
+        purchaseInvoices: [inv('a', '2025-12-31T10:00:00-03:00'), inv('b', '2026-01-01T10:00:00-03:00')],
+        purchaseInvoiceItems: [{ id: 'it', tenant_id, invoice_id: 'a' }],
+        stockMovements: [{ id: 'm', tenant_id, product_id, type: 'PURCHASE_IN', quantity: 10, unit_cost: 5, balance_after: 10, avg_cost_after: 5, purchase_invoice_item_id: 'it', performed_by_user_id: 'own', created_at: '2025-12-31T10:00:00-03:00' }],
+        syncRejected: [{ event: { id: 'e', table: 'purchase_invoices', op: 'INSERT', row_id: 'a', payload: {} }, message: 'duplicada' }],
+      } as never);
+    });
+    render(<AnnualClose />);
+    const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+    expect(screen.getByText('Custo total do estoque').parentElement!.textContent).toContain(fmt(50));
+    expect(screen.getAllByText(/aparece\(m\) mais de uma vez/).length).toBeGreaterThan(0);
+  });
+});
+
+describe('Fechamento anual (tela): auditoria GPT rodada 6 ampliada (1fbc385)', () => {
+  const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+  afterEach(() => act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: null, legacyOrigin: null, legacyConfirmedTenantId: null, legacyArchive: [] })));
+
+  it('P1-01: aberto às 09h, a recusa de duplicidade que chega às 11h não muda a posição; Atualizar gera uma posição nova', () => {
+    vi.setSystemTime(new Date('2026-11-14T09:00:00-03:00'));
+    const s0 = useTcheStore.getState();
+    const tenant_id = s0.tenant.id;
+    const product_id = s0.products[0]!.id;
+    const key = '4326'.padEnd(44, '9');
+    const inv = (id: string, imported_at: string) => ({ id, tenant_id, supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: '2026-11-13T08:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 500, imported_at });
+    setup('own');
+    act(() => {
+      useTcheStore.setState({
+        purchaseInvoices: [inv('a', '2026-11-13T09:00:00-03:00')],
+        purchaseInvoiceItems: [{ id: 'it', tenant_id, invoice_id: 'a' }],
+        stockMovements: [{ id: 'm', tenant_id, product_id, type: 'PURCHASE_IN', quantity: 100, unit_cost: 5, balance_after: 100, avg_cost_after: 5, purchase_invoice_item_id: 'it', performed_by_user_id: 'own', created_at: '2026-11-13T09:00:00-03:00' }],
+        syncRejected: [],
+      } as never);
+    });
+    render(<AnnualClose />);
+    expect(screen.getByText('Custo total do estoque').parentElement!.textContent).toContain(fmt(500));
+    vi.setSystemTime(new Date('2026-11-14T11:00:00-03:00'));
+    act(() => {
+      useTcheStore.setState({
+        purchaseInvoices: [inv('a', '2026-11-13T09:00:00-03:00'), inv('b', '2026-11-13T08:30:00-03:00')],
+        syncRejected: [{ event: { id: 'e', table: 'purchase_invoices', op: 'INSERT', row_id: 'a', payload: {} }, message: 'duplicada' }],
+      } as never);
+    });
+    expect(screen.getByText('Custo total do estoque').parentElement!.textContent).toContain(fmt(500));
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 09:00:00 \(ano em andamento\)/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByLabelText('Atualizar com os dados novos'));
+    expect(screen.getByText('Custo total do estoque').parentElement!.textContent).toContain(fmt(0));
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 11:00:00 \(ano em andamento\)/).length).toBeGreaterThan(0);
+  });
+
+  it('P1-02: ciclo loja A → B → A: cada loja tem as suas taxas e comissões, inclusive depois de reiniciar e na exportação', async () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    const base = useTcheStore.getState().tenant;
+    const asStore = (id: string) => act(() => useTcheStore.setState({ tenant: { ...base, id } } as never));
+    const settings = () => useOwnerSettings.getState();
+    const credit = (tenantId: string) => ({ ...pay(1000, '2025-05-01T12:00:00', 'CREDIT'), acquirer: 'STONE', card_brand: 'VISA', tenant_id: tenantId }) as Payment;
+    const rule = { acquirer: 'STONE' as const, method: 'CREDIT' as const, brand: null, fixed: 0, days: 30, businessDays: false };
+    // Loja A: 3% e comissão de 12% no iFood.
+    asStore('loja-A');
+    expect(settings().saveFeeRule({ ...rule, pct: 3 })).toBeNull();
+    expect(settings().setAppCommission('ifood', 12)).toBeNull();
+    // Loja B: começa sem taxa nenhuma (as de A não aparecem).
+    asStore('loja-B');
+    expect(storeFees(settings(), 'loja-B').feeRules).toEqual([]);
+    setup('own', [credit('loja-B')]);
+    const b0 = render(<AnnualClose />);
+    expect(screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)').parentElement!.parentElement!.textContent).toContain(fmt(1000));
+    b0.unmount();
+    // B cadastra 1% para a mesma maquininha/forma/bandeira (não esbarra na de A), muda comissão.
+    expect(settings().saveFeeRule({ ...rule, pct: 1 })).toBeNull();
+    expect(settings().setAppCommission('ifood', 20)).toBeNull();
+    // B edita a sua taxa para 8%.
+    const bRule = storeFees(settings(), 'loja-B').feeRules[0]!;
+    expect(settings().saveFeeRule({ ...rule, id: bRule.id, pct: 8 })).toBeNull();
+    // Reinicia o app: grava, apaga a memória e carrega de novo do armazenamento do aparelho.
+    const key = useOwnerSettings.persist.getOptions().name!;
+    const saved = window.localStorage.getItem(key);
+    expect(saved).toContain('loja-A');
+    act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: null }));
+    window.localStorage.setItem(key, saved!);
+    await act(async () => {
+      await useOwnerSettings.persist.rehydrate();
+    });
+    // Volta para A: continua 3% e 12%, sem nada do que B fez.
+    asStore('loja-A');
+    expect(storeFees(settings(), 'loja-A').feeRules.map((r) => r.pct)).toEqual([3]);
+    expect(storeFees(settings(), 'loja-A').appCommissionPct.ifood).toBe(12);
+    expect(storeFees(settings(), 'loja-B').feeRules.map((r) => r.pct)).toEqual([8]);
+    expect(storeFees(settings(), 'loja-B').appCommissionPct.ifood).toBe(20);
+    setup('own', [credit('loja-A')]);
+    render(<AnnualClose />);
+    expect(screen.getByText(/taxa estimada/).textContent).toContain(fmt(30));
+    expect(screen.queryByText('Situação de repasse desconhecida (sem taxa cadastrada)')).toBeNull();
+    // Exportação de A usa os 3% (CSV do faturamento).
+    const blobs: Blob[] = [];
+    const origCreate = URL.createObjectURL;
+    const origClick = HTMLAnchorElement.prototype.click;
+    URL.createObjectURL = ((b: Blob) => {
+      blobs.push(b);
+      return 'blob:x';
+    }) as typeof URL.createObjectURL;
+    HTMLAnchorElement.prototype.click = () => {};
+    try {
+      fireEvent.click(screen.getByLabelText('Fechamento de caixa e formas de pagamento: baixar Excel (CSV)'));
+    } finally {
+      URL.createObjectURL = origCreate;
+      HTMLAnchorElement.prototype.click = origClick;
+    }
+    expect(blobs).toHaveLength(1);
+    const csv = await new Promise<string>((res) => {
+      const r = new FileReader();
+      r.onload = () => res(String(r.result));
+      r.readAsText(blobs[0]!);
+    });
+    expect(csv).toContain('30,00');
+    expect(csv).not.toContain('80,00');
+    act(() => useTcheStore.setState({ tenant: base } as never));
+  });
+
+  it('P1-02: taxas de antes da separação por loja não valem para nenhuma loja (migração da v3)', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    // Migração da v3 (lista única): vira "taxas antigas", sem loja.
+    const migrated = useOwnerSettings.persist.getOptions().migrate!({ feeRules: [{ id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false }], appCommissionPct: { ifood: 12 } }, 3) as unknown as Record<string, unknown>;
+    expect(migrated.feeRules).toBeUndefined();
+    expect(migrated.feesByTenant).toEqual({});
+    expect((migrated.legacyFees as { feeRules: unknown[] }).feeRules).toHaveLength(1);
+    expect(migrated.legacyOrigin).toBeNull();
+  });
+
+  it('rodada 10 P1-01: loja B sem taxas, R$ 10.000 no crédito e regra antiga de 3% não confirmada: o aviso do fechamento só leva à revisão, sem cadastrar nem mudar o resultado', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    const tid = useTcheStore.getState().tenant.id;
+    const old = { id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false } as const;
+    // Origem anotada = esta loja e quem abre é o proprietário: mesmo assim o fechamento não traz nada.
+    act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: { feeRules: [old], appCommissionPct: {} }, legacyOrigin: tid, legacyConfirmedTenantId: null }));
+    setup('own', [{ ...pay(10000, '2025-05-01T12:00:00', 'CREDIT'), acquirer: 'STONE', card_brand: 'VISA' } as Payment]);
+    const review = vi.fn();
+    render(<AnnualClose onReviewFees={review} />);
+    const before = screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)').parentElement!.textContent;
+    expect(screen.getAllByText(/de antes da separação por loja/).length).toBeGreaterThan(0);
+    expect(screen.queryByLabelText('As taxas são desta loja')).toBeNull();
+    fireEvent.click(screen.getByLabelText('Revisar em Taxas e recebíveis'));
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(storeFees(useOwnerSettings.getState(), tid).feeRules).toHaveLength(0);
+    expect(useOwnerSettings.getState().legacyFees?.feeRules).toHaveLength(1);
+    expect(screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)').parentElement!.textContent).toBe(before);
+    expect(screen.queryByText(fmt(300))).toBeNull();
+  });
+
+  it('rodada 8 P2-01: loja com taxa nova continua avisada das taxas antigas pendentes (não somem da tela)', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    const tid = useTcheStore.getState().tenant.id;
+    const old = { id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false } as const;
+    const pix = { ...old, id: 'p', method: 'PIX', pct: 0.99, days: 0 } as const;
+    act(() => useOwnerSettings.setState({ feesByTenant: { [tid]: { feeRules: [pix], appCommissionPct: {} } }, legacyFees: { feeRules: [old], appCommissionPct: { ifood: 12 } } }));
+    setup('own');
+    render(<AnnualClose />);
+    expect(screen.getAllByText(/não entraram nestes números/).length).toBeGreaterThan(0);
+  });
+
+  it('troca de loja com a tela aberta refaz a foto (não mostra a posição da loja anterior)', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    const base = useTcheStore.getState().tenant;
+    setup('own', [pay(30, '2025-05-01T12:00:00')]);
+    render(<AnnualClose />);
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
+    act(() => useTcheStore.setState({ tenant: { ...base, id: 'outra-loja' } } as never));
+    expect(screen.queryByText('Total recebido (bruto)')?.parentElement?.textContent ?? '').not.toContain(fmt(30));
+    act(() => useTcheStore.setState({ tenant: base } as never));
+  });
+
+  it('P1-01: a nuvem reescreve as listas com o mesmo conteúdo: não aparece o aviso de dados novos', () => {
+    vi.setSystemTime(new Date('2026-11-14T09:00:00-03:00'));
+    setup('own', [pay(30, '2026-11-14T08:00:00')]);
+    render(<AnnualClose />);
+    act(() => {
+      const st = useTcheStore.getState();
+      useTcheStore.setState({ tenant: { ...st.tenant }, products: [...st.products], staff: [...st.staff], payments: [...st.payments] } as never);
+    });
+    expect(screen.queryByText(/Chegaram dados novos/)).toBeNull();
+  });
+});
