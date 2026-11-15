@@ -552,7 +552,7 @@ describe('GPT r15 P1-01: venda estornada e encerrada como devolvida em outro apa
     render(<RefundReopenedOrders deps={d} />);
     await waitFor(() => expect(calls.some((c) => c.fn === 'tchefood_order_snapshot')).toBe(true));
     expect(st().payments.find((p) => p.id === pay.id)!.status).toBe('APPROVED');
-    expect(localStorage.getItem(`tchefood.refundChangesSeq.v1:${st().tenant.id}`)).toBe('41');
+    expect(st().pullStatus.refund_seq).toBe(41);
     cleanup();
     // Resolvido: a próxima leitura traz a conta.
     useTcheStore.setState({ syncRejected: [] });
@@ -563,13 +563,13 @@ describe('GPT r15 P1-01: venda estornada e encerrada como devolvida em outro apa
     expect(st().auditLogs.filter((l) => l.order_id === orderId).map((l) => l.action_type).sort()).toEqual(expect.arrayContaining(['ORDER_REFUNDED_WRITE_OFF', 'POINT_PAYMENT_REFUNDED']));
     // Relatórios: a venda devolvida não fica como recebida.
     expect(keptSaleCents(after, logsOf())).toMatchObject({ keptCents: 0, writtenOff: true });
-    await waitFor(() => expect(localStorage.getItem(`tchefood.refundChangesSeq.v1:${st().tenant.id}`)).toBe('42'));
+    await waitFor(() => expect(st().pullStatus.refund_seq).toBe(42));
     // Já aplicado: outra leitura com o mesmo registro não busca a conta de novo.
     cleanup();
-    localStorage.clear();
+    useTcheStore.setState((s) => ({ pullStatus: { ...s.pullStatus, refund_seq: 0 } }));
     const before = calls.filter((c) => c.fn === 'tchefood_order_snapshot').length;
     render(<RefundReopenedOrders deps={d} />);
-    await waitFor(() => expect(localStorage.getItem(`tchefood.refundChangesSeq.v1:${st().tenant.id}`)).toBe('42'));
+    await waitFor(() => expect(st().pullStatus.refund_seq).toBe(42));
     expect(calls.filter((c) => c.fn === 'tchefood_order_snapshot').length).toBe(before);
   });
 });

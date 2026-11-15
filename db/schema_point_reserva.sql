@@ -2249,9 +2249,13 @@ $$;
 -- qualquer status: a conta estornada e já encerrada em outro aparelho também aparece. Uma linha por conta, pela
 -- última dessas alterações (last_seq, last_audit_id), em ordem de last_seq; status e saldo atuais da conta.
 -- p_limit de 1 a 200 (padrão 100; fora disso ou p_after_seq negativo: TF006). next_seq: de onde ler a próxima página
--- (has_more). safe_seq: até onde o aparelho pode guardar como lido: a sequência é dada na gravação e uma transação
--- ainda aberta pode gravar uma sequência menor que outra já visível, então só conta como lido o que tem mais de
--- 10 minutos (nenhuma destas transações dura tanto); o que é mais novo volta na próxima leitura (repetir é inofensivo).
+-- (has_more). safe_seq: até onde o aparelho pode guardar como lido.
+-- GPT r17 P2-01: a sequência é dada na gravação, e uma transação ainda aberta poderia gravar uma sequência menor que
+-- a de outra já confirmada. Isso NÃO depende de prazo: todo registro destes dois tipos é gravado com a trava da loja
+-- (tchefood_manager_pin:<loja>) tomada, até o fim da transação (o gatilho tchefood_refund_audit_lock_guard recusa
+-- a gravação sem ela). As gravações da mesma loja andam uma depois da outra: a sequência menor sempre confirma antes
+-- da maior, então o que o aparelho lê (confirmado) nunca deixa um registro menor para trás, e safe_seq = next_seq.
+-- Só uma sessão de superusuário em modo réplica (que desliga gatilhos) escaparia, e isso não é caminho do sistema.
 CREATE OR REPLACE FUNCTION tchefood_list_refund_order_changes(p_after_seq BIGINT DEFAULT 0, p_limit INT DEFAULT 100)
 RETURNS JSONB
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
@@ -2291,14 +2295,34 @@ BEGIN
       INTO v_rows, v_count, v_next
       FROM page;
     v_next := COALESCE(v_next, v_after);
-    SELECT COALESCE(max(a.server_seq), v_after) INTO v_safe
-      FROM audit_logs a
-     WHERE a.tenant_id = v_tenant AND a.server_seq > v_after AND a.server_seq <= v_next
-       AND a.action_type IN ('POINT_PAYMENT_REFUNDED', 'ORDER_REFUNDED_WRITE_OFF')
-       AND a.created_at < NOW() - INTERVAL '10 minutes';
+    v_safe := v_next;
     RETURN jsonb_build_object('items', v_rows, 'next_seq', v_next, 'safe_seq', v_safe, 'has_more', v_count > v_limit);
 END;
 $$;
+
+-- -----------------------------------------------------------------------------
+-- GPT r17 P2-01: registro de estorno / encerramento só com a trava da loja tomada
+-- -----------------------------------------------------------------------------
+-- A leitura incremental (tchefood_list_refund_order_changes) confia que a sequência menor confirma antes da maior.
+-- O que garante isso é a trava da loja (a mesma do PIN do gerente), tomada por tchefood_refund_point_payment e
+-- tchefood_close_refunded_order antes de gravar e mantida até o fim da transação. O gatilho confere, no banco, que quem
+-- grava um destes registros está com essa trava (exclusiva, desta sessão): qualquer outro caminho é recusado.
+CREATE OR REPLACE FUNCTION tchefood_refund_audit_lock_guard()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    v_key BIGINT := hashtext('tchefood_manager_pin:' || NEW.tenant_id::text);
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_locks l
+                    WHERE l.locktype = 'advisory' AND l.pid = pg_backend_pid() AND l.granted AND l.mode = 'ExclusiveLock'
+                      AND l.objsubid = 1 AND l.classid = ((v_key >> 32) & 4294967295)::oid AND l.objid = (v_key & 4294967295)::oid) THEN
+        RAISE EXCEPTION 'TCHEFOOD_COBRANCA: o registro de estorno ou encerramento só é gravado com a trava da loja tomada.' USING ERRCODE = 'TF006';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE TRIGGER trg_audit_logs_refund_lock BEFORE INSERT ON audit_logs
+    FOR EACH ROW WHEN (NEW.action_type IN ('POINT_PAYMENT_REFUNDED', 'ORDER_REFUNDED_WRITE_OFF'))
+    EXECUTE FUNCTION tchefood_refund_audit_lock_guard();
 
 -- -----------------------------------------------------------------------------
 -- Permissões
@@ -2335,7 +2359,8 @@ BEGIN
         'tchefood_list_point_refunds(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT)',
         'tchefood_order_snapshot(UUID)',
         'tchefood_list_refund_reopened_orders(TEXT, INT)',
-        'tchefood_list_refund_order_changes(BIGINT, INT)'] LOOP
+        'tchefood_list_refund_order_changes(BIGINT, INT)',
+        'tchefood_refund_audit_lock_guard()'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
             EXECUTE format('REVOKE ALL ON FUNCTION %s FROM anon', v_fn);

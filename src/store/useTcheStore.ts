@@ -334,6 +334,12 @@ export interface PullStatus {
   last_error: string | null;
   /** Pessoas ativas na equipe da nuvem que este aparelho ainda não tem (entram com "Atualizar equipe"). */
   cloud_staff_unknown: number;
+  /**
+   * GPT r17: até onde este aparelho já leu e aplicou os estornos e encerramentos feitos em outros aparelhos
+   * (audit_logs.server_seq da loja). Mora aqui, junto das contas que descreve (e não no localStorage, que as abas do
+   * navegador dividem): quem avança o ponto é quem aplicou a alteração, na mesma memória e no mesmo estado salvo.
+   */
+  refund_seq?: number;
 }
 
 export const EMPTY_PULL_STATUS: PullStatus = { last_pull_at: null, last_error: null, cloud_staff_unknown: 0 };
@@ -590,6 +596,8 @@ interface Actions {
   /** Equipe com PIN vinda do servidor ("Atualizar equipe"). */
   applyCloudStaff: (staff: StaffUser[]) => ActionResult<{ added: number }>;
   setPullError: (message: string) => void;
+  /** Guarda até onde os estornos de outros aparelhos já foram aplicados aqui (só anda para a frente). */
+  setRefundSeq: (seq: number) => void;
   ackSyncedEvents: (eventIds: UUID[]) => void;
   setSyncError: (message: string | null, blockedEventId: UUID | null) => void;
   /** Tira da fila os eventos recusados pela nuvem e guarda em syncRejected. */
@@ -4313,7 +4321,7 @@ export const useTcheStore = create<TcheState>()(
               : {}),
             // Desativado em outro aparelho: sai da sessão aqui também.
             currentUserId: currentStillActive ? state.currentUserId : null,
-            pullStatus: { last_pull_at: nowISO(), last_error: null, cloud_staff_unknown: team.unknown },
+            pullStatus: { last_pull_at: nowISO(), last_error: null, cloud_staff_unknown: team.unknown, refund_seq: state.pullStatus?.refund_seq },
           });
           return { ok: true, data: { unknownStaff: team.unknown } };
         },
@@ -4334,6 +4342,7 @@ export const useTcheStore = create<TcheState>()(
         },
 
         setPullError: (message) => set((s) => ({ pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), last_error: message } })),
+        setRefundSeq: (seq) => set((s) => ((s.pullStatus?.refund_seq ?? 0) >= seq ? {} : { pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), refund_seq: seq } })),
 
         ackSyncedEvents: (eventIds) => {
           if (eventIds.length === 0) return;

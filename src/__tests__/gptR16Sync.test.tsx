@@ -79,14 +79,14 @@ function serverOfA(orderId: string, status: 'PAYING' | 'CLOSED' = 'PAYING') {
 
 /** Troca a loja deste aparelho para a B (o que joinCloudStore faz: outra loja, outra sessão, sem as contas da A). */
 function switchToStoreB() {
-  useTcheStore.setState((s) => ({ tenant: { ...s.tenant, id: STORE_B }, cloud: cloudOf(STORE_B, 'b@loja'), orders: [], orderItems: [], payments: [], auditLogs: [], outbox: [], syncRejected: [] }));
+  useTcheStore.setState((s) => ({ tenant: { ...s.tenant, id: STORE_B }, cloud: cloudOf(STORE_B, 'b@loja'), orders: [], orderItems: [], payments: [], auditLogs: [], outbox: [], syncRejected: [], pullStatus: { last_pull_at: null, last_error: null, cloud_staff_unknown: 0 } }));
 }
 const nothingOfA = (orderId: string) => {
   expect(st().orders.some((o) => o.id === orderId)).toBe(false);
   expect(st().payments.some((p) => p.order_id === orderId)).toBe(false);
   expect(st().orderItems.some((i) => i.order_id === orderId)).toBe(false);
   expect(st().auditLogs.some((l) => l.order_id === orderId)).toBe(false);
-  expect(localStorage.getItem(`tchefood.refundChangesSeq.v1:${STORE_B}`)).toBeNull();
+  expect(st().pullStatus.refund_seq ?? 0).toBe(0);
 };
 
 beforeEach(() => {

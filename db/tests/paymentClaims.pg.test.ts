@@ -3275,22 +3275,20 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(by(three.order)).toMatchObject({ status: 'PAYING', remaining_balance: 100 });
       expect(out.has_more).toBe(false);
       expect(out.next_seq).toBe(by(three.order).last_seq);
-      // Registros de agora: o aparelho ainda não guarda como lido (voltam na próxima leitura).
-      expect(out.safe_seq).toBe(start);
+      // GPT r17 P2-01: a gravação é serializada pela trava da loja (sem prazo presumido): tudo o que foi lido já é seguro.
+      expect(out.safe_seq).toBe(out.next_seq);
       // Paginado, em ordem de sequência; depois da última, nada.
       const p1 = changes(start, 2);
       expect(p1.items.map((i) => i.order_id)).toEqual([one.order, two.order]);
       expect(p1).toMatchObject({ has_more: true, next_seq: by(two.order).last_seq });
       expect(changes(p1.next_seq, 2)).toMatchObject({ items: [{ order_id: three.order }], has_more: false });
       expect(changes(out.next_seq)).toMatchObject({ items: [], next_seq: out.next_seq, safe_seq: out.next_seq, has_more: false });
-      // Mais de 10 minutos depois: tudo conta como lido.
-      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE audit_logs SET created_at = created_at - INTERVAL '11 minutes' WHERE server_seq > ${start} AND action_type IN ('POINT_PAYMENT_REFUNDED', 'ORDER_REFUNDED_WRITE_OFF'); COMMIT;`);
       expect(changes(start).safe_seq).toBe(out.next_seq);
       // Nova alteração numa conta já lida (2º fechamento): volta com a sequência nova.
       asDevice(closeQ(three.order, crypto.randomUUID()));
       const again = changes(out.next_seq);
       expect(again.items).toMatchObject([{ order_id: three.order, status: 'CLOSED', remaining_balance: 100 }]);
-      expect(again.safe_seq).toBe(out.next_seq);
+      expect(again.safe_seq).toBe(again.next_seq);
       // Outra loja, anônimo e argumentos inválidos.
       expect(changes(start, undefined, OTHER).items.some((i) => [one.order, two.order, three.order].includes(i.order_id))).toBe(false);
       expect(asRole('anon', 'SELECT tchefood_list_refund_order_changes(0)')).toMatchObject({ ok: false, sqlstate: '42501' });
@@ -3298,39 +3296,62 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(detailOf('SELECT tchefood_list_refund_order_changes(0, 201)')).toMatch(/^TF006/);
     });
 
-    it('GPT r16 (a verificar): registro gravado antes e confirmado depois de outro com sequência maior: o ponto de leitura não passa por ele e a conta aparece na leitura seguinte', async () => {
+    it('GPT r17 P2-01: a leitura não depende de prazo: duas gravações da mesma loja andam uma depois da outra e o ponto de leitura nunca passa de um registro por confirmar', async () => {
       type Out = { items: Array<{ order_id: string; last_seq: number }>; next_seq: number; safe_seq: number; has_more: boolean };
       const changes = (after: number) => json<Out>(asDevice(`SELECT tchefood_list_refund_order_changes(${after})`));
+      const start = Number(sql('SELECT COALESCE(max(server_seq), 0) FROM audit_logs'));
       const x = refundedOrder();
       const y = refundedOrder();
-      // Os registros dos dois estornos já são antigos: o ponto de partida do aparelho.
-      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE audit_logs SET created_at = created_at - INTERVAL '11 minutes' WHERE order_id IN ('${x.order}', '${y.order}'); COMMIT;`);
-      const start = Number(sql('SELECT COALESCE(max(server_seq), 0) FROM audit_logs'));
-      expect(changes(start)).toMatchObject({ items: [], safe_seq: start });
-      const insert = (order: string) => `INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
-        VALUES ('${TENANT}', '${order}', '${STAFF}', 'ORDER_REFUNDED_WRITE_OFF', 'venda devolvida ao cliente', '{"written_off_cents": 0}'::jsonb) RETURNING server_seq;`;
-      // Sessão 1 grava primeiro (sequência menor) e fica aberta; a sessão 2 grava depois e confirma antes.
+      const z = refundedOrder();
+      // O registro dos estornos (já confirmados) é lido por inteiro e o ponto anda até o último.
+      const base = changes(start);
+      expect(base.items.map((i) => i.order_id)).toEqual([x.order, y.order, z.order]);
+      expect(base.safe_seq).toBe(base.next_seq);
+      // Sessão 1 encerra a conta X (como o aparelho) e fica aberta; a sessão 2 encerra a Y, e espera a trava da loja.
+      const closeSql = (order: string) => `SET LOCAL ROLE authenticated; SELECT set_config('request.jwt.claims', '{"tenant_id":"${TENANT}"}', true); ${closeQ(order, crypto.randomUUID())};`;
       const s1 = session();
-      s1.send('BEGIN; SET LOCAL session_replication_role = replica;');
-      s1.send(insert(x.order));
-      await until('sessão 1 gravou', () => /^\d+$/m.test(s1.output()));
-      const seqX = Number(s1.output().trim().split('\n').pop());
-      const seqY = Number(sql(`BEGIN; SET LOCAL session_replication_role = replica; ${insert(y.order)} COMMIT;`).split('\n').find((l) => /^\d+$/.test(l)));
-      expect(seqX).toBeLessThan(seqY);
-      // O aparelho lê agora: só vê a conta Y. O ponto de leitura NÃO anda (registro recente), então X não é pulada.
-      const first = changes(start);
-      expect(first.items.map((i) => i.order_id)).toEqual([y.order]);
-      expect(first).toMatchObject({ next_seq: seqY, safe_seq: start });
-      // A sessão 1 confirma. A leitura seguinte, do mesmo ponto, traz as duas.
+      s1.send(`BEGIN; ${closeSql(x.order)}`);
+      await until('sessão 1 gravou', () => writeOffs(x.order) === 0 && /ORDER|\{/.test(s1.output()));
+      const before = waiting();
+      const s2 = session();
+      s2.send(`BEGIN; ${closeSql(y.order)}`);
+      await until('sessão 2 espera a trava da loja', () => waiting() > before);
+      // Com as duas em andamento nada novo está confirmado: a leitura do aparelho não anda nem vê as contas.
+      const during = changes(base.next_seq);
+      expect(during).toMatchObject({ items: [], next_seq: base.next_seq, safe_seq: base.next_seq });
       s1.end('COMMIT;');
       await s1.done;
-      const second = changes(start);
-      expect(second.items.map((i) => i.order_id)).toEqual([x.order, y.order]);
-      expect(second.safe_seq).toBe(start);
-      // Um registro antigo seguido de um recente: o ponto anda só até o antigo.
-      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE audit_logs SET created_at = created_at - INTERVAL '11 minutes' WHERE server_seq = ${seqX}; COMMIT;`);
-      expect(changes(start)).toMatchObject({ safe_seq: seqX, next_seq: seqY });
-      expect(changes(seqX).items.map((i) => i.order_id)).toEqual([y.order]);
+      s2.end('COMMIT;');
+      await s2.done;
+      expect(writeOffs(x.order)).toBe(1);
+      expect(writeOffs(y.order)).toBe(1);
+      // Depois de confirmadas, as duas aparecem, na ordem da sequência (a da sessão 1 é menor), e o ponto anda até a última.
+      const after = changes(base.next_seq);
+      expect(after.items.map((i) => i.order_id)).toEqual([x.order, y.order]);
+      expect(after.items[0]!.last_seq).toBeLessThan(after.items[1]!.last_seq);
+      expect(after.safe_seq).toBe(after.next_seq);
+      expect(changes(after.safe_seq).items).toEqual([]);
+    });
+
+    it('GPT r17 P2-01: registro de estorno ou encerramento sem a trava da loja é recusado pelo banco (nem o servidor grava por outro caminho)', () => {
+      const x = refundedOrder();
+      const insert = (type: string) => `INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES ('${TENANT}', '${x.order}', '${STAFF}', '${type}', 'venda devolvida ao cliente', '{"written_off_cents": 0}'::jsonb)`;
+      for (const type of ['ORDER_REFUNDED_WRITE_OFF', 'POINT_PAYMENT_REFUNDED']) {
+        const direct = psql(target!, `BEGIN; SET LOCAL ROLE service_role; ${insert(type)}; COMMIT;`, DB);
+        expect(direct.ok, type).toBe(false);
+        // Com a trava da loja tomada (como as funções do servidor fazem) a gravação passa.
+        const locked = psql(target!, `BEGIN; SELECT pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || '${TENANT}')); ${insert(type)}; ROLLBACK;`, DB);
+        expect(locked.ok, locked.message ?? type).toBe(true);
+        // Trava de outra loja, ou compartilhada: não vale.
+        const other = psql(target!, `BEGIN; SELECT pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || '${OTHER}')); ${insert(type)}; ROLLBACK;`, DB);
+        expect(other.ok, type).toBe(false);
+        const shared = psql(target!, `BEGIN; SELECT pg_advisory_xact_lock_shared(hashtext('tchefood_manager_pin:' || '${TENANT}')); ${insert(type)}; ROLLBACK;`, DB);
+        expect(shared.ok, type).toBe(false);
+      }
+      // Outros tipos de registro não são afetados.
+      const other = psql(target!, `BEGIN; INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason) VALUES ('${TENANT}', '${x.order}', '${STAFF}', 'POINT_CHARGE_RESOLVED', 'x'); ROLLBACK;`, DB);
+      expect(other.ok, other.message ?? '').toBe(true);
     });
 
     describe('P1-02: tchefood_list_point_payments', () => {
@@ -3364,8 +3385,10 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
         chargeId = sql(`BEGIN; SET LOCAL session_replication_role = replica;
           INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status, external_order_id, external_payment_id)
           VALUES ('${LATE_TENANT}', '${refunded.key}', '${order}', '${LIST_TERMINAL}', 'mercado_pago_point', 'LIST-POINT', 'CREDIT', 1600, 'refunded', 'ORD-LISTA-777', 'NSU-ESTORNO-1') RETURNING id; COMMIT;`).split('\n').filter((l) => /^[0-9a-f-]{36}$/.test(l))[0]!;
-        refundAudit = sql(`INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, reason, metadata)
-          VALUES ('${LATE_TENANT}', '${order}', '${LATE_STAFF}', '${LATE_STAFF}', 'POINT_PAYMENT_REFUNDED', 'estorno conferido', '{"payment_id":"${refunded.id}"}') RETURNING id;`);
+        // Com a trava da loja tomada, como as funções do servidor gravam este registro (GPT r17 P2-01).
+        refundAudit = sql(`BEGIN; SELECT pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || '${LATE_TENANT}'));
+          INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, reason, metadata)
+          VALUES ('${LATE_TENANT}', '${order}', '${LATE_STAFF}', '${LATE_STAFF}', 'POINT_PAYMENT_REFUNDED', 'estorno conferido', '{"payment_id":"${refunded.id}"}') RETURNING id; COMMIT;`).split('\n').filter((l) => /^[0-9a-f-]{36}$/.test(l))[0]!;
         // Pagamento fora do Mercado Pago (não aparece) e pagamento do Mercado Pago de outra loja (não aparece).
         sql(`BEGIN; SET LOCAL session_replication_role = replica;
              INSERT INTO payments (order_id, tenant_id, waiter_id, amount, method, status, acquirer, idempotency_key) VALUES ('${order}', '${LATE_TENANT}', '${LATE_STAFF}', 5, 'CASH', 'APPROVED', 'CASH_DESK', '${key('lpc')}');

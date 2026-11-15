@@ -20,13 +20,43 @@ let current: Promise<void> | null = null;
 const browserFetch: FetchLike = (url, init) => fetch(url, init);
 
 /**
+ * GPT r17 (a verificar): tempo máximo de cada pedido à nuvem. Um pedido que nunca responde (rede parada, servidor
+ * mudo) segurava a rodada inteira para sempre, e com ela a fila e a leitura dos estornos. Passado o prazo o pedido é
+ * abortado e vira "sem conexão": a rodada termina e a seguinte tenta de novo (o envio é idempotente, como em qualquer
+ * queda de rede).
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
+function withRequestTimeout(fetchFn: FetchLike, ms: number = REQUEST_TIMEOUT_MS): FetchLike {
+  return (url, init) => {
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        ctrl?.abort();
+        reject(new Error('A nuvem não respondeu a tempo.'));
+      }, ms);
+    });
+    expired.catch(() => undefined);
+    const stop = () => clearTimeout(timer);
+    const call = fetchFn(url, ctrl ? { ...init, signal: ctrl.signal } : init).then(
+      (res) => ({ ok: res.ok, status: res.status, text: () => Promise.race([res.text(), expired]).finally(stop) }),
+      (e) => {
+        stop();
+        throw e;
+      },
+    );
+    return Promise.race([call, expired]);
+  };
+}
+
+/**
  * Uma renovação do token por vez, dividida entre o laço e a cobrança na Point: duas renovações com o mesmo
  * refresh token (uma largada pelo prazo da cobrança, outra do laço) podem derrubar a sessão do aparelho.
  */
 let refreshing: { token: string; promise: ReturnType<typeof refreshDevice> } | null = null;
 function sharedRefresh(session: { url: string; anon_key: string; refresh_token: string }, fetchFn: FetchLike): ReturnType<typeof refreshDevice> {
   if (refreshing && refreshing.token === session.refresh_token) return refreshing.promise;
-  const promise = refreshDevice(session.url, session.anon_key, session.refresh_token, fetchFn);
+  const promise = refreshDevice(session.url, session.anon_key, session.refresh_token, withRequestTimeout(fetchFn));
   const entry = { token: session.refresh_token, promise };
   refreshing = entry;
   const clear = () => {
@@ -34,6 +64,23 @@ function sharedRefresh(session: { url: string; anon_key: string; refresh_token: 
   };
   promise.then(clear, clear);
   return promise;
+}
+
+type CloudSessionNow = NonNullable<ReturnType<typeof useTcheStore.getState>['cloud']>;
+
+/**
+ * GPT r17 (a verificar): guarda o token renovado só se a sessão do aparelho ainda é a que foi renovada. Durante a
+ * renovação o aparelho pode ter sido desconectado, trocado de loja ou entrado com outra conta da mesma loja: a resposta
+ * antiga não ressuscita nem sobrescreve a sessão de agora. Duas rodadas dividem a mesma renovação (sharedRefresh): se a
+ * outra já guardou este token, vale.
+ */
+function applyRefreshedSession(session: CloudSessionNow, tokens: Awaited<ReturnType<typeof refreshDevice>>): { ok: true } | { ok: false; error: string | null } {
+  const cur = useTcheStore.getState().cloud;
+  if (!cur || cur.url !== session.url || cur.email !== session.email || cur.tenant_id !== session.tenant_id) return { ok: false, error: null };
+  if (cur.refresh_token === tokens.refresh_token) return { ok: true };
+  if (cur.refresh_token !== session.refresh_token) return { ok: false, error: null };
+  const res = useTcheStore.getState().setCloudSession({ ...cur, ...tokens });
+  return res.ok ? { ok: true } : { ok: false, error: res.error };
 }
 
 function pullDue(lastPullAt: string | null | undefined, nowMs: number): boolean {
@@ -113,7 +160,7 @@ async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): 
   const wantsRefunds = pull === 'force' || (pull === 'due' && refundPullDue(sessionKey(tenantId, session), Date.now()));
   if (state.outbox.length === 0 && !wantsPull && !wantsRefunds) return;
   running = true;
-  const round = runRound(session, fetchFn, wantsPull, wantsRefunds, tenantId);
+  const round = runRound(session, withRequestTimeout(fetchFn), wantsPull, wantsRefunds, tenantId);
   current = round;
   try {
     await round;
@@ -139,9 +186,10 @@ async function sendAndPull(session: NonNullable<ReturnType<typeof useTcheStore.g
     if (needsRefresh(session.expires_at)) {
       try {
         const t = await sharedRefresh(session, fetchFn);
-        const res = useTcheStore.getState().setCloudSession({ ...session, ...t });
+        const res = applyRefreshedSession(session, t);
         if (!res.ok) {
-          useTcheStore.getState().setSyncError(res.error, null);
+          // Sessão trocada ou desconectada durante a renovação: esta rodada acaba sem usar o token antigo.
+          if (res.error) useTcheStore.getState().setSyncError(res.error, null);
           return null;
         }
         token = t.access_token;
@@ -292,8 +340,7 @@ export async function freshCloudConfig(fetchFn: FetchLike = browserFetch): Promi
   if (!needsRefresh(session.expires_at)) return { url: session.url, anonKey: session.anon_key, accessToken: session.access_token };
   try {
     const t = await sharedRefresh(session, fetchFn);
-    const res = useTcheStore.getState().setCloudSession({ ...session, ...t });
-    if (!res.ok) return null;
+    if (!applyRefreshedSession(session, t).ok) return null;
     return { url: session.url, anonKey: session.anon_key, accessToken: t.access_token };
   } catch {
     return null;

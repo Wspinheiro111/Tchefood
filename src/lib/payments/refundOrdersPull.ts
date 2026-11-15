@@ -58,22 +58,15 @@ export async function syncOrderFromServer(orderId: string, deps: ClaimDeps = def
   return r.ok ? r.data.kind : 'failed';
 }
 
-/** Até onde este aparelho já leu os estornos e encerramentos da loja (audit_logs.server_seq), por loja. */
-const CHANGES_SEQ = 'tchefood.refundChangesSeq.v1:';
-export function refundChangesSeq(tenantId: string): number {
-  try {
-    const n = Number(localStorage.getItem(CHANGES_SEQ + tenantId));
-    return Number.isSafeInteger(n) && n > 0 ? n : 0;
-  } catch {
-    return 0; // Sem armazenamento: lê tudo de novo (repetir é inofensivo).
-  }
-}
-function saveRefundChangesSeq(tenantId: string, seq: number): void {
-  try {
-    localStorage.setItem(CHANGES_SEQ + tenantId, String(seq));
-  } catch {
-    // Sem armazenamento: a próxima leitura começa do zero.
-  }
+/**
+ * Até onde este aparelho já leu e aplicou os estornos e encerramentos da loja (audit_logs.server_seq). Fica no estado
+ * do aparelho (pullStatus.refund_seq), junto das contas: GPT r17 (a verificar): no localStorage as abas do mesmo
+ * navegador dividiam o ponto, e uma aba que avançava fazia a outra pular uma alteração que ainda não tinha aplicado.
+ * Só vale para a loja do estado atual (a leitura confere a loja antes de usar).
+ */
+export function refundChangesSeq(): number {
+  const n = Number(useTcheStore.getState().pullStatus?.refund_seq);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
 }
 
 export type BlockedReason = 'pending' | 'rejected' | 'failed';
@@ -96,7 +89,7 @@ export interface RefundOrdersPull {
  * alteração daqui na fila ou recusada segura o ponto (volta na próxima leitura).
  */
 async function pullRefundOrderChanges(scope: PullScope, deps: ClaimDeps): Promise<boolean> {
-  const from = refundChangesSeq(scope.tenantId);
+  const from = refundChangesSeq();
   const out = await listRefundOrderChanges(from, deps);
   if (out.kind !== 'ok' || !sameScope(scope)) return false;
   let upTo = out.safeSeq;
@@ -116,7 +109,7 @@ async function pullRefundOrderChanges(scope: PullScope, deps: ClaimDeps): Promis
     }
   }
   if (!sameScope(scope)) return false;
-  if (upTo > from) saveRefundChangesSeq(scope.tenantId, upTo);
+  if (upTo > from) useTcheStore.getState().setRefundSeq(upTo);
   return ok;
 }
 
