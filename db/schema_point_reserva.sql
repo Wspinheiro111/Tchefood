@@ -1931,14 +1931,13 @@ BEGIN
                 to_char(v_remaining / 100.0, 'FM999999990.00'), to_char(v_refunded / 100.0, 'FM999999990.00')
                 USING ERRCODE = 'TF007', DETAIL = 'balance_not_refunded';
         END IF;
-        -- GPT r12 P2-02: baixas anteriores da mesma conta (reaberta por um segundo estorno) já foram reconhecidas;
-        -- este registro baixa só a diferença (written_off_cents) e guarda o total (cumulative_written_off_cents).
+        -- GPT r12 P2-02 / r14 P1-02: baixas anteriores da mesma conta (reaberta por outro estorno) já foram registradas.
+        -- O total baixado da conta passa a ser o saldo de agora (cumulative_written_off_cents); este registro guarda só a
+        -- diferença para o total anterior (written_off_cents), que pode ser zero ou negativa quando o cliente pagou
+        -- parte do que tinha sido baixado. A soma dos registros é sempre o saldo que ficou sem pagar, contado uma vez.
         SELECT COALESCE(SUM((a.metadata->>'written_off_cents')::BIGINT), 0) INTO v_prev FROM audit_logs a
          WHERE a.tenant_id = v_tenant AND a.order_id = p_order AND a.action_type = 'ORDER_REFUNDED_WRITE_OFF';
         v_increment := v_remaining - v_prev;
-        IF v_increment <= 0 THEN
-            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o saldo desta conta já foi baixado.' USING ERRCODE = 'TF007', DETAIL = 'nothing_to_write_off';
-        END IF;
     END IF;
     v_checked_at := clock_timestamp();
     SELECT count(*) INTO v_failures FROM audit_logs a

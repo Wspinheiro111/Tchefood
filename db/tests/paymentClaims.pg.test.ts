@@ -3138,6 +3138,60 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(new Date(String(w2.closed_at)).getTime()).toBe(new Date(firstClosed).getTime());
     });
 
+    it('GPT r14 P1-02 (ciclo completo): 2 pagamentos Point → fecha → 1º estorno → baixa → 2º estorno → pagamento parcial → encerra; ou pagamento integral → fecha zerada', () => {
+      for (const variant of ['partial', 'full'] as const) {
+        const order = withItems(100);
+        const a = paidCharge(order, 5000);
+        const b = paidCharge(order, 5000);
+        expect(orderState(order)).toBe('10000|0|CLOSED');
+        const firstClosed = sql(`SELECT to_jsonb(closed_at) #>> '{}' FROM orders WHERE id = '${order}'`);
+        expect(refundPoint(a.id).ok).toBe(true);
+        expect(orderState(order)).toBe('5000|5000|PAYING');
+        const w1 = JSON.parse(last(asDevice(closeQ(order, crypto.randomUUID())))) as Record<string, unknown>;
+        expect(w1).toMatchObject({ status: 'CLOSED', written_off_cents: 5000, cumulative_written_off_cents: 5000 });
+        const r2 = refundPoint(b.id);
+        expect(r2.ok, r2.message ?? '').toBe(true);
+        expect(orderState(order)).toBe('0|10000|PAYING');
+        if (variant === 'partial') {
+          // O cliente paga R$ 50 (reserva + dinheiro); os R$ 50 restantes já tinham sido baixados antes.
+          const paid = pay(payment(order, 50, { idempotency_key: key('r14p') }));
+          expect(paid.ok, paid.message ?? '').toBe(true);
+          expect(orderState(order)).toBe('5000|5000|PAYING');
+          const w2 = JSON.parse(last(asDevice(closeQ(order, crypto.randomUUID())))) as Record<string, unknown>;
+          // Antes da correção: TF007 nothing_to_write_off (a conta ficava aberta).
+          expect(w2).toMatchObject({ status: 'CLOSED', written_off_cents: 0, cumulative_written_off_cents: 5000 });
+          expect(orderState(order)).toBe('5000|5000|CLOSED');
+          // O total baixado da conta é R$ 50 (o saldo que ficou sem pagar), contado uma vez.
+          expect(sql(`SELECT count(*) || '|' || sum((metadata->>'written_off_cents')::bigint) || '|' || sum(amount_impact) FROM audit_logs WHERE action_type = 'ORDER_REFUNDED_WRITE_OFF' AND order_id = '${order}'`)).toBe('2|5000|50.00');
+          expect(sql(`SELECT to_jsonb(closed_at) #>> '{}' FROM orders WHERE id = '${order}'`)).toBe(firstClosed);
+          // Outro clique na conta encerrada: TF007, sem registro novo.
+          expect(asDevice(closeQ(order, crypto.randomUUID()))).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        } else {
+          const paid = pay(payment(order, 100, { idempotency_key: key('r14f') }));
+          expect(paid.ok, paid.message ?? '').toBe(true);
+          expect(orderState(order)).toBe('10000|0|CLOSED');
+          // Nada a baixar: o gerente não encerra de novo.
+          expect(asDevice(closeQ(order, crypto.randomUUID()))).toMatchObject({ ok: false, sqlstate: 'TF007' });
+        }
+      }
+    });
+
+    it('GPT r14 P1-02: pagamento depois da baixa que cobre mais do que o saldo baixado: a nova baixa reduz o total (diferença negativa) e o total fica igual ao saldo', () => {
+      const order = withItems(100);
+      const a = paidCharge(order, 5000);
+      const b = paidCharge(order, 5000);
+      expect(refundPoint(a.id).ok).toBe(true);
+      asDevice(closeQ(order, crypto.randomUUID()));
+      expect(refundPoint(b.id).ok).toBe(true);
+      const paid = pay(payment(order, 80, { idempotency_key: key('r14n') }));
+      expect(paid.ok, paid.message ?? '').toBe(true);
+      expect(orderState(order)).toBe('8000|2000|PAYING');
+      const w = JSON.parse(last(asDevice(closeQ(order, crypto.randomUUID())))) as Record<string, unknown>;
+      expect(w).toMatchObject({ status: 'CLOSED', written_off_cents: -3000, cumulative_written_off_cents: 2000 });
+      expect(sql(`SELECT sum((metadata->>'written_off_cents')::bigint) || '|' || sum(amount_impact) FROM audit_logs WHERE action_type = 'ORDER_REFUNDED_WRITE_OFF' AND order_id = '${order}'`)).toBe('2000|20.00');
+      expect(orderState(order)).toBe('8000|2000|CLOSED');
+    });
+
     it('GPT r12 P1-02/P1-03: tchefood_order_snapshot e tchefood_list_refund_reopened_orders dão o estado oficial, só da loja do token', () => {
       const { order, ch } = refundedOrder();
       const listed = json<Array<Record<string, unknown>>>(asDevice('SELECT tchefood_list_refund_reopened_orders()'));

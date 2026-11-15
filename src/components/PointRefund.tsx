@@ -52,9 +52,10 @@ export const POINT_REFUND_REMOTE = 'Estorno registrado no servidor. Não deu par
 
 /**
  * GPT r12 (P1-02): traz a conta do servidor para este aparelho (tchefood_order_snapshot). 'applied': este aparelho
- * ficou com o estado do servidor; 'pending': há alteração desta conta na fila daqui (nada mudou); 'failed': sem leitura.
+ * ficou com o estado do servidor; 'pending': há alteração desta conta na fila daqui (nada mudou); 'rejected': há
+ * alteração desta conta recusada pela nuvem (nada mudou até resolver); 'failed': sem leitura.
  */
-export async function syncOrderFromServer(orderId: string, deps: ClaimDeps = defaultClaimDeps()): Promise<'applied' | 'pending' | 'missing' | 'failed'> {
+export async function syncOrderFromServer(orderId: string, deps: ClaimDeps = defaultClaimDeps()): Promise<'applied' | 'pending' | 'rejected' | 'missing' | 'failed'> {
   const snap = await getOrderSnapshot(orderId, deps);
   if (snap.kind === 'missing') return 'missing';
   if (snap.kind !== 'ok') return 'failed';
@@ -323,7 +324,8 @@ export async function submitRefundedWriteOff(orderId: string, managerPin: string
     if (applied.ok && applied.data.kind === 'applied') {
       clearWriteOffAttempt(orderId);
       const mine = snap.snapshot.audits.find((a) => a.action_type === 'ORDER_REFUNDED_WRITE_OFF' && (a.metadata as Record<string, unknown> | null)?.client_audit_id === clientAuditId);
-      const cents = Number((mine?.metadata as Record<string, unknown> | undefined)?.written_off_cents);
+      const meta = mine?.metadata as Record<string, unknown> | undefined;
+      const cents = Number(meta?.cumulative_written_off_cents ?? meta?.written_off_cents);
       return { ok: true, data: { writtenOff: Number.isInteger(cents) && cents > 0 ? cents / 100 : 0 } };
     }
   }
@@ -347,7 +349,7 @@ export function WriteOffRefundedButton({ orderId, label, onClosed, deps }: { ord
         successMessage="Conta encerrada no servidor como venda devolvida."
         onSubmit={(pin, reason) => submitRefundedWriteOff(orderId, pin, reason, deps)}
         onSuccess={(data) => {
-          toast.alert(`Conta encerrada como venda devolvida: ${formatBRL(data.writtenOff)} baixado.`);
+          toast.alert(`Conta encerrada como venda devolvida: ${formatBRL(data.writtenOff)} baixado no total da conta.`);
           onClosed?.();
         }}
       />
@@ -372,9 +374,18 @@ export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?
   const payments = useTcheStore((s) => s.payments);
   const logs = useTcheStore((s) => s.auditLogs);
   const tables = useTcheStore((s) => s.tables);
+  const outbox = useTcheStore((s) => s.outbox);
+  const rejected = useTcheStore((s) => s.syncRejected);
   const [server, setServer] = useState<ServerReopenedOrder[] | null>(null);
   const [readAt, setReadAt] = useState<Date | null>(null);
   const [failed, setFailed] = useState(false);
+  // GPT r14 P1-01: contas reabertas no servidor que não puderam vir para cá (alteração desta conta na fila ou recusada).
+  const [blocked, setBlocked] = useState<Record<string, 'pending' | 'rejected' | 'failed'>>({});
+  // Muda quando a fila ou os recusados de uma conta bloqueada mudam: lê o servidor de novo na hora (sem esperar o minuto).
+  const blockedKey = useMemo(() => Object.keys(blocked).sort().map((id) => {
+    const touches = (e: { row_id: string; payload?: unknown }) => e.row_id === id || (e.payload as Record<string, unknown> | undefined)?.order_id === id;
+    return `${id}:${outbox.some(touches) ? 'q' : ''}${(rejected ?? []).some((r) => touches(r.event)) ? 'r' : ''}`;
+  }).join(','), [blocked, outbox, rejected]);
   useEffect(() => {
     if (!cloud) return;
     let alive = true;
@@ -387,14 +398,17 @@ export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?
       // Diferente da daqui (falta a conta, outro status ou outro saldo): o estado oficial vem do servidor.
       const differs = out.items.filter((i) => {
         const o = st.orders.find((x) => x.id === i.order_id);
-        return !o || o.status !== 'PAYING' || toCents(o.remaining_balance) !== toCents(i.remaining_balance);
+        return !o || o.status !== 'PAYING' || toCents(o.remaining_balance) !== toCents(i.remaining_balance) || !isRefundReopenedOrder(o, st.payments, st.auditLogs);
       }).map((i) => i.order_id);
       const stale = st.orders.filter((o) => isRefundReopenedOrder(o, st.payments, st.auditLogs) && !onServer.has(o.id)).map((o) => o.id);
+      const next: Record<string, 'pending' | 'rejected' | 'failed'> = {};
       for (const id of [...differs, ...stale]) {
-        await syncOrderFromServer(id, deps);
+        const r = await syncOrderFromServer(id, deps);
         if (!alive) return;
+        if (onServer.has(id) && (r === 'pending' || r === 'rejected' || r === 'failed')) next[id] = r;
       }
       setServer(out.items);
+      setBlocked(next);
       setFailed(false);
       setReadAt(new Date());
     };
@@ -404,11 +418,17 @@ export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?
       alive = false;
       clearInterval(t);
     };
-  }, [cloud, deps]);
-  const local = orders.filter((o) => isRefundReopenedOrder(o, payments, logs));
-  // Do servidor e ainda não trazida (leitura falhou ou alteração desta conta na fila daqui): aparece com os dados do servidor.
-  const remoteOnly = (server ?? []).filter((r) => !local.some((o) => o.id === r.order_id) && !orders.some((o) => o.id === r.order_id && o.status === 'CLOSED'));
+  }, [cloud, deps, blockedKey]);
+  const local = orders.filter((o) => isRefundReopenedOrder(o, payments, logs) && !blocked[o.id]);
+  // Reaberta no servidor e ainda não aplicada aqui (mesmo que este aparelho ainda a veja fechada): aparece com os dados
+  // do servidor e o motivo, sem ações até convergir (cobrar ou encerrar dependem do estado do servidor aqui).
+  const remoteOnly = (server ?? []).filter((r) => blocked[r.order_id] || !orders.some((o) => o.id === r.order_id));
   if (local.length === 0 && remoteOnly.length === 0) return null;
+  const why = (id: string) => (blocked[id] === 'rejected'
+    ? 'este aparelho tem alteração desta conta recusada pela nuvem: resolva em Nuvem › recusados; depois a conta vem do servidor e as ações aparecem aqui.'
+    : blocked[id] === 'pending'
+      ? 'este aparelho tem alteração desta conta ainda não enviada: aguarde a sincronização; depois a conta vem do servidor e as ações aparecem aqui.'
+      : 'ainda não trazida para este aparelho (leitura da nuvem falhou); tentando de novo a cada minuto.');
   return (
     <div role="alert" className="rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
       <div className="mb-1 font-black text-brasa">Contas reabertas pelo estorno</div>
@@ -431,8 +451,8 @@ export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?
       {remoteOnly.map((r) => {
         const label = tables.find((t) => t.id === r.table_id)?.label ?? 'Conta';
         return (
-          <div key={r.order_id} className="flex flex-wrap items-center justify-between gap-2 border-t border-ouro/40 py-2">
-            <span><b>{label}</b> · saldo {formatBRL(r.remaining_balance)} · <span className="text-xs">no servidor; ainda não trazida para este aparelho (sincronize e abra de novo)</span></span>
+          <div key={r.order_id} data-testid={`reopened-blocked-${r.order_id}`} className="flex flex-wrap items-center justify-between gap-2 border-t border-ouro/40 py-2">
+            <span><b>{label}</b> · saldo {formatBRL(r.remaining_balance)} no servidor · <span className="text-xs">{why(r.order_id)}</span></span>
           </div>
         );
       })}

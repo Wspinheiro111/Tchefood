@@ -44,6 +44,7 @@ const { clearReviewHold, getReviewHold } = await import('../lib/payments/reviewH
 const { useToast } = await import('../components/ui');
 const { submitRefundedWriteOff, isRefundReopenedOrder, syncOrderFromServer, RefundReopenedOrders } = await import('../components/PointRefund');
 const { listPointPayments } = await import('../lib/payments/pointPaymentsServer');
+const { keptSaleCents, writeOffsByOrder } = await import('../lib/reports');
 /** Mensagens de toast desde o começo do teste (o que o operador viu). */
 const toastLog: string[] = [];
 useToast.subscribe((s: { toasts: Array<{ id: unknown; kind: string; text: string }> }, prev: { toasts: Array<{ id: unknown }> }) => {
@@ -930,4 +931,83 @@ function freeValue(v: string) {
     expect(sql(`SELECT count(*) FROM audit_logs WHERE order_id = '${id}' AND action_type = 'ORDER_REFUNDED_WRITE_OFF'`)).toBe('1');
     expect(st().auditLogs.filter((l) => l.order_id === id && l.action_type === 'ORDER_REFUNDED_WRITE_OFF')).toHaveLength(1);
   }, 90_000);
+  it('GPT r14 (ciclo completo no aparelho): 2 pagamentos Point → fecha → 1º estorno (outro aparelho) → baixa → 2º estorno com evento local recusado e depois na fila → converge → pagamento parcial → encerra; total baixado uma vez e relatório com o que ficou pago', async () => {
+    login(OWNER_PIN);
+    if (!st().tables.some((t) => t.number === 13)) ok(st().saveTable({ number: 13, label: 'Mesa 13', area: 'Salão', capacity: 4, active: true }));
+    const id = openTableWith(13, 2);
+    await expectSynced('conta de duas Point');
+    const o = st().orders.find((x) => x.id === id)!;
+    const totalCents = Math.round(o.remaining_balance * 100);
+    const half = totalCents / 2;
+    expect(Number.isInteger(half)).toBe(true);
+    const termId = crypto.randomUUID();
+    sql(`INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${termId}', '${TENANT}', 'Point E2E 4', 'MP-E2E-4', 'MERCADO_PAGO');`);
+    useTcheStore.setState((s) => ({ terminals: [...s.terminals, { id: termId, tenant_id: TENANT, name: 'Point E2E 4', serial_number: 'MP-E2E-4', acquirer: 'MERCADO_PAGO', mode: 'TEF_POS_WIRELESS', online: true, battery_level: 90 } as never] }));
+    const keys = [crypto.randomUUID(), crypto.randomUUID()];
+    keys.forEach((k, i) => {
+      sql(`INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status, external_order_id, external_payment_id, paid_amount_cents, card_brand, authorization_code)
+           VALUES ('${TENANT}', '${k}', '${id}', '${termId}', 'mercado_pago_point', 'MP-E2E-4', 'CREDIT', ${half}, 'approved', 'ORD-${k}', 'PE2E4${i}', ${half}, 'VISA', 'AUT4');`);
+      ok(st().registerPayment({
+        orderId: id, amount: half / 100, method: 'CREDIT', status: 'APPROVED', terminal_id: termId, acquirer: 'MERCADO_PAGO',
+        acquirer_cnpj: '10573521000191', card_brand: 'VISA', nsu: `PE2E4${i}`, authorization_code: 'AUT4', terminal_serial: 'MP-E2E-4', idempotency_key: k, item_ids: [],
+      }));
+    });
+    await expectSynced('duas Point');
+    expect(serverOrder(id)).toBe('CLOSED 0.00');
+    const firstClosed = sql(`SELECT to_jsonb(closed_at) #>> '{}' FROM orders WHERE id = '${id}'`);
+    const staff = st().currentUserId!;
+    /** O outro aparelho estorna (o point-charge confere no Mercado Pago e grava no servidor). */
+    const refundElsewhere = (k: string, i: number) => {
+      const auth = sql(`SELECT tchefood_authorize_point_reconcile('${TENANT}', '${k}', '${staff}', '${MANAGER_PIN}', 'Venda estornada na maquininha');`);
+      const chargeId = sql(`SELECT id FROM terminal_charges WHERE idempotency_key = '${k}'`);
+      const evidence = JSON.stringify({ authorization_audit_id: auth, operation_id: null, mp_payment_id: `PE2E4${i}`, mp_amount_cents: half, mp_external_reference: k, mp_status: 'refunded', mp_amount_refunded_cents: half });
+      sql(`BEGIN; SET LOCAL ROLE service_role; SELECT status FROM tchefood_refund_point_payment('${TENANT}', '${chargeId}', '${staff}', 'Venda estornada na maquininha', '{"raw_status":"refunded"}'::jsonb, '${evidence}'::jsonb); COMMIT;`);
+    };
+    const local = () => st().orders.find((x) => x.id === id)!;
+    // 1º estorno em outro aparelho: este aparelho traz a conta pela lista de contas reabertas.
+    refundElsewhere(keys[0]!, 0);
+    render(<RefundReopenedOrders />);
+    await waitFor(() => expect(local().status).toBe('PAYING'), { timeout: 10_000 });
+    expect(Math.round(local().remaining_balance * 100)).toBe(half);
+    cleanup();
+    expect(await submitRefundedWriteOff(id, MANAGER_PIN, 'Cliente não vai pagar de novo')).toEqual({ ok: true, data: { writtenOff: half / 100 } });
+    expect(local().status).toBe('CLOSED');
+    // 2º estorno em outro aparelho, com um evento desta conta recusado aqui: a conta aparece com o motivo, sem ações.
+    refundElsewhere(keys[1]!, 1);
+    expect(serverOrder(id)).toBe(`PAYING ${(totalCents / 100).toFixed(2)}`);
+    const stray = { id: crypto.randomUUID(), table: 'orders', op: 'UPDATE', row_id: id, payload: { id, customer_count: 3 }, created_at: new Date().toISOString() } as never;
+    useTcheStore.setState({ syncRejected: [{ event: stray, message: 'recusado', rejected_at: new Date().toISOString() } as never] });
+    render(<RefundReopenedOrders />);
+    expect((await screen.findByTestId(`reopened-blocked-${id}`, {}, { timeout: 10_000 })).textContent).toMatch(/recusada pela nuvem/);
+    expect(local().status).toBe('CLOSED');
+    // O gerente resolve o recusado; o mesmo evento ainda na fila: "aguarde a sincronização".
+    act(() => useTcheStore.setState({ syncRejected: [], outbox: [stray] }));
+    await waitFor(() => expect(screen.getByTestId(`reopened-blocked-${id}`).textContent).toMatch(/aguarde a sincronização/), { timeout: 10_000 });
+    expect(local().status).toBe('CLOSED');
+    // A fila esvazia: a conta vem do servidor e as ações aparecem.
+    act(() => useTcheStore.setState({ outbox: [] }));
+    await waitFor(() => expect(local().status).toBe('PAYING'), { timeout: 10_000 });
+    await screen.findByRole('button', { name: 'Encerrar como venda devolvida' });
+    expect(Math.round(local().remaining_balance * 100)).toBe(totalCents);
+    cleanup();
+    // O cliente paga a metade (reserva + dinheiro); a outra metade já tinha sido baixada.
+    const cashKey = crypto.randomUUID();
+    const c = await startPaymentClaim(true, { orderId: id, key: cashKey, method: 'CASH', acquirer: 'CASH_DESK', amount: half / 100 });
+    expect(c, JSON.stringify(c)).toMatchObject({ ok: true });
+    ok(st().registerPayment({ orderId: id, amount: half / 100, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: cashKey, item_ids: [] }));
+    if (c.ok) { c.handle.settle(); c.handle.leave(); }
+    await expectSynced('pagamento parcial depois do 2º estorno');
+    expect(serverOrder(id)).toBe(`PAYING ${(half / 100).toFixed(2)}`);
+    // Antes da correção: TF007 (o saldo "já tinha sido baixado") e a conta ficava aberta.
+    expect(await submitRefundedWriteOff(id, MANAGER_PIN, 'Cliente não vai pagar de novo')).toEqual({ ok: true, data: { writtenOff: half / 100 } });
+    expect(serverOrder(id)).toBe(`CLOSED ${(half / 100).toFixed(2)}`);
+    expect(local().status).toBe('CLOSED');
+    expect(sql(`SELECT count(*) || '|' || sum((metadata->>'written_off_cents')::bigint) FROM audit_logs WHERE order_id = '${id}' AND action_type = 'ORDER_REFUNDED_WRITE_OFF'`)).toBe(`2|${half}`);
+    expect(sql(`SELECT to_jsonb(closed_at) #>> '{}' FROM orders WHERE id = '${id}'`)).toBe(firstClosed);
+    // Relatório: a venda vale o que ficou pago (metade), a baixa contada uma vez.
+    const writeOffs = writeOffsByOrder(st().auditLogs);
+    expect(writeOffs.get(id)).toBe(half);
+    expect(keptSaleCents(local(), writeOffs)).toEqual({ totalCents, keptCents: half, writtenOff: true });
+    await settleLoops();
+  }, 120_000);
 });

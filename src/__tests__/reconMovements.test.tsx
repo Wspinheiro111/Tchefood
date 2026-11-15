@@ -10,6 +10,7 @@ import {
   currentShiftPeriod,
   loadServerPointPayments,
   reconciliationMovements,
+  keptSaleCents,
   writeOffsByOrder,
   shiftStartBrasilia,
   type ShiftPeriod,
@@ -313,5 +314,21 @@ describe('GPT r12 P2-02: duas baixas na mesma conta', () => {
   it('cada registro tem só a diferença baixada: a conta soma (R$ 50 + R$ 50 = R$ 100); o mesmo registro duas vezes conta uma', () => {
     expect(writeOffsByOrder([wo('w1', 5000), wo('w2', 5000)]).get('o1')).toBe(10000);
     expect(writeOffsByOrder([wo('w1', 5000), wo('w1', 5000)]).get('o1')).toBe(5000);
+  });
+});
+
+describe('GPT r14 P2-01: baixa antiga depois de a conta reaberta ser quitada', () => {
+  const wo = (id: string, cents: number): AuditLog => ({
+    id, tenant_id: 't', order_id: 'o1', performed_by_user_id: 'u', authorized_by_manager_id: 'm', action_type: 'ORDER_REFUNDED_WRITE_OFF',
+    amount_impact: cents / 100, reason: 'venda devolvida', whatsapp_alert_sent: false, metadata: { written_off_cents: cents }, created_at: new Date().toISOString(),
+  });
+  const order = (remaining: number, status: 'CLOSED' | 'PAYING' = 'CLOSED') => ({ id: 'o1', total_amount: 100, remaining_balance: remaining, status }) as never;
+  it('baixa de R$ 50, novo estorno e quitação de R$ 100: a venda vale R$ 100 (a baixa antiga deixou de valer)', () => {
+    expect(keptSaleCents(order(0), writeOffsByOrder([wo('w1', 5000)]))).toEqual({ totalCents: 10000, keptCents: 10000, writtenOff: false });
+  });
+  it('baixa que continua valendo reduz na proporção: fechada com R$ 50 sem pagar → R$ 50 vendidos; com pagamento parcial e segunda baixa (diferença 0), também', () => {
+    expect(keptSaleCents(order(50), writeOffsByOrder([wo('w1', 5000)]))).toEqual({ totalCents: 10000, keptCents: 5000, writtenOff: true });
+    expect(keptSaleCents(order(50), writeOffsByOrder([wo('w1', 5000), wo('w2', 0)]))).toEqual({ totalCents: 10000, keptCents: 5000, writtenOff: true });
+    expect(keptSaleCents(order(20), writeOffsByOrder([wo('w1', 5000), wo('w2', -3000)]))).toEqual({ totalCents: 10000, keptCents: 8000, writtenOff: true });
   });
 });

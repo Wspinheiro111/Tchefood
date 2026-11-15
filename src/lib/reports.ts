@@ -142,10 +142,11 @@ export function formatShiftStart(start: Date): string {
   return start.toLocaleString('pt-BR', { timeZone: SHIFT_TIME_ZONE, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
-/** Centavos baixados de um registro ORDER_REFUNDED_WRITE_OFF: `metadata.written_off_cents`, senão |amount_impact|. */
+/** Centavos baixados de um registro ORDER_REFUNDED_WRITE_OFF (a diferença, com sinal): `metadata.written_off_cents`, senão |amount_impact|. */
 export function writeOffCents(l: AuditLog): number {
   const c = (l.metadata as Record<string, unknown> | null)?.written_off_cents;
-  if (typeof c === 'number' && Number.isSafeInteger(c) && c >= 0) return c;
+  // GPT r14 P1-02: a diferença de uma baixa depois de pagamento pode ser zero ou negativa (o total baixado diminuiu).
+  if (typeof c === 'number' && Number.isSafeInteger(c)) return c;
   const v = Math.abs(toCents(l.amount_impact));
   return Number.isFinite(v) ? v : 0;
 }
@@ -167,10 +168,16 @@ export function writeOffsByOrder(logs: readonly AuditLog[] | undefined): Map<str
   return out;
 }
 
-/** Centavos da conta que seguem vendidos depois da baixa (total − baixado, nunca negativo); sem baixa, o total. */
+/**
+ * Centavos da conta que seguem vendidos depois da baixa (total − baixado, nunca negativo); sem baixa, o total.
+ * GPT r14 P2-01: a baixa que vale é a de agora. Conta fechada com registro de baixa: o baixado é o saldo que ficou
+ * sem pagar (o banco só fecha com saldo pela baixa, e o total baixado é esse saldo); quitada depois de reaberta por
+ * outro estorno (saldo zero), a baixa antiga deixa de valer e a venda conta inteira. Conta ainda aberta: o registrado.
+ */
 export function keptSaleCents(o: Order, writeOffs: ReadonlyMap<string, number>): { totalCents: number; keptCents: number; writtenOff: boolean } {
   const totalCents = toCents(o.total_amount);
-  const w = writeOffs.get(o.id);
+  const recorded = writeOffs.get(o.id);
+  const w = recorded === undefined ? undefined : o.status === 'CLOSED' ? Math.max(0, toCents(o.remaining_balance)) : recorded;
   if (w === undefined || w <= 0) return { totalCents, keptCents: totalCents, writtenOff: false };
   return { totalCents, keptCents: Math.max(0, totalCents - w), writtenOff: true };
 }

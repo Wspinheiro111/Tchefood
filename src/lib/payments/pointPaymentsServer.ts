@@ -152,8 +152,9 @@ export async function closeRefundedOrder(input: CloseRefundedInput, deps: ClaimD
     const closedAt = str(body.closed_at);
     return {
       kind: 'closed', auditId, managerId: managerId && UUID_RE.test(managerId) ? managerId : null,
-      writtenOffCents: Number.isInteger(cents) && cents > 0 ? cents : null,
-      cumulativeWrittenOffCents: Number.isInteger(cumulative) && cumulative > 0 ? cumulative : null,
+      // GPT r14 P1-02: a diferença pode ser zero ou negativa (o cliente pagou parte do que tinha sido baixado).
+      writtenOffCents: Number.isInteger(cents) ? cents : null,
+      cumulativeWrittenOffCents: Number.isInteger(cumulative) && cumulative >= 0 ? cumulative : null,
       closedAt: closedAt && Number.isFinite(Date.parse(closedAt)) ? closedAt : null,
     };
   } catch {

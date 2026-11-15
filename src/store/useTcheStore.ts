@@ -504,7 +504,7 @@ interface Actions {
    */
   mirrorRefundedOrderWriteOff: (
     orderId: UUID,
-    server: { auditId: UUID; managerId: UUID | null; writtenOffCents: number | null; closedAt?: string | null },
+    server: { auditId: UUID; managerId: UUID | null; writtenOffCents: number | null; cumulativeWrittenOffCents?: number | null; closedAt?: string | null },
     reason: string,
   ) => ActionResult<{ writtenOff: number }>;
   /**
@@ -513,7 +513,7 @@ interface Actions {
    * Só local (nada vai para a fila: é o que o servidor já tem). Com alteração desta conta ainda na fila daqui, não
    * mexe (kind 'pending'): o servidor ainda não tem o que este aparelho fez.
    */
-  applyServerOrderSnapshot: (snapshot: ServerOrderSnapshot) => ActionResult<{ kind: 'applied' | 'pending'; status: OrderStatus }>;
+  applyServerOrderSnapshot: (snapshot: ServerOrderSnapshot) => ActionResult<{ kind: 'applied' | 'pending' | 'rejected'; status: OrderStatus }>;
 
   // Fase 3 — KDS e QR Code
   advanceItemStatus: (itemId: UUID) => ActionResult<OrderItem>;
@@ -2571,6 +2571,8 @@ export const useTcheStore = create<TcheState>()(
           if (order.status === 'CLOSED') return { ok: true, data: { writtenOff: 0 } };
           // O valor baixado é o do servidor (written_off_cents); sem ele, o saldo daqui.
           const writtenOff = server.writtenOffCents !== null ? server.writtenOffCents / 100 : order.remaining_balance;
+          // Total baixado da conta agora (esta baixa e as anteriores), para mostrar ao operador.
+          const totalWrittenOff = server.cumulativeWrittenOffCents != null ? server.cumulativeWrittenOffCents / 100 : writtenOff;
           const ts = nowISO();
           // Decisão do Will (15/11): a conta fecha com a hora do primeiro fechamento (turno da venda original), do servidor.
           const closedAt = server.closedAt ?? ts;
@@ -2581,7 +2583,7 @@ export const useTcheStore = create<TcheState>()(
             action_type: 'ORDER_REFUNDED_WRITE_OFF',
             amount_impact: writtenOff,
             reason: reason.trim(),
-            metadata: { written_off_cents: toCents(writtenOff), server_verified: true, server_audit_id: server.auditId, operator_name: user.name },
+            metadata: { written_off_cents: toCents(writtenOff), cumulative_written_off_cents: toCents(totalWrittenOff), server_verified: true, server_audit_id: server.auditId, operator_name: user.name },
           });
           // O mesmo id do registro do servidor: a leitura da nuvem não duplica. Nada vai para a fila: o servidor já fechou
           // a conta e liberou a mesa (um UPDATE daqui com saldo devendo seria recusado lá).
@@ -2590,7 +2592,7 @@ export const useTcheStore = create<TcheState>()(
             tables: s.tables.map((t) => (t.id === order.table_id && t.current_order_id === orderId ? { ...t, status: 'FREE', current_order_id: null, updated_at: ts } : t)),
             auditLogs: [{ ...log, id: server.auditId }, ...s.auditLogs],
           }));
-          return { ok: true, data: { writtenOff } };
+          return { ok: true, data: { writtenOff: totalWrittenOff } };
         },
 
         applyServerOrderSnapshot: (snap) => {
@@ -2602,9 +2604,10 @@ export const useTcheStore = create<TcheState>()(
           const itemIds = new Set(snap.items.map((i) => String(i.id)));
           const paymentIds = new Set(snap.payments.map((p) => String(p.id)));
           const touches = (e: SyncEvent) => e.row_id === orderId || itemIds.has(e.row_id) || paymentIds.has(e.row_id) || (e.payload as Record<string, unknown> | undefined)?.order_id === orderId;
-          if (state.outbox.some(touches) || (state.syncRejected ?? []).some((r) => touches(r.event))) {
-            return { ok: true, data: { kind: 'pending', status: state.orders.find((o) => o.id === orderId)?.status ?? status } };
-          }
+          // GPT r14 P1-01: recusado (precisa de ação em Nuvem › recusados) e na fila (sobe sozinho) são ditos à parte.
+          const localStatus = state.orders.find((o) => o.id === orderId)?.status ?? status;
+          if ((state.syncRejected ?? []).some((r) => touches(r.event))) return { ok: true, data: { kind: 'rejected', status: localStatus } };
+          if (state.outbox.some(touches)) return { ok: true, data: { kind: 'pending', status: localStatus } };
           const num = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : 0);
           const money = { subtotal_items: num(so.subtotal_items), service_fee_amount: num(so.service_fee_amount), discount_amount: num(so.discount_amount), total_amount: num(so.total_amount), paid_amount: num(so.paid_amount), remaining_balance: num(so.remaining_balance) };
           const closedAt = typeof so.closed_at === 'string' ? so.closed_at : null;

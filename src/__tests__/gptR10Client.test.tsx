@@ -459,3 +459,56 @@ describe('GPT r12 P1-01: conta sem NFC-e, fechada na Point e estornada', () => {
     expect(isRefundReopenedOrder(withNote, st().payments, [])).toBe(false);
   });
 });
+
+describe('GPT r14 P1-01: conta reaberta no servidor com evento desta conta pendente ou recusado aqui', () => {
+  it('aparelho com a conta CLOSED e evento recusado: a tela mostra a conta do servidor e o motivo; resolvido o evento, traz a conta e mostra as ações', async () => {
+    const orderId = openWithItems();
+    const order = st().orders.find((o) => o.id === orderId)!;
+    payPoint(orderId, order.remaining_balance, 'k-outro');
+    const local = st().orders.find((o) => o.id === orderId)!;
+    expect(local.status).toBe('CLOSED');
+    const pay = st().payments.find((p) => p.idempotency_key === 'k-outro')!;
+    // Um evento desta conta recusado pela nuvem neste aparelho.
+    const ev = st().outbox.find((e) => e.table === 'orders' && e.row_id === orderId)!;
+    useTcheStore.setState({ outbox: [], syncRejected: [{ event: ev, message: 'recusado', rejected_at: new Date().toISOString() } as never], cloud: CLOUD });
+    // No servidor: o outro aparelho estornou; a conta está PAYING com o saldo.
+    const serverOrder = { ...local, status: 'PAYING', closed_at: null, paid_amount: 0, remaining_balance: local.total_amount };
+    const snapshot = {
+      order: serverOrder, items: st().orderItems.filter((i) => i.order_id === orderId).map((i) => ({ ...i, is_paid: false })),
+      payments: [{ ...pay, status: 'REFUNDED' }],
+      audits: [{ id: REFUND_AUDIT, order_id: orderId, performed_by_user_id: st().currentUserId, authorized_by_manager_id: MANAGER, action_type: 'POINT_PAYMENT_REFUNDED', amount_impact: 0,
+        reason: 'venda estornada na maquininha', metadata: { order_reopened: true, payment_id: pay.id }, created_at: new Date().toISOString() }],
+    };
+    const { d, calls } = rpcDeps((fn) => (fn === 'tchefood_list_refund_reopened_orders'
+      ? { status: 200, body: [{ order_id: orderId, table_id: local.table_id, status: 'PAYING', remaining_balance: local.total_amount, total_amount: local.total_amount, refunded_at: new Date().toISOString() }] }
+      : { status: 200, body: snapshot }));
+    render(<RefundReopenedOrders onOpenCheckout={() => undefined} deps={d} />);
+    const row = await screen.findByTestId(`reopened-blocked-${orderId}`);
+    expect(row.textContent).toMatch(/recusada pela nuvem/);
+    expect(screen.queryByRole('button', { name: 'Encerrar como venda devolvida' })).toBeNull();
+    expect(st().orders.find((o) => o.id === orderId)!.status).toBe('CLOSED');
+    // Resolvido o recusado (descartado em Nuvem › recusados): lê de novo, traz a conta e as ações aparecem.
+    const before = calls.length;
+    act(() => useTcheStore.setState({ syncRejected: [] }));
+    await waitFor(() => expect(st().orders.find((o) => o.id === orderId)!.status).toBe('PAYING'));
+    expect(calls.length).toBeGreaterThan(before);
+    await screen.findByRole('button', { name: 'Encerrar como venda devolvida' });
+    expect(screen.getByRole('button', { name: 'Cobrar de novo' })).toBeTruthy();
+    expect(screen.queryByTestId(`reopened-blocked-${orderId}`)).toBeNull();
+    expect(st().payments.find((p) => p.id === pay.id)!.status).toBe('REFUNDED');
+  });
+
+  it('com o evento ainda na fila: mostra a conta e "aguarde a sincronização"', async () => {
+    const orderId = openWithItems();
+    const order = st().orders.find((o) => o.id === orderId)!;
+    payPoint(orderId, order.remaining_balance, 'k-fila');
+    const local = st().orders.find((o) => o.id === orderId)!;
+    useTcheStore.setState({ cloud: CLOUD });
+    const { d } = rpcDeps((fn) => (fn === 'tchefood_list_refund_reopened_orders'
+      ? { status: 200, body: [{ order_id: orderId, table_id: local.table_id, status: 'PAYING', remaining_balance: local.total_amount, total_amount: local.total_amount, refunded_at: new Date().toISOString() }] }
+      : { status: 200, body: { order: { ...local, status: 'PAYING', closed_at: null }, items: [], payments: [], audits: [] } }));
+    render(<RefundReopenedOrders deps={d} />);
+    expect((await screen.findByTestId(`reopened-blocked-${orderId}`)).textContent).toMatch(/aguarde a sincronização/);
+    expect(st().orders.find((o) => o.id === orderId)!.status).toBe('CLOSED');
+  });
+});
