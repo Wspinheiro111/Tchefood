@@ -647,7 +647,7 @@ describe('rodada interna 3', () => {
 
   it('NF-e importada também em outro aparelho (a nuvem recusou a daqui): as entradas daqui ficam fora do inventário e são avisadas', () => {
     const key = '4325'.padEnd(44, '7');
-    const invoices = [{ id: 'nuvem', access_key: key }, { id: 'aqui', access_key: key }, { id: 'outra', access_key: '4325'.padEnd(44, '8') }];
+    const invoices = [{ id: 'nuvem', access_key: key, imported_at: '2025-03-01T10:00:00-03:00' }, { id: 'aqui', access_key: key }, { id: 'outra', access_key: '4325'.padEnd(44, '8') }];
     const items = [{ id: 'it1', invoice_id: 'aqui' }, { id: 'it2', invoice_id: 'outra' }];
     const movs = [mov({ id: 'm1', quantity: 10, unit_cost: 2, purchase_invoice_item_id: 'it1' }), mov({ id: 'm2', quantity: 3, unit_cost: 5, purchase_invoice_item_id: 'it2' })];
     const dup = duplicateInvoiceMovementIds(movs, items, invoices, rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'aqui' } }]));
@@ -879,5 +879,61 @@ describe('auditoria GPT rodada 5 (f9f2022)', () => {
     const aLate = { ...a, imported_at: '2026-11-14T10:00:00-03:00' } as PurchaseInvoice;
     const rl = run([aLate, b], nove);
     expect([rl.purchases.length, rl.afterCutoff, rl.importedAfterCutoff]).toEqual([0, 1, 1]);
+  });
+});
+
+describe('Codex em 1fbc385', () => {
+  it('P2: cópia aceita importada depois do corte não apaga as entradas daqui (a mercadoria não some dos dois aparelhos)', () => {
+    const key = '4325'.padEnd(44, '6');
+    // A importou offline em 31/12/2025; B importou e sincronizou em 01/01/2026; a nuvem recusou a de A.
+    const nuvem = { id: 'b', access_key: key, environment: 'PRODUCTION', imported_at: '2026-01-01T10:00:00-03:00' } as const;
+    const aqui = { id: 'a', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-31T10:00:00-03:00' } as const;
+    const items = [{ id: 'it', invoice_id: 'a' }];
+    const movs = [mov({ id: 'm', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'it', created_at: '2025-12-31T10:00:00-03:00' })];
+    const rejected = rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a' } }]);
+    const run = (p: ReturnType<typeof yearPeriod>, now: Date) => {
+      const review = reviewDuplicateInvoices(movs, items, [nuvem, aqui], rejected, positionCutoff(p, now));
+      return inventoryAt([product({})], movs, p, new Set(), now, review.excluded, review.unconfirmed);
+    };
+    // 2025 encerrado: a cópia de B tem as entradas em 2026, então as de A ficam (R$ 50,00) e são avisadas.
+    const r25 = run(yearPeriod(2025), new Date('2026-11-14T12:00:00-03:00'));
+    expect([r25.totalCost, r25.duplicateMovements, r25.duplicateUnconfirmed]).toEqual([50, 0, 1]);
+    // 2026 em andamento: a cópia de B já estava na nuvem antes do corte, então as de A saem (contam em B).
+    const r26 = run(yearPeriod(2026), new Date('2026-11-14T12:00:00-03:00'));
+    expect([r26.totalCost, r26.duplicateMovements]).toEqual([0, 1]);
+    const dup26 = reviewDuplicateInvoices(movs, items, [nuvem, aqui], rejected, positionCutoff(yearPeriod(2026), new Date('2026-11-14T12:00:00-03:00')));
+    expect([...dup26.excluded]).toEqual(['m']);
+    // Cópia aceita importada exatamente no corte (00:00 de 01/01/2026) também não prova para 2025.
+    const noCorte = reviewDuplicateInvoices(movs, items, [{ ...nuvem, imported_at: '2026-01-01T00:00:00-03:00' }, aqui], rejected, yearPeriod(2025).to);
+    expect([...noCorte.excluded]).toEqual([]);
+    const antes = reviewDuplicateInvoices(movs, items, [{ ...nuvem, imported_at: '2025-12-31T23:59:59-03:00' }, aqui], rejected, yearPeriod(2025).to);
+    expect([...antes.excluded]).toEqual(['m']);
+    // Sem corte informado, comportamento anterior (prova vale).
+    expect([...reviewDuplicateInvoices(movs, items, [nuvem, aqui], rejected).excluded]).toEqual(['m']);
+  });
+
+  it('cópia de homologação na nuvem (importada antes) não prova a duplicata: as entradas de produção daqui ficam e são avisadas', () => {
+    const key = '4325'.padEnd(44, '5');
+    const hom = { id: 'b', access_key: key, environment: 'HOMOLOGATION', imported_at: '2025-06-01T10:00:00-03:00' } as const;
+    const aqui = { id: 'a', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-31T10:00:00-03:00' } as const;
+    const items = [{ id: 'it', invoice_id: 'a' }];
+    const movs = [mov({ id: 'm', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'it', created_at: '2025-12-31T10:00:00-03:00' })];
+    const rejected = rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a' } }]);
+    const now = new Date('2026-11-14T12:00:00-03:00');
+    const review = reviewDuplicateInvoices(movs, items, [hom, aqui], rejected, positionCutoff(P, now));
+    expect([[...review.excluded], review.unconfirmed]).toEqual([[], [['m']]]);
+    const r = inventoryAt([product({})], movs, P, new Set(), now, review.excluded, review.unconfirmed);
+    expect([r.totalCost, r.duplicateUnconfirmed]).toEqual([50, 1]);
+  });
+
+  it('duas cópias recusadas com entradas aqui e sem prova: fica uma só, nunca em dobro', () => {
+    const key = '4325'.padEnd(44, '4');
+    const c1 = { id: 'a1', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-30T10:00:00-03:00' } as const;
+    const c2 = { id: 'a2', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-31T10:00:00-03:00' } as const;
+    const items = [{ id: 'i1', invoice_id: 'a1' }, { id: 'i2', invoice_id: 'a2' }];
+    const movs = [mov({ id: 'm1', purchase_invoice_item_id: 'i1' }), mov({ id: 'm2', purchase_invoice_item_id: 'i2' })];
+    const rejected = rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a1' } }, { event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a2' } }]);
+    const review = reviewDuplicateInvoices(movs, items, [c2, c1], rejected, positionCutoff(P, new Date('2026-11-14T12:00:00-03:00')));
+    expect([[...review.excluded], review.unconfirmed]).toEqual([['m2'], [['m1']]]);
   });
 });

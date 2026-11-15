@@ -241,3 +241,27 @@ describe('Fechamento anual (tela): auditoria GPT rodada 3', () => {
     expect(alert.textContent).toContain('Fechamento de caixa e formas de pagamento: 1');
   });
 });
+
+describe('Fechamento anual (tela): Codex em 1fbc385', () => {
+  it('NF-e recusada aqui, mas a cópia aceita foi importada em 2026: o inventário de 2025 mantém as entradas daqui e avisa', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    const s = useTcheStore.getState();
+    const tenant_id = s.tenant.id;
+    const product_id = s.products[0]!.id;
+    const key = '4325'.padEnd(44, '6');
+    const inv = (id: string, imported_at: string) => ({ id, tenant_id, supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: '2025-12-31T09:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 50, imported_at });
+    setup('own');
+    act(() => {
+      useTcheStore.setState({
+        purchaseInvoices: [inv('a', '2025-12-31T10:00:00-03:00'), inv('b', '2026-01-01T10:00:00-03:00')],
+        purchaseInvoiceItems: [{ id: 'it', tenant_id, invoice_id: 'a' }],
+        stockMovements: [{ id: 'm', tenant_id, product_id, type: 'PURCHASE_IN', quantity: 10, unit_cost: 5, balance_after: 10, avg_cost_after: 5, purchase_invoice_item_id: 'it', performed_by_user_id: 'own', created_at: '2025-12-31T10:00:00-03:00' }],
+        syncRejected: [{ event: { id: 'e', table: 'purchase_invoices', op: 'INSERT', row_id: 'a', payload: {} }, message: 'duplicada' }],
+      } as never);
+    });
+    render(<AnnualClose />);
+    const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+    expect(screen.getByText('Custo total do estoque').parentElement!.textContent).toContain(fmt(50));
+    expect(screen.getAllByText(/aparece\(m\) mais de uma vez/).length).toBeGreaterThan(0);
+  });
+});

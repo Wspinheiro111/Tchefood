@@ -306,8 +306,9 @@ export interface DuplicateInvoiceReview {
  * grava nota, itens e entradas de uma vez e recusa chave repetida no aparelho, então a
  * outra cópia só chega pela nuvem (importada em OUTRO aparelho, que tem as entradas
  * dela). As entradas deste aparelho só saem com prova: a nuvem RECUSOU a nota deste
- * aparelho (está na fila de recusados), ou seja, a mercadoria já foi lançada pela cópia
- * aceita. Sem essa prova, as entradas ficam e a nota é avisada para conferir.
+ * aparelho (está na fila de recusados) E a cópia aceita é de produção e foi importada
+ * antes do instante do relatório, ou seja, a mercadoria já foi lançada pela cópia aceita
+ * nesta posição. Sem essa prova, as entradas ficam e a nota é avisada para conferir.
  * Se mais de uma cópia não recusada tem entradas aqui, vale a primeira pela mesma ordem
  * das compras (compareInvoiceCopies) e as outras saem. Nunca zero sem prova, nunca em dobro.
  */
@@ -316,6 +317,9 @@ export function reviewDuplicateInvoices(
   items: ReadonlyArray<Pick<PurchaseInvoiceItem, 'id' | 'invoice_id'>>,
   invoices: readonly InvoiceCopy[],
   rejectedIds: ReadonlySet<string> = new Set(),
+  /** Instante do relatório (positionCutoff). A cópia aceita só prova a duplicata se já
+   *  estava importada antes dele: a importada depois tem as entradas fora desta posição. */
+  cutoff: number = Number.POSITIVE_INFINITY,
 ): DuplicateInvoiceReview {
   const byKey = new Map<string, InvoiceCopy[]>();
   for (const i of invoices) {
@@ -341,6 +345,26 @@ export function reviewDuplicateInvoices(
     if (copies.length < 2) continue;
     const withMoves = copies.filter((c) => (movesByInvoice.get(c.id)?.length ?? 0) > 0).sort(compareInvoiceCopies);
     const candidates = withMoves.filter((c) => !rejectedIds.has(c.id));
+    // Prova da duplicata: a cópia aceita (não recusada, sem entradas aqui, veio da nuvem)
+    // foi importada antes do instante do relatório. Importada no corte ou depois (ou sem
+    // data), as entradas dela não estão nesta posição em nenhum aparelho: as recusadas daqui
+    // ficam (e são avisadas), senão a mercadoria sumiria do inventário dos dois aparelhos.
+    const proof = copies.some((c) => {
+      if (rejectedIds.has(c.id) || (movesByInvoice.get(c.id)?.length ?? 0) > 0) return false;
+      // A de homologação na nuvem também faz recusar a de produção (a chave é única na
+      // loja), mas não é mercadoria: não prova que a compra já foi lançada.
+      if (c.environment !== undefined && c.environment !== 'PRODUCTION') return false;
+      const t = at(c.imported_at ?? null);
+      return t !== null && t < cutoff;
+    });
+    if (candidates.length === 0 && !proof) {
+      // Fica uma cópia só (a primeira pela mesma ordem), nunca em dobro.
+      const [first, ...rest] = withMoves;
+      for (const c of rest) for (const id of movesByInvoice.get(c.id) ?? []) excluded.add(id);
+      const kept = first ? movesByInvoice.get(first.id) ?? [] : [];
+      if (kept.length > 0) unconfirmed.push(kept);
+      continue;
+    }
     const keep = candidates[0]?.id ?? null;
     for (const c of withMoves) {
       if (c.id === keep) continue;

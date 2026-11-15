@@ -140,7 +140,7 @@ export function AnnualClose() {
   const testMovements = useMemo(() => testInvoiceMovementIds(stockMovements, purchaseInvoiceItems, purchaseInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices]);
   // Prova de duplicata: a nuvem recusou a NF-e deste aparelho (fila de recusados).
   const rejectedInvoices = useMemo(() => rejectedInvoiceIds(syncRejected ?? []), [syncRejected]);
-  const duplicateReview = useMemo(() => reviewDuplicateInvoices(stockMovements, purchaseInvoiceItems, purchaseInvoices, rejectedInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices, rejectedInvoices]);
+  const duplicateReview = useMemo(() => reviewDuplicateInvoices(stockMovements, purchaseInvoiceItems, purchaseInvoices, rejectedInvoices, positionCutoff(period, now)), [stockMovements, purchaseInvoiceItems, purchaseInvoices, rejectedInvoices, period, now]);
   const inventory = useMemo(
     () => inventoryAt(products, stockMovements, period, testMovements, now, duplicateReview.excluded, duplicateReview.unconfirmed),
     [products, stockMovements, period, testMovements, now, duplicateReview],
