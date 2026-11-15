@@ -7,7 +7,7 @@ import { COURIER_SETTLE_PIN_REFUSED, settleCourierInCloud } from '../lib/sync/co
 
 const st = () => useTcheStore.getState();
 const cfg = { url: 'http://cloud.test', anonKey: 'anon', accessToken: 'jwt' };
-const req = { id: 'a1', courier_id: 'c1', delivery_ids: ['d1'], cash_collected: 0, courier_fees: 7, staff_id: 'u1', staff_pin: '5555' };
+const req = { id: 'a1', courier_id: 'c1', delivery_ids: ['d1'], cash_collected: 0, courier_fees: 7, staff_id: 'u1', staff_pin: '5555', payments: [] };
 
 beforeEach(() => {
   st().resetDemo();
@@ -50,7 +50,7 @@ describe('acerto pela nuvem: PIN de quem acertou (GPT, rodada 10 do PR #54)', ()
       return { ok: true, status: 200, text: async () => JSON.stringify({ error: 'TCHEFOOD_PIN_RECUSADO' }) };
     };
     const payments = st().payments.length;
-    const r = await st().settleCourierOnline(courier.id, { payFromDrawer: false, auth: null, fetchFn });
+    const r = await st().settleCourierOnline(courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn });
     expect(bodies).toHaveLength(1);
     expect(bodies[0]).toMatchObject({ p_staff: st().currentUserId, p_staff_pin: pin });
     expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/A nuvem recusou o PIN de quem está acertando\. Saia e entre de novo com o seu PIN atual\..*Nada saiu da gaveta/) });
@@ -66,7 +66,7 @@ describe('acerto pela nuvem: PIN de quem acertou (GPT, rodada 10 do PR #54)', ()
     if (!pay.ok) throw new Error(pay.error);
     useTcheStore.setState((s) => ({ outbox: s.outbox.filter((e) => e.table === 'payments') }));
     expect(st().outbox.length).toBeGreaterThan(0);
-    const held = await st().settleCourierOnline(courier.id, { payFromDrawer: false, auth: null, fetchFn });
+    const held = await st().settleCourierOnline(courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn });
     expect(held).toMatchObject({ ok: false, error: expect.stringMatching(/A nuvem ainda não recebeu todas as contas pagas na entrega/) });
     expect(bodies).toHaveLength(1);
   });

@@ -199,6 +199,11 @@ export interface PaymentInput {
   item_ids: UUID[];
   /** request_id da cobrança em andamento na maquininha que originou este pagamento. */
   charge_request_id?: string | null;
+  /**
+   * Id do pagamento, quando a nuvem já o gravou (recebimento da senha gravado junto com o acerto
+   * do entregador): o envio da fila devolve o mesmo pagamento (GPT, rodada 11 do PR #54).
+   */
+  payment_id?: UUID;
 }
 
 export interface PaymentOutcome {
@@ -622,6 +627,8 @@ interface Actions {
   rejectSyncEvents: (rejections: Array<{ eventId: UUID; status: number; message: string }>) => void;
   /** Devolve os recusados para o começo da fila, na ordem original, para nova tentativa. */
   retryRejectedSync: () => void;
+  /** Mudança antiga da mesa sem a lista de campos (tableEditOnly): sai da fila para os recusados. */
+  parkLegacyTableReviews: () => void;
   /**
    * Autorização de gerente recusada (fila antiga sem PIN, ou PIN trocado em outro
    * aparelho antes de subir): o mesmo gerente digita o PIN atual e o evento fica
@@ -956,16 +963,34 @@ function tableEditEvent(before: DiningTable, after: DiningTable): SyncEvent {
  * o que outro aparelho mudou depois. Evento só de ocupação (sem campo mudado): sai da fila (null).
  * O PATCH só grava as colunas que vão nele (GPT, rodada 8 do PR #54).
  * Evento gravado por uma versão anterior (sem table_edit_fields): não dá para saber o que a
- * pessoa mudou, e a mudança não pode sumir. Sobe o cadastro inteiro (número, nome, área,
- * lugares, ativa) como o aparelho viu, sem a ocupação; pode regravar uma mudança mais nova de
- * outro aparelho, o mal menor diante de perder a daqui (GPT, rodada 10 do PR #54).
+ * pessoa mudou, e a mudança não pode sumir (GPT, rodada 10 do PR #54) nem regravar calada uma
+ * mudança mais nova de outro aparelho (GPT, rodada 11). Fica com o cadastro inteiro como o
+ * aparelho viu, sem a ocupação, e marcado para conferência: vai para os recusados com o aviso
+ * (parkLegacyTableReviews) e só sobe quando a pessoa reenvia.
  */
 function tableEditOnly(e: SyncEvent): SyncEvent | null {
+  const legacy = e.table_edit_fields === undefined;
   const fields = e.table_edit_fields ?? TABLE_EDIT_FIELDS;
   if (fields.length === 0) return null;
   const payload: Record<string, unknown> = {};
   for (const f of ['id', 'tenant_id', 'updated_at', ...fields]) if (e.payload[f] !== undefined) payload[f] = e.payload[f];
-  return { ...e, payload, table_edit_fields: [...fields] };
+  return { ...e, payload, table_edit_fields: [...fields], ...(legacy ? { legacy_table_review: true as const } : {}) };
+}
+
+export const LEGACY_TABLE_REVIEW_MESSAGE =
+  'Mudança no cadastro desta mesa feita antes da atualização do app: não dá para saber qual campo foi mudado aqui, e subir tudo pode desfazer uma mudança mais nova de outro aparelho. Confira o cadastro da mesa; "Reenviar recusados" sobe nome, área, lugares e situação como estão neste aparelho.';
+
+/**
+ * A loja deste aparelho já foi ligada à nuvem (o acerto sem a nuvem seria recusado ao conectar de
+ * novo). Aparelho que veio de uma versão anterior não tem o vínculo gravado (undefined): não conta
+ * como loja só do aparelho se ele já falou com a nuvem alguma vez (sincronizou, leu da nuvem ou tem
+ * evento recusado por ela) (GPT, rodada 11 do PR #54). null = loja criada só neste aparelho.
+ */
+export function cloudLinkedStore(s: Pick<TcheState, 'cloud' | 'cloudLinkedTenantId' | 'tenant' | 'syncStatus' | 'pullStatus' | 'syncRejected'>): boolean {
+  if (s.cloud) return true;
+  if (s.cloudLinkedTenantId !== undefined) return s.cloudLinkedTenantId === s.tenant.id;
+  return Boolean(s.syncStatus?.last_success_at || s.syncStatus?.last_error_at || s.pullStatus?.last_pull_at
+    || s.pullStatus?.last_orders_pull_at || (s.syncRejected ?? []).length > 0);
 }
 
 /** Sangria do acerto já feita neste aparelho (a autorização dela cita o acerto). */
@@ -2283,6 +2308,9 @@ export const useTcheStore = create<TcheState>()(
           if (get().payments.some((p) => p.idempotency_key === input.idempotency_key)) {
             return fail('Transação duplicada (idempotency_key já registrada).');
           }
+          if (input.payment_id !== undefined && get().payments.some((p) => p.id === input.payment_id)) {
+            return fail('Transação duplicada (pagamento já registrado).');
+          }
           if (input.status === 'APPROVED' && toCents(amount) > toCents(order.remaining_balance)) {
             return fail('Valor maior que o saldo restante da mesa.');
           }
@@ -2296,7 +2324,7 @@ export const useTcheStore = create<TcheState>()(
 
           const ts = nowISO();
           const payment: Payment = {
-            id: uuid(),
+            id: input.payment_id ?? uuid(),
             order_id: order.id,
             tenant_id: get().tenant.id,
             waiter_id: user.id,
@@ -4061,7 +4089,11 @@ export const useTcheStore = create<TcheState>()(
             const settling = courierSettleBlocksStoreChange(get());
             if (settling) return fail(settling.replace('trocar a loja deste aparelho', 'desconectar da nuvem'));
           }
-          set(session ? { cloud: session, cloudLinkedTenantId: session.tenant_id } : { cloud: null });
+          // Desconectar guarda a loja que estava ligada, também no aparelho que veio de uma versão
+          // anterior sem o vínculo gravado (GPT, rodada 11 do PR #54).
+          set(session
+            ? { cloud: session, cloudLinkedTenantId: session.tenant_id }
+            : { cloud: null, cloudLinkedTenantId: get().cloud?.tenant_id ?? get().cloudLinkedTenantId ?? null });
           return { ok: true, data: undefined };
         },
 
@@ -4660,9 +4692,25 @@ export const useTcheStore = create<TcheState>()(
           });
         },
 
+        parkLegacyTableReviews: () =>
+          set((s) => {
+            const parked = s.outbox.filter((e) => e.legacy_table_review);
+            if (parked.length === 0) return {};
+            const at = nowISO();
+            return {
+              outbox: s.outbox.filter((e) => !e.legacy_table_review),
+              syncRejected: [...(s.syncRejected ?? []), ...parked.map((event) => ({ event, status: 409, message: LEGACY_TABLE_REVIEW_MESSAGE, rejected_at: at }))],
+            };
+          }),
+
         retryRejectedSync: () =>
           set((s) => {
-            const back = (s.syncRejected ?? []).map((r) => r.event);
+            // Reenviar é a decisão da pessoa: a mudança antiga da mesa sobe como está (sem a marca).
+            const back = (s.syncRejected ?? []).map((r) => {
+              if (!r.event.legacy_table_review) return r.event;
+              const { legacy_table_review: _l, ...ev } = r.event;
+              return ev;
+            });
             if (back.length === 0) return {};
             // Voltam na frente: são mais antigos que tudo o que entrou na fila depois.
             back.sort((a, b) => a.created_at.localeCompare(b.created_at));
@@ -5473,7 +5521,7 @@ export const useTcheStore = create<TcheState>()(
           if (get().cloud) return fail(COURIER_SETTLE_OFFLINE);
           // Loja da nuvem desconectada: o acerto feito aqui seria recusado pela nuvem ao conectar de
           // novo (só a função grava acerto), com os pagamentos e a sangria já feitos (Codex, rodada 11).
-          if (get().cloudLinkedTenantId === get().tenant.id) return fail('Esta loja é da nuvem: conecte de novo à nuvem para acertar com o entregador.');
+          if (cloudLinkedStore(get())) return fail('Esta loja é da nuvem: conecte de novo à nuvem para acertar com o entregador.');
           const user = currentUser();
           if (!user) return fail('Sessão expirada. Faça login novamente.');
           if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário acerta com o entregador.');
@@ -5627,6 +5675,11 @@ export const useTcheStore = create<TcheState>()(
             if (!open) return fail('Abra o caixa para pagar o entregador com o dinheiro da gaveta.');
             if (!opts.auth) return fail('Pagar o entregador pelo caixa é sangria: precisa do PIN do gerente.');
           }
+          // Ganho pago por fora no próprio acerto: o mesmo PIN de gerente e registro na auditoria da
+          // pendência ("pago por fora"); sem eles o ganho não fica dado por pago (GPT, rodada 11 do PR #54).
+          if (!opts.payFromDrawer && feesCents > 0 && !opts.auth) {
+            return fail('Ganho do entregador pago por fora: precisa do PIN do gerente e do motivo.');
+          }
           // Tudo o que pode parar o acerto no meio é conferido antes da nuvem: depois dela, o acerto já vale.
           // Plano do recebimento: o que cada senha paga na entrega recebe do dinheiro trazido. A
           // primeira tentativa o guarda na pendente; a repetição recebe o guardado, e senha cujo saldo
@@ -5673,7 +5726,7 @@ export const useTcheStore = create<TcheState>()(
               const err = checkCollect(order, d.id);
               if (err) return fail(err);
               const amount = fromCentsLocal(toCents(order.remaining_balance));
-              plan.push({ delivery_id: d.id, order_id: order.id, pickup_number: order.pickup_number ?? null, amount });
+              plan.push({ delivery_id: d.id, order_id: order.id, pickup_number: order.pickup_number ?? null, amount, payment_id: uuid() });
               collectedCents += toCents(amount);
             }
           }
@@ -5690,7 +5743,7 @@ export const useTcheStore = create<TcheState>()(
           if (planMismatch) {
             plan = own.filter((d) => d.pay_on_delivery && !approvedEntrega(d.id)).map((d) => {
               const order = get().orders.find((o) => o.id === d.order_id);
-              return { delivery_id: d.id, order_id: d.order_id, pickup_number: order?.pickup_number ?? null, amount: fromCentsLocal(toCents(order?.remaining_balance ?? 0)) };
+              return { delivery_id: d.id, order_id: d.order_id, pickup_number: order?.pickup_number ?? null, amount: fromCentsLocal(toCents(order?.remaining_balance ?? 0)), payment_id: uuid() };
             });
           }
           const withdrawalAuth = opts.payFromDrawer && feesCents > 0
@@ -5699,6 +5752,11 @@ export const useTcheStore = create<TcheState>()(
                 reason: opts.auth!.reason.trim().length >= MIN_REASON_LENGTH ? opts.auth!.reason : `Acerto do entregador ${courierName}`,
               }
             : null;
+          const outsideAuth = !opts.payFromDrawer && feesCents > 0 ? { managerPin: opts.auth!.managerPin, reason: opts.auth!.reason } : null;
+          if (outsideAuth) {
+            const pre = authorizeManager(outsideAuth, { orderId: null, action: 'COURIER_PAID_OUTSIDE' });
+            if (!pre.ok) return pre;
+          }
           if (withdrawalAuth) {
             const inDrawer = cashSummary(open!, get().payments, get().cashMovements).expected;
             if (feesCents > toCents(inDrawer) + collectedCents) {
@@ -5738,14 +5796,36 @@ export const useTcheStore = create<TcheState>()(
               };
               set((s) => ({ courierSettlePending: [...(s.courierSettlePending ?? []), entry] }));
             }
+            // Pendente sem o id dos recebimentos (versão anterior): ganha os ids agora, gravados na
+            // pendente antes do pedido, para a próxima repetição mandar os mesmos.
+            if (pending && plan.some((m) => m.payment_id === undefined)) {
+              plan = plan.map((m) => (m.payment_id === undefined ? { ...m, payment_id: uuid() } : m));
+              const withIds = new Map(plan.map((m) => [m.delivery_id, m.payment_id!]));
+              set((s) => ({
+                courierSettlePending: (s.courierSettlePending ?? []).map((p) => (p.id !== id ? p : {
+                  ...p,
+                  planned: (p.planned ?? plan).map((m) => ({ ...m, payment_id: m.payment_id ?? withIds.get(m.delivery_id) ?? uuid() })),
+                })),
+              }));
+            }
             // A pendente fica gravada no aparelho antes de o pedido sair (auditoria interna, rodada 11).
-            await awaitPersisted();
+            // Gravação que falhou (armazenamento cheio ou indisponível): o pedido não sai, porque sem
+            // a pendente gravada um acerto feito na nuvem se perderia com o app fechado (GPT, rodada 11).
+            if (!(await awaitPersisted())) {
+              if (!pending) dropPending();
+              return fail('Não foi possível gravar o acerto neste aparelho (armazenamento cheio ou indisponível). O acerto não foi enviado à nuvem e nada saiu da gaveta.');
+            }
             result = await settleCourierInCloud(
               { url: session.url, anonKey: session.anon_key, accessToken: session.access_token },
               // A nuvem confere o PIN de quem acertou (GPT, rodada 10 do PR #54). A repetição vai em
               // nome de quem fez a primeira tentativa: a nuvem devolve o acerto gravado antes de
               // conferir o PIN, e só confere o PIN se não houver acerto com este id.
-              { id, courier_id: courierId, delivery_ids: deliveryIds, cash_collected: fromCentsLocal(cashCents), courier_fees: fromCentsLocal(feesCents), staff_id: pending?.staff_id ?? user.id, staff_pin: user.pin_code },
+              {
+                id, courier_id: courierId, delivery_ids: deliveryIds, cash_collected: fromCentsLocal(cashCents), courier_fees: fromCentsLocal(feesCents),
+                staff_id: pending?.staff_id ?? user.id, staff_pin: user.pin_code,
+                // O recebimento de cada senha é gravado pela nuvem junto com o acerto (GPT, rodada 11).
+                payments: plan.map((m) => ({ delivery_id: m.delivery_id, payment_id: m.payment_id!, amount: m.amount })),
+              },
               fetchFn,
             );
           } finally {
@@ -5793,7 +5873,8 @@ export const useTcheStore = create<TcheState>()(
                 ? `O dinheiro deste acerto (${formatBRL(fromCentsLocal(cashCents))}) não bate com os saldos de agora (${formatBRL(fromCentsLocal(alreadyCents + collectedCents))}): confira no caixa antes de receber.`
                 : NOT_DONE,
             })),
-            missing_withdrawal: pay ? { amount: fromCentsLocal(feesCents), error: NOT_DONE } : null,
+            // Pago por fora também fica na pendência até o registro do gerente (GPT, rodada 11 do PR #54).
+            missing_withdrawal: feesCents > 0 ? { amount: fromCentsLocal(feesCents), error: NOT_DONE } : null,
             created_at: nowISO(),
           };
           set((s) => ({
@@ -5812,6 +5893,15 @@ export const useTcheStore = create<TcheState>()(
           // Pendente antiga que não bate: nada é recebido sozinho, a pendência mostra o motivo.
           if (planned.missing_payments.length > 0 && !planMismatch) get().finishCourierSettleFollowUp(settlement.id, { kind: 'payments' });
           if (pay) get().finishCourierSettleFollowUp(settlement.id, { kind: 'withdrawal', auth: withdrawalAuth! });
+          if (outsideAuth) {
+            const r = get().finishCourierSettleFollowUp(settlement.id, { kind: 'paid_outside', auth: outsideAuth });
+            if (!r.ok) {
+              const f = (get().courierSettleFollowUps ?? []).find((x) => x.settlement_id === settlement.id);
+              if (f?.missing_withdrawal) {
+                set((s) => ({ courierSettleFollowUps: withFollowUp(s.courierSettleFollowUps, { ...f, missing_withdrawal: { ...f.missing_withdrawal!, error: r.error } }) }));
+              }
+            }
+          }
           const follow = (get().courierSettleFollowUps ?? []).find((x) => x.settlement_id === settlement.id);
           if (follow) {
             return fail(`Acerto gravado na nuvem, com pendência neste aparelho. ${followUpText(follow)} Termine em "Acerto gravado na nuvem com pendência", no quadro da entrega.`);
@@ -5879,6 +5969,7 @@ export const useTcheStore = create<TcheState>()(
                 terminal_serial: null,
                 idempotency_key: key,
                 item_ids: [],
+                ...(m.payment_id ? { payment_id: m.payment_id } : {}),
               });
               if (!r.ok) still.push({ ...m, error: r.error });
             }
@@ -6080,7 +6171,15 @@ export const useTcheStore = create<TcheState>()(
       onRehydrateStorage: () => () => {
         // Com o fallback síncrono (localStorage), este callback roda ainda dentro de
         // create(), antes de useTcheStore existir; adiamos para depois da atribuição.
-        queueMicrotask(() => useTcheStore.setState({ hydrated: true }));
+        // Aparelho de uma versão anterior, ligado à nuvem, sem o vínculo gravado: grava agora
+        // (GPT, rodada 11 do PR #54).
+        queueMicrotask(() => {
+          const s = useTcheStore.getState();
+          useTcheStore.setState({
+            hydrated: true,
+            ...(s.cloud && s.cloudLinkedTenantId === undefined ? { cloudLinkedTenantId: s.cloud.tenant_id } : {}),
+          });
+        });
       },
     },
   ),

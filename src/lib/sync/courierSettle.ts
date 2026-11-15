@@ -18,6 +18,11 @@ export interface CourierSettleRequest {
   staff_id: UUID;
   /** PIN de quem acertou: a nuvem confere (GPT, rodada 10 do PR #54). */
   staff_pin: string;
+  /**
+   * Recebimento de cada senha paga na entrega, gravado pela nuvem junto com o acerto (o aparelho
+   * registra depois o mesmo pagamento, com este id) (GPT, rodada 11 do PR #54).
+   */
+  payments: { delivery_id: UUID; payment_id: UUID; amount: number }[];
 }
 
 /** A nuvem não aceitou o PIN de quem acertou (ou está bloqueado por tentativas). */
@@ -51,7 +56,7 @@ export interface CourierSettlePendingEntry {
    * O que a primeira tentativa ia receber de cada senha paga na entrega (valor em reais, exato em
    * centavos). A repetição recebe isto, não o saldo de agora; ausente em pendentes antigas.
    */
-  planned?: { delivery_id: UUID; order_id: UUID; pickup_number: number | null; amount: number }[];
+  planned?: { delivery_id: UUID; order_id: UUID; pickup_number: number | null; amount: number; payment_id?: UUID }[];
   /** Quem fez a primeira tentativa: a repetição vai no nome dele (ausente em pendentes antigas). */
   staff_id?: UUID;
 }
@@ -68,7 +73,8 @@ export interface CourierSettleFollowUp {
   delivery_ids: UUID[];
   cash_collected: number;
   courier_fees: number;
-  missing_payments: { delivery_id: UUID; order_id: UUID; pickup_number: number | null; amount: number; error: string }[];
+  /** payment_id: o id com que a nuvem gravou o recebimento junto com o acerto (ausente nas antigas). */
+  missing_payments: { delivery_id: UUID; order_id: UUID; pickup_number: number | null; amount: number; error: string; payment_id?: UUID }[];
   /** Sangria do ganho ainda não feita (null = nada a fazer pela gaveta). */
   missing_withdrawal: { amount: number; error: string } | null;
   created_at: string;
@@ -157,6 +163,7 @@ export async function settleCourierInCloud(cfg: SyncConfig, req: CourierSettleRe
         p_courier_fees: req.courier_fees,
         p_staff: req.staff_id,
         p_staff_pin: req.staff_pin,
+        p_payments: req.payments,
       }),
     });
   } catch {

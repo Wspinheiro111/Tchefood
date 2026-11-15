@@ -127,7 +127,7 @@ describe('acerto com o entregador pela nuvem (auditoria interna, rodada 8 do PR 
     const auth = st().outbox.find((e) => e.table === 'audit_logs' && e.payload.action_type === 'CASH_WITHDRAWAL')!;
     expect(auth.payload.metadata).toMatchObject({ movement_id: drawerOut()[0]!.id, courier_settlement_id: s.data.id });
     // Nada mais a acertar.
-    expect((await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: cloudFn(calls) })).ok).toBe(false);
+    expect((await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: cloudFn(calls) })).ok).toBe(false);
     expect(calls).toHaveLength(1);
   });
 
@@ -206,7 +206,7 @@ describe('acerto com o entregador pela nuvem (auditoria interna, rodada 8 do PR 
       cloud: { url: 'http://cloud.test', anon_key: 'anon', email: 'loja@test', access_token: 'jwt', refresh_token: 'r', expires_at: 9e9, tenant_id: s.tenant.id },
     }));
     const calls: Call[] = [];
-    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: cloudFn(calls) });
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: cloudFn(calls) });
     expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/ainda não recebeu/) });
     expect(calls).toEqual([]);
   });
@@ -476,7 +476,7 @@ describe('acerto sem resposta da nuvem (auditoria interna, rodada 8 do PR #54)',
     connectCloud();
     const calls: Call[] = [];
     const db = cloudDb(calls, { lose: 1 });
-    const r1 = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: db.fn });
+    const r1 = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: db.fn });
     expect(r1.ok).toBe(false);
     const pending = st().courierSettlePending ?? [];
     expect(pending).toHaveLength(1);
@@ -488,13 +488,13 @@ describe('acerto sem resposta da nuvem (auditoria interna, rodada 8 do PR #54)',
     connectCloud();
 
     // Sem dizer qual: não mistura a pendente com a nova; acerta só a nova.
-    const rNew = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: db.fn });
+    const rNew = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: db.fn });
     if (!rNew.ok) throw new Error(rNew.error);
     expect(calls[1]!.body.p_delivery_ids).toEqual([b.delivery.id]);
     expect(calls[1]!.body.p_id).not.toBe(pending[0]!.id);
 
     // A pendente, pela ação dela: o mesmo id e os mesmos valores.
-    const r2 = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, pendingId: pending[0]!.id, fetchFn: db.fn });
+    const r2 = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, pendingId: pending[0]!.id, fetchFn: db.fn });
     if (!r2.ok) throw new Error(r2.error);
     expect(calls[2]!.body).toMatchObject({ p_id: pending[0]!.id, p_delivery_ids: [a.delivery.id], p_cash_collected: a.order.total_amount });
     expect(st().courierSettlePending).toEqual([]);
@@ -507,11 +507,11 @@ describe('acerto sem resposta da nuvem (auditoria interna, rodada 8 do PR #54)',
     connectCloud();
     const calls: Call[] = [];
     const db = cloudDb(calls, { lose: 1 });
-    expect((await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: db.fn })).ok).toBe(false);
+    expect((await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: db.fn })).ok).toBe(false);
     const pendingId = calls[0]!.body.p_id as string;
     // Muda o que o aparelho calcularia agora (o saldo da conta).
     useTcheStore.setState((s) => ({ orders: s.orders.map((o) => (o.id === a.order.id ? { ...o, remaining_balance: o.remaining_balance - 1 } : o)) }));
-    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, pendingId, fetchFn: db.fn });
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, pendingId, fetchFn: db.fn });
     expect(calls[1]!.body).toMatchObject({ p_id: pendingId, p_cash_collected: calls[0]!.body.p_cash_collected });
     // O saldo mudou desde o acerto gravado: a senha fica na pendência, não é recebida calada (rodada 11).
     expect(r.ok).toBe(false);
@@ -541,7 +541,7 @@ describe('leitura velha logo depois do acerto (auditoria interna, rodada 8 do PR
     expect(st().openCashSession(100).ok).toBe(true);
     const a = deliveredOrder(false);
     connectCloud();
-    const s = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: cloudFn([]) });
+    const s = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: cloudFn([]) });
     if (!s.ok) throw new Error(s.error);
     const snapshot = () => ({
       tenant_id: st().tenant.id, server_now: new Date().toISOString(), orders: [...st().orders], orderItems: [...st().orderItems], payments: [...st().payments],
@@ -562,7 +562,7 @@ describe('mensagens do acerto (auditoria interna, rodada 8 do PR #54)', () => {
     connectCloud();
     const db = cloudDb([]);
     db.taken.set(a.delivery.id, 'outro-acerto');
-    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: db.fn });
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: db.fn });
     if (r.ok) throw new Error('devia recusar');
     expect(r.error).not.toMatch(/TCHEFOOD_/);
     expect(r.error).not.toMatch(UUID_RE);
@@ -574,7 +574,7 @@ describe('mensagens do acerto (auditoria interna, rodada 8 do PR #54)', () => {
     expect(st().openCashSession(100).ok).toBe(true);
     const a = deliveredOrder();
     connectCloud();
-    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: async () => { throw new TypeError('Failed to fetch'); } });
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: async () => { throw new TypeError('Failed to fetch'); } });
     if (r.ok) throw new Error('devia falhar');
     expect(r.error).not.toMatch(/Failed to fetch/);
     expect(r.error).toMatch(/Sem resposta da nuvem/);
@@ -589,7 +589,7 @@ describe('mensagens do acerto (auditoria interna, rodada 8 do PR #54)', () => {
     connectCloud();
     useTcheStore.setState({ outbox: [itemEvent] });
     const calls: Call[] = [];
-    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: cloudFn(calls) });
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: cloudFn(calls) });
     expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/contas pagas na entrega.*Espere a fila/) });
     expect(calls).toEqual([]);
   });
@@ -637,15 +637,17 @@ describe('troca de loja com acerto do entregador em andamento (Codex, PR #54)', 
     const gate = new Promise<void>((r) => { release = r; });
     const inner = cloudFn(calls);
     const slow: FetchLike = async (url, init) => { await gate; return inner(url, init); };
-    const running = st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: slow });
+    const running = st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: slow });
     await Promise.resolve();
     const tenant = st().tenant.id;
     expect(newStore()).toMatchObject({ ok: false, error: expect.stringMatching(/esperando a resposta da nuvem/) });
     expect(st().tenant.id).toBe(tenant);
     release();
     expect((await running).ok).toBe(true);
+    // O "pago por fora" do acerto entrou na fila (registro do gerente); aqui só conta a pendência.
+    expect(st().outbox.some((e) => e.table === 'audit_logs' && e.payload.action_type === 'COURIER_PAID_OUTSIDE')).toBe(true);
 
-    useTcheStore.setState({ courierSettleFollowUps: [{
+    useTcheStore.setState({ outbox: [], courierSettleFollowUps: [{
       settlement_id: 's1', courier_id: a.courier.id, courier_name: a.courier.name, delivery_ids: [a.delivery.id], cash_collected: 0,
       courier_fees: 7, missing_payments: [], missing_withdrawal: { amount: 7, error: 'x' }, created_at: '2026-11-14T12:00:00Z',
     }] });
@@ -663,7 +665,7 @@ describe('terminar a pendência recebe só o valor do acerto e não perde senha 
     connectCloud();
     const calls: Call[] = [];
     const fn = afterCloud(cloudFn(calls), () => useTcheStore.setState({ cloudSkippedOrderIds: [a.order.id] }));
-    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: fn });
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: fn });
     expect(r.ok).toBe(false);
     useTcheStore.setState({ cloudSkippedOrderIds: [] });
     const settlementId = calls[0]!.body.p_id as string;
@@ -685,7 +687,7 @@ describe('terminar a pendência recebe só o valor do acerto e não perde senha 
     const changed = planned - 20;
     // A nuvem grava o acerto com o valor planejado; antes de receber, o saldo da conta muda.
     const fn = afterCloud(cloudFn(calls), () => setOrder(a.order.id, { remaining_balance: changed }));
-    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: fn });
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: fn });
     expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/O saldo da senha \d+ mudou desde o acerto \(acerto: R\$\s[\d,]+, saldo agora: R\$\s[\d,]+\)/) });
     expect(calls[0]!.body.p_cash_collected).toBe(planned);
     expect(entrega(a.delivery.id)).toEqual([]);

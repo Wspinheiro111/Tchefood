@@ -5009,9 +5009,19 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       return { d, orderId: order.id };
     }
     const nico = () => st().couriers.find((c) => c.phone === '53999990310')!.id;
+    /** Recebimento de cada senha paga na entrega ainda devendo, como o aparelho manda (GPT, rodada 11 do PR #54). */
+    const duePayments = (deliveryIds: string[]) => {
+      const rows = sql(`SELECT d.id || '|' || o.remaining_balance FROM own_deliveries d JOIN orders o ON o.id = d.order_id
+                         WHERE d.id IN (${deliveryIds.map((x) => `'${x}'`).join(',')}) AND d.pay_on_delivery
+                           AND o.status = 'PAYING' AND o.remaining_balance > 0 ORDER BY d.id`);
+      return rows === '' ? [] : rows.split('\n').map((r) => {
+        const [deliveryId, amount] = r.split('|');
+        return { delivery_id: deliveryId!, payment_id: crypto.randomUUID(), amount: Number(amount) };
+      });
+    };
     const nicoTerms = (deliveryIds: string[], cash: number, pin: string | null, id: string = crypto.randomUUID()) => ({
       p_id: id, p_courier: nico(), p_delivery_ids: deliveryIds, p_cash_collected: cash, p_courier_fees: 3 * deliveryIds.length,
-      p_staff: cashierId(), ...(pin === null ? {} : { p_staff_pin: pin }),
+      p_staff: cashierId(), ...(pin === null ? {} : { p_staff_pin: pin }), p_payments: duePayments(deliveryIds),
     });
     const unsettled = (ids: string[]) => sql(`SELECT count(*) FROM own_deliveries WHERE id IN (${ids.map((x) => `'${x}'`).join(',')}) AND settlement_id IS NULL`);
     const settlementsOf = (ids: string[]) => sql(`SELECT count(*) FROM courier_settlements WHERE delivery_ids && ARRAY[${ids.map((x) => `'${x}'`).join(',')}]::uuid[]`);
@@ -5221,6 +5231,50 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(settlementsOf([frac.d.id])).toBe('0');
     });
 
+    it('acerto pela nuvem: o recebimento das senhas entra na mesma transação; a conta fica paga e outro aparelho não cobra o mesmo saldo (GPT, rodada 11 do PR #54)', async () => {
+      forgetPinFailures();
+      const cod = await nicoDelivers('Rua 312, 1', true);
+      const owed = owedOf(cod.orderId);
+      const terms = nicoTerms([cod.d.id], owed, CASHIER_PIN);
+      const payId = terms.p_payments[0]!.payment_id;
+      const r = await settleRpc(terms);
+      expect(r.status, r.body).toBe(200);
+      // A fila de A não subiu nada: o pagamento já está na nuvem, com o id de A, e a conta fechou.
+      expect(sql(`SELECT amount || ' ' || method || ' ' || acquirer || ' ' || status || ' ' || idempotency_key || ' ' || waiter_id FROM payments WHERE id = '${payId}'`))
+        .toBe(`${owed.toFixed(2)} CASH CASH_DESK APPROVED entrega-${cod.d.id} ${cashierId()}`);
+      expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${cod.orderId}'`)).toBe('CLOSED 0.00');
+      // B tenta receber o mesmo saldo: a nuvem recusa.
+      const pay = (id: string) => fetchB()('http://cloud.test/rest/v1/rpc/tchefood_register_payment', {
+        method: 'POST', headers: {},
+        body: JSON.stringify({ p_payment: {
+          id, order_id: cod.orderId, tenant_id: TENANT, waiter_id: cashierId(), terminal_id: null, amount: owed, tip_amount: 0, method: 'CASH',
+          status: 'APPROVED', acquirer: 'CASH_DESK', idempotency_key: `b-${id}`, created_at: new Date().toISOString(),
+        } }),
+      }).then(async (x) => ({ status: x.status, body: await x.text() }));
+      const b = await pay(crypto.randomUUID());
+      expect(b.status, b.body).toBeGreaterThanOrEqual(400);
+      // A sobe depois o mesmo pagamento (mesmo id): a nuvem devolve o gravado, sem pagamento novo.
+      const a = await pay(payId);
+      expect(a.status, a.body).toBe(200);
+      expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${cod.orderId}' AND status = 'APPROVED'`)).toBe('1');
+    });
+
+    it('acerto pela nuvem sem o recebimento de uma senha (app antigo) ou com outro valor: recusado, nada gravado (GPT, rodada 11 do PR #54)', async () => {
+      forgetPinFailures();
+      const cod = await nicoDelivers('Rua 312, 2', true);
+      const owed = owedOf(cod.orderId);
+      const without = await settleRpc({ ...nicoTerms([cod.d.id], owed, CASHIER_PIN), p_payments: [] });
+      expect(without.status, without.body).toBeGreaterThanOrEqual(400);
+      expect(without.body).toMatch(/atualize o aplicativo/);
+      const terms = nicoTerms([cod.d.id], owed, CASHIER_PIN);
+      const other = await settleRpc({ ...terms, p_payments: [{ ...terms.p_payments[0]!, amount: owed - 1 }] });
+      expect(other.status, other.body).toBeGreaterThanOrEqual(400);
+      expect(other.body).toMatch(/não é o saldo dela na nuvem/);
+      expect(settlementsOf([cod.d.id])).toBe('0');
+      expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${cod.orderId}'`)).toBe('0');
+      expect(sql(`SELECT status FROM orders WHERE id = '${cod.orderId}'`)).toBe('PAYING');
+    });
+
     it('cópia velha da entrega mandada por outro aparelho não volta a entrega atrás nem troca o entregador, e não trava a fila (auditoria interna, rodada 8 do PR #54)', async () => {
       login(OWNER_PIN);
       const zone = st().deliveryZones.find((z) => z.active)!;
@@ -5286,6 +5340,35 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
         expect(other.status, other.body).toBeGreaterThanOrEqual(400);
         expect(other.body).toMatch(/outro acerto com este id/);
         expect(sql(`SELECT settled_by_user_id FROM courier_settlements WHERE id = '${id}'`)).toBe(cashierId());
+      });
+
+      it('a repetição que chega com a primeira ainda rodando espera por ela e devolve o acerto, mesmo com o PIN de outra pessoa (GPT, rodada 11 do PR #54)', async () => {
+        forgetPinFailures();
+        const { d } = await nicoDelivers('Rua 330, 4', false);
+        const id = crypto.randomUUID();
+        const failuresBefore = settledFailures();
+        const call = (pin: string) => `SELECT set_config('request.jwt.claims', '{"role":"authenticated","tenant_id":"${TENANT}","sub":"device"}', true);
+          SET LOCAL ROLE authenticated;
+          SELECT tchefood_settle_courier('${id}', '${nico()}', ARRAY['${d.id}']::uuid[], 0, 3, '${cashierId()}', '${pin}', '[]'::jsonb)::text;`;
+        const run = (pin: string, sleep: number) => new Promise<{ code: number | null; out: string }>((resolve) => {
+          const p = spawn('psql', ['-h', target!.host, '-p', String(target!.port), '-U', target!.user, '-d', DB, '-X', '-q', '-t', '-A', '-v', 'ON_ERROR_STOP=1']);
+          p.stdin.end(`BEGIN;\n${call(pin)}\nSELECT pg_sleep(${sleep});\nCOMMIT;\n`);
+          let out = '';
+          p.stdout.on('data', (b) => (out += String(b)));
+          p.stderr.on('data', (b) => (out += String(b)));
+          p.on('close', (code) => resolve({ code, out }));
+        });
+        // A primeira passa pelo PIN e demora para gravar; a repetição chega com o PIN de outra pessoa.
+        const first = run(CASHIER_PIN, 1.2);
+        await new Promise((r) => setTimeout(r, 300));
+        const retry = await run('0000', 0);
+        const done = await first;
+        expect(done.code, done.out).toBe(0);
+        expect(retry.code, retry.out).toBe(0);
+        expect(retry.out).toContain(id);
+        expect(retry.out).not.toMatch(/TCHEFOOD_PIN_RECUSADO/);
+        expect(settledFailures()).toBe(failuresBefore);
+        expect(settlementsOf([d.id])).toBe('1');
       });
 
       it('acerto novo sem PIN (app antigo): erro pedindo para atualizar, sem gravar falha de PIN nem acerto', async () => {

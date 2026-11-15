@@ -2,10 +2,14 @@
  * Mudança da mesa gravada na fila por uma versão anterior (sem table_edit_fields): na recuperação
  * de conta recusada, de itens atrasados, no descarte e na leitura que libera a mesa, o nome, a
  * área e os lugares mudados aqui continuam subindo, sem a ocupação velha (GPT, rodada 10 do PR #54).
+ * Como não dá para saber o que mudou, o evento não sobe sozinho: vai para os recusados com o aviso
+ * e só sobe quando a pessoa reenvia (GPT, rodada 11 do PR #54).
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { CloudOrders } from '../lib/sync/orderPull';
-import { useTcheStore, type CloudSession } from '../store/useTcheStore';
+import { LEGACY_TABLE_REVIEW_MESSAGE, useTcheStore, type CloudSession } from '../store/useTcheStore';
+import { syncOnce } from '../lib/sync/useCloudSync';
+import type { FetchLike } from '../lib/sync/supabaseSync';
 import type { DiningTable, Order, OrderItem, SyncEvent } from '../types';
 
 const st = () => useTcheStore.getState();
@@ -51,6 +55,7 @@ function expectCadastroOnly(e: SyncEvent | undefined) {
   expect(e!.payload).not.toHaveProperty('current_order_id');
   expect(Object.keys(e!.payload).sort()).toEqual(CADASTRO);
   expect(e!.table_edit_fields).toEqual(['number', 'label', 'area', 'capacity', 'active']);
+  expect(e!.legacy_table_review).toBe(true);
 }
 
 beforeEach(() => st().resetDemo());
@@ -128,6 +133,32 @@ describe('mudança da mesa da versão anterior (sem table_edit_fields) (GPT, rod
     }));
     expect(r.ok).toBe(true);
     expectCadastroOnly(st().outbox.find((e) => e.id === 'e-legado'));
+  });
+});
+
+describe('mudança antiga da mesa não sobe sozinha (GPT, rodada 11 do PR #54)', () => {
+  it('vai para os recusados com o aviso antes do envio; reenviar sobe o cadastro, uma vez', async () => {
+    lateSetup((free) => [legacy(free, O1)]);
+    const r = st().moveLateItemsToNewOrder('e-cerveja');
+    if (!r.ok) throw new Error(r.error);
+    const sent: string[] = [];
+    const fetchFn: FetchLike = async (url, init) => {
+      sent.push(`${init.method ?? 'GET'} ${url} ${init.body ?? ''}`);
+      return { ok: true, status: 200, text: async () => '[]' };
+    };
+    await syncOnce(fetchFn);
+    // A capacidade 8 deste aparelho não subiu: B pode ter mudado a mesa depois.
+    expect(sent.some((x) => x.includes('dining_tables') && x.includes('"capacity":8'))).toBe(false);
+    expect(st().outbox.some((e) => e.id === 'e-legado')).toBe(false);
+    const parked = (st().syncRejected ?? []).find((x) => x.event.id === 'e-legado')!;
+    expect(parked.message).toBe(LEGACY_TABLE_REVIEW_MESSAGE);
+    expect(parked.event.payload).not.toHaveProperty('current_order_id');
+    // Reenviar é a decisão: volta para a fila sem a marca, e o próximo envio o sobe.
+    st().retryRejectedSync();
+    const back = st().outbox.find((e) => e.id === 'e-legado')!;
+    expect(back.legacy_table_review).toBeUndefined();
+    st().parkLegacyTableReviews();
+    expect(st().outbox.some((e) => e.id === 'e-legado')).toBe(true);
   });
 });
 

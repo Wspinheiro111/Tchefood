@@ -647,13 +647,23 @@ CREATE TRIGGER trg_own_deliveries_0_stale_stays BEFORE UPDATE ON own_deliveries
     FOR EACH ROW EXECUTE FUNCTION tchefood_own_delivery_stale_stays();
 
 -- O acerto pela nuvem. Devolve a linha gravada (a mesma em toda chamada com o mesmo p_id).
--- A versão sem o PIN de quem acertou sai (GPT, rodada 10 do PR #54).
+-- A versão sem o PIN de quem acertou sai (GPT, rodada 10 do PR #54), e a sem os recebimentos
+-- das senhas também (GPT, rodada 11).
+--
+-- p_payments: o recebimento de cada senha paga na entrega ([{delivery_id, payment_id, amount}]).
+-- Ele é gravado NA MESMA transação do acerto (tchefood_register_payment, em dinheiro, chave
+-- entrega-<id>): com o acerto gravado, a conta já está paga na nuvem e outro aparelho não cobra
+-- o mesmo saldo de novo enquanto este ainda não subiu a fila (GPT, rodada 11 do PR #54). O
+-- aparelho registra depois o mesmo pagamento (mesmo id), e a função o devolve como já gravado.
 DROP FUNCTION IF EXISTS tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID);
+DROP FUNCTION IF EXISTS tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID, VARCHAR);
 CREATE OR REPLACE FUNCTION tchefood_settle_courier(
     p_id UUID, p_courier UUID, p_delivery_ids UUID[], p_cash_collected NUMERIC, p_courier_fees NUMERIC, p_staff UUID,
-    p_staff_pin VARCHAR DEFAULT NULL)
+    p_staff_pin VARCHAR DEFAULT NULL, p_payments JSONB DEFAULT NULL)
 RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
+    v_due RECORD;
+    v_pay JSONB;
     v_tenant UUID := tchefood_tenant();
     v_ids UUID[];
     v_row courier_settlements%ROWTYPE;
@@ -679,6 +689,11 @@ BEGIN
     IF cardinality(v_ids) <> cardinality(p_delivery_ids) THEN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA: entrega repetida ou vazia na lista do acerto.';
     END IF;
+    -- Uma chamada por id de cada vez: a repetição que chega com a primeira ainda rodando espera
+    -- ela terminar e então a encontra gravada, em vez de ser recusada (PIN de outra pessoa) e o
+    -- aparelho largar a pendência de um acerto que a primeira grava logo depois (GPT, rodada 11
+    -- do PR #54). Fica antes de qualquer recusa; nenhuma outra função usa esta chave.
+    PERFORM pg_advisory_xact_lock(hashtextextended('tchefood_courier_settle:' || v_tenant::text || ':' || p_id::text, 0));
     -- Mesma chamada de novo (resposta perdida): devolve o acerto gravado, antes do PIN. A
     -- repetição não autoriza nada novo; com o PIN trocado ou a loja bloqueada, recusar aqui
     -- faria o aparelho largar um acerto que a nuvem já tem. Só desta loja, com os mesmos termos
@@ -761,6 +776,34 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA: só caixa, gerente ou proprietário ativo da loja acerta com o entregador.';
     END IF;
 
+    IF p_payments IS NOT NULL AND jsonb_typeof(p_payments) <> 'array' THEN
+        RAISE EXCEPTION 'TCHEFOOD_ENTREGA: recebimentos do acerto em formato inválido.';
+    END IF;
+
+    -- O recebimento de cada senha ainda devendo entra junto com o acerto, no valor que o aparelho
+    -- mostrou (o mesmo saldo da nuvem), com o id que o aparelho vai usar.
+    FOR v_due IN
+        SELECT d.id AS delivery_id, d.order_id, o.remaining_balance
+          FROM own_deliveries d JOIN orders o ON o.id = d.order_id AND o.tenant_id = v_tenant
+         WHERE d.id = ANY(v_ids) AND d.tenant_id = v_tenant AND d.pay_on_delivery
+           AND o.status = 'PAYING' AND o.remaining_balance > 0
+         ORDER BY d.id
+    LOOP
+        SELECT x INTO v_pay FROM jsonb_array_elements(COALESCE(p_payments, '[]'::jsonb)) x
+         WHERE jsonb_typeof(x) = 'object' AND x->>'delivery_id' = v_due.delivery_id::text LIMIT 1;
+        IF v_pay IS NULL OR v_pay->>'payment_id' IS NULL THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: atualize o aplicativo para acertar com o entregador (o recebimento das senhas vai junto com o acerto).';
+        END IF;
+        IF (v_pay->>'amount') IS NULL OR (v_pay->>'amount')::numeric <> v_due.remaining_balance THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: o valor de uma senha do acerto (%) não é o saldo dela na nuvem (%). Confira as contas e acerte de novo.', v_pay->>'amount', v_due.remaining_balance;
+        END IF;
+        PERFORM tchefood_register_payment(jsonb_build_object(
+            'id', v_pay->>'payment_id', 'order_id', v_due.order_id, 'tenant_id', v_tenant, 'waiter_id', p_staff,
+            'terminal_id', NULL, 'amount', v_due.remaining_balance, 'tip_amount', 0, 'method', 'CASH', 'status', 'APPROVED',
+            'acquirer', 'CASH_DESK', 'acquirer_cnpj', NULL, 'card_brand', NULL, 'nsu', NULL, 'authorization_code', NULL,
+            'terminal_serial', NULL, 'idempotency_key', 'entrega-' || v_due.delivery_id::text, 'created_at', now()));
+    END LOOP;
+
     PERFORM set_config('tchefood.courier_settle', p_id::text, true);
     INSERT INTO courier_settlements (id, tenant_id, courier_id, deliveries, cash_collected, courier_fees, cash_movement_id, delivery_ids, settled_by_user_id)
     VALUES (p_id, v_tenant, p_courier, cardinality(v_ids), p_cash_collected, p_courier_fees, NULL, v_ids, p_staff)
@@ -775,8 +818,8 @@ DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
         REVOKE ALL ON FUNCTION tchefood_own_delivery_stale_stays() FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID, VARCHAR) FROM PUBLIC, anon;
-        GRANT EXECUTE ON FUNCTION tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID, VARCHAR) TO authenticated;
+        REVOKE ALL ON FUNCTION tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID, VARCHAR, JSONB) FROM PUBLIC, anon;
+        GRANT EXECUTE ON FUNCTION tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID, VARCHAR, JSONB) TO authenticated;
     END IF;
 END $$;
 

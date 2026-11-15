@@ -64,7 +64,7 @@ function cloudFn(calls: Call[]): FetchLike {
 const pinRefused: FetchLike = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ error: 'TCHEFOOD_PIN_RECUSADO' }) });
 const down: FetchLike = async () => { throw new TypeError('Failed to fetch'); };
 const settle = (courierId: string, fetchFn: FetchLike, pendingId?: string) =>
-  st().settleCourierOnline(courierId, { payFromDrawer: false, auth: null, fetchFn, ...(pendingId !== undefined ? { pendingId } : {}) });
+  st().settleCourierOnline(courierId, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn, ...(pendingId !== undefined ? { pendingId } : {}) });
 
 /** Primeira tentativa sem resposta: fica o acerto pendente. */
 async function pendingFor(courierId: string) {
@@ -251,7 +251,7 @@ describe('5: acerto incerto e desconectar da nuvem (Codex, rodada 11)', () => {
     // Mesmo sem nuvem (estado antigo), nada repete fora dela nem acerta as mesmas entregas.
     useTcheStore.setState({ cloud: null });
     expect(await settle(a.courier.id, cloudFn([]), p.id)).toMatchObject({ ok: false, error: expect.stringMatching(/conecte de novo/) });
-    expect(st().settleCourier(a.courier.id, { payFromDrawer: false, auth: null })).toMatchObject({ ok: false, error: 'Nenhuma entrega para acertar.' });
+    expect(st().settleCourier(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' } })).toMatchObject({ ok: false, error: 'Nenhuma entrega para acertar.' });
     expect(st().courierSettlements).toEqual([]);
   });
 });
@@ -265,7 +265,7 @@ describe('6: valores vistos e recebimento recusado (Codex, rodada 11)', () => {
     useTcheStore.setState((s) => ({ orders: s.orders.map((o) => (o.id === a.order.id ? { ...o, remaining_balance: o.remaining_balance - 4 } : o)) }));
     const fn = vi.fn(cloudFn([]));
     const r = await st().settleCourierOnline(a.courier.id, {
-      payFromDrawer: false, auth: null, fetchFn: fn, deliveryIds: [a.delivery.id], expected: { cash: shownCash, fees: a.delivery.courier_fee ?? 0 },
+      payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: fn, deliveryIds: [a.delivery.id], expected: { cash: shownCash, fees: a.delivery.courier_fee ?? 0 },
     });
     expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/valores deste acerto mudaram/) });
     expect(fn).not.toHaveBeenCalled();
@@ -309,7 +309,7 @@ describe('7: recebimento recusado resolvido e loja da nuvem desconectada (Codex,
     useTcheStore.setState({ outbox: [] });
     expect(st().setCloudSession({ ...st().cloud! }).ok).toBe(true);
     expect(st().setCloudSession(null).ok).toBe(true);
-    expect(st().settleCourier(a.courier.id, { payFromDrawer: false, auth: null })).toMatchObject({ ok: false, error: expect.stringMatching(/loja é da nuvem/) });
+    expect(st().settleCourier(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' } })).toMatchObject({ ok: false, error: expect.stringMatching(/loja é da nuvem/) });
     expect(st().courierSettlements).toEqual([]);
   });
 });

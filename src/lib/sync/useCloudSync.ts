@@ -337,6 +337,8 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
       }
     }
     const cfg: SyncConfig = { url: session.url, anonKey: session.anon_key, accessToken: token };
+    // Mudança antiga da mesa que não pode subir sozinha: vai para os recusados antes do envio (GPT, rodada 11).
+    useTcheStore.getState().parkLegacyTableReviews();
     const { outbox: events, syncRejected } = useTcheStore.getState();
     if (events.length === 0) {
       await pullOnce(cfg, fetchFn, due, force);

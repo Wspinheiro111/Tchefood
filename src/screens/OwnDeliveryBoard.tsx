@@ -35,6 +35,8 @@ export function OwnDeliveryBoard() {
   const [cancelFor, setCancelFor] = useState<OwnDelivery | null>(null);
   const [target, setTarget] = useState<SettleTarget | null>(null);
   const [payAuthOpen, setPayAuthOpen] = useState(false);
+  // Ganho pago por fora no próprio acerto: PIN de gerente e motivo (GPT, rodada 11 do PR #54).
+  const [outsideAuthOpen, setOutsideAuthOpen] = useState(false);
   const [followPinFor, setFollowPinFor] = useState<CourierSettleFollowUp | null>(null);
   // "Pago por fora" pede PIN de gerente e motivo (GPT, rodada 10 do PR #54).
   const [paidOutsideFor, setPaidOutsideFor] = useState<CourierSettleFollowUp | null>(null);
@@ -84,6 +86,7 @@ export function OwnDeliveryBoard() {
       : useTcheStore.getState().settleCourierOnline(t.entry.courier_id, { payFromDrawer, auth, pendingId: t.entry.id });
   const closeSettle = () => {
     setPayAuthOpen(false);
+    setOutsideAuthOpen(false);
     setTarget(null);
   };
   /**
@@ -244,7 +247,7 @@ export function OwnDeliveryBoard() {
         )}
       </Sheet>
 
-      <Sheet open={target !== null && !payAuthOpen} onClose={closeSettle} title={`Acerto · ${shown?.name ?? ''}`}>
+      <Sheet open={target !== null && !payAuthOpen && !outsideAuthOpen} onClose={closeSettle} title={`Acerto · ${shown?.name ?? ''}`}>
         {target && shown && (
           <div className="space-y-3 text-sm">
             {target.kind === 'pending' && (
@@ -276,6 +279,7 @@ export function OwnDeliveryBoard() {
               disabled={settlingBusy}
               onClick={async () => {
                 const t = target;
+                if (shown.fees > 0) return setOutsideAuthOpen(true);
                 setSettlingBusy(true);
                 const r = await settle(t, false, null);
                 setSettlingBusy(false);
@@ -302,6 +306,23 @@ export function OwnDeliveryBoard() {
         onSubmit={async (managerPin, reason) => {
           const t = target!;
           const r = await settle(t, true, { managerPin, reason });
+          settleLanded(t, r);
+          return r;
+        }}
+        onSuccess={closeSettle}
+      />
+
+      <ManagerAuthSheet
+        open={outsideAuthOpen && target !== null}
+        onClose={() => setOutsideAuthOpen(false)}
+        title="Ganho do entregador pago por fora"
+        summary={<span>Receber o dinheiro das senhas e marcar o ganho de <b>{formatBRL(shown?.fees ?? 0)}</b> para {shown?.name} como pago sem sair da gaveta. Fica registrado na auditoria; diga no motivo como foi pago.</span>}
+        confirmLabel="Autorizar e acertar"
+        quickReasons={['Pago em pix pela loja', 'Pago em dinheiro fora do caixa']}
+        successMessage="Acerto feito."
+        onSubmit={async (managerPin, reason) => {
+          const t = target!;
+          const r = await settle(t, false, { managerPin, reason });
           settleLanded(t, r);
           return r;
         }}

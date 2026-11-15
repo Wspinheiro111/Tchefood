@@ -5,7 +5,7 @@ import type { FetchLike } from '../lib/sync/supabaseSync';
 import { COURIER_SETTLE_PIN_REFUSED, parseSettlementRow, settleCourierInCloud } from '../lib/sync/courierSettle';
 
 const cfg = { url: 'http://cloud.test', anonKey: 'anon', accessToken: 'jwt' };
-const req = { id: 'a1', courier_id: 'c1', delivery_ids: ['d1'], cash_collected: 0, courier_fees: 7, staff_id: 'u1', staff_pin: '5555' };
+const req = { id: 'a1', courier_id: 'c1', delivery_ids: ['d1'], cash_collected: 0, courier_fees: 7, staff_id: 'u1', staff_pin: '5555', payments: [] };
 const reply = (status: number, body: unknown): FetchLike => async () => ({
   ok: status >= 200 && status < 300,
   status,

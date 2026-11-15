@@ -864,6 +864,13 @@ export interface SyncEvent {
    * mudou depois (GPT, rodada 8 do PR #54). Não vai para o banco.
    */
   table_edit_fields?: TableEditField[];
+  /**
+   * Mudança da mesa gravada por uma versão anterior (sem table_edit_fields) que perdeu a ocupação
+   * numa recuperação: não dá para saber o que a pessoa mudou, então ela não sobe sozinha. Vai para
+   * os recusados com o aviso, e só sobe (o cadastro inteiro, como este aparelho viu) quando a
+   * pessoa reenvia (GPT, rodada 11 do PR #54). Não vai para o banco.
+   */
+  legacy_table_review?: true;
   /** Só no proprietário da loja nova: sobe por tchefood_start_store, com o usuário do QR. */
   store_start?: StoreStartSync;
   /**

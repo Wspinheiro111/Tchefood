@@ -93,7 +93,7 @@ describe('P2-01: acerto sem resposta com entrega que sumiu do aparelho (GPT, rod
     const c = deliveredOrder();
     connectCloud();
     const down: FetchLike = async () => { throw new TypeError('Failed to fetch'); };
-    expect((await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: down })).ok).toBe(false);
+    expect((await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, fetchFn: down })).ok).toBe(false);
     const pending = st().courierSettlePending ?? [];
     expect(pending).toHaveLength(1);
     expect([...pending[0]!.delivery_ids].sort()).toEqual([a.delivery.id, b.delivery.id, c.delivery.id].sort());
@@ -103,7 +103,7 @@ describe('P2-01: acerto sem resposta com entrega que sumiu do aparelho (GPT, rod
     useTcheStore.setState((s) => ({ ownDeliveries: s.ownDeliveries.filter((d) => d.id !== removed.id) }));
     const calls: Call[] = [];
     const fn = vi.fn(cloudFn(calls));
-    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, pendingId: pending[0]!.id, fetchFn: fn });
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, pendingId: pending[0]!.id, fetchFn: fn });
     expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/não está mais neste aparelho/) });
     expect(fn).not.toHaveBeenCalled();
     expect(st().courierSettlePending).toEqual(pending);
@@ -112,7 +112,7 @@ describe('P2-01: acerto sem resposta com entrega que sumiu do aparelho (GPT, rod
 
     // A entrega volta (sincronizou): a repetição segue, com as três.
     useTcheStore.setState((s) => ({ ownDeliveries: [...s.ownDeliveries, removed] }));
-    const r2 = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, pendingId: pending[0]!.id, fetchFn: fn });
+    const r2 = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' }, pendingId: pending[0]!.id, fetchFn: fn });
     if (!r2.ok) throw new Error(r2.error);
     expect(fn).toHaveBeenCalledTimes(1);
     expect(calls[0]!.body).toMatchObject({ p_id: pending[0]!.id });
