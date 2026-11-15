@@ -1635,6 +1635,86 @@ describe("ação de status já enviada (trava de 60 s)", () => {
   });
 });
 
+describe("ação de status: proteção enquanto finaliza (rodada 4)", () => {
+  it("leitura do pedido depois do envio ainda pendente: a segunda requisição não chama o app de novo", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const perform = vi.spyOn(api, "performAction");
+    const realGet = repository.getOrder.bind(repository);
+    let releaseRead: () => void = () => undefined;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let reads = 0;
+    vi.spyOn(repository, "getOrder").mockImplementation(async (channel, orderId) => {
+      reads += 1;
+      if (reads === 2) await readGate; // a leitura logo depois do envio fica pendurada
+      return realGet(channel, orderId);
+    });
+    const first = inbox.performAction("ifood", id, "confirm");
+    await vi.waitFor(() => expect(perform).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(reads).toBe(2));
+    await expect(inbox.performAction("ifood", id, "confirm")).rejects.toThrow(/andamento|já enviada/);
+    releaseRead();
+    await first;
+    await expect(inbox.performAction("ifood", id, "confirm")).rejects.toThrow(/já enviada/);
+    expect(perform).toHaveBeenCalledTimes(1);
+  });
+
+  it("app aceitou e a leitura seguinte falhou: não sugere reenvio e a repetição não vai ao app", async () => {
+    const { sandbox, api, repository, inbox } = setup();
+    const id = sandbox.placeOrder({ items: ITEMS });
+    await inbox.runCycle();
+    const perform = vi.spyOn(api, "performAction");
+    const realGet = repository.getOrder.bind(repository);
+    let reads = 0;
+    vi.spyOn(repository, "getOrder").mockImplementation(async (channel, orderId) => {
+      reads += 1;
+      if (reads === 2) throw new Error("Banco indisponível.");
+      return realGet(channel, orderId);
+    });
+    const result = await inbox.performAction("ifood", id, "confirm");
+    expect(result.order.externalId).toBe(id);
+    expect(perform).toHaveBeenCalledTimes(1);
+    await expect(inbox.performAction("ifood", id, "confirm")).rejects.toThrow(/já enviada/);
+    expect(perform).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("pedido mínimo com horário do evento ausente (rodada 4)", () => {
+  it("PLC sem createdAt e detalhe ilegível: entra na recuperação e recupera itens, pagamentos, total e isTest sem duplicar eventos", async () => {
+    let offset = 0;
+    const { sandbox, api, repository, inbox } = setup({ now: () => new Date(Date.now() + offset) });
+    const id = sandbox.placeOrder({ items: ITEMS, isTest: true });
+    const expected = await api.getOrder(id);
+    const realPoll = api.pollEvents.bind(api);
+    // O que o adapter produz para um evento sem createdAt (isoInstant: o mais antigo possível).
+    vi.spyOn(api, "pollEvents").mockImplementation(async () =>
+      (await realPoll()).map((event) => (event.externalOrderId === id ? { ...event, createdAt: new Date(0).toISOString() } : event)),
+    );
+    const realGetOrder = api.getOrder.bind(api);
+    let calls = 0;
+    vi.spyOn(api, "getOrder").mockImplementation(async (orderId) => {
+      calls += 1;
+      if (calls <= ORDER_DETAIL_MAX_FAILURES + 1) throw new DeliveryMarketplaceError("ifood", "not_found", "Pedido não encontrado no iFood.", 404);
+      return realGetOrder(orderId);
+    });
+    for (let cycle = 1; cycle <= ORDER_DETAIL_MAX_FAILURES; cycle += 1) await inbox.runCycle();
+    const minimal = (await repository.getOrder("ifood", id))!;
+    expect(minimal.detailPending).toBe(true);
+    expect(minimal.order.createdAt).toBe(new Date(0).toISOString()); // o horário do iFood fica como veio
+    expect(sandbox.pendingEventCount()).toBe(0); // o evento foi confirmado
+    offset += DETAIL_RETRY_DELAY_SECONDS * 1000;
+    const report = (await inbox.runCycle())[0]!;
+    expect(report.duplicates).toBe(0);
+    const record = (await repository.getOrder("ifood", id))!;
+    expect(record.detailPending).toBe(false);
+    expect(record.order.items).toEqual(expected.items);
+    expect(record.order.payments).toEqual(expected.payments);
+    expect(record.order.totals).toEqual(expected.totals);
+    expect(record.order.isTest).toBe(true);
+  });
+});
+
 describe("pedido concluído pelo app com o cancelamento em análise", () => {
   it("CAR seguido de CON: zera a pendência e marca para conferência; a venda não fica travada para sempre", async () => {
     const { sandbox, repository, inbox } = setup();

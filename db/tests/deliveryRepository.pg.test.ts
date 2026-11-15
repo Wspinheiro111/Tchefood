@@ -225,7 +225,7 @@ function setup() {
     expect((await repository.getOrder('ifood', id))!.needsReview).toBe(true);
   });
 
-  it('recuperação do detalhe ignora pedido cancelado e pedido de mais de 7 dias; cancelado não sai de cancelled', async () => {
+  it('recuperação do detalhe ignora pedido cancelado e pedido recebido há mais de 7 dias (não o horário do app); cancelado não sai de cancelled', async () => {
     const { sandbox, api, repository, inbox } = setup();
     const spy = vi.spyOn(api, 'getOrder').mockRejectedValue(new DeliveryMarketplaceError('ifood', 'invalid_response', 'Valor inválido no iFood: total.subTotal.'));
     const [old, cancelled, fresh] = [sandbox.placeOrder({ items: ITEMS }), sandbox.placeOrder({ items: ITEMS }), sandbox.placeOrder({ items: ITEMS })];
@@ -234,10 +234,12 @@ function setup() {
     sandbox.emitFromMarketplace(cancelled, 'CAN');
     await inbox.runChannel(api);
     sql(`UPDATE delivery_orders SET detail_retry_at = NULL WHERE external_id IN ('${old}', '${cancelled}', '${fresh}');
-         UPDATE delivery_orders SET placed_at = NOW() - INTERVAL '8 days' WHERE external_id = '${old}';`);
+         UPDATE delivery_orders SET received_at = NOW() - INTERVAL '8 days' WHERE external_id = '${old}';
+         UPDATE delivery_orders SET placed_at = 'epoch' WHERE external_id = '${fresh}';`);
     const state = (x: string) => sql(`SELECT status || ':' || detail_pending FROM delivery_orders WHERE external_id = '${x}'`);
     expect([old, cancelled, fresh].map(state)).toEqual(['placed:true', 'cancelled:true', 'placed:true']);
     const listed = (await repository.listDetailPending('ifood', 100)).map((r) => r.order.externalId);
+    // fresh: horário do app ausente (1970), mas recebido agora pelo servidor: entra na recuperação.
     expect(listed).toContain(fresh);
     expect(listed).not.toContain(old);
     expect(listed).not.toContain(cancelled);

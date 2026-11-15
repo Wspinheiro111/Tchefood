@@ -30,6 +30,9 @@ CREATE INDEX IF NOT EXISTS idx_delivery_orders_detail_pending ON delivery_orders
 -- (sem mudar a versão); tchefood_delivery_save_order só a zera quando o pedido volta a ficar sem detalhe (FALSE ->
 -- TRUE: busca logo).
 ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS detail_retry_at TIMESTAMPTZ;
+-- Quando o servidor gravou o pedido pela primeira vez (relógio do banco). Decide a janela de 7 dias da recuperação do
+-- detalhe: o horário do app (placed_at) pode vir ausente e virar 1970, e esse pedido nunca seria buscado de novo.
+ALTER TABLE delivery_orders ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE delivery_orders DROP CONSTRAINT IF EXISTS delivery_orders_version_positive;
 ALTER TABLE delivery_orders ADD CONSTRAINT delivery_orders_version_positive CHECK (version >= 1);
 -- merchantId do iFood cadastrado à mão: só letras, números e hífen (o polling ignora, com aviso no log, um id
@@ -107,7 +110,8 @@ $$;
 
 -- Pedidos ainda sem o detalhe do app cuja próxima tentativa já chegou (o servidor tenta buscar o detalhe de novo):
 -- primeiro os nunca adiados, depois os de tentativa mais antiga; empate pelo pedido mais antigo. Pedido cancelado ou
--- feito há mais de 7 dias fica de fora (não vira venda; a pendência gravada fica para a conferência).
+-- recebido pelo servidor há mais de 7 dias (received_at, não o horário do app) fica de fora (não vira venda; a
+-- pendência gravada fica para a conferência).
 CREATE OR REPLACE FUNCTION tchefood_delivery_list_detail_pending(p_channel delivery_channel, p_limit INTEGER)
 RETURNS JSONB
 LANGUAGE sql STABLE SET search_path = public AS $$
@@ -115,7 +119,7 @@ LANGUAGE sql STABLE SET search_path = public AS $$
                               ORDER BY q.detail_retry_at NULLS FIRST, q.placed_at, q.external_id), '[]'::jsonb)
       FROM (SELECT * FROM delivery_orders o
              WHERE o.channel = p_channel AND o.detail_pending
-               AND o.status <> 'cancelled' AND o.placed_at > NOW() - INTERVAL '7 days'
+               AND o.status <> 'cancelled' AND o.received_at > NOW() - INTERVAL '7 days'
                AND COALESCE(o.detail_retry_at, '-infinity'::timestamptz) <= NOW()
              ORDER BY o.detail_retry_at NULLS FIRST, o.placed_at, o.external_id
              LIMIT LEAST(GREATEST(COALESCE(p_limit, 20), 1), 100)) q

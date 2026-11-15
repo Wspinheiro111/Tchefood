@@ -107,7 +107,7 @@ não acusa um cancelamento que não foi pedido. Se o desfazer também falhar, a 
 | Método e rota | O que faz |
 |---|---|
 | `GET /health` | Público: `ok`, `running`, `merchants`, `lastCycleAt` e `hasError` (sim/não). O texto do erro fica só no log. |
-| `POST /ifood/orders/:id/actions/:acao` | `confirm`, `start_preparation`, `ready_for_pickup`, `dispatch`. 200 com o pedido **ainda no status de antes** (o novo só chega com o evento do iFood) e `actionSent: <ação>`: a tela mostra "enviado, aguardando o app" no lugar do botão. A mesma ação de novo para o mesmo pedido em até 60 s, sem evento novo do pedido: 409 "Ação já enviada ao app, aguardando a confirmação dele" sem chamar o iFood (só em memória do processo; só depois de sucesso, então a nova tentativa depois de uma falha segue normal) |
+| `POST /ifood/orders/:id/actions/:acao` | `confirm`, `start_preparation`, `ready_for_pickup`, `dispatch`. 200 com o pedido **ainda no status de antes** (o novo só chega com o evento do iFood) e `actionSent: <ação>`: a tela mostra "enviado, aguardando o app" no lugar do botão. A mesma ação de novo para o mesmo pedido em até 60 s, sem evento novo do pedido: 409 "Ação já enviada ao app, aguardando a confirmação dele" sem chamar o iFood (só em memória do processo; só depois de sucesso, então a nova tentativa depois de uma falha segue normal). A trava vale assim que o iFood aceita, e a ação segue "em andamento" (409) até a resposta sair; se a leitura do pedido no banco falhar depois do aceite, a resposta é 200 com o pedido lido antes e `actionSent` (nunca um erro que convide a repetir) |
 | `GET /ifood/orders/:id/cancellation-reasons` | Motivos que o iFood aceita agora para o pedido |
 | `POST /ifood/orders/:id/cancellation` | `{code, description, details?, authorization}`; o código precisa estar na lista atual. Lista vazia (pedido concluído, cancelado ou fora da janela): 400 "O iFood não aceita cancelamento deste pedido agora." |
 | `POST /ifood/orders/:id/dispute` | Resposta à negociação (corpo abaixo), mais `authorization` (PIN de gerente) e `disputeId` da negociação mostrada (obrigatório: ausente ou fora do formato dá 400, outra negociação dá 409, os dois antes do PIN e sem chamar o iFood). A resposta só vai para essa negociação; se o app trocar a negociação depois da conferência, a reserva dá 409 sem chamar o iFood |
@@ -281,7 +281,8 @@ Todos os caminhos ficam em `IFOOD_PATHS` (`ifoodMerchantApi.ts`), marcados "a co
   `needsReview` sozinho não bloqueia (junta avisos de naturezas diferentes; travar por ele pararia pedido bom): sai
   como aviso em `deliverySaleWarnings(registro)`, para a tela mostrar e pedir conferência. Ainda não está ligada em
   nada: a tela do item 5 chama a guarda antes de lançar a venda, mandar para a produção ou emitir a nota.
-- Pedido mínimo cujo detalhe nunca vem: passados 7 dias do pedido ele sai do rodízio de recuperação e continua com
+- Pedido mínimo cujo detalhe nunca vem: passados 7 dias de quando o servidor o recebeu (`received_at`, relógio do
+  banco; não o horário do app, que pode vir ausente e virar 1970) ele sai do rodízio de recuperação e continua com
   `detailPending = true`, ou seja bloqueado pela guarda para sempre. Só uma liberação manual, com o PIN de gerente,
   pode destravar (lançando itens e valores conferidos no Portal do Parceiro); essa liberação é trabalho do item 5 e
   ainda não existe.

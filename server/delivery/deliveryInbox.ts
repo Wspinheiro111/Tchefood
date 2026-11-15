@@ -148,7 +148,7 @@ export interface DeliveryRepository {
   listOrders(): Promise<DeliveryOrderRecord[]>;
   // Pedidos do app ainda sem o detalhe (detailPending) cuja próxima tentativa já chegou (ver deferDetail): primeiro
   // os nunca adiados, depois os de tentativa mais antiga; empate pelo pedido mais antigo. No máximo limit. Ficam de
-  // fora o pedido cancelado e o feito há mais de DETAIL_PENDING_MAX_AGE_DAYS dias (não viram venda; a conferência
+  // fora o pedido cancelado e o recebido pelo servidor há mais de DETAIL_PENDING_MAX_AGE_DAYS dias (não viram venda; a conferência
   // fica com a pendência gravada).
   listDetailPending(channel: DeliveryChannelKey, limit: number): Promise<DeliveryOrderRecord[]>;
   // Adia a próxima tentativa de buscar o detalhe de um pedido ainda detailPending para daqui a seconds segundos
@@ -162,6 +162,9 @@ export class InMemoryDeliveryRepository implements DeliveryRepository {
   private readonly orders = new Map<string, DeliveryOrderRecord>();
   // Próxima tentativa do detalhe por pedido (detail_retry_at no banco), fora do registro: saveOrder não mexe.
   private readonly detailRetryAt = new Map<string, number>();
+  // Quando o servidor gravou o pedido pela primeira vez (received_at no banco): é o que decide os 7 dias da
+  // recuperação, não o horário do app (que pode vir ausente e virar 1970).
+  private readonly receivedAt = new Map<string, number>();
   private readonly now: () => Date;
 
   constructor(options: { now?: () => Date } = {}) {
@@ -188,6 +191,7 @@ export class InMemoryDeliveryRepository implements DeliveryRepository {
     if (storedVersion !== record.version) throw new DeliveryConcurrencyError(record.order.channel, record.order.externalId);
     if (stored && !stored.detailPending && record.detailPending) this.detailRetryAt.delete(key);
     const version = storedVersion + 1;
+    if (!stored) this.receivedAt.set(key, this.now().getTime());
     this.orders.set(key, { ...structuredClone(record), version });
     return version;
   }
@@ -208,7 +212,7 @@ export class InMemoryDeliveryRepository implements DeliveryRepository {
           record.order.channel === channel &&
           record.detailPending &&
           record.order.status !== "cancelled" &&
-          Date.parse(record.order.createdAt) >= oldest &&
+          (this.receivedAt.get(`${record.order.channel}:${record.order.externalId}`) ?? now) >= oldest &&
           retryAt(record) <= now,
       )
       .sort(
@@ -406,19 +410,26 @@ export class DeliveryInbox {
     this.actionsInFlight.add(key);
     try {
       await adapter.performAction(externalOrderId, action);
+      // O app aceitou: a trava de 60 s vale já, antes de qualquer leitura do banco, e a ação continua "em andamento"
+      // até o fim desta função. Guarda o status de antes do envio: a repetição só passa quando um evento mudar o pedido.
+      this.actionsSent.set(key, {
+        action,
+        at: this.now().getTime(),
+        status: record.order.status,
+        cancellationPending: record.cancellationPending,
+      });
+      // O status oficial chega pelo evento do app; nada é gravado aqui, para que a resposta da ação nunca
+      // sobrescreva um evento processado pelo polling enquanto a chamada estava em andamento. Se a leitura falhar,
+      // a ação já foi aceita: devolve o pedido lido antes (a resposta diz actionSent) em vez de um erro que convide
+      // a repetir.
+      try {
+        return await this.requireOrder(channel, externalOrderId);
+      } catch {
+        return record;
+      }
     } finally {
       this.actionsInFlight.delete(key);
     }
-    // O status oficial chega pelo evento do app; nada é gravado aqui, para que a resposta da ação nunca
-    // sobrescreva um evento processado pelo polling enquanto a chamada estava em andamento.
-    const latest = await this.requireOrder(channel, externalOrderId);
-    this.actionsSent.set(key, {
-      action,
-      at: this.now().getTime(),
-      status: latest.order.status,
-      cancellationPending: latest.cancellationPending,
-    });
-    return latest;
   }
 
   async listCancellationReasons(channel: DeliveryChannelKey, externalOrderId: string): Promise<DeliveryCancellationReason[]> {
