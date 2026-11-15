@@ -444,17 +444,22 @@ export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?
   // Reaberta no servidor e ainda não aplicada aqui (mesmo que este aparelho ainda a veja fechada): aparece com os dados
   // do servidor e o motivo, sem ações até convergir (cobrar ou encerrar dependem do estado do servidor aqui).
   const remoteOnly = (server ?? []).filter((r) => blocked[r.order_id] || !orders.some((o) => o.id === r.order_id));
+  // GPT r18 P2-01: conta que só este aparelho ainda vê reaberta (pode já ter sido paga ou encerrada em outro aparelho)
+  // e não pôde ser atualizada: aparece com o saldo daqui, o motivo e sem ações.
+  const staleBlocked = orders.filter((o) => blocked[o.id] && isRefundReopenedOrder(o, payments, logs) && !(server ?? []).some((r) => r.order_id === o.id));
   const failure = failed === 'changes' ? READ_PARTIAL : failed === 'all' ? READ_FAILED : null;
-  if (local.length === 0 && remoteOnly.length === 0) {
+  if (local.length === 0 && remoteOnly.length === 0 && staleBlocked.length === 0) {
     // Sem conta para mostrar, mas a leitura falhou: o aviso aparece (falha não fica com cara de "nada pendente").
     if (!cloud || !failure) return null;
     return <div role="alert" data-testid="reopened-read-failed" className="rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm text-slate-800">{failure}{readAt ? ` Última leitura completa às ${hhmm(readAt)}.` : ''}</div>;
   }
-  const why = (id: string) => (blocked[id] === 'rejected'
+  const why = (id: string, stale = false) => (blocked[id] === 'rejected'
     ? 'este aparelho tem alteração desta conta recusada pela nuvem: resolva em Nuvem › recusados; depois a conta vem do servidor e as ações aparecem aqui.'
     : blocked[id] === 'pending'
       ? 'este aparelho tem alteração desta conta ainda não enviada: aguarde a sincronização; depois a conta vem do servidor e as ações aparecem aqui.'
-      : 'ainda não trazida para este aparelho (leitura da nuvem falhou); tentando de novo a cada minuto.');
+      : stale
+        ? 'a conta pode já ter sido paga ou encerrada em outro aparelho e não foi conferida (a leitura da nuvem falhou); tentando de novo a cada minuto.'
+        : 'ainda não trazida para este aparelho (leitura da nuvem falhou); tentando de novo a cada minuto.');
   return (
     <div role="alert" className="rounded-2xl border-2 border-ouro bg-ouro/10 p-4 text-sm">
       <div className="mb-1 font-black text-brasa">Contas reabertas pelo estorno</div>
@@ -474,6 +479,11 @@ export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?
           </div>
         );
       })}
+      {staleBlocked.map((o) => (
+        <div key={o.id} data-testid={`reopened-blocked-${o.id}`} className="flex flex-wrap items-center justify-between gap-2 border-t border-ouro/40 py-2">
+          <span><b>{tables.find((t) => t.id === o.table_id)?.label ?? 'Conta'}</b> · saldo {formatBRL(o.remaining_balance)} neste aparelho (pode estar desatualizado) · <span className="text-xs">{why(o.id, true)}</span></span>
+        </div>
+      ))}
       {remoteOnly.map((r) => {
         const label = tables.find((t) => t.id === r.table_id)?.label ?? 'Conta';
         return (

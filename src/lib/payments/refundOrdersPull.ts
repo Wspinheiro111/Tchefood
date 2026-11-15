@@ -163,10 +163,15 @@ async function doPull(deps: ClaimDeps, scope: PullScope): Promise<RefundOrdersPu
   }).map((i) => i.order_id);
   // Só este aparelho ainda vê como reaberta (paga ou encerrada em outro aparelho, ou resposta perdida): confere lá.
   const stale = st.orders.filter((o) => isRefundReopenedOrder(o, st.payments, st.auditLogs) && !onServer.has(o.id)).map((o) => o.id);
+  // GPT r18 P2-01: vale para as duas listas. A conta que só este aparelho ainda vê reaberta (paga ou encerrada em outro
+  // aparelho) e não pôde ser atualizada fica bloqueada como as demais, e a leitura que falhou não é "completa".
+  let refreshFailed = false;
   for (const id of [...differs, ...stale]) {
     const r = await syncOrderFromServer(id, deps, scope);
     if (!sameScope(scope)) return { ...nothing, changesOk: false };
-    if (onServer.has(id) && (r === 'pending' || r === 'rejected' || r === 'failed')) blocked[id] = r;
+    if (r === 'pending' || r === 'rejected' || r === 'failed') blocked[id] = r;
+    if (r === 'failed') refreshFailed = true;
   }
-  return { ok: changesOk, changesOk, reopened: out.items, blocked };
+  const complete = changesOk && !refreshFailed;
+  return { ok: complete, changesOk: complete, reopened: out.items, blocked };
 }
