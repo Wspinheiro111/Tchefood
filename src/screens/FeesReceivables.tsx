@@ -7,7 +7,7 @@ import { useMemo, useState } from 'react';
 import { CalendarDays, Pencil, Plus, Trash2 } from 'lucide-react';
 import { Btn, Sheet, toast } from '../components/ui';
 import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
-import { useOwnerSettings, useStoreFees } from '../store/useOwnerSettings';
+import { mergeLegacyFees, pendingLegacyFees, useOwnerSettings, useStoreFees } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import { parseMoneyInput } from '../lib/cashRegister';
 import { DELIVERY_CHANNEL_CATALOG } from '../../server/delivery/marketplace';
@@ -31,7 +31,7 @@ export function FeesReceivables() {
   const canEdit = isManagerRole(user?.role);
   const { feeRules: rules, appCommissionPct: commissions } = useStoreFees();
   const tenantId = useTcheStore((s) => s.tenant.id);
-  const legacyFees = useOwnerSettings((s) => s.legacyFees);
+  const legacyFees = useOwnerSettings(pendingLegacyFees);
   const saveFeeRule = useOwnerSettings((s) => s.saveFeeRule);
   const removeFeeRule = useOwnerSettings((s) => s.removeFeeRule);
   const setAppCommission = useOwnerSettings((s) => s.setAppCommission);
@@ -60,28 +60,68 @@ export function FeesReceivables() {
 
   const edit = (r: FeeRule) => setDraft({ id: r.id, acquirer: r.acquirer, method: r.method, brand: r.brand, pct: String(r.pct).replace('.', ','), fixed: String(r.fixed).replace('.', ','), days: String(r.days), businessDays: r.businessDays });
 
-  const anyLegacy = !!legacyFees && (legacyFees.feeRules.length > 0 || Object.values(legacyFees.appCommissionPct).some((v) => v !== null && v !== undefined));
-  const showLegacy = anyLegacy && rules.length === 0 && !Object.values(commissions).some((v) => v !== null && v !== undefined);
+  // Taxas antigas (de antes da separação por loja) ficam à vista enquanto existirem, mesmo
+  // que a loja já tenha cadastrado as suas: nada fica guardado sem a gerência ver.
+  const legacyReview = useMemo(
+    () => (legacyFees ? mergeLegacyFees({ feeRules: rules, appCommissionPct: commissions }, legacyFees) : null),
+    [legacyFees, rules, commissions],
+  );
+  const conflictRule = new Set(legacyReview?.conflicts.rules.map((r) => r.id) ?? []);
+  const conflictChannel = new Set(legacyReview?.conflicts.channels ?? []);
+  const legacyChannels = legacyFees ? Object.entries(legacyFees.appCommissionPct).filter(([, v]) => v !== null && v !== undefined) : [];
+  const legacyTotal = (legacyFees?.feeRules.length ?? 0) + legacyChannels.length;
+  const onlyConflicts = legacyTotal > 0 && legacyTotal === conflictRule.size + conflictChannel.size;
+  const channelLabel = (key: string) => (DELIVERY_CHANNEL_CATALOG as Readonly<Record<string, { label: string }>>)[key]?.label ?? key;
 
   return (
     <div className="space-y-4">
-      {showLegacy && (
-        <section role="alert" className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-amarelo/15 p-4 text-sm">
-          <span>
-            Há {legacyFees!.feeRules.length} taxa(s) da maquininha cadastrada(s) antes de o app separar as taxas por loja. Não se sabe de qual loja são, então não valem para esta loja até você confirmar.
-          </span>
+      {legacyFees && (
+        <section role="alert" aria-label="Taxas antigas" className="space-y-2 rounded-2xl bg-amarelo/15 p-4 text-sm">
+          <p>
+            Taxas e comissões cadastradas antes de o app separar as taxas por loja. Não se sabe de qual loja são, então não valem para esta loja até você trazê-las. O que já existe na loja com valor diferente não é trocado: fica aqui marcado como conflito.
+          </p>
+          <ul className="list-disc pl-5">
+            {legacyFees.feeRules.map((r) => (
+              <li key={r.id}>
+                {FEE_ACQUIRER_LABEL[r.acquirer]} · {FEE_METHOD_LABEL[r.method]} · {r.brand ?? 'todas as bandeiras'}: {String(r.pct).replace('.', ',')}% + {formatBRL(r.fixed)}, D+{r.days}
+                {conflictRule.has(r.id) && <strong> (conflito: a loja já tem outra taxa para esta maquininha, forma e bandeira)</strong>}
+              </li>
+            ))}
+            {legacyChannels.map(([ch, v]) => (
+              <li key={ch}>
+                Comissão {channelLabel(ch)}: {String(v).replace('.', ',')}%
+                {conflictChannel.has(ch) && <strong> (conflito: a loja já tem outra comissão para este app)</strong>}
+              </li>
+            ))}
+          </ul>
           {canEdit && (
-            <Btn
-              variant="secondary"
-              aria-label="As taxas são desta loja"
-              onClick={() => {
-                const err = useOwnerSettings.getState().adoptLegacyFees(tenantId);
-                if (err) toast.error(err);
-                else toast.success('Taxas confirmadas para esta loja.');
-              }}
-            >
-              As taxas são desta loja
-            </Btn>
+            <div className="flex flex-wrap gap-2">
+              {!onlyConflicts && (
+                <Btn
+                  variant="secondary"
+                  aria-label="As taxas são desta loja"
+                  onClick={() => {
+                    const err = useOwnerSettings.getState().adoptLegacyFees(tenantId);
+                    if (err) toast.error(err);
+                    else toast.success(pendingLegacyFees(useOwnerSettings.getState()) ? 'Taxas trazidas. As que conflitam ficaram marcadas para você conferir.' : 'Taxas trazidas para esta loja.');
+                  }}
+                >
+                  As taxas são desta loja
+                </Btn>
+              )}
+              {onlyConflicts && (
+                <Btn
+                  variant="secondary"
+                  aria-label="Descartar as taxas antigas em conflito"
+                  onClick={() => {
+                    useOwnerSettings.getState().discardLegacyFees();
+                    toast.success('Taxas antigas descartadas. Valem as cadastradas para esta loja.');
+                  }}
+                >
+                  Descartar as antigas em conflito
+                </Btn>
+              )}
+            </div>
           )}
         </section>
       )}

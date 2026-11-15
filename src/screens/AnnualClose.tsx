@@ -146,8 +146,10 @@ export function AnnualClose() {
   // "situação desconhecida"), nunca como as desta loja.
   const { feeRules, appCommissionPct } = storeFees(snap, tenant.id);
   const anyFee = (f: StoreFees | null) => !!f && (f.feeRules.length > 0 || Object.values(f.appCommissionPct).some((v) => v !== null && v !== undefined));
-  // Taxas de antes da separação por loja e esta loja sem taxas: avisa e oferece confirmar.
-  const feesForeign = anyFee(snap.legacyFees) && !anyFee(storeFees(snap, tenant.id));
+  // Há taxas de antes da separação por loja esperando decisão: avisa sempre (mesmo que a loja
+  // já tenha as suas), porque elas não entram nos números até a gerência trazê-las.
+  const feesForeign = anyFee(snap.legacyFees);
+  const storeHasFees = anyFee(storeFees(snap, tenant.id));
   // Só a loja deste aparelho (o que sobrou de outra loja fica fora e é avisado).
   const ownProducts = useMemo(() => ownStore(allProducts, tenant.id), [allProducts, tenant.id]);
   const products = ownProducts.rows;
@@ -231,7 +233,9 @@ export function AnnualClose() {
   const clockNote = `ATENÇÃO: o relógio deste aparelho estava em ${brasiliaDateTime(now.getTime())}, antes de ${year} começar, quando este relatório foi gerado. Os números são do ano inteiro, mas confira a data e a hora do aparelho.`;
   const otherNote = `${otherStore} registro(s) de outra loja ou sem loja identificada que ficaram neste aparelho (de antes de ligá-lo a esta loja) foram deixados de fora dos totais.`;
   // Notas que vão em todos os relatórios exportados (as mesmas que a tela mostra no topo).
-  const feesNote = 'Esta loja não tem taxas da maquininha nem comissões cadastradas; as que existem neste aparelho são de antes da separação por loja e não se sabe de qual loja são: foram tratadas como NÃO cadastradas (repasse com situação desconhecida, taxa estimada zero). Se forem desta loja, toque em "As taxas são desta loja" no topo do Fechamento anual (ou em Taxas e recebíveis).';
+  const feesNote = storeHasFees
+    ? 'Há taxas da maquininha ou comissões dos apps de antes da separação por loja neste aparelho, sem loja definida: não entraram nestes números (valem só as cadastradas para esta loja). Confira e traga as que forem desta loja em Taxas e recebíveis (ou em "As taxas são desta loja" aqui); as que conflitam com as da loja não são trocadas.'
+    : 'Esta loja não tem taxas da maquininha nem comissões cadastradas; as que existem neste aparelho são de antes da separação por loja e não se sabe de qual loja são: foram tratadas como NÃO cadastradas (repasse com situação desconhecida, taxa estimada zero). Se forem desta loja, toque em "As taxas são desta loja" no topo do Fechamento anual (ou em Taxas e recebíveis).';
   const partialNote = [
     ...(feesForeign ? [feesNote] : []),
     ...(partial ? [`O ano de ${year} ainda não terminou: os números vão até ${cutoffLabel} (horário de Brasília), não até 31/12.`] : []),

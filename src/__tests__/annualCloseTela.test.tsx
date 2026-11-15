@@ -391,9 +391,25 @@ describe('Fechamento anual (tela): auditoria GPT rodada 6 ampliada (1fbc385)', (
     expect(storeFees(useOwnerSettings.getState(), tid).feeRules).toHaveLength(1);
     expect(useOwnerSettings.getState().legacyFees).toBeNull();
     expect(screen.getByText(/taxa estimada/).textContent).toContain(fmt(30));
-    // Loja que já tem taxas não engole as antigas.
+    // A loja já tem a mesma taxa: trazer de novo não duplica, e as antigas iguais somem.
     act(() => useOwnerSettings.setState({ legacyFees: migrated.legacyFees as never }));
-    expect(useOwnerSettings.getState().adoptLegacyFees(tid)).toMatch(/já tem taxas/);
+    expect(useOwnerSettings.getState().adoptLegacyFees(tid)).toBeNull();
+    expect(storeFees(useOwnerSettings.getState(), tid).feeRules).toHaveLength(1);
+    expect(useOwnerSettings.getState().legacyFees).toBeNull();
+  });
+
+  it('rodada 8 P2-01: loja com taxa nova continua avisada das taxas antigas pendentes (não somem da tela)', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    const tid = useTcheStore.getState().tenant.id;
+    const old = { id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false } as const;
+    const pix = { ...old, id: 'p', method: 'PIX', pct: 0.99, days: 0 } as const;
+    act(() => useOwnerSettings.setState({ feesByTenant: { [tid]: { feeRules: [pix], appCommissionPct: {} } }, legacyFees: { feeRules: [old], appCommissionPct: { ifood: 12 } } }));
+    setup('own');
+    render(<AnnualClose />);
+    expect(screen.getAllByText(/não entraram nestes números/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByLabelText('As taxas são desta loja'));
+    expect(storeFees(useOwnerSettings.getState(), tid).feeRules.map((r) => r.id).sort()).toEqual(['p', 'r']);
+    expect(screen.queryAllByText(/não entraram nestes números/)).toHaveLength(0);
   });
 
   it('troca de loja com a tela aberta refaz a foto (não mostra a posição da loja anterior)', () => {

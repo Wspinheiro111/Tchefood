@@ -39,8 +39,14 @@ interface OwnerSettingsState {
    * não valem para nenhuma até alguém da gerência confirmar (`adoptLegacyFees`).
    */
   legacyFees: StoreFees | null;
-  /** As taxas antigas (sem loja) passam a ser da loja indicada, se ela ainda não tem taxas. */
+  /**
+   * Traz as taxas antigas (sem loja) para a loja indicada, sem sobrescrever nada que ela já
+   * tenha: a regra da mesma maquininha, forma e bandeira (ou a comissão do mesmo app) com
+   * valor diferente fica nas antigas, à vista, até a gerência resolver; a igual não duplica.
+   */
   adoptLegacyFees: (tenantId: string) => string | null;
+  /** Descarta as taxas antigas que sobraram (só as que conflitam com as da loja). */
+  discardLegacyFees: () => void;
   /** Grava (novo ou edição) uma regra de taxa DA LOJA ATUAL. Devolve o erro, ou null. */
   saveFeeRule: (rule: Omit<FeeRule, 'id'> & { id?: string }) => string | null;
   removeFeeRule: (id: string) => void;
@@ -75,6 +81,42 @@ const currentTenantId = (): string => useTcheStore.getState().tenant.id;
 const hasAnyFee = (f: StoreFees | null | undefined): boolean =>
   !!f && (f.feeRules.length > 0 || Object.values(f.appCommissionPct).some((v) => v !== null && v !== undefined));
 
+const sameSlot = (a: FeeRule, b: FeeRule) => a.acquirer === b.acquirer && a.method === b.method && a.brand === b.brand;
+const sameValues = (a: FeeRule, b: FeeRule) => a.pct === b.pct && a.fixed === b.fixed && a.days === b.days && a.businessDays === b.businessDays;
+
+/**
+ * Junta as taxas antigas às da loja sem sobrescrever: o que não existe na loja entra; o que
+ * já existe igual não duplica (sai das antigas); o que existe com valor diferente é conflito
+ * e fica nas antigas (`left`), nunca troca a taxa da loja sozinho.
+ */
+export function mergeLegacyFees(store: StoreFees, legacy: StoreFees): { merged: StoreFees; left: StoreFees; conflicts: { rules: FeeRule[]; channels: string[] } } {
+  const rules = [...store.feeRules];
+  const leftRules: FeeRule[] = [];
+  for (const r of legacy.feeRules) {
+    const cur = rules.find((x) => sameSlot(x, r));
+    if (!cur) rules.push(rules.some((x) => x.id === r.id) ? { ...r, id: uuid() } : r);
+    else if (!sameValues(cur, r)) leftRules.push(r);
+  }
+  const commissions = { ...store.appCommissionPct };
+  const leftCommissions: Record<string, number | null> = {};
+  for (const [ch, v] of Object.entries(legacy.appCommissionPct)) {
+    if (v === null || v === undefined) continue;
+    const cur = commissions[ch];
+    if (cur === null || cur === undefined) commissions[ch] = v;
+    else if (cur !== v) leftCommissions[ch] = v;
+  }
+  return {
+    merged: { feeRules: rules, appCommissionPct: commissions },
+    left: { feeRules: leftRules, appCommissionPct: leftCommissions },
+    conflicts: { rules: leftRules, channels: Object.keys(leftCommissions) },
+  };
+}
+
+/** Taxas antigas que ainda esperam decisão (null = nenhuma). */
+export function pendingLegacyFees(s: Pick<OwnerSettingsState, 'legacyFees'>): StoreFees | null {
+  return hasAnyFee(s.legacyFees) ? s.legacyFees : null;
+}
+
 /** Hook: taxas e comissões da loja que está no aparelho agora. */
 export function useStoreFees(): StoreFees {
   const tenantId = useTcheStore((s) => s.tenant.id);
@@ -99,17 +141,15 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
         let err: string | null = null;
         set((s) => {
           if (!hasAnyFee(s.legacyFees)) {
-            err = 'Não há taxas antigas para confirmar.';
+            err = 'Não há taxas antigas para trazer.';
             return {};
           }
-          if (hasAnyFee(s.feesByTenant[tenantId])) {
-            err = 'Esta loja já tem taxas cadastradas: confira as antigas e cadastre de novo o que for dela.';
-            return {};
-          }
-          return { feesByTenant: { ...s.feesByTenant, [tenantId]: s.legacyFees! }, legacyFees: null };
+          const { merged, left } = mergeLegacyFees(storeFees(s, tenantId), s.legacyFees!);
+          return { feesByTenant: { ...s.feesByTenant, [tenantId]: merged }, legacyFees: hasAnyFee(left) ? left : null };
         });
         return err;
       },
+      discardLegacyFees: () => set({ legacyFees: null }),
       saveFeeRule: (input) => {
         const rule: FeeRule = {
           id: input.id ?? uuid(),
