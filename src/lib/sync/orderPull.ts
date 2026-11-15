@@ -386,6 +386,21 @@ export function parseCloudOrders(body: unknown, tenantId: UUID): CloudOrders {
   };
 }
 
+const ORDER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Contas que a leitura pede pelo id (até 500, nesta ordem): primeiro as em aberto aqui, depois
+ * as das entregas próprias ainda sem acerto aqui, em qualquer data. Assim a entrega acertada em
+ * outro aparelho com a conta encerrada há mais de 24 h desce com o acerto e sai do acerto deste
+ * aparelho, que senão a mandaria em todo acerto daquele entregador e seria sempre recusado
+ * (Codex no PR #54). Só ids UUID: um banco ainda sem a migração recusaria a leitura inteira.
+ */
+export function orderIdsToReconcile(s: { orders: readonly Pick<Order, 'id' | 'status'>[]; ownDeliveries: readonly Pick<OwnDelivery, 'order_id' | 'status' | 'settlement_id'>[] }): UUID[] {
+  const open = s.orders.filter((o) => o.status === 'OPEN' || o.status === 'PAYING').map((o) => o.id);
+  const unsettled = s.ownDeliveries.filter((d) => d.status !== 'CANCELED' && d.settlement_id === null).map((d) => d.order_id);
+  return [...new Set([...open, ...unsettled])].filter((id) => ORDER_ID_RE.test(id));
+}
+
 /**
  * Contas, itens, pagamentos e ocupação das mesas da loja do token, numa foto só do banco.
  * `openHere`: contas em aberto neste aparelho; o banco as devolve mesmo encerradas há mais

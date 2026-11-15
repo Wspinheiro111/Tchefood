@@ -8,7 +8,7 @@ import { useEffect, useState, useSyncExternalStore } from 'react';
 import { useTcheStore, type PullSource, type PullStatus } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
-import { fetchCloudOrders, missingCatalog, missingHalves, missingModifiers, skippedMessage } from './orderPull';
+import { fetchCloudOrders, missingCatalog, orderIdsToReconcile, missingHalves, missingModifiers, skippedMessage } from './orderPull';
 
 const INTERVAL_MS = 5_000;
 /** Leitura dos cadastros da nuvem pela cadência normal (só com a fila vazia: o que é daqui sobe antes). */
@@ -104,8 +104,6 @@ export function resetPullLoopForTests(): void {
   ordersRoundRan.clear();
   for (const l of roundListeners) l();
 }
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Aviso de rede da leitura da nuvem: só o texto em português, sem o do navegador. */
 export const NETWORK_PULL_MESSAGE = 'Sem conexão com a nuvem. Tentando de novo.';
@@ -216,9 +214,8 @@ async function pullOrdersOnce(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh:
     // Só ids UUID vão para p_order_ids (auditoria interna, rodada 8 do PR #54): o banco
     // atualizado ignora o id fora do formato, mas um banco ainda sem a migração recusaria a
     // leitura inteira, e o id inválido ocuparia uma das 500 vagas da lista.
-    const openHere = useTcheStore.getState().orders
-      .filter((o) => (o.status === 'OPEN' || o.status === 'PAYING') && UUID_RE.test(o.id))
-      .map((o) => o.id);
+    // Com as contas das entregas ainda sem acerto aqui (Codex no PR #54): ver orderIdsToReconcile.
+    const openHere = orderIdsToReconcile(useTcheStore.getState());
     const snapshot = await fetchCloudOrders(cfg, tenantId, fetchFn, openHere);
     let st = useTcheStore.getState();
     if (!st.cloud || st.tenant.id !== tenantId) return 'discarded';

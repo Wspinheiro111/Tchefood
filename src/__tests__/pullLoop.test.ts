@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CloudSnapshot } from '../lib/sync/cloudPull';
 import type { CloudOrders } from '../lib/sync/orderPull';
 import { useTcheStore, type CloudSession } from '../store/useTcheStore';
-import type { Order, OrderItem } from '../types';
+import type { Order, OrderItem, OwnDelivery } from '../types';
 
 const fake = vi.hoisted(() => ({
   catalog: vi.fn<() => Promise<unknown>>(),
@@ -219,6 +219,38 @@ describe('contas abertas enviadas ao banco (auditoria interna, rodada 8 do PR #5
     await tick();
     expect(fake.orders).toHaveBeenCalledTimes(1);
     expect(fake.orders.mock.calls[0]![3]).toEqual([O2]);
+  });
+});
+
+describe('entrega sem acerto aqui com a conta encerrada há mais de 24 h (Codex no PR #54)', () => {
+  const O3 = '03030303-0303-4303-8303-030303030303';
+  const O4 = '04040404-0404-4404-8404-040404040404';
+  const O5 = '05050505-0505-4505-8505-050505050505';
+  const S1 = '0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0a';
+  const delivery = (id: string, orderId: string, over: Partial<OwnDelivery> = {}): OwnDelivery => ({
+    id, tenant_id: st().tenant.id, order_id: orderId, customer_name: 'Ana', customer_phone: '55999990000', address: 'Rua 1', reference: null,
+    zone_id: 'z1', zone_name: 'Centro', delivery_fee: 5, pay_on_delivery: false, change_for: null, status: 'DELIVERED', courier_id: 'c1',
+    courier_fee: 4, out_at: '2026-11-12T19:00:00Z', delivered_at: '2026-11-12T19:30:00Z', settlement_id: null, created_at: '2026-11-12T18:30:00Z', ...over,
+  });
+  const closed = (id: string): Order => ({ ...openOrder(id, st().tables.find((t) => t.kind === 'TABLE')!.id), status: 'CLOSED', closed_at: '2026-11-12T19:30:00Z', paid_amount: 50, remaining_balance: 0 });
+
+  it('a leitura pede a conta da entrega sem acerto (depois das abertas), e o acerto feito em outro aparelho desce', async () => {
+    const table = st().tables.find((t) => t.kind === 'TABLE')!.id;
+    useTcheStore.setState({
+      orders: [closed(O3), openOrder(O2, table), closed(O4), closed(O5)],
+      ownDeliveries: [
+        delivery('d3', O3),
+        delivery('d4', O4, { settlement_id: '0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b' }),
+        delivery('d5', O5, { status: 'CANCELED' }),
+      ],
+    });
+    fake.orders.mockImplementation(async () => {
+      const c = ordersWith();
+      return { ...c, orders: [...c.orders, closed(O3)], ownDeliveries: [delivery('d3', O3, { settlement_id: S1 })] };
+    });
+    await tick();
+    expect(fake.orders.mock.calls[0]![3]).toEqual([O2, O3]);
+    expect(st().ownDeliveries.find((d) => d.id === 'd3')!.settlement_id).toBe(S1);
   });
 });
 
