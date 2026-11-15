@@ -4008,6 +4008,12 @@ export const useTcheStore = create<TcheState>()(
           if (session && session.tenant_id !== get().tenant.id) {
             return fail('Esta conta da nuvem é de outra loja. Use a conta desta loja ou inicie uma loja nova.');
           }
+          // Desconectar com acerto do entregador incerto ou a terminar: o acerto sem nuvem faria
+          // outro acerto das mesmas entregas e outra sangria (Codex, rodada 11 do PR #54).
+          if (!session && get().cloud) {
+            const settling = courierSettleBlocksStoreChange(get());
+            if (settling) return fail(settling.replace('trocar a loja deste aparelho', 'desconectar da nuvem'));
+          }
           set({ cloud: session });
           return { ok: true, data: undefined };
         },
@@ -5422,7 +5428,9 @@ export const useTcheStore = create<TcheState>()(
           if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário acerta com o entregador.');
           const courier = get().couriers.find((c) => c.id === courierId);
           if (!courier) return fail('Entregador não encontrado.');
-          const own = get().ownDeliveries.filter((d) => d.courier_id === courierId && d.status === 'DELIVERED' && d.settlement_id === null);
+          // Entrega de um acerto da nuvem ainda incerto não entra num acerto sem nuvem.
+          const inPending = new Set((get().courierSettlePending ?? []).flatMap((p) => p.delivery_ids));
+          const own = get().ownDeliveries.filter((d) => d.courier_id === courierId && d.status === 'DELIVERED' && d.settlement_id === null && !inPending.has(d.id));
           if (own.length === 0) return fail('Nenhuma entrega para acertar.');
           const feesCents = own.reduce((a, d) => a + toCents(d.courier_fee ?? 0), 0);
           if (opts.payFromDrawer && feesCents > 0) {
@@ -5501,7 +5509,11 @@ export const useTcheStore = create<TcheState>()(
         settleCourierOnline: async (courierId, opts) => {
           const cloud = get().cloud;
           const tenantAtStart = get().tenant.id;
-          if (!cloud) return get().settleCourier(courierId, opts);
+          if (!cloud) {
+            // Acerto incerto da nuvem só se repete pela nuvem (Codex, rodada 11 do PR #54).
+            if (opts.pendingId !== undefined) return fail('Este acerto ficou sem resposta da nuvem: conecte de novo à nuvem para repetir.');
+            return get().settleCourier(courierId, opts);
+          }
           const user = currentUser();
           if (!user) return fail('Sessão expirada. Faça login novamente.');
           if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário acerta com o entregador.');

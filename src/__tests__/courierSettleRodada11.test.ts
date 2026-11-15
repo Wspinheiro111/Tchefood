@@ -239,3 +239,19 @@ describe('4: repetição sem o entregador no aparelho', () => {
     expect(await settle(a.courier.id, cloudFn([]))).toMatchObject({ ok: false, error: 'Entregador não encontrado.' });
   });
 });
+
+describe('5: acerto incerto e desconectar da nuvem (Codex, rodada 11)', () => {
+  it('não desconecta com acerto sem resposta; sem nuvem, a repetição é recusada e o acerto local não pega as entregas dele', async () => {
+    const a = deliveredOrder();
+    connectCloud();
+    const p = await pendingFor(a.courier.id);
+    const r = st().setCloudSession(null);
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/desconectar da nuvem/) });
+    expect(st().cloud).not.toBeNull();
+    // Mesmo sem nuvem (estado antigo), nada repete fora dela nem acerta as mesmas entregas.
+    useTcheStore.setState({ cloud: null });
+    expect(await settle(a.courier.id, cloudFn([]), p.id)).toMatchObject({ ok: false, error: expect.stringMatching(/conecte de novo/) });
+    expect(st().settleCourier(a.courier.id, { payFromDrawer: false, auth: null })).toMatchObject({ ok: false, error: 'Nenhuma entrega para acertar.' });
+    expect(st().courierSettlements).toEqual([]);
+  });
+});
