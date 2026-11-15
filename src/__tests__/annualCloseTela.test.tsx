@@ -109,10 +109,10 @@ describe('Fechamento anual (tela): corte único no ano em andamento (auditoria P
     render(<AnnualClose />);
     expect((screen.getByLabelText('Ano do fechamento') as HTMLSelectElement).value).toBe('2026');
     expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
-    expect(screen.getAllByText(/Posição em 14\/11\/2026 10:00 \(ano em andamento\)/)).toHaveLength(2);
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 10:00:00 \(ano em andamento\)/)).toHaveLength(2);
     expect(screen.getAllByText(/os números vão até 14\/11\/2026 10:00/).length).toBeGreaterThan(0);
     const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
-    expect(alert.textContent).toContain('a partir de 14/11/2026 10:00');
+    expect(alert.textContent).toContain('a partir de 14/11/2026 10:00:00');
     expect(alert.textContent).toContain('Inventário de insumos e mercadorias: 1');
     expect(alert.textContent).toContain('Fechamento de caixa e formas de pagamento: 1');
     expect(alert.textContent).toContain('Contas a pagar e a receber em aberto: 1');
@@ -128,8 +128,8 @@ describe('Fechamento anual (tela): corte único no ano em andamento (auditoria P
       reader.onload = () => resolve(String(reader.result));
       reader.readAsText(blob as unknown as Blob);
     });
-    expect(csv).toContain('01/01/2026 a 14/11/2026 10:00 (ano em andamento)');
-    expect(csv).toContain('1 registro(s) com data a partir de 14/11/2026 10:00 (instante deste relatório) ficaram de fora');
+    expect(csv).toContain('01/01/2026 a 14/11/2026 10:00:00 (ano em andamento)');
+    expect(csv).toContain('1 registro(s) com data a partir de 14/11/2026 10:00:00 (instante deste relatório) ficaram de fora');
 
     // Duas horas depois, "Atualizar" traz o registro das 11:00 e o aviso some.
     vi.setSystemTime(new Date('2026-11-14T12:00:00-03:00'));
@@ -157,8 +157,8 @@ describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
     vi.setSystemTime(new Date('2026-11-14T10:00:30-03:00'));
     setup('own', [pay(30, '2026-11-14T09:00:00')]);
     render(<AnnualClose />);
-    // Corte no próximo minuto cheio: 10:00:30 vira 10:01 (o que já foi lançado entra).
-    expect(screen.getAllByText(/os números vão até 14\/11\/2026 10:01 /).length).toBeGreaterThan(0);
+    // Corte no instante real, com segundos (auditoria GPT rodada 3, P2-02).
+    expect(screen.getAllByText(/os números vão até 14\/11\/2026 10:00:30 /).length).toBeGreaterThan(0);
     vi.setSystemTime(new Date('2026-11-14T12:00:00-03:00'));
     act(() => {
       useTcheStore.setState({
@@ -169,7 +169,7 @@ describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
     });
     expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
     expect(screen.getByText('Itens com saldo').parentElement!.textContent).toContain('0');
-    expect(screen.getAllByText(/Posição em 14\/11\/2026 10:01 \(ano em andamento\)/)).toHaveLength(2);
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 10:00:30 \(ano em andamento\)/)).toHaveLength(2);
     const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
     expect(alert.textContent).toContain('Inventário de insumos e mercadorias: 1');
     expect(alert.textContent).toContain('Fechamento de caixa e formas de pagamento: 2');
@@ -225,5 +225,19 @@ describe('Fechamento anual (tela): rodada interna 3', () => {
     expect(screen.getAllByText('Observações deste relatório')).toHaveLength(4);
     expect(screen.getAllByText(/venda estornada ainda aparece aqui como a receber/).length).toBe(1);
     expect(screen.getAllByText(/não lance estas taxas de novo/).length).toBe(1);
+  });
+});
+
+describe('Fechamento anual (tela): auditoria GPT rodada 3', () => {
+  const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+
+  it('P2-02: com o relógio em 10:00:01, o das 10:00:00 entra e o das 10:00:40 fica fora e é avisado', () => {
+    vi.setSystemTime(new Date('2026-11-14T10:00:01-03:00'));
+    setup('own', [pay(30, '2026-11-14T10:00:00'), pay(70, '2026-11-14T10:00:40')]);
+    render(<AnnualClose />);
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
+    expect(screen.getAllByText(/os números vão até 14\/11\/2026 10:00:01 /).length).toBeGreaterThan(0);
+    const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
+    expect(alert.textContent).toContain('Fechamento de caixa e formas de pagamento: 1');
   });
 });

@@ -11,7 +11,7 @@ import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTche
 import { useOwnerSettings } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import type { MarketplaceSale } from '../lib/ownerDashboard';
-import { brasiliaDateTime, brasiliaYear, clockBeforeYear, defaultYear, duplicateInvoiceMovementIds, ownStore, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { brasiliaDateTime, brasiliaYear, clockBeforeYear, defaultYear, ownStore, rejectedInvoiceIds, reviewDuplicateInvoices, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, REPORT_TITLE, revenueDoc, toCsv, toPrintableHtml, type AnnualReportKind, type ReportDoc } from '../lib/annualCloseExport';
 
 /**
@@ -20,17 +20,10 @@ import { DEVICE_ONLY, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel,
  */
 const NO_MARKETPLACE: MarketplaceSale[] = [];
 /**
- * Agora, arredondado para o próximo minuto cheio: o corte bate com o hh:mm mostrado e
- * o que foi lançado até o instante em que a tela abriu (ou foi atualizada) entra.
+ * O instante real em que a tela abriu (ou foi atualizada), sem arredondar: é o corte
+ * dos números, e a tela mostra até os segundos.
  */
-const minuteNow = (): Date => {
-  const t = Date.now();
-  const rem = ((t % 60_000) + 60_000) % 60_000;
-  const up = rem === 0 ? t : t + (60_000 - rem);
-  // No último minuto do ano, subir para 00:00 daria o ano por encerrado antes da hora.
-  const y = brasiliaYear(new Date(t).toISOString());
-  return new Date(y !== null && brasiliaYear(new Date(up).toISOString()) !== y ? t : up);
-};
+const captureNow = (): Date => new Date();
 /** Hora em que o arquivo foi gerado (pode ser depois do instante dos números, dito no período). */
 const generatedAtLabel = (): string => new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
 
@@ -84,6 +77,7 @@ export function AnnualClose() {
   const couriers = useTcheStore((s) => s.couriers);
   const allOrders = useTcheStore((s) => s.orders);
   const purchaseInvoiceItems = useTcheStore((s) => s.purchaseInvoiceItems);
+  const syncRejected = useTcheStore((s) => s.syncRejected);
   const feeRules = useOwnerSettings((s) => s.feeRules);
   const appCommissionPct = useOwnerSettings((s) => s.appCommissionPct);
   // Só a loja deste aparelho (o que sobrou de outra loja fica fora e é avisado).
@@ -109,10 +103,10 @@ export function AnnualClose() {
   const marketplace = NO_MARKETPLACE;
   const androidApp = inAndroidApp();
 
-  // "Agora" fixo enquanto a tela está aberta (no minuto cheio, para o rótulo hh:mm ser
-  // exatamente o corte): os quatro relatórios, a lista de anos, o título e as notas usam o
+  // "Agora" fixo enquanto a tela está aberta (o instante real, mostrado com segundos):
+  // os quatro relatórios, a lista de anos, o título e as notas usam o
   // mesmo instante. "Atualizar" e a troca de ano pegam um novo.
-  const [now, setNow] = useState(minuteNow);
+  const [now, setNow] = useState(captureNow);
   // A lista de anos só depende do ANO de agora (não refaz a cada Atualizar).
   const nowYear = brasiliaYear(now.toISOString());
   const yearAnchor = useMemo(() => new Date(Date.UTC(nowYear ?? 1970, 6, 1)), [nowYear]);
@@ -144,10 +138,12 @@ export function AnnualClose() {
   const clockWrong = clockBeforeYear(period, now);
 
   const testMovements = useMemo(() => testInvoiceMovementIds(stockMovements, purchaseInvoiceItems, purchaseInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices]);
-  const duplicateMovements = useMemo(() => duplicateInvoiceMovementIds(stockMovements, purchaseInvoiceItems, purchaseInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices]);
+  // Prova de duplicata: a nuvem recusou a NF-e deste aparelho (fila de recusados).
+  const rejectedInvoices = useMemo(() => rejectedInvoiceIds(syncRejected ?? []), [syncRejected]);
+  const duplicateReview = useMemo(() => reviewDuplicateInvoices(stockMovements, purchaseInvoiceItems, purchaseInvoices, rejectedInvoices), [stockMovements, purchaseInvoiceItems, purchaseInvoices, rejectedInvoices]);
   const inventory = useMemo(
-    () => inventoryAt(products, stockMovements, period, testMovements, now, duplicateMovements),
-    [products, stockMovements, period, testMovements, now, duplicateMovements],
+    () => inventoryAt(products, stockMovements, period, testMovements, now, duplicateReview.excluded, duplicateReview.unconfirmed),
+    [products, stockMovements, period, testMovements, now, duplicateReview],
   );
   const revenue = useMemo(
     () => revenueByMethod({ payments, marketplace, feeRules, appCommissionPct, cashSessions, cashMovements, staff, orders }, period, now),
@@ -217,7 +213,7 @@ export function AnnualClose() {
   // pede para exportar de novo, em vez de gerar um arquivo que se contradiz.
   const fresh = (): boolean => {
     if (!partial || Date.now() < period.to) return true;
-    setNow(minuteNow());
+    setNow(captureNow());
     window.alert(`O ano de ${year} terminou com a tela aberta: os números foram atualizados até 31/12. Exporte de novo.`);
     return false;
   };
@@ -277,7 +273,7 @@ export function AnnualClose() {
           value={year}
           onChange={(e) => {
             setPicked(Number(e.target.value));
-            setNow(minuteNow());
+            setNow(captureNow());
           }}
         >
           {years.map((y) => (
@@ -300,7 +296,7 @@ export function AnnualClose() {
             <span>
               {year} ainda não terminou: os números vão até {cutoffLabel} (horário de Brasília), quando a tela foi aberta ou atualizada. Gere de novo depois de 31/12.
             </span>
-            <Btn variant="secondary" aria-label="Atualizar os números até agora" onClick={() => setNow(minuteNow())}>
+            <Btn variant="secondary" aria-label="Atualizar os números até agora" onClick={() => setNow(captureNow())}>
               <RefreshCw className="h-4 w-4" /> Atualizar
             </Btn>
           </div>

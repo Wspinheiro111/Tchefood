@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clockBeforeYear, duplicateInvoiceMovementIds, ownStore, defaultYear, positionCutoff, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { brasiliaDayStart, compareInvoiceCopies, rejectedInvoiceIds, reviewDuplicateInvoices, settlementDayEndBrasilia, clockBeforeYear, duplicateInvoiceMovementIds, ownStore, defaultYear, positionCutoff, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
 import { br, code, escapeHtml, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, revenueDoc, toCsv, toPrintableHtml, type ReportDoc } from '../lib/annualCloseExport';
 import type { FeeRule } from '../lib/cardFees';
 import type { CashMovement, CashSession, CourierSettlement, OwnDelivery, Payment, Product, PurchaseInvoice, StockMovement, Supplier } from '../types';
@@ -409,7 +409,7 @@ describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
   const at9 = '2026-11-14T09:00:00-03:00';
   const at11 = '2026-11-14T11:00:00-03:00';
   const base = { period: '', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g' };
-  const AVISO = (n: number) => `ATENÇÃO: ${n} registro(s) com data a partir de 14/11/2026 10:00 (instante deste relatório) ficaram de fora`;
+  const AVISO = (n: number) => `ATENÇÃO: ${n} registro(s) com data a partir de 14/11/2026 10:00:00 (instante deste relatório) ficaram de fora`;
   const session = (s: Partial<CashSession>): CashSession =>
     ({ id: Math.random().toString(), status: 'CLOSED', opened_at: '2026-11-14T08:00:00-03:00', closed_at: at9, opened_by_user_id: null, closed_by_user_id: null, opening_float: 0, expected_cash: 0, counted_cash: 0, difference: 0, ...s }) as CashSession;
   const cashMov = (m: Partial<CashMovement>): CashMovement => ({ id: Math.random().toString(), type: 'SUPPLY', amount: 10, reason: 'troco', created_at: at9, ...m }) as CashMovement;
@@ -419,8 +419,8 @@ describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
     ({ id: Math.random().toString(), order_id: 'o1', status: 'DELIVERED', courier_id: 'c1', courier_fee: 7, pay_on_delivery: false, delivered_at: at9, settlement_id: null, ...x }) as OwnDelivery;
 
   it('periodLabel mostra a hora do corte no ano em andamento e 31/12 no ano encerrado', () => {
-    expect(periodLabel('inventory', P26, NOW)).toBe('Posição em 14/11/2026 10:00 (ano em andamento)');
-    expect(periodLabel('revenue', P26, NOW)).toBe('01/01/2026 a 14/11/2026 10:00 (ano em andamento)');
+    expect(periodLabel('inventory', P26, NOW)).toBe('Posição em 14/11/2026 10:00:00 (ano em andamento)');
+    expect(periodLabel('revenue', P26, NOW)).toBe('01/01/2026 a 14/11/2026 10:00:00 (ano em andamento)');
     expect(periodLabel('inventory', P, NOW)).toBe('Posição em 31/12/2025');
     expect(periodLabel('expenses', P, NOW)).toBe('01/01/2025 a 31/12/2025');
   });
@@ -580,7 +580,7 @@ describe('rodada interna 1: corte, futuro e HTML', () => {
     const open = openPositionsAt({ payments: [pay({ amount: 12, method: 'CREDIT', acquirer: 'STONE', created_at: '2025-12-20T20:00:00-03:00' }), pay({ amount: 3, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2026-11-14T11:00:00-03:00' })], feeRules: [], ownDeliveries: [], courierSettlements: [], couriers: [], orders: [] }, P26, NOW);
     const html = toPrintableHtml(openDoc(open, base));
     expect(html).toContain('SITUAÇÃO DE REPASSE DESCONHECIDA: 1 venda(s)');
-    expect(html).toContain('1 registro(s) com data a partir de 14/11/2026 10:00');
+    expect(html).toContain('1 registro(s) com data a partir de 14/11/2026 10:00:00');
   });
 });
 
@@ -645,12 +645,12 @@ describe('rodada interna 3', () => {
   const base = { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
   const NOW = new Date('2026-11-14T10:00:00-03:00');
 
-  it('NF-e importada também em outro aparelho: as entradas daqui ficam fora do inventário e são avisadas', () => {
+  it('NF-e importada também em outro aparelho (a nuvem recusou a daqui): as entradas daqui ficam fora do inventário e são avisadas', () => {
     const key = '4325'.padEnd(44, '7');
     const invoices = [{ id: 'nuvem', access_key: key }, { id: 'aqui', access_key: key }, { id: 'outra', access_key: '4325'.padEnd(44, '8') }];
     const items = [{ id: 'it1', invoice_id: 'aqui' }, { id: 'it2', invoice_id: 'outra' }];
     const movs = [mov({ id: 'm1', quantity: 10, unit_cost: 2, purchase_invoice_item_id: 'it1' }), mov({ id: 'm2', quantity: 3, unit_cost: 5, purchase_invoice_item_id: 'it2' })];
-    const dup = duplicateInvoiceMovementIds(movs, items, invoices);
+    const dup = duplicateInvoiceMovementIds(movs, items, invoices, rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'aqui' } }]));
     expect([...dup]).toEqual(['m1']);
     const r = inventoryAt([product({})], movs, P, new Set(), NOW, dup);
     expect([r.rows[0]!.quantity, r.totalCost, r.duplicateMovements]).toEqual([3, 15, 1]);
@@ -754,5 +754,71 @@ describe('auditoria GPT rodada 2 (119ade2)', () => {
     const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW2) };
     const r = expensesByCategory({ ...base, purchaseInvoices: [homolog, prod] }, P, NOW2);
     expect([r.rows[0]!.amount, r.homologationInvoices]).toEqual([50, 0]);
+  });
+});
+
+describe('auditoria GPT rodada 3 (0dd946d)', () => {
+  const base = { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+  const NOW3 = new Date('2026-11-14T12:00:00-03:00');
+  const key = '4325'.padEnd(44, '9');
+
+  it('P1-01: cópia sem entradas aqui e sem recusa da nuvem não zera as 10 un.: ficam, com aviso para conferir', () => {
+    const invoices = [
+      { id: 'sem', access_key: key, environment: 'PRODUCTION' as const, imported_at: '2025-03-01T10:00:00-03:00' },
+      { id: 'com', access_key: key, environment: 'PRODUCTION' as const, imported_at: '2025-03-02T10:00:00-03:00' },
+    ];
+    const items = [{ id: 'i1', invoice_id: 'com' }];
+    const movs = [mov({ id: 'm', quantity: 10, unit_cost: 3, purchase_invoice_item_id: 'i1' })];
+    const rev = reviewDuplicateInvoices(movs, items, invoices);
+    expect([[...rev.excluded], rev.unconfirmed]).toEqual([[], [['m']]]);
+    const r = inventoryAt([product({})], movs, P, new Set(), NOW3, rev.excluded, rev.unconfirmed);
+    expect([r.rows[0]!.quantity, r.totalCost]).toEqual([10, 30]);
+    expect(toCsv(inventoryDoc(r, base))).toContain('sem prova de que é duplicata: as entradas deste aparelho foram MANTIDAS');
+    // Com a prova (a nuvem recusou a nota deste aparelho), saem e não há aviso de conferir.
+    const proved = reviewDuplicateInvoices(movs, items, invoices, new Set(['com']));
+    expect([[...proved.excluded], proved.unconfirmed]).toEqual([['m'], []]);
+    // Entrada depois do corte, ou de nota de homologação: não está no saldo, não avisa.
+    const late = [mov({ id: 'm', quantity: 10, unit_cost: 3, purchase_invoice_item_id: 'i1', created_at: '2026-02-01T10:00:00-03:00' })];
+    const rl = reviewDuplicateInvoices(late, items, invoices);
+    expect(inventoryAt([product({})], late, P, new Set(), NOW3, rl.excluded, rl.unconfirmed).duplicateUnconfirmed).toBe(0);
+    const homolog = [invoices[0]!, { ...invoices[1]!, environment: 'HOMOLOGATION' as const }];
+    const rh = reviewDuplicateInvoices(movs, items, homolog);
+    const ih = inventoryAt([product({})], movs, P, testInvoiceMovementIds(movs, items, homolog), NOW3, rh.excluded, rh.unconfirmed);
+    expect([ih.totalCost, ih.duplicateUnconfirmed]).toEqual([0, 0]);
+    expect(toCsv(inventoryDoc(ih, base))).not.toContain('MANTIDAS');
+  });
+
+  it('P2-01: inventário e compras usam a mesma cópia (data válida antes da importada primeiro)', () => {
+    const semData = { id: 'a', supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: 'lixo', environment: 'PRODUCTION', invoice_amount: 40, imported_at: '2025-03-01T10:00:00-03:00' } as PurchaseInvoice;
+    const comData = { ...semData, id: 'b', issued_at: '2025-03-01T09:00:00-03:00', invoice_amount: 40, imported_at: '2025-03-05T10:00:00-03:00' } as PurchaseInvoice;
+    expect(compareInvoiceCopies(comData, semData)).toBeLessThan(0);
+    const items = [{ id: 'ia', invoice_id: 'a' }, { id: 'ib', invoice_id: 'b' }];
+    const movs = [mov({ id: 'ma', quantity: 4, unit_cost: 1, purchase_invoice_item_id: 'ia' }), mov({ id: 'mb', quantity: 10, unit_cost: 4, purchase_invoice_item_id: 'ib' })];
+    for (const list of [[semData, comData], [comData, semData]]) {
+      const rev = reviewDuplicateInvoices(movs, items, list);
+      expect([...rev.excluded]).toEqual(['ma']);
+      const inv = inventoryAt([product({})], movs, P, new Set(), NOW3, rev.excluded);
+      expect(inv.totalCost).toBe(40);
+      const exp = expensesByCategory({ purchaseInvoices: list, suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW3) }, P, NOW3);
+      expect(exp.purchases.map((x) => x.amount)).toEqual([40]);
+      expect(exp.invalidIssueDates).toBe(0);
+    }
+  });
+
+  it('P2-03: fim do dia do repasse é o começo do dia seguinte em Brasília (dias de 25 h e de 23 h de 2018)', () => {
+    const d0 = rule({ days: 0 });
+    // 17/02/2018 teve 25 h (o horário de verão acabou à meia-noite do dia 18).
+    expect(settlementDayEndBrasilia(Date.parse('2018-02-17T10:00:00-02:00'), d0)).toBe(Date.parse('2018-02-18T00:00:00-03:00'));
+    // 04/11/2018 teve 23 h e começou à 01:00.
+    expect(brasiliaDayStart(2018, 10, 4)).toBe(Date.parse('2018-11-04T01:00:00-02:00'));
+    expect(settlementDayEndBrasilia(Date.parse('2018-11-04T10:00:00-02:00'), d0)).toBe(Date.parse('2018-11-05T00:00:00-02:00'));
+    expect(settlementDayEndBrasilia(Date.parse('2018-11-03T10:00:00-03:00'), d0)).toBe(Date.parse('2018-11-04T01:00:00-02:00'));
+    const P18 = yearPeriod(2018);
+    const open = (sale: string, now: string) =>
+      openPositionsAt({ payments: [pay({ amount: 100, method: 'CREDIT', acquirer: 'STONE', created_at: sale })], feeRules: [d0], ownDeliveries: [], courierSettlements: [], couriers: [], orders: [] }, P18, new Date(now)).cardReceivables.length;
+    // 23:30 do dia de 25 h: o dia do repasse ainda não acabou.
+    expect(open('2018-02-17T10:00:00-02:00', '2018-02-17T23:30:00-03:00')).toBe(1);
+    // 00:30 de 05/11, depois do dia de 23 h: o repasse do dia 04 já caiu.
+    expect(open('2018-11-04T10:00:00-02:00', '2018-11-05T00:30:00-02:00')).toBe(0);
   });
 });

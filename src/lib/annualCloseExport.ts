@@ -102,6 +102,7 @@ export function inventoryDoc(r: InventoryReport, base: Omit<ReportDoc, 'title' |
       'Custo unitário = custo médio ponderado das compras (com frete, IPI, ICMS-ST etc. da nota).',
       'A entrada conta pela data em que a nota foi IMPORTADA no app (nota emitida em 30/12 e importada em 03/01 não está neste saldo, mas está nas compras do ano).',
       ...(r.duplicateMovements > 0 ? [`${r.duplicateMovements} entrada(s) de NF-e repetida ficaram fora deste saldo: a nota também foi importada em OUTRO aparelho (a nuvem ficou com a de lá, e as entradas estão no inventário daquele aparelho) ou foi importada mais de uma vez neste aparelho (vale só a primeira importação). Confira se a nota está certa.`] : []),
+      ...(r.duplicateUnconfirmed > 0 ? [`ATENÇÃO: ${r.duplicateUnconfirmed} NF-e aparece(m) mais de uma vez neste aparelho (outra cópia com a mesma chave veio da nuvem) sem prova de que é duplicata: as entradas deste aparelho foram MANTIDAS neste saldo. Se outro aparelho também lançou essa nota, a soma dos inventários conta a mercadoria duas vezes. Confira antes de somar.`] : []),
       ...(r.testMovements > 0 ? [`${r.testMovements} entrada(s) por NF-e de homologação (teste) ficaram de fora do saldo e do custo.`] : []),
       ...(r.missingNcm > 0 ? [`${r.missingNcm} produto(s) com saldo estão sem NCM válido (8 dígitos) no cadastro.`] : []),
       ...invalid(r.invalidDates, 'movimento(s) de estoque'),

@@ -61,6 +61,19 @@ const at = (iso: string | null | undefined): number | null => {
  * manhã ela ficava "depois do instante do relatório"). Nos dias em que o horário de verão
  * antigo pulava a meia-noite, vale 01:00, que ainda é o mesmo dia.
  */
+/**
+ * 00:00 do dia (y, m de 0 a 11, d) no calendário de Brasília. Nos dias em que o horário
+ * de verão antigo pulava a meia-noite, 01:00 (o primeiro instante daquele dia). Aceita
+ * d fora do mês (31/12 + 1 = 01/01), como Date.UTC.
+ */
+export function brasiliaDayStart(y: number, m: number, d: number): number {
+  const day = new Date(Date.UTC(y, m, d));
+  const [yy, mm, dd] = [day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()];
+  const t = brasiliaInstant(yy, mm, dd, 0);
+  const got = brasiliaYmd(t);
+  return got.y === yy && got.m === mm && got.d === dd ? t : brasiliaInstant(yy, mm, dd, 1);
+}
+
 export function invoiceDate(iso: string | null | undefined): number | null {
   if (typeof iso === 'string') {
     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
@@ -69,9 +82,7 @@ export function invoiceDate(iso: string | null | undefined): number | null {
       const mo = Number(m[2]);
       const d = Number(m[3]);
       if (mo < 1 || mo > 12 || d < 1 || d > new Date(Date.UTC(y, mo, 0)).getUTCDate()) return null;
-      let t = brasiliaInstant(y, mo - 1, d, 0);
-      const got = brasiliaYmd(t);
-      if (got.y !== y || got.m !== mo - 1 || got.d !== d) t = brasiliaInstant(y, mo - 1, d, 1);
+      const t = brasiliaDayStart(y, mo - 1, d);
       return inRange(t) ? t : null;
     }
   }
@@ -107,9 +118,10 @@ export function brasiliaDate(t: number | Date): string {
   return DMY.format(new Date(t));
 }
 
-const HM = new Intl.DateTimeFormat('pt-BR', { timeZone: SHIFT_TIME_ZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+// Com segundos: o corte do ano em andamento é o instante exato da tela.
+const HM = new Intl.DateTimeFormat('pt-BR', { timeZone: SHIFT_TIME_ZONE, hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
 
-/** "dd/mm/aaaa hh:mm" no horário de Brasília. */
+/** "dd/mm/aaaa hh:mm:ss" no horário de Brasília. */
 export function brasiliaDateTime(t: number | Date): string {
   return `${brasiliaDate(t)} ${HM.format(new Date(t))}`;
 }
@@ -194,7 +206,16 @@ export function settlementDayBrasilia(createdAtMs: number, rule: Pick<FeeRule, '
     }
     while (weekend()) day.setUTCDate(day.getUTCDate() + 1);
   }
-  return brasiliaInstant(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0);
+  return brasiliaDayStart(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
+}
+
+/**
+ * Fim do dia do repasse: o começo do dia SEGUINTE no calendário de Brasília (não 24 h
+ * depois, porque com o horário de verão antigo o dia teve 23 ou 25 horas).
+ */
+export function settlementDayEndBrasilia(createdAtMs: number, rule: Pick<FeeRule, 'days' | 'businessDays'>): number {
+  const { y, m, d } = brasiliaYmd(settlementDayBrasilia(createdAtMs, rule));
+  return brasiliaDayStart(y, m, d + 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +250,8 @@ export interface InventoryReport {
   testMovements: number;
   /** Entradas de NF-e que a nuvem já tem por outro aparelho (fora, para não somar duas vezes). */
   duplicateMovements: number;
+  /** NF-e repetidas cujas entradas ficaram neste inventário sem prova de duplicata (conferir). */
+  duplicateUnconfirmed: number;
   /** Instante da posição: fim do ano, ou agora se o ano ainda não terminou. */
   cutoff: number;
   /** Movimentos do ano com data no instante da posição ou depois (ficaram de fora). */
@@ -252,21 +275,49 @@ export function ownStore<T extends { tenant_id?: string | null }>(rows: readonly
   return { rows: out, other };
 }
 
+type InvoiceCopy = Pick<PurchaseInvoice, 'id' | 'access_key'> & Partial<Pick<PurchaseInvoice, 'imported_at' | 'environment' | 'issued_at'>>;
+
 /**
- * Entradas de estoque de uma NF-e que está neste aparelho mais de uma vez (mesma chave
- * de acesso): a cópia da nuvem foi importada por OUTRO aparelho, que já tem essas
- * entradas, e a deste aparelho foi recusada pela nuvem. Somar os inventários contaria
- * a mercadoria duas vezes, então elas ficam fora daqui (e são avisadas).
- * Se mais de uma cópia tem entradas NESTE aparelho (a nota foi importada aqui duas
- * vezes), a mercadoria entrou aqui: valem as entradas de uma cópia só (a importada
- * primeiro) e as das outras ficam fora. Nunca zero, nunca em dobro.
+ * Ordem única das cópias da mesma NF-e (mesma chave), usada pelo inventário e pelas
+ * compras: produção antes de homologação, com data de emissão válida antes de sem data,
+ * importada primeiro, e por fim o id (para não depender da ordem da lista).
  */
-export function duplicateInvoiceMovementIds(
+export function compareInvoiceCopies(a: InvoiceCopy, b: InvoiceCopy): number {
+  const prod = (c: InvoiceCopy) => (c.environment === undefined || c.environment === 'PRODUCTION' ? 0 : 1);
+  const dated = (c: InvoiceCopy) => (c.issued_at === undefined || invoiceDate(c.issued_at) !== null ? 0 : 1);
+  const imp = (c: InvoiceCopy) => at(c.imported_at) ?? Infinity;
+  return prod(a) - prod(b) || dated(a) - dated(b) || (imp(a) === imp(b) ? 0 : imp(a) < imp(b) ? -1 : 1) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+/** Ids das NF-e deste aparelho cujo envio à nuvem foi recusado (fila de recusados). */
+export function rejectedInvoiceIds(rejected: ReadonlyArray<{ event: { table: string; op: string; row_id: string } }>): Set<string> {
+  return new Set(rejected.filter((r) => r.event.table === 'purchase_invoices' && r.event.op === 'INSERT').map((r) => r.event.row_id));
+}
+
+export interface DuplicateInvoiceReview {
+  /** Entradas que ficam fora do inventário deste aparelho. */
+  excluded: Set<string>;
+  /** Por NF-e repetida sem prova de duplicata: as entradas deste aparelho que ficaram. */
+  unconfirmed: string[][];
+}
+
+/**
+ * NF-e que está neste aparelho mais de uma vez (mesma chave de acesso). A importação
+ * grava nota, itens e entradas de uma vez e recusa chave repetida no aparelho, então a
+ * outra cópia só chega pela nuvem (importada em OUTRO aparelho, que tem as entradas
+ * dela). As entradas deste aparelho só saem com prova: a nuvem RECUSOU a nota deste
+ * aparelho (está na fila de recusados), ou seja, a mercadoria já foi lançada pela cópia
+ * aceita. Sem essa prova, as entradas ficam e a nota é avisada para conferir.
+ * Se mais de uma cópia não recusada tem entradas aqui, vale a primeira pela mesma ordem
+ * das compras (compareInvoiceCopies) e as outras saem. Nunca zero sem prova, nunca em dobro.
+ */
+export function reviewDuplicateInvoices(
   movements: readonly StockMovement[],
   items: ReadonlyArray<Pick<PurchaseInvoiceItem, 'id' | 'invoice_id'>>,
-  invoices: ReadonlyArray<Pick<PurchaseInvoice, 'id' | 'access_key'> & Partial<Pick<PurchaseInvoice, 'imported_at' | 'environment'>>>,
-): Set<string> {
-  const byKey = new Map<string, Array<(typeof invoices)[number]>>();
+  invoices: readonly InvoiceCopy[],
+  rejectedIds: ReadonlySet<string> = new Set(),
+): DuplicateInvoiceReview {
+  const byKey = new Map<string, InvoiceCopy[]>();
   for (const i of invoices) {
     const k = (i.access_key ?? '').trim();
     if (k === '') continue;
@@ -274,8 +325,9 @@ export function duplicateInvoiceMovementIds(
     list.push(i);
     byKey.set(k, list);
   }
-  const out = new Set<string>();
-  if (![...byKey.values()].some((l) => l.length > 1)) return out;
+  const excluded = new Set<string>();
+  const unconfirmed: string[][] = [];
+  if (![...byKey.values()].some((l) => l.length > 1)) return { excluded, unconfirmed };
   const itemInvoice = new Map(items.map((i) => [i.id, i.invoice_id]));
   const movesByInvoice = new Map<string, string[]>();
   for (const m of movements) {
@@ -287,24 +339,28 @@ export function duplicateInvoiceMovementIds(
   }
   for (const copies of byKey.values()) {
     if (copies.length < 2) continue;
-    // Mesma ordem da escolha das compras (expensesByCategory): produção antes de
-    // homologação, depois a importada primeiro.
-    const prod = (c: (typeof copies)[number]) => (c.environment === undefined || c.environment === 'PRODUCTION' ? 0 : 1);
-    const imp = (c: (typeof copies)[number]) => at(c.imported_at) ?? Infinity;
-    const withMoves = copies
-      .filter((c) => (movesByInvoice.get(c.id)?.length ?? 0) > 0)
-      .sort((a, b) => prod(a) - prod(b) || (imp(a) === imp(b) ? 0 : imp(a) < imp(b) ? -1 : 1) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-    // Duas ou mais cópias com entradas aqui: a primeira fica, as outras saem. Uma só:
-    // se outra cópia (de produção) veio de outro aparelho, aquele aparelho já conta a
-    // mercadoria e esta sai; se as outras são só de homologação, esta fica.
-    const othersProduction = (c: (typeof copies)[number]) => copies.some((o) => o !== c && prod(o) === 0);
-    const keep = withMoves.length >= 2 ? withMoves[0]!.id : withMoves.length === 1 && !othersProduction(withMoves[0]!) ? withMoves[0]!.id : null;
+    const withMoves = copies.filter((c) => (movesByInvoice.get(c.id)?.length ?? 0) > 0).sort(compareInvoiceCopies);
+    const candidates = withMoves.filter((c) => !rejectedIds.has(c.id));
+    const keep = candidates[0]?.id ?? null;
     for (const c of withMoves) {
       if (c.id === keep) continue;
-      for (const id of movesByInvoice.get(c.id) ?? []) out.add(id);
+      for (const id of movesByInvoice.get(c.id) ?? []) excluded.add(id);
     }
+    // Ficou uma cópia com entradas e há outra cópia sem entradas aqui: sem prova de que
+    // a mercadoria já foi lançada em outro aparelho. Mantém e avisa.
+    if (keep !== null && copies.some((c) => c.id !== keep && (movesByInvoice.get(c.id)?.length ?? 0) === 0)) unconfirmed.push(movesByInvoice.get(keep) ?? []);
   }
-  return out;
+  return { excluded, unconfirmed };
+}
+
+/** Só as entradas que ficam fora (veja reviewDuplicateInvoices). */
+export function duplicateInvoiceMovementIds(
+  movements: readonly StockMovement[],
+  items: ReadonlyArray<Pick<PurchaseInvoiceItem, 'id' | 'invoice_id'>>,
+  invoices: readonly InvoiceCopy[],
+  rejectedIds: ReadonlySet<string> = new Set(),
+): Set<string> {
+  return reviewDuplicateInvoices(movements, items, invoices, rejectedIds).excluded;
 }
 
 /** Movimentos de estoque que vieram de NF-e de homologação (teste): não são mercadoria real. */
@@ -340,6 +396,8 @@ export function inventoryAt(
   testMovementIds: ReadonlySet<string> = new Set(),
   now: Date = new Date(),
   duplicateMovementIds: ReadonlySet<string> = new Set(),
+  /** Grupos de reviewDuplicateInvoices().unconfirmed: o aviso só conta os que entraram no saldo. */
+  duplicateUnconfirmed: ReadonlyArray<readonly string[]> = [],
 ): InventoryReport {
   const cutoff = positionCutoff(p, now);
   const byProduct = new Map<string, Array<{ t: number; m: StockMovement; idx: number }>>();
@@ -362,6 +420,7 @@ export function inventoryAt(
   let totalC = 0;
   let missingNcm = 0;
   let testMovements = 0;
+  const counted = new Set<string>();
   let duplicateMovements = 0;
   for (const [productId, list] of byProduct) {
     // Mesmo instante: vale o que foi gravado depois (ordem do livro).
@@ -377,6 +436,7 @@ export function inventoryAt(
     let costTimes = 0; // Σ quantidade(milésimos) × custo(décimos de milésimo)
     for (const { m } of list) {
       if (testMovementIds.has(m.id) || duplicateMovementIds.has(m.id)) continue;
+      counted.add(m.id);
       const q = Math.round(m.quantity * 1000);
       milli += q;
       costTimes += q * Math.round(m.unit_cost * 10_000);
@@ -403,7 +463,7 @@ export function inventoryAt(
     });
   }
   rows.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
-  return { rows, totalCost: fromCents(totalC), missingNcm, invalidDates, testMovements, duplicateMovements, cutoff, afterCutoff: late };
+  return { rows, totalCost: fromCents(totalC), missingNcm, invalidDates, testMovements, duplicateMovements, duplicateUnconfirmed: duplicateUnconfirmed.filter((g) => g.some((id) => counted.has(id))).length, cutoff, afterCutoff: late };
 }
 
 // ---------------------------------------------------------------------------
@@ -801,7 +861,7 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
     // andamento, repasse de hoje em diante ainda está a receber.
     // Venda bem mais antiga que o prazo: já caiu (pula o cálculo do dia, que é caro).
     if (cutoff - t > maxSettlementMs(rule)) continue;
-    if (settlementDayBrasilia(t, rule) + DAY_MS <= cutoff) continue;
+    if (settlementDayEndBrasilia(t, rule) <= cutoff) continue;
     const key = `${pay.acquirer}|${pay.method}`;
     const row = card.get(key) ?? { acquirer: pay.acquirer, method: pay.method, gross: 0, fee: 0, count: 0 };
     const g = toCents(pay.amount) + toCents(pay.tip_amount ?? 0);
@@ -971,26 +1031,14 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
   let duplicateInvoices = 0;
   // A mesma NF-e (mesma chave) importada em dois aparelhos antes de sincronizar fica
   // duas vezes aqui (a da nuvem e a recusada deste aparelho): conta uma vez só. Antes de
-  // olhar o período, escolhe a cópia mais confiável de cada chave: produção, com data de
-  // emissão válida, importada primeiro. Assim a cópia sem data não tira a nota do ano certo.
-  const rank = (i: PurchaseInvoice): [number, number, number] => [
-    i.environment === 'PRODUCTION' ? 0 : 1,
-    invoiceDate(i.issued_at) !== null ? 0 : 1,
-    at(i.imported_at) ?? Infinity,
-  ];
+  // olhar o período, escolhe a cópia de cada chave pela mesma ordem do inventário
+  // (compareInvoiceCopies). Assim a cópia sem data não tira a nota do ano certo.
   const best = new Map<string, PurchaseInvoice>();
   for (const inv of input.purchaseInvoices) {
     const key = (inv.access_key ?? '').trim();
     if (key === '') continue;
     const cur = best.get(key);
-    if (cur === undefined) {
-      best.set(key, inv);
-      continue;
-    }
-    const a = rank(inv);
-    const b = rank(cur);
-    const cmp = a[0] - b[0] || a[1] - b[1] || (a[2] === b[2] ? 0 : a[2] < b[2] ? -1 : 1) || (inv.id < cur.id ? -1 : 1);
-    if (cmp < 0) best.set(key, inv);
+    if (cur === undefined || compareInvoiceCopies(inv, cur) < 0) best.set(key, inv);
   }
   for (const inv of input.purchaseInvoices) {
     const key = (inv.access_key ?? '').trim();
