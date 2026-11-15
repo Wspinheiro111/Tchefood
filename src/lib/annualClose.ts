@@ -564,6 +564,9 @@ export interface RevenueReport {
   /** Dinheiro recebido fora de qualquer turno de caixa (não aparece nos fechamentos). */
   cashOutsideSessions: number;
   cashOutsideSessionsCount: number;
+  /** Dinheiro recebido enquanto havia um turno com abertura/fechamento inválido: nem dentro nem fora comprovado. */
+  cashUndeterminedSession: number;
+  cashUndeterminedSessionCount: number;
   /** Fim do período: fim do ano, ou agora se o ano ainda não terminou. */
   cutoff: number;
   /** Pagamentos, pedidos de app, turnos e movimentos de caixa do ano com data no fim do período ou depois (ficaram de fora). */
@@ -677,13 +680,15 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod, now: Date = 
     // ou fechado só depois do corte (ex.: aberto em 31/12 e fechado em 01/01).
     const opened = at(s.opened_at);
     const closedT = s.status === 'CLOSED' ? at(s.closed_at) : null;
+    // Abertura inválida também entra no aviso de datas (ela muda o dinheiro "fora de turno").
+    if (opened === null) invalidDates += 1;
     if (opened !== null && opened < cutoff && (s.status !== 'CLOSED' || (closedT !== null && closedT >= cutoff))) openSessions += 1;
     if (s.status !== 'CLOSED') {
       // Turno aberto depois do instante do relatório: fica de fora e é avisado.
       if (opened !== null && afterCutoff(opened, p, cutoff)) late += 1;
       continue;
     }
-    if (closedT === null) invalidDates += 1;
+    if (closedT === null && opened !== null) invalidDates += 1;
     if (!inPeriod(closedT)) continue;
     sessionIds.add(s.id);
     if (s.difference !== null) diffC += toCents(s.difference);
@@ -701,17 +706,28 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod, now: Date = 
   }
   closings.sort((a, b) => (at(a.closedAt) ?? 0) - (at(b.closedAt) ?? 0));
   // Dinheiro fora de turno: pagamento em dinheiro sem nenhum turno de caixa aberto naquela hora.
-  const windows = input.cashSessions
-    .map((s) => ({ from: at(s.opened_at), to: s.status === 'CLOSED' ? at(s.closed_at) : Number.POSITIVE_INFINITY }))
-    .filter((w): w is { from: number; to: number } => w.from !== null && w.to !== null);
+  const spans = input.cashSessions.map((s) => ({ from: at(s.opened_at), to: s.status === 'CLOSED' ? at(s.closed_at) : Number.POSITIVE_INFINITY }));
+  const windows = spans.filter((w): w is { from: number; to: number } => w.from !== null && w.to !== null);
+  // Turno com abertura ou fechamento inválido: não dá para dizer que o pagamento ficou
+  // fora dele. O que cair no trecho possível vai para "situação de caixa indeterminada".
+  const unknownSpans = spans
+    .filter((w) => w.from === null || w.to === null)
+    .map((w) => ({ from: w.from ?? Number.NEGATIVE_INFINITY, to: w.to ?? Number.POSITIVE_INFINITY }));
   let outsideC = 0;
   let outsideN = 0;
+  let undeterminedC = 0;
+  let undeterminedN = 0;
   for (const pay of input.payments) {
     if (pay.status !== 'APPROVED' || pay.method !== 'CASH' || pay.acquirer === 'MOCK') continue;
     const t = at(pay.created_at);
     // Mesmos pagamentos do faturamento (já contados lá se ficaram depois do corte).
     if (t === null || t < p.from || t >= cutoff) continue;
     if (windows.some((w) => t >= w.from && t <= w.to)) continue;
+    if (unknownSpans.some((w) => t >= w.from && t <= w.to)) {
+      undeterminedC += toCents(pay.amount);
+      undeterminedN += 1;
+      continue;
+    }
     outsideC += toCents(pay.amount);
     outsideN += 1;
   }
@@ -723,18 +739,25 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod, now: Date = 
     if (o.status === 'CLOSED' && o.service_fee_amount > 0) feeOrders.set(o.id, toCents(o.service_fee_amount));
   }
   if (feeOrders.size > 0) {
-    const paid = new Map<string, { all: number; inPeriod: number }>();
+    // Rateio pelo acumulado: a parte do período = parte de tudo pago até o corte − parte de
+    // tudo pago antes de 01/01. Somando os anos, dá exatamente a parte da taxa dos pagamentos
+    // com data válida (o centavo que sobra fica num ano só, nunca em dois). Pagamento sem
+    // data válida não cai em ano nenhum e já é avisado nas datas inválidas.
+    const paid = new Map<string, { all: number; before: number; upTo: number }>();
     for (const pay of input.payments) {
       if (pay.status !== 'APPROVED' || pay.acquirer === 'MOCK' || !feeOrders.has(pay.order_id)) continue;
       const t = at(pay.created_at);
       const c = toCents(pay.amount);
-      const row = paid.get(pay.order_id) ?? { all: 0, inPeriod: 0 };
+      const row = paid.get(pay.order_id) ?? { all: 0, before: 0, upTo: 0 };
       row.all += c;
-      if (t !== null && t >= p.from && t < cutoff) row.inPeriod += c;
+      if (t !== null && t < p.from) row.before += c;
+      if (t !== null && t < cutoff) row.upTo += c;
       paid.set(pay.order_id, row);
     }
     for (const [id, x] of paid) {
-      if (x.all > 0 && x.inPeriod > 0) serviceFeeC += Math.round((feeOrders.get(id)! * x.inPeriod) / x.all);
+      if (x.all <= 0 || x.upTo <= x.before) continue;
+      const fee = feeOrders.get(id)!;
+      serviceFeeC += Math.round((fee * x.upTo) / x.all) - Math.round((fee * x.before) / x.all);
     }
   }
   let suppliesC = 0;
@@ -768,6 +791,8 @@ export function revenueByMethod(input: RevenueInput, p: YearPeriod, now: Date = 
     simulatorAmount: fromCents(simC),
     cashOutsideSessions: fromCents(outsideC),
     cashOutsideSessionsCount: outsideN,
+    cashUndeterminedSession: fromCents(undeterminedC),
+    cashUndeterminedSessionCount: undeterminedN,
     cutoff,
     afterCutoff: late,
   };
@@ -1010,6 +1035,8 @@ export interface ExpensesReport {
   invalidIssueDates: number;
   /** Ano em andamento: NF-e emitidas antes do instante do relatório mas importadas depois (ficaram fora). */
   importedAfterCutoff: number;
+  /** Ano em andamento: NF-e de produção sem data de importação válida (fora do total). */
+  unknownImportInvoices: number;
   /** NF-e repetidas (mesma chave de acesso) contadas uma vez só. */
   duplicateInvoices: number;
   /** Sangrias do caixa no ano que não são acerto de entregador: sem categoria. */
@@ -1063,9 +1090,13 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
   // aparelho quando os números foram fixados (o inventário também não tem as entradas
   // dela). Sai ANTES da escolha da cópia, para não tirar uma cópia que já estava aqui.
   // Ano encerrado: vale só a emissão (nota de dezembro importada em janeiro fica em dezembro).
+  // Ano em andamento e data de importação inválida: não dá para provar que a nota já
+  // estava aqui no instante do relatório. Fica fora, como as importadas depois, com aviso.
+  let unknownImport = 0;
   const importedLate = (inv: PurchaseInvoice): boolean => {
+    if (!(cutoff < p.to)) return false;
     const imported = at(inv.imported_at);
-    return cutoff < p.to && imported !== null && imported >= cutoff;
+    return imported === null || imported >= cutoff;
   };
   const visible = input.purchaseInvoices.filter((inv) => !importedLate(inv));
   // Só uma cópia de PRODUÇÃO que já estava aqui conta no lugar da que chegou depois: a de
@@ -1074,15 +1105,30 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
     visible.filter((inv) => inv.environment === 'PRODUCTION').map((inv) => (inv.access_key ?? '').trim()).filter((k) => k !== ''),
   );
   const lateSeen = new Set<string>();
-  for (const inv of input.purchaseInvoices) {
-    if (!importedLate(inv)) continue;
+  // Mesma ordem da escolha da cópia: o aviso não depende da ordem da lista.
+  for (const inv of input.purchaseInvoices.filter(importedLate).sort(compareInvoiceCopies)) {
     // Homologação nunca conta: atualizar não a traria, então não avisa (nem ocupa a chave).
-    if (inv.environment !== 'PRODUCTION') continue;
+    // Sem data de importação (ano em andamento), entra no aviso de homologação deixada de fora.
+    if (inv.environment !== 'PRODUCTION') {
+      const th = invoiceDate(inv.issued_at);
+      if (at(inv.imported_at) === null && th !== null && th >= p.from && th < cutoff) homologation += 1;
+      continue;
+    }
     const key = (inv.access_key ?? '').trim();
     // Outra cópia de produção já estava aqui (ela conta), ou esta chave já foi avisada.
     if (key !== '' && (visibleProductionKeys.has(key) || lateSeen.has(key))) continue;
     if (key !== '') lateSeen.add(key);
-    const t = invoiceDate(inv.issued_at) ?? at(inv.imported_at);
+    const importedAt = at(inv.imported_at);
+    const t = invoiceDate(inv.issued_at) ?? importedAt;
+    if (importedAt === null) {
+      // Sem data de importação válida: fora do total, com aviso próprio (não é "depois do corte").
+      // Nota claramente de outro ano (emissão válida fora do período) não entra em aviso nenhum.
+      if (t === null || (t >= p.from && t < cutoff)) {
+        invalidDates += 1;
+        unknownImport += 1;
+      }
+      continue;
+    }
     if (t === null || t < p.from) continue;
     late += 1;
     if (t < cutoff) importedAfterCutoff += 1;
@@ -1185,7 +1231,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
     { key: 'OTHER', label: 'Outras despesas (luz, água, gás, internet, impostos)', amount: null, count: 0, source: 'NOT_TRACKED', note: NOT_TRACKED },
   ];
   const total = rows.reduce((a, r) => a + (r.amount === null ? 0 : toCents(r.amount)), 0);
-  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, invalidIssueDates, importedAfterCutoff, duplicateInvoices, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates, cutoff, afterCutoff: late };
+  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, invalidIssueDates, importedAfterCutoff, unknownImportInvoices: unknownImport, duplicateInvoices, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates, cutoff, afterCutoff: late };
 }
 
 const fmt = (cents: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(fromCents(cents));

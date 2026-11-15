@@ -61,25 +61,89 @@ function printDoc(doc: ReportDoc, name: string) {
   window.setTimeout(() => win.print(), 300);
 }
 
+/** Dados do aparelho que entram nos relatórios (a loja inclusive). */
+const SNAPSHOT_KEYS = [
+  'tenant', 'staff', 'products', 'stockMovements', 'payments', 'cashSessions', 'cashMovements', 'purchaseInvoices',
+  'suppliers', 'ownDeliveries', 'courierSettlements', 'couriers', 'orders', 'purchaseInvoiceItems', 'syncRejected',
+] as const;
+const FEE_KEYS = ['feeRules', 'appCommissionPct', 'feeTenantId'] as const;
+type TcheData = Pick<ReturnType<typeof useTcheStore.getState>, (typeof SNAPSHOT_KEYS)[number]>;
+type FeeData = Pick<ReturnType<typeof useOwnerSettings.getState>, (typeof FEE_KEYS)[number]>;
+interface Snapshot extends TcheData, FeeData {
+  now: Date;
+}
+
+/**
+ * Foto do aparelho num instante: o relógio E os dados. O relatório parcial é a posição
+ * nesse instante com os dados que o aparelho tinha nele; o que chega depois (sincronização,
+ * venda nova, recusa da nuvem) só entra quando a pessoa toca em Atualizar, que tira uma
+ * foto nova (com novo instante, mostrado no relatório).
+ */
+function captureSnapshot(): Snapshot {
+  const s = useTcheStore.getState();
+  const o = useOwnerSettings.getState();
+  const out = { now: captureNow() } as Record<string, unknown>;
+  for (const k of SNAPSHOT_KEYS) out[k] = s[k];
+  for (const k of FEE_KEYS) out[k] = o[k];
+  return out as unknown as Snapshot;
+}
+
+/**
+ * Mesmo conteúdo? A busca da nuvem recria as listas a cada minuto mesmo sem mudança, então
+ * compara pelo conteúdo (calculado uma vez por lista nova).
+ */
+const contentCache = new WeakMap<object, string>();
+function content(v: unknown): string {
+  if (typeof v !== 'object' || v === null) return JSON.stringify(v ?? null);
+  let c = contentCache.get(v);
+  if (c === undefined) {
+    c = JSON.stringify(v);
+    contentCache.set(v, c);
+  }
+  return c;
+}
+const same = (a: unknown, b: unknown): boolean => a === b || content(a) === content(b);
+
 export function AnnualClose() {
   const user = useTcheStore(selectCurrentUser);
-  const tenant = useTcheStore((s) => s.tenant);
-  const staff = useTcheStore((s) => s.staff);
-  const allProducts = useTcheStore((s) => s.products);
-  const allStockMovements = useTcheStore((s) => s.stockMovements);
-  const allPayments = useTcheStore((s) => s.payments);
-  const allCashSessions = useTcheStore((s) => s.cashSessions);
-  const allCashMovements = useTcheStore((s) => s.cashMovements);
-  const allPurchaseInvoices = useTcheStore((s) => s.purchaseInvoices);
-  const suppliers = useTcheStore((s) => s.suppliers);
-  const allOwnDeliveries = useTcheStore((s) => s.ownDeliveries);
-  const allCourierSettlements = useTcheStore((s) => s.courierSettlements);
-  const couriers = useTcheStore((s) => s.couriers);
-  const allOrders = useTcheStore((s) => s.orders);
-  const purchaseInvoiceItems = useTcheStore((s) => s.purchaseInvoiceItems);
-  const syncRejected = useTcheStore((s) => s.syncRejected);
-  const feeRules = useOwnerSettings((s) => s.feeRules);
-  const appCommissionPct = useOwnerSettings((s) => s.appCommissionPct);
+  const [snap, setSnap] = useState(captureSnapshot);
+  const refresh = () => setSnap(captureSnapshot());
+  // Chegou dado novo depois da foto: avisa e oferece Atualizar (os números não mudam sozinhos).
+  const tcheChanged = useTcheStore((s) => SNAPSHOT_KEYS.some((k) => !same(s[k], snap[k])));
+  const feesChanged = useOwnerSettings((s) => FEE_KEYS.some((k) => !same(s[k], snap[k])));
+  // As taxas ainda não tinham carregado do aparelho quando a tela abriu: tira a foto de novo
+  // assim que carregarem (antes disso a tela não mostrou taxa nenhuma de verdade).
+  useEffect(() => {
+    if (useOwnerSettings.persist.hasHydrated()) return;
+    return useOwnerSettings.persist.onFinishHydration(() => setSnap(captureSnapshot()));
+  }, []);
+  const dataChanged = tcheChanged || feesChanged;
+  const now = snap.now;
+  const {
+    tenant,
+    staff,
+    products: allProducts,
+    stockMovements: allStockMovements,
+    payments: allPayments,
+    cashSessions: allCashSessions,
+    cashMovements: allCashMovements,
+    purchaseInvoices: allPurchaseInvoices,
+    suppliers,
+    ownDeliveries: allOwnDeliveries,
+    courierSettlements: allCourierSettlements,
+    couriers,
+    orders: allOrders,
+    purchaseInvoiceItems,
+    syncRejected,
+  } = snap;
+  // Taxas e comissões só valem se foram gravadas (ou confirmadas) nesta loja: as de outra
+  // loja que ficaram no aparelho, ou de antes de o app registrar a loja, contam como NÃO
+  // cadastradas (o repasse fica "situação desconhecida"), nunca como as desta loja.
+  const feesOwned = snap.feeTenantId === tenant.id;
+  const hasFees = snap.feeRules.length > 0 || Object.values(snap.appCommissionPct).some((v) => v !== null && v !== undefined);
+  const feesForeign = hasFees && !feesOwned;
+  const feeRules = useMemo(() => (feesOwned ? snap.feeRules : []), [feesOwned, snap.feeRules]);
+  const appCommissionPct = useMemo(() => (feesOwned ? snap.appCommissionPct : {}), [feesOwned, snap.appCommissionPct]);
   // Só a loja deste aparelho (o que sobrou de outra loja fica fora e é avisado).
   const ownProducts = useMemo(() => ownStore(allProducts, tenant.id), [allProducts, tenant.id]);
   const products = ownProducts.rows;
@@ -106,7 +170,6 @@ export function AnnualClose() {
   // "Agora" fixo enquanto a tela está aberta (o instante real, mostrado com segundos):
   // os quatro relatórios, a lista de anos, o título e as notas usam o
   // mesmo instante. "Atualizar" e a troca de ano pegam um novo.
-  const [now, setNow] = useState(captureNow);
   // A lista de anos só depende do ANO de agora (não refaz a cada Atualizar).
   const nowYear = brasiliaYear(now.toISOString());
   const yearAnchor = useMemo(() => new Date(Date.UTC(nowYear ?? 1970, 6, 1)), [nowYear]);
@@ -164,7 +227,9 @@ export function AnnualClose() {
   const clockNote = `ATENÇÃO: o relógio deste aparelho estava em ${brasiliaDateTime(now.getTime())}, antes de ${year} começar, quando este relatório foi gerado. Os números são do ano inteiro, mas confira a data e a hora do aparelho.`;
   const otherNote = `${otherStore} registro(s) de outra loja ou sem loja identificada que ficaram neste aparelho (de antes de ligá-lo a esta loja) foram deixados de fora dos totais.`;
   // Notas que vão em todos os relatórios exportados (as mesmas que a tela mostra no topo).
+  const feesNote = 'As taxas da maquininha e as comissões dos apps gravadas neste aparelho não estão confirmadas como desta loja (são de outra loja ou de antes desta versão): foram tratadas como NÃO cadastradas (repasse com situação desconhecida, taxa estimada zero). Se forem desta loja, toque em "As taxas são desta loja" no topo do Fechamento anual.';
   const partialNote = [
+    ...(feesForeign ? [feesNote] : []),
     ...(partial ? [`O ano de ${year} ainda não terminou: os números vão até ${cutoffLabel} (horário de Brasília), não até 31/12.`] : []),
     ...(clockWrong ? [clockNote] : []),
     ...(otherStore > 0 ? [otherNote] : []),
@@ -195,7 +260,7 @@ export function AnnualClose() {
     const base = {
       period: periodLabel(kind, period, now),
       store: { name: tenant.name, legalName: tenant.legal_name, cnpj: tenant.cnpj, city: tenant.city, state: tenant.state },
-      generatedAt: generatedAtLabel(),
+      generatedAt: `${generatedAtLabel()} (dados do aparelho em ${brasiliaDateTime(now.getTime())})`,
     };
     switch (kind) {
       case 'inventory':
@@ -213,7 +278,7 @@ export function AnnualClose() {
   // pede para exportar de novo, em vez de gerar um arquivo que se contradiz.
   const fresh = (): boolean => {
     if (!partial || Date.now() < period.to) return true;
-    setNow(captureNow());
+    refresh();
     window.alert(`O ano de ${year} terminou com a tela aberta: os números foram atualizados até 31/12. Exporte de novo.`);
     return false;
   };
@@ -273,7 +338,7 @@ export function AnnualClose() {
           value={year}
           onChange={(e) => {
             setPicked(Number(e.target.value));
-            setNow(captureNow());
+            refresh();
           }}
         >
           {years.map((y) => (
@@ -291,12 +356,35 @@ export function AnnualClose() {
         <p role="note" className="w-full rounded-xl bg-amarelo/15 p-3 text-sm font-semibold">
           {DEVICE_ONLY}
         </p>
+        {dataChanged && (
+          <div role="status" className="flex w-full flex-wrap items-center justify-between gap-2 rounded-xl bg-amarelo/15 p-3 text-sm font-semibold">
+            <span>Chegaram dados novos neste aparelho depois de {brasiliaDateTime(now.getTime())}. Os números abaixo (e o que exportar) continuam sendo os daquele instante; toque em Atualizar para gerar uma posição nova.</span>
+            <Btn variant="secondary" aria-label="Atualizar com os dados novos" onClick={refresh}>
+              <RefreshCw className="h-4 w-4" /> Atualizar
+            </Btn>
+          </div>
+        )}
+        {feesForeign && (
+          <div role="alert" className="flex w-full flex-wrap items-center justify-between gap-2 rounded-xl bg-amarelo/15 p-3 text-sm">
+            <span>{feesNote}</span>
+            <Btn
+              variant="secondary"
+              aria-label="As taxas são desta loja"
+              onClick={() => {
+                useOwnerSettings.getState().confirmFeesTenant(tenant.id);
+                refresh();
+              }}
+            >
+              As taxas são desta loja
+            </Btn>
+          </div>
+        )}
         {partial && (
           <div role="status" className="flex w-full flex-wrap items-center justify-between gap-2 rounded-xl bg-amarelo/15 p-3 text-sm">
             <span>
               {year} ainda não terminou: os números vão até {cutoffLabel} (horário de Brasília), quando a tela foi aberta ou atualizada. Gere de novo depois de 31/12.
             </span>
-            <Btn variant="secondary" aria-label="Atualizar os números até agora" onClick={() => setNow(captureNow())}>
+            <Btn variant="secondary" aria-label="Atualizar os números até agora" onClick={() => refresh()}>
               <RefreshCw className="h-4 w-4" /> Atualizar
             </Btn>
           </div>
@@ -347,6 +435,7 @@ export function AnnualClose() {
           {revenue.simulatorCount > 0 && line('Simulador de maquininha (fora do total)', formatBRL(revenue.simulatorAmount))}
           {line('Fechamentos de caixa', String(revenue.closings.length), revenue.closings.length > 0 ? `diferença somada ${formatBRL(revenue.closingsDifference)}` : undefined)}
           {revenue.openSessions > 0 && line('Turnos de caixa abertos no fim do período', String(revenue.openSessions), '(fechamento fora deste relatório)')}
+          {revenue.cashUndeterminedSessionCount > 0 && line('Dinheiro com situação de caixa indeterminada', formatBRL(revenue.cashUndeterminedSession), '(turno com data inválida)')}
           {revenue.cashOutsideSessionsCount > 0 && line('Dinheiro recebido sem caixa aberto', formatBRL(revenue.cashOutsideSessions), '(está no Dinheiro, fora dos fechamentos)')}
           <p className="mt-2 text-sm text-slate-500">Fora deste relatório: pedidos dos apps de delivery (informe pelo extrato do app) e estornos feitos na maquininha (abata pelo extrato da adquirente).</p>
         </>,

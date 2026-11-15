@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AnnualClose } from '../screens/AnnualClose';
 import { useBackOfficeTabs } from '../screens/BackOffice';
 import { useTcheStore } from '../store/useTcheStore';
+import { useOwnerSettings } from '../store/useOwnerSettings';
 import type { Payment, StaffUser } from '../types';
 
 const staff = [
@@ -170,10 +171,12 @@ describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
     expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
     expect(screen.getByText('Itens com saldo').parentElement!.textContent).toContain('0');
     expect(screen.getAllByText(/Posição em 14\/11\/2026 10:00:30 \(ano em andamento\)/)).toHaveLength(2);
-    const alert = screen.getAllByRole('alert').find((a) => a.textContent!.includes('instante deste relatório'))!;
-    expect(alert.textContent).toContain('Inventário de insumos e mercadorias: 1');
-    expect(alert.textContent).toContain('Fechamento de caixa e formas de pagamento: 2');
-    expect(alert.textContent).toContain('Despesas operacionais: 1');
+    // Auditoria GPT r7 (P1-01): o dado que chegou depois não muda a foto; a tela avisa.
+    expect(screen.getByText(/Chegaram dados novos neste aparelho depois de 14\/11\/2026 10:00:30/)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText('Atualizar com os dados novos'));
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(100));
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 12:00:00 \(ano em andamento\)/)).toHaveLength(2);
+    expect(screen.queryByText(/Chegaram dados novos/)).toBeNull();
   });
 
   it('venda sem taxa de dezembro do ano anterior aparece na tela com valor e quantidade', () => {
@@ -263,5 +266,91 @@ describe('Fechamento anual (tela): Codex em 1fbc385', () => {
     const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
     expect(screen.getByText('Custo total do estoque').parentElement!.textContent).toContain(fmt(50));
     expect(screen.getAllByText(/aparece\(m\) mais de uma vez/).length).toBeGreaterThan(0);
+  });
+});
+
+describe('Fechamento anual (tela): auditoria GPT rodada 6 ampliada (1fbc385)', () => {
+  const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+  afterEach(() => act(() => useOwnerSettings.setState({ feeRules: [], appCommissionPct: {}, feeTenantId: null })));
+
+  it('P1-01: aberto às 09h, a recusa de duplicidade que chega às 11h não muda a posição; Atualizar gera uma posição nova', () => {
+    vi.setSystemTime(new Date('2026-11-14T09:00:00-03:00'));
+    const s0 = useTcheStore.getState();
+    const tenant_id = s0.tenant.id;
+    const product_id = s0.products[0]!.id;
+    const key = '4326'.padEnd(44, '9');
+    const inv = (id: string, imported_at: string) => ({ id, tenant_id, supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: '2026-11-13T08:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 500, imported_at });
+    setup('own');
+    act(() => {
+      useTcheStore.setState({
+        purchaseInvoices: [inv('a', '2026-11-13T09:00:00-03:00')],
+        purchaseInvoiceItems: [{ id: 'it', tenant_id, invoice_id: 'a' }],
+        stockMovements: [{ id: 'm', tenant_id, product_id, type: 'PURCHASE_IN', quantity: 100, unit_cost: 5, balance_after: 100, avg_cost_after: 5, purchase_invoice_item_id: 'it', performed_by_user_id: 'own', created_at: '2026-11-13T09:00:00-03:00' }],
+        syncRejected: [],
+      } as never);
+    });
+    render(<AnnualClose />);
+    expect(screen.getByText('Custo total do estoque').parentElement!.textContent).toContain(fmt(500));
+    vi.setSystemTime(new Date('2026-11-14T11:00:00-03:00'));
+    act(() => {
+      useTcheStore.setState({
+        purchaseInvoices: [inv('a', '2026-11-13T09:00:00-03:00'), inv('b', '2026-11-13T08:30:00-03:00')],
+        syncRejected: [{ event: { id: 'e', table: 'purchase_invoices', op: 'INSERT', row_id: 'a', payload: {} }, message: 'duplicada' }],
+      } as never);
+    });
+    expect(screen.getByText('Custo total do estoque').parentElement!.textContent).toContain(fmt(500));
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 09:00:00 \(ano em andamento\)/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByLabelText('Atualizar com os dados novos'));
+    expect(screen.getByText('Custo total do estoque').parentElement!.textContent).toContain(fmt(0));
+    expect(screen.getAllByText(/Posição em 14\/11\/2026 11:00:00 \(ano em andamento\)/).length).toBeGreaterThan(0);
+  });
+
+  it('P1-02: taxa de 3% gravada na loja A não vale para a loja B (fica sem taxa cadastrada) até confirmar', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    act(() => {
+      useOwnerSettings.setState({ feeRules: [{ id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false }], appCommissionPct: {}, feeTenantId: 'loja-A' });
+    });
+    setup('own', [{ ...pay(1000, '2025-05-01T12:00:00', 'CREDIT'), acquirer: 'STONE', card_brand: 'VISA' } as Payment]);
+    render(<AnnualClose />);
+    expect(screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)').parentElement!.parentElement!.textContent).toContain(fmt(1000));
+    expect(screen.queryByText(/taxa estimada R\$/)).toBeNull();
+    expect(screen.getAllByText(/não estão confirmadas como desta loja/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByLabelText('As taxas são desta loja'));
+    expect(useOwnerSettings.getState().feeTenantId).toBe(useTcheStore.getState().tenant.id);
+    expect(screen.getByText(/taxa estimada/).textContent).toContain(fmt(30));
+    expect(screen.queryByText('Situação de repasse desconhecida (sem taxa cadastrada)')).toBeNull();
+  });
+
+  it('P1-02: quem grava a taxa grava para a loja atual, e a loja fica salva com as taxas (sobrevive a reiniciar)', () => {
+    act(() => useOwnerSettings.setState({ feeRules: [], appCommissionPct: {}, feeTenantId: null }));
+    expect(useOwnerSettings.getState().saveFeeRule({ acquirer: 'STONE', method: 'DEBIT', brand: null, pct: 1, fixed: 0, days: 1, businessDays: false })).toBeNull();
+    expect(useOwnerSettings.getState().feeTenantId).toBe(useTcheStore.getState().tenant.id);
+    const saved = useOwnerSettings.persist.getOptions().partialize!(useOwnerSettings.getState()) as Record<string, unknown>;
+    expect(saved.feeTenantId).toBe(useTcheStore.getState().tenant.id);
+    const migrated = useOwnerSettings.persist.getOptions().migrate!({ feeRules: [] }, 3) as unknown as Record<string, unknown>;
+    expect(migrated.feeTenantId).toBeNull();
+  });
+
+  it('P1-02: com taxas de outra loja na lista, gravar uma taxa nova não confirma as outras', () => {
+    act(() => useOwnerSettings.setState({ feeRules: [{ id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false }], appCommissionPct: {}, feeTenantId: 'loja-A' }));
+    expect(useOwnerSettings.getState().saveFeeRule({ acquirer: 'STONE', method: 'DEBIT', brand: null, pct: 1, fixed: 0, days: 1, businessDays: false })).toBeNull();
+    expect(useOwnerSettings.getState().setAppCommission('ifood', 12)).toBeNull();
+    useOwnerSettings.getState().removeFeeRule('r');
+    expect(useOwnerSettings.getState().feeTenantId).toBe('loja-A');
+    // Antigo (sem loja gravada) com taxas: também continua pedindo a confirmação.
+    act(() => useOwnerSettings.setState({ feeTenantId: null }));
+    useOwnerSettings.getState().setAppCommission('ifood', 10);
+    expect(useOwnerSettings.getState().feeTenantId).toBeNull();
+  });
+
+  it('P1-01: a nuvem reescreve as listas com o mesmo conteúdo: não aparece o aviso de dados novos', () => {
+    vi.setSystemTime(new Date('2026-11-14T09:00:00-03:00'));
+    setup('own', [pay(30, '2026-11-14T08:00:00')]);
+    render(<AnnualClose />);
+    act(() => {
+      const st = useTcheStore.getState();
+      useTcheStore.setState({ tenant: { ...st.tenant }, products: [...st.products], staff: [...st.staff], payments: [...st.payments] } as never);
+    });
+    expect(screen.queryByText(/Chegaram dados novos/)).toBeNull();
   });
 });

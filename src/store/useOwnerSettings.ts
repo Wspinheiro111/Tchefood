@@ -11,6 +11,7 @@ import { idbStorage } from '../lib/idbStorage';
 import { round2 } from '../lib/money';
 import { validateFeeRule, type FeeRule } from '../lib/cardFees';
 import { nowISO, uuid } from '../lib/ids';
+import { useTcheStore } from './useTcheStore';
 import { DEFAULT_WINBACK_TEMPLATE, normalizeCouponCode, validateCampaign, type WinbackCampaign, type WinbackContact } from '../lib/winback';
 
 /** 0 = domingo … 6 = sábado (Date.getDay()). Null = sem meta naquele dia. */
@@ -35,12 +36,35 @@ interface OwnerSettingsState {
   /** Comissão de cada app de delivery em % (chave do canal). Null = não cadastrada. */
   appCommissionPct: Record<string, number | null>;
   setAppCommission: (channel: string, pct: number | null) => string | null;
+  /**
+   * Loja (tenant_id) a que as taxas e comissões acima pertencem: a que estava neste
+   * aparelho quando foram gravadas ou confirmadas. Null = gravadas antes deste campo
+   * existir (loja desconhecida). O fechamento anual só usa as taxas da loja atual.
+   */
+  feeTenantId: string | null;
+  /** Confirma que as taxas e comissões gravadas são da loja indicada. */
+  confirmFeesTenant: (tenantId: string) => void;
   /** Campanha para chamar de volta o cliente sumido. */
   winbackCampaign: WinbackCampaign;
   saveWinbackCampaign: (c: WinbackCampaign) => string | null;
   /** Quem já recebeu a mensagem (para não mandar duas vezes e medir quem voltou). */
   winbackContacts: WinbackContact[];
   markWinbackSent: (customerId: string) => void;
+}
+
+/** Loja que está neste aparelho agora (quem grava uma taxa grava para ela). */
+const currentTenantId = (): string => useTcheStore.getState().tenant.id;
+
+/**
+ * Loja das taxas depois de uma gravação: só passa a ser a loja atual se já era dela ou se
+ * não havia taxa nem comissão gravada. Com taxas de outra loja (ou de antes deste campo)
+ * na lista, gravar uma não confirma as outras: continua pedindo a confirmação explícita.
+ */
+function stampAfterEdit(s: Pick<OwnerSettingsState, 'feeRules' | 'appCommissionPct' | 'feeTenantId'>): string | null {
+  const cur = currentTenantId();
+  if (s.feeTenantId === cur) return cur;
+  const hadAny = s.feeRules.length > 0 || Object.values(s.appCommissionPct).some((v) => v !== null && v !== undefined);
+  return hadAny ? s.feeTenantId : cur;
 }
 
 const DEFAULT_CAMPAIGN: WinbackCampaign = { template: DEFAULT_WINBACK_TEMPLATE, offer: '10% de desconto', coupon: 'VOLTA10' };
@@ -74,17 +98,19 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
           dup = s.feeRules.some((r) => r.id !== rule.id && r.acquirer === rule.acquirer && r.method === rule.method && r.brand === rule.brand);
           if (dup) return {};
           const exists = s.feeRules.some((r) => r.id === rule.id);
-          return { feeRules: exists ? s.feeRules.map((r) => (r.id === rule.id ? rule : r)) : [...s.feeRules, rule] };
+          return { feeRules: exists ? s.feeRules.map((r) => (r.id === rule.id ? rule : r)) : [...s.feeRules, rule], feeTenantId: stampAfterEdit(s) };
         });
         return dup ? 'Já existe uma taxa para essa maquininha, forma e bandeira. Edite a que existe.' : null;
       },
-      removeFeeRule: (id) => set((s) => ({ feeRules: s.feeRules.filter((r) => r.id !== id) })),
+      removeFeeRule: (id) => set((s) => ({ feeRules: s.feeRules.filter((r) => r.id !== id), feeTenantId: stampAfterEdit(s) })),
       appCommissionPct: {},
       setAppCommission: (channel, pct) => {
         if (pct !== null && (!Number.isFinite(pct) || pct < 0 || pct > 50)) return 'Comissão entre 0% e 50%.';
-        set((s) => ({ appCommissionPct: { ...s.appCommissionPct, [channel]: pct === null ? null : round2(pct) } }));
+        set((s) => ({ appCommissionPct: { ...s.appCommissionPct, [channel]: pct === null ? null : round2(pct) }, feeTenantId: stampAfterEdit(s) }));
         return null;
       },
+      feeTenantId: null,
+      confirmFeesTenant: (tenantId) => set({ feeTenantId: tenantId }),
       winbackCampaign: DEFAULT_CAMPAIGN,
       saveWinbackCampaign: (c) => {
         const err = validateCampaign(c);
@@ -105,6 +131,7 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
         dailyGoals: s.dailyGoals,
         feeRules: s.feeRules,
         appCommissionPct: s.appCommissionPct,
+        feeTenantId: s.feeTenantId,
         winbackCampaign: s.winbackCampaign,
         winbackContacts: s.winbackContacts,
       }),
@@ -114,6 +141,7 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
         if (typeof out.appCommissionPct !== 'object' || out.appCommissionPct === null) out.appCommissionPct = {};
         if (typeof out.winbackCampaign !== 'object' || out.winbackCampaign === null) out.winbackCampaign = DEFAULT_CAMPAIGN;
         if (!Array.isArray(out.winbackContacts)) out.winbackContacts = [];
+        if (typeof out.feeTenantId !== 'string') out.feeTenantId = null;
         return out as unknown as OwnerSettingsState;
       },
     },

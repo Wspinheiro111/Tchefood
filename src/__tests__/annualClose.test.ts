@@ -937,3 +937,52 @@ describe('Codex em 1fbc385', () => {
     expect([[...review.excluded], review.unconfirmed]).toEqual([['m2'], [['m1']]]);
   });
 });
+
+describe('auditoria GPT rodada 6 ampliada (1fbc385)', () => {
+  it('P2-01: taxa de serviço de R$ 0,01 paga em dois anos soma R$ 0,01 nos dois relatórios', () => {
+    const order = { id: 'o1', status: 'CLOSED', service_fee_amount: 0.01 } as never;
+    const payments = [
+      pay({ id: 'a', order_id: 'o1', method: 'CASH', acquirer: 'CASH_DESK', amount: 0.5, created_at: '2025-12-20T20:00:00-03:00' }),
+      pay({ id: 'b', order_id: 'o1', method: 'CASH', acquirer: 'CASH_DESK', amount: 0.5, created_at: '2026-01-05T20:00:00-03:00' }),
+    ];
+    const now = new Date('2026-11-14T12:00:00-03:00');
+    const r25 = revenueByMethod({ ...emptyRevenueInput, payments, orders: [order] }, yearPeriod(2025), now);
+    const r26 = revenueByMethod({ ...emptyRevenueInput, payments, orders: [order] }, yearPeriod(2026), now);
+    expect(Math.round((r25.serviceFee + r26.serviceFee) * 100)).toBe(1);
+    // Em qualquer ordem dos pagamentos.
+    const r25b = revenueByMethod({ ...emptyRevenueInput, payments: [...payments].reverse(), orders: [order] }, yearPeriod(2025), now);
+    expect(r25b.serviceFee).toBe(r25.serviceFee);
+  });
+
+  it('P2-02: ano em andamento, NF-e com data de importação inválida fica fora com aviso; ano encerrado vale a emissão', () => {
+    const P26 = yearPeriod(2026);
+    const nove = new Date('2026-11-14T09:00:00-03:00');
+    const inv = { id: 'n', supplier_id: 's', access_key: '4326'.padEnd(44, '1'), number: '1', series: '1', issued_at: '2026-11-14T08:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 500, imported_at: 'sem-data' } as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, nove) }, P26, nove);
+    expect([r.purchases.length, r.unknownImportInvoices, r.invalidDates > 0, r.importedAfterCutoff]).toEqual([0, 1, true, 0]);
+    expect(toCsv(expensesDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('sem data de importação válida');
+    const dez = { ...inv, issued_at: '2025-12-20T10:00:00-03:00' } as PurchaseInvoice;
+    const r25 = expensesByCategory({ purchaseInvoices: [dez], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, nove) }, P, nove);
+    expect([r25.purchases.length, r25.unknownImportInvoices]).toEqual([1, 0]);
+    // Nota claramente de outro ano (emitida em 2024) sem data de importação: nenhum aviso em 2026.
+    const velha = { ...inv, issued_at: '2024-03-01T10:00:00-03:00' } as PurchaseInvoice;
+    const rv = expensesByCategory({ purchaseInvoices: [velha], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, nove) }, P26, nove);
+    expect([rv.invalidDates, rv.unknownImportInvoices]).toEqual([0, 0]);
+    // O aviso não depende da ordem das cópias.
+    const late = { ...inv, id: 'n2', imported_at: '2026-11-14T11:00:00-03:00' } as PurchaseInvoice;
+    const ab = expensesByCategory({ purchaseInvoices: [late, inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, nove) }, P26, nove);
+    const ba = expensesByCategory({ purchaseInvoices: [inv, late], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, nove) }, P26, nove);
+    expect([ab.importedAfterCutoff, ab.unknownImportInvoices]).toEqual([ba.importedAfterCutoff, ba.unknownImportInvoices]);
+  });
+
+  it('P2-04: caixa fechado com data de fechamento inválida não vira dinheiro fora de turno', () => {
+    const session = { id: 'c', tenant_id: 't', status: 'CLOSED', opened_at: '2025-05-01T10:00:00-03:00', closed_at: 'sem-data', opening_amount: 0, expected_cash: 0, counted_cash: 0, difference: 0 } as never;
+    const payments = [pay({ method: 'CASH', acquirer: 'CASH_DESK', amount: 100, created_at: '2025-05-01T20:00:00-03:00' })];
+    const r = revenueByMethod({ ...emptyRevenueInput, payments, cashSessions: [session] }, P, new Date('2026-11-14T12:00:00-03:00'));
+    expect([r.cashOutsideSessions, r.cashUndeterminedSession, r.cashUndeterminedSessionCount]).toEqual([0, 100, 1]);
+    expect(toCsv(revenueDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('situação de caixa indeterminada');
+    // Antes da abertura válida continua fora de turno.
+    const cedo = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'CASH', acquirer: 'CASH_DESK', amount: 7, created_at: '2025-05-01T08:00:00-03:00' })], cashSessions: [session] }, P, new Date('2026-11-14T12:00:00-03:00'));
+    expect([cedo.cashOutsideSessions, cedo.cashUndeterminedSession]).toEqual([7, 0]);
+  });
+});
