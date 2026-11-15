@@ -2601,6 +2601,12 @@ export const useTcheStore = create<TcheState>()(
           const orderId = typeof so.id === 'string' ? so.id : '';
           const status = so.status as OrderStatus;
           if (!orderId || !['OPEN', 'PAYING', 'CLOSED', 'CANCELED'].includes(String(status))) return fail('Resposta do servidor sem a conta.');
+          // GPT r16 P0-01: só entra aqui conta da loja deste aparelho. Resposta de outra loja (leitura começada antes de
+          // trocar a loja, com a sessão antiga) é descartada inteira; linha de outra conta ou de outra loja também.
+          const foreign = (r: Record<string, unknown>) => r.order_id !== orderId || (r.tenant_id !== undefined && r.tenant_id !== null && r.tenant_id !== state.tenant.id);
+          if (so.tenant_id !== state.tenant.id || snap.items.some(foreign) || snap.payments.some(foreign) || snap.audits.some(foreign)) {
+            return fail('A resposta do servidor é de outra loja ou de outra conta. Nada foi alterado neste aparelho.');
+          }
           const itemIds = new Set(snap.items.map((i) => String(i.id)));
           const paymentIds = new Set(snap.payments.map((p) => String(p.id)));
           const touches = (e: SyncEvent) => e.row_id === orderId || itemIds.has(e.row_id) || paymentIds.has(e.row_id) || (e.payload as Record<string, unknown> | undefined)?.order_id === orderId;

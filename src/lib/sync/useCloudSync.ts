@@ -40,24 +40,54 @@ function pullDue(lastPullAt: string | null | undefined, nowMs: number): boolean 
   return !lastPullAt || nowMs - Date.parse(lastPullAt) >= PULL_EVERY_MS;
 }
 
+/** Loja e sessão da nuvem de uma rodada (url, conta e loja do token). */
+const sessionKey = (tenantId: string, session: { url: string; email: string; tenant_id: string }) => `${tenantId}|${session.url}|${session.email}|${session.tenant_id}`;
+
 /** Lê os cadastros da nuvem e aplica (o store deixa como está o que ainda não subiu daqui). */
-async function pullOnce(cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
-  const tenantId = useTcheStore.getState().tenant.id;
+async function pullOnce(cfg: SyncConfig, fetchFn: FetchLike, tenantId: string, session: { url: string; email: string; tenant_id: string }): Promise<void> {
+  // GPT r16 P0-01: a loja e a sessão são as do começo da rodada (cfg é dessa sessão). Trocou de loja ou desconectou
+  // antes ou enquanto lia: nada é lido nem aplicado com a sessão antiga.
+  const same = () => {
+    const st = useTcheStore.getState();
+    return st.tenant.id === tenantId && st.cloud !== null && sessionKey(st.tenant.id, st.cloud) === sessionKey(tenantId, session);
+  };
+  if (!same()) return;
   try {
     const snapshot = await fetchCloudSnapshot(cfg, tenantId, fetchFn);
     const st = useTcheStore.getState();
-    // Trocou de loja ou desconectou enquanto lia: descarta.
-    if (!st.cloud || st.tenant.id !== tenantId) return;
+    if (!same()) return;
     const r = st.applyCloudSnapshot(snapshot);
     if (!r.ok) st.setPullError(r.error);
   } catch (e) {
     useTcheStore.getState().setPullError((e as Error).message);
   }
-  // GPT r15 P1-01: estornos da Point e encerramentos como venda devolvida feitos em outro aparelho (também com este
-  // fechado): a conta daqui fica com o estado do servidor. Import tardio: o módulo usa este para a sessão.
+}
+
+/** Última leitura dos estornos e encerramentos de outros aparelhos, por loja e sessão (uma por minuto no laço). */
+let refundPull: { key: string; at: number } | null = null;
+function refundPullDue(key: string, nowMs: number): boolean {
+  return !refundPull || refundPull.key !== key || nowMs - refundPull.at >= PULL_EVERY_MS;
+}
+
+/**
+ * GPT r15 P1-01: estornos da Point e encerramentos como venda devolvida feitos em outro aparelho (também com este
+ * fechado): a conta daqui fica com o estado do servidor. GPT r16: roda à parte da leitura dos cadastros e da fila
+ * (P1-01: evento de outra coisa preso na fila não segura; conta com alteração daqui na fila ou recusada não é
+ * sobrescrita) e só com a loja e a sessão em que a rodada começou (P0-01: trocou de loja no meio, nada é lido nem
+ * aplicado com a sessão antiga). Import tardio: o módulo usa este para a sessão.
+ */
+async function pullRefunds(tenantId: string, session: { url: string; email: string; tenant_id: string }, cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
+  const key = sessionKey(tenantId, session);
   try {
     const [m, c] = await Promise.all([import('../payments/refundOrdersPull'), import('../payments/paymentClaim')]);
-    await m.pullRefundOrders({ ...c.defaultClaimDeps(), config: async () => cfg, fetch: fetchFn });
+    const scope = { tenantId, session: `${session.url}|${session.email}|${session.tenant_id}` };
+    if (!m.sameScope(scope)) return;
+    refundPull = { key, at: Date.now() };
+    const out = await m.pullRefundOrders({ ...c.defaultClaimDeps(), config: async () => cfg, fetch: fetchFn }, scope);
+    // GPT r16 P2-01: a falha desta leitura aparece no estado da nuvem (não fica calada no laço).
+    if ((!out.changesOk || !out.reopened) && m.sameScope(scope)) {
+      useTcheStore.getState().setPullError('Não foi possível ler os estornos e encerramentos feitos em outros aparelhos; tentando de novo em um minuto.');
+    }
   } catch {
     // Sem leitura agora: tenta de novo na próxima rodada.
   }
@@ -79,9 +109,11 @@ async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): 
   const session = state.cloud;
   if (!session) return;
   const wantsPull = pull === 'force' || (pull === 'due' && pullDue(state.pullStatus?.last_pull_at, Date.now()));
-  if (state.outbox.length === 0 && !wantsPull) return;
+  const tenantId = state.tenant.id;
+  const wantsRefunds = pull === 'force' || (pull === 'due' && refundPullDue(sessionKey(tenantId, session), Date.now()));
+  if (state.outbox.length === 0 && !wantsPull && !wantsRefunds) return;
   running = true;
-  const round = runRound(session, fetchFn, wantsPull);
+  const round = runRound(session, fetchFn, wantsPull, wantsRefunds, tenantId);
   current = round;
   try {
     await round;
@@ -90,8 +122,19 @@ async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): 
   }
 }
 
-async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getState>['cloud']>, fetchFn: FetchLike, wantsPull: boolean): Promise<void> {
+async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getState>['cloud']>, fetchFn: FetchLike, wantsPull: boolean, wantsRefunds: boolean, tenantId: string): Promise<void> {
   try {
+    const cfg = await sendAndPull(session, fetchFn, wantsPull, tenantId);
+    // À parte da fila e dos cadastros: roda mesmo com evento preso na fila ou com a leitura dos cadastros falhando.
+    if (cfg && wantsRefunds) await pullRefunds(tenantId, session, cfg, fetchFn);
+  } finally {
+    running = false;
+  }
+}
+
+/** Renova o token, sobe a fila e lê os cadastros. Devolve a sessão usada (null: sem token válido). */
+async function sendAndPull(session: NonNullable<ReturnType<typeof useTcheStore.getState>['cloud']>, fetchFn: FetchLike, wantsPull: boolean, tenantId: string): Promise<SyncConfig | null> {
+  {
     let token = session.access_token;
     if (needsRefresh(session.expires_at)) {
       try {
@@ -99,19 +142,19 @@ async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getS
         const res = useTcheStore.getState().setCloudSession({ ...session, ...t });
         if (!res.ok) {
           useTcheStore.getState().setSyncError(res.error, null);
-          return;
+          return null;
         }
         token = t.access_token;
       } catch (e) {
         useTcheStore.getState().setSyncError((e as Error).message, null);
-        return;
+        return null;
       }
     }
     const cfg: SyncConfig = { url: session.url, anonKey: session.anon_key, accessToken: token };
     const { outbox: events, syncRejected } = useTcheStore.getState();
     if (events.length === 0) {
-      await pullOnce(cfg, fetchFn);
-      return;
+      if (wantsPull) await pullOnce(cfg, fetchFn, tenantId, session);
+      return cfg;
     }
     const held = (syncRejected ?? []).map((r) => r.event);
     const result = await flushOutbox(events, cfg, fetchFn, 50, held, declinedAwaitingRelease);
@@ -130,9 +173,8 @@ async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getS
       st.setSyncError(`Servidor recusou um evento${more} (HTTP ${first.status}): ${first.message}`, null);
     }
     // Fila zerou nesta rodada: lê a nuvem agora, se estava na hora.
-    if (wantsPull && useTcheStore.getState().outbox.length === 0 && !result.retryLater) await pullOnce(cfg, fetchFn);
-  } finally {
-    running = false;
+    if (wantsPull && useTcheStore.getState().outbox.length === 0 && !result.retryLater) await pullOnce(cfg, fetchFn, tenantId, session);
+    return cfg;
   }
 }
 

@@ -3298,6 +3298,41 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(detailOf('SELECT tchefood_list_refund_order_changes(0, 201)')).toMatch(/^TF006/);
     });
 
+    it('GPT r16 (a verificar): registro gravado antes e confirmado depois de outro com sequência maior: o ponto de leitura não passa por ele e a conta aparece na leitura seguinte', async () => {
+      type Out = { items: Array<{ order_id: string; last_seq: number }>; next_seq: number; safe_seq: number; has_more: boolean };
+      const changes = (after: number) => json<Out>(asDevice(`SELECT tchefood_list_refund_order_changes(${after})`));
+      const x = refundedOrder();
+      const y = refundedOrder();
+      // Os registros dos dois estornos já são antigos: o ponto de partida do aparelho.
+      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE audit_logs SET created_at = created_at - INTERVAL '11 minutes' WHERE order_id IN ('${x.order}', '${y.order}'); COMMIT;`);
+      const start = Number(sql('SELECT COALESCE(max(server_seq), 0) FROM audit_logs'));
+      expect(changes(start)).toMatchObject({ items: [], safe_seq: start });
+      const insert = (order: string) => `INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, action_type, reason, metadata)
+        VALUES ('${TENANT}', '${order}', '${STAFF}', 'ORDER_REFUNDED_WRITE_OFF', 'venda devolvida ao cliente', '{"written_off_cents": 0}'::jsonb) RETURNING server_seq;`;
+      // Sessão 1 grava primeiro (sequência menor) e fica aberta; a sessão 2 grava depois e confirma antes.
+      const s1 = session();
+      s1.send('BEGIN; SET LOCAL session_replication_role = replica;');
+      s1.send(insert(x.order));
+      await until('sessão 1 gravou', () => /^\d+$/m.test(s1.output()));
+      const seqX = Number(s1.output().trim().split('\n').pop());
+      const seqY = Number(sql(`BEGIN; SET LOCAL session_replication_role = replica; ${insert(y.order)} COMMIT;`).split('\n').find((l) => /^\d+$/.test(l)));
+      expect(seqX).toBeLessThan(seqY);
+      // O aparelho lê agora: só vê a conta Y. O ponto de leitura NÃO anda (registro recente), então X não é pulada.
+      const first = changes(start);
+      expect(first.items.map((i) => i.order_id)).toEqual([y.order]);
+      expect(first).toMatchObject({ next_seq: seqY, safe_seq: start });
+      // A sessão 1 confirma. A leitura seguinte, do mesmo ponto, traz as duas.
+      s1.end('COMMIT;');
+      await s1.done;
+      const second = changes(start);
+      expect(second.items.map((i) => i.order_id)).toEqual([x.order, y.order]);
+      expect(second.safe_seq).toBe(start);
+      // Um registro antigo seguido de um recente: o ponto anda só até o antigo.
+      sql(`BEGIN; SET LOCAL session_replication_role = replica; UPDATE audit_logs SET created_at = created_at - INTERVAL '11 minutes' WHERE server_seq = ${seqX}; COMMIT;`);
+      expect(changes(start)).toMatchObject({ safe_seq: seqX, next_seq: seqY });
+      expect(changes(seqX).items.map((i) => i.order_id)).toEqual([y.order]);
+    });
+
     describe('P1-02: tchefood_list_point_payments', () => {
       const LIST_TERMINAL = '68686868-6868-4868-8868-686868686868';
       type Item = { payment_id: string; order_id: string; charge_id: string | null; idempotency_key: string; amount: number; method: string; nsu: string | null;

@@ -1137,6 +1137,29 @@ function freeValue(v: string) {
     expect(onServer(d.id).writeOffs).toHaveLength(0);
     expect(onA(d.id)).toEqual({ ...onServer(d.id), kept: d.cents });
     expect(onA(d.id).payments).toEqual([`${cash}:APPROVED`, `${d.key}:REFUNDED`].sort());
+
+    // 5) GPT r16 P1-01: alteração de produto presa na fila do A (rede falhando só para ela); o B estorna e encerra
+    //    outra conta. O laço do A (sem forçar) traz o estado financeiro e a alteração continua na fila.
+    const e = await sellOnA(14, 'e');
+    const product = st().products[0]!;
+    const stuck = { id: crypto.randomUUID(), table: 'products', op: 'UPDATE', row_id: product.id, payload: { ...product }, created_at: new Date().toISOString() };
+    useTcheStore.setState((s) => ({ outbox: [...s.outbox, stuck as never] }));
+    net.block.push('products', 'products', 'products', 'products');
+    refundOnB(e);
+    writeOffOnB(e.id);
+    // Rodada normal do laço, um minuto depois da última leitura dos estornos: a fila não esvazia.
+    const real = Date.now;
+    const later = vi.spyOn(Date, 'now').mockImplementation(() => real() + 61_000);
+    try {
+      await syncOnce();
+    } finally {
+      later.mockRestore();
+    }
+    expect(st().outbox.map((x) => x.id)).toEqual([stuck.id]);
+    expect(onA(e.id)).toEqual({ ...onServer(e.id), kept: 0 });
+    // A rede volta: a alteração do produto sobe.
+    net.block.length = 0;
+    await expectSynced('produto preso');
     await settleLoops();
   }, 180_000);
 });
