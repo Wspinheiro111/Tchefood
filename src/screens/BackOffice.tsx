@@ -104,7 +104,7 @@ export function BackOffice({ onExit }: { onExit?: (view: BackOfficeExit) => void
       </div>
       {tab === 'owner' && <OwnerDashboard onNavigate={navigate} />}
       {tab === 'fees' && <FeesReceivables />}
-      {tab === 'annual' && <AnnualClose />}
+      {tab === 'annual' && <AnnualClose onReviewFees={() => setTab('fees')} />}
       {tab === 'entrega' && <OwnDeliveryAdmin />}
       {tab === 'dash' && <Dashboard />}
       {tab === 'recon' && <Reconciliation />}

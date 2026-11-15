@@ -104,7 +104,8 @@ function content(v: unknown): string {
 }
 const same = (a: unknown, b: unknown): boolean => a === b || content(a) === content(b);
 
-export function AnnualClose() {
+/** `onReviewFees`: abre Taxas e recebíveis (onde as taxas antigas são revisadas). */
+export function AnnualClose({ onReviewFees }: { onReviewFees?: () => void } = {}) {
   const user = useTcheStore(selectCurrentUser);
   const [snap, setSnap] = useState(captureSnapshot);
   const refresh = () => setSnap(captureSnapshot());
@@ -234,8 +235,8 @@ export function AnnualClose() {
   const otherNote = `${otherStore} registro(s) de outra loja ou sem loja identificada que ficaram neste aparelho (de antes de ligá-lo a esta loja) foram deixados de fora dos totais.`;
   // Notas que vão em todos os relatórios exportados (as mesmas que a tela mostra no topo).
   const feesNote = storeHasFees
-    ? 'Há taxas da maquininha ou comissões dos apps de antes da separação por loja neste aparelho, sem loja definida: não entraram nestes números (valem só as cadastradas para esta loja). Confira e traga as que forem desta loja em Taxas e recebíveis (ou em "As taxas são desta loja" aqui); as que conflitam com as da loja não são trocadas.'
-    : 'Esta loja não tem taxas da maquininha nem comissões cadastradas; as que existem neste aparelho são de antes da separação por loja e não se sabe de qual loja são: foram tratadas como NÃO cadastradas (repasse com situação desconhecida, taxa estimada zero). Se forem desta loja, toque em "As taxas são desta loja" no topo do Fechamento anual (ou em Taxas e recebíveis).';
+    ? 'Há taxas da maquininha ou comissões dos apps de antes da separação por loja neste aparelho, sem loja definida: não entraram nestes números (valem só as cadastradas para esta loja). A revisão delas fica em Retaguarda › Taxas e recebíveis.'
+    : 'Esta loja não tem taxas da maquininha nem comissões cadastradas; as que existem neste aparelho são de antes da separação por loja e não se sabe de qual loja são: foram tratadas como NÃO cadastradas (repasse com situação desconhecida, taxa estimada zero). A revisão delas fica em Retaguarda › Taxas e recebíveis.';
   const partialNote = [
     ...(feesForeign ? [feesNote] : []),
     ...(partial ? [`O ano de ${year} ainda não terminou: os números vão até ${cutoffLabel} (horário de Brasília), não até 31/12.`] : []),
@@ -375,16 +376,11 @@ export function AnnualClose() {
         {feesForeign && (
           <div role="alert" className="flex w-full flex-wrap items-center justify-between gap-2 rounded-xl bg-amarelo/15 p-3 text-sm">
             <span>{feesNote}</span>
-            <Btn
-              variant="secondary"
-              aria-label="As taxas são desta loja"
-              onClick={() => {
-                useOwnerSettings.getState().adoptLegacyFees(tenant.id);
-                refresh();
-              }}
-            >
-              As taxas são desta loja
-            </Btn>
+            {onReviewFees && (
+              <Btn variant="secondary" aria-label="Revisar em Taxas e recebíveis" onClick={onReviewFees}>
+                Revisar em Taxas e recebíveis
+              </Btn>
+            )}
           </div>
         )}
         {partial && (

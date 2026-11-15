@@ -271,7 +271,7 @@ describe('Fechamento anual (tela): Codex em 1fbc385', () => {
 
 describe('Fechamento anual (tela): auditoria GPT rodada 6 ampliada (1fbc385)', () => {
   const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
-  afterEach(() => act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: null })));
+  afterEach(() => act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: null, legacyOrigin: null, legacyConfirmedTenantId: null, legacyArchive: [] })));
 
   it('P1-01: aberto às 09h, a recusa de duplicidade que chega às 11h não muda a posição; Atualizar gera uma posição nova', () => {
     vi.setSystemTime(new Date('2026-11-14T09:00:00-03:00'));
@@ -374,28 +374,34 @@ describe('Fechamento anual (tela): auditoria GPT rodada 6 ampliada (1fbc385)', (
     act(() => useTcheStore.setState({ tenant: base } as never));
   });
 
-  it('P1-02: taxas de antes da separação por loja não valem para nenhuma loja até confirmar', () => {
+  it('P1-02: taxas de antes da separação por loja não valem para nenhuma loja (migração da v3)', () => {
     vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
     // Migração da v3 (lista única): vira "taxas antigas", sem loja.
     const migrated = useOwnerSettings.persist.getOptions().migrate!({ feeRules: [{ id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false }], appCommissionPct: { ifood: 12 } }, 3) as unknown as Record<string, unknown>;
     expect(migrated.feeRules).toBeUndefined();
     expect(migrated.feesByTenant).toEqual({});
     expect((migrated.legacyFees as { feeRules: unknown[] }).feeRules).toHaveLength(1);
-    act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: migrated.legacyFees as never }));
-    setup('own', [{ ...pay(1000, '2025-05-01T12:00:00', 'CREDIT'), acquirer: 'STONE', card_brand: 'VISA' } as Payment]);
-    render(<AnnualClose />);
-    expect(screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)')).toBeTruthy();
-    expect(screen.getAllByText(/de antes da separação por loja/).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByLabelText('As taxas são desta loja'));
+    expect(migrated.legacyOrigin).toBeNull();
+  });
+
+  it('rodada 10 P1-01: loja B sem taxas, R$ 10.000 no crédito e regra antiga de 3% não confirmada: o aviso do fechamento só leva à revisão, sem cadastrar nem mudar o resultado', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
     const tid = useTcheStore.getState().tenant.id;
-    expect(storeFees(useOwnerSettings.getState(), tid).feeRules).toHaveLength(1);
-    expect(useOwnerSettings.getState().legacyFees).toBeNull();
-    expect(screen.getByText(/taxa estimada/).textContent).toContain(fmt(30));
-    // A loja já tem a mesma taxa: trazer de novo não duplica, e as antigas iguais somem.
-    act(() => useOwnerSettings.setState({ legacyFees: migrated.legacyFees as never }));
-    expect(useOwnerSettings.getState().adoptLegacyFees(tid)).toBeNull();
-    expect(storeFees(useOwnerSettings.getState(), tid).feeRules).toHaveLength(1);
-    expect(useOwnerSettings.getState().legacyFees).toBeNull();
+    const old = { id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false } as const;
+    // Origem anotada = esta loja e quem abre é o proprietário: mesmo assim o fechamento não traz nada.
+    act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: { feeRules: [old], appCommissionPct: {} }, legacyOrigin: tid, legacyConfirmedTenantId: null }));
+    setup('own', [{ ...pay(10000, '2025-05-01T12:00:00', 'CREDIT'), acquirer: 'STONE', card_brand: 'VISA' } as Payment]);
+    const review = vi.fn();
+    render(<AnnualClose onReviewFees={review} />);
+    const before = screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)').parentElement!.textContent;
+    expect(screen.getAllByText(/de antes da separação por loja/).length).toBeGreaterThan(0);
+    expect(screen.queryByLabelText('As taxas são desta loja')).toBeNull();
+    fireEvent.click(screen.getByLabelText('Revisar em Taxas e recebíveis'));
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(storeFees(useOwnerSettings.getState(), tid).feeRules).toHaveLength(0);
+    expect(useOwnerSettings.getState().legacyFees?.feeRules).toHaveLength(1);
+    expect(screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)').parentElement!.textContent).toBe(before);
+    expect(screen.queryByText(fmt(300))).toBeNull();
   });
 
   it('rodada 8 P2-01: loja com taxa nova continua avisada das taxas antigas pendentes (não somem da tela)', () => {
@@ -407,9 +413,6 @@ describe('Fechamento anual (tela): auditoria GPT rodada 6 ampliada (1fbc385)', (
     setup('own');
     render(<AnnualClose />);
     expect(screen.getAllByText(/não entraram nestes números/).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByLabelText('As taxas são desta loja'));
-    expect(storeFees(useOwnerSettings.getState(), tid).feeRules.map((r) => r.id).sort()).toEqual(['p', 'r']);
-    expect(screen.queryAllByText(/não entraram nestes números/)).toHaveLength(0);
   });
 
   it('troca de loja com a tela aberta refaz a foto (não mostra a posição da loja anterior)', () => {

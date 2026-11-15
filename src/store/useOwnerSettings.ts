@@ -40,9 +40,19 @@ interface OwnerSettingsState {
    */
   legacyFees: StoreFees | null;
   /**
-   * Traz as taxas antigas (sem loja) para a loja indicada, sem sobrescrever nada que ela já
-   * tenha: a regra da mesma maquininha, forma e bandeira (ou a comissão do mesmo app) com
-   * valor diferente fica nas antigas, à vista, até a gerência resolver; a igual não duplica.
+   * Loja que estava no aparelho quando ele abriu esta versão com taxas antigas (a única
+   * pista de origem: a v3 não gravava a loja). Null = ainda não anotada. Só o proprietário
+   * DESSA loja pode confirmar e trazer as antigas; para qualquer outra loja elas ficam em
+   * quarentena (nem os valores aparecem).
+   */
+  legacyOrigin: string | null;
+  /** Loja cujo proprietário confirmou que as antigas são dela (os valores só aparecem para ela). */
+  legacyConfirmedTenantId: string | null;
+  /**
+   * O proprietário da loja de origem confirma que as taxas antigas são dela e as traz, sem
+   * sobrescrever nada: a regra da mesma maquininha, forma e bandeira (ou a comissão do mesmo
+   * app) com valor diferente fica nas antigas, marcada como conflito; a igual não duplica.
+   * Só vale para a loja que está no aparelho agora.
    */
   adoptLegacyFees: (tenantId: string) => string | null;
   /**
@@ -51,7 +61,7 @@ interface OwnerSettingsState {
    */
   discardLegacyFees: () => string | null;
   /** Taxas antigas tiradas da lista (mais recente por último), guardadas para restaurar. */
-  legacyArchive: StoreFees[];
+  legacyArchive: LegacyBatch[];
   /** Volta as últimas taxas antigas tiradas para a lista de pendentes. */
   restoreLegacyFees: () => string | null;
   /** Grava (novo ou edição) uma regra de taxa DA LOJA ATUAL. Devolve o erro, ou null. */
@@ -65,6 +75,13 @@ interface OwnerSettingsState {
   /** Quem já recebeu a mensagem (para não mandar duas vezes e medir quem voltou). */
   winbackContacts: WinbackContact[];
   markWinbackSent: (customerId: string) => void;
+}
+
+/** Taxas antigas guardadas fora da lista, com a pista de origem e a confirmação que tinham. */
+export interface LegacyBatch {
+  fees: StoreFees;
+  origin: string;
+  confirmedTenantId: string | null;
 }
 
 export interface StoreFees {
@@ -85,6 +102,22 @@ export function storeFees(s: Pick<OwnerSettingsState, 'feesByTenant'>, tenantId:
 /** Só gerente ou proprietário mexe nas taxas antigas (sem loja definida). */
 const NOT_MANAGER = 'Só gerente ou proprietário revisa as taxas antigas.';
 const currentIsManager = (): boolean => isManagerRole(selectCurrentUser(useTcheStore.getState())?.role);
+/** Origem das taxas antigas que não dá mais para saber (fica em quarentena). */
+export const UNKNOWN_ORIGIN = '?';
+const currentIsOwner = (): boolean => selectCurrentUser(useTcheStore.getState())?.role === 'OWNER';
+
+/**
+ * O que a loja atual pode fazer com as taxas antigas:
+ * - 'revealed': o proprietário desta loja já confirmou que são dela (valores à vista para a gerência);
+ * - 'confirm': o aparelho estava nesta loja quando atualizou; o proprietário pode confirmar (sem ver os valores antes);
+ * - 'quarantine': origem desconhecida ou outra loja: ninguém aqui vê os valores nem pode trazê-las.
+ */
+export type LegacyAccess = 'revealed' | 'confirm' | 'quarantine';
+export function legacyAccess(s: Pick<OwnerSettingsState, 'legacyOrigin' | 'legacyConfirmedTenantId'>, tenantId: string): LegacyAccess {
+  if (s.legacyConfirmedTenantId === tenantId) return 'revealed';
+  if (s.legacyConfirmedTenantId === null && s.legacyOrigin === tenantId) return 'confirm';
+  return 'quarantine';
+}
 
 /** Loja que está neste aparelho agora (quem grava uma taxa grava para ela). */
 const currentTenantId = (): string => useTcheStore.getState().tenant.id;
@@ -148,16 +181,29 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
       },
       feesByTenant: {},
       legacyFees: null,
+      legacyOrigin: null,
+      legacyConfirmedTenantId: null,
       adoptLegacyFees: (tenantId) => {
-        if (!currentIsManager()) return NOT_MANAGER;
+        if (!currentIsOwner()) return 'Só o proprietário confirma de qual loja são as taxas antigas.';
+        if (tenantId !== currentTenantId()) return 'Só dá para trazer as taxas antigas para a loja que está neste aparelho.';
         let err: string | null = null;
         set((s) => {
           if (!hasAnyFee(s.legacyFees)) {
             err = 'Não há taxas antigas para trazer.';
             return {};
           }
+          if (legacyAccess(s, tenantId) === 'quarantine') {
+            err = 'Estas taxas antigas não são desta loja (ou a origem é desconhecida): ficam guardadas, sem uso aqui.';
+            return {};
+          }
           const { merged, left } = mergeLegacyFees(storeFees(s, tenantId), s.legacyFees!);
-          return { feesByTenant: { ...s.feesByTenant, [tenantId]: merged }, legacyFees: hasAnyFee(left) ? left : null };
+          const rest = hasAnyFee(left);
+          return {
+            feesByTenant: { ...s.feesByTenant, [tenantId]: merged },
+            legacyFees: rest ? left : null,
+            legacyConfirmedTenantId: rest ? tenantId : null,
+            legacyOrigin: rest ? s.legacyOrigin : null,
+          };
         });
         return err;
       },
@@ -170,7 +216,9 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
             err = 'Não há taxas antigas para tirar da lista.';
             return {};
           }
-          return { legacyArchive: [...s.legacyArchive, s.legacyFees!], legacyFees: null };
+          // Sem pista anotada, guarda como origem desconhecida (nunca é anotada depois, em outra loja).
+          const batch: LegacyBatch = { fees: s.legacyFees!, origin: s.legacyOrigin ?? UNKNOWN_ORIGIN, confirmedTenantId: s.legacyConfirmedTenantId };
+          return { legacyArchive: [...s.legacyArchive, batch], legacyFees: null, legacyOrigin: null, legacyConfirmedTenantId: null };
         });
         return err;
       },
@@ -187,7 +235,8 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
             err = 'Resolva antes as taxas antigas que estão na lista.';
             return {};
           }
-          return { legacyFees: last, legacyArchive: s.legacyArchive.slice(0, -1) };
+          // Volta com a mesma pista de origem e a mesma confirmação: restaurar não revela nada.
+          return { legacyFees: last.fees, legacyOrigin: last.origin, legacyConfirmedTenantId: last.confirmedTenantId, legacyArchive: s.legacyArchive.slice(0, -1) };
         });
         return err;
       },
@@ -254,6 +303,8 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
         feesByTenant: s.feesByTenant,
         legacyFees: s.legacyFees,
         legacyArchive: s.legacyArchive,
+        legacyOrigin: s.legacyOrigin,
+        legacyConfirmedTenantId: s.legacyConfirmedTenantId,
         winbackCampaign: s.winbackCampaign,
         winbackContacts: s.winbackContacts,
       }),
@@ -270,7 +321,11 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
           const legacy: StoreFees = { feeRules: oldRules, appCommissionPct: oldCommissions };
           out.legacyFees = hasAnyFee(legacy) ? legacy : null;
         }
-        if (!Array.isArray(out.legacyArchive)) out.legacyArchive = [];
+        out.legacyArchive = Array.isArray(out.legacyArchive)
+          ? (out.legacyArchive as unknown[]).map((b) => (b && typeof b === 'object' && 'fees' in b ? b : { fees: b, origin: UNKNOWN_ORIGIN, confirmedTenantId: null }))
+          : [];
+        if (typeof out.legacyOrigin !== 'string') out.legacyOrigin = null;
+        if (typeof out.legacyConfirmedTenantId !== 'string') out.legacyConfirmedTenantId = null;
         if (typeof out.winbackCampaign !== 'object' || out.winbackCampaign === null) out.winbackCampaign = DEFAULT_CAMPAIGN;
         if (!Array.isArray(out.winbackContacts)) out.winbackContacts = [];
         return out as unknown as OwnerSettingsState;
@@ -278,3 +333,19 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
     },
   ),
 );
+
+/**
+ * Anota a pista de origem das taxas antigas: a loja que está no aparelho quando ele abre esta
+ * versão pela primeira vez (com os dados da loja já carregados). Só anota uma vez.
+ */
+export function stampLegacyOrigin(): void {
+  const s = useOwnerSettings.getState();
+  if (!hasAnyFee(s.legacyFees) || s.legacyOrigin !== null || s.legacyConfirmedTenantId !== null) return;
+  useOwnerSettings.setState({ legacyOrigin: useTcheStore.getState().tenant.id });
+}
+const tryStampLegacyOrigin = () => {
+  if (useOwnerSettings.persist.hasHydrated() && useTcheStore.persist.hasHydrated()) stampLegacyOrigin();
+};
+useOwnerSettings.persist.onFinishHydration(tryStampLegacyOrigin);
+useTcheStore.persist.onFinishHydration(tryStampLegacyOrigin);
+tryStampLegacyOrigin();
