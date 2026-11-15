@@ -462,6 +462,8 @@ interface DeviceSlice {
    * nas versões antigas (= []) (auditoria interna, rodada 8 do PR #54).
    */
   courierSettlePending?: CourierSettlePendingEntry[];
+  /** Loja que este aparelho já ligou à nuvem (fica ao desconectar): o acerto sem nuvem é recusado nela. */
+  cloudLinkedTenantId?: UUID | null;
   /**
    * Acertos gravados na nuvem com pendência neste aparelho (senha paga na entrega não recebida,
    * sangria não feita): ficam no quadro da entrega até serem terminados. Ausente = [].
@@ -4036,6 +4038,7 @@ export const useTcheStore = create<TcheState>()(
             courierSettledRecently: [],
             currentUserId: owner.id,
             cloud: linkedCloud ?? null,
+            cloudLinkedTenantId: linkedCloud?.tenant_id ?? null,
             managerPinFailures: 0,
             managerPinLockedUntil: null,
             nfceSeq: 1,
@@ -4058,7 +4061,7 @@ export const useTcheStore = create<TcheState>()(
             const settling = courierSettleBlocksStoreChange(get());
             if (settling) return fail(settling.replace('trocar a loja deste aparelho', 'desconectar da nuvem'));
           }
-          set({ cloud: session });
+          set(session ? { cloud: session, cloudLinkedTenantId: session.tenant_id } : { cloud: null });
           return { ok: true, data: undefined };
         },
 
@@ -4142,6 +4145,7 @@ export const useTcheStore = create<TcheState>()(
             courierSettledRecently: [],
             currentUserId: who.id,
             cloud: session,
+            cloudLinkedTenantId: session.tenant_id,
             managerPinFailures: 0,
             managerPinLockedUntil: null,
             nfceSeq: 1,
@@ -5467,6 +5471,9 @@ export const useTcheStore = create<TcheState>()(
           // Loja ligada à nuvem: o acerto é feito pela nuvem antes de sair dinheiro da gaveta
           // (settleCourierOnline; auditoria interna, rodada 8 do PR #54).
           if (get().cloud) return fail(COURIER_SETTLE_OFFLINE);
+          // Loja da nuvem desconectada: o acerto feito aqui seria recusado pela nuvem ao conectar de
+          // novo (só a função grava acerto), com os pagamentos e a sangria já feitos (Codex, rodada 11).
+          if (get().cloudLinkedTenantId === get().tenant.id) return fail('Esta loja é da nuvem: conecte de novo à nuvem para acertar com o entregador.');
           const user = currentUser();
           if (!user) return fail('Sessão expirada. Faça login novamente.');
           if (!CASH_ROLES.includes(user.role)) return fail('Só caixa, gerente ou proprietário acerta com o entregador.');
@@ -5907,10 +5914,22 @@ export const useTcheStore = create<TcheState>()(
               },
             }), whatsapp_alert_sent: false };
             const next = { ...f, missing_payments: f.missing_payments.filter((x) => x.delivery_id !== m.delivery_id) };
+            // Recebimento desta senha recusado pela nuvem (conta recebida em outro aparelho): sai
+            // daqui junto, com o pagamento local que a nuvem não tem, para a leitura trazer a conta
+            // como está na nuvem e o caixa não somar dinheiro que não entrou (Codex, rodada 11).
+            const key = `entrega-${m.delivery_id}`;
+            const rejectedPay = (get().syncRejected ?? []).filter((r) => r.event.table === 'payments' && r.event.payload.idempotency_key === key);
+            const rejectedIds = new Set(rejectedPay.map((r) => r.event.row_id));
             set((s) => ({
               courierSettleFollowUps: withFollowUp(s.courierSettleFollowUps, next),
               auditLogs: [log, ...s.auditLogs],
               outbox: [...s.outbox, managerAuthEvent(log, step.auth.managerPin)],
+              ...(rejectedIds.size > 0
+                ? {
+                    payments: s.payments.filter((p) => !rejectedIds.has(p.id)),
+                    syncRejected: (s.syncRejected ?? []).filter((r) => !(r.event.table === 'payments' && rejectedIds.has(r.event.row_id))),
+                  }
+                : {}),
             }));
             return { ok: true, data: next.missing_payments.length === 0 && next.missing_withdrawal === null ? null : next };
           }

@@ -287,3 +287,29 @@ describe('6: valores vistos e recebimento recusado (Codex, rodada 11)', () => {
     expect(st().courierSettleFollowUps!.find((x) => x.settlement_id === r.data.id)!.missing_payments).toHaveLength(1);
   });
 });
+
+describe('7: recebimento recusado resolvido e loja da nuvem desconectada (Codex, rodada 11)', () => {
+  it('"Resolver com gerente" tira o recebimento recusado e o pagamento local que a nuvem não tem', async () => {
+    const a = deliveredOrder();
+    connectCloud();
+    const r = await settle(a.courier.id, cloudFn([]));
+    if (!r.ok) throw new Error(r.error);
+    const ev = st().outbox.find((e) => e.table === 'payments' && e.payload.idempotency_key === `entrega-${a.delivery.id}`)!;
+    st().rejectSyncEvents([{ eventId: ev.id, status: 400, message: 'conta já encerrada.' }]);
+    const manager = st().staff.find((u) => u.role === 'MANAGER')!;
+    const done = st().finishCourierSettleFollowUp(r.data.id, { kind: 'payment_resolved', delivery_id: a.delivery.id, auth: { managerPin: manager.pin_code, reason: 'Recebida no balcão por outro aparelho' } });
+    expect(done.ok).toBe(true);
+    expect(st().syncRejected.some((x) => x.event.id === ev.id)).toBe(false);
+    expect(st().payments.some((p) => p.idempotency_key === `entrega-${a.delivery.id}`)).toBe(false);
+  });
+
+  it('loja da nuvem desconectada não acerta com o entregador sem a nuvem', () => {
+    const a = deliveredOrder();
+    connectCloud();
+    useTcheStore.setState({ outbox: [] });
+    expect(st().setCloudSession({ ...st().cloud! }).ok).toBe(true);
+    expect(st().setCloudSession(null).ok).toBe(true);
+    expect(st().settleCourier(a.courier.id, { payFromDrawer: false, auth: null })).toMatchObject({ ok: false, error: expect.stringMatching(/loja é da nuvem/) });
+    expect(st().courierSettlements).toEqual([]);
+  });
+});
