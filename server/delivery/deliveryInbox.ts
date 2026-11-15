@@ -925,13 +925,17 @@ export class DeliveryInbox {
   }
 }
 
+const UNKNOWN_EVENT_TIME = new Date(0).toISOString();
+
 function applySignal(record: DeliveryOrderRecord, event: DeliveryEvent): void {
   if (event.createdAt > record.lastEventAt) record.lastEventAt = event.createdAt;
   const isCancellationSignal = event.signal === "cancellation_requested" || event.signal === "cancellation_denied";
   if (isCancellationSignal) {
-    // Evento de cancelamento atrasado (ex.: o pedido chegando depois da recusa) não reabre nada.
-    if (record.lastCancellationEventAt !== null && event.createdAt < record.lastCancellationEventAt) return;
-    record.lastCancellationEventAt = event.createdAt;
+    // Evento de cancelamento atrasado (ex.: o pedido chegando depois da recusa) não reabre nada. Evento sem horário
+    // (vira 1970) não dá para ordenar: vale como chegou e não mexe no último horário conhecido.
+    const unknownTime = event.createdAt === UNKNOWN_EVENT_TIME;
+    if (!unknownTime && record.lastCancellationEventAt !== null && event.createdAt < record.lastCancellationEventAt) return;
+    if (!unknownTime) record.lastCancellationEventAt = event.createdAt;
     // O app respondeu (CAR = recebeu o pedido, CARF = recusou): a reserva do pedido da loja acabou.
     record.cancellationRequest = null;
   }

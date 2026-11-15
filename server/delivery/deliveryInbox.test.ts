@@ -266,6 +266,32 @@ describe("caixa de entrada de delivery", () => {
     expect(allowedDeliveryActions(record.order, record.cancellationPending)).toContain("confirm");
   });
 
+  it("cancelamento sem horário do evento (1970) não é descartado depois de um evento com horário", async () => {
+    const repository = new InMemoryDeliveryRepository();
+    const adapter = {
+      channel: "ifood" as const,
+      queue: [] as DeliveryEvent[],
+      pollEvents: async () => adapter.queue.splice(0),
+      acknowledge: async () => undefined,
+      getOrder: async () => ({ ...(await baseOrder()), status: "placed" as const }),
+      performAction: async () => undefined,
+      listCancellationReasons: async () => [],
+      requestCancellation: async () => undefined,
+      respondToDispute: async () => undefined,
+    };
+    const custom = new DeliveryInbox({ adapters: [adapter], repository });
+    const event = (id: string, signal: DeliveryEvent["signal"], createdAt: string): DeliveryEvent => ({
+      channel: "ifood", externalEventId: id, externalOrderId: "o1", merchantExternalId: "m", rawCode: id, signal, createdAt, dispute: null,
+    });
+    adapter.queue.push(event("e1", "placed", "2026-11-09T10:00:00Z"), event("e3", "cancellation_denied", "2026-11-09T10:02:00Z"));
+    await custom.runCycle();
+    adapter.queue.push(event("e2", "cancellation_requested", "1970-01-01T00:00:00.000Z"));
+    await custom.runCycle();
+    const [record] = await custom.listOrders();
+    expect(record.cancellationPending).toBe(true);
+    expect(record.lastCancellationEventAt).toBe("2026-11-09T10:02:00Z");
+  });
+
   it("recusa de cancelamento recebida durante a chamada não é desfeita", async () => {
     const repository = new InMemoryDeliveryRepository();
     const queue: DeliveryEvent[] = [];
