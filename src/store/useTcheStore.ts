@@ -4300,7 +4300,9 @@ export const useTcheStore = create<TcheState>()(
             tenant_id: tenant.id,
             table_id: order.table_id,
             opened_by_user_id: user.id,
-            status: 'OPEN',
+            // Mesa e comanda abrem a conta; balcão e totem nascem aguardando pagamento, como na venda
+            // normal (o banco recusa pedido de senha que não nasce PAYING; Codex no PR #54).
+            status: points ? 'OPEN' : 'PAYING',
             customer_count: Math.max(1, order.customer_count),
             // Sem CPF: a conta encerrada pode ser de outro cliente da mesa (ou ter recebido os
             // itens de outra conta), e o CPF dela iria para a nota errada.

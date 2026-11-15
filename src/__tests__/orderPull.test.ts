@@ -531,6 +531,18 @@ describe('moveLateItemsToNewOrder (item atrasado de conta encerrada)', () => {
     if (!r.ok) throw new Error(r.error);
     expect(st().orders.find((o) => o.id === r.data.newOrderId)!.charge_service_fee).toBe(false);
   });
+
+  it('pedido de senha (totem): a conta nova dos itens atrasados nasce aguardando pagamento, como o banco exige (Codex no PR #54)', () => {
+    const { childEv } = setup(true);
+    const kiosk = st().tables.find((t) => t.kind === 'KIOSK')!;
+    useTcheStore.setState({ orders: st().orders.map((o) => (o.id === O1 ? { ...o, table_id: kiosk.id, pickup_number: 7, fulfillment_type: 'TAKEOUT' } : o)) });
+    const r = st().moveLateItemsToNewOrder(childEv.id);
+    if (!r.ok) throw new Error(r.error);
+    const fresh = st().orders.find((o) => o.id === r.data.newOrderId)!;
+    expect(fresh).toMatchObject({ status: 'PAYING', charge_service_fee: false, fulfillment_type: 'TAKEOUT' });
+    const insert = st().outbox.find((e) => e.table === 'orders' && e.op === 'INSERT' && e.row_id === fresh.id)!;
+    expect(insert.payload.status).toBe('PAYING');
+  });
 });
 
 describe('parseCloudOrders: valor que esta versão não conhece e tipos estritos (auditoria interna, rodada 8 do PR #54)', () => {
