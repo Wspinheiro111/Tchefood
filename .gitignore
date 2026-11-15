@@ -13,3 +13,4 @@ android/local.properties
 /.apk-link.*
 /.apk-anterior
 /.apk-pendente
+/dist-ifood
