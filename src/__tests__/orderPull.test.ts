@@ -543,6 +543,19 @@ describe('moveLateItemsToNewOrder (item atrasado de conta encerrada)', () => {
     const insert = st().outbox.find((e) => e.table === 'orders' && e.op === 'INSERT' && e.row_id === fresh.id)!;
     expect(insert.payload.status).toBe('PAYING');
   });
+
+  it('pedido de senha: a conta nova ganha senha nova do dia, e a próxima venda não repete senha (GPT, rodada 10 do PR #54)', () => {
+    const { childEv } = setup(true);
+    const kiosk = st().tables.find((t) => t.kind === 'KIOSK')!;
+    const now = new Date().toISOString();
+    const other = order(O2, { tenant_id: st().tenant.id, table_id: kiosk.id, status: 'CLOSED', pickup_number: 40, fulfillment_type: 'TAKEOUT', opened_at: now });
+    useTcheStore.setState({
+      orders: [...st().orders.map((o) => (o.id === O1 ? { ...o, table_id: kiosk.id, pickup_number: 12, fulfillment_type: 'TAKEOUT' as const, opened_at: now } : o)), other],
+    });
+    const r = st().moveLateItemsToNewOrder(childEv.id);
+    if (!r.ok) throw new Error(r.error);
+    expect(st().orders.find((o) => o.id === r.data.newOrderId)!.pickup_number).toBe(41);
+  });
 });
 
 describe('parseCloudOrders: valor que esta versão não conhece e tipos estritos (auditoria interna, rodada 8 do PR #54)', () => {

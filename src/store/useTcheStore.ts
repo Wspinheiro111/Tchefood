@@ -711,7 +711,14 @@ interface Actions {
    */
   finishCourierSettleFollowUp: (
     settlementId: UUID,
-    step: { kind: 'payments' } | { kind: 'withdrawal'; auth: ManagerAuthInput } | { kind: 'paid_outside' },
+    // "Pago por fora" pede PIN de gerente e motivo, como a sangria (GPT, rodada 10 do PR #54).
+    // Senha presa (conta sumiu, fechada sem este dinheiro, saldo ou recebimento diferente): sai da
+    // pendência só com PIN de gerente e registro (GPT, rodada 10 do PR #54).
+    step:
+      | { kind: 'payments' }
+      | { kind: 'withdrawal'; auth: ManagerAuthInput }
+      | { kind: 'paid_outside'; auth: ManagerAuthInput }
+      | { kind: 'payment_resolved'; delivery_id: UUID; auth: ManagerAuthInput },
   ) => ActionResult<CourierSettleFollowUp | null>;
 }
 
@@ -815,6 +822,9 @@ function syncEvent(table: SyncEvent['table'], op: SyncEvent['op'], row: { id: UU
     row_id: row.id,
     payload: { ...row } as Record<string, unknown>,
     created_at: nowISO(),
+    // Atualização da mesa: lista vazia = nada do cadastro mudado (o cadastro troca pela lista dele).
+    // Sem a lista, o evento foi gravado por uma versão anterior (tableEditOnly) (GPT, rodada 10 do PR #54).
+    ...(table === 'dining_tables' && op === 'UPDATE' ? { table_edit_fields: [] } : {}),
   };
 }
 
@@ -941,13 +951,17 @@ function tableEditEvent(before: DiningTable, after: DiningTable): SyncEvent {
  * mudou aqui (table_edit_fields). Nome, área e lugares que eram cópia não sobem, para não regravar
  * o que outro aparelho mudou depois. Evento só de ocupação (sem campo mudado): sai da fila (null).
  * O PATCH só grava as colunas que vão nele (GPT, rodada 8 do PR #54).
+ * Evento gravado por uma versão anterior (sem table_edit_fields): não dá para saber o que a
+ * pessoa mudou, e a mudança não pode sumir. Sobe o cadastro inteiro (número, nome, área,
+ * lugares, ativa) como o aparelho viu, sem a ocupação; pode regravar uma mudança mais nova de
+ * outro aparelho, o mal menor diante de perder a daqui (GPT, rodada 10 do PR #54).
  */
 function tableEditOnly(e: SyncEvent): SyncEvent | null {
-  const fields = e.table_edit_fields ?? [];
+  const fields = e.table_edit_fields ?? TABLE_EDIT_FIELDS;
   if (fields.length === 0) return null;
   const payload: Record<string, unknown> = {};
   for (const f of ['id', 'tenant_id', 'updated_at', ...fields]) if (e.payload[f] !== undefined) payload[f] = e.payload[f];
-  return { ...e, payload };
+  return { ...e, payload, table_edit_fields: [...fields] };
 }
 
 /** Sangria do acerto já feita neste aparelho (a autorização dela cita o acerto). */
@@ -4323,7 +4337,10 @@ export const useTcheStore = create<TcheState>()(
             nfce_key: null,
             opened_at: ts,
             closed_at: null,
-            pickup_number: order.pickup_number,
+            // Pedido de senha ganha senha nova do dia: com a senha antiga e a abertura de agora, a
+            // próxima venda do totem repetiria a senha seguinte à antiga (nextPickupNumber segue a
+            // mais recente; GPT, rodada 10 do PR #54).
+            pickup_number: order.pickup_number === null ? null : nextPickupNumber(s.orders.filter((o) => o.table_id === order.table_id), new Date(ts)),
             pickup_name: order.pickup_name,
             fulfillment_type: order.fulfillment_type,
           };
@@ -5447,7 +5464,13 @@ export const useTcheStore = create<TcheState>()(
           const inPending = new Set(pendingList.flatMap((p) => p.delivery_ids));
           let own: OwnDelivery[];
           if (pending) {
-            own = pending.delivery_ids.map((x) => get().ownDeliveries.find((d) => d.id === x)).filter((d): d is OwnDelivery => d !== undefined);
+            // Entrega do acerto fora deste aparelho: sem ela, o dinheiro dela não seria recebido
+            // (GPT, rodada 10 do PR #54). Não chama a nuvem e a pendente fica.
+            const found = pending.delivery_ids.map((x) => get().ownDeliveries.find((d) => d.id === x));
+            if (found.some((d) => d === undefined)) {
+              return fail('Uma das entregas deste acerto não está mais neste aparelho. Sincronize ("Sincronizar agora") e tente de novo.');
+            }
+            own = found as OwnDelivery[];
           } else {
             own = get().ownDeliveries
               .filter((d) => d.courier_id === courierId && d.status === 'DELIVERED' && d.settlement_id === null && !inPending.has(d.id))
@@ -5468,11 +5491,13 @@ export const useTcheStore = create<TcheState>()(
           if (get().outbox.some((e) => e.table === 'own_deliveries' && ownIds.has(e.row_id))) {
             return fail('A nuvem ainda não recebeu todas as entregas deste entregador. Espere a fila de sincronização subir e acerte de novo.');
           }
-          // O dinheiro trazido não passa do total das contas pagas na entrega na nuvem: conta ou item
-          // ainda na fila deixaria esse total menor lá, e a nuvem recusaria o acerto.
+          // O dinheiro trazido é exatamente o que as contas pagas na entrega devem na nuvem: conta,
+          // item ou pagamento ainda na fila deixaria esse valor outro lá, e a nuvem recusaria o
+          // acerto (pagamento: GPT, rodada 10 do PR #54).
           const codOrders = new Set(own.filter((d) => d.pay_on_delivery).map((d) => d.order_id));
           const codQueued = get().outbox.find((e) =>
-            (e.table === 'orders' && codOrders.has(e.row_id)) || (e.table === 'order_items' && codOrders.has(e.payload.order_id as UUID)));
+            (e.table === 'orders' && codOrders.has(e.row_id))
+            || ((e.table === 'order_items' || e.table === 'payments') && codOrders.has(e.payload.order_id as UUID)));
           if (codQueued) {
             const o = get().orders.find((x) => x.id === (codQueued.table === 'orders' ? codQueued.row_id : codQueued.payload.order_id));
             const which = o?.pickup_number != null ? ` (senha ${o.pickup_number})` : '';
@@ -5548,7 +5573,8 @@ export const useTcheStore = create<TcheState>()(
             }
             result = await settleCourierInCloud(
               { url: session.url, anonKey: session.anon_key, accessToken: session.access_token },
-              { id, courier_id: courierId, delivery_ids: deliveryIds, cash_collected: fromCentsLocal(cashCents), courier_fees: fromCentsLocal(feesCents), staff_id: user.id },
+              // A nuvem confere o PIN de quem acertou (GPT, rodada 10 do PR #54).
+              { id, courier_id: courierId, delivery_ids: deliveryIds, cash_collected: fromCentsLocal(cashCents), courier_fees: fromCentsLocal(feesCents), staff_id: user.id, staff_pin: user.pin_code },
               fetchFn,
             );
           } finally {
@@ -5623,13 +5649,40 @@ export const useTcheStore = create<TcheState>()(
           if (step.kind === 'payments') {
             const still: CourierSettleFollowUp['missing_payments'] = [];
             for (const m of f.missing_payments) {
-              if (get().payments.some((p) => p.status === 'APPROVED' && p.idempotency_key === `entrega-${m.delivery_id}`)) continue;
-              // Recebida no caixa enquanto isso (ou desfeita): não há mais o que receber.
+              // A senha só sai da pendência com o recebimento `entrega-<id>` aprovado no valor do
+              // acerto (o que a nuvem gravou como dinheiro trazido). Fora isso fica, com o motivo:
+              // nunca recebe outro valor nem some calada (GPT, rodada 10 do PR #54).
+              const key = `entrega-${m.delivery_id}`;
+              const plannedCents = toCents(m.amount);
+              const existing = get().payments.find((p) => p.idempotency_key === key);
+              if (existing) {
+                if (existing.status !== 'APPROVED') {
+                  still.push({ ...m, error: 'Há um recebimento desta entrega que não está aprovado: confira no caixa.' });
+                } else if (toCents(existing.amount) !== plannedCents) {
+                  still.push({ ...m, error: `Já há um recebimento desta entrega com outro valor (${formatBRL(existing.amount)}): confira no caixa.` });
+                }
+                continue;
+              }
               const order = get().orders.find((o) => o.id === m.order_id);
-              if (!order || order.status !== 'PAYING' || !(order.remaining_balance > 0)) continue;
+              const who = m.pickup_number != null ? `da senha ${m.pickup_number}` : 'desta senha';
+              if (!order) {
+                still.push({ ...m, error: `A conta ${who} não está neste aparelho: sincronize e tente de novo.` });
+                continue;
+              }
+              if (order.status !== 'PAYING' || !(order.remaining_balance > 0)) {
+                still.push({ ...m, error: `A conta ${who} foi recebida, reaberta ou desfeita sem o dinheiro deste acerto: confira no caixa.` });
+                continue;
+              }
+              if (toCents(order.remaining_balance) !== plannedCents) {
+                still.push({
+                  ...m,
+                  error: `O saldo ${who} mudou desde o acerto (acerto: ${formatBRL(m.amount)}, saldo agora: ${formatBRL(order.remaining_balance)}). Confira no caixa antes de receber.`,
+                });
+                continue;
+              }
               const r = get().registerPayment({
                 orderId: order.id,
-                amount: order.remaining_balance,
+                amount: fromCentsLocal(plannedCents),
                 method: 'CASH',
                 status: 'APPROVED',
                 terminal_id: null,
@@ -5639,14 +5692,49 @@ export const useTcheStore = create<TcheState>()(
                 nsu: null,
                 authorization_code: null,
                 terminal_serial: null,
-                idempotency_key: `entrega-${m.delivery_id}`,
+                idempotency_key: key,
                 item_ids: [],
               });
-              if (!r.ok) still.push({ ...m, amount: order.remaining_balance, error: r.error });
+              if (!r.ok) still.push({ ...m, error: r.error });
             }
             const next = save({ ...f, missing_payments: still });
             if (still.length > 0) return fail(followUpText({ ...f, missing_payments: still, missing_withdrawal: null }));
             return { ok: true, data: next };
+          }
+          if (step.kind === 'payment_resolved') {
+            // Senha presa resolvida com o gerente: sai só ela, com registro na auditoria na mesma
+            // gravação; a nuvem confere o PIN de novo (tchefood_courier_followup_audit). Nada é
+            // recebido aqui (amount_impact 0) (GPT, rodada 10 do PR #54).
+            const m = f.missing_payments.find((x) => x.delivery_id === step.delivery_id);
+            if (!m) return fail('Esta senha já saiu da pendência do acerto.');
+            const authRes = authorizeManager(step.auth, { orderId: null, action: 'COURIER_PAYMENT_RESOLVED' });
+            if (!authRes.ok) return authRes;
+            const manager = authRes.data;
+            const log: AuditLog = { ...buildAudit({
+              order_id: null,
+              performed_by_user_id: user.id,
+              authorized_by_manager_id: manager.id,
+              action_type: 'COURIER_PAYMENT_RESOLVED',
+              amount_impact: 0,
+              reason: step.auth.reason.trim(),
+              metadata: {
+                courier_settlement_id: settlementId,
+                delivery_id: m.delivery_id,
+                order_id: m.order_id,
+                pickup_number: m.pickup_number,
+                amount: m.amount,
+                last_error: m.error,
+                manager_id: manager.id,
+                manager_name: manager.name,
+              },
+            }), whatsapp_alert_sent: false };
+            const next = { ...f, missing_payments: f.missing_payments.filter((x) => x.delivery_id !== m.delivery_id) };
+            set((s) => ({
+              courierSettleFollowUps: withFollowUp(s.courierSettleFollowUps, next),
+              auditLogs: [log, ...s.auditLogs],
+              outbox: [...s.outbox, managerAuthEvent(log, step.auth.managerPin)],
+            }));
+            return { ok: true, data: next.missing_payments.length === 0 && next.missing_withdrawal === null ? null : next };
           }
           if (!f.missing_withdrawal) return fail('A sangria deste acerto já foi resolvida.');
           // Sangria já feita (o app fechou antes de tirar da pendência): não sai de novo, e "pago por
@@ -5657,7 +5745,39 @@ export const useTcheStore = create<TcheState>()(
               ? fail('A sangria deste acerto já está registrada no caixa (feita antes de o app fechar). Confira a gaveta: se o dinheiro não saiu dela, registre um suprimento do valor.')
               : { ok: true, data: (get().courierSettleFollowUps ?? []).find((x) => x.settlement_id === settlementId) ?? null };
           }
-          if (step.kind === 'paid_outside') return { ok: true, data: save({ ...f, missing_withdrawal: null }) };
+          if (step.kind === 'paid_outside') {
+            // Pago por fora: PIN de gerente e motivo, e registro na auditoria junto com a saída da
+            // pendência (GPT, rodada 10 do PR #54). Nada sai da gaveta (amount_impact 0).
+            const authRes = authorizeManager(step.auth, { orderId: null, action: 'COURIER_PAID_OUTSIDE' });
+            if (!authRes.ok) return authRes;
+            const manager = authRes.data;
+            // A nuvem confere o PIN de novo: o registro sobe por tchefood_courier_followup_audit
+            // (db/schema_contas_aparelhos.sql), com o PIN só na fila. Não é alerta de fraude.
+            const log: AuditLog = { ...buildAudit({
+              order_id: null,
+              performed_by_user_id: user.id,
+              authorized_by_manager_id: manager.id,
+              action_type: 'COURIER_PAID_OUTSIDE',
+              amount_impact: 0,
+              reason: step.auth.reason.trim(),
+              metadata: {
+                courier_settlement_id: settlementId,
+                courier_id: f.courier_id,
+                courier_name: f.courier_name,
+                amount: f.missing_withdrawal.amount,
+                paid_outside: true,
+                manager_id: manager.id,
+                manager_name: manager.name,
+              },
+            }), whatsapp_alert_sent: false };
+            const next = { ...f, missing_withdrawal: null };
+            set((s) => ({
+              courierSettleFollowUps: withFollowUp(s.courierSettleFollowUps, next),
+              auditLogs: [log, ...s.auditLogs],
+              outbox: [...s.outbox, managerAuthEvent(log, step.auth.managerPin)],
+            }));
+            return { ok: true, data: next.missing_payments.length === 0 ? null : next };
+          }
           const auth = {
             managerPin: step.auth.managerPin,
             reason: step.auth.reason.trim().length >= MIN_REASON_LENGTH ? step.auth.reason : `Acerto do entregador ${f.courier_name}`,

@@ -16,7 +16,12 @@ export interface CourierSettleRequest {
   cash_collected: number;
   courier_fees: number;
   staff_id: UUID;
+  /** PIN de quem acertou: a nuvem confere (GPT, rodada 10 do PR #54). */
+  staff_pin: string;
 }
+
+/** A nuvem não aceitou o PIN de quem acertou (ou está bloqueado por tentativas). */
+export const COURIER_SETTLE_PIN_REFUSED = 'PIN de quem acertou não confere na nuvem (ou está bloqueado por tentativas).';
 
 export type CourierSettleResult =
   | { ok: true; settlement: CourierSettlement }
@@ -141,6 +146,7 @@ export async function settleCourierInCloud(cfg: SyncConfig, req: CourierSettleRe
         p_cash_collected: req.cash_collected,
         p_courier_fees: req.courier_fees,
         p_staff: req.staff_id,
+        p_staff_pin: req.staff_pin,
       }),
     });
   } catch {
@@ -173,6 +179,11 @@ export async function settleCourierInCloud(cfg: SyncConfig, req: CourierSettleRe
     body = JSON.parse(text || 'null');
   } catch {
     // cai na conferência abaixo
+  }
+  // PIN recusado: a função responde sem erro (para a falha ficar no registro), e é definitivo:
+  // nada foi gravado (GPT, rodada 10 do PR #54). O "Nada saiu da gaveta" quem mostra acrescenta.
+  if (body && typeof body === 'object' && (body as { error?: unknown }).error === 'TCHEFOOD_PIN_RECUSADO') {
+    return { ok: false, refused: true, message: COURIER_SETTLE_PIN_REFUSED, code: 'TCHEFOOD_PIN_RECUSADO' };
   }
   const settlement = parseSettlementRow(body);
   if (!settlement || settlement.id !== req.id) {

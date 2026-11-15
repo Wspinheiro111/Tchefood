@@ -79,10 +79,20 @@ const SET_PERMISSION_RPC = 'tchefood_set_role_permission';
 const START_STORE_RPC = 'tchefood_start_store';
 const REGISTER_PAYMENT_RPC = 'tchefood_register_payment';
 const CASHBACK_REDEEM_RPC = 'tchefood_register_cashback_redeem';
+// Pendência do acerto com o entregador (GPT, rodada 10 do PR #54): "pago por fora" e senha
+// resolvida com o gerente. A função confere o PIN e grava o audit_log; o banco recusa o INSERT direto.
+const COURIER_FOLLOWUP_RPC = 'tchefood_courier_followup_audit';
+const COURIER_FOLLOWUP_ACTIONS: ReadonlyArray<string> = ['COURIER_PAID_OUTSIDE', 'COURIER_PAYMENT_RESOLVED'];
+
+/** Registro da pendência do acerto com o entregador: sobe por tchefood_courier_followup_audit. */
+export function isCourierFollowUpAudit(event: SyncEvent): boolean {
+  return event.table === 'audit_logs' && event.op === 'INSERT' && COURIER_FOLLOWUP_ACTIONS.includes(String(event.payload.action_type))
+    && event.payload.authorized_by_manager_id != null;
+}
 
 /** Eventos que sobem por função do servidor que confere PIN e responde null quando ele não confere. */
 export function isPinCheckedRpc(event: SyncEvent): boolean {
-  return isManagerAuthorization(event) || isKegChange(event) || event.table === 'staff_users' || event.table === 'role_permissions';
+  return isManagerAuthorization(event) || isKegChange(event) || isCourierFollowUpAudit(event) || event.table === 'staff_users' || event.table === 'role_permissions';
 }
 
 /** Barril encerrado de uma troca de barril que sobe por tchefood_change_keg. */
@@ -266,8 +276,26 @@ function buildCashbackRedeemRequest(event: SyncEvent, cfg: SyncConfig): SyncRequ
   });
 }
 
+function buildCourierFollowUpRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
+  if (!event.manager_pin) {
+    throw new Error('Pendência do acerto sem PIN para o servidor conferir. Em Nuvem, digite o PIN do gerente neste evento recusado e toque em Reenviar recusados.');
+  }
+  const p = event.payload;
+  const metadata = (p.metadata as Record<string, unknown> | null | undefined) ?? {};
+  return rpcRequest(cfg, COURIER_FOLLOWUP_RPC, {
+    p_audit_id: event.row_id,
+    p_action: p.action_type,
+    p_settlement_id: metadata.courier_settlement_id ?? null,
+    p_performed_by: p.performed_by_user_id,
+    p_manager_pin: event.manager_pin,
+    p_reason: p.reason,
+    p_metadata: metadata,
+  });
+}
+
 export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   if (isManagerAuthorization(event)) return buildAuthorizeRequest(event, cfg);
+  if (isCourierFollowUpAudit(event)) return buildCourierFollowUpRequest(event, cfg);
   if (isCashbackRedeem(event)) return buildCashbackRedeemRequest(event, cfg);
   if (event.table === 'payments') return buildPaymentRequest(event, cfg);
   if (isKegChange(event)) return buildKegChangeRequest(event, cfg);
@@ -524,7 +552,7 @@ export async function flushOutbox(
     if (res.ok) {
       // A RPC responde null quando o PIN não confere no servidor (ou está bloqueado):
       // nada foi autorizado, e a atualização da comanda que vem depois seria recusada.
-      if ((isManagerAuthorization(event) || isKegChange(event)) && !isUuidResponse(text)) {
+      if ((isManagerAuthorization(event) || isKegChange(event) || isCourierFollowUpAudit(event)) && !isUuidResponse(text)) {
         reject(event, res.status, 'O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).');
         continue;
       }

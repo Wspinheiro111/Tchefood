@@ -526,9 +526,15 @@ END $$;
 --     UPDATE, em ordem fixa: dois acertos juntos esperam um pelo outro), recusa se alguma já
 --     tem acerto (TCHEFOOD_ENTREGA_JA_ACERTADA, com a entrega e o acerto em DETAIL), não é
 --     deste entregador e desta loja, não foi entregue, ou se o ganho não é a soma dos ganhos
---     delas (o dinheiro trazido não passa do total das contas pagas na entrega). Aceito, grava
---     o acerto (com as entregas em delivery_ids e sem sangria: cash_movement_id NULL) e marca
---     as entregas. A mesma chamada repetida (resposta perdida, ou ainda rodando) devolve o
+--     delas, ou se o dinheiro trazido não é exatamente o que as contas pagas na entrega devem
+--     (o saldo da conta ainda em pagamento mais o pagamento `entrega-<id>` de uma tentativa
+--     anterior; GPT, rodada 10 do PR #54). Aceito, grava o acerto (com as entregas em
+--     delivery_ids e sem sangria: cash_movement_id NULL) e marca as entregas.
+--     Roda como dona (SECURITY DEFINER, tudo filtrado pela loja do token) e confere o PIN de
+--     quem acertou (tchefood_check_pin) antes de tudo, também na repetição: o token do aparelho
+--     sozinho não acerta em nome de um caixa (GPT, rodada 10 do PR #54). PIN errado ou
+--     bloqueado: devolve {"error":"TCHEFOOD_PIN_RECUSADO"} sem gravar o acerto (a falha fica
+--     no registro). A mesma chamada repetida (resposta perdida, ou ainda rodando) devolve o
 --     acerto gravado: a conferência é repetida depois da trava, como em tchefood_record_payment.
 --  b. A sangria do ganho é uma sangria comum, com PIN de gerente, que o aparelho cria só
 --     depois de a nuvem aceitar o acerto (a autorização dela cita o acerto, só para consulta).
@@ -631,9 +637,12 @@ CREATE TRIGGER trg_own_deliveries_0_stale_stays BEFORE UPDATE ON own_deliveries
     FOR EACH ROW EXECUTE FUNCTION tchefood_own_delivery_stale_stays();
 
 -- O acerto pela nuvem. Devolve a linha gravada (a mesma em toda chamada com o mesmo p_id).
+-- A versão sem o PIN de quem acertou sai (GPT, rodada 10 do PR #54).
+DROP FUNCTION IF EXISTS tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID);
 CREATE OR REPLACE FUNCTION tchefood_settle_courier(
-    p_id UUID, p_courier UUID, p_delivery_ids UUID[], p_cash_collected NUMERIC, p_courier_fees NUMERIC, p_staff UUID)
-RETURNS JSONB LANGUAGE plpgsql SECURITY INVOKER SET search_path = public AS $$
+    p_id UUID, p_courier UUID, p_delivery_ids UUID[], p_cash_collected NUMERIC, p_courier_fees NUMERIC, p_staff UUID,
+    p_staff_pin VARCHAR DEFAULT NULL)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
     v_tenant UUID := tchefood_tenant();
     v_ids UUID[];
@@ -642,8 +651,7 @@ DECLARE
     v_taken_settlement UUID;
     v_found INT;
     v_fees NUMERIC;
-    v_cod INT;
-    v_cod_total NUMERIC;
+    v_owed NUMERIC;
 BEGIN
     IF v_tenant IS NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA: sem loja no acesso do aparelho.';
@@ -653,9 +661,19 @@ BEGIN
        OR p_cash_collected IS NULL OR p_courier_fees IS NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA: acerto sem id, entregador, entregas, valores ou quem acertou.';
     END IF;
+    -- A coluna guarda centavos: fração de centavo seria arredondada calada (GPT, rodada 10 do PR #54).
+    IF p_cash_collected <> round(p_cash_collected, 2) OR p_courier_fees <> round(p_courier_fees, 2) THEN
+        RAISE EXCEPTION 'TCHEFOOD_ENTREGA: valor do acerto com fração de centavo.';
+    END IF;
     v_ids := ARRAY(SELECT DISTINCT x FROM unnest(p_delivery_ids) AS x WHERE x IS NOT NULL ORDER BY x);
     IF cardinality(v_ids) <> cardinality(p_delivery_ids) THEN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA: entrega repetida ou vazia na lista do acerto.';
+    END IF;
+    -- Quem acertou prova o PIN, também na repetição (GPT, rodada 10 do PR #54). Falha: devolve
+    -- a recusa sem erro, para a falha ficar no registro (tchefood_check_pin a grava).
+    IF tchefood_check_pin(v_tenant, ARRAY[p_staff_pin]::VARCHAR[], ARRAY['CASHIER', 'MANAGER', 'OWNER']::user_role[],
+                          p_staff, p_staff, 'COURIER_SETTLED', 'actor') IS NULL THEN
+        RETURN jsonb_build_object('error', 'TCHEFOOD_PIN_RECUSADO');
     END IF;
 
     -- Mesma chamada de novo (resposta perdida): devolve o acerto gravado.
@@ -687,10 +705,9 @@ BEGIN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA_JA_ACERTADA: a entrega % já foi acertada com o entregador (outro aparelho). Nada sai da gaveta por este acerto.', v_taken_delivery
             USING DETAIL = json_build_object('delivery_id', v_taken_delivery, 'settlement_id', v_taken_settlement)::text;
     END IF;
-    SELECT count(*), COALESCE(sum(d.courier_fee), 0), count(*) FILTER (WHERE d.pay_on_delivery),
-           COALESCE(sum(o.total_amount) FILTER (WHERE d.pay_on_delivery), 0)
-      INTO v_found, v_fees, v_cod, v_cod_total
-      FROM own_deliveries d LEFT JOIN orders o ON o.id = d.order_id AND o.tenant_id = v_tenant
+    SELECT count(*), COALESCE(sum(d.courier_fee), 0)
+      INTO v_found, v_fees
+      FROM own_deliveries d
      WHERE d.id = ANY(v_ids) AND d.tenant_id = v_tenant AND d.courier_id = p_courier AND d.status = 'DELIVERED';
     IF v_found <> cardinality(v_ids) THEN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA: só entrega entregue, deste entregador e desta loja, entra no acerto (a nuvem ainda não tem alguma como entregue?).';
@@ -698,10 +715,25 @@ BEGIN
     IF v_fees <> p_courier_fees THEN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA: o ganho do acerto (%) não é a soma dos ganhos das entregas (%).', p_courier_fees, v_fees;
     END IF;
-    -- O dinheiro trazido vira o pagamento das contas pagas na entrega, que podem ainda estar na
-    -- fila do aparelho: não passa do total delas (e é zero sem nenhuma).
-    IF p_cash_collected < 0 OR p_cash_collected > v_cod_total OR (v_cod = 0 AND p_cash_collected <> 0) THEN
-        RAISE EXCEPTION 'TCHEFOOD_ENTREGA: o dinheiro do acerto (%) não confere com as contas pagas na entrega (até %).', p_cash_collected, v_cod_total;
+    -- O dinheiro trazido é exatamente o que as contas pagas na entrega devem (GPT, rodada 10 do
+    -- PR #54): o saldo da conta ainda em pagamento, mais o pagamento deste acerto feito numa
+    -- tentativa anterior (chave entrega-<id>). Zero sem nenhuma. Conta paga no balcão não deve nada.
+    -- As contas travam antes da conta do devido (ordem fixa, depois das entregas): um pagamento da
+    -- mesma conta chegando de outro aparelho espera, e o valor lido não fica velho na transação.
+    PERFORM 1 FROM orders o
+     WHERE o.tenant_id = v_tenant
+       AND o.id IN (SELECT d.order_id FROM own_deliveries d WHERE d.id = ANY(v_ids) AND d.tenant_id = v_tenant AND d.pay_on_delivery)
+     ORDER BY o.id FOR UPDATE;
+    SELECT COALESCE(sum(
+               CASE WHEN o.status = 'PAYING' AND o.remaining_balance > 0 THEN o.remaining_balance ELSE 0 END
+             + COALESCE((SELECT sum(p.amount) FROM payments p
+                          WHERE p.tenant_id = v_tenant AND p.order_id = d.order_id AND p.status = 'APPROVED'
+                            AND p.idempotency_key = 'entrega-' || d.id::text), 0)), 0)
+      INTO v_owed
+      FROM own_deliveries d LEFT JOIN orders o ON o.id = d.order_id AND o.tenant_id = v_tenant
+     WHERE d.id = ANY(v_ids) AND d.tenant_id = v_tenant AND d.pay_on_delivery;
+    IF p_cash_collected <> v_owed THEN
+        RAISE EXCEPTION 'TCHEFOOD_ENTREGA: o dinheiro do acerto (%) não é o que as contas pagas na entrega devem (%). Confira as contas e acerte de novo.', p_cash_collected, v_owed;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM couriers c WHERE c.id = p_courier AND c.tenant_id = v_tenant) THEN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA: entregador não é desta loja.';
@@ -725,7 +757,147 @@ DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
         REVOKE ALL ON FUNCTION tchefood_own_delivery_stale_stays() FROM PUBLIC, anon, authenticated;
-        REVOKE ALL ON FUNCTION tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID) FROM PUBLIC, anon;
-        GRANT EXECUTE ON FUNCTION tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID) TO authenticated;
+        REVOKE ALL ON FUNCTION tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID, VARCHAR) FROM PUBLIC, anon;
+        GRANT EXECUTE ON FUNCTION tchefood_settle_courier(UUID, UUID, UUID[], NUMERIC, NUMERIC, UUID, VARCHAR) TO authenticated;
+    END IF;
+END $$;
+
+-- -----------------------------------------------------------------------------
+-- 11. Pendência do acerto com o entregador resolvida com o gerente (GPT, rodada 10 do PR #54)
+-- -----------------------------------------------------------------------------
+-- O acerto gravado na nuvem ficou com pendência no aparelho e o gerente a resolve sem dinheiro
+-- passar pela gaveta aqui (amount_impact 0):
+--  - COURIER_PAID_OUTSIDE: o ganho do entregador foi pago por fora (pix, dinheiro fora do
+--    caixa). Recusado se a sangria do acerto já está registrada.
+--  - COURIER_PAYMENT_RESOLVED: uma senha paga na entrega ficou presa (conta sumiu, fechada sem
+--    este dinheiro, saldo ou recebimento diferente). metadata.delivery_id é uma entrega do acerto.
+-- O PIN do gerente é conferido aqui, com o bloqueio de 3 erros (tchefood_check_pin), e o registro
+-- na auditoria nasce só nesta função: o aparelho não grava essas ações direto em audit_logs
+-- (trg_audit_logs_courier_guard, abaixo, e trg_audit_logs_guard para o gerente).
+-- Devolve o id do registro, ou NULL quando o PIN não confere (a falha fica na auditoria).
+-- Reenvio (a resposta se perdeu): devolve o registro já gravado, sem pedir o PIN de novo.
+CREATE OR REPLACE FUNCTION tchefood_courier_followup_audit(
+    p_audit_id UUID,
+    p_action VARCHAR,
+    p_settlement_id UUID,
+    p_performed_by UUID,
+    p_manager_pin VARCHAR,
+    p_reason TEXT,
+    p_metadata JSONB DEFAULT '{}'::jsonb
+) RETURNS UUID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_settlement courier_settlements%ROWTYPE;
+    v_performer staff_users%ROWTYPE;
+    v_manager staff_users%ROWTYPE;
+    v_existing audit_logs%ROWTYPE;
+    v_delivery UUID;
+    v_extra JSONB;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: sessão sem tenant.';
+    END IF;
+    IF p_action IS NULL OR p_action NOT IN ('COURIER_PAID_OUTSIDE', 'COURIER_PAYMENT_RESOLVED') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ENTREGA: ação % não é de pendência do acerto.', p_action;
+    END IF;
+    IF p_audit_id IS NULL OR p_settlement_id IS NULL OR p_performed_by IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_ENTREGA: pendência do acerto sem registro, acerto ou operador.';
+    END IF;
+
+    -- Dois reenvios do mesmo registro juntos: o segundo espera e encontra o do primeiro.
+    PERFORM pg_advisory_xact_lock(hashtext('tchefood_courier_followup_audit:' || p_audit_id::text));
+    -- Reenvio: o mesmo registro (pelo id ou pelo id do aparelho) já está gravado.
+    SELECT * INTO v_existing FROM audit_logs a
+     WHERE a.id = p_audit_id OR (a.tenant_id = v_tenant AND a.metadata->>'client_audit_id' = p_audit_id::text)
+     ORDER BY (a.id = p_audit_id) DESC
+     LIMIT 1;
+    IF FOUND THEN
+        IF v_existing.tenant_id <> v_tenant OR v_existing.action_type <> p_action
+           OR v_existing.metadata->>'courier_settlement_id' IS DISTINCT FROM p_settlement_id::text THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: já existe outro registro com este id.';
+        END IF;
+        RETURN v_existing.id;
+    END IF;
+
+    IF p_reason IS NULL OR length(trim(p_reason)) < 5 THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: motivo obrigatório (mínimo 5 caracteres).';
+    END IF;
+    SELECT * INTO v_settlement FROM courier_settlements s WHERE s.id = p_settlement_id AND s.tenant_id = v_tenant;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_ENTREGA: acerto com o entregador não encontrado nesta loja.';
+    END IF;
+    IF p_action = 'COURIER_PAYMENT_RESOLVED' THEN
+        BEGIN
+            v_delivery := (p_metadata->>'delivery_id')::uuid;
+        EXCEPTION WHEN others THEN
+            v_delivery := NULL;
+        END;
+        -- A entrega precisa ser do acerto (pela lista gravada nele ou pela marca na entrega).
+        IF v_delivery IS NULL OR NOT (
+            COALESCE(v_delivery = ANY (v_settlement.delivery_ids), FALSE)
+            OR EXISTS (SELECT 1 FROM own_deliveries d WHERE d.id = v_delivery AND d.tenant_id = v_tenant AND d.settlement_id = v_settlement.id)
+        ) THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: a senha resolvida precisa ser de uma entrega deste acerto.';
+        END IF;
+    END IF;
+    SELECT * INTO v_performer FROM staff_users u
+     WHERE u.id = p_performed_by AND u.tenant_id = v_tenant AND u.active AND u.role IN ('CASHIER', 'MANAGER', 'OWNER');
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: só caixa, gerente ou proprietário acerta com o entregador.';
+    END IF;
+
+    v_manager := tchefood_check_pin(v_tenant, ARRAY[p_manager_pin], ARRAY['MANAGER', 'OWNER']::user_role[], NULL,
+                                    p_performed_by, p_action, 'manager');
+    IF v_manager.id IS NULL THEN RETURN NULL; END IF;
+
+    IF p_action = 'COURIER_PAID_OUTSIDE' THEN
+        -- A sangria deste acerto já foi registrada: o ganho não foi pago por fora.
+        IF EXISTS (SELECT 1 FROM audit_logs a
+                    WHERE a.tenant_id = v_tenant AND a.action_type = 'CASH_WITHDRAWAL'
+                      AND a.metadata->>'courier_settlement_id' = p_settlement_id::text) THEN
+            RAISE EXCEPTION 'TCHEFOOD_ENTREGA: a sangria deste acerto já está registrada no caixa.';
+        END IF;
+        v_extra := jsonb_build_object('courier_fees', v_settlement.courier_fees, 'paid_outside', true);
+    ELSE
+        v_extra := jsonb_build_object('delivery_id', v_delivery);
+    END IF;
+
+    INSERT INTO audit_logs (id, tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type,
+                            amount_impact, reason, whatsapp_alert_sent, metadata)
+    VALUES (p_audit_id, v_tenant, NULL, v_performer.id, v_manager.id, p_action, 0, trim(p_reason), FALSE,
+            COALESCE(p_metadata, '{}'::jsonb) || v_extra || jsonb_build_object(
+                'client_audit_id', p_audit_id,
+                'courier_settlement_id', v_settlement.id,
+                'courier_id', v_settlement.courier_id,
+                'manager_id', v_manager.id,
+                'manager_name', v_manager.name,
+                'server_verified', true));
+    RETURN p_audit_id;
+END;
+$$;
+
+-- O aparelho não grava essas ações direto em audit_logs, nem sem gerente: só a função acima.
+-- Gatilho à parte (não mexe em tchefood_guard_audit_insert, do cashback). Dentro da função,
+-- current_user é o dono dela e o registro passa.
+CREATE OR REPLACE FUNCTION tchefood_courier_audit_guard()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.action_type IN ('COURIER_PAID_OUTSIDE', 'COURIER_PAYMENT_RESOLVED') AND current_user IN ('anon', 'authenticated') THEN
+        RAISE EXCEPTION 'TCHEFOOD_ANTIFRAUDE: pendência do acerto com o entregador só é registrada por tchefood_courier_followup_audit().';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_audit_logs_courier_guard ON audit_logs;
+CREATE TRIGGER trg_audit_logs_courier_guard BEFORE INSERT ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION tchefood_courier_audit_guard();
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE ALL ON FUNCTION tchefood_courier_audit_guard() FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_courier_followup_audit(UUID, VARCHAR, UUID, UUID, VARCHAR, TEXT, JSONB) FROM PUBLIC, anon;
+        GRANT EXECUTE ON FUNCTION tchefood_courier_followup_audit(UUID, VARCHAR, UUID, UUID, VARCHAR, TEXT, JSONB) TO authenticated;
     END IF;
 END $$;

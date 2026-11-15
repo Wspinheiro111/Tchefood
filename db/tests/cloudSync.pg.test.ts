@@ -16,7 +16,7 @@ import { afterEach, beforeAll, describe, expect, it, vi, beforeEach } from 'vite
 
 import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, migratePersisted, REJECTED_ORDER_ONLY_CPF, useTcheStore, type PickupLine } from '../../src/store/useTcheStore';
 import { availableCashback, cashbackOrphanCents } from '../../src/lib/loyalty';
-import type { CashbackLedgerEntry } from '../../src/types';
+import type { CashbackLedgerEntry, OwnDelivery } from '../../src/types';
 import { flushOutbox, sanitizePayload, type SyncRejection } from '../../src/lib/sync/supabaseSync';
 import { fetchCashbackPending, fetchCloudCustomerCashback, fetchCloudSnapshot, fetchCloudStaff, fetchStaffPins, reconcileCashback } from '../../src/lib/sync/cloudPull';
 import { fetchCloudOrders } from '../../src/lib/sync/orderPull';
@@ -4848,7 +4848,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
         fetchFn('http://cloud.test/rest/v1/rpc/tchefood_settle_courier', { method: 'POST', headers: {}, body: JSON.stringify(args) })
           .then(async (r) => ({ status: r.status, body: await r.text() }));
       const terms = (id: string, deliveryIds: string[], fees = 7) => ({
-        p_id: id, p_courier: courier.id, p_delivery_ids: deliveryIds, p_cash_collected: 0, p_courier_fees: fees, p_staff: cashierId(),
+        p_id: id, p_courier: courier.id, p_delivery_ids: deliveryIds, p_cash_collected: 0, p_courier_fees: fees, p_staff: cashierId(), p_staff_pin: CASHIER_PIN,
       });
       const withdrawals = () => sql(`SELECT count(*) FROM cash_movements WHERE session_id = '${session.id}' AND type = 'WITHDRAWAL'`);
 
@@ -4863,7 +4863,8 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       const OTHER = '55555555-5555-4555-8555-555555555555';
       sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${OTHER}', 'Outra', 'Outra Ltda', '11222333000262') ON CONFLICT DO NOTHING;`);
       const cross = await rpc(postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: OTHER, sub: 'device-c' }, emulatorLog), terms(crypto.randomUUID(), [d.id]));
-      expect(cross.status, cross.body).toBeGreaterThanOrEqual(400);
+      // O caixa não é da outra loja: o PIN não confere lá (GPT, rodada 10 do PR #54).
+      expect(cross.body).toMatch(/TCHEFOOD_PIN_RECUSADO/);
       expect(sql(`SELECT settlement_id IS NULL FROM own_deliveries WHERE id = '${d.id}'`)).toBe('t');
       // Ganho que não é a soma das entregas: recusado.
       const inflated = await rpc(fetchB(), terms(crypto.randomUUID(), [d.id], 70));
@@ -4935,7 +4936,7 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       const id = crypto.randomUUID();
       const call = (pid: string) => `SELECT set_config('request.jwt.claims', '{"role":"authenticated","tenant_id":"${TENANT}","sub":"device"}', true);
         SET LOCAL ROLE authenticated;
-        SELECT tchefood_settle_courier('${pid}', '${courier.id}', ARRAY['${d.id}']::uuid[], 0, 7, '${cashierId()}')->>'id';`;
+        SELECT tchefood_settle_courier('${pid}', '${courier.id}', ARRAY['${d.id}']::uuid[], 0, 7, '${cashierId()}', '${CASHIER_PIN}')->>'id';`;
       // A primeira chamada segura a trava da entrega; a repetida espera e, ao entrar, devolve o acerto gravado.
       const hold = (pid: string) => new Promise<{ code: number | null; out: string }>((resolve) => {
         const [host, port, user] = [target!.host, String(target!.port), target!.user];
@@ -4957,6 +4958,240 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(other.out).toMatch(/TCHEFOOD_ENTREGA_JA_ACERTADA/);
       expect(other.out).toContain(`"settlement_id" : "${id}"`);
       expect(sql(`SELECT count(*) FROM courier_settlements WHERE delivery_ids @> ARRAY['${d.id}']::uuid[]`)).toBe('1');
+    });
+
+    // Acerto pela nuvem com dados à mão (GPT, rodada 10 do PR #54): entregas do entregador Nico.
+    const settleRpc = (args: Record<string, unknown>) =>
+      fetchB()('http://cloud.test/rest/v1/rpc/tchefood_settle_courier', { method: 'POST', headers: {}, body: JSON.stringify(args) })
+        .then(async (r) => ({ status: r.status, body: await r.text() }));
+    async function nicoDelivers(address: string, payOnDelivery: boolean): Promise<{ d: OwnDelivery; orderId: string }> {
+      login(OWNER_PIN);
+      const zone = st().deliveryZones.find((z) => z.active)!;
+      const courier = st().couriers.find((c) => c.phone === '53999990310') ?? ok(st().saveCourier({ name: 'Nico', phone: '53999990310', fee_per_delivery: 3, active: true }));
+      login(CASHIER_PIN);
+      const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
+      const order = ok(st().createPickupOrder({
+        lines: [line], fulfillment: 'DELIVERY', customerName: 'Rosa',
+        delivery: { customerName: 'Rosa', phone: '53 98888-0310', address, reference: '', zoneId: zone.id, changeFor: null, payOnDelivery },
+      }));
+      if (!payOnDelivery) payCash(order.id);
+      const d = st().ownDeliveries.find((x) => x.order_id === order.id)!;
+      ok(st().setOwnDeliveryStatus(d.id, 'READY'));
+      ok(st().dispatchOwnDeliveries([d.id], courier.id));
+      ok(st().setOwnDeliveryStatus(d.id, 'DELIVERED'));
+      await expectSynced(`entrega ${address}`);
+      return { d, orderId: order.id };
+    }
+    const nico = () => st().couriers.find((c) => c.phone === '53999990310')!.id;
+    const nicoTerms = (deliveryIds: string[], cash: number, pin: string | null, id: string = crypto.randomUUID()) => ({
+      p_id: id, p_courier: nico(), p_delivery_ids: deliveryIds, p_cash_collected: cash, p_courier_fees: 3 * deliveryIds.length,
+      p_staff: cashierId(), ...(pin === null ? {} : { p_staff_pin: pin }),
+    });
+    const unsettled = (ids: string[]) => sql(`SELECT count(*) FROM own_deliveries WHERE id IN (${ids.map((x) => `'${x}'`).join(',')}) AND settlement_id IS NULL`);
+    const settlementsOf = (ids: string[]) => sql(`SELECT count(*) FROM courier_settlements WHERE delivery_ids && ARRAY[${ids.map((x) => `'${x}'`).join(',')}]::uuid[]`);
+    const owedOf = (orderId: string) => Number(sql(`SELECT remaining_balance FROM orders WHERE id = '${orderId}'`));
+
+    it('pendência do acerto resolvida com o gerente (pago por fora, senha presa): a nuvem confere o PIN e grava o registro; o aparelho não grava direto (GPT, rodada 10 do PR #54)', async () => {
+      forgetPinFailures();
+      const { d } = await nicoDelivers('Rua 320, 1', false);
+      login(CASHIER_PIN);
+      if (!st().cashSessions.some((c) => c.status === 'OPEN')) ok(st().openCashSession(50));
+      // A nuvem grava o acerto e, antes da resposta, o PIN fica bloqueado neste aparelho: a sangria fica pendente.
+      const deviceFetch = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: TENANT, sub: 'device' }, emulatorLog);
+      const lockAfter: typeof deviceFetch = async (url, init) => {
+        const res = await deviceFetch(url, init);
+        useTcheStore.setState({ managerPinLockedUntil: Date.now() + 60_000 });
+        return res;
+      };
+      const r = await st().settleCourierOnline(nico(), { payFromDrawer: true, auth: MANAGER, fetchFn: lockAfter });
+      expect(r.ok).toBe(false);
+      useTcheStore.setState({ managerPinLockedUntil: null, managerPinFailures: 0 });
+      const follow = (st().courierSettleFollowUps ?? []).find((f) => f.delivery_ids.includes(d.id))!;
+      expect(follow.missing_withdrawal).not.toBeNull();
+      const sid = follow.settlement_id;
+      await expectSynced('acerto do Nico');
+      const managerId = st().staff.find((u) => u.pin_code === MANAGER_PIN)!.id;
+
+      // O aparelho não grava essas ações direto na tabela: nem com gerente, nem sem.
+      for (const action_type of ['COURIER_PAID_OUTSIDE', 'COURIER_PAYMENT_RESOLVED']) {
+        for (const authorized_by_manager_id of [managerId, null]) {
+          const forged = await rawB('POST', 'audit_logs', {
+            id: crypto.randomUUID(), tenant_id: TENANT, order_id: null, performed_by_user_id: cashierId(), authorized_by_manager_id,
+            action_type, amount_impact: 0, reason: 'Pago em pix pela loja', whatsapp_alert_sent: false,
+            metadata: { courier_settlement_id: sid, delivery_id: d.id }, created_at: new Date().toISOString(),
+          });
+          expect(forged.status, `${action_type} ${authorized_by_manager_id}`).toBeGreaterThanOrEqual(400);
+          expect(forged.body).toMatch(/TCHEFOOD_ANTIFRAUDE/);
+        }
+      }
+
+      const rpc = (args: Record<string, unknown>, fetchFn = fetchB()) =>
+        fetchFn('http://cloud.test/rest/v1/rpc/tchefood_courier_followup_audit', { method: 'POST', headers: {}, body: JSON.stringify(args) })
+          .then(async (x) => ({ status: x.status, body: await x.text() }));
+      const args = (over: Record<string, unknown> = {}) => ({
+        p_audit_id: crypto.randomUUID(), p_action: 'COURIER_PAID_OUTSIDE', p_settlement_id: sid, p_performed_by: cashierId(),
+        p_manager_pin: MANAGER_PIN, p_reason: 'Pago em pix pela loja', p_metadata: {}, ...over,
+      });
+      const rows = (action = 'COURIER_PAID_OUTSIDE') => sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = '${action}'`);
+      const failures = () => sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'
+                                    AND metadata->>'attempted_action' = 'COURIER_PAID_OUTSIDE'`);
+      // Ação que não é de pendência do acerto: recusada.
+      expect((await rpc(args({ p_action: 'CASH_WITHDRAWAL' }))).body).toMatch(/não é de pendência do acerto/);
+      // PIN errado: null, nada gravado, a falha fica no registro.
+      const failuresBefore = Number(failures());
+      const wrong = await rpc(args({ p_manager_pin: '0000' }));
+      expect(wrong.status, wrong.body).toBe(200);
+      expect(wrong.body.trim()).toBe('null');
+      expect(rows()).toBe('0');
+      expect(Number(failures())).toBe(failuresBefore + 1);
+      forgetPinFailures();
+      // PIN do caixa no lugar do gerente: também null.
+      expect((await rpc(args({ p_manager_pin: CASHIER_PIN }))).body.trim()).toBe('null');
+      forgetPinFailures();
+      // Motivo curto e acerto que não existe: recusados.
+      expect((await rpc(args({ p_reason: 'pix' }))).body).toMatch(/motivo obrigatório/);
+      expect((await rpc(args({ p_settlement_id: crypto.randomUUID() }))).body).toMatch(/acerto com o entregador não encontrado/);
+      // Outra loja não resolve o acerto desta.
+      const OTHER = '55555555-5555-4555-8555-555555555555';
+      sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${OTHER}', 'Outra', 'Outra Ltda', '11222333000262') ON CONFLICT DO NOTHING;`);
+      const other = postgrestFetch(target!, DB, { role: 'authenticated', tenant_id: OTHER, sub: 'device-c' }, emulatorLog);
+      expect((await rpc(args(), other)).body).toMatch(/não encontrado nesta loja/);
+      expect(rows()).toBe('0');
+
+      // Pago por fora pelo app: a pendência sai na hora e a fila sobe pela função, com o gerente conferido pela nuvem.
+      expect(st().finishCourierSettleFollowUp(sid, { kind: 'paid_outside', auth: { managerPin: MANAGER_PIN, reason: 'Pago em pix pela loja' } }).ok).toBe(true);
+      const log = st().auditLogs.find((l) => l.action_type === 'COURIER_PAID_OUTSIDE')!;
+      await expectSynced('pago por fora');
+      expect(sql(`SELECT authorized_by_manager_id || ' ' || amount_impact || ' ' || whatsapp_alert_sent || ' ' || (metadata->>'server_verified')
+                   || ' ' || (metadata->>'courier_settlement_id') FROM audit_logs WHERE id = '${log.id}'`))
+        .toBe(`${managerId} 0.00 false true ${sid}`);
+      expect(rows()).toBe('1');
+      // Reenvio (a resposta se perdeu): devolve o mesmo registro, mesmo com outro PIN, sem gravar outro.
+      expect(JSON.parse((await rpc(args({ p_audit_id: log.id, p_manager_pin: '0000' }))).body)).toBe(log.id);
+      expect(rows()).toBe('1');
+      // O mesmo id para outro acerto, ou para a outra ação: recusado.
+      expect((await rpc(args({ p_audit_id: log.id, p_settlement_id: crypto.randomUUID() }))).body).toMatch(/outro registro com este id/);
+      expect((await rpc(args({ p_audit_id: log.id, p_action: 'COURIER_PAYMENT_RESOLVED', p_metadata: { delivery_id: d.id } }))).body)
+        .toMatch(/outro registro com este id/);
+
+      // Senha presa: a entrega precisa ser do acerto.
+      const resolved = (over: Record<string, unknown>) => args({ p_action: 'COURIER_PAYMENT_RESOLVED', p_reason: 'Recebido no caixa por outro meio', ...over });
+      expect((await rpc(resolved({ p_metadata: {} }))).body).toMatch(/entrega deste acerto/);
+      expect((await rpc(resolved({ p_metadata: { delivery_id: 'não é uuid' } }))).body).toMatch(/entrega deste acerto/);
+      expect((await rpc(resolved({ p_metadata: { delivery_id: crypto.randomUUID() } }))).body).toMatch(/entrega deste acerto/);
+      expect(rows('COURIER_PAYMENT_RESOLVED')).toBe('0');
+      // Pelo app: a senha sai da pendência e o registro sobe pela função (a sangria já com a regra dela não entra aqui).
+      useTcheStore.setState({ courierSettleFollowUps: [{
+        ...follow, missing_withdrawal: null,
+        missing_payments: [{ delivery_id: d.id, order_id: d.order_id, pickup_number: null, amount: 0, error: 'Conta recebida sem este dinheiro.' }],
+      }] });
+      expect(st().finishCourierSettleFollowUp(sid, { kind: 'payment_resolved', delivery_id: d.id, auth: { managerPin: MANAGER_PIN, reason: 'Recebido no caixa por outro meio' } }))
+        .toEqual({ ok: true, data: null });
+      const rlog = st().auditLogs.find((l) => l.action_type === 'COURIER_PAYMENT_RESOLVED')!;
+      await expectSynced('senha resolvida');
+      expect(sql(`SELECT authorized_by_manager_id || ' ' || amount_impact || ' ' || (metadata->>'delivery_id') || ' ' || (metadata->>'server_verified')
+                   FROM audit_logs WHERE id = '${rlog.id}'`)).toBe(`${managerId} 0.00 ${d.id} true`);
+      // A regra da sangria não vale para a senha resolvida (pago por fora já gravado acima).
+      expect(rows('COURIER_PAYMENT_RESOLVED')).toBe('1');
+    });
+
+    it('acerto pela nuvem: o token do aparelho não acerta em nome de um caixa sem o PIN dele, nem repetindo o mesmo id (GPT, rodada 10 do PR #54)', async () => {
+      forgetPinFailures();
+      const { d } = await nicoDelivers('Rua 310, 1', false);
+      const failuresBefore = Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'
+                                           AND metadata->>'attempted_action' = 'COURIER_SETTLED'`));
+      // UUID do caixa com PIN errado, e sem PIN: nada gravado, a entrega fica sem acerto, a falha fica no registro.
+      for (const pin of ['0000', null]) {
+        const r = await settleRpc(nicoTerms([d.id], 0, pin));
+        expect(r.body, String(pin)).toMatch(/TCHEFOOD_PIN_RECUSADO/);
+        expect(settlementsOf([d.id])).toBe('0');
+        expect(unsettled([d.id])).toBe('1');
+      }
+      expect(Number(sql(`SELECT count(*) FROM audit_logs WHERE tenant_id = '${TENANT}' AND action_type = 'MANAGER_PIN_FAILED'
+                           AND metadata->>'attempted_action' = 'COURIER_SETTLED'`))).toBe(failuresBefore + 2);
+      forgetPinFailures();
+      // PIN do gerente com o UUID do caixa: também não.
+      expect((await settleRpc(nicoTerms([d.id], 0, MANAGER_PIN))).body).toMatch(/TCHEFOOD_PIN_RECUSADO/);
+      expect(settlementsOf([d.id])).toBe('0');
+      forgetPinFailures();
+      // Com o PIN certo: grava.
+      const id = crypto.randomUUID();
+      const okCall = await settleRpc(nicoTerms([d.id], 0, CASHIER_PIN, id));
+      expect(okCall.status, okCall.body).toBe(200);
+      expect(JSON.parse(okCall.body)).toMatchObject({ id, settled_by_user_id: cashierId(), delivery_ids: [d.id] });
+      expect(unsettled([d.id])).toBe('0');
+      // A repetição do mesmo id também precisa do PIN.
+      const replay = await settleRpc(nicoTerms([d.id], 0, '0000', id));
+      expect(replay.body).toMatch(/TCHEFOOD_PIN_RECUSADO/);
+      expect(replay.body).not.toContain(id);
+      forgetPinFailures();
+      expect(JSON.parse((await settleRpc(nicoTerms([d.id], 0, CASHIER_PIN, id))).body)).toMatchObject({ id });
+      expect(settlementsOf([d.id])).toBe('1');
+    });
+
+    it('acerto pela nuvem: o dinheiro trazido é exatamente o que as contas pagas na entrega devem (GPT, rodada 10 do PR #54)', async () => {
+      forgetPinFailures();
+      // Uma conta paga na entrega, sem pagamento: R$ 0 e metade são recusados, nada é gravado.
+      const cod = await nicoDelivers('Rua 311, 1', true);
+      const owed = owedOf(cod.orderId);
+      expect(owed).toBeGreaterThan(0);
+      expect(sql(`SELECT status FROM orders WHERE id = '${cod.orderId}'`)).toBe('PAYING');
+      for (const cash of [0, owed / 2, owed + 1]) {
+        const r = await settleRpc(nicoTerms([cod.d.id], cash, CASHIER_PIN));
+        expect(r.status, `${cash}: ${r.body}`).toBeGreaterThanOrEqual(400);
+        expect(r.body).toMatch(/não é o que as contas pagas na entrega devem/);
+        expect(settlementsOf([cod.d.id])).toBe('0');
+        expect(unsettled([cod.d.id])).toBe('1');
+      }
+      // Paga na entrega + paga no balcão: só a primeira deve; o valor exato passa.
+      const prepaid = await nicoDelivers('Rua 311, 2', false);
+      expect((await settleRpc(nicoTerms([cod.d.id, prepaid.d.id].sort(), owed + 1, CASHIER_PIN))).status).toBeGreaterThanOrEqual(400);
+      const mixed = await settleRpc(nicoTerms([cod.d.id, prepaid.d.id].sort(), owed, CASHIER_PIN));
+      expect(mixed.status, mixed.body).toBe(200);
+      expect(unsettled([cod.d.id, prepaid.d.id])).toBe('0');
+
+      // Duas pagas na entrega: a soma das duas, exata.
+      const c1 = await nicoDelivers('Rua 311, 3', true);
+      const c2 = await nicoDelivers('Rua 311, 4', true);
+      const both = [c1.d.id, c2.d.id].sort();
+      const sum = owedOf(c1.orderId) + owedOf(c2.orderId);
+      expect((await settleRpc(nicoTerms(both, owedOf(c1.orderId), CASHIER_PIN))).body).toMatch(/não é o que as contas pagas na entrega devem/);
+      expect(settlementsOf(both)).toBe('0');
+      const pair = await settleRpc(nicoTerms(both, sum, CASHIER_PIN));
+      expect(pair.status, pair.body).toBe(200);
+      expect(Number(JSON.parse(pair.body).cash_collected)).toBe(sum);
+
+      // Paga na entrega, mas o cliente pagou no balcão (conta fechada, saldo 0): não deve nada.
+      const counter = await nicoDelivers('Rua 311, 5', true);
+      const total = owedOf(counter.orderId);
+      payCash(counter.orderId);
+      await expectSynced('conta paga no balcão');
+      expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${counter.orderId}'`)).toBe('CLOSED 0.00');
+      expect((await settleRpc(nicoTerms([counter.d.id], total, CASHIER_PIN))).body).toMatch(/não é o que as contas pagas na entrega devem/);
+      const zero = await settleRpc(nicoTerms([counter.d.id], 0, CASHIER_PIN));
+      expect(zero.status, zero.body).toBe(200);
+
+      // Pagamento do próprio acerto de uma tentativa anterior (chave entrega-<id>): conta como devido.
+      const again = await nicoDelivers('Rua 311, 6', true);
+      const paid = owedOf(again.orderId);
+      ok(st().registerPayment({
+        orderId: again.orderId, amount: paid, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
+        acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null,
+        idempotency_key: `entrega-${again.d.id}`, item_ids: [],
+      }));
+      await expectSynced('pagamento entrega-');
+      expect((await settleRpc(nicoTerms([again.d.id], 0, CASHIER_PIN))).body).toMatch(/não é o que as contas pagas na entrega devem/);
+      const withPaid = await settleRpc(nicoTerms([again.d.id], paid, CASHIER_PIN));
+      expect(withPaid.status, withPaid.body).toBe(200);
+
+      // Fração de centavo no dinheiro ou no ganho: recusada (a coluna arredondaria calada).
+      const frac = await nicoDelivers('Rua 311, 7', false);
+      const fracCash = await settleRpc({ ...nicoTerms([frac.d.id], 0, CASHIER_PIN), p_cash_collected: 0.004 });
+      expect(fracCash.status, fracCash.body).toBeGreaterThanOrEqual(400);
+      const fracFees = await settleRpc({ ...nicoTerms([frac.d.id], 0, CASHIER_PIN), p_courier_fees: 3.004 });
+      expect(fracFees.status, fracFees.body).toBeGreaterThanOrEqual(400);
+      expect(fracFees.body).toMatch(/centavo/);
+      expect(settlementsOf([frac.d.id])).toBe('0');
     });
 
     it('cópia velha da entrega mandada por outro aparelho não volta a entrega atrás nem troca o entregador, e não trava a fila (auditoria interna, rodada 8 do PR #54)', async () => {

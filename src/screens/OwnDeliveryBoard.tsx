@@ -36,6 +36,10 @@ export function OwnDeliveryBoard() {
   const [target, setTarget] = useState<SettleTarget | null>(null);
   const [payAuthOpen, setPayAuthOpen] = useState(false);
   const [followPinFor, setFollowPinFor] = useState<CourierSettleFollowUp | null>(null);
+  // "Pago por fora" pede PIN de gerente e motivo (GPT, rodada 10 do PR #54).
+  const [paidOutsideFor, setPaidOutsideFor] = useState<CourierSettleFollowUp | null>(null);
+  // Senha presa na pendência: sai só com PIN de gerente e registro (GPT, rodada 10 do PR #54).
+  const [resolveFor, setResolveFor] = useState<{ f: CourierSettleFollowUp; m: CourierSettleFollowUp['missing_payments'][number] } | null>(null);
   const pendingList = useTcheStore((s) => s.courierSettlePending ?? NO_PENDING);
   const followUps = useTcheStore((s) => s.courierSettleFollowUps ?? NO_FOLLOW_UPS);
   const [sentOut, setSentOut] = useState<OwnDelivery[] | null>(null);
@@ -96,10 +100,10 @@ export function OwnDeliveryBoard() {
     closeSettle();
     return true;
   };
-  const finishFollowUp = (f: CourierSettleFollowUp, step: { kind: 'payments' } | { kind: 'paid_outside' }) => {
+  const finishFollowUp = (f: CourierSettleFollowUp, step: { kind: 'payments' }) => {
     const r = useTcheStore.getState().finishCourierSettleFollowUp(f.settlement_id, step);
     if (!r.ok) return toast.error(r.error);
-    toast.success(r.data === null ? `Acerto de ${f.courier_name} terminado.` : step.kind === 'payments' ? 'Senhas recebidas.' : 'Ganho marcado como pago por fora.');
+    toast.success(r.data === null ? `Acerto de ${f.courier_name} terminado.` : 'Senhas recebidas.');
   };
 
   return (
@@ -117,7 +121,12 @@ export function OwnDeliveryBoard() {
               <p className="text-slate-600">{f.delivery_ids.length} entrega(s) · dinheiro {formatBRL(f.cash_collected)} · ganho {formatBRL(f.courier_fees)}</p>
               <ul className="my-1 list-disc pl-5 text-slate-700">
                 {f.missing_payments.map((m) => (
-                  <li key={m.delivery_id}>Senha {formatPickupNumber(m.pickup_number)}: {formatBRL(m.amount)} não recebido. {m.error}</li>
+                  <li key={m.delivery_id}>
+                    Senha {formatPickupNumber(m.pickup_number)}: {formatBRL(m.amount)} não recebido. {m.error}
+                    {canSettle && (
+                      <Btn variant="secondary" className="ml-2" onClick={() => setResolveFor({ f, m })}>Resolver com gerente</Btn>
+                    )}
+                  </li>
                 ))}
                 {f.missing_withdrawal && <li>Sangria de {formatBRL(f.missing_withdrawal.amount)} para o entregador não feita. {f.missing_withdrawal.error}</li>}
               </ul>
@@ -125,7 +134,7 @@ export function OwnDeliveryBoard() {
                 <div className="flex flex-wrap gap-2">
                   {f.missing_payments.length > 0 && <Btn variant="gold" onClick={() => finishFollowUp(f, { kind: 'payments' })}>Receber as senhas</Btn>}
                   {f.missing_withdrawal && <Btn variant="success" onClick={() => setFollowPinFor(f)}>Fazer a sangria (PIN do gerente)</Btn>}
-                  {f.missing_withdrawal && <Btn variant="secondary" onClick={() => finishFollowUp(f, { kind: 'paid_outside' })}>Pago por fora</Btn>}
+                  {f.missing_withdrawal && <Btn variant="secondary" onClick={() => setPaidOutsideFor(f)}>Pago por fora</Btn>}
                 </div>
               )}
             </div>
@@ -309,6 +318,30 @@ export function OwnDeliveryBoard() {
         successMessage="Sangria feita."
         onSubmit={(managerPin, reason) => useTcheStore.getState().finishCourierSettleFollowUp(followPinFor!.settlement_id, { kind: 'withdrawal', auth: { managerPin, reason } })}
         onSuccess={() => setFollowPinFor(null)}
+      />
+
+      <ManagerAuthSheet
+        open={paidOutsideFor !== null}
+        onClose={() => setPaidOutsideFor(null)}
+        title="Ganho do entregador pago por fora"
+        summary={<span>Ganho de <b>{formatBRL(paidOutsideFor?.missing_withdrawal?.amount ?? 0)}</b> para {paidOutsideFor?.courier_name} pago sem sair da gaveta. Fica registrado na auditoria; diga no motivo como foi pago.</span>}
+        confirmLabel="Autorizar pago por fora"
+        quickReasons={['Pago em pix pela loja', 'Pago em dinheiro fora do caixa']}
+        successMessage="Ganho marcado como pago por fora."
+        onSubmit={(managerPin, reason) => useTcheStore.getState().finishCourierSettleFollowUp(paidOutsideFor!.settlement_id, { kind: 'paid_outside', auth: { managerPin, reason } })}
+        onSuccess={() => setPaidOutsideFor(null)}
+      />
+
+      <ManagerAuthSheet
+        open={resolveFor !== null}
+        onClose={() => setResolveFor(null)}
+        title="Senha resolvida com o gerente"
+        summary={<span>Senha {formatPickupNumber(resolveFor?.m.pickup_number ?? null)} de {resolveFor?.f.courier_name}: <b>{formatBRL(resolveFor?.m.amount ?? 0)}</b> sai da pendência sem ser recebida aqui. Fica registrado na auditoria; diga no motivo o que aconteceu.</span>}
+        confirmLabel="Autorizar"
+        quickReasons={['Recebido no caixa por outro meio', 'Conta desfeita pelo cliente']}
+        successMessage="Senha resolvida."
+        onSubmit={(managerPin, reason) => useTcheStore.getState().finishCourierSettleFollowUp(resolveFor!.f.settlement_id, { kind: 'payment_resolved', delivery_id: resolveFor!.m.delivery_id, auth: { managerPin, reason } })}
+        onSuccess={() => setResolveFor(null)}
       />
 
       <ManagerAuthSheet

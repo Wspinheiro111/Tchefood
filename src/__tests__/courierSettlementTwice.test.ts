@@ -346,7 +346,9 @@ describe('acerto gravado na nuvem com pendência neste aparelho (auditoria inter
     expect(r.ok).toBe(false);
     const id = calls[0]!.body.p_id as string;
     expect(st().courierSettleFollowUps![0]).toMatchObject({ settlement_id: id, missing_payments: [], missing_withdrawal: expect.anything() });
-    const o = st().finishCourierSettleFollowUp(id, { kind: 'paid_outside' });
+    // "Pago por fora" pede PIN de gerente (GPT, rodada 10 do PR #54): o bloqueio já passou.
+    useTcheStore.setState({ managerPinLockedUntil: null });
+    const o = st().finishCourierSettleFollowUp(id, { kind: 'paid_outside', auth: MANAGER });
     if (!o.ok) throw new Error(o.error);
     expect(st().courierSettleFollowUps).toEqual([]);
     expect(drawerOut()).toEqual([]);
@@ -461,7 +463,7 @@ describe('aparelho interrompido depois de a nuvem gravar o acerto (GPT, rodada 8
       settlement_id: id, courier_id: a.courier.id, courier_name: a.courier.name, delivery_ids: [a.delivery.id], cash_collected: 0,
       courier_fees: a.delivery.courier_fee ?? 0, missing_payments: [], missing_withdrawal: { amount: a.delivery.courier_fee ?? 0, error: 'Acerto interrompido antes deste passo.' }, created_at: '2026-11-14T12:00:00Z',
     }] });
-    expect(st().finishCourierSettleFollowUp(id, { kind: 'paid_outside' })).toMatchObject({ ok: false, error: expect.stringMatching(/já está registrada no caixa/) });
+    expect(st().finishCourierSettleFollowUp(id, { kind: 'paid_outside', auth: MANAGER })).toMatchObject({ ok: false, error: expect.stringMatching(/já está registrada no caixa/) });
     expect(drawerOut()).toHaveLength(1);
     expect(st().courierSettleFollowUps).toEqual([]);
   });
@@ -649,5 +651,105 @@ describe('troca de loja com acerto do entregador em andamento (Codex, PR #54)', 
     expect(newStore()).toMatchObject({ ok: false, error: expect.stringMatching(/acerto com o entregador para terminar/) });
     useTcheStore.setState({ courierSettleFollowUps: [], outbox: [] });
     expect(newStore().ok).toBe(true);
+  });
+});
+
+describe('terminar a pendência recebe só o valor do acerto e não perde senha (GPT, rodada 10 do PR #54)', () => {
+  /** Acerto gravado na nuvem com a senha ainda por receber (o recebimento falhou logo depois da nuvem). */
+  async function stuck() {
+    expect(st().openCashSession(100).ok).toBe(true);
+    const a = deliveredOrder();
+    connectCloud();
+    const calls: Call[] = [];
+    const fn = afterCloud(cloudFn(calls), () => useTcheStore.setState({ cloudSkippedOrderIds: [a.order.id] }));
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: fn });
+    expect(r.ok).toBe(false);
+    useTcheStore.setState({ cloudSkippedOrderIds: [] });
+    const settlementId = calls[0]!.body.p_id as string;
+    const planned = st().courierSettleFollowUps![0]!.missing_payments[0]!.amount;
+    expect(planned).toBe(a.order.total_amount);
+    return { a, settlementId, planned, calls };
+  }
+  const setOrder = (id: string, patch: Record<string, unknown>) =>
+    useTcheStore.setState((s) => ({ orders: s.orders.map((o) => (o.id === id ? { ...o, ...patch } : o)) }));
+  const entrega = (deliveryId: string) => st().payments.filter((p) => p.idempotency_key === `entrega-${deliveryId}`);
+  const missing = () => st().courierSettleFollowUps?.[0]?.missing_payments ?? [];
+
+  it('o saldo mudou entre a nuvem e o recebimento: não recebe outro valor; com o saldo de volta, recebe o do acerto uma vez', async () => {
+    expect(st().openCashSession(100).ok).toBe(true);
+    const a = deliveredOrder();
+    connectCloud();
+    const calls: Call[] = [];
+    const planned = a.order.total_amount;
+    const changed = planned - 20;
+    // A nuvem grava o acerto com o valor planejado; antes de receber, o saldo da conta muda.
+    const fn = afterCloud(cloudFn(calls), () => setOrder(a.order.id, { remaining_balance: changed }));
+    const r = await st().settleCourierOnline(a.courier.id, { payFromDrawer: false, auth: null, fetchFn: fn });
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/O saldo da senha \d+ mudou desde o acerto \(acerto: R\$\s[\d,]+, saldo agora: R\$\s[\d,]+\)/) });
+    expect(calls[0]!.body.p_cash_collected).toBe(planned);
+    expect(entrega(a.delivery.id)).toEqual([]);
+    expect(missing()).toEqual([expect.objectContaining({ delivery_id: a.delivery.id, amount: planned, error: expect.stringMatching(/mudou desde o acerto/) })]);
+    const id = calls[0]!.body.p_id as string;
+    const again = st().finishCourierSettleFollowUp(id, { kind: 'payments' });
+    expect(again).toMatchObject({ ok: false, error: expect.stringMatching(/Confira no caixa antes de receber/) });
+    expect(entrega(a.delivery.id)).toEqual([]);
+
+    setOrder(a.order.id, { remaining_balance: planned });
+    const ok = st().finishCourierSettleFollowUp(id, { kind: 'payments' });
+    if (!ok.ok) throw new Error(ok.error);
+    expect(entrega(a.delivery.id).map((p) => p.amount)).toEqual([planned]);
+    expect(st().courierSettleFollowUps).toEqual([]);
+    expect(st().finishCourierSettleFollowUp(id, { kind: 'payments' }).ok).toBe(false);
+    expect(entrega(a.delivery.id)).toHaveLength(1);
+  });
+
+  it('a conta da senha não está no aparelho: a senha fica na pendência', async () => {
+    const { a, settlementId } = await stuck();
+    useTcheStore.setState((s) => ({ orders: s.orders.filter((o) => o.id !== a.order.id) }));
+    const r = st().finishCourierSettleFollowUp(settlementId, { kind: 'payments' });
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/não está neste aparelho/) });
+    expect(missing()).toEqual([expect.objectContaining({ delivery_id: a.delivery.id, error: expect.stringMatching(/sincronize e tente de novo/) })]);
+  });
+
+  it.each([
+    ['aberta (OPEN)', { status: 'OPEN' }],
+    ['fechada (CLOSED)', { status: 'CLOSED', remaining_balance: 0 }],
+    ['cancelada (CANCELED)', { status: 'CANCELED' }],
+    ['em pagamento com saldo zero', { status: 'PAYING', remaining_balance: 0 }],
+  ])('conta %s sem o recebimento da entrega: a senha fica na pendência', async (_label, patch) => {
+    const { a, settlementId } = await stuck();
+    setOrder(a.order.id, patch);
+    const r = st().finishCourierSettleFollowUp(settlementId, { kind: 'payments' });
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/confira no caixa/i) });
+    expect(entrega(a.delivery.id)).toEqual([]);
+    expect(missing()).toEqual([expect.objectContaining({ delivery_id: a.delivery.id })]);
+  });
+
+  it('recebimento da entrega já aprovado com o valor do acerto: o passo termina, sem pagamento novo', async () => {
+    const { a, settlementId, planned } = await stuck();
+    const paid = st().registerPayment({
+      orderId: a.order.id, amount: planned, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
+      acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: `entrega-${a.delivery.id}`, item_ids: [],
+    });
+    if (!paid.ok) throw new Error(paid.error);
+    const before = st().payments.length;
+    const r = st().finishCourierSettleFollowUp(settlementId, { kind: 'payments' });
+    if (!r.ok) throw new Error(r.error);
+    expect(st().payments).toHaveLength(before);
+    expect(st().courierSettleFollowUps).toEqual([]);
+  });
+
+  it('recebimento da entrega aprovado com outro valor: fica na pendência, sem pagamento novo', async () => {
+    const { a, settlementId, planned } = await stuck();
+    const paid = st().registerPayment({
+      orderId: a.order.id, amount: planned - 5, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
+      acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: `entrega-${a.delivery.id}`, item_ids: [],
+    });
+    if (!paid.ok) throw new Error(paid.error);
+    const before = st().payments.length;
+    const r = st().finishCourierSettleFollowUp(settlementId, { kind: 'payments' });
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/outro valor/) });
+    expect(st().payments).toHaveLength(before);
+    expect(missing()).toEqual([expect.objectContaining({ delivery_id: a.delivery.id, amount: planned })]);
   });
 });

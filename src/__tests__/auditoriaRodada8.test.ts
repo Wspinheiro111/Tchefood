@@ -124,7 +124,7 @@ describe('moveLateItemsToNewOrder: taxa e mudança da mesa (auditoria interna, r
 
   it('evento da mesa só de ocupação (nada do cadastro mudado aqui) sai da fila (GPT, rodada 8 do PR #54)', () => {
     const { free } = setup([]);
-    const occupy = ev('dining_tables', free.id, { ...free, status: 'OCCUPIED', current_order_id: O1 }, { id: 'e-ocupa' });
+    const occupy = ev('dining_tables', free.id, { ...free, status: 'OCCUPIED', current_order_id: O1 }, { id: 'e-ocupa', table_edit_fields: [] });
     useTcheStore.setState({ outbox: [occupy] });
     const r = st().moveLateItemsToNewOrder('e-cerveja');
     if (!r.ok) throw new Error(r.error);

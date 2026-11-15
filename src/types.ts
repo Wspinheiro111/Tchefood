@@ -447,7 +447,13 @@ export type AuditActionType =
   | 'PRICE_OVERRIDE'
   // Conta de itens atrasados descartada com mesa ocupada por outro cliente (auditoria interna,
   // rodada 8 do PR #54): sem PIN de gerente, só o registro dos itens que saíram do aparelho.
-  | 'LATE_ITEMS_DISCARDED';
+  | 'LATE_ITEMS_DISCARDED'
+  // Ganho do entregador pago por fora da gaveta, com PIN de gerente conferido no aparelho
+  // (GPT, rodada 10 do PR #54). Sobe por tchefood_courier_followup_audit, que confere o PIN.
+  | 'COURIER_PAID_OUTSIDE'
+  // Senha presa na pendência do acerto resolvida com PIN de gerente, sem receber nada aqui
+  // (GPT, rodada 10 do PR #54). Sobe pela mesma função da nuvem.
+  | 'COURIER_PAYMENT_RESOLVED';
 
 export interface AuditLog {
   id: UUID;

@@ -284,6 +284,8 @@ export const AUDIT_LABEL: Record<AuditLog['action_type'], string> = {
   CASH_CLOSE_DIFFERENCE: 'Caixa fechado com diferença',
   PRICE_OVERRIDE: 'Preço diferente do cadastro aceito pelo gerente',
   LATE_ITEMS_DISCARDED: 'Conta de itens atrasados descartada (mesa de outro cliente)',
+  COURIER_PAID_OUTSIDE: 'Ganho do entregador pago por fora da gaveta',
+  COURIER_PAYMENT_RESOLVED: 'Senha do acerto com o entregador resolvida pelo gerente',
 };
 
 /** Texto do alerta enviado ao WhatsApp do proprietário. */
