@@ -366,3 +366,63 @@ describe('mensagens da leitura das contas e espera medida do fim (auditoria inte
     expect(msg(900 * 60_000, false)).toBeNull();
   });
 });
+
+describe('mais de 500 contas pedidas pelo id: cada leitura pede o lote seguinte (GPT, rodada 13 do PR #54)', () => {
+  const id = (n: number) => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
+  const empty = (): CloudOrders => ({ tenant_id: st().tenant.id, server_now: new Date().toISOString(), orders: [], orderItems: [], payments: [], ownDeliveries: [], tables: [], cashSessions: [], skippedOrderIds: [] });
+
+  it('reconcileWindow percorre a lista inteira e volta ao começo', async () => {
+    const { reconcileWindow } = await import('../lib/sync/orderPull');
+    const ids = Array.from({ length: 1200 }, (_, n) => id(n));
+    const seen = new Set<string>();
+    let cursor = 0;
+    for (let i = 0; i < 3; i++) {
+      const w = reconcileWindow(ids, cursor);
+      expect(w.ids).toHaveLength(500);
+      w.ids.forEach((x) => seen.add(x));
+      cursor = w.next;
+    }
+    expect(seen.size).toBe(1200);
+    expect(reconcileWindow(ids.slice(0, 10), 7)).toEqual({ ids: ids.slice(0, 10), next: 0 });
+  });
+
+  it('a conta encerrada em outro aparelho fora do primeiro lote chega e libera a mesa', async () => {
+    const table = st().tables.find((t) => t.kind === 'TABLE')!;
+    const target = id(599);
+    const local = Array.from({ length: 600 }, (_, n) => openOrder(id(n), n === 599 ? table.id : `mesa-${n}`));
+    useTcheStore.setState((s) => ({
+      orders: [...s.orders, ...local],
+      tables: s.tables.map((t) => (t.id === table.id ? { ...t, status: 'OCCUPIED', current_order_id: target } : t)),
+    }));
+    const closedAt = new Date(Date.now() - 2 * 24 * 3600_000).toISOString();
+    fake.catalog.mockResolvedValue(catalogOfDemo());
+    fake.orders.mockImplementation(async (...args: unknown[]) => {
+      const asked = args[3] as string[];
+      expect(asked.length).toBeLessThanOrEqual(500);
+      if (!asked.includes(target)) return empty();
+      const closed = { ...openOrder(target, table.id), status: 'CLOSED' as const, closed_at: closedAt, paid_amount: 50, remaining_balance: 0 };
+      return { ...empty(), orders: [closed], tables: [{ id: table.id, status: 'FREE', current_order_id: null, updated_at: closedAt }] };
+    });
+    await tick({ forcePull: true });
+    expect(st().orders.find((o) => o.id === target)!.status).toBe('OPEN');
+    await tick({ forcePull: true });
+    expect(st().orders.find((o) => o.id === target)!.status).toBe('CLOSED');
+    expect(st().tables.find((t) => t.id === table.id)!.current_order_id).toBeNull();
+  });
+
+  it('a entrega sem acerto fora do primeiro lote também é pedida', async () => {
+    const local = Array.from({ length: 600 }, (_, n) => openOrder(id(n), `mesa-${n}`));
+    const deliveryOrder = id(700);
+    useTcheStore.setState((s) => ({
+      orders: [...s.orders, ...local],
+      ownDeliveries: [...s.ownDeliveries, { id: 'd-700', order_id: deliveryOrder, status: 'DELIVERED', settlement_id: null } as OwnDelivery],
+    }));
+    fake.catalog.mockResolvedValue(catalogOfDemo());
+    fake.orders.mockImplementation(async () => empty());
+    await tick({ forcePull: true });
+    await tick({ forcePull: true });
+    for (const c of fake.orders.mock.calls) expect((c[3] as string[]).length).toBeLessThanOrEqual(500);
+    const asked = fake.orders.mock.calls.flatMap((c) => c[3] as string[]);
+    expect(asked).toContain(deliveryOrder);
+  });
+});

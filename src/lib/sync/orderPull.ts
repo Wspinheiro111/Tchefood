@@ -389,7 +389,7 @@ export function parseCloudOrders(body: unknown, tenantId: UUID): CloudOrders {
 const ORDER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Contas que a leitura pede pelo id (até 500, nesta ordem): primeiro as em aberto aqui, depois
+ * Contas que a leitura pede pelo id (em lotes de 500, reconcileWindow): as em aberto aqui e
  * as das entregas próprias ainda sem acerto aqui, em qualquer data. Assim a entrega acertada em
  * outro aparelho com a conta encerrada há mais de 24 h desce com o acerto e sai do acerto deste
  * aparelho, que senão a mandaria em todo acerto daquele entregador e seria sempre recusado
@@ -401,6 +401,25 @@ export function orderIdsToReconcile(s: { orders: readonly Pick<Order, 'id' | 'st
   return [...new Set([...open, ...unsettled])].filter((id) => ORDER_ID_RE.test(id));
 }
 
+/** Ids por leitura (o banco lê até 500 de `p_order_ids`). */
+export const RECONCILE_BATCH = 500;
+
+/**
+ * Lote de ids pedidos nesta leitura quando passam do limite (GPT, rodada 13 do PR #54): a lista
+ * vai em ordem de id e cada leitura pede o lote seguinte, voltando ao começo depois do último.
+ * Assim toda conta em aberto aqui e toda entrega sem acerto é pedida a cada
+ * ceil(n / 500) leituras, em vez de as mesmas 500 primeiras sempre. A junção já trata a resposta
+ * como parte: conta pedida que não veio fica como está e é pedida de novo no próximo giro.
+ * `cursor` é a posição do próximo lote; devolve o lote e a posição seguinte.
+ */
+export function reconcileWindow(ids: readonly UUID[], cursor: number, size = RECONCILE_BATCH): { ids: UUID[]; next: number } {
+  const sorted = [...new Set(ids)].sort();
+  if (sorted.length <= size) return { ids: sorted, next: 0 };
+  const start = Number.isInteger(cursor) && cursor > 0 ? cursor % sorted.length : 0;
+  const batch = [...sorted.slice(start, start + size), ...sorted.slice(0, Math.max(0, start + size - sorted.length))];
+  return { ids: batch, next: (start + size) % sorted.length };
+}
+
 /**
  * Contas, itens, pagamentos e ocupação das mesas da loja do token, numa foto só do banco.
  * `openHere`: contas em aberto neste aparelho; o banco as devolve mesmo encerradas há mais
@@ -410,7 +429,7 @@ export async function fetchCloudOrders(cfg: SyncConfig, tenantId: UUID, fetchFn:
   const res = await fetchFn(`${cfg.url.replace(/\/+$/, '')}/rest/v1/rpc/tchefood_pull_orders`, {
     method: 'POST',
     headers: { apikey: cfg.anonKey, Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ p_order_ids: [...new Set(openHere)].slice(0, 500) }),
+    body: JSON.stringify({ p_order_ids: [...new Set(openHere)].slice(0, RECONCILE_BATCH) }),
   });
   const text = await res.text().catch(() => '');
   if (!res.ok) {
