@@ -166,7 +166,7 @@ export function AnnualClose() {
 
   const cutoffLabel = brasiliaDateTime(positionCutoff(period, now));
   const clockNote = `ATENÇÃO: o relógio deste aparelho estava em ${brasiliaDateTime(now.getTime())}, antes de ${year} começar, quando este relatório foi gerado. Os números são do ano inteiro, mas confira a data e a hora do aparelho.`;
-  const otherNote = `${otherStore} registro(s) de outra loja que ficaram neste aparelho (de antes de ligá-lo a esta loja) foram deixados de fora.`;
+  const otherNote = `${otherStore} registro(s) de outra loja ou sem loja identificada que ficaram neste aparelho (de antes de ligá-lo a esta loja) foram deixados de fora dos totais.`;
   // Notas que vão em todos os relatórios exportados (as mesmas que a tela mostra no topo).
   const partialNote = [
     ...(partial ? [`O ano de ${year} ainda não terminou: os números vão até ${cutoffLabel} (horário de Brasília), não até 31/12.`] : []),

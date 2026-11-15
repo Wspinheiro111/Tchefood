@@ -238,13 +238,15 @@ export interface InventoryReport {
 /**
  * Só os registros da loja deste aparelho. Ligar o aparelho a outra loja (ou zerar) nem
  * sempre apaga tudo o que era da anterior: o que tem tenant_id de outra loja fica fora
- * e é contado para o aviso. Registro sem tenant_id (dado antigo) fica.
+ * e é contado para o aviso. Registro sem tenant_id também fica fora (e é contado): todo
+ * registro que o app grava leva a loja, então um sem loja tem origem desconhecida e não
+ * pode entrar nos números desta loja.
  */
 export function ownStore<T extends { tenant_id?: string | null }>(rows: readonly T[], tenantId: string): { rows: T[]; other: number } {
   const out: T[] = [];
   let other = 0;
   for (const r of rows) {
-    if (r.tenant_id && r.tenant_id !== tenantId) other += 1;
+    if (r.tenant_id !== tenantId) other += 1;
     else out.push(r);
   }
   return { rows: out, other };
@@ -255,24 +257,52 @@ export function ownStore<T extends { tenant_id?: string | null }>(rows: readonly
  * de acesso): a cópia da nuvem foi importada por OUTRO aparelho, que já tem essas
  * entradas, e a deste aparelho foi recusada pela nuvem. Somar os inventários contaria
  * a mercadoria duas vezes, então elas ficam fora daqui (e são avisadas).
+ * Se mais de uma cópia tem entradas NESTE aparelho (a nota foi importada aqui duas
+ * vezes), a mercadoria entrou aqui: valem as entradas de uma cópia só (a importada
+ * primeiro) e as das outras ficam fora. Nunca zero, nunca em dobro.
  */
 export function duplicateInvoiceMovementIds(
   movements: readonly StockMovement[],
   items: ReadonlyArray<Pick<PurchaseInvoiceItem, 'id' | 'invoice_id'>>,
-  invoices: ReadonlyArray<Pick<PurchaseInvoice, 'id' | 'access_key'>>,
+  invoices: ReadonlyArray<Pick<PurchaseInvoice, 'id' | 'access_key'> & Partial<Pick<PurchaseInvoice, 'imported_at' | 'environment'>>>,
 ): Set<string> {
-  const byKey = new Map<string, number>();
+  const byKey = new Map<string, Array<(typeof invoices)[number]>>();
   for (const i of invoices) {
     const k = (i.access_key ?? '').trim();
-    if (k !== '') byKey.set(k, (byKey.get(k) ?? 0) + 1);
+    if (k === '') continue;
+    const list = byKey.get(k) ?? [];
+    list.push(i);
+    byKey.set(k, list);
   }
-  const dup = new Set(invoices.filter((i) => (byKey.get((i.access_key ?? '').trim()) ?? 0) > 1).map((i) => i.id));
   const out = new Set<string>();
-  if (dup.size === 0) return out;
+  if (![...byKey.values()].some((l) => l.length > 1)) return out;
   const itemInvoice = new Map(items.map((i) => [i.id, i.invoice_id]));
+  const movesByInvoice = new Map<string, string[]>();
   for (const m of movements) {
     const inv = m.purchase_invoice_item_id ? itemInvoice.get(m.purchase_invoice_item_id) : undefined;
-    if (inv !== undefined && dup.has(inv)) out.add(m.id);
+    if (inv === undefined) continue;
+    const list = movesByInvoice.get(inv) ?? [];
+    list.push(m.id);
+    movesByInvoice.set(inv, list);
+  }
+  for (const copies of byKey.values()) {
+    if (copies.length < 2) continue;
+    // Mesma ordem da escolha das compras (expensesByCategory): produção antes de
+    // homologação, depois a importada primeiro.
+    const prod = (c: (typeof copies)[number]) => (c.environment === undefined || c.environment === 'PRODUCTION' ? 0 : 1);
+    const imp = (c: (typeof copies)[number]) => at(c.imported_at) ?? Infinity;
+    const withMoves = copies
+      .filter((c) => (movesByInvoice.get(c.id)?.length ?? 0) > 0)
+      .sort((a, b) => prod(a) - prod(b) || (imp(a) === imp(b) ? 0 : imp(a) < imp(b) ? -1 : 1) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    // Duas ou mais cópias com entradas aqui: a primeira fica, as outras saem. Uma só:
+    // se outra cópia (de produção) veio de outro aparelho, aquele aparelho já conta a
+    // mercadoria e esta sai; se as outras são só de homologação, esta fica.
+    const othersProduction = (c: (typeof copies)[number]) => copies.some((o) => o !== c && prod(o) === 0);
+    const keep = withMoves.length >= 2 ? withMoves[0]!.id : withMoves.length === 1 && !othersProduction(withMoves[0]!) ? withMoves[0]!.id : null;
+    for (const c of withMoves) {
+      if (c.id === keep) continue;
+      for (const id of movesByInvoice.get(c.id) ?? []) out.add(id);
+    }
   }
   return out;
 }
@@ -792,7 +822,8 @@ export function openPositionsAt(input: OpenPositionsInput, p: YearPeriod, now: D
   const paidBefore = new Map<string, number>();
   let late = 0;
   for (const pay of input.payments) {
-    if (pay.status !== 'APPROVED') continue;
+    // Simulador (MOCK) não é dinheiro: não abate o que o entregador deve.
+    if (pay.status !== 'APPROVED' || pay.acquirer === 'MOCK') continue;
     const t = at(pay.created_at);
     // Conta aqui (todos os aprovados) o pagamento depois da posição ou com data inválida,
     // também o de cartão: ficou fora do A receber e da conta do dinheiro com o entregador.
@@ -938,19 +969,39 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
   let invalidDates = 0;
   let invalidIssueDates = 0;
   let duplicateInvoices = 0;
-  const seenKeys = new Set<string>();
+  // A mesma NF-e (mesma chave) importada em dois aparelhos antes de sincronizar fica
+  // duas vezes aqui (a da nuvem e a recusada deste aparelho): conta uma vez só. Antes de
+  // olhar o período, escolhe a cópia mais confiável de cada chave: produção, com data de
+  // emissão válida, importada primeiro. Assim a cópia sem data não tira a nota do ano certo.
+  const rank = (i: PurchaseInvoice): [number, number, number] => [
+    i.environment === 'PRODUCTION' ? 0 : 1,
+    invoiceDate(i.issued_at) !== null ? 0 : 1,
+    at(i.imported_at) ?? Infinity,
+  ];
+  const best = new Map<string, PurchaseInvoice>();
   for (const inv of input.purchaseInvoices) {
-    // A mesma NF-e (mesma chave) importada em dois aparelhos antes de sincronizar fica
-    // duas vezes aqui (a da nuvem e a recusada deste aparelho): conta uma vez só.
+    const key = (inv.access_key ?? '').trim();
+    if (key === '') continue;
+    const cur = best.get(key);
+    if (cur === undefined) {
+      best.set(key, inv);
+      continue;
+    }
+    const a = rank(inv);
+    const b = rank(cur);
+    const cmp = a[0] - b[0] || a[1] - b[1] || (a[2] === b[2] ? 0 : a[2] < b[2] ? -1 : 1) || (inv.id < cur.id ? -1 : 1);
+    if (cmp < 0) best.set(key, inv);
+  }
+  for (const inv of input.purchaseInvoices) {
     const key = (inv.access_key ?? '').trim();
     if (key !== '') {
-      if (seenKeys.has(key)) {
-        // Conta para o aviso só se a nota for deste período.
-        const td = invoiceDate(inv.issued_at) ?? at(inv.imported_at);
+      if (best.get(key) !== inv) {
+        // Cópia repetida: conta para o aviso só se a nota escolhida for deste período.
+        const chosen = best.get(key)!;
+        const td = invoiceDate(chosen.issued_at) ?? at(chosen.imported_at);
         if (td !== null && td >= p.from && td < cutoff) duplicateInvoices += 1;
         continue;
       }
-      seenKeys.add(key);
     }
     // Emissão (dhEmi ou dEmi); sem ela (ou com ela inválida), a data da importação.
     const issued = invoiceDate(inv.issued_at);

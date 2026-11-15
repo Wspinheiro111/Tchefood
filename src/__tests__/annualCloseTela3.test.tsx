@@ -8,7 +8,7 @@ import type { Payment, StaffUser } from '../types';
 
 const staff = [{ id: 'own', name: 'Dono', role: 'OWNER', active: true }] as unknown as StaffUser[];
 const pay = (amount: number, at: string, extra: Partial<Payment> = {}) =>
-  ({ id: `${amount}-${at}`, order_id: 'o', amount, tip_amount: 0, method: 'PIX', status: 'APPROVED', acquirer: 'CASH_DESK', card_brand: null, created_at: `${at}-03:00`, ...extra }) as unknown as Payment;
+  ({ id: `${amount}-${at}`, order_id: 'o', amount, tip_amount: 0, method: 'PIX', status: 'APPROVED', acquirer: 'CASH_DESK', card_brand: null, created_at: `${at}-03:00`, tenant_id: useTcheStore.getState().tenant.id, ...extra }) as unknown as Payment;
 function setup(state: Record<string, unknown>) {
   act(() => {
     useTcheStore.setState({ staff, currentUserId: 'own', payments: [], stockMovements: [], purchaseInvoices: [], purchaseInvoiceItems: [], cashSessions: [], cashMovements: [], ownDeliveries: [], courierSettlements: [], orders: [], ...state } as never);

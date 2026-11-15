@@ -15,7 +15,7 @@ const staff = [
   { id: 'cx', name: 'Caixa', role: 'CASHIER', active: true },
 ] as unknown as StaffUser[];
 const pay = (amount: number, at: string, method = 'PIX') =>
-  ({ id: `${amount}-${at}`, order_id: 'o', amount, tip_amount: 0, method, status: 'APPROVED', acquirer: 'CASH_DESK', card_brand: null, created_at: `${at}-03:00` }) as unknown as Payment;
+  ({ id: `${amount}-${at}`, order_id: 'o', amount, tip_amount: 0, method, status: 'APPROVED', acquirer: 'CASH_DESK', card_brand: null, created_at: `${at}-03:00`, tenant_id: useTcheStore.getState().tenant.id }) as unknown as Payment;
 
 function setup(userId: string, payments: Payment[] = []) {
   act(() => {
@@ -164,7 +164,7 @@ describe('Fechamento anual (tela): rodada interna após a auditoria 2', () => {
       useTcheStore.setState({
         payments: [pay(30, '2026-11-14T09:00:00'), pay(70, '2026-11-14T11:00:00')],
         stockMovements: [{ id: 'm11', tenant_id: useTcheStore.getState().tenant.id, product_id: 'p1', type: 'PURCHASE_IN', quantity: 1, unit_cost: 1, balance_after: 1, avg_cost_after: 1, purchase_invoice_item_id: null, performed_by_user_id: 'own', created_at: '2026-11-14T11:00:00-03:00' }],
-        cashMovements: [{ id: 'w11', type: 'WITHDRAWAL', amount: 5, reason: 'gelo', created_at: '2026-11-14T11:00:00-03:00' }],
+        cashMovements: [{ id: 'w11', tenant_id: useTcheStore.getState().tenant.id, type: 'WITHDRAWAL', amount: 5, reason: 'gelo', created_at: '2026-11-14T11:00:00-03:00' }],
       } as never);
     });
     expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));

@@ -597,7 +597,7 @@ describe('rodada interna 2: contador, dados e exportação', () => {
 
   it('registro de outra loja que sobrou no aparelho fica fora e é contado', () => {
     const r = ownStore([{ tenant_id: 'a' }, { tenant_id: 'b' }, { tenant_id: undefined }, { tenant_id: null }], 'a');
-    expect([r.rows.length, r.other]).toEqual([3, 1]);
+    expect([r.rows.length, r.other]).toEqual([1, 3]);
   });
 
   it('NF-e repetida (mesma chave) conta uma vez e é avisada', () => {
@@ -654,7 +654,7 @@ describe('rodada interna 3', () => {
     expect([...dup]).toEqual(['m1']);
     const r = inventoryAt([product({})], movs, P, new Set(), NOW, dup);
     expect([r.rows[0]!.quantity, r.totalCost, r.duplicateMovements]).toEqual([3, 15, 1]);
-    expect(toCsv(inventoryDoc(r, base))).toContain('1 entrada(s) de NF-e que também foi importada em OUTRO aparelho');
+    expect(toCsv(inventoryDoc(r, base))).toContain('1 entrada(s) de NF-e repetida ficaram fora deste saldo');
   });
 
   it('data de relógio zerado (1970) conta como data inválida, não some', () => {
@@ -673,5 +673,86 @@ describe('rodada interna 3', () => {
     const inv = (id: string) => ({ id, supplier_id: 's1', access_key: '4325'.padEnd(44, '9'), number: '1', series: '1', issued_at: '2024-03-01T10:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 10, imported_at: '2024-03-01T10:00:00-03:00' }) as PurchaseInvoice;
     const r = expensesByCategory({ purchaseInvoices: [inv('a'), inv('b')], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW) }, P, NOW);
     expect(r.duplicateInvoices).toBe(0);
+  });
+});
+
+describe('auditoria GPT rodada 2 (119ade2)', () => {
+  const NOW2 = new Date('2026-11-14T12:00:00-03:00');
+
+  it('P0-01: registro sem loja identificada fica fora dos totais e é contado', () => {
+    const r = ownStore([{ tenant_id: 'b' }, { tenant_id: 'a' }, { tenant_id: undefined }, { tenant_id: null }, { tenant_id: '' }], 'b');
+    expect([r.rows.length, r.other]).toEqual([1, 4]);
+    // Troca de loja: o pagamento antigo, sem loja, não entra no faturamento da loja B.
+    const pays = ownStore([pay({ amount: 70, tenant_id: undefined as unknown as string }), pay({ amount: 30, tenant_id: 'b' })], 'b');
+    const rev = revenueByMethod({ ...emptyRevenueInput, payments: pays.rows }, P, NOW2);
+    expect([rev.totalGross, pays.other]).toEqual([30, 1]);
+  });
+
+  it('P1-01: NF-e importada duas vezes NESTE aparelho conta uma vez (nunca zero, nunca em dobro)', () => {
+    const key = '4325'.padEnd(44, '3');
+    const invoices = [
+      { id: 'segunda', access_key: key, imported_at: '2025-03-02T10:00:00-03:00' },
+      { id: 'primeira', access_key: key, imported_at: '2025-03-01T10:00:00-03:00' },
+    ];
+    const items = [{ id: 'i1', invoice_id: 'primeira' }, { id: 'i2', invoice_id: 'segunda' }];
+    const movs = [mov({ id: 'a', quantity: 10, unit_cost: 2, purchase_invoice_item_id: 'i1' }), mov({ id: 'b', quantity: 10, unit_cost: 2, purchase_invoice_item_id: 'i2' })];
+    const dup = duplicateInvoiceMovementIds(movs, items, invoices);
+    expect([...dup]).toEqual(['b']);
+    const r = inventoryAt([product({})], movs, P, new Set(), NOW2, dup);
+    expect([r.rows[0]!.quantity, r.totalCost, r.duplicateMovements]).toEqual([10, 20, 1]);
+    expect(toCsv(inventoryDoc(r, { period: periodLabel('inventory', P), store: { name: 'Loja', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('vale só a primeira importação');
+  });
+
+  it('P2-01: pagamento do simulador (MOCK) não abate o dinheiro com o entregador', () => {
+    const r = openPositionsAt(
+      {
+        payments: [pay({ order_id: 'o1', method: 'CREDIT', acquirer: 'MOCK', amount: 100, created_at: '2025-12-31T20:00:00-03:00' })],
+        feeRules: [],
+        ownDeliveries: [{ id: 'd1', order_id: 'o1', status: 'DELIVERED', courier_id: 'c1', courier_fee: 5, pay_on_delivery: true, delivered_at: '2025-12-31T21:00:00-03:00', settlement_id: null } as OwnDelivery],
+        courierSettlements: [],
+        couriers: [{ id: 'c1', name: 'Beto' }] as never,
+        orders: [{ id: 'o1', total_amount: 100 }],
+      },
+      P,
+      NOW2,
+    );
+    expect(r.courierCashTotal).toBe(100);
+  });
+
+  it('P2-02: cópia sem data não tira a NF-e do ano certo; uma compra só, no ano da emissão', () => {
+    const key = '4325'.padEnd(44, '4');
+    const semData = { id: 'sem', supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: null, environment: 'PRODUCTION', invoice_amount: 80, imported_at: '2026-01-05T10:00:00-03:00' } as PurchaseInvoice;
+    const comData = { ...semData, id: 'com', issued_at: '2025-12-20T10:00:00-03:00', imported_at: '2026-01-06T10:00:00-03:00' } as PurchaseInvoice;
+    const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW2) };
+    for (const list of [[semData, comData], [comData, semData]]) {
+      const r2025 = expensesByCategory({ ...base, purchaseInvoices: list }, P, NOW2);
+      expect([r2025.purchases.length, r2025.rows[0]!.amount, r2025.duplicateInvoices]).toEqual([1, 80, 1]);
+      const r2026 = expensesByCategory({ ...base, purchaseInvoices: list }, yearPeriod(2026), NOW2);
+      expect([r2026.purchases.length, r2026.duplicateInvoices]).toEqual([0, 0]);
+    }
+  });
+
+  it('P1-01: com cópia de homologação e de produção da mesma nota, o inventário fica com a de produção (nunca zero)', () => {
+    const key = '4325'.padEnd(44, '6');
+    const invoices = [
+      { id: 'h', access_key: key, environment: 'HOMOLOGATION' as const, imported_at: '2025-05-01T10:00:00-03:00' },
+      { id: 'p', access_key: key, environment: 'PRODUCTION' as const, imported_at: '2025-05-02T10:00:00-03:00' },
+    ];
+    const items = [{ id: 'ih', invoice_id: 'h' }, { id: 'ip', invoice_id: 'p' }];
+    const movs = [mov({ id: 'mh', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ih' }), mov({ id: 'mp', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ip' })];
+    const r = inventoryAt([product({})], movs, P, testInvoiceMovementIds(movs, items, invoices), NOW2, duplicateInvoiceMovementIds(movs, items, invoices));
+    expect(r.totalCost).toBe(50);
+    // Só a de produção tem entrada aqui e a outra cópia é de homologação: fica.
+    const r2 = inventoryAt([product({})], [movs[1]!], P, new Set(), NOW2, duplicateInvoiceMovementIds([movs[1]!], items, invoices));
+    expect(r2.totalCost).toBe(50);
+  });
+
+  it('P2-02: cópia de produção vale mais que a de homologação com a mesma chave', () => {
+    const key = '4325'.padEnd(44, '5');
+    const homolog = { id: 'h', supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: '2025-05-01T10:00:00-03:00', environment: 'HOMOLOGATION', invoice_amount: 50, imported_at: '2025-05-01T10:00:00-03:00' } as PurchaseInvoice;
+    const prod = { ...homolog, id: 'p', environment: 'PRODUCTION', imported_at: '2025-05-02T10:00:00-03:00' } as PurchaseInvoice;
+    const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW2) };
+    const r = expensesByCategory({ ...base, purchaseInvoices: [homolog, prod] }, P, NOW2);
+    expect([r.rows[0]!.amount, r.homologationInvoices]).toEqual([50, 0]);
   });
 });
