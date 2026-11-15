@@ -187,7 +187,10 @@ export function Dashboard() {
 
 const ACQUIRER_NAME = { STONE: 'Stone', PAGBANK: 'PagBank', MERCADO_PAGO: 'Mercado Pago', CASH_DESK: 'Dinheiro / Caixa' } as const;
 
-type ServerRefunds = { state: 'IDLE' | 'LOADING' | 'FAILED' } | { state: 'LOADED'; items: ServerPointPayment[] };
+type ServerRefunds = { state: 'IDLE' | 'LOADING' | 'FAILED' } | { state: 'LOADED'; items: ServerPointPayment[]; loadedAt: Date };
+
+/** GPT r12 (P2-01): estorno feito em outro aparelho aparece aqui sem recarregar a tela (o período anda a cada minuto). */
+export const RECON_REFRESH_MS = 60_000;
 
 /**
  * Movimentos da Point do servidor para o período (vendas do período e estornos do período, pela data do estorno),
@@ -206,6 +209,8 @@ function useServerRefunds(cloud: boolean, period: ShiftPeriod, refresh: string):
   const endMs = period.end.getTime();
   const periodKey = `${startMs}|${endMs}`;
   const [state, setState] = useState<{ key: string; value: ServerRefunds }>({ key: periodKey, value: { state: cloud ? 'LOADING' : 'IDLE' } });
+  // GPT r12 (P2-01): o fim do período anda a cada minuto (useShiftPeriod), e cada mudança lê a nuvem de novo:
+  // estorno registrado em outro aparelho aparece em até um minuto, sem recarregar a tela.
   useEffect(() => {
     if (!cloud) {
       setState({ key: periodKey, value: { state: 'IDLE' } });
@@ -215,7 +220,7 @@ function useServerRefunds(cloud: boolean, period: ShiftPeriod, refresh: string):
     // Mesmo período: mantém os dados já lidos enquanto recarrega; outro período: "lendo".
     setState((s) => (s.key === periodKey && s.value.state === 'LOADED' ? s : { key: periodKey, value: { state: 'LOADING' } }));
     loadServerPointPayments({ start: new Date(startMs), end: new Date(endMs) }, (input) => listPointPayments(input), (input) => listPointRefunds(input))
-      .then((items) => alive && setState({ key: periodKey, value: { state: 'LOADED', items } }))
+      .then((items) => alive && setState({ key: periodKey, value: { state: 'LOADED', items, loadedAt: new Date() } }))
       .catch(() => alive && setState({ key: periodKey, value: { state: 'FAILED' } }));
     return () => {
       alive = false;
@@ -250,6 +255,11 @@ export function Reconciliation({ onOpenCheckout }: { onOpenCheckout?: (orderId: 
   );
   return (
     <div className="space-y-4">
+      {cloud && server.state === 'LOADED' && (
+        <p role="status" className="text-xs text-slate-500" data-testid="recon-loaded-at">
+          Estornos da nuvem atualizados às {server.loadedAt.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })} (de novo a cada minuto).
+        </p>
+      )}
       {cloud && server.state !== 'LOADED' && (
         <div role="status" className="rounded-2xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
           {server.state === 'LOADING' ? 'Lendo os estornos da nuvem…' : 'Estornos da nuvem não carregados: sem a data do servidor, os estornos deste aparelho ficam à parte (sem data) até a leitura voltar.'}

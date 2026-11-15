@@ -42,7 +42,7 @@ const { superviseSettledClaims, resetClaimSupervisor } = await import('../lib/pa
 const ledger = await import('../lib/payments/claimLedger');
 const { clearReviewHold, getReviewHold } = await import('../lib/payments/reviewHolds');
 const { useToast } = await import('../components/ui');
-const { submitRefundedWriteOff, isRefundReopenedOrder } = await import('../components/PointRefund');
+const { submitRefundedWriteOff, isRefundReopenedOrder, syncOrderFromServer, RefundReopenedOrders } = await import('../components/PointRefund');
 const { listPointPayments } = await import('../lib/payments/pointPaymentsServer');
 /** Mensagens de toast desde o começo do teste (o que o operador viu). */
 const toastLog: string[] = [];
@@ -836,4 +836,94 @@ function freeValue(v: string) {
     await expectSynced('venda devolvida');
     expect(serverOrder(id)).toMatch(/^CLOSED/);
   }, 60_000);
+  it('GPT r12 (P1-02, P1-03): conta paga na Point no aparelho A e estornada pelo B; os dois ficam com o estado do servidor (também depois de recarregar); a resposta do encerramento se perde, o app reinicia e a repetição fecha uma vez só', async () => {
+    login(OWNER_PIN);
+    if (!st().tables.some((t) => t.number === 12)) ok(st().saveTable({ number: 12, label: 'Mesa 12', area: 'Salão', capacity: 4, active: true }));
+    const id = openTableWith(12);
+    await expectSynced('conta da Point (dois aparelhos)');
+    const o = st().orders.find((x) => x.id === id)!;
+    const cents = Math.round(o.remaining_balance * 100);
+    const termId = crypto.randomUUID();
+    const key = crypto.randomUUID();
+    sql(`INSERT INTO pos_terminals (id, tenant_id, name, serial_number, acquirer) VALUES ('${termId}', '${TENANT}', 'Point E2E 3', 'MP-E2E-3', 'MERCADO_PAGO');`);
+    useTcheStore.setState((s) => ({ terminals: [...s.terminals, { id: termId, tenant_id: TENANT, name: 'Point E2E 3', serial_number: 'MP-E2E-3', acquirer: 'MERCADO_PAGO', mode: 'TEF_POS_WIRELESS', online: true, battery_level: 90 } as never] }));
+    // Aparelho A: a Point aprovou (cobrança aprovada no servidor), o pagamento entra e a conta fecha nos dois lados.
+    sql(`INSERT INTO terminal_charges (tenant_id, idempotency_key, order_id, terminal_id, provider, external_terminal_id, method, amount_cents, status, external_order_id, external_payment_id, paid_amount_cents, card_brand, authorization_code)
+         VALUES ('${TENANT}', '${key}', '${id}', '${termId}', 'mercado_pago_point', 'MP-E2E-3', 'CREDIT', ${cents}, 'approved', 'ORD-${key}', 'PE2E3', ${cents}, 'VISA', 'AUT3');`);
+    const paid = ok(st().registerPayment({
+      orderId: id, amount: o.remaining_balance, method: 'CREDIT', status: 'APPROVED', terminal_id: termId, acquirer: 'MERCADO_PAGO',
+      acquirer_cnpj: '10573521000191', card_brand: 'VISA', nsu: 'PE2E3', authorization_code: 'AUT3', terminal_serial: 'MP-E2E-3', idempotency_key: key, item_ids: [],
+    }));
+    expect(paid.closed).toBe(true);
+    await expectSynced('pagamento da Point (A)');
+    expect(serverOrder(id)).toBe('CLOSED 0.00');
+    const firstClosed = sql(`SELECT to_jsonb(closed_at) #>> '{}' FROM orders WHERE id = '${id}'`);
+    const pick = (ids: string) => ({
+      orders: st().orders.filter((x) => x.id === ids), payments: st().payments.filter((x) => x.order_id === ids),
+      orderItems: st().orderItems.filter((x) => x.order_id === ids), auditLogs: st().auditLogs.filter((x) => x.order_id === ids),
+    });
+    const deviceA = pick(id);
+    const without = () => useTcheStore.setState((s) => ({
+      orders: s.orders.filter((x) => x.id !== id), payments: s.payments.filter((x) => x.order_id !== id),
+      orderItems: s.orderItems.filter((x) => x.order_id !== id), auditLogs: s.auditLogs.filter((x) => x.order_id !== id),
+    }));
+    // Aparelho B (não tem a conta): o gerente estorna; o point-charge confere no Mercado Pago e grava no servidor.
+    without();
+    const staff = st().currentUserId!;
+    const auth = sql(`SELECT tchefood_authorize_point_reconcile('${TENANT}', '${key}', '${staff}', '${MANAGER_PIN}', 'Venda estornada na maquininha');`);
+    expect(auth).toMatch(/^[0-9a-f-]{36}$/);
+    const chargeId = sql(`SELECT id FROM terminal_charges WHERE idempotency_key = '${key}'`);
+    const evidence = JSON.stringify({ authorization_audit_id: auth, operation_id: null, mp_payment_id: 'PE2E3', mp_amount_cents: cents, mp_external_reference: key, mp_status: 'refunded', mp_amount_refunded_cents: cents });
+    sql(`BEGIN; SET LOCAL ROLE service_role; SELECT status FROM tchefood_refund_point_payment('${TENANT}', '${chargeId}', '${staff}', 'Venda estornada na maquininha', '{"raw_status":"refunded"}'::jsonb, '${evidence}'::jsonb); COMMIT;`);
+    expect(serverOrder(id)).toBe(`PAYING ${o.remaining_balance.toFixed(2)}`);
+    // B traz a conta do servidor (o que submitPointRefund faz depois do estorno de pagamento de outro aparelho).
+    expect(await syncOrderFromServer(id)).toBe('applied');
+    const fin = () => {
+      const ord = st().orders.find((x) => x.id === id)!;
+      return {
+        status: ord.status, total: ord.total_amount, paid: ord.paid_amount, remaining: ord.remaining_balance, closedAt: ord.closed_at,
+        payments: st().payments.filter((p) => p.order_id === id).map((p) => `${p.idempotency_key}:${p.status}`),
+        paidItems: st().orderItems.filter((i) => i.order_id === id && i.is_paid).length,
+        reopened: isRefundReopenedOrder(ord, st().payments, st().auditLogs),
+      };
+    };
+    const server = { status: 'PAYING', remaining: o.remaining_balance, payments: [`${key}:REFUNDED`], paidItems: Number(sql(`SELECT count(*) FROM order_items WHERE order_id = '${id}' AND is_paid`)) };
+    const onB = fin();
+    expect(onB).toMatchObject({ ...server, closedAt: null, reopened: true });
+    // Aparelho A (ainda com a conta fechada e o pagamento aprovado): a lista de contas reabertas lê o servidor e traz.
+    without();
+    useTcheStore.setState((s) => ({ orders: [...deviceA.orders, ...s.orders], payments: [...s.payments, ...deviceA.payments], orderItems: [...s.orderItems, ...deviceA.orderItems], auditLogs: [...deviceA.auditLogs, ...s.auditLogs] }));
+    expect(fin()).toMatchObject({ status: 'CLOSED', payments: [`${key}:APPROVED`] });
+    render(<RefundReopenedOrders />);
+    await waitFor(() => expect(fin().status).toBe('PAYING'), { timeout: 10_000 });
+    expect(fin()).toEqual(onB);
+    await screen.findByText(/Servidor lido às/);
+    cleanup();
+    // Recarregar a página: o que ficou gravado no aparelho é o estado do servidor.
+    await useTcheStore.persist.rehydrate();
+    expect(fin()).toEqual(onB);
+    // P1-03: o encerramento como venda devolvida grava no servidor e a resposta se perde (e a leitura da conta também).
+    net.lose.push('tchefood_close_refunded_order', 'tchefood_order_snapshot');
+    const lost = await submitRefundedWriteOff(id, MANAGER_PIN, 'Cliente não vai pagar de novo');
+    expect(lost.ok).toBe(false);
+    expect(fin().status).toBe('PAYING');
+    expect(serverOrder(id)).toMatch(/^CLOSED/);
+    const attempt = localStorage.getItem(`tchefood.writeOffAttempt.v1:${id}`);
+    expect(attempt).toMatch(/^[0-9a-f-]{36}$/);
+    // O app reinicia (o id da tentativa ficou no aparelho) e o gerente repete: o servidor devolve o mesmo encerramento.
+    await useTcheStore.persist.rehydrate();
+    const again = await submitRefundedWriteOff(id, MANAGER_PIN, 'Cliente não vai pagar de novo');
+    expect(again).toEqual({ ok: true, data: { writtenOff: o.remaining_balance } });
+    expect(sql(`SELECT count(*) || '|' || sum((metadata->>'written_off_cents')::bigint) || '|' || min(metadata->>'client_audit_id') FROM audit_logs WHERE order_id = '${id}' AND action_type = 'ORDER_REFUNDED_WRITE_OFF'`)).toBe(`1|${cents}|${attempt}`);
+    expect(st().auditLogs.filter((l) => l.order_id === id && l.action_type === 'ORDER_REFUNDED_WRITE_OFF')).toHaveLength(1);
+    expect(localStorage.getItem(`tchefood.writeOffAttempt.v1:${id}`)).toBeNull();
+    // Decisão do Will: a conta volta ao turno do primeiro fechamento, aqui e no servidor.
+    expect(sql(`SELECT to_jsonb(closed_at) #>> '{}' FROM orders WHERE id = '${id}'`)).toBe(firstClosed);
+    expect(new Date(fin().closedAt!).getTime()).toBe(new Date(firstClosed).getTime());
+    expect(fin().status).toBe('CLOSED');
+    // Repetir de novo (outro clique, id novo): o servidor recusa (já fechada) e o estado oficial confirma; nada muda.
+    expect(await submitRefundedWriteOff(id, MANAGER_PIN, 'Cliente não vai pagar de novo')).toEqual({ ok: true, data: { writtenOff: 0 } });
+    expect(sql(`SELECT count(*) FROM audit_logs WHERE order_id = '${id}' AND action_type = 'ORDER_REFUNDED_WRITE_OFF'`)).toBe('1');
+    expect(st().auditLogs.filter((l) => l.order_id === id && l.action_type === 'ORDER_REFUNDED_WRITE_OFF')).toHaveLength(1);
+  }, 90_000);
 });

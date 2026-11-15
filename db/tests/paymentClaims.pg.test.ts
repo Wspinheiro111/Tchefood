@@ -3113,6 +3113,51 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
                                        AND (a.metadata->>'written_off_cents')::bigint = round(o.remaining_balance * 100))`)).toBe('0');
     });
 
+    it('GPT r12 P2-02 + decisão do Will: dois estornos e duas baixas na mesma conta somam o saldo perdoado, uma vez; a conta volta ao turno da venda', () => {
+      const order = withItems(100);
+      const a = paidCharge(order, 5000);
+      const b = paidCharge(order, 5000);
+      expect(orderState(order)).toBe('10000|0|CLOSED');
+      const firstClosed = sql(`SELECT to_jsonb(closed_at) #>> '{}' FROM orders WHERE id = '${order}'`);
+      expect(refundPoint(a.id).ok).toBe(true);
+      expect(orderState(order)).toBe('5000|5000|PAYING');
+      const w1 = JSON.parse(last(asDevice(closeQ(order, crypto.randomUUID())))) as Record<string, unknown>;
+      expect(w1).toMatchObject({ status: 'CLOSED', written_off_cents: 5000, cumulative_written_off_cents: 5000 });
+      expect(orderState(order)).toBe('5000|5000|CLOSED');
+      expect(sql(`SELECT to_jsonb(closed_at) #>> '{}' FROM orders WHERE id = '${order}'`)).toBe(firstClosed);
+      const r2 = refundPoint(b.id);
+      expect(r2.ok, r2.message ?? '').toBe(true);
+      expect(orderState(order)).toBe('0|10000|PAYING');
+      const w2 = JSON.parse(last(asDevice(closeQ(order, crypto.randomUUID())))) as Record<string, unknown>;
+      expect(w2).toMatchObject({ status: 'CLOSED', written_off_cents: 5000, cumulative_written_off_cents: 10000 });
+      expect(orderState(order)).toBe('0|10000|CLOSED');
+      // O total das baixas é o saldo perdoado (R$ 100), nunca R$ 150.
+      expect(sql(`SELECT sum((metadata->>'written_off_cents')::bigint) || '|' || sum(amount_impact) FROM audit_logs WHERE action_type = 'ORDER_REFUNDED_WRITE_OFF' AND order_id = '${order}'`)).toBe('10000|100.00');
+      // Decisão do Will (15/11): a venda devolvida fica no turno em que a conta foi fechada pela primeira vez.
+      expect(sql(`SELECT to_jsonb(closed_at) #>> '{}' FROM orders WHERE id = '${order}'`)).toBe(firstClosed);
+      expect(new Date(String(w2.closed_at)).getTime()).toBe(new Date(firstClosed).getTime());
+    });
+
+    it('GPT r12 P1-02/P1-03: tchefood_order_snapshot e tchefood_list_refund_reopened_orders dão o estado oficial, só da loja do token', () => {
+      const { order, ch } = refundedOrder();
+      const listed = json<Array<Record<string, unknown>>>(asDevice('SELECT tchefood_list_refund_reopened_orders()'));
+      expect(listed.find((x) => x.order_id === order)).toMatchObject({ status: 'PAYING', remaining_balance: 100 });
+      expect(json<Array<Record<string, unknown>>>(asDevice('SELECT tchefood_list_refund_reopened_orders()', OTHER)).some((x) => x.order_id === order)).toBe(false);
+      const snap = json<{ order: Record<string, unknown>; items: unknown[]; payments: Array<Record<string, unknown>>; audits: Array<Record<string, unknown>> }>(asDevice(`SELECT tchefood_order_snapshot('${order}')`));
+      expect(snap.order).toMatchObject({ id: order, status: 'PAYING', remaining_balance: 100 });
+      expect(snap.items.length).toBeGreaterThan(0);
+      expect(snap.payments.map((p) => `${p.idempotency_key}:${p.status}`)).toEqual([`${ch.key}:REFUNDED`]);
+      expect(snap.audits.map((x) => x.action_type)).toEqual(['POINT_PAYMENT_REFUNDED']);
+      expect(last(asDevice(`SELECT COALESCE(tchefood_order_snapshot('${order}')::text, 'null')`, OTHER))).toBe('null');
+      expect(asRole('anon', `SELECT tchefood_order_snapshot('${order}')`)).toMatchObject({ ok: false, sqlstate: '42501' });
+      // Encerrada como venda devolvida: sai da lista e o retrato traz o registro da baixa.
+      asDevice(closeQ(order, crypto.randomUUID()));
+      expect(json<Array<Record<string, unknown>>>(asDevice('SELECT tchefood_list_refund_reopened_orders()')).some((x) => x.order_id === order)).toBe(false);
+      const after = json<{ order: Record<string, unknown>; audits: Array<Record<string, unknown>> }>(asDevice(`SELECT tchefood_order_snapshot('${order}')`));
+      expect(after.order.status).toBe('CLOSED');
+      expect(after.audits.map((x) => x.action_type)).toEqual(['POINT_PAYMENT_REFUNDED', 'ORDER_REFUNDED_WRITE_OFF']);
+    });
+
     describe('P1-02: tchefood_list_point_payments', () => {
       const LIST_TERMINAL = '68686868-6868-4868-8868-686868686868';
       type Item = { payment_id: string; order_id: string; charge_id: string | null; idempotency_key: string; amount: number; method: string; nsu: string | null;

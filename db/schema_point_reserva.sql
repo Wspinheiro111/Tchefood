@@ -1797,7 +1797,8 @@ $$;
 --   * CLOSED → PAYING só com tchefood.point_resolution apontando para o registro POINT_PAYMENT_REFUNDED desta conta
 --     com order_reopened = true (gravado na mesma transação pelo estorno) e saldo maior que zero;
 --   * OPEN/PAYING → CLOSED com saldo só com tchefood.order_write_off apontando para o registro ORDER_REFUNDED_WRITE_OFF
---     desta conta com written_off_cents igual ao saldo (o aparelho não grava esse registro: tchefood_guard_point_audit).
+--     desta conta com cumulative_written_off_cents (o total baixado da conta, somando as baixas anteriores) igual ao
+--     saldo (o aparelho não grava esse registro: tchefood_guard_point_audit).
 CREATE OR REPLACE FUNCTION tchefood_order_close_guard()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
@@ -1826,7 +1827,8 @@ BEGIN
                AND EXISTS (SELECT 1 FROM audit_logs a
                             WHERE a.id = v_flag::uuid AND a.tenant_id = OLD.tenant_id AND a.order_id = OLD.id
                               AND a.action_type = 'ORDER_REFUNDED_WRITE_OFF'
-                              AND a.metadata->>'written_off_cents' = round(v_remaining * 100)::BIGINT::text) THEN
+                              AND COALESCE(a.metadata->>'cumulative_written_off_cents', a.metadata->>'written_off_cents')
+                                  = round(v_remaining * 100)::BIGINT::text) THEN
                 RETURN NEW;
             END IF;
         END IF;
@@ -1883,6 +1885,9 @@ DECLARE
     v_remaining BIGINT;
     v_refunded BIGINT;
     v_audit UUID;
+    v_prev BIGINT := 0;
+    v_increment BIGINT;
+    v_closed_at TIMESTAMPTZ;
 BEGIN
     IF v_tenant IS NULL THEN
         RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
@@ -1926,6 +1931,14 @@ BEGIN
                 to_char(v_remaining / 100.0, 'FM999999990.00'), to_char(v_refunded / 100.0, 'FM999999990.00')
                 USING ERRCODE = 'TF007', DETAIL = 'balance_not_refunded';
         END IF;
+        -- GPT r12 P2-02: baixas anteriores da mesma conta (reaberta por um segundo estorno) já foram reconhecidas;
+        -- este registro baixa só a diferença (written_off_cents) e guarda o total (cumulative_written_off_cents).
+        SELECT COALESCE(SUM((a.metadata->>'written_off_cents')::BIGINT), 0) INTO v_prev FROM audit_logs a
+         WHERE a.tenant_id = v_tenant AND a.order_id = p_order AND a.action_type = 'ORDER_REFUNDED_WRITE_OFF';
+        v_increment := v_remaining - v_prev;
+        IF v_increment <= 0 THEN
+            RAISE EXCEPTION 'TCHEFOOD_PAGAMENTO: o saldo desta conta já foi baixado.' USING ERRCODE = 'TF007', DETAIL = 'nothing_to_write_off';
+        END IF;
     END IF;
     v_checked_at := clock_timestamp();
     SELECT count(*) INTO v_failures FROM audit_logs a
@@ -1947,19 +1960,31 @@ BEGIN
     END IF;
     IF v_replay.id IS NOT NULL THEN
         RETURN jsonb_build_object('audit_id', v_replay.id, 'order_id', p_order, 'status', v_order.status,
-                                  'written_off_cents', (v_replay.metadata->>'written_off_cents')::BIGINT);
+                                  'written_off_cents', (v_replay.metadata->>'written_off_cents')::BIGINT,
+                                  'cumulative_written_off_cents', COALESCE((v_replay.metadata->>'cumulative_written_off_cents')::BIGINT,
+                                                                           (v_replay.metadata->>'written_off_cents')::BIGINT),
+                                  'closed_at', v_order.closed_at);
     END IF;
+    -- Decisão do Will (15/11): a venda devolvida conta no turno em que a conta foi fechada pela primeira vez
+    -- (previous_closed_at do primeiro estorno que a reabriu); sem ela (conta nunca fechada), agora.
+    SELECT min((a.metadata->>'previous_closed_at')::TIMESTAMPTZ) INTO v_closed_at FROM audit_logs a
+     WHERE a.tenant_id = v_tenant AND a.order_id = p_order AND a.action_type = 'POINT_PAYMENT_REFUNDED'
+       AND a.metadata->>'order_reopened' = 'true' AND a.metadata->>'previous_closed_at' IS NOT NULL;
+    v_closed_at := COALESCE(v_closed_at, NOW());
     INSERT INTO audit_logs (tenant_id, order_id, performed_by_user_id, authorized_by_manager_id, action_type, amount_impact, reason, metadata)
-    VALUES (v_tenant, p_order, p_staff, v_manager.id, 'ORDER_REFUNDED_WRITE_OFF', v_remaining / 100.0, trim(p_reason),
-            jsonb_build_object('written_off_cents', v_remaining, 'refunded_cents', v_refunded, 'client_audit_id', p_client_audit_id,
-                               'previous_status', v_order.status, 'manager_name', v_manager.name, 'server_verified', true))
+    VALUES (v_tenant, p_order, p_staff, v_manager.id, 'ORDER_REFUNDED_WRITE_OFF', v_increment / 100.0, trim(p_reason),
+            jsonb_build_object('written_off_cents', v_increment, 'cumulative_written_off_cents', v_remaining,
+                               'refunded_cents', v_refunded, 'client_audit_id', p_client_audit_id,
+                               'previous_status', v_order.status, 'manager_name', v_manager.name, 'server_verified', true,
+                               'sale_closed_at', v_closed_at))
     RETURNING id INTO v_audit;
     PERFORM set_config('tchefood.order_write_off', v_audit::text, true);
-    UPDATE orders SET status = 'CLOSED', closed_at = NOW() WHERE id = p_order AND tenant_id = v_tenant;
+    UPDATE orders SET status = 'CLOSED', closed_at = v_closed_at WHERE id = p_order AND tenant_id = v_tenant;
     PERFORM set_config('tchefood.order_write_off', '', true);
     UPDATE dining_tables SET status = 'FREE', current_order_id = NULL, updated_at = NOW()
      WHERE id = v_order.table_id AND current_order_id = p_order;
-    RETURN jsonb_build_object('audit_id', v_audit, 'order_id', p_order, 'status', 'CLOSED', 'written_off_cents', v_remaining);
+    RETURN jsonb_build_object('audit_id', v_audit, 'order_id', p_order, 'status', 'CLOSED', 'written_off_cents', v_increment,
+                              'cumulative_written_off_cents', v_remaining, 'closed_at', v_closed_at);
 END;
 $$;
 
@@ -2120,6 +2145,73 @@ END;
 $$;
 
 -- -----------------------------------------------------------------------------
+-- 7h. Estado oficial de uma conta (GPT r12 P1-02/P1-03), só leitura, loja do token
+-- -----------------------------------------------------------------------------
+-- tchefood_order_snapshot(p_order) RETURNS JSONB {order, items, payments, audits} ou NULL (conta de outra loja ou
+-- inexistente): a linha da conta, os itens, os pagamentos e os registros do estorno/venda devolvida
+-- (POINT_PAYMENT_REFUNDED, ORDER_REFUNDED_WRITE_OFF). O aparelho que não fez o pagamento (outro aparelho, ou depois de
+-- perder a resposta) converge para o estado do servidor. Nada de segredo.
+CREATE OR REPLACE FUNCTION tchefood_order_snapshot(p_order UUID)
+RETURNS JSONB
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+    v_order orders%ROWTYPE;
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
+    END IF;
+    SELECT * INTO v_order FROM orders WHERE id = p_order AND tenant_id = v_tenant;
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object(
+        'order', to_jsonb(v_order),
+        'items', COALESCE((SELECT jsonb_agg(to_jsonb(i) ORDER BY i.created_at, i.id) FROM order_items i
+                            WHERE i.order_id = p_order), '[]'::jsonb),
+        'payments', COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.created_at, p.id) FROM payments p
+                               WHERE p.order_id = p_order AND p.tenant_id = v_tenant), '[]'::jsonb),
+        'audits', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                               'id', a.id, 'order_id', a.order_id, 'performed_by_user_id', a.performed_by_user_id,
+                               'authorized_by_manager_id', a.authorized_by_manager_id, 'action_type', a.action_type,
+                               'amount_impact', a.amount_impact, 'reason', a.reason, 'metadata', a.metadata, 'created_at', a.created_at)
+                               ORDER BY a.server_seq)
+                             FROM audit_logs a
+                            WHERE a.tenant_id = v_tenant AND a.order_id = p_order
+                              AND a.action_type IN ('POINT_PAYMENT_REFUNDED', 'ORDER_REFUNDED_WRITE_OFF')), '[]'::jsonb));
+END;
+$$;
+
+-- tchefood_list_refund_reopened_orders() RETURNS JSONB [{order_id, table_id, status, remaining_balance, total_amount,
+-- opened_at, previous_closed_at, refunded_at}]: as contas da loja reabertas por estorno da Point que ainda devem
+-- (PAYING com saldo), as 200 mais recentes. Cada aparelho acha a conta reaberta mesmo sem tê-la (GPT r12 P1-02).
+CREATE OR REPLACE FUNCTION tchefood_list_refund_reopened_orders()
+RETURNS JSONB
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_tenant UUID := tchefood_tenant();
+BEGIN
+    IF v_tenant IS NULL THEN
+        RAISE EXCEPTION 'TCHEFOOD_AUTH: token sem loja (tenant_id).';
+    END IF;
+    RETURN COALESCE((
+        SELECT jsonb_agg(row_to_json(x)::jsonb ORDER BY x.refunded_at DESC)
+          FROM (SELECT o.id AS order_id, o.table_id, o.status, o.remaining_balance, o.total_amount, o.opened_at,
+                       r.previous_closed_at, r.refunded_at
+                  FROM orders o
+                  JOIN LATERAL (SELECT min((a.metadata->>'previous_closed_at')::TIMESTAMPTZ) AS previous_closed_at,
+                                       max(a.created_at) AS refunded_at
+                                  FROM audit_logs a
+                                 WHERE a.tenant_id = o.tenant_id AND a.order_id = o.id
+                                   AND a.action_type = 'POINT_PAYMENT_REFUNDED' AND a.metadata->>'order_reopened' = 'true') r
+                    ON r.refunded_at IS NOT NULL
+                 WHERE o.tenant_id = v_tenant AND o.status = 'PAYING' AND o.remaining_balance > 0
+                 ORDER BY r.refunded_at DESC
+                 LIMIT 200) x), '[]'::jsonb);
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
 -- Permissões
 -- -----------------------------------------------------------------------------
 -- Aparelho (authenticated, loja do token): ler a reserva da conta, pedir e liberar reserva de pagamento.
@@ -2151,7 +2243,9 @@ BEGIN
         'tchefood_payment_replay_ok(payments, payments, UUID)',
         'tchefood_close_refunded_order(UUID, UUID, TEXT, TEXT, UUID)',
         'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)',
-        'tchefood_list_point_refunds(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT)'] LOOP
+        'tchefood_list_point_refunds(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT)',
+        'tchefood_order_snapshot(UUID)',
+        'tchefood_list_refund_reopened_orders()'] LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
             EXECUTE format('REVOKE ALL ON FUNCTION %s FROM anon', v_fn);
@@ -2170,7 +2264,9 @@ BEGIN
         'tchefood_authorize_claim_refunded(VARCHAR, UUID, VARCHAR, TEXT, JSONB)',
         'tchefood_close_refunded_order(UUID, UUID, TEXT, TEXT, UUID)',
         'tchefood_list_point_payments(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, INT)',
-        'tchefood_list_point_refunds(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT)'] LOOP
+        'tchefood_list_point_refunds(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT)',
+        'tchefood_order_snapshot(UUID)',
+        'tchefood_list_refund_reopened_orders()'] LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
             EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO authenticated', v_fn);
         END IF;

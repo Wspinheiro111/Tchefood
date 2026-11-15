@@ -152,13 +152,17 @@ export function writeOffCents(l: AuditLog): number {
 
 /**
  * Conta encerrada pelo gerente como venda devolvida: centavos baixados por conta (ORDER_REFUNDED_WRITE_OFF). O valor
- * baixado foi estornado e não é venda; só o que ficou pago conta. Mais de um registro da mesma conta: vale o maior.
+ * baixado foi estornado e não é venda; só o que ficou pago conta. Mais de um registro da mesma conta (reaberta de novo
+ * por outro estorno): cada um tem só a diferença baixada, e somam.
  */
 export function writeOffsByOrder(logs: readonly AuditLog[] | undefined): Map<string, number> {
   const out = new Map<string, number>();
+  const seen = new Set<string>();
   for (const l of logs ?? []) {
-    if (l.action_type !== 'ORDER_REFUNDED_WRITE_OFF' || !l.order_id) continue;
-    out.set(l.order_id, Math.max(out.get(l.order_id) ?? 0, writeOffCents(l)));
+    if (l.action_type !== 'ORDER_REFUNDED_WRITE_OFF' || !l.order_id || seen.has(l.id)) continue;
+    seen.add(l.id);
+    // GPT r12 P2-02: cada baixa registra só a diferença (written_off_cents); a conta soma as baixas dela.
+    out.set(l.order_id, (out.get(l.order_id) ?? 0) + writeOffCents(l));
   }
   return out;
 }

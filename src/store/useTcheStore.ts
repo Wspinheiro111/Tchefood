@@ -42,6 +42,7 @@ import type {
   ModifierOption,
   Order,
   OrderItem,
+  OrderStatus,
   Payment,
   Permission,
   PosTerminal,
@@ -85,6 +86,7 @@ import { idbStorage } from '../lib/idbStorage';
 import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, reviewHoldKey } from '../lib/payments/reviewHolds';
+import type { ServerOrderSnapshot } from '../lib/payments/pointPaymentsServer';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { isTf012Rejection, reservationExceeds, TOTAL_BELOW_PAID } from '../lib/payments/pointReservation';
 import { localClaim } from '../lib/payments/claimLedger';
@@ -500,7 +502,18 @@ interface Actions {
    * (tchefood_close_refunded_order). Só depois da resposta dele: a conta fecha aqui com o saldo baixado e o registro
    * ORDER_REFUNDED_WRITE_OFF com o mesmo id do servidor (só local; o servidor grava o dele).
    */
-  mirrorRefundedOrderWriteOff: (orderId: UUID, server: { auditId: UUID; managerId: UUID | null; writtenOffCents: number | null }, reason: string) => ActionResult<{ writtenOff: number }>;
+  mirrorRefundedOrderWriteOff: (
+    orderId: UUID,
+    server: { auditId: UUID; managerId: UUID | null; writtenOffCents: number | null; closedAt?: string | null },
+    reason: string,
+  ) => ActionResult<{ writtenOff: number }>;
+  /**
+   * GPT r12 (P1-02, P1-03): traz para este aparelho o estado oficial de uma conta (tchefood_order_snapshot): status,
+   * fechamento e totais da conta, situação dos pagamentos e dos itens, e os registros do estorno e da venda devolvida.
+   * Só local (nada vai para a fila: é o que o servidor já tem). Com alteração desta conta ainda na fila daqui, não
+   * mexe (kind 'pending'): o servidor ainda não tem o que este aparelho fez.
+   */
+  applyServerOrderSnapshot: (snapshot: ServerOrderSnapshot) => ActionResult<{ kind: 'applied' | 'pending'; status: OrderStatus }>;
 
   // Fase 3 — KDS e QR Code
   advanceItemStatus: (itemId: UUID) => ActionResult<OrderItem>;
@@ -851,6 +864,20 @@ function managerAuthEvent(log: AuditLog, managerPin: string | null): SyncEvent {
   const event = syncEvent('audit_logs', 'INSERT', log);
   // Sem gerente (ex.: resgate de cashback), o audit_log sobe direto, sem RPC.
   return managerPin === null ? event : { ...event, manager_pin: managerPin };
+}
+
+/** Colunas que o aparelho guarda de uma linha do servidor (tchefood_order_snapshot): o resto da linha fica lá. */
+const ORDER_KEYS = ['id', 'tenant_id', 'table_id', 'opened_by_user_id', 'status', 'customer_count', 'customer_cpf', 'subtotal_items', 'charge_service_fee', 'service_fee_pct', 'service_fee_amount', 'discount_amount', 'total_amount', 'paid_amount', 'remaining_balance', 'nfce_status', 'nfce_key', 'opened_at', 'closed_at', 'pickup_number', 'pickup_name', 'fulfillment_type'] as const satisfies readonly (keyof Order)[];
+const PAYMENT_KEYS = ['id', 'order_id', 'tenant_id', 'waiter_id', 'terminal_id', 'amount', 'tip_amount', 'method', 'status', 'acquirer', 'acquirer_cnpj', 'card_brand', 'nsu', 'authorization_code', 'terminal_serial', 'idempotency_key', 'created_at'] as const satisfies readonly (keyof Payment)[];
+const ITEM_KEYS = ['id', 'order_id', 'product_id', 'waiter_id', 'quantity', 'unit_price', 'modifiers_unit_price', 'total_item_price', 'meat_doneness', 'notes', 'sector', 'status', 'is_paid', 'origin', 'created_at', 'prepared_at', 'canceled_at', 'canceled_by_user_id', 'cancel_reason', 'weight_gross_grams', 'weight_tare_grams', 'weight_source', 'keg_volume_ml', 'combo_parent_item_id', 'priced_at', 'half_product_ids', 'modifier_option_ids'] as const satisfies readonly (keyof OrderItem)[];
+const NUMERIC_KEYS = new Set(['customer_count', 'subtotal_items', 'service_fee_pct', 'service_fee_amount', 'discount_amount', 'total_amount', 'paid_amount', 'remaining_balance', 'amount', 'tip_amount', 'quantity', 'unit_price', 'modifiers_unit_price', 'total_item_price']);
+function pickRow(row: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of keys) {
+    const v = row[k];
+    out[k] = NUMERIC_KEYS.has(k) ? Number(v ?? 0) : k === 'half_product_ids' || k === 'modifier_option_ids' ? (Array.isArray(v) ? v : []) : v ?? null;
+  }
+  return out;
 }
 
 function fail(error: string): { ok: false; error: string } {
@@ -2494,6 +2521,8 @@ export const useTcheStore = create<TcheState>()(
                 amount: payment?.amount ?? null,
                 nsu: payment?.nsu ?? null,
                 server_verified: true,
+                // GPT r12: a conta fechada reabriu com este estorno (identifica a conta reaberta, com ou sem NFC-e).
+                order_reopened: Boolean(order && order.status === 'CLOSED'),
                 server_audit_id: opts?.serverAuditId ?? null,
                 authorization_audit_id: opts?.authorizationAuditId ?? null,
                 operator_name: user.name,
@@ -2543,6 +2572,8 @@ export const useTcheStore = create<TcheState>()(
           // O valor baixado é o do servidor (written_off_cents); sem ele, o saldo daqui.
           const writtenOff = server.writtenOffCents !== null ? server.writtenOffCents / 100 : order.remaining_balance;
           const ts = nowISO();
+          // Decisão do Will (15/11): a conta fecha com a hora do primeiro fechamento (turno da venda original), do servidor.
+          const closedAt = server.closedAt ?? ts;
           const log = buildAudit({
             order_id: orderId,
             performed_by_user_id: user.id,
@@ -2555,11 +2586,72 @@ export const useTcheStore = create<TcheState>()(
           // O mesmo id do registro do servidor: a leitura da nuvem não duplica. Nada vai para a fila: o servidor já fechou
           // a conta e liberou a mesa (um UPDATE daqui com saldo devendo seria recusado lá).
           set((s) => ({
-            orders: s.orders.map((o) => (o.id === orderId ? { ...o, status: 'CLOSED', closed_at: ts } : o)),
+            orders: s.orders.map((o) => (o.id === orderId ? { ...o, status: 'CLOSED', closed_at: closedAt } : o)),
             tables: s.tables.map((t) => (t.id === order.table_id && t.current_order_id === orderId ? { ...t, status: 'FREE', current_order_id: null, updated_at: ts } : t)),
             auditLogs: [{ ...log, id: server.auditId }, ...s.auditLogs],
           }));
           return { ok: true, data: { writtenOff } };
+        },
+
+        applyServerOrderSnapshot: (snap) => {
+          const state = get();
+          const so = snap.order;
+          const orderId = typeof so.id === 'string' ? so.id : '';
+          const status = so.status as OrderStatus;
+          if (!orderId || !['OPEN', 'PAYING', 'CLOSED', 'CANCELED'].includes(String(status))) return fail('Resposta do servidor sem a conta.');
+          const itemIds = new Set(snap.items.map((i) => String(i.id)));
+          const paymentIds = new Set(snap.payments.map((p) => String(p.id)));
+          const touches = (e: SyncEvent) => e.row_id === orderId || itemIds.has(e.row_id) || paymentIds.has(e.row_id) || (e.payload as Record<string, unknown> | undefined)?.order_id === orderId;
+          if (state.outbox.some(touches) || (state.syncRejected ?? []).some((r) => touches(r.event))) {
+            return { ok: true, data: { kind: 'pending', status: state.orders.find((o) => o.id === orderId)?.status ?? status } };
+          }
+          const num = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+          const money = { subtotal_items: num(so.subtotal_items), service_fee_amount: num(so.service_fee_amount), discount_amount: num(so.discount_amount), total_amount: num(so.total_amount), paid_amount: num(so.paid_amount), remaining_balance: num(so.remaining_balance) };
+          const closedAt = typeof so.closed_at === 'string' ? so.closed_at : null;
+          const local = state.orders.find((o) => o.id === orderId);
+          const merged: Order = local
+            ? {
+              ...local, ...money, status, closed_at: closedAt,
+              nfce_status: (so.nfce_status as string | null) ?? local.nfce_status, nfce_key: (so.nfce_key as string | null) ?? local.nfce_key,
+            }
+            : { ...(pickRow(so, ORDER_KEYS) as unknown as Order), ...money, status, closed_at: closedAt };
+          const payments = [...state.payments];
+          for (const sp of snap.payments) {
+            const i = payments.findIndex((p) => p.id === sp.id);
+            if (i >= 0) payments[i] = { ...payments[i]!, status: sp.status as Payment['status'], amount: num(sp.amount) };
+            else payments.push({ ...(pickRow(sp, PAYMENT_KEYS) as unknown as Payment), amount: num(sp.amount), tip_amount: num(sp.tip_amount) });
+          }
+          const orderItems = [...state.orderItems];
+          for (const si of snap.items) {
+            const i = orderItems.findIndex((x) => x.id === si.id);
+            if (i >= 0) orderItems[i] = { ...orderItems[i]!, is_paid: Boolean(si.is_paid), status: si.status as OrderItem['status'] };
+            else orderItems.push(pickRow(si, ITEM_KEYS) as unknown as OrderItem);
+          }
+          const known = new Set(state.auditLogs.flatMap((l) => [l.id, String(l.metadata?.server_audit_id ?? '')]));
+          const audits: AuditLog[] = snap.audits.filter((a) => !known.has(String(a.id))).map((a) => ({
+            id: String(a.id), tenant_id: merged.tenant_id, order_id: orderId, performed_by_user_id: String(a.performed_by_user_id ?? ''),
+            authorized_by_manager_id: (a.authorized_by_manager_id as string | null) ?? null, action_type: a.action_type as AuditLog['action_type'],
+            amount_impact: num(a.amount_impact), reason: String(a.reason ?? ''), whatsapp_alert_sent: false,
+            metadata: (a.metadata as Record<string, unknown> | null) ?? null, created_at: String(a.created_at),
+          }));
+          const ts = nowISO();
+          set((s) => ({
+            orders: local ? s.orders.map((o) => (o.id === orderId ? merged : o)) : [merged, ...s.orders],
+            payments,
+            orderItems,
+            // Conta encerrada no servidor: a mesa dela fica livre aqui também (como o servidor faz).
+            tables: status === 'CLOSED' || status === 'CANCELED'
+              ? s.tables.map((t) => (t.current_order_id === orderId ? { ...t, status: 'FREE', current_order_id: null, updated_at: ts } : t))
+              : s.tables,
+            auditLogs: audits.length ? [...audits, ...s.auditLogs] : s.auditLogs,
+          }));
+          // A trava local da chave (revisão) de um pagamento que o servidor já resolveu sai.
+          for (const sp of snap.payments) {
+            const key = typeof sp.idempotency_key === 'string' ? sp.idempotency_key : null;
+            const hold = key && sp.status !== 'PENDING' ? getReviewHoldByKey(key) : null;
+            if (hold && hold.order_id === orderId) clearReviewHold(orderId, reviewHoldKey(hold));
+          }
+          return { ok: true, data: { kind: 'applied', status } };
         },
 
         advanceItemStatus: (itemId) => {

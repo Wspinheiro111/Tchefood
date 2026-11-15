@@ -4,17 +4,18 @@
  * própria. A venda conta no turno em que foi feita (mesmo estornada depois); o estorno conta no turno da data
  * do estorno no servidor; sem data confirmada, fica à parte ("estorno sem data confirmada").
  */
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   currentShiftPeriod,
   loadServerPointPayments,
   reconciliationMovements,
+  writeOffsByOrder,
   shiftStartBrasilia,
   type ShiftPeriod,
 } from '../lib/reports';
 import type { ListPointPaymentsInput, ListPointPaymentsResult, ListPointRefundsInput, ServerPointPayment } from '../lib/payments/pointPaymentsServer';
-import { Dashboard, Reconciliation } from '../screens/BackOffice';
+import { Dashboard, RECON_REFRESH_MS, Reconciliation } from '../screens/BackOffice';
 import { useTcheStore } from '../store/useTcheStore';
 import type { AuditLog, Payment } from '../types';
 
@@ -264,6 +265,32 @@ describe('Tela de conciliação: bruto, estornos e líquido', () => {
     expect(screen.queryByText(/estorno sem data confirmada/i)).toBeNull();
   });
 
+  it('GPT r12 P2-01: estorno registrado em OUTRO aparelho (nada muda aqui): a tela lê a nuvem de novo a cada minuto e mostra a hora da leitura', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const sale = { ...nowSale(), status: 'APPROVED' as const };
+      const refundedAt = new Date(new Date(sale.created_at).getTime() + 60_000).toISOString();
+      let refunded = false;
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        if (String(url).includes('tchefood_list_refund_reopened_orders')) return { ok: true, status: 200, text: async () => '[]' };
+        const row = refunded ? { ...server(sale, null, 'REFUNDED'), refunded_at: refundedAt } : server(sale, null, 'APPROVED');
+        const items = String(url).includes('tchefood_list_point_refunds') ? (refunded ? [row] : []) : [row];
+        return { ok: true, status: 200, text: async () => JSON.stringify({ items, next_cursor: null }) };
+      }));
+      useTcheStore.setState({ payments: [sale], auditLogs: [], cloud: CLOUD });
+      render(<Reconciliation />);
+      await waitFor(() => expect(screen.getByTestId('recon-net-MERCADO_PAGO').textContent).toMatch(/^R\$\s100,00$/));
+      expect(screen.getByTestId('recon-loaded-at').textContent).toMatch(/atualizados às \d{2}:\d{2}/);
+      // O outro aparelho estorna: este aparelho não espelha nada (o pagamento daqui continua APPROVED).
+      refunded = true;
+      await act(async () => { await vi.advanceTimersByTimeAsync(RECON_REFRESH_MS); });
+      await waitFor(() => expect(screen.getByTestId('recon-refunds-MERCADO_PAGO').textContent).toMatch(/^−R\$\s100,00$/));
+      expect(screen.getByTestId('recon-net-MERCADO_PAGO').textContent).toMatch(/^R\$\s0,00$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('painel do turno: venda antiga estornada hoje reduz o faturamento de hoje (mesma regra da conciliação)', async () => {
     const period = currentShiftPeriod();
     const old = pay('dash-old', '2026-10-01T20:00:00', { status: 'REFUNDED' });
@@ -277,3 +304,14 @@ describe('Tela de conciliação: bruto, estornos e líquido', () => {
   });
 });
 
+
+describe('GPT r12 P2-02: duas baixas na mesma conta', () => {
+  const wo = (id: string, cents: number): AuditLog => ({
+    id, tenant_id: 't', order_id: 'o1', performed_by_user_id: 'u', authorized_by_manager_id: 'm', action_type: 'ORDER_REFUNDED_WRITE_OFF',
+    amount_impact: cents / 100, reason: 'venda devolvida', whatsapp_alert_sent: false, metadata: { written_off_cents: cents }, created_at: new Date().toISOString(),
+  });
+  it('cada registro tem só a diferença baixada: a conta soma (R$ 50 + R$ 50 = R$ 100); o mesmo registro duas vezes conta uma', () => {
+    expect(writeOffsByOrder([wo('w1', 5000), wo('w2', 5000)]).get('o1')).toBe(10000);
+    expect(writeOffsByOrder([wo('w1', 5000), wo('w1', 5000)]).get('o1')).toBe(5000);
+  });
+});
