@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertOctagon, AlertTriangle, ArrowDownRight, ArrowUpRight, Info, Pencil, Target } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
-import { useOwnerSettings, WEEKDAY_LABEL } from '../store/useOwnerSettings';
+import { useOwnerSettings, useStoreFees, WEEKDAY_LABEL } from '../store/useOwnerSettings';
 import { useDeliveryOrders, useDeliveryPolling } from '../lib/deliveryDemo';
 import { DELIVERY_CHANNEL_CATALOG } from '../../server/delivery/marketplace';
 import { getReviewHold } from '../lib/payments/reviewHolds';
@@ -99,8 +99,7 @@ export function OwnerDashboard({ onNavigate }: { onNavigate: (target: DashboardN
   const cancel = useMemo(() => cancellations(ix, range), [ix, range]);
   const ret = useMemo(() => customerReturn(ix, range, now), [ix, range, now]);
   const deliveries = useMemo(() => deliveryStatus(marketplace, range), [marketplace, range]);
-  const feeRules = useOwnerSettings((s) => s.feeRules);
-  const appCommissionPct = useOwnerSettings((s) => s.appCommissionPct);
+  const { feeRules, appCommissionPct } = useStoreFees();
   const left = useMemo(() => leftover(ix, range, feeRules, appCommissionPct), [ix, range, feeRules, appCommissionPct]);
   const rating = useMemo(() => reviewSummary(reviews, range), [reviews, range]);
 

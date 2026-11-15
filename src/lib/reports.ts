@@ -46,7 +46,7 @@ function wallClockAsUtc(ms: number): number {
 }
 
 /** Instante em que o relógio de Brasília marca `y-m-d hh:00`. */
-function brasiliaInstant(y: number, m: number, d: number, hour: number): number {
+export function brasiliaInstant(y: number, m: number, d: number, hour: number): number {
   const guess = Date.UTC(y, m, d, hour);
   let at = guess - (wallClockAsUtc(guess) - guess);
   at = guess - (wallClockAsUtc(at) - at);
