@@ -986,3 +986,40 @@ describe('auditoria GPT rodada 6 ampliada (1fbc385)', () => {
     expect([cedo.cashOutsideSessions, cedo.cashUndeterminedSession]).toEqual([7, 0]);
   });
 });
+
+describe('auditoria GPT rodada 7 (99cde60)', () => {
+  const key = '4325'.padEnd(44, '7');
+  const now = new Date('2026-11-14T12:00:00-03:00');
+  const items = [{ id: 'ia', invoice_id: 'a' }, { id: 'ib', invoice_id: 'b' }];
+  // A: produção, recusada pela nuvem, entrada em 30/12/2025 (10 × R$ 5,00).
+  const A = { id: 'a', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-30T10:00:00-03:00' } as const;
+  const movA = mov({ id: 'ma', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ia', created_at: '2025-12-30T10:00:00-03:00' });
+  const rejected = rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a' } }]);
+  const run = (list: readonly (typeof A | { id: string; access_key: string; environment: string; imported_at: string })[], movs: ReturnType<typeof mov>[], p: ReturnType<typeof yearPeriod>) => {
+    const review = reviewDuplicateInvoices(movs, items, list as never, rejected, positionCutoff(p, now));
+    return { review, inv: inventoryAt([product({})], movs, p, new Set(), now, review.excluded, review.unconfirmed) };
+  };
+
+  it('P2-01: cópia B não recusada com entrada só em 02/01/2026 não tira a entrada de A do inventário de 2025 (nas duas ordens)', () => {
+    const B = { id: 'b', access_key: key, environment: 'PRODUCTION', imported_at: '2026-01-02T10:00:00-03:00' } as const;
+    const movB = mov({ id: 'mb', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ib', created_at: '2026-01-02T10:00:00-03:00' });
+    for (const list of [[A, B], [B, A]]) {
+      const r25 = run(list, [movA, movB], yearPeriod(2025));
+      expect([r25.inv.totalCost, r25.inv.duplicateUnconfirmed]).toEqual([50, 1]);
+      expect([...r25.review.excluded]).toEqual(['mb']);
+      // 2026: as duas cópias de produção têm entradas na posição; conta uma vez (fica a aceita B).
+      const r26 = run(list, [movA, movB], yearPeriod(2026));
+      expect([r26.inv.totalCost, [...r26.review.excluded]]).toEqual([50, ['ma']]);
+    }
+  });
+
+  it('P2-01: cópia B de homologação não recusada com entradas não tira a entrada de produção de A (nas duas ordens)', () => {
+    const B = { id: 'b', access_key: key, environment: 'HOMOLOGATION', imported_at: '2025-12-29T10:00:00-03:00' } as const;
+    const movB = mov({ id: 'mb', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ib', created_at: '2025-12-29T10:00:00-03:00' });
+    for (const list of [[A, B], [B, A]]) {
+      const r25 = run(list, [movA, movB], yearPeriod(2025));
+      expect([r25.inv.totalCost, r25.inv.duplicateUnconfirmed]).toEqual([50, 1]);
+      expect([...r25.review.excluded]).toEqual(['mb']);
+    }
+  });
+});

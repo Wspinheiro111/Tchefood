@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AnnualClose } from '../screens/AnnualClose';
 import { useBackOfficeTabs } from '../screens/BackOffice';
 import { useTcheStore } from '../store/useTcheStore';
-import { useOwnerSettings } from '../store/useOwnerSettings';
+import { storeFees, useOwnerSettings } from '../store/useOwnerSettings';
 import type { Payment, StaffUser } from '../types';
 
 const staff = [
@@ -271,7 +271,7 @@ describe('Fechamento anual (tela): Codex em 1fbc385', () => {
 
 describe('Fechamento anual (tela): auditoria GPT rodada 6 ampliada (1fbc385)', () => {
   const fmt = (v: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
-  afterEach(() => act(() => useOwnerSettings.setState({ feeRules: [], appCommissionPct: {}, feeTenantId: null })));
+  afterEach(() => act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: null })));
 
   it('P1-01: aberto às 09h, a recusa de duplicidade que chega às 11h não muda a posição; Atualizar gera uma posição nova', () => {
     vi.setSystemTime(new Date('2026-11-14T09:00:00-03:00'));
@@ -305,42 +305,106 @@ describe('Fechamento anual (tela): auditoria GPT rodada 6 ampliada (1fbc385)', (
     expect(screen.getAllByText(/Posição em 14\/11\/2026 11:00:00 \(ano em andamento\)/).length).toBeGreaterThan(0);
   });
 
-  it('P1-02: taxa de 3% gravada na loja A não vale para a loja B (fica sem taxa cadastrada) até confirmar', () => {
+  it('P1-02: ciclo loja A → B → A: cada loja tem as suas taxas e comissões, inclusive depois de reiniciar e na exportação', async () => {
     vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
-    act(() => {
-      useOwnerSettings.setState({ feeRules: [{ id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false }], appCommissionPct: {}, feeTenantId: 'loja-A' });
-    });
-    setup('own', [{ ...pay(1000, '2025-05-01T12:00:00', 'CREDIT'), acquirer: 'STONE', card_brand: 'VISA' } as Payment]);
-    render(<AnnualClose />);
+    const base = useTcheStore.getState().tenant;
+    const asStore = (id: string) => act(() => useTcheStore.setState({ tenant: { ...base, id } } as never));
+    const settings = () => useOwnerSettings.getState();
+    const credit = (tenantId: string) => ({ ...pay(1000, '2025-05-01T12:00:00', 'CREDIT'), acquirer: 'STONE', card_brand: 'VISA', tenant_id: tenantId }) as Payment;
+    const rule = { acquirer: 'STONE' as const, method: 'CREDIT' as const, brand: null, fixed: 0, days: 30, businessDays: false };
+    // Loja A: 3% e comissão de 12% no iFood.
+    asStore('loja-A');
+    expect(settings().saveFeeRule({ ...rule, pct: 3 })).toBeNull();
+    expect(settings().setAppCommission('ifood', 12)).toBeNull();
+    // Loja B: começa sem taxa nenhuma (as de A não aparecem).
+    asStore('loja-B');
+    expect(storeFees(settings(), 'loja-B').feeRules).toEqual([]);
+    setup('own', [credit('loja-B')]);
+    const b0 = render(<AnnualClose />);
     expect(screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)').parentElement!.parentElement!.textContent).toContain(fmt(1000));
-    expect(screen.queryByText(/taxa estimada R\$/)).toBeNull();
-    expect(screen.getAllByText(/não estão confirmadas como desta loja/).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByLabelText('As taxas são desta loja'));
-    expect(useOwnerSettings.getState().feeTenantId).toBe(useTcheStore.getState().tenant.id);
+    b0.unmount();
+    // B cadastra 1% para a mesma maquininha/forma/bandeira (não esbarra na de A), muda comissão.
+    expect(settings().saveFeeRule({ ...rule, pct: 1 })).toBeNull();
+    expect(settings().setAppCommission('ifood', 20)).toBeNull();
+    // B edita a sua taxa para 8%.
+    const bRule = storeFees(settings(), 'loja-B').feeRules[0]!;
+    expect(settings().saveFeeRule({ ...rule, id: bRule.id, pct: 8 })).toBeNull();
+    // Reinicia o app: grava, apaga a memória e carrega de novo do armazenamento do aparelho.
+    const key = useOwnerSettings.persist.getOptions().name!;
+    const saved = window.localStorage.getItem(key);
+    expect(saved).toContain('loja-A');
+    act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: null }));
+    window.localStorage.setItem(key, saved!);
+    await act(async () => {
+      await useOwnerSettings.persist.rehydrate();
+    });
+    // Volta para A: continua 3% e 12%, sem nada do que B fez.
+    asStore('loja-A');
+    expect(storeFees(settings(), 'loja-A').feeRules.map((r) => r.pct)).toEqual([3]);
+    expect(storeFees(settings(), 'loja-A').appCommissionPct.ifood).toBe(12);
+    expect(storeFees(settings(), 'loja-B').feeRules.map((r) => r.pct)).toEqual([8]);
+    expect(storeFees(settings(), 'loja-B').appCommissionPct.ifood).toBe(20);
+    setup('own', [credit('loja-A')]);
+    render(<AnnualClose />);
     expect(screen.getByText(/taxa estimada/).textContent).toContain(fmt(30));
     expect(screen.queryByText('Situação de repasse desconhecida (sem taxa cadastrada)')).toBeNull();
+    // Exportação de A usa os 3% (CSV do faturamento).
+    const blobs: Blob[] = [];
+    const origCreate = URL.createObjectURL;
+    const origClick = HTMLAnchorElement.prototype.click;
+    URL.createObjectURL = ((b: Blob) => {
+      blobs.push(b);
+      return 'blob:x';
+    }) as typeof URL.createObjectURL;
+    HTMLAnchorElement.prototype.click = () => {};
+    try {
+      fireEvent.click(screen.getByLabelText('Fechamento de caixa e formas de pagamento: baixar Excel (CSV)'));
+    } finally {
+      URL.createObjectURL = origCreate;
+      HTMLAnchorElement.prototype.click = origClick;
+    }
+    expect(blobs).toHaveLength(1);
+    const csv = await new Promise<string>((res) => {
+      const r = new FileReader();
+      r.onload = () => res(String(r.result));
+      r.readAsText(blobs[0]!);
+    });
+    expect(csv).toContain('30,00');
+    expect(csv).not.toContain('80,00');
+    act(() => useTcheStore.setState({ tenant: base } as never));
   });
 
-  it('P1-02: quem grava a taxa grava para a loja atual, e a loja fica salva com as taxas (sobrevive a reiniciar)', () => {
-    act(() => useOwnerSettings.setState({ feeRules: [], appCommissionPct: {}, feeTenantId: null }));
-    expect(useOwnerSettings.getState().saveFeeRule({ acquirer: 'STONE', method: 'DEBIT', brand: null, pct: 1, fixed: 0, days: 1, businessDays: false })).toBeNull();
-    expect(useOwnerSettings.getState().feeTenantId).toBe(useTcheStore.getState().tenant.id);
-    const saved = useOwnerSettings.persist.getOptions().partialize!(useOwnerSettings.getState()) as Record<string, unknown>;
-    expect(saved.feeTenantId).toBe(useTcheStore.getState().tenant.id);
-    const migrated = useOwnerSettings.persist.getOptions().migrate!({ feeRules: [] }, 3) as unknown as Record<string, unknown>;
-    expect(migrated.feeTenantId).toBeNull();
+  it('P1-02: taxas de antes da separação por loja não valem para nenhuma loja até confirmar', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    // Migração da v3 (lista única): vira "taxas antigas", sem loja.
+    const migrated = useOwnerSettings.persist.getOptions().migrate!({ feeRules: [{ id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false }], appCommissionPct: { ifood: 12 } }, 3) as unknown as Record<string, unknown>;
+    expect(migrated.feeRules).toBeUndefined();
+    expect(migrated.feesByTenant).toEqual({});
+    expect((migrated.legacyFees as { feeRules: unknown[] }).feeRules).toHaveLength(1);
+    act(() => useOwnerSettings.setState({ feesByTenant: {}, legacyFees: migrated.legacyFees as never }));
+    setup('own', [{ ...pay(1000, '2025-05-01T12:00:00', 'CREDIT'), acquirer: 'STONE', card_brand: 'VISA' } as Payment]);
+    render(<AnnualClose />);
+    expect(screen.getByText('Situação de repasse desconhecida (sem taxa cadastrada)')).toBeTruthy();
+    expect(screen.getAllByText(/de antes da separação por loja/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByLabelText('As taxas são desta loja'));
+    const tid = useTcheStore.getState().tenant.id;
+    expect(storeFees(useOwnerSettings.getState(), tid).feeRules).toHaveLength(1);
+    expect(useOwnerSettings.getState().legacyFees).toBeNull();
+    expect(screen.getByText(/taxa estimada/).textContent).toContain(fmt(30));
+    // Loja que já tem taxas não engole as antigas.
+    act(() => useOwnerSettings.setState({ legacyFees: migrated.legacyFees as never }));
+    expect(useOwnerSettings.getState().adoptLegacyFees(tid)).toMatch(/já tem taxas/);
   });
 
-  it('P1-02: com taxas de outra loja na lista, gravar uma taxa nova não confirma as outras', () => {
-    act(() => useOwnerSettings.setState({ feeRules: [{ id: 'r', acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false }], appCommissionPct: {}, feeTenantId: 'loja-A' }));
-    expect(useOwnerSettings.getState().saveFeeRule({ acquirer: 'STONE', method: 'DEBIT', brand: null, pct: 1, fixed: 0, days: 1, businessDays: false })).toBeNull();
-    expect(useOwnerSettings.getState().setAppCommission('ifood', 12)).toBeNull();
-    useOwnerSettings.getState().removeFeeRule('r');
-    expect(useOwnerSettings.getState().feeTenantId).toBe('loja-A');
-    // Antigo (sem loja gravada) com taxas: também continua pedindo a confirmação.
-    act(() => useOwnerSettings.setState({ feeTenantId: null }));
-    useOwnerSettings.getState().setAppCommission('ifood', 10);
-    expect(useOwnerSettings.getState().feeTenantId).toBeNull();
+  it('troca de loja com a tela aberta refaz a foto (não mostra a posição da loja anterior)', () => {
+    vi.setSystemTime(new Date('2026-02-10T10:00:00-03:00'));
+    const base = useTcheStore.getState().tenant;
+    setup('own', [pay(30, '2025-05-01T12:00:00')]);
+    render(<AnnualClose />);
+    expect(screen.getByText('Total recebido (bruto)').parentElement!.textContent).toContain(fmt(30));
+    act(() => useTcheStore.setState({ tenant: { ...base, id: 'outra-loja' } } as never));
+    expect(screen.queryByText('Total recebido (bruto)')?.parentElement?.textContent ?? '').not.toContain(fmt(30));
+    act(() => useTcheStore.setState({ tenant: base } as never));
   });
 
   it('P1-01: a nuvem reescreve as listas com o mesmo conteúdo: não aparece o aviso de dados novos', () => {

@@ -7,7 +7,7 @@ import { useMemo, useState } from 'react';
 import { CalendarDays, Pencil, Plus, Trash2 } from 'lucide-react';
 import { Btn, Sheet, toast } from '../components/ui';
 import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
-import { useOwnerSettings } from '../store/useOwnerSettings';
+import { useOwnerSettings, useStoreFees } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import { parseMoneyInput } from '../lib/cashRegister';
 import { DELIVERY_CHANNEL_CATALOG } from '../../server/delivery/marketplace';
@@ -29,10 +29,11 @@ export function FeesReceivables() {
   const user = useTcheStore(selectCurrentUser);
   const payments = useTcheStore((s) => s.payments);
   const canEdit = isManagerRole(user?.role);
-  const rules = useOwnerSettings((s) => s.feeRules);
+  const { feeRules: rules, appCommissionPct: commissions } = useStoreFees();
+  const tenantId = useTcheStore((s) => s.tenant.id);
+  const legacyFees = useOwnerSettings((s) => s.legacyFees);
   const saveFeeRule = useOwnerSettings((s) => s.saveFeeRule);
   const removeFeeRule = useOwnerSettings((s) => s.removeFeeRule);
-  const commissions = useOwnerSettings((s) => s.appCommissionPct);
   const setAppCommission = useOwnerSettings((s) => s.setAppCommission);
   const [draft, setDraft] = useState<Draft | null>(null);
   const agenda = useMemo(() => receivables(payments, rules), [payments, rules]);
@@ -59,8 +60,31 @@ export function FeesReceivables() {
 
   const edit = (r: FeeRule) => setDraft({ id: r.id, acquirer: r.acquirer, method: r.method, brand: r.brand, pct: String(r.pct).replace('.', ','), fixed: String(r.fixed).replace('.', ','), days: String(r.days), businessDays: r.businessDays });
 
+  const anyLegacy = !!legacyFees && (legacyFees.feeRules.length > 0 || Object.values(legacyFees.appCommissionPct).some((v) => v !== null && v !== undefined));
+  const showLegacy = anyLegacy && rules.length === 0 && !Object.values(commissions).some((v) => v !== null && v !== undefined);
+
   return (
     <div className="space-y-4">
+      {showLegacy && (
+        <section role="alert" className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-amarelo/15 p-4 text-sm">
+          <span>
+            Há {legacyFees!.feeRules.length} taxa(s) da maquininha cadastrada(s) antes de o app separar as taxas por loja. Não se sabe de qual loja são, então não valem para esta loja até você confirmar.
+          </span>
+          {canEdit && (
+            <Btn
+              variant="secondary"
+              aria-label="As taxas são desta loja"
+              onClick={() => {
+                const err = useOwnerSettings.getState().adoptLegacyFees(tenantId);
+                if (err) toast.error(err);
+                else toast.success('Taxas confirmadas para esta loja.');
+              }}
+            >
+              As taxas são desta loja
+            </Btn>
+          )}
+        </section>
+      )}
       <section className="rounded-2xl border border-slate-200 bg-base p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div>

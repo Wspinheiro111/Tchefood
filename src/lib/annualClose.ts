@@ -334,17 +334,26 @@ export function reviewDuplicateInvoices(
   if (![...byKey.values()].some((l) => l.length > 1)) return { excluded, unconfirmed };
   const itemInvoice = new Map(items.map((i) => [i.id, i.invoice_id]));
   const movesByInvoice = new Map<string, string[]>();
+  // Cópia com entrada que conta nesta posição: de produção e com alguma entrada antes do corte.
+  const countsHere = new Set<string>();
   for (const m of movements) {
     const inv = m.purchase_invoice_item_id ? itemInvoice.get(m.purchase_invoice_item_id) : undefined;
     if (inv === undefined) continue;
     const list = movesByInvoice.get(inv) ?? [];
     list.push(m.id);
     movesByInvoice.set(inv, list);
+    const t = at(m.created_at);
+    if (t !== null && t < cutoff) countsHere.add(inv);
   }
+  const eligible = (c: InvoiceCopy): boolean => countsHere.has(c.id) && (c.environment === undefined || c.environment === 'PRODUCTION');
   for (const copies of byKey.values()) {
     if (copies.length < 2) continue;
-    const withMoves = copies.filter((c) => (movesByInvoice.get(c.id)?.length ?? 0) > 0).sort(compareInvoiceCopies);
-    const candidates = withMoves.filter((c) => !rejectedIds.has(c.id));
+    // As que contam nesta posição vêm primeiro: uma cópia de homologação, ou com entradas só
+    // depois do corte, nunca tira a entrada que conta (ela mesma sairia do saldo depois).
+    const withMoves = copies
+      .filter((c) => (movesByInvoice.get(c.id)?.length ?? 0) > 0)
+      .sort((a, b) => Number(eligible(b)) - Number(eligible(a)) || compareInvoiceCopies(a, b));
+    const candidates = withMoves.filter((c) => !rejectedIds.has(c.id) && eligible(c));
     // Prova da duplicata: a cópia aceita (não recusada, sem entradas aqui, veio da nuvem)
     // foi importada antes do instante do relatório. Importada no corte ou depois (ou sem
     // data), as entradas dela não estão nesta posição em nenhum aparelho: as recusadas daqui

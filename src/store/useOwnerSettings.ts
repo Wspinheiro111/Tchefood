@@ -28,22 +28,24 @@ interface OwnerSettingsState {
   dailyGoals: WeekdayGoals;
   /** Grava a meta do dia da semana. Valor inválido devolve o erro. */
   setDailyGoal: (weekday: number, value: number | null) => string | null;
-  /** Taxas da maquininha do contrato da loja (vazio até o proprietário cadastrar). */
-  feeRules: FeeRule[];
-  /** Grava (novo ou edição) uma regra de taxa. Devolve o erro, ou null. */
+  /**
+   * Taxas da maquininha e comissões dos apps, separadas por loja (tenant_id): o aparelho
+   * pode ter operado mais de uma loja, e cada uma tem o seu contrato. Toda leitura e
+   * gravação usa só a lista da loja que está no aparelho agora (`storeFees`).
+   */
+  feesByTenant: Record<string, StoreFees>;
+  /**
+   * Taxas gravadas antes de serem separadas por loja: não se sabe de qual loja são, então
+   * não valem para nenhuma até alguém da gerência confirmar (`adoptLegacyFees`).
+   */
+  legacyFees: StoreFees | null;
+  /** As taxas antigas (sem loja) passam a ser da loja indicada, se ela ainda não tem taxas. */
+  adoptLegacyFees: (tenantId: string) => string | null;
+  /** Grava (novo ou edição) uma regra de taxa DA LOJA ATUAL. Devolve o erro, ou null. */
   saveFeeRule: (rule: Omit<FeeRule, 'id'> & { id?: string }) => string | null;
   removeFeeRule: (id: string) => void;
-  /** Comissão de cada app de delivery em % (chave do canal). Null = não cadastrada. */
-  appCommissionPct: Record<string, number | null>;
+  /** Comissão de cada app de delivery em % DA LOJA ATUAL. Null = não cadastrada. */
   setAppCommission: (channel: string, pct: number | null) => string | null;
-  /**
-   * Loja (tenant_id) a que as taxas e comissões acima pertencem: a que estava neste
-   * aparelho quando foram gravadas ou confirmadas. Null = gravadas antes deste campo
-   * existir (loja desconhecida). O fechamento anual só usa as taxas da loja atual.
-   */
-  feeTenantId: string | null;
-  /** Confirma que as taxas e comissões gravadas são da loja indicada. */
-  confirmFeesTenant: (tenantId: string) => void;
   /** Campanha para chamar de volta o cliente sumido. */
   winbackCampaign: WinbackCampaign;
   saveWinbackCampaign: (c: WinbackCampaign) => string | null;
@@ -52,19 +54,31 @@ interface OwnerSettingsState {
   markWinbackSent: (customerId: string) => void;
 }
 
+export interface StoreFees {
+  feeRules: FeeRule[];
+  /** Comissão de cada app de delivery em % (chave do canal). Null = não cadastrada. */
+  appCommissionPct: Record<string, number | null>;
+}
+
+const NO_FEE_RULES: FeeRule[] = [];
+const NO_COMMISSIONS: Record<string, number | null> = {};
+const NO_FEES: StoreFees = { feeRules: NO_FEE_RULES, appCommissionPct: NO_COMMISSIONS };
+
+/** Taxas e comissões da loja indicada (vazio se ela não cadastrou: "não cadastrada"). */
+export function storeFees(s: Pick<OwnerSettingsState, 'feesByTenant'>, tenantId: string): StoreFees {
+  return s.feesByTenant[tenantId] ?? NO_FEES;
+}
+
 /** Loja que está neste aparelho agora (quem grava uma taxa grava para ela). */
 const currentTenantId = (): string => useTcheStore.getState().tenant.id;
 
-/**
- * Loja das taxas depois de uma gravação: só passa a ser a loja atual se já era dela ou se
- * não havia taxa nem comissão gravada. Com taxas de outra loja (ou de antes deste campo)
- * na lista, gravar uma não confirma as outras: continua pedindo a confirmação explícita.
- */
-function stampAfterEdit(s: Pick<OwnerSettingsState, 'feeRules' | 'appCommissionPct' | 'feeTenantId'>): string | null {
-  const cur = currentTenantId();
-  if (s.feeTenantId === cur) return cur;
-  const hadAny = s.feeRules.length > 0 || Object.values(s.appCommissionPct).some((v) => v !== null && v !== undefined);
-  return hadAny ? s.feeTenantId : cur;
+const hasAnyFee = (f: StoreFees | null | undefined): boolean =>
+  !!f && (f.feeRules.length > 0 || Object.values(f.appCommissionPct).some((v) => v !== null && v !== undefined));
+
+/** Hook: taxas e comissões da loja que está no aparelho agora. */
+export function useStoreFees(): StoreFees {
+  const tenantId = useTcheStore((s) => s.tenant.id);
+  return useOwnerSettings((s) => storeFees(s, tenantId));
 }
 
 const DEFAULT_CAMPAIGN: WinbackCampaign = { template: DEFAULT_WINBACK_TEMPLATE, offer: '10% de desconto', coupon: 'VOLTA10' };
@@ -79,7 +93,23 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
         set((s) => ({ dailyGoals: { ...s.dailyGoals, [weekday]: value === null ? null : round2(value) } }));
         return null;
       },
-      feeRules: [],
+      feesByTenant: {},
+      legacyFees: null,
+      adoptLegacyFees: (tenantId) => {
+        let err: string | null = null;
+        set((s) => {
+          if (!hasAnyFee(s.legacyFees)) {
+            err = 'Não há taxas antigas para confirmar.';
+            return {};
+          }
+          if (hasAnyFee(s.feesByTenant[tenantId])) {
+            err = 'Esta loja já tem taxas cadastradas: confira as antigas e cadastre de novo o que for dela.';
+            return {};
+          }
+          return { feesByTenant: { ...s.feesByTenant, [tenantId]: s.legacyFees! }, legacyFees: null };
+        });
+        return err;
+      },
       saveFeeRule: (input) => {
         const rule: FeeRule = {
           id: input.id ?? uuid(),
@@ -94,23 +124,33 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
         const err = validateFeeRule(rule);
         if (err) return err;
         let dup = false;
+        const tenantId = currentTenantId();
         set((s) => {
-          dup = s.feeRules.some((r) => r.id !== rule.id && r.acquirer === rule.acquirer && r.method === rule.method && r.brand === rule.brand);
+          const cur = storeFees(s, tenantId);
+          dup = cur.feeRules.some((r) => r.id !== rule.id && r.acquirer === rule.acquirer && r.method === rule.method && r.brand === rule.brand);
           if (dup) return {};
-          const exists = s.feeRules.some((r) => r.id === rule.id);
-          return { feeRules: exists ? s.feeRules.map((r) => (r.id === rule.id ? rule : r)) : [...s.feeRules, rule], feeTenantId: stampAfterEdit(s) };
+          const exists = cur.feeRules.some((r) => r.id === rule.id);
+          const feeRules = exists ? cur.feeRules.map((r) => (r.id === rule.id ? rule : r)) : [...cur.feeRules, rule];
+          return { feesByTenant: { ...s.feesByTenant, [tenantId]: { ...cur, feeRules } } };
         });
         return dup ? 'Já existe uma taxa para essa maquininha, forma e bandeira. Edite a que existe.' : null;
       },
-      removeFeeRule: (id) => set((s) => ({ feeRules: s.feeRules.filter((r) => r.id !== id), feeTenantId: stampAfterEdit(s) })),
-      appCommissionPct: {},
+      removeFeeRule: (id) => {
+        const tenantId = currentTenantId();
+        set((s) => {
+          const cur = storeFees(s, tenantId);
+          return { feesByTenant: { ...s.feesByTenant, [tenantId]: { ...cur, feeRules: cur.feeRules.filter((r) => r.id !== id) } } };
+        });
+      },
       setAppCommission: (channel, pct) => {
         if (pct !== null && (!Number.isFinite(pct) || pct < 0 || pct > 50)) return 'Comissão entre 0% e 50%.';
-        set((s) => ({ appCommissionPct: { ...s.appCommissionPct, [channel]: pct === null ? null : round2(pct) }, feeTenantId: stampAfterEdit(s) }));
+        const tenantId = currentTenantId();
+        set((s) => {
+          const cur = storeFees(s, tenantId);
+          return { feesByTenant: { ...s.feesByTenant, [tenantId]: { ...cur, appCommissionPct: { ...cur.appCommissionPct, [channel]: pct === null ? null : round2(pct) } } } };
+        });
         return null;
       },
-      feeTenantId: null,
-      confirmFeesTenant: (tenantId) => set({ feeTenantId: tenantId }),
       winbackCampaign: DEFAULT_CAMPAIGN,
       saveWinbackCampaign: (c) => {
         const err = validateCampaign(c);
@@ -125,23 +165,31 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
     {
       name: 'tchefood-owner-settings',
       storage: createJSONStorage(() => idbStorage),
-      // v2 = taxas da maquininha e comissão dos apps; v3 = campanha do cliente sumido.
-      version: 3,
+      // v2 = taxas da maquininha e comissão dos apps; v3 = campanha do cliente sumido;
+      // v4 = taxas e comissões separadas por loja (as antigas ficam sem loja até confirmar).
+      version: 4,
       partialize: (s) => ({
         dailyGoals: s.dailyGoals,
-        feeRules: s.feeRules,
-        appCommissionPct: s.appCommissionPct,
-        feeTenantId: s.feeTenantId,
+        feesByTenant: s.feesByTenant,
+        legacyFees: s.legacyFees,
         winbackCampaign: s.winbackCampaign,
         winbackContacts: s.winbackContacts,
       }),
       migrate: (persisted) => {
         const out = { ...(persisted as Record<string, unknown>) };
-        if (!Array.isArray(out.feeRules)) out.feeRules = [];
-        if (typeof out.appCommissionPct !== 'object' || out.appCommissionPct === null) out.appCommissionPct = {};
+        // Até a v3 havia uma lista só no aparelho, sem loja: vira "taxas antigas" (sem loja).
+        const oldRules = Array.isArray(out.feeRules) ? (out.feeRules as FeeRule[]) : [];
+        const oldCommissions = typeof out.appCommissionPct === 'object' && out.appCommissionPct !== null ? (out.appCommissionPct as Record<string, number | null>) : {};
+        delete out.feeRules;
+        delete out.appCommissionPct;
+        delete out.feeTenantId;
+        if (typeof out.feesByTenant !== 'object' || out.feesByTenant === null) out.feesByTenant = {};
+        if (out.legacyFees === undefined) {
+          const legacy: StoreFees = { feeRules: oldRules, appCommissionPct: oldCommissions };
+          out.legacyFees = hasAnyFee(legacy) ? legacy : null;
+        }
         if (typeof out.winbackCampaign !== 'object' || out.winbackCampaign === null) out.winbackCampaign = DEFAULT_CAMPAIGN;
         if (!Array.isArray(out.winbackContacts)) out.winbackContacts = [];
-        if (typeof out.feeTenantId !== 'string') out.feeTenantId = null;
         return out as unknown as OwnerSettingsState;
       },
     },

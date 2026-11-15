@@ -8,7 +8,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { FileSpreadsheet, Printer, RefreshCw } from 'lucide-react';
 import { Btn, toast } from '../components/ui';
 import { isManagerRole, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
-import { useOwnerSettings } from '../store/useOwnerSettings';
+import { storeFees, useOwnerSettings, type StoreFees } from '../store/useOwnerSettings';
 import { formatBRL } from '../lib/money';
 import type { MarketplaceSale } from '../lib/ownerDashboard';
 import { brasiliaDateTime, brasiliaYear, clockBeforeYear, defaultYear, ownStore, rejectedInvoiceIds, reviewDuplicateInvoices, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, positionCutoff, revenueByMethod, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
@@ -66,7 +66,7 @@ const SNAPSHOT_KEYS = [
   'tenant', 'staff', 'products', 'stockMovements', 'payments', 'cashSessions', 'cashMovements', 'purchaseInvoices',
   'suppliers', 'ownDeliveries', 'courierSettlements', 'couriers', 'orders', 'purchaseInvoiceItems', 'syncRejected',
 ] as const;
-const FEE_KEYS = ['feeRules', 'appCommissionPct', 'feeTenantId'] as const;
+const FEE_KEYS = ['feesByTenant', 'legacyFees'] as const;
 type TcheData = Pick<ReturnType<typeof useTcheStore.getState>, (typeof SNAPSHOT_KEYS)[number]>;
 type FeeData = Pick<ReturnType<typeof useOwnerSettings.getState>, (typeof FEE_KEYS)[number]>;
 interface Snapshot extends TcheData, FeeData {
@@ -111,6 +111,11 @@ export function AnnualClose() {
   // Chegou dado novo depois da foto: avisa e oferece Atualizar (os números não mudam sozinhos).
   const tcheChanged = useTcheStore((s) => SNAPSHOT_KEYS.some((k) => !same(s[k], snap[k])));
   const feesChanged = useOwnerSettings((s) => FEE_KEYS.some((k) => !same(s[k], snap[k])));
+  // Outra loja entrou no aparelho com a tela aberta: a foto da loja anterior não serve.
+  const liveTenantId = useTcheStore((s) => s.tenant.id);
+  useEffect(() => {
+    if (liveTenantId !== snap.tenant.id) setSnap(captureSnapshot());
+  }, [liveTenantId, snap.tenant.id]);
   // As taxas ainda não tinham carregado do aparelho quando a tela abriu: tira a foto de novo
   // assim que carregarem (antes disso a tela não mostrou taxa nenhuma de verdade).
   useEffect(() => {
@@ -136,14 +141,13 @@ export function AnnualClose() {
     purchaseInvoiceItems,
     syncRejected,
   } = snap;
-  // Taxas e comissões só valem se foram gravadas (ou confirmadas) nesta loja: as de outra
-  // loja que ficaram no aparelho, ou de antes de o app registrar a loja, contam como NÃO
-  // cadastradas (o repasse fica "situação desconhecida"), nunca como as desta loja.
-  const feesOwned = snap.feeTenantId === tenant.id;
-  const hasFees = snap.feeRules.length > 0 || Object.values(snap.appCommissionPct).some((v) => v !== null && v !== undefined);
-  const feesForeign = hasFees && !feesOwned;
-  const feeRules = useMemo(() => (feesOwned ? snap.feeRules : []), [feesOwned, snap.feeRules]);
-  const appCommissionPct = useMemo(() => (feesOwned ? snap.appCommissionPct : {}), [feesOwned, snap.appCommissionPct]);
+  // Taxas e comissões são guardadas por loja: só valem as desta loja. As de outra loja, ou
+  // de antes da separação por loja (sem loja), contam como NÃO cadastradas (o repasse fica
+  // "situação desconhecida"), nunca como as desta loja.
+  const { feeRules, appCommissionPct } = storeFees(snap, tenant.id);
+  const anyFee = (f: StoreFees | null) => !!f && (f.feeRules.length > 0 || Object.values(f.appCommissionPct).some((v) => v !== null && v !== undefined));
+  // Taxas de antes da separação por loja e esta loja sem taxas: avisa e oferece confirmar.
+  const feesForeign = anyFee(snap.legacyFees) && !anyFee(storeFees(snap, tenant.id));
   // Só a loja deste aparelho (o que sobrou de outra loja fica fora e é avisado).
   const ownProducts = useMemo(() => ownStore(allProducts, tenant.id), [allProducts, tenant.id]);
   const products = ownProducts.rows;
@@ -227,7 +231,7 @@ export function AnnualClose() {
   const clockNote = `ATENÇÃO: o relógio deste aparelho estava em ${brasiliaDateTime(now.getTime())}, antes de ${year} começar, quando este relatório foi gerado. Os números são do ano inteiro, mas confira a data e a hora do aparelho.`;
   const otherNote = `${otherStore} registro(s) de outra loja ou sem loja identificada que ficaram neste aparelho (de antes de ligá-lo a esta loja) foram deixados de fora dos totais.`;
   // Notas que vão em todos os relatórios exportados (as mesmas que a tela mostra no topo).
-  const feesNote = 'As taxas da maquininha e as comissões dos apps gravadas neste aparelho não estão confirmadas como desta loja (são de outra loja ou de antes desta versão): foram tratadas como NÃO cadastradas (repasse com situação desconhecida, taxa estimada zero). Se forem desta loja, toque em "As taxas são desta loja" no topo do Fechamento anual.';
+  const feesNote = 'Esta loja não tem taxas da maquininha nem comissões cadastradas; as que existem neste aparelho são de antes da separação por loja e não se sabe de qual loja são: foram tratadas como NÃO cadastradas (repasse com situação desconhecida, taxa estimada zero). Se forem desta loja, toque em "As taxas são desta loja" no topo do Fechamento anual (ou em Taxas e recebíveis).';
   const partialNote = [
     ...(feesForeign ? [feesNote] : []),
     ...(partial ? [`O ano de ${year} ainda não terminou: os números vão até ${cutoffLabel} (horário de Brasília), não até 31/12.`] : []),
@@ -371,7 +375,7 @@ export function AnnualClose() {
               variant="secondary"
               aria-label="As taxas são desta loja"
               onClick={() => {
-                useOwnerSettings.getState().confirmFeesTenant(tenant.id);
+                useOwnerSettings.getState().adoptLegacyFees(tenant.id);
                 refresh();
               }}
             >
