@@ -379,9 +379,6 @@ export function testInvoiceMovementIds(
   return out;
 }
 
-/** quantidade (3 casas) × custo (4 casas) em centavos, só com inteiros. */
-const qtyTimesCostCents = (qty: number, cost: number): number => Math.round((Math.round(qty * 1000) * Math.round(cost * 10_000)) / 100_000);
-
 /**
  * Posição do estoque no fim do ano: para cada produto, a soma das entradas DESTE
  * aparelho no livro (stock_movements, só INSERT) até a posição, com o custo médio
@@ -445,7 +442,9 @@ export function inventoryAt(
     const unitCost = milli > 0 ? Math.round(costTimes / milli) / 10_000 : 0;
     if (qty === 0) continue;
     const prod = byId.get(productId);
-    const totalCents = qtyTimesCostCents(qty, unitCost);
+    // Total direto da soma exata das entradas (centavos só no fim); o custo médio de 4
+    // casas é só para mostrar e não volta para o total.
+    const totalCents = Math.round(costTimes / 100_000);
     totalC += totalCents;
     const ncm = prod?.ncm ?? '';
     if (!/^\d{8}$/.test(ncm)) missingNcm += 1;
@@ -985,6 +984,8 @@ export interface ExpensesReport {
   homologationInvoices: number;
   /** NF-e com data de emissão inválida, contadas pela data da importação. */
   invalidIssueDates: number;
+  /** Ano em andamento: NF-e emitidas antes do instante do relatório mas importadas depois (ficaram fora). */
+  importedAfterCutoff: number;
   /** NF-e repetidas (mesma chave de acesso) contadas uma vez só. */
   duplicateInvoices: number;
   /** Sangrias do caixa no ano que não são acerto de entregador: sem categoria. */
@@ -1028,19 +1029,44 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
   let homologation = 0;
   let invalidDates = 0;
   let invalidIssueDates = 0;
+  let importedAfterCutoff = 0;
   let duplicateInvoices = 0;
   // A mesma NF-e (mesma chave) importada em dois aparelhos antes de sincronizar fica
   // duas vezes aqui (a da nuvem e a recusada deste aparelho): conta uma vez só. Antes de
   // olhar o período, escolhe a cópia de cada chave pela mesma ordem do inventário
   // (compareInvoiceCopies). Assim a cópia sem data não tira a nota do ano certo.
-  const best = new Map<string, PurchaseInvoice>();
+  // Ano em andamento: a nota importada no instante do relatório ou depois não estava no
+  // aparelho quando os números foram fixados (o inventário também não tem as entradas
+  // dela). Sai ANTES da escolha da cópia, para não tirar uma cópia que já estava aqui.
+  // Ano encerrado: vale só a emissão (nota de dezembro importada em janeiro fica em dezembro).
+  const importedLate = (inv: PurchaseInvoice): boolean => {
+    const imported = at(inv.imported_at);
+    return cutoff < p.to && imported !== null && imported >= cutoff;
+  };
+  const visible = input.purchaseInvoices.filter((inv) => !importedLate(inv));
+  const visibleKeys = new Set(visible.map((inv) => (inv.access_key ?? '').trim()).filter((k) => k !== ''));
+  const lateSeen = new Set<string>();
   for (const inv of input.purchaseInvoices) {
+    if (!importedLate(inv)) continue;
+    const key = (inv.access_key ?? '').trim();
+    // Outra cópia já estava aqui (ela conta), ou esta chave já foi avisada.
+    if (key !== '' && (visibleKeys.has(key) || lateSeen.has(key))) continue;
+    if (key !== '') lateSeen.add(key);
+    // Homologação nunca conta: atualizar não a traria, então não avisa.
+    if (inv.environment !== 'PRODUCTION') continue;
+    const t = invoiceDate(inv.issued_at) ?? at(inv.imported_at);
+    if (t === null || t < p.from) continue;
+    late += 1;
+    if (t < cutoff) importedAfterCutoff += 1;
+  }
+  const best = new Map<string, PurchaseInvoice>();
+  for (const inv of visible) {
     const key = (inv.access_key ?? '').trim();
     if (key === '') continue;
     const cur = best.get(key);
     if (cur === undefined || compareInvoiceCopies(inv, cur) < 0) best.set(key, inv);
   }
-  for (const inv of input.purchaseInvoices) {
+  for (const inv of visible) {
     const key = (inv.access_key ?? '').trim();
     if (key !== '') {
       if (best.get(key) !== inv) {
@@ -1131,7 +1157,7 @@ export function expensesByCategory(input: ExpensesInput, p: YearPeriod, now: Dat
     { key: 'OTHER', label: 'Outras despesas (luz, água, gás, internet, impostos)', amount: null, count: 0, source: 'NOT_TRACKED', note: NOT_TRACKED },
   ];
   const total = rows.reduce((a, r) => a + (r.amount === null ? 0 : toCents(r.amount)), 0);
-  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, invalidIssueDates, duplicateInvoices, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates, cutoff, afterCutoff: late };
+  return { rows, total: fromCents(total), purchases, homologationInvoices: homologation, invalidIssueDates, importedAfterCutoff, duplicateInvoices, withdrawals, withdrawalsTotal: fromCents(withdrawalsC), invalidDates, cutoff, afterCutoff: late };
 }
 
 const fmt = (cents: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(fromCents(cents));

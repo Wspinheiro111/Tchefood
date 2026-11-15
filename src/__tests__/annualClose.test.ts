@@ -822,3 +822,40 @@ describe('auditoria GPT rodada 3 (0dd946d)', () => {
     expect(open('2018-11-04T10:00:00-02:00', '2018-11-05T00:30:00-02:00')).toBe(0);
   });
 });
+
+describe('auditoria GPT rodada 4 (435c529)', () => {
+  it('P2-01: total do inventário sai da soma exata das entradas (R$ 2.000,10), em qualquer ordem', () => {
+    const a = mov({ id: 'a', quantity: 1000, unit_cost: 1, created_at: '2025-03-01T10:00:00-03:00' });
+    const b = mov({ id: 'b', quantity: 1000, unit_cost: 1.0001, created_at: '2025-03-02T10:00:00-03:00' });
+    for (const list of [[a, b], [b, a]]) {
+      const r = inventoryAt([product({})], list, P, new Set(), new Date('2026-11-14T12:00:00-03:00'));
+      expect([r.rows[0]!.quantity, r.rows[0]!.total, r.totalCost]).toEqual([2000, 2000.1, 2000.1]);
+    }
+  });
+
+  it('P2-02: no ano em andamento, NF-e emitida antes do corte mas importada depois fica fora com aviso; ao atualizar, entra', () => {
+    const P26 = yearPeriod(2026);
+    const inv = { id: 'n', supplier_id: 's', access_key: '4325'.padEnd(44, '2'), number: '1', series: '1', issued_at: '2026-11-14T08:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 500, imported_at: '2026-11-14T11:00:00-03:00' } as PurchaseInvoice;
+    const run = (now: Date) => expensesByCategory({ purchaseInvoices: [inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, now) }, P26, now);
+    const nove = run(new Date('2026-11-14T09:00:00-03:00'));
+    expect([nove.purchases.length, nove.afterCutoff, nove.importedAfterCutoff]).toEqual([0, 1, 1]);
+    expect(toCsv(expensesDoc(nove, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('importada(s) neste aparelho depois dele');
+    const doze = run(new Date('2026-11-14T12:00:00-03:00'));
+    expect([doze.purchases.length, doze.rows[0]!.amount, doze.afterCutoff]).toEqual([1, 500, 0]);
+    // Cópia da nuvem já estava aqui (importada às 08:30, sem data válida) e a local veio às 11:00:
+    // conta a que estava aqui, uma vez, sem aviso de repetida nem de fora do instante.
+    const nuvem = { ...inv, id: 'nuvem', issued_at: 'lixo', imported_at: '2026-11-14T08:30:00-03:00' } as PurchaseInvoice;
+    const both = expensesByCategory({ purchaseInvoices: [inv, nuvem], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, new Date('2026-11-14T09:00:00-03:00')) }, P26, new Date('2026-11-14T09:00:00-03:00'));
+    expect([both.purchases.length, both.duplicateInvoices, both.afterCutoff, both.importedAfterCutoff]).toEqual([1, 0, 0, 0]);
+    // As duas cópias chegaram depois do corte: nenhuma conta, um aviso só, e nada de "repetida".
+    const twoLate = expensesByCategory({ purchaseInvoices: [inv, { ...inv, id: 'n2', imported_at: '2026-11-14T10:00:00-03:00' } as PurchaseInvoice], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, new Date('2026-11-14T09:00:00-03:00')) }, P26, new Date('2026-11-14T09:00:00-03:00'));
+    expect([twoLate.purchases.length, twoLate.duplicateInvoices, twoLate.afterCutoff, twoLate.importedAfterCutoff]).toEqual([0, 0, 1, 1]);
+    // Homologação importada depois: não conta nem pede para atualizar.
+    const hom = expensesByCategory({ purchaseInvoices: [{ ...inv, environment: 'HOMOLOGATION' } as PurchaseInvoice], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, new Date('2026-11-14T09:00:00-03:00')) }, P26, new Date('2026-11-14T09:00:00-03:00'));
+    expect([hom.afterCutoff, hom.importedAfterCutoff]).toEqual([0, 0]);
+    // Ano encerrado: nota de dezembro importada em janeiro continua em dezembro.
+    const dez = { ...inv, issued_at: '2025-12-20T10:00:00-03:00', imported_at: '2026-01-05T10:00:00-03:00' } as PurchaseInvoice;
+    const r25 = expensesByCategory({ purchaseInvoices: [dez], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, new Date('2026-11-14T09:00:00-03:00')) }, P, new Date('2026-11-14T09:00:00-03:00'));
+    expect([r25.purchases.length, r25.rows[0]!.amount]).toEqual([1, 500]);
+  });
+});

@@ -234,6 +234,7 @@ export function expensesDoc(r: ExpensesReport, base: Omit<ReportDoc, 'title' | '
       'Regime de caixa: taxas de entrega contam na data do acerto com o entregador. O que estava a pagar aos entregadores em 31/12 está no relatório de contas em aberto e entra aqui no ano do acerto.',
       ...(r.homologationInvoices > 0 ? [`${r.homologationInvoices} NF-e de homologação (teste) no ano ficou(aram) de fora.`] : []),
       ...(r.duplicateInvoices > 0 ? [`${r.duplicateInvoices} NF-e importada(s) também em outro aparelho (mesma chave de acesso, aparece duas vezes aqui) foi(ram) contada(s) uma vez só.`] : []),
+      ...(r.importedAfterCutoff > 0 ? [`${r.importedAfterCutoff} NF-e emitida(s) antes do instante deste relatório, mas importada(s) neste aparelho depois dele, ficou(aram) de fora (também estão no aviso de registros fora do instante). Atualize o relatório para incluí-la(s).`] : []),
       ...(r.invalidIssueDates > 0 ? [`${r.invalidIssueDates} NF-e com data de emissão inválida foi(ram) contada(s) pela data da importação: confira o ano dessa(s) nota(s).`] : []),
       ...invalid(r.invalidDates, 'nota(s), acerto(s) ou sangria(s)'),
       ...afterCutoffNote(r.afterCutoff, r.cutoff),
