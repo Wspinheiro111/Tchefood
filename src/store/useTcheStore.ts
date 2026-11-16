@@ -83,7 +83,7 @@ import {
 import { can, PERMISSION_LABEL } from '../lib/permissions';
 import { nowISO, stableUuid, uuid } from '../lib/ids';
 import { MAX_REVIEW_COMMENT } from '../lib/reviews';
-import { idbStorage } from '../lib/idbStorage';
+import { idbStorage, storedOnlyInMemory } from '../lib/idbStorage';
 import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, reviewHoldKey } from '../lib/payments/reviewHolds';
@@ -6958,7 +6958,8 @@ export const useTcheStore = create<TcheState>()(
  * grava a cada set() sem esperar; antes de uma chamada à nuvem que não pode se perder (acerto com
  * o entregador), espere esta para o app fechado logo depois não perder o que foi guardado
  * (auditoria interna do PR #54). A transação nova fica atrás das anteriores no IndexedDB.
- * Devolve false se a gravação falhou (nunca lança).
+ * Devolve false se a gravação falhou (nunca lança), também quando o estado só ficou na memória porque o
+ * IndexedDB e o localStorage recusaram (o adaptador do persist cai para a memória sem avisar; Codex no PR #54).
  */
 export async function awaitPersisted(): Promise<boolean> {
   try {
@@ -6966,7 +6967,7 @@ export async function awaitPersisted(): Promise<boolean> {
     if (!o.storage || !o.name) return false;
     const state = o.partialize ? o.partialize(useTcheStore.getState()) : useTcheStore.getState();
     await o.storage.setItem(o.name, { state, version: o.version });
-    return true;
+    return !storedOnlyInMemory(o.name);
   } catch {
     return false;
   }

@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 // Acerto com o entregador pela nuvem: o PIN de quem acertou vai junto e a recusa dele é
 // definitiva; pagamento de conta paga na entrega ainda na fila segura o acerto (GPT, rodada 10 do PR #54).
 import { beforeEach, describe, expect, it } from 'vitest';

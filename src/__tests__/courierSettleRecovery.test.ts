@@ -120,27 +120,27 @@ describe('pendência do acerto volta quando a nuvem recusa o registro do gerente
 });
 
 describe('awaitPersisted: o estado está gravado no aparelho antes da chamada à nuvem', () => {
-  it('só termina depois que a gravação do estado atual termina, e grava o estado atual', async () => {
-    let release!: () => void;
+  it('grava o estado atual no aparelho e devolve true', async () => {
     const writes: string[] = [];
-    vi.spyOn(idbStorage, 'setItem').mockImplementation((_k, v) => {
+    const orig = Storage.prototype.setItem;
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, k: string, v: string) {
       writes.push(v);
-      return new Promise<void>((r) => { release = r; });
+      orig.call(this, k, v);
     });
     useTcheStore.setState({ courierSettlePending: [{ id: 'pend-1' } as never] });
-    let done = false;
-    const p = awaitPersisted().then((ok) => { done = ok; });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(done).toBe(false);
+    await expect(awaitPersisted()).resolves.toBe(true);
     expect(writes.at(-1)).toContain('pend-1');
-    release();
-    await p;
-    expect(done).toBe(true);
   });
 
   it('falha na gravação não lança (o acerto segue como antes): devolve false', async () => {
-    vi.spyOn(idbStorage, 'setItem').mockImplementation(() => Promise.reject(new Error('quota')));
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    await expect(awaitPersisted()).resolves.toBe(false);
+  });
+
+  it('o estado que só ficaria na memória (IndexedDB e localStorage recusam) não conta como gravado (Codex no PR #54)', async () => {
+    // O adaptador do persist cai para a memória sem avisar: awaitPersisted não pode devolver true.
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('cheio', 'QuotaExceededError'); });
+    expect(() => idbStorage.setItem('x', 'y')).not.toThrow();
     await expect(awaitPersisted()).resolves.toBe(false);
   });
 });

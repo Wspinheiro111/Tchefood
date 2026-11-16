@@ -28,6 +28,20 @@ import { setReviewHold } from '../../src/lib/payments/reviewHolds';
 import { beginLocalClaim, generateReleaseToken } from '../../src/lib/payments/claimLedger';
 import { createSupabaseLikeDb, pgTargetFromEnv, postgrestFetch, psql, psqlFile, type EmulatorLog, type PgTarget } from './postgrestEmulator';
 
+// O aparelho grava o acerto com o entregador antes de chamar a nuvem, e o que fica só na memória não conta
+// (Codex no PR #54). Sem navegador aqui: um localStorage em memória faz o papel do armazenamento do aparelho.
+if (typeof globalThis.localStorage === 'undefined') {
+  const m = new Map<string, string>();
+  (globalThis as { localStorage?: Storage }).localStorage = {
+    get length() { return m.size; },
+    clear: () => m.clear(),
+    getItem: (k: string) => m.get(k) ?? null,
+    key: (i: number) => [...m.keys()][i] ?? null,
+    removeItem: (k: string) => { m.delete(k); },
+    setItem: (k: string, v: string) => { m.set(k, String(v)); },
+  };
+}
+
 // A espera depois de falha da leitura das contas fica na memória do módulo: cada teste começa sem
 // ela, como um aparelho que acabou de abrir o app (auditoria interna, rodada 8 do PR #54).
 beforeEach(() => resetPullLoopForTests());

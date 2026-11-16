@@ -51,18 +51,29 @@ const fallback: StateStorage = {
   setItem: (k, v) => {
     try {
       localStorage.setItem(k, v);
+      memory.delete(k);
     } catch {
       memory.set(k, v);
     }
   },
   removeItem: (k) => {
+    memory.delete(k);
     try {
       localStorage.removeItem(k);
     } catch {
-      memory.delete(k);
+      // nada a apagar fora da memória
     }
   },
 };
+
+/**
+ * A última gravação desta chave ficou só na memória (IndexedDB e localStorage recusaram, por exemplo sem espaço):
+ * some ao fechar o app. O adaptador não lança nesse caso (o persist do Zustand grava sem esperar); quem precisa
+ * saber antes de uma chamada à nuvem que não pode se perder (acerto com o entregador) confere aqui (Codex no PR #54).
+ */
+export function storedOnlyInMemory(k: string): boolean {
+  return memory.has(k);
+}
 
 export const idbStorage: StateStorage = hasIndexedDB
   ? {
@@ -77,6 +88,7 @@ export const idbStorage: StateStorage = hasIndexedDB
       setItem: async (k, v) => {
         try {
           await tx('readwrite', (s) => s.put(v, k));
+          memory.delete(k);
         } catch {
           fallback.setItem(k, v);
         }
