@@ -375,15 +375,35 @@ describe('mais de 500 contas pedidas pelo id: cada leitura pede o lote seguinte 
     const { reconcileWindow } = await import('../lib/sync/orderPull');
     const ids = Array.from({ length: 1200 }, (_, n) => id(n));
     const seen = new Set<string>();
-    let cursor = 0;
+    let after: string | null = null;
     for (let i = 0; i < 3; i++) {
-      const w = reconcileWindow(ids, cursor);
+      const w = reconcileWindow(ids, after);
       expect(w.ids).toHaveLength(500);
       w.ids.forEach((x) => seen.add(x));
-      cursor = w.next;
+      after = w.next;
     }
     expect(seen.size).toBe(1200);
-    expect(reconcileWindow(ids.slice(0, 10), 7)).toEqual({ ids: ids.slice(0, 10), next: 0 });
+    expect(reconcileWindow(ids.slice(0, 10), id(7))).toEqual({ ids: ids.slice(0, 10), next: null });
+  });
+
+  it('lista que muda entre leituras não pula id ainda não pedido no giro (GPT, rodada 14)', async () => {
+    const { reconcileWindow } = await import('../lib/sync/orderPull');
+    let ids = Array.from({ length: 1200 }, (_, n) => id(n));
+    const first = reconcileWindow(ids, null);
+    // 100 contas do primeiro lote fecham e 50 novas entram antes do fim da lista.
+    ids = [...ids.filter((x) => !first.ids.slice(0, 100).includes(x)), ...Array.from({ length: 50 }, (_, n) => id(5000 + n))];
+    const seen = new Set<string>();
+    let after = first.next;
+    for (let i = 0; i < 3; i++) {
+      const w = reconcileWindow(ids, after);
+      w.ids.forEach((x) => seen.add(x));
+      after = w.next;
+    }
+    // Do id 500 em diante (e as 50 novas), tudo foi pedido no mesmo giro.
+    for (const x of ids.filter((x) => x > first.next!)) expect(seen.has(x)).toBe(true);
+    expect(seen.has(id(500))).toBe(true);
+    // O id que sumiu da lista: o próximo lote começa no seguinte que ainda existe.
+    expect(reconcileWindow([id(1), id(3), ...Array.from({ length: 600 }, (_, n) => id(1000 + n))], id(2)).ids[0]).toBe(id(3));
   });
 
   it('a conta encerrada em outro aparelho fora do primeiro lote chega e libera a mesa', async () => {
@@ -408,6 +428,28 @@ describe('mais de 500 contas pedidas pelo id: cada leitura pede o lote seguinte 
     await tick({ forcePull: true });
     expect(st().orders.find((o) => o.id === target)!.status).toBe('CLOSED');
     expect(st().tables.find((t) => t.id === table.id)!.current_order_id).toBeNull();
+  });
+
+  it('foto que não pode ser aplicada pede o mesmo lote de novo (GPT, rodada 14)', async () => {
+    const local = Array.from({ length: 600 }, (_, n) => openOrder(id(n), `mesa-${n}`));
+    useTcheStore.setState((s) => ({ orders: [...s.orders, ...local] }));
+    fake.catalog.mockResolvedValue(catalogOfDemo());
+    let calls = 0;
+    fake.orders.mockImplementation(async () => {
+      calls += 1;
+      // Primeira foto traz um produto que nenhuma leitura dos cadastros conhece: não é aplicada.
+      if (calls === 1) return { ...empty(), orders: [openOrder(id(0), 'mesa-0')], orderItems: [{ id: 'it-x', order_id: id(0), product_id: 'produto-que-nao-existe', quantity: 1, unit_price: 1, total_price: 1, status: 'PENDING', is_paid: false, sector: 'KITCHEN', created_at: new Date().toISOString() } as never] };
+      return empty();
+    });
+    await tick({ forcePull: true });
+    await tick({ forcePull: true });
+    const asked = fake.orders.mock.calls.map((c) => c[3] as string[]);
+    expect(asked.length).toBeGreaterThanOrEqual(2);
+    expect(asked[1]).toEqual(asked[0]);
+    await tick({ forcePull: true });
+    const third = fake.orders.mock.calls.at(-1)![3] as string[];
+    expect(third).not.toEqual(asked[0]);
+    expect(third).toContain(id(599));
   });
 
   it('a entrega sem acerto fora do primeiro lote também é pedida', async () => {

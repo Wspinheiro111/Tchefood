@@ -410,14 +410,17 @@ export const RECONCILE_BATCH = 500;
  * Assim toda conta em aberto aqui e toda entrega sem acerto é pedida a cada
  * ceil(n / 500) leituras, em vez de as mesmas 500 primeiras sempre. A junção já trata a resposta
  * como parte: conta pedida que não veio fica como está e é pedida de novo no próximo giro.
- * `cursor` é a posição do próximo lote; devolve o lote e a posição seguinte.
+ * `after` é o último id do lote anterior (não a posição): conta que sai ou entra na lista entre
+ * duas leituras não faz o lote pular ids que ainda não foram pedidos neste giro (GPT, rodada 14).
+ * Devolve o lote e o `after` da próxima leitura.
  */
-export function reconcileWindow(ids: readonly UUID[], cursor: number, size = RECONCILE_BATCH): { ids: UUID[]; next: number } {
+export function reconcileWindow(ids: readonly UUID[], after?: UUID | null, size = RECONCILE_BATCH): { ids: UUID[]; next: UUID | null } {
   const sorted = [...new Set(ids)].sort();
-  if (sorted.length <= size) return { ids: sorted, next: 0 };
-  const start = Number.isInteger(cursor) && cursor > 0 ? cursor % sorted.length : 0;
+  if (sorted.length <= size) return { ids: sorted, next: null };
+  const found = after ? sorted.findIndex((x) => x > after) : 0;
+  const start = found < 0 ? 0 : found;
   const batch = [...sorted.slice(start, start + size), ...sorted.slice(0, Math.max(0, start + size - sorted.length))];
-  return { ids: batch, next: (start + size) % sorted.length };
+  return { ids: batch, next: batch[batch.length - 1] ?? null };
 }
 
 /**

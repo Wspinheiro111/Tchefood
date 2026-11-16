@@ -40,8 +40,12 @@ interface PullLoopState {
   lastOrdersFailureMs: number;
   /** Falhas seguidas da leitura das contas (zera quando dá certo). */
   ordersFailures: number;
-  /** Posição do próximo lote de ids pedidos pelo id (reconcileWindow; GPT, rodada 13 do PR #54). */
-  reconcileCursor?: number;
+  /**
+   * Último id do lote pedido pelo id na última foto aplicada (reconcileWindow; GPT, rodadas 13 e
+   * 14 do PR #54). Só anda quando a foto é aplicada: foto que falha ou não pode ser aplicada pede
+   * o mesmo lote de novo.
+   */
+  reconcileAfter?: string | null;
   /** Início da última leitura dos cadastros pedida pelas contas (deu certo ou não). */
   lastCatalogRereadMs: number | null;
   /**
@@ -218,9 +222,8 @@ async function pullOrdersOnce(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh:
     // leitura inteira, e o id inválido ocuparia uma das 500 vagas da lista.
     // Com as contas das entregas ainda sem acerto aqui (Codex no PR #54): ver orderIdsToReconcile.
     // Mais de 500: cada leitura pede o lote seguinte (GPT, rodada 13 do PR #54).
-    const batch = reconcileWindow(orderIdsToReconcile(useTcheStore.getState()), loopFor(tenantId).reconcileCursor ?? 0);
+    const batch = reconcileWindow(orderIdsToReconcile(useTcheStore.getState()), loopFor(tenantId).reconcileAfter);
     const snapshot = await fetchCloudOrders(cfg, tenantId, fetchFn, batch.ids);
-    loopFor(tenantId).reconcileCursor = batch.next;
     let st = useTcheStore.getState();
     if (!st.cloud || st.tenant.id !== tenantId) return 'discarded';
     const known = () => ({ productIds: useTcheStore.getState().products.map((p) => p.id), tableIds: useTcheStore.getState().tables.map((t) => t.id) });
@@ -272,6 +275,7 @@ async function pullOrdersOnce(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh:
       st.setPullError(r.error, 'orders');
       return 'failed';
     }
+    loopFor(tenantId).reconcileAfter = batch.next;
     // Contas deixadas de lado (valor que este aparelho não reconhece): o resto foi aplicado,
     // mas o aviso fica para a equipe ver (auditoria interna, rodada 8 do PR #54).
     const skipped = snapshot.skippedOrderIds?.length ? skippedMessage(snapshot) : null;
