@@ -617,6 +617,21 @@ BEGIN
        AND current_setting('tchefood.courier_settle', true) IS DISTINCT FROM NEW.settlement_id::text THEN
         RAISE EXCEPTION 'TCHEFOOD_ENTREGA_ACERTO_ONLINE: a entrega só entra num acerto pela nuvem (tchefood_settle_courier).';
     END IF;
+    -- Cópia velha de outro aparelho de uma entrega já acertada em outro (sem o acerto, com o
+    -- andamento de antes ou igual): o acerto e o andamento da nuvem ficam, e a atualização é
+    -- aceita sem mudar nada, em vez de ser recusada para sempre e travar o acerto daquele
+    -- aparelho (Codex no PR #54). Mudança de verdade (cliente, endereço, taxa, cancelamento)
+    -- continua com as travas de schema_entrega.sql.
+    IF OLD.settlement_id IS NOT NULL AND NEW.settlement_id IS NULL AND NEW.status <> 'CANCELED' AND v_new <= v_old THEN
+        RAISE NOTICE 'TCHEFOOD_ENTREGA_COPIA_VELHA: a entrega % já foi acertada e fica como está.', OLD.id;
+        NEW.settlement_id := OLD.settlement_id;
+        NEW.status := OLD.status;
+        NEW.courier_id := OLD.courier_id;
+        NEW.courier_fee := OLD.courier_fee;
+        NEW.out_at := OLD.out_at;
+        NEW.delivered_at := OLD.delivered_at;
+        RETURN NEW;
+    END IF;
     -- Entrega cancelada ou acertada, e o cancelamento: ficam com as travas de schema_entrega.sql.
     IF OLD.status = 'CANCELED' OR OLD.settlement_id IS NOT NULL OR NEW.status = 'CANCELED' THEN
         RETURN NEW;

@@ -3405,6 +3405,16 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     expect((await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, { ...settled, courier_fee: 0 })).status).toBeGreaterThanOrEqual(400);
     expect((await raw('PATCH', `courier_settlements?id=eq.${settlement.id}`, { cash_collected: 0 })).status).toBeGreaterThanOrEqual(400);
     expect((await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, settled)).status).toBeLessThan(300);
+    // Cópia velha de outro aparelho, sem o acerto (marcou entregue antes de saber dele): é aceita
+    // e o acerto e o andamento da nuvem ficam; mudança de verdade continua recusada (Codex no PR #54).
+    const settledRow = () => sql(`SELECT status || ' ' || settlement_id || ' ' || courier_fee FROM own_deliveries WHERE id = '${d1!.id}'`);
+    const beforeStale = settledRow();
+    expect((await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, { ...settled, settlement_id: null })).status).toBeLessThan(300);
+    expect((await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, { ...settled, settlement_id: null, status: 'OUT', delivered_at: null })).status).toBeLessThan(300);
+    expect(settledRow()).toBe(beforeStale);
+    expect((await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, { ...settled, settlement_id: null, address: 'Rua Trocada 99' })).status).toBeGreaterThanOrEqual(400);
+    expect((await raw('PATCH', `own_deliveries?id=eq.${d1!.id}`, { ...settled, settlement_id: null, status: 'CANCELED' })).status).toBeGreaterThanOrEqual(400);
+    expect(settledRow()).toBe(beforeStale);
     expect((await raw('POST', 'courier_settlements?on_conflict=id', settlement, 'resolution=ignore-duplicates,return=minimal')).status).toBeLessThan(300);
     // Acerto gravado direto na tabela, sem a função: recusado.
     const wrong = await raw('POST', 'courier_settlements', { ...settlement, id: crypto.randomUUID() });
