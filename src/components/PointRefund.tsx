@@ -457,6 +457,8 @@ export function RefundReopenedOrders({ onOpenCheckout, deps }: { onOpenCheckout?
     ? 'este aparelho tem alteração desta conta recusada pela nuvem: resolva em Nuvem › recusados; depois a conta vem do servidor e as ações aparecem aqui.'
     : blocked[id] === 'pending'
       ? 'este aparelho tem alteração desta conta ainda não enviada: aguarde a sincronização; depois a conta vem do servidor e as ações aparecem aqui.'
+      : blocked[id] === 'missing'
+        ? 'a conta não foi encontrada no servidor, então não dá para cobrar nem encerrar por aqui; tentando de novo a cada minuto.'
       : stale
         ? 'a conta pode já ter sido paga ou encerrada em outro aparelho e não foi conferida (a leitura da nuvem falhou); tentando de novo a cada minuto.'
         : 'ainda não trazida para este aparelho (leitura da nuvem falhou); tentando de novo a cada minuto.');

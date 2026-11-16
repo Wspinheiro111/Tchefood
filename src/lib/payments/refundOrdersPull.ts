@@ -69,7 +69,7 @@ export function refundChangesSeq(): number {
   return Number.isSafeInteger(n) && n > 0 ? n : 0;
 }
 
-export type BlockedReason = 'pending' | 'rejected' | 'failed';
+export type BlockedReason = 'pending' | 'rejected' | 'failed' | 'missing';
 
 export interface RefundOrdersPull {
   /** false: alguma leitura do servidor falhou (o que deu para ler foi aplicado; tenta de novo na próxima). */
@@ -105,7 +105,8 @@ async function pullRefundOrderChanges(scope: PullScope, deps: ClaimDeps): Promis
     const r = await syncOrderFromServer(c.order_id, deps, scope);
     if (r !== 'applied') {
       upTo = Math.min(upTo, c.last_seq - 1);
-      if (r === 'failed' || r === 'missing') ok = false;
+      // GPT r19 P2-02: conta que não convergiu (evento na fila ou recusado, sem leitura, não encontrada) deixa a leitura incompleta.
+      ok = false;
     }
   }
   if (!sameScope(scope)) return false;
@@ -163,15 +164,17 @@ async function doPull(deps: ClaimDeps, scope: PullScope): Promise<RefundOrdersPu
   }).map((i) => i.order_id);
   // Só este aparelho ainda vê como reaberta (paga ou encerrada em outro aparelho, ou resposta perdida): confere lá.
   const stale = st.orders.filter((o) => isRefundReopenedOrder(o, st.payments, st.auditLogs) && !onServer.has(o.id)).map((o) => o.id);
-  // GPT r18 P2-01: vale para as duas listas. A conta que só este aparelho ainda vê reaberta (paga ou encerrada em outro
-  // aparelho) e não pôde ser atualizada fica bloqueada como as demais, e a leitura que falhou não é "completa".
-  let refreshFailed = false;
+  // GPT r18 P2-01 e r19: vale para as duas listas. Conta que não pôde ser atualizada (retrato com erro, evento dela na
+  // fila ou recusado, ou não encontrada no servidor) fica bloqueada, sem ações, e a leitura não é "completa" até convergir.
+  let refreshIncomplete = false;
   for (const id of [...differs, ...stale]) {
     const r = await syncOrderFromServer(id, deps, scope);
     if (!sameScope(scope)) return { ...nothing, changesOk: false };
-    if (r === 'pending' || r === 'rejected' || r === 'failed') blocked[id] = r;
-    if (r === 'failed') refreshFailed = true;
+    if (r !== 'applied') {
+      blocked[id] = r;
+      refreshIncomplete = true;
+    }
   }
-  const complete = changesOk && !refreshFailed;
+  const complete = changesOk && !refreshIncomplete;
   return { ok: complete, changesOk: complete, reopened: out.items, blocked };
 }
