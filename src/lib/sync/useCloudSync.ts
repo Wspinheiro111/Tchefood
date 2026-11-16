@@ -46,6 +46,11 @@ interface PullLoopState {
    * o mesmo lote de novo.
    */
   reconcileAfter?: string | null;
+  /**
+   * Contas antigas já conferidas com a nuvem nesta abertura do app (pedidas num lote ou vindas na
+   * foto). As que ainda não foram não são cobradas até o lote delas (GPT, rodada 15 do PR #54).
+   */
+  reconciledIds?: Set<string>;
   /** Início da última leitura dos cadastros pedida pelas contas (deu certo ou não). */
   lastCatalogRereadMs: number | null;
   /**
@@ -142,6 +147,17 @@ function pullErrorMessage(e: unknown, source: PullSource): string {
  * (auditoria interna, rodada 8 do PR #54). Sem internet de vez, o laço nem roda (useOnline) e a
  * faixa "Offline" já cobre.
  */
+/**
+ * A loja e a sessão da nuvem de quando a rodada começou ainda são as de agora (GPT, rodada 15 do
+ * PR #54): a falha (ou a resposta) de uma leitura da loja anterior não pode virar aviso nem dado
+ * na loja atual. O token é o da rodada (a renovação só acontece no começo de syncOnce).
+ */
+function sameStore(tenantId: string, cfg: SyncConfig): boolean {
+  const st = useTcheStore.getState();
+  return !!st.cloud && st.tenant.id === tenantId && st.cloud.tenant_id === tenantId
+    && st.cloud.url === cfg.url && st.cloud.access_token === cfg.accessToken;
+}
+
 function reportPullError(e: unknown, source: PullSource): void {
   const network = isNetworkError(e);
   const message = pullErrorMessage(e, source);
@@ -189,18 +205,21 @@ function pullDue(lastPullAt: string | null | undefined, nowMs: number, everyMs: 
 /** Lê os cadastros da nuvem e aplica (o store deixa como está o que ainda não subiu daqui). */
 async function pullCatalog(cfg: SyncConfig, fetchFn: FetchLike): Promise<boolean> {
   const tenantId = useTcheStore.getState().tenant.id;
+  // A loja mudou depois de a rodada começar: o token é o da loja anterior (GPT, rodada 15).
+  if (!sameStore(tenantId, cfg)) return false;
   try {
     const snapshot = await fetchCloudSnapshot(cfg, tenantId, fetchFn);
     const st = useTcheStore.getState();
     // Trocou de loja ou desconectou enquanto lia: descarta.
-    if (!st.cloud || st.tenant.id !== tenantId) return false;
+    if (!sameStore(tenantId, cfg)) return false;
     const r = st.applyCloudSnapshot(snapshot);
     loopFor(tenantId).lastCatalogError = r.ok ? null : r.error;
     if (!r.ok) st.setPullError(r.error, 'catalog');
     return r.ok;
   } catch (e) {
-    const st = useTcheStore.getState();
-    if (st.cloud && st.tenant.id === tenantId) loopFor(tenantId).lastCatalogError = pullErrorMessage(e, 'catalog');
+    // Trocou de loja ou desconectou enquanto lia: a falha não é desta loja.
+    if (!sameStore(tenantId, cfg)) return false;
+    loopFor(tenantId).lastCatalogError = pullErrorMessage(e, 'catalog');
     reportPullError(e, 'catalog');
     return false;
   }
@@ -216,16 +235,19 @@ async function pullCatalog(cfg: SyncConfig, fetchFn: FetchLike): Promise<boolean
  */
 async function pullOrdersOnce(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh: boolean, force: boolean): Promise<'ok' | 'failed' | 'discarded'> {
   const tenantId = useTcheStore.getState().tenant.id;
+  // A loja mudou depois de a rodada começar: o token é o da loja anterior (GPT, rodada 15).
+  if (!sameStore(tenantId, cfg)) return 'discarded';
   try {
     // Só ids UUID vão para p_order_ids (auditoria interna, rodada 8 do PR #54): o banco
     // atualizado ignora o id fora do formato, mas um banco ainda sem a migração recusaria a
     // leitura inteira, e o id inválido ocuparia uma das 500 vagas da lista.
     // Com as contas das entregas ainda sem acerto aqui (Codex no PR #54): ver orderIdsToReconcile.
     // Mais de 500: cada leitura pede o lote seguinte (GPT, rodada 13 do PR #54).
-    const batch = reconcileWindow(orderIdsToReconcile(useTcheStore.getState()), loopFor(tenantId).reconcileAfter);
+    const reconcileIds = orderIdsToReconcile(useTcheStore.getState());
+    const batch = reconcileWindow(reconcileIds, loopFor(tenantId).reconcileAfter);
     const snapshot = await fetchCloudOrders(cfg, tenantId, fetchFn, batch.ids);
     let st = useTcheStore.getState();
-    if (!st.cloud || st.tenant.id !== tenantId) return 'discarded';
+    if (!sameStore(tenantId, cfg)) return 'discarded';
     const known = () => ({ productIds: useTcheStore.getState().products.map((p) => p.id), tableIds: useTcheStore.getState().tables.map((t) => t.id) });
     // Adicionais e sabores do meio a meio que este aparelho não tem e que ainda não foram
     // conferidos numa leitura dos cadastros feita depois de uma foto que os trazia.
@@ -247,7 +269,7 @@ async function pullOrdersOnce(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh:
       loopFor(tenantId).lastCatalogRereadMs = nowMs;
       const ok = await pullCatalog(cfg, fetchFn);
       st = useTcheStore.getState();
-      if (!st.cloud || st.tenant.id !== tenantId) return 'discarded';
+      if (!sameStore(tenantId, cfg)) return 'discarded';
       // A leitura deu certo e começou depois da foto: o que ainda falta não vai chegar.
       if (ok) {
         const now = new Set([...st.modifierOptions.map((m) => m.id), ...st.products.map((p) => p.id)]);
@@ -270,18 +292,28 @@ async function pullOrdersOnce(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh:
     }
     // Uma mudança deste aparelho pode ter entrado na fila enquanto a leitura voltava: o
     // store confere a fila de agora e deixa essa conta como está.
-    const r = st.applyCloudOrders(snapshot);
+    // Contas antigas conferidas: as pedidas neste lote e as que vieram na foto (abertas na nuvem
+    // ou encerradas nas últimas 24 h). As outras esperam o lote delas e não são cobradas até lá
+    // (GPT, rodada 15 do PR #54). Só as da lista de antes da leitura: conta aberta aqui enquanto
+    // a leitura voltava é nova, não está atrasada.
+    const loop = loopFor(tenantId);
+    const seen = new Set<string>([...(loop.reconciledIds ?? []), ...batch.ids, ...snapshot.orders.map((o) => o.id), ...(snapshot.skippedOrderIds ?? [])]);
+    const unreconciledOrderIds = reconcileIds.filter((id) => !seen.has(id));
+    const r = st.applyCloudOrders(snapshot, { unreconciledOrderIds });
     if (!r.ok) {
       st.setPullError(r.error, 'orders');
       return 'failed';
     }
-    loopFor(tenantId).reconcileAfter = batch.next;
+    loop.reconcileAfter = batch.next;
+    loop.reconciledIds = new Set(reconcileIds.filter((id) => seen.has(id)));
     // Contas deixadas de lado (valor que este aparelho não reconhece): o resto foi aplicado,
     // mas o aviso fica para a equipe ver (auditoria interna, rodada 8 do PR #54).
     const skipped = snapshot.skippedOrderIds?.length ? skippedMessage(snapshot) : null;
     if (skipped) useTcheStore.getState().setPullError(skipped, 'orders');
     return 'ok';
   } catch (e) {
+    // Trocou de loja ou desconectou enquanto lia: a falha não é desta loja (GPT, rodada 15).
+    if (!sameStore(tenantId, cfg)) return 'discarded';
     reportPullError(e, 'orders');
     return 'failed';
   }
@@ -409,6 +441,8 @@ export function cloudStaleMessage(input: {
    * sem leitura nenhuma (auditoria interna, rodada 8 do PR #54). Ausente: já houve.
    */
   ordersRoundRan?: boolean;
+  /** Contas antigas que ainda esperam o lote delas (cloudUnreconciledOrderIds; GPT, rodada 15). */
+  unreconciled?: number;
 }): string | null {
   if (!input.cloud) return null;
   if (input.ordersRoundRan === false && !(input.nowMs - input.sessionSinceMs > ORDERS_STALE_MS)) return null;
@@ -422,8 +456,11 @@ export function cloudStaleMessage(input: {
   } else if (input.nowMs - input.sessionSinceMs > ORDERS_STALE_MS) {
     stale = 'Contas ainda não atualizadas da nuvem neste aparelho: confira o saldo antes de cobrar.';
   }
-  if (stale && ordersError) return `${stale} ${ordersError}`;
-  return stale ?? ordersError;
+  const waiting = input.unreconciled && input.unreconciled > 0
+    ? `${input.unreconciled === 1 ? '1 conta antiga deste aparelho ainda não foi conferida' : `${input.unreconciled} contas antigas deste aparelho ainda não foram conferidas`} com a nuvem: não são cobradas até lá.`
+    : null;
+  const parts = [stale, ordersError, waiting].filter((x): x is string => !!x);
+  return parts.length > 0 ? parts.join(' ') : null;
 }
 
 /**
@@ -461,7 +498,8 @@ export function useCloudStaleMessage(): string | null {
     const id = setInterval(() => setNowMs(Date.now()), 15_000);
     return () => clearInterval(id);
   }, []);
-  return cloudStaleMessage({ cloud: hasSession, pullStatus, sessionSinceMs, nowMs, ordersRoundRan: roundRan });
+  const unreconciled = useTcheStore((s) => (s.cloudUnreconciledOrderIds ?? []).length);
+  return cloudStaleMessage({ cloud: hasSession, pullStatus, sessionSinceMs, nowMs, ordersRoundRan: roundRan, unreconciled });
 }
 
 /** URL e chave pública do projeto Supabase vindas do build (.env). */

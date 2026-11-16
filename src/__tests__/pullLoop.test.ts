@@ -452,6 +452,50 @@ describe('mais de 500 contas pedidas pelo id: cada leitura pede o lote seguinte 
     expect(third).toContain(id(599));
   });
 
+  it('conta antiga que espera o lote dela fica não conferida, não é cobrada e depois fecha (GPT, rodada 15)', async () => {
+    const table = st().tables.find((t) => t.kind === 'TABLE')!;
+    const target = id(500);
+    const local = Array.from({ length: 501 }, (_, n) => openOrder(id(n), n === 500 ? table.id : `mesa-${n}`));
+    useTcheStore.setState((s) => ({
+      orders: [...s.orders, ...local],
+      tables: s.tables.map((t) => (t.id === table.id ? { ...t, status: 'OCCUPIED', current_order_id: target } : t)),
+    }));
+    const closedAt = new Date(Date.now() - 2 * 24 * 3600_000).toISOString();
+    fake.catalog.mockResolvedValue(catalogOfDemo());
+    fake.orders.mockImplementation(async (...args: unknown[]) => {
+      const asked = args[3] as string[];
+      if (!asked.includes(target)) return empty();
+      const closed = { ...openOrder(target, table.id), status: 'CLOSED' as const, closed_at: closedAt, paid_amount: 50, remaining_balance: 0 };
+      return { ...empty(), orders: [closed], tables: [{ id: table.id, status: 'FREE', current_order_id: null, updated_at: closedAt }] };
+    });
+    await tick({ forcePull: true });
+    // Só o primeiro lote: a conta continua aberta aqui, mas marcada como não conferida.
+    expect(st().orders.find((o) => o.id === target)!.status).toBe('OPEN');
+    // (com as contas abertas da demonstração, de id maior, também fora do primeiro lote)
+    const waiting = st().cloudUnreconciledOrderIds!;
+    expect(waiting).toContain(target);
+    expect(waiting.every((x) => !(fake.orders.mock.calls[0]![3] as string[]).includes(x))).toBe(true);
+    expect(cloudStaleMessage({ cloud: true, pullStatus: st().pullStatus, sessionSinceMs: Date.now(), nowMs: Date.now(), unreconciled: waiting.length })).toMatch(new RegExp(`${waiting.length} contas antigas deste aparelho ainda não foram conferidas com a nuvem`));
+    expect(cloudStaleMessage({ cloud: true, pullStatus: st().pullStatus, sessionSinceMs: Date.now(), nowMs: Date.now(), unreconciled: 1 })).toMatch(/1 conta antiga deste aparelho ainda não foi conferida/);
+    // Cobrar em dinheiro aqui é recusado enquanto ela espera o lote.
+    const login = st().login('5555');
+    if (!login.ok) throw new Error(login.error);
+    const paid = st().registerPayment({ orderId: target, amount: 50, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'nao-conferida', item_ids: [] });
+    expect(paid.ok).toBe(false);
+    expect(paid.ok ? '' : paid.error).toMatch(/ainda não foi conferida com a nuvem/);
+    expect(st().payments.some((p) => p.order_id === target)).toBe(false);
+    // As do primeiro lote foram conferidas e continuam cobráveis.
+    expect(st().cloudUnreconciledOrderIds).not.toContain(id(0));
+    // Próximo lote: o fechamento chega, a mesa fica livre e nada mais espera.
+    await tick({ forcePull: true });
+    expect(st().orders.find((o) => o.id === target)!.status).toBe('CLOSED');
+    expect(st().tables.find((t) => t.id === table.id)!.current_order_id).toBeNull();
+    expect(st().cloudUnreconciledOrderIds).toEqual([]);
+    // A volta seguinte (primeiro lote de novo) não marca de novo as já conferidas.
+    await tick({ forcePull: true });
+    expect(st().cloudUnreconciledOrderIds).toEqual([]);
+  });
+
   it('a entrega sem acerto fora do primeiro lote também é pedida', async () => {
     const local = Array.from({ length: 600 }, (_, n) => openOrder(id(n), `mesa-${n}`));
     const deliveryOrder = id(700);
@@ -466,5 +510,38 @@ describe('mais de 500 contas pedidas pelo id: cada leitura pede o lote seguinte 
     for (const c of fake.orders.mock.calls) expect((c[3] as string[]).length).toBeLessThanOrEqual(500);
     const asked = fake.orders.mock.calls.flatMap((c) => c[3] as string[]);
     expect(asked).toContain(deliveryOrder);
+  });
+});
+
+describe('falha de leitura da loja anterior não aparece na loja atual (GPT, rodada 15 do PR #54)', () => {
+  const B = '0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e';
+  const switchToB = () => useTcheStore.setState((s) => ({ tenant: { ...s.tenant, id: B }, cloud: { ...session(B), access_token: 'jwt-b' }, pullStatus: { ...s.pullStatus, last_error: null, last_error_source: null } }));
+
+  it('contas: a leitura de A falha depois da troca para B e B fica como estava', async () => {
+    let reject: (e: unknown) => void = () => undefined;
+    fake.orders.mockImplementation(() => new Promise((_, rej) => { reject = rej; }));
+    const round = syncOnce(noFetch, {});
+    await vi.waitFor(() => expect(fake.orders).toHaveBeenCalledTimes(1));
+    switchToB();
+    const before = st().pullStatus;
+    reject(new Error('Não foi possível ler as contas da nuvem: HTTP 500'));
+    await round;
+    expect(st().pullStatus).toEqual(before);
+    expect(st().pullStatus?.last_error ?? null).toBeNull();
+  });
+
+  it('cadastros: a leitura de A falha depois da troca para B e B fica como estava', async () => {
+    let reject: (e: unknown) => void = () => undefined;
+    fake.catalog.mockImplementation(() => new Promise((_, rej) => { reject = rej; }));
+    fake.orders.mockImplementation(async () => { throw new Error('as contas de B não deviam ser lidas com o token de A'); });
+    useTcheStore.setState((s) => ({ pullStatus: { ...s.pullStatus, last_pull_at: null, last_orders_pull_at: new Date().toISOString() } }));
+    const round = syncOnce(noFetch, { forcePull: true });
+    await vi.waitFor(() => expect(fake.catalog).toHaveBeenCalledTimes(1));
+    switchToB();
+    const before = st().pullStatus;
+    reject(new Error('Não foi possível ler os cadastros da nuvem: HTTP 500'));
+    await round;
+    expect(st().pullStatus).toEqual(before);
+    expect(fake.orders).not.toHaveBeenCalled();
   });
 });

@@ -456,6 +456,14 @@ interface DeviceSlice {
    */
   cloudSkippedOrderIds?: UUID[];
   /**
+   * Contas antigas deste aparelho (em aberto aqui ou com entrega sem acerto) que ainda não foram
+   * conferidas com a nuvem: com mais de 500, cada leitura pede um lote, e a conta que espera o
+   * lote dela pode ter sido encerrada em outro aparelho há mais de 24 h (GPT, rodada 15 do PR #54).
+   * Não são cobradas aqui até o lote delas chegar (chargeBlock), e a tela avisa. Ausente nas
+   * versões antigas (= []).
+   */
+  cloudUnreconciledOrderIds?: UUID[];
+  /**
    * Vendas de balcão (Ficha Rápida) que chegaram pagas pela leitura da nuvem: foram recebidas em
    * outro aparelho, que imprime as fichas delas. Este aparelho não as imprime, porque não tem as
    * fichas já entregues ao cliente e imprimiria outro jogo de códigos (Codex, PR #54). Ausente = [].
@@ -595,7 +603,11 @@ interface Actions {
    * Contas, itens, pagamentos e ocupação das mesas lidos da nuvem (src/lib/sync/orderPull.ts):
    * a nuvem manda no dinheiro; conta com mudança deste aparelho ainda pendente fica como está.
    */
-  applyCloudOrders: (snapshot: CloudOrders) => ActionResult<{ replaced: number }>;
+  /**
+   * `unreconciledOrderIds`: contas antigas que esta foto não conferiu (lote de outra leitura;
+   * GPT, rodada 15 do PR #54). Ausente: nenhuma.
+   */
+  applyCloudOrders: (snapshot: CloudOrders, opts?: { unreconciledOrderIds?: UUID[] }) => ActionResult<{ replaced: number }>;
   /**
    * Conta recusada porque a mesa já tinha outra conta aberta (outro aparelho abriu antes,
    * TCHEFOOD_MESA_OCUPADA): os itens dela passam para a conta aberta da mesa e a conta
@@ -784,6 +796,7 @@ function initialDevice(): DeviceSlice {
     // Os caixas da nuvem são da loja: resetDemo não leva os da loja anterior (auditoria interna, rodada 8 do PR #54).
     cloudCashRanges: [],
     cloudSkippedOrderIds: [],
+    cloudUnreconciledOrderIds: [],
     cloudClosedCounterOrderIds: [],
     // Os acertos do entregador pendentes são da loja (auditoria interna, rodada 8 do PR #54).
     courierSettlePending: [],
@@ -1485,6 +1498,7 @@ export const useTcheStore = create<TcheState>()(
       const skippedByPull = (orderId: UUID): boolean => (get().cloudSkippedOrderIds ?? []).includes(orderId);
       const chargeBlock = (orderId: UUID): string | null =>
         skippedByPull(orderId) ? SKIPPED_ORDER_CHARGE
+          : (get().cloudUnreconciledOrderIds ?? []).includes(orderId) ? UNRECONCILED_ORDER_CHARGE
           : cloudDiscountConflict(orderId) ? CLOUD_DISCOUNT_CONFLICT
             : rejectedCashbackRedeem(orderId) ? REJECTED_CASHBACK_REDEEM
               : rejectedTouchesOrder(orderId) ? REJECTED_ORDER_EVENT
@@ -1496,6 +1510,8 @@ export const useTcheStore = create<TcheState>()(
        */
       let reviewedChargeOrderId: UUID | null = null;
       const SKIPPED_ORDER_CHARGE = 'Esta conta tem um valor que esta versão do app não conhece: atualize o app antes de cobrar.';
+      const UNRECONCILED_ORDER_CHARGE =
+        'Esta conta ainda não foi conferida com a nuvem (este aparelho tem mais de 500 contas antigas, conferidas em lotes): ela pode ter sido encerrada em outro aparelho. Espere alguns segundos e tente de novo.';
       const HELD_ORDER_EVENT =
         'Uma mudança desta conta está esperando na fila atrás de outra que a nuvem recusou (da mesa ou de outro registro), e a conta pode já ter sido encerrada e paga em outro aparelho: este aparelho não sabe o saldo certo. Resolva em Retaguarda › Nuvem › recusados antes de cobrar.';
       const CLOUD_DISCOUNT_NEEDS_MANAGER = ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER;
@@ -4081,6 +4097,7 @@ export const useTcheStore = create<TcheState>()(
             cloudCashRanges: [],
             lateItemsOrderIds: [],
             cloudSkippedOrderIds: [],
+            cloudUnreconciledOrderIds: [],
             cloudClosedCounterOrderIds: [],
             // Acertos do entregador pendentes da loja anterior (auditoria interna, rodada 8 do PR #54).
             courierSettlePending: [],
@@ -4192,6 +4209,7 @@ export const useTcheStore = create<TcheState>()(
             cloudCashRanges: [],
             lateItemsOrderIds: [],
             cloudSkippedOrderIds: [],
+            cloudUnreconciledOrderIds: [],
             cloudClosedCounterOrderIds: [],
             // Acertos do entregador pendentes da loja anterior (auditoria interna, rodada 8 do PR #54).
             courierSettlePending: [],
@@ -4252,7 +4270,7 @@ export const useTcheStore = create<TcheState>()(
           return { ok: true, data: { unknownStaff: team.unknown } };
         },
 
-        applyCloudOrders: (snapshot) => {
+        applyCloudOrders: (snapshot, opts) => {
           const state = get();
           if (!state.cloud || snapshot.tenant_id !== state.tenant.id || state.cloud.tenant_id !== state.tenant.id) {
             return fail('As contas da nuvem não são da loja deste aparelho.');
@@ -4301,6 +4319,8 @@ export const useTcheStore = create<TcheState>()(
             // Contas deixadas de lado nesta leitura (valor que esta versão não conhece): não são
             // cobradas aqui até o app ser atualizado (auditoria interna, rodada 8 do PR #54).
             cloudSkippedOrderIds: [...(snapshot.skippedOrderIds ?? [])],
+            // Contas antigas que esperam o lote delas: não são cobradas até lá (GPT, rodada 15).
+            cloudUnreconciledOrderIds: [...(opts?.unreconciledOrderIds ?? [])],
             cloudClosedCounterOrderIds: cloudClosedCounter(state, merged.orders, merged.tables),
             pullStatus: {
               ...(state.pullStatus ?? EMPTY_PULL_STATUS),
