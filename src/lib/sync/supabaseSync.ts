@@ -721,3 +721,35 @@ export function refreshDevice(url: string, anonKey: string, refreshToken: string
 export function needsRefresh(expiresAt: number, nowMs = Date.now()): boolean {
   return expiresAt * 1000 - nowMs < 120_000;
 }
+
+/**
+ * GPT r17 (a verificar): tempo máximo de cada pedido à nuvem. Um pedido que nunca responde (rede parada, servidor
+ * mudo) segurava a rodada inteira para sempre, e com ela a fila e a leitura dos estornos. Passado o prazo o pedido é
+ * abortado e vira "sem conexão": a rodada termina e a seguinte tenta de novo (o envio é idempotente, como em qualquer
+ * queda de rede). Vale também para o acerto com o entregador (Codex no PR #54): sem prazo, o acerto preso deixava
+ * o entregador, a troca de loja e o PIN do gerente travados até reiniciar o app.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
+export function withRequestTimeout(fetchFn: FetchLike, ms: number = REQUEST_TIMEOUT_MS): FetchLike {
+  return (url, init) => {
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        ctrl?.abort();
+        reject(new Error('A nuvem não respondeu a tempo.'));
+      }, ms);
+    });
+    expired.catch(() => undefined);
+    const stop = () => clearTimeout(timer);
+    const call = fetchFn(url, ctrl ? { ...init, signal: ctrl.signal } : init).then(
+      (res) => ({ ok: res.ok, status: res.status, text: () => Promise.race([res.text(), expired]).finally(stop) }),
+      (e) => {
+        stop();
+        throw e;
+      },
+    );
+    return Promise.race([call, expired]);
+  };
+}
+

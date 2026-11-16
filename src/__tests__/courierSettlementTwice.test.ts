@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DELIVERY_REFUSAL_DROPPED, useTcheStore, type PickupLine } from '../store/useTcheStore';
 import type { FetchLike } from '../lib/sync/supabaseSync';
 import { COURIER_SETTLE_OFFLINE } from '../lib/sync/courierSettle';
+import { REQUEST_TIMEOUT_MS } from '../lib/sync/supabaseSync';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
 import { OwnDeliveryBoard } from '../screens/OwnDeliveryBoard';
 
@@ -759,5 +760,30 @@ describe('terminar a pendência recebe só o valor do acerto e não perde senha 
     expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/outro valor/) });
     expect(st().payments).toHaveLength(before);
     expect(missing()).toEqual([expect.objectContaining({ delivery_id: a.delivery.id, amount: planned })]);
+  });
+});
+
+describe('acerto que a nuvem não responde nem recusa (Codex no PR #54)', () => {
+  it.each(['pedido', 'corpo da resposta'])('%s que nunca chega: passado o prazo, fica pendente, nada sai da gaveta e o entregador não fica preso', async (where) => {
+    expect(st().openCashSession(100).ok).toBe(true);
+    const a = deliveredOrder();
+    connectCloud();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const stuck: FetchLike = where === 'pedido'
+      ? () => new Promise(() => {})
+      : async () => ({ ok: true, status: 200, text: () => new Promise<string>(() => {}) });
+    const p = st().settleCourierOnline(a.courier.id, { payFromDrawer: true, auth: MANAGER, fetchFn: stuck });
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS + 10);
+    const r1 = await p;
+    expect(r1).toMatchObject({ ok: false, error: expect.stringMatching(/Nada saiu da gaveta/) });
+    expect(drawerOut()).toEqual([]);
+    const pendingId = (st().courierSettlePending ?? [])[0]!.id;
+    vi.useRealTimers();
+    // A nova tentativa sai (o entregador não ficou "em acerto") com o mesmo id.
+    const calls: Call[] = [];
+    const r2 = await st().settleCourierOnline(a.courier.id, { payFromDrawer: true, auth: MANAGER, pendingId, fetchFn: cloudFn(calls) });
+    if (!r2.ok) throw new Error(r2.error);
+    expect(calls[0]!.body.p_id).toBe(pendingId);
+    expect(drawerOut()).toHaveLength(1);
   });
 });

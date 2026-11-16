@@ -6,7 +6,8 @@
  */
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import { useTcheStore, type PullSource, type PullStatus } from '../../store/useTcheStore';
-import { flushOutbox, needsRefresh, recordKeys, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
+import { flushOutbox, needsRefresh, recordKeys, refreshDevice, withRequestTimeout, type FetchLike, type SyncConfig } from './supabaseSync';
+export { REQUEST_TIMEOUT_MS } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
 import { fetchCloudOrders, missingCatalog, orderIdsToReconcile, missingHalves, missingModifiers, reconcileWindow, skippedMessage } from './orderPull';
 import { pendingRelease } from '../payments/claimLedger';
@@ -207,36 +208,6 @@ function markChecked(tenantId: string, ids: readonly string[]): void {
 }
 
 const browserFetch: FetchLike = (url, init) => fetch(url, init);
-
-/**
- * GPT r17 (a verificar): tempo máximo de cada pedido à nuvem. Um pedido que nunca responde (rede parada, servidor
- * mudo) segurava a rodada inteira para sempre, e com ela a fila e a leitura dos estornos. Passado o prazo o pedido é
- * abortado e vira "sem conexão": a rodada termina e a seguinte tenta de novo (o envio é idempotente, como em qualquer
- * queda de rede).
- */
-export const REQUEST_TIMEOUT_MS = 30_000;
-function withRequestTimeout(fetchFn: FetchLike, ms: number = REQUEST_TIMEOUT_MS): FetchLike {
-  return (url, init) => {
-    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const expired = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        ctrl?.abort();
-        reject(new Error('A nuvem não respondeu a tempo.'));
-      }, ms);
-    });
-    expired.catch(() => undefined);
-    const stop = () => clearTimeout(timer);
-    const call = fetchFn(url, ctrl ? { ...init, signal: ctrl.signal } : init).then(
-      (res) => ({ ok: res.ok, status: res.status, text: () => Promise.race([res.text(), expired]).finally(stop) }),
-      (e) => {
-        stop();
-        throw e;
-      },
-    );
-    return Promise.race([call, expired]);
-  };
-}
 
 /**
  * Uma renovação do token por vez, dividida entre o laço e a cobrança na Point: duas renovações com o mesmo

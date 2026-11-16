@@ -98,7 +98,7 @@ import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
 import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
 import { comboChildrenOf, comboComponents, comboNeedsDoneness, expandComboItem } from '../lib/combos';
 import { mergeCloudOrders, pendingOrderKeys, type CloudOrders } from '../lib/sync/orderPull';
-import { heldRecordKeys, needsRefresh, recordKeys, refreshDevice, type FetchLike } from '../lib/sync/supabaseSync';
+import { heldRecordKeys, needsRefresh, recordKeys, refreshDevice, withRequestTimeout, type FetchLike } from '../lib/sync/supabaseSync';
 import {
   COURIER_SETTLE_OFFLINE,
   COURIER_SETTLED_KEEP_MS,
@@ -6538,7 +6538,9 @@ export const useTcheStore = create<TcheState>()(
           // 1) A nuvem grava o acerto (ou recusa: entrega já acertada em outro aparelho).
           const terms = pending ? pending.terms : JSON.stringify([deliveryIds, feesCents, cashCents]);
           const id = pending ? pending.id : uuid();
-          const fetchFn = opts.fetchFn ?? ((u, init) => fetch(u, init));
+          // Com prazo (pedido e corpo da resposta): passado o prazo, conta como "sem resposta" e a pendente fica para
+          // repetir com o mesmo id, sem prender o entregador, a troca de loja e o PIN do gerente (Codex no PR #54).
+          const fetchFn = withRequestTimeout(opts.fetchFn ?? ((u, init) => fetch(u, init)));
           const dropPending = () => set((s) => ({ courierSettlePending: (s.courierSettlePending ?? []).filter((p) => p.id !== id) }));
           courierSettleInFlight.add(courierId);
           let result: CourierSettleResult;

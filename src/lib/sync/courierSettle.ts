@@ -170,7 +170,13 @@ export async function settleCourierInCloud(cfg: SyncConfig, req: CourierSettleRe
     // Sem o texto do navegador ("Failed to fetch"): não diz nada ao operador.
     return { ok: false, refused: false, message: 'Sem resposta da nuvem.' };
   }
-  const text = await res.text().catch(() => '');
+  let text: string;
+  try {
+    text = await res.text();
+  } catch {
+    // Corpo que não chega (prazo do pedido, conexão caída no meio): resultado incerto, a pendente fica (Codex no PR #54).
+    return { ok: false, refused: false, message: 'Sem resposta da nuvem.' };
+  }
   if (!res.ok) {
     let raw = '';
     let pgCode = '';
