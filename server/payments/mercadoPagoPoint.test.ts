@@ -187,6 +187,16 @@ describe("MercadoPagoPointProvider", () => {
     expect(await codeFor(500)).toBe("unavailable");
   });
 
+  it("F5: 409 desconhecido na criação fica com resultado desconhecido; 409 conhecidos seguem iguais", async () => {
+    const create = (status: number, body: unknown) =>
+      makeProvider(vi.fn().mockResolvedValue(jsonResponse(status, body))).createCharge({ ...request, method: "credit", installments: 1 }).catch((e: unknown) => e);
+    expect(await create(409, { errors: [{ code: "outro" }] })).toMatchObject({ code: "invalid_request", httpStatus: 409, outcomeUnknown: true });
+    expect(await create(409, {})).toMatchObject({ code: "invalid_request", outcomeUnknown: true });
+    expect(await create(409, { errors: [{ code: "idempotency_key_already_used" }] })).toMatchObject({ code: "idempotency_conflict", outcomeUnknown: false });
+    expect(await create(409, { errors: [{ code: "already_queued_order_on_terminal" }] })).toMatchObject({ code: "terminal_busy", outcomeUnknown: false });
+    expect(await create(400, {})).toMatchObject({ code: "invalid_request", outcomeUnknown: false });
+  });
+
   it("falha de rede em escrita marca resultado desconhecido; em leitura não", async () => {
     const failing = vi.fn().mockRejectedValue(new Error("socket hang up"));
     const write = await makeProvider(failing).createCharge(request).catch(e => e as PaymentTerminalProviderError);
@@ -325,5 +335,106 @@ describe("MercadoPagoPointProvider", () => {
   it("ordem sem transação nunca aprova (sem valor pago confirmado)", async () => {
     const r = await makeProvider(vi.fn().mockResolvedValue(jsonResponse(200, { id: "ORD2", status: "processed", status_detail: "processed", total_amount: "50.00", transactions: {} }))).getCharge("ORD2");
     expect(r.status).toBe("manual_review");
+  });
+
+  describe("findChargeByReference (auditoria r5)", () => {
+    const NOW = Date.parse("2026-11-14T12:30:00.000Z");
+    const CREATED = "2026-11-14T12:00:00.000Z";
+    const find = (fetchImpl: ReturnType<typeof vi.fn>, ref = "sale_1", options: { createdAt?: string } = { createdAt: CREATED }) =>
+      new MercadoPagoPointProvider({ accessToken: "TEST-token", fetchImpl: fetchImpl as unknown as typeof fetch, now: () => NOW }).findChargeByReference(ref, options);
+
+    // Busca devolve a lista; a ordem completa vem de GET /v1/orders/{id}.
+    const searchThenGet = (items: unknown[], full: (id: string) => unknown = (id) => order({ id })) =>
+      vi.fn().mockImplementation(async (url: string) => {
+        if (url.includes("/v1/orders?")) return jsonResponse(200, { data: items });
+        return jsonResponse(200, full(decodeURIComponent(url.split("/v1/orders/")[1]!)));
+      });
+
+    it("GET /v1/orders com a referência e a janela em RFC 3339 (gravação ± 10 min, fim nunca no futuro), só leitura", async () => {
+      const fetchImpl = searchThenGet([order()]);
+      const found = await find(fetchImpl);
+      expect(found).toMatchObject({ externalOrderId: "ORD1", externalReference: "sale_1", externalTerminalId: "PAX_A910__SN1", status: "approved", externalPaymentId: "1234567890", amountCents: 5000 });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(fetchImpl.mock.calls[1][0]).toBe("https://api.mercadopago.com/v1/orders/ORD1");
+      const [url, init] = fetchImpl.mock.calls[0];
+      expect(url).toBe("https://api.mercadopago.com/v1/orders?external_reference=sale_1&begin_date=2026-11-14T11%3A50%3A00.000Z&end_date=2026-11-14T12%3A10%3A00.000Z");
+      expect(init.method).toBe("GET");
+      expect(init.body).toBeUndefined();
+      expect(init.headers.Authorization).toBe("Bearer TEST-token");
+      expect(init.headers["X-Idempotency-Key"]).toBeUndefined();
+      const query = new URL(url).searchParams;
+      expect([...query.keys()]).toEqual(["external_reference", "begin_date", "end_date"]);
+      expect(new Date(query.get("begin_date")!).toISOString()).toBe(query.get("begin_date"));
+    });
+
+    it("nenhuma ordem: null", async () => {
+      expect(await find(vi.fn().mockResolvedValue(jsonResponse(200, { data: [] })))).toBeNull();
+    });
+
+    it("só vale referência idêntica e tipo point (ou sem tipo)", async () => {
+      const others = [order({ id: "X1", external_reference: "sale_10" }), order({ id: "X2", external_reference: "SALE_1" }), order({ id: "X3", type: "qr" }), order({ id: "X4", external_reference: undefined }), "lixo", null];
+      expect(await find(vi.fn().mockResolvedValue(jsonResponse(200, { data: others })))).toBeNull();
+      const noType = order({ id: "ORD9" });
+      delete (noType as Record<string, unknown>).type;
+      expect((await find(searchThenGet([...others, noType])))?.externalOrderId).toBe("ORD9");
+    });
+
+    it("F2: janela da busca = gravação ± 10 min, com o fim limitado a agora", async () => {
+      const urlFor = async (createdAt: string) => {
+        const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(200, { data: [] }));
+        await find(fetchImpl, "sale_1", { createdAt });
+        const q = new URL(fetchImpl.mock.calls[0][0]).searchParams;
+        return [q.get("begin_date"), q.get("end_date")];
+      };
+      // Cobrança de 5 min atrás: o fim é agora, não agora + 10 min.
+      expect(await urlFor("2026-11-14T12:25:00.000Z")).toEqual(["2026-11-14T12:15:00.000Z", "2026-11-14T12:30:00.000Z"]);
+      // Cobrança antiga: no máximo 10 min depois da gravação.
+      expect(await urlFor("2026-11-10T08:00:00.000Z")).toEqual(["2026-11-10T07:50:00.000Z", "2026-11-10T08:10:00.000Z"]);
+      // Gravação "no futuro" (relógio torto): o fim nunca passa de agora nem fica antes do começo.
+      expect(await urlFor("2026-11-14T12:35:00.000Z")).toEqual(["2026-11-14T12:25:00.000Z", "2026-11-14T12:30:00.000Z"]);
+    });
+
+    it("F2: do item da busca só vale o id; a ordem completa vem de getCharge", async () => {
+      // Item da busca diz "approved" com outro valor; a leitura pelo id manda.
+      const fetchImpl = searchThenGet([order({ status: "processed", transactions: { payments: [{ id: "P", amount: "999.00", paid_amount: "999.00", status: "processed", status_detail: "accredited" }] } })], (id) => order({ id, status: "at_terminal", status_detail: "at_terminal" }, { status: "at_terminal", status_detail: "at_terminal", paid_amount: undefined }));
+      const found = await find(fetchImpl);
+      expect(found).toMatchObject({ externalOrderId: "ORD1", status: "at_terminal", amountCents: 5000 });
+      // A ordem lida pelo id precisa ter a mesma referência.
+      await expect(find(searchThenGet([order()], (id) => order({ id, external_reference: "outra" })))).rejects.toMatchObject({ code: "malformed_response" });
+      // Item sem id: erro.
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(200, { data: [order({ id: undefined })] })))).rejects.toMatchObject({ code: "malformed_response" });
+    });
+
+    it("F2: busca recusada (400) tem detail próprio (search_refused); 422 continua invalid_request comum", async () => {
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(400, { errors: [{ code: "bad_request" }] })))).rejects.toMatchObject({ code: "invalid_request", httpStatus: 400, detail: "search_refused", outcomeUnknown: false });
+      const other = await find(vi.fn().mockResolvedValue(jsonResponse(422, {}))).catch((e: unknown) => e);
+      expect(other).toMatchObject({ code: "invalid_request", detail: null });
+    });
+
+    it("mais de uma ordem com a referência: erro (multiple_orders), não escolhe", async () => {
+      const err = await find(vi.fn().mockResolvedValue(jsonResponse(200, { data: [order(), order({ id: "ORD2" })] }))).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(PaymentTerminalProviderError);
+      expect(err).toMatchObject({ code: "malformed_response", detail: "multiple_orders", outcomeUnknown: false });
+    });
+
+    it("erro HTTP, rede ou corpo sem lista: erro", async () => {
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(500, {})))).rejects.toMatchObject({ code: "unavailable", outcomeUnknown: false });
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(401, {})))).rejects.toMatchObject({ code: "unauthorized" });
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(404, {})))).rejects.toMatchObject({ code: "not_found" });
+      await expect(find(vi.fn().mockRejectedValue(new TypeError("rede")))).rejects.toMatchObject({ code: "unavailable", outcomeUnknown: false });
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(200, {})))).rejects.toMatchObject({ code: "malformed_response" });
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(200, { data: { results: [] } })))).rejects.toMatchObject({ code: "malformed_response" });
+      // Ordem com a referência, mas ilegível: erro, nunca "não achou".
+      await expect(find(vi.fn().mockResolvedValue(jsonResponse(200, { data: [{ external_reference: "sale_1", type: "point" }] })))).rejects.toMatchObject({ code: "malformed_response" });
+    });
+
+    it("referência inválida ou sem a hora da cobrança: recusa antes da rede", async () => {
+      const fetchImpl = vi.fn();
+      await expect(find(fetchImpl, "x".repeat(65))).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(find(fetchImpl, "sale 1")).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(find(fetchImpl, "sale_1", {})).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(find(fetchImpl, "sale_1", { createdAt: "ontem" })).rejects.toMatchObject({ code: "invalid_request" });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
   });
 });

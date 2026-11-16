@@ -15,5 +15,5 @@
     "types": ["node"]
   },
   "include": ["supabase/functions"],
-  "exclude": ["supabase/functions/emit-nfce/index.ts"]
+  "exclude": ["supabase/functions/emit-nfce/index.ts", "supabase/functions/point-charge/index.ts"]
 }

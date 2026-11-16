@@ -11,18 +11,22 @@ import {
   type PaymentTerminalOperatingMode,
   type PaymentTerminalPaymentMethodType,
   type PaymentTerminalProvider,
-} from "../shared/paymentTerminal";
+} from "../shared/paymentTerminal.ts";
 
 const DEFAULT_BASE_URL = "https://api.mercadopago.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
 const TERMINALS_PAGE_SIZE = 50;
 const MAX_TERMINAL_PAGES = 20;
+// Janela da busca de ordem por referência: da gravação da cobrança menos 10 min até agora mais 10 min (relógios diferentes).
+const SEARCH_MARGIN_MS = 10 * 60_000;
 
 export type MercadoPagoPointProviderOptions = {
   accessToken: string;
   baseUrl?: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** Relógio (ms) para o fim da janela da busca por referência. Padrão: Date.now. */
+  now?: () => number;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -70,6 +74,7 @@ export class MercadoPagoPointProvider implements PaymentTerminalProvider {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
+  private readonly now: () => number;
 
   constructor(options: MercadoPagoPointProviderOptions) {
     if (!options.accessToken) throw new Error("mercado_pago_point_access_token_required");
@@ -77,6 +82,7 @@ export class MercadoPagoPointProvider implements PaymentTerminalProvider {
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.now = options.now ?? Date.now;
   }
 
   async listTerminals(): Promise<PaymentTerminalInfo[]> {
@@ -151,17 +157,69 @@ export class MercadoPagoPointProvider implements PaymentTerminalProvider {
       ...(request.description ? { description: request.description.slice(0, 150) } : {}),
     };
 
-    const { body } = await this.request("POST", "/v1/orders", {
-      mutating: true,
-      idempotencyKey: request.idempotencyKey,
-      payload,
-    });
+    let body: unknown;
+    try {
+      ({ body } = await this.request("POST", "/v1/orders", {
+        mutating: true,
+        idempotencyKey: request.idempotencyKey,
+        payload,
+      }));
+    } catch (error) {
+      // 409 sem código conhecido na criação não prova que a ordem não foi criada: o resultado fica desconhecido
+      // (reconsulta/revisão), nunca recusa direta. Os 409 conhecidos (idempotency_conflict, terminal_busy) seguem iguais.
+      if (error instanceof PaymentTerminalProviderError && error.httpStatus === 409 && error.code === "invalid_request") {
+        throw new PaymentTerminalProviderError("invalid_request", { httpStatus: 409, outcomeUnknown: true, detail: "unknown_conflict" });
+      }
+      throw error;
+    }
     return this.parseMutatingOrder(body);
   }
 
   async getCharge(externalOrderId: string): Promise<PaymentTerminalChargeResult> {
     const { body } = await this.request("GET", `/v1/orders/${encodeURIComponent(externalOrderId)}`, { mutating: false });
     return this.parseOrder(body);
+  }
+
+  // Ordem de uma criação sem resposta, pela referência enviada (GET /v1/orders com external_reference e a janela
+  // begin_date/end_date em RFC 3339, lista em "data"). A janela é a criação ± SEARCH_MARGIN_MS, com o fim nunca no
+  // futuro. Só vale item com a referência idêntica e tipo "point" (ou sem tipo); do item da busca só se usa o id, e a
+  // ordem completa vem de getCharge. Nenhum = null (não achou AGORA, não prova que não existe); mais de um = erro;
+  // busca recusada (400) = erro com detail "search_refused"; outro erro HTTP = erro.
+  async findChargeByReference(externalReference: string, options: { createdAt?: string } = {}): Promise<PaymentTerminalChargeResult | null> {
+    if (!isValidExternalReference(externalReference)) throw new PaymentTerminalProviderError("invalid_request");
+    const created = typeof options.createdAt === "string" ? Date.parse(options.createdAt) : Number.NaN;
+    if (!Number.isFinite(created)) throw new PaymentTerminalProviderError("invalid_request");
+    const now = this.now();
+    const begin = created - SEARCH_MARGIN_MS;
+    const end = Math.max(begin, Math.min(now, created + SEARCH_MARGIN_MS));
+    const query = new URLSearchParams({
+      external_reference: externalReference,
+      begin_date: new Date(begin).toISOString(),
+      end_date: new Date(end).toISOString(),
+    });
+    let body: unknown;
+    try {
+      ({ body } = await this.request("GET", `/v1/orders?${query.toString()}`, { mutating: false }));
+    } catch (error) {
+      if (error instanceof PaymentTerminalProviderError && error.httpStatus === 400) {
+        throw new PaymentTerminalProviderError("invalid_request", { httpStatus: 400, detail: "search_refused" });
+      }
+      throw error;
+    }
+    const data = asObject(body)?.data;
+    if (!Array.isArray(data)) throw malformed();
+    const matches = data.filter((raw) => {
+      const item = asObject(raw);
+      return item !== null && item.external_reference === externalReference && (item.type == null || item.type === "point");
+    });
+    if (matches.length === 0) return null;
+    if (matches.length > 1) throw new PaymentTerminalProviderError("malformed_response", { detail: "multiple_orders" });
+    const id = asString(asObject(matches[0])?.id);
+    if (!id) throw malformed();
+    const found = await this.getCharge(id);
+    // A ordem lida pelo id precisa ser a mesma e ter a referência idêntica.
+    if (found.externalOrderId !== id || found.externalReference !== externalReference) throw malformed();
+    return found;
   }
 
   async cancelCharge(externalOrderId: string, options: { idempotencyKey: string }): Promise<PaymentTerminalCancelResult> {

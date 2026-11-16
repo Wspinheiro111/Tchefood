@@ -63,7 +63,7 @@ export interface ProductRow {
 }
 
 export type PaymentMethod = 'CREDIT' | 'DEBIT' | 'PIX' | 'VOUCHER' | 'CASH';
-export type Acquirer = 'STONE' | 'PAGBANK' | 'MOCK' | 'CASH_DESK';
+export type Acquirer = 'STONE' | 'PAGBANK' | 'MERCADO_PAGO' | 'MOCK' | 'CASH_DESK';
 
 export interface PaymentRow {
   id: string;
@@ -86,10 +86,14 @@ export interface NfceSource {
   payments: PaymentRow[];
 }
 
-/** CNPJ das credenciadoras, conferidos pelo DV. Só esses adquirentes podem sair como integrados. */
-export const ACQUIRER_CNPJ: Readonly<Record<'STONE' | 'PAGBANK', string>> = {
+/**
+ * CNPJ das credenciadoras, conferidos pelo DV. Só esses adquirentes podem sair como integrados. Os mesmos que o
+ * aparelho grava no pagamento (src/lib/payments/drivers.ts ACQUIRER_CNPJ; o teste confere que são iguais).
+ */
+export const ACQUIRER_CNPJ: Readonly<Record<'STONE' | 'PAGBANK' | 'MERCADO_PAGO', string>> = {
   STONE: '16501555000157', // Stone Instituição de Pagamento S.A.
   PAGBANK: '08561701000101', // PagSeguro Internet Instituição de Pagamento S.A. (PagBank)
+  MERCADO_PAGO: '10573521000191', // Mercado Pago Instituição de Pagamento Ltda. (Point)
 };
 
 /** tPag. Vale (VOUCHER) é vale-refeição (11) no restaurante, nunca "crédito loja" (05). */
@@ -232,7 +236,7 @@ export function paymentGroup(payment: PaymentRow): FocusPaymentGroup {
   if (!INTEGRATED_CODES.has(code)) return { ...group, tipo_integracao: 2 };
 
   const acquirer = payment.acquirer;
-  const expected = acquirer === 'STONE' || acquirer === 'PAGBANK' ? ACQUIRER_CNPJ[acquirer] : null;
+  const expected = acquirer === 'STONE' || acquirer === 'PAGBANK' || acquirer === 'MERCADO_PAGO' ? ACQUIRER_CNPJ[acquirer] : null;
   const recorded = digits(payment.acquirer_cnpj);
   const authorization = String(payment.authorization_code ?? '').trim();
   const proven =

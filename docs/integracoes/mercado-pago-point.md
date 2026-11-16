@@ -2,20 +2,344 @@
 
 Cliente servidor em `server/payments/mercadoPagoPoint.ts`, portado do Tchê Vendas (mesmas regras e testes).
 Usa a **Orders API** (`POST /v1/orders`, `type: "point"`): o servidor manda a cobrança para a maquininha
-pelo `terminal_id` e consulta o resultado em `GET /v1/orders/{id}`. Pix sai como ordem `qr` na própria tela.
+pelo `terminal_id` e consulta o resultado em `GET /v1/orders/{id}`.
 
-## O que falta para cobrar de verdade
+## Como a cobrança anda
+
+```
+Tchê Food (celular/tablet)          Edge Function point-charge           Mercado Pago            Point Smart
+  "Cobrar R$ 24,50 crédito"  ──►  grava terminal_charges ("creating") ──► POST /v1/orders ──► mostra o valor
+  consulta a cada 2 s         ◄──  GET /v1/orders/{id} + /v1/payments/{id}, confere tudo
+  APPROVED com NSU/autorização     grava "approved"
+  registra o pagamento ──────────► payments: o banco só aceita se terminal_charges está "approved" e confere
+```
+
+- Código: `src/lib/payments/mercadoPagoPointDriver.ts` (app), `supabase/functions/point-charge/` (nuvem),
+  `db/schema_mercado_pago.sql` (banco).
+- **NSU** = ID do pagamento no Mercado Pago (o "ID da operação" do comprovante). **Autorização**, bandeira e
+  final do cartão vêm de `GET /v1/payments/{id}`. Nada é gerado pelo app.
+- Aprovado só quando ordem e pagamento confirmam referência, maquininha, valor cobrado, valor pago, forma
+  (crédito à vista ou débito), autorização e bandeira (Visa, Master ou Elo). Parcelas = 1 e bandeira vêm do
+  próprio pagamento (ausentes não contam). Qualquer diferença vira revisão manual. O banco confere de novo ao
+  gravar o pagamento, inclusive bandeira e CNPJ do Mercado Pago (10.573.521/0001-91).
+- Cobrança nova só para conta **aberta no servidor**, com **operador identificado** (da equipe ativa da loja, conferido
+  no banco) e dentro do saldo dele, menos as outras cobranças da mesma conta que ainda não terminaram
+  (`tchefood_open_terminal_charge`, com a conta travada). Reservam: criando, na fila, na maquininha e em **revisão
+  manual**, sem limite de tempo, e aprovadas ainda sem pagamento gravado. Só liberam com o fim comprovado no Mercado
+  Pago (recusada, cancelada, expirada, estornada). PIN de gerente e tempo passado não liberam.
+- **A conta cobrada é a que o servidor conhece** (auditoria r4): antes de cobrar, o app espera a sincronização que
+  estiver em andamento (nunca toma "já está sincronizando" por sucesso), sobe a fila e só segue quando nenhum
+  evento da conta (a própria conta, itens, pagamentos, cashback) ficou na fila nem foi recusado pela nuvem
+  (`ensureOrderSynced`, com prazo de 15 s). O saldo da conta no aparelho vai junto (`expected_balance_cents`) e
+  o banco recusa abrir a cobrança se o saldo dele for outro (`TF008`). Nada é mandado à maquininha nesses casos.
+- A mesma reserva vale para **qualquer outro pagamento** da conta: dinheiro, Pix, outra maquininha ou outra cobrança
+  (`db/schema_point_reserva.sql`, gatilho em `payments` com a conta travada). Pagamento aprovado só entra até o saldo
+  menos a reserva das outras cobranças; o pagamento da própria cobrança aprovada consome a reserva dela. O caixa lê a
+  reserva da conta a cada 5 s (`tchefood_point_reservation`) e mostra "Há uma cobrança na Point em andamento nesta
+  conta" com o valor livre; sem nuvem, vale a cobrança incerta da Point gravada no próprio aparelho.
+- Sem cartão em 2 minutos (contados desde o primeiro envio) o app **encerra a tentativa**: pede à maquininha que
+  pare de esperar o cartão. Não é estorno: cobrança já paga continua paga e volta como aprovada. O servidor só
+  aceita o encerramento por prazo depois dos mesmos 2 min, contados pelo **relógio do banco** desde a hora em que a
+  cobrança foi gravada (`tchefood_request_point_timeout`; a hora gravada não muda). Como essa hora é um pouco
+  depois do primeiro envio do app, o servidor pode responder "cedo demais": o app segue consultando e pedindo,
+  até o limite de 3 min 30 s desde o primeiro envio. Pedidos de encerramento simultâneos gravam um só.
+  Só vira "recusado" quando o Mercado Pago confirma cancelada; senão vira revisão manual.
+- Encerrar **antes do prazo** a pedido do operador exige **PIN de gerente** e motivo (5+ letras), conferidos no banco
+  (`tchefood_authorize_point_cancel`, mesmas regras de `tchefood_authorize_manager`: 3 PINs errados em 60 s
+  bloqueiam). Fica um registro `POINT_CHARGE_CANCELED` em `audit_logs` e a cobrança guarda operador, gerente e
+  registro; o banco recusa encerramento "pelo operador" sem gerente. O pedido também confere conta, valor e forma.
+  Repetir o mesmo pedido reaproveita a primeira autorização (um registro só), mas só com o PIN conferido de novo
+  (PIN errado ou bloqueado: nada é autorizado e a falha conta no bloqueio); cobrança que já terminou não gera
+  registro de encerramento.
+- **Um pedido por vez fala com o Mercado Pago**, em três passos no banco (relógio do banco):
+  1. `tchefood_claim_point_dispatch` dá a posse do envio (30 s, maior que o prazo de 15 s da chamada; no máximo 8
+     posses por cobrança). Com posse em vigor, as outras consultas só acompanham.
+  2. `tchefood_begin_point_dispatch` é a barreira **imediatamente antes** da chamada: confere de uma vez só que a
+     posse ainda é a de quem chama, que não venceu e que não há pedido de encerramento; marca o primeiro envio e
+     renova a posse. Não passou, não manda.
+  **Só o pedido de criação (`create`) manda a ordem pela primeira vez.** A consulta (`status`) só repete, com a
+  mesma chave, um envio que comprovadamente já saiu (`dispatched_at` gravado), para recuperar a ordem; a barreira
+  do banco confere isso de novo (`p_allow_first` falso nunca marca o primeiro envio). Cobrança gravada e largada
+  antes do primeiro envio fica parada até o encerramento por prazo, que a encerra com prova (nada foi cobrado).
+  3. A ordem devolvida é **ligada à cobrança assim que chega**, em qualquer estado não final (inclusive revisão
+     manual), e só depois o resultado é conferido. Com o encerramento já pedido, ela é cancelada no Mercado Pago
+     na mesma hora e vale o que ele responder.
+  Sem resultado do Mercado Pago (queda, prazo, erro 5xx, 408, 429, resposta ilegível), a posse **nunca é devolvida
+  antes da hora**: fica até vencer e só então a próxima consulta repete com a **mesma chave** (o Mercado Pago
+  devolve a ordem original). Se a resposta da barreira demorar mais de 10 s para chegar, o envio não sai (a
+  chamada poderia passar do fim da posse). Nesse caso o primeiro envio já ficou marcado sem a chamada ter saído,
+  e quem faz o primeiro POST de verdade pode ser uma consulta (`status`) depois que a posse vence; ele conta como
+  repetição, então uma recusa ali fica como resultado desconhecido (vai para revisão), nunca "nada foi cobrado".
+  Recusa do pedido só vira "nada foi cobrado" no **primeiro**
+  envio; numa repetição (ou com conflito de idempotência) o envio anterior pode ter criado a ordem, e a cobrança
+  segue como resultado desconhecido.
+- **Envio sem resposta nunca vira recusa por tempo nem por PIN.** Encerramento pedido com a ordem ainda desconhecida:
+  se nenhum envio saiu, encerra com prova (`voided_before_send`); se saiu, espera a posse vencer e a cobrança vai
+  para **revisão manual** (`DISPATCH_UNKNOWN`, `tchefood_settle_point_dispatch`) e segue segurando o saldo. Ela
+  pode ter sido paga: confira no app do Mercado Pago. Uma resposta atrasada ainda liga a ordem à cobrança em
+  revisão manual. A liberação conferida pelo gerente (com prova do Mercado Pago) fica para a tela de conciliação,
+  fora deste PR.
+- **Duas ordens para a mesma chave** (o Mercado Pago não deveria devolver): a segunda é cancelada no Mercado Pago
+  na hora e a cobrança fica em revisão manual (`ORDER_ID_CHANGED`, com o número da segunda anotado) até alguém
+  conferir; consulta nenhuma desfaz essa revisão.
+- **Cobrança largada pelo aparelho** (app fechado no meio, pedido de encerramento que não chegou): ao abrir outra
+  cobrança na mesma conta, o servidor encerra por prazo as antigas que já passaram dos 2 min (relógio do banco),
+  com as mesmas regras: cancelada só com a confirmação do Mercado Pago; envio sem resposta vai para revisão manual
+  e segue reservando.
+- Chave que **nunca foi gravada** (a criação se perdeu no caminho) não tem o que cancelar: o servidor grava o
+  **bloqueio preventivo** da chave (`tchefood_block_point_key`), exige operador da equipe ativa e registra
+  `POINT_KEY_BLOCKED` em `audit_logs`. Pedido "pelo operador" (com PIN) sem cobrança gravada é recusado. O app, ao
+  receber essa recusa, pede o bloqueio na mesma volta e guarda a autorização do gerente: se a criação gravar
+  primeiro, ela vai de novo e encerra a cobrança que ficou.
+- O prazo de 15 s de cada chamada conta também a obtenção da sessão (renovação do token). Sessão que não chega
+  antes do primeiro envio = recusa local, nada foi mandado; depois de um envio incerto, a cobrança segue o caminho
+  de sempre e termina no limite de 3 min 30 s em revisão manual se a nuvem não responder.
+- Criação sem resposta (queda, prazo de 15 s por chamada estourado, erro 5xx): nem "cobrança não encontrada" nem
+  outra recusa provam que nada foi cobrado, porque a primeira criação pode estar a caminho. Quem decide é o
+  encerramento no servidor: sem cobrança gravada, ele grava o bloqueio preventivo da chave (`voided_before_send`) e a criação
+  atrasada encontra a cobrança encerrada e não vai à Point.
+- Cobrança em estado final (aprovada, recusada, cancelada, expirada, estornada) não muda mais: cada gravação só vale
+  se o estado ainda for o lido, e o banco recusa mudar uma cobrança final.
+- Cobrança incerta do Mercado Pago **não** entra pelo comprovante digitado: o banco recusaria. Ela se resolve pela
+  tela "Conferir no Mercado Pago" (abaixo): o servidor lê o Mercado Pago e só então aprova, encerra ou libera.
+
+## Auditoria r5 (decisões do Will, 14/11/2026)
+
+**Reserva antes de qualquer cobrança.** Em toda loja na nuvem, com ou sem Point (auditoria r7 P1-01, decisão do
+Will; antes valia só na loja com Point): todo pagamento fora do Mercado Pago (dinheiro, Stone, PagBank,
+Pix manual, ficha rápida, retirada) pede antes a reserva no servidor (`tchefood_claim_payment`, conta travada,
+mesma chave do pagamento, saldo conferido). Sem internet ou sem resposta do servidor, o caixa avisa e não cobra.
+O banco também exige: pagamento aprovado fora do Mercado Pago sem reserva aberta da mesma conta, forma e
+credenciadora é recusado (TF010), em qualquer loja e mesmo de aparelho antigo que não pede reserva. Única exceção: o
+dinheiro do entregador de uma entrega paga na entrega que o banco confere (`tchefood_courier_cash_payment`).
+A reserva e as cobranças da Point somam uma reserva só (`tchefood_point_reserved_cents`), usada pela Point,
+pela reserva nova e pelo gatilho de payments.
+Cobrança aprovada só deixa de reservar com o pagamento APROVADO do Mercado Pago dela ou quando a própria cobrança
+é estornada pela resolução verificada (auditoria r7 P0-01). Pagamento do Mercado Pago recusado (DECLINED) com a
+chave de uma cobrança só entra com a cobrança recusada, cancelada ou expirada; estornado (REFUNDED), só com a
+cobrança estornada. Pagamento PENDING do Mercado Pago não entra (auditoria r8: nada no app nem nas Edge Functions o
+grava; a cobrança em andamento fica em `terminal_charges`).
+
+**Estorno do pagamento da Point já registrado (GPT r9 P1-01).** Pagamento APROVADO do Mercado Pago só vira REFUNDED
+por `tchefood_refund_point_payment(p_tenant, p_id, p_staff, p_reason, p_patch, p_evidence)` (só a service role, chamada
+pela Edge Function): PIN de gerente pela conferência (`tchefood_authorize_point_reconcile`, uso único) e o estorno
+provado no Mercado Pago (mesmo pagamento, valor e referência; `refunded` com o valor estornado igual ao valor,
+`mp_amount_refunded_cents`; `cancelled` só existe antes da aprovação e é recusado; estorno parcial não tem caminho;
+contestação nunca; autorização de até 10 min, pedida com a cobrança já aprovada; motivo de 10 a 500 caracteres). Numa
+transação, com as travas na ordem PIN, conta, cobrança, pagamento: a cobrança vira `refunded`, o pagamento REFUNDED, a
+conta é recalculada e fica UM registro `POINT_PAYMENT_REFUNDED` (gerente, motivo, prova). Conta ainda aberta: o saldo
+volta. Conta já fechada (GPT r10 P1-01, decisão: o estorno total reabre a conta): volta a PAYING, `closed_at` NULL,
+com o saldo devolvido; o mesmo `POINT_PAYMENT_REFUNDED` guarda `order_reopened: true` (false quando a conta não estava fechada) e `previous_closed_at`, e é ele que
+deixa `tchefood_order_close_guard` aceitar a reabertura (fora disso, como na main, a conta encerrada não reabre). A
+mesa não muda: a conta reaberta é cobrada pela lista de contas (a mesa já está livre ou com outra conta). Depois, o
+caixa cobra de novo (reserva e pagamento de sempre) ou o gerente encerra como venda devolvida:
+`tchefood_close_refunded_order(p_order, p_staff, p_manager_pin, p_reason, p_client_audit_id)` (aparelho; PIN de
+gerente com o bloqueio de sempre; motivo de 10 a 500; só com o saldo inteiro coberto pelos pagamentos estornados do
+Mercado Pago da conta e nada reservado). Ela grava `ORDER_REFUNDED_WRITE_OFF` (valor baixado em `amount_impact` e
+`metadata.written_off_cents`, para os relatórios) e fecha a conta com esse saldo; reenvio com o mesmo
+`p_client_audit_id` devolve o mesmo resultado. Conta fechada com saldo só existe com esse registro.
+UPDATE direto do pagamento para REFUNDED é recusado (TF007), mesmo com a cobrança estornada. Repetir devolve a
+cobrança estornada sem gravar de novo.
+
+**Lista dos pagamentos da Point (GPT r10 P1-02).** `tchefood_list_point_payments(p_from, p_to, p_search, p_cursor,
+p_limit)` (aparelho, só leitura, loja do token): os pagamentos do Mercado Pago no período (sem prazo escondido), com
+busca por NSU, chave, ordem do Mercado Pago ou valor, do mais novo ao mais antigo em páginas (`next_cursor`), e, no
+estornado, `refunded_at` (hora do servidor do registro do estorno), `refund_audit_id` e `refunded_by_manager_id`.
+Quem chama é a ação `refund` da point-charge (`refundCharge`), pedida na retaguarda (Conciliação → "Pagamentos da
+Point" → "Registrar estorno", PIN de gerente e motivo). Antes do PIN ela confere que a cobrança está aprovada com o
+pagamento registrado (senão 409; a aprovada sem pagamento segue pela conferência). Depois do PIN lê só o próprio
+pagamento (`GET /v1/payments/{id}`, token da loja) e exige o mesmo ID, o mesmo valor, a referência ecoada (= chave),
+status `refunded` e `transaction_amount_refunded` igual ao valor da cobrança (só estorno total); a prova enviada ao
+banco (com `mp_amount_refunded_cents`) é montada só com essa resposta. Sem prova não grava nada e responde revisão
+(`NOT_REFUNDED`, `PARTIAL_REFUND`, `CANCELLED_AFTER_APPROVAL` — `cancelled` num pagamento aprovado é contradição —,
+`CHARGEBACK`, `MISMATCH`, `MP_UNAVAILABLE`, `NO_PAYMENT_ID`); recusa do banco = 409 (`refund_refused`, texto neutro, /
+`not_applicable`). Motivo de 10 a 500 caracteres (também na conferência); `operation_id` é ignorado no estorno. A
+resposta do estorno confirmado traz `payment_registered` (há pagamento do Mercado Pago gravado com a chave). Gravado, o aparelho que pediu espelha o pagamento REFUNDED e o saldo e tira a
+trava da chave; os outros aparelhos não recebem pagamentos pela nuvem (`applyCloudSnapshot` não traz pagamentos).
+Sem resposta conclusiva, o aparelho não muda nada e pede para repetir (a repetição não grava duas vezes).
+
+**Pagamento aprovado é final por UPDATE.** Fora desse estorno, nenhum papel (aparelho, service role, dono do banco)
+tira um pagamento de APROVADO por UPDATE (DELETE da linha pela service role ou pelo dono do banco continua possível,
+como na main; o aparelho não apaga pagamento): DECLINED, PENDING ou REFUNDED fora do Mercado Pago são TF007 (`approved_is_final`). Estorno
+fora do Mercado Pago (Stone, PagBank, dinheiro) não tem caminho no sistema (como na main); fica decisão do Will.
+
+**Chave conferida em todo status (auditoria r8 P1-01).** Fora do Mercado Pago, pagamento com a chave de uma cobrança
+da Point é recusado em qualquer status (TF009, `key_in_use`), com a conta e a chave travadas na mesma ordem da abertura
+da cobrança (as duas ao mesmo tempo esperam uma pela outra). Fora do Mercado Pago só entram aprovado e recusado:
+PENDING e REFUNDED são recusados (TF007; o aparelho só registra aprovado ou recusado, e o pagamento retirado no
+aparelho fica REFUNDED só nele, com o INSERT tirado da fila). O recusado com a chave de uma reserva é o registro da
+recusa daquela cobrança: entra com a reserva aberta ou já liberada (a recusa libera a reserva e o registro sobe
+depois), desde que seja da mesma conta, forma e credenciadora (TF010 se não for).
+
+Fim da reserva: o pagamento aprovado com a chave dela a consome de vez (`consumed`); recusa na maquininha ou
+desistência a libera (só quem pediu, sem PIN); reserva presa (aparelho fechou no meio, liberação sem rede) aparece
+na tela da conta e o gerente libera com PIN e motivo (`tchefood_release_payment_claim_manager`, registrado). O app
+repete a liberação que falhou por rede.
+
+**Cobrança da Point em revisão só sai com o Mercado Pago.** "Conferir no Mercado Pago" (PIN de gerente + motivo,
+`tchefood_authorize_point_reconcile`) faz o servidor ler a ordem e o pagamento no Mercado Pago:
+- revisão manual com ordem: aprovada com todas as conferências da aprovação normal, ou recusada/cancelada/expirada/
+  estornada como o Mercado Pago disser;
+- envio sem resposta e sem ordem (`DISPATCH_UNKNOWN`): busca a ordem pela referência (`GET /v1/orders`); achando uma,
+  segue como acima; sem ordem, o gerente pode digitar o ID da operação do comprovante, que o servidor confere
+  (referência, valor, forma, autorização). Sem nada disso a cobrança continua em revisão e reservando;
+- aprovada sem pagamento registrado: o app registra o pagamento com os dados do servidor, sem cobrar de novo; se o
+  Mercado Pago mostra o estorno, ela vira `refunded` e libera a reserva uma vez;
+- ainda não terminada (`creating`/`pending`/`at_terminal`: Point sem rede, app fechado no meio; revisão PR #49 e
+  auditoria interna 3): no prazo de espera do cartão (2 min pelo relógio do banco contra a hora gravada da cobrança,
+  `tchefood_point_charge_in_wait`, com ou sem pedido de encerramento, inclusive o do gerente) a conferência não consulta nem grava
+  nada e nunca devolve um fim (`WAITING_CARD`): a cobrança pode estar sendo feita em outro aparelho, que registra a
+  aprovação. Depois do prazo, sem PIN, segue como o encerramento por prazo: grava o pedido de encerramento, pede o
+  cancelamento da ordem e grava o que o Mercado Pago disser (aprovada com todas as conferências; recusada/cancelada/
+  expirada com o eco da referência e da maquininha). Sem ordem: nunca enviada = cancelada com prova; envio sem
+  resposta = revisão manual, e aí a conferência continua com o PIN. Ainda aberta no Mercado Pago = continua
+  reservando (`DISPATCH_PENDING`, `MP_PENDING`); nada vira recusa nem revisão por tempo. Se a cobrança terminar
+  aprovada no meio da chamada pela consulta de outro aparelho, a resposta é `APPROVED_ELSEWHERE`, nunca a aprovação.
+  A tela da conta só oferece "Resolver cobrança da Point" para a cobrança aberta que o servidor marca vencida
+  (`stale` em `tchefood_point_reservation`, relógio do banco); antes disso mostra "cobrando em outro aparelho", sem
+  ação. A aprovada sem pagamento registrado (de outro aparelho) só fica `stale` `tchefood_claim_abandon_after()`
+  (5 min) depois da aprovação (`updated_at` da cobrança), não da criação: o aparelho que cobrou pode estar sem rede
+  com o pagamento na fila; antes disso a tela mostra "aguardando o pagamento do aparelho que cobrou";
+- estornada: só leitura, sem PIN e sem gravar nada. Com o ID do pagamento: o pagamento precisa provar o estorno (mesmo
+  ID, valor e referência; `refunded` com `transaction_amount_refunded` igual ao valor; contestação `charged_back` nunca
+  serve aqui). Sem o ID do
+  pagamento: a própria ordem lida agora, a mesma ligada, estornada, ecoando referência e maquininha e com o mesmo
+  valor, e o pagamento que ela lista provando o estorno total (ordem sem pagamento = `REFUND_WITHOUT_PAYMENT`: só a
+  ordem não diz quanto voltou). Na aprovada sem pagamento registrado, a ordem estornada também só vale com o
+  pagamento (o da ordem ou, sem ele, o da aprovação) provando o estorno total; a prova gravada leva `mp_status` e
+  `mp_amount_refunded_cents`. Provado: "recusada" com `code: REFUNDED`, e o
+  aparelho tira a trava avisando "estornada no Mercado Pago".
+- contestação (`charged_back`) nunca prova estorno, com ou sem PIN, em nenhum `status_detail` (decisão do Will,
+  auditoria interna 3): a cobrança fica em revisão manual e o gerente resolve com o Mercado Pago.
+- só estorno total prova (auditoria interna 1), em toda conferência pelo pagamento: `refunded` com
+  `transaction_amount_refunded` igual ao valor. Valor estornado menor = `PARTIAL_REFUND` (o sistema não registra
+  estorno parcial). `cancelled` só prova na cobrança em revisão manual (nunca chegou a aprovada); na aprovada ou na
+  estornada é contradição: `CANCELLED_AFTER_APPROVAL`. Nada é gravado nesses casos. A prova gravada pelo fim
+  verificado leva `mp_amount_refunded_cents`.
+
+Trava do aparelho quando a conferência responde "não há o que conferir" (409): o app lê o estado gravado (ação
+`status`) e só tira a trava com o fim provado no servidor: recusada/cancelada/expirada, ou aprovada (409 numa aprovada
+= pagamento já registrado no servidor). Estornada sem prova, em revisão, aberta, erro de leitura ou resposta de outra
+chave: a trava fica, com o motivo. Antes de registrar uma aprovação da Point, o aparelho relê a reserva da conta: só
+registra se o servidor ainda mostra a cobrança aprovada sem pagamento; já registrada lá, tira a trava sem registrar
+(evita o segundo pagamento e a segunda NFC-e); sem leitura, não registra.
+Só `tchefood_resolve_point_charge` (service role, com a autorização do gerente, um registro por fim) tira uma
+cobrança da revisão ou estorna uma aprovada; a consulta normal não muda mais uma cobrança em revisão. Nada é
+liberado por tempo ou por declaração.
+
+"Cancelar cobrança" na espera da Point pede PIN de gerente e motivo.
+
+## Auditoria r6 (decisões do Will, 14/11/2026)
+
+**Toda loja na nuvem reserva antes de cobrar.** Com ou sem Point, o aparelho ligado à nuvem pede a reserva ao
+servidor (`tchefood_claim_payment`) antes de qualquer pagamento fora do Mercado Pago, sem olhar a lista de
+maquininhas salva no aparelho. Sem internet, recusa ou erro: não cobra. O aparelho gera um segredo de 64 hex,
+grava no aparelho antes de chamar e manda junto; o banco guarda só o sha256 (coluna que o aparelho não lê).
+Liberar sem PIN (`tchefood_release_payment_claim`) e renovar (`tchefood_touch_payment_claim`) exigem esse segredo;
+o UUID do operador não prova mais nada. Pagamento com a chave de uma reserva liberada é recusado (TF013).
+
+**Prazo de atividade.** A reserva tem `active_until` (90 s, relógio do banco), renovado a cada 20 s durante a
+cobrança e, depois dela, até o servidor consumir a reserva (supervisor no laço de sincronização, sobrevive a
+reinício). O gerente só libera (`tchefood_release_payment_claim_manager`, PIN) depois de 5 min sem renovação
+(`tchefood_claim_abandon_after`); antes disso recebe TF011 com o horário, sem gastar tentativa de PIN.
+
+**Se o gerente liberar com o pagamento ainda no aparelho** (aparelho sem internet por mais de 6,5 min): o
+aparelho tira o pagamento da conta, reabre a conta e mostra a trava "estorne na maquininha" / "devolva o dinheiro";
+a trava bloqueia qualquer forma de pagamento na conta e só sai com "Estornei / devolvi" e PIN de gerente conferido
+no servidor (`tchefood_authorize_claim_refunded`). O mesmo vale para pagamento recusado pelo servidor.
+Maquininha que responde com outra credenciadora: a reserva é trocada no servidor (`tchefood_reclaim_payment`)
+antes de registrar o comprovante.
+
+**Total da conta.** Desconto, cancelamento de item ou retirada da taxa que deixem o saldo abaixo do reservado são
+recusados (TF012).
+
+**Mercado Pago.** `external_reference` do pagamento diferente da chave da cobrança, ou id da ordem (`ORD…`)
+diferente, vai para revisão. O `order.id` numérico do `/v1/payments` é a merchant_order e não é comparado.
+Recusa/cancelamento/expiração/estorno só liberam a reserva com a ordem ecoando a referência e a maquininha;
+estorno na conferência exige o pagamento provando o estorno. 409 desconhecido na criação = resultado desconhecido.
+A busca por referência termina no máximo em "agora"; recusa da busca tem mensagem própria.
+
+**Ordem de publicação (janela de manutenção, caixa fechado).** Migrations e app novo vão juntos: nenhum dos dois
+funciona com o outro na versão antiga.
+
+1. **Antes das migrations, todo aparelho sobe a fila** (Nuvem sem pendências: nenhum pagamento esperando para subir).
+   Pagamento sem reserva que ainda estiver na fila de um aparelho quando as migrations entrarem é recusado com TF010
+   em qualquer loja (com ou sem Point): o dinheiro foi recebido e o pagamento não fica registrado.
+2. Aplicar as migrations (`20261114130000_mercado_pago.sql`, `20261114140000_point_reserva.sql`, depois das de 14/11
+   da main).
+3. Publicar a Edge Function `point-charge`.
+4. Atualizar **todos** os aparelhos para o app novo, na mesma janela.
+5. Abrir o caixa.
+
+O que acontece fora dessa ordem:
+- **App antigo depois das migrations:** todo pagamento recebido sem a reserva (o app antigo não pede, ou pede pela
+  função antiga) é recusado com TF010, e o dinheiro recebido fica sem registro no servidor; as chamadas de reserva
+  com a assinatura antiga dão 42883 (função não existe).
+- **App novo antes das migrations:** as funções de reserva não existem (42883); o caixa não cobra (falha fechada)
+  até as migrations entrarem.
+- **App novo com a migration antiga da reserva:** o app só aceita a renovação da reserva
+  (`tchefood_touch_payment_claim`) que devolve a chave (`idempotency_key`) da própria reserva; a versão antiga da
+  função não a devolve, e toda renovação conta como sem resposta (a cobrança não registra depois de 90 s). Por isso a
+  migration `20261114140000_point_reserva.sql` entra antes de qualquer aparelho receber o app novo (passos 2 e 4).
+
+**Dinheiro do entregador** (`entrega-<id>`, sem reserva): o servidor só aceita esse pagamento com a entrega já
+`DELIVERED` lá (`tchefood_courier_cash_payment`). Na fila do aparelho, a marcação de entregue entra antes do acerto
+(a fila sobe em ordem); o acerto liga o pagamento à marcação de entregue que ainda está na fila ou recusada
+(`depends_on_event_ids`), e o pagamento espera ela subir. Marcação recusada segura o pagamento até ser resolvida.
+
+## Passo a passo para testar com uma Point Smart
 
 1. Conta Mercado Pago da loja + aplicação em <https://www.mercadopago.com.br/developers/panel/app>
-   (produto "Pagamentos presenciais"). O Access Token fica só no servidor, nunca no app.
-2. Maquininha Point Smart vinculada à mesma conta e trocada para **modo PDV**
+   (produto "Pagamentos presenciais"). Copie o **Access Token de produção** (`APP_USR-...`).
+2. Point Smart vinculada à mesma conta e em **modo PDV**
    (`PATCH /terminals/v1/setup` com `operating_mode: "PDV"`, depois reiniciar a maquininha).
-3. `listTerminals()` devolve o `terminal_id` (ex.: `NEWLAND_N950__N950NCB123456`) para cadastrar no Tchê Food.
-4. Webhook de "Order (Mercado Pago)" apontando para o backend (ainda não existe; por ora o status é consultado).
+3. Descubra o `terminal_id` (ex.: `NEWLAND_N950__N950NCB123456`) em `GET /terminals/v1/list`.
+4. No Supabase (SQL Editor), com o id da loja:
+
+   ```sql
+   INSERT INTO payment_provider_secrets (tenant_id, provider, access_token)
+   VALUES ('<id da loja>', 'mercado_pago_point', 'APP_USR-...')
+   ON CONFLICT (tenant_id, provider) DO UPDATE SET access_token = EXCLUDED.access_token, updated_at = NOW();
+
+   INSERT INTO pos_terminals (tenant_id, name, serial_number, acquirer, mode)
+   VALUES ('<id da loja>', 'Point Smart Caixa', '<terminal_id do passo 3>', 'MERCADO_PAGO', 'TEF_POS_WIRELESS');
+   ```
+
+   O `serial_number` da maquininha Mercado Pago é o `terminal_id` da API.
+5. Publique a função: `supabase functions deploy point-charge` (ela importa `server/payments/`, por isso use o
+   CLI atual, que empacota arquivos fora de `supabase/functions`).
+6. No app, conecte a loja à nuvem, espere a maquininha aparecer, escolha **TEF POS Sem Fio** e a Point Smart
+   no fechamento da conta.
+
+### Teste com a Point real
+
+Respostas reais conferidas com os parsers de produção: [`scripts/point-smoke.mjs`](../../scripts/point-smoke.mjs) (`node scripts/point-smoke.mjs --help`).
+
+## NFC-e da venda na Point
+
+O cartão cobrado pela Point sai na NFC-e como **pagamento integrado** (`tpIntegra` 1), como Stone e PagBank. Motivo:
+no grupo de cartão da NFC-e (NT 2015.002, campo `tpIntegra`), 1 é o pagamento integrado com o sistema de automação da
+empresa (TEF, POS integrado) e 2 é o não integrado (a maquininha avulsa, em que o operador digita o valor nela). Na
+Point o valor, a referência e a maquininha saem do nosso sistema pela API do Mercado Pago, e a aprovação volta para
+ele com o código de autorização: é integrado.
+
+Salvaguardas (`supabase/functions/emit-nfce/payload.ts`, `paymentGroup`): só sai 1 com o pagamento gravado com o
+adquirente `MERCADO_PAGO`, o CNPJ da credenciadora gravado igual ao do Mercado Pago (`10573521000191`, o mesmo de
+`src/lib/payments/drivers.ts`; um teste confere que as duas listas são iguais), CNPJ com dígito válido e código de
+autorização presente. Faltou qualquer um (por exemplo, pagamento registrado à mão sem o CNPJ): sai 2, sem CNPJ e
+sem autorização; nada é inventado. Antes de publicar: emitir uma NFC-e de venda Point em homologação e conferir
+tPag/tpIntegra/CNPJ/cAut no XML (checklist de publicação).
+
+## Ainda não
+
+- Pix pela Point (ordem `qr`), crédito parcelado e outras bandeiras (Amex, Hipercard).
+- Webhook "Order (Mercado Pago)": por ora o app consulta.
+- Taxa do cartão por adquirente (`cardFees`) para o Mercado Pago.
+- Comprovante impresso na Point: a ordem vai com `no_ticket`; o comprovante da loja sai pela impressora do app.
 
 ## Regras mantidas
 
 - Mesma `X-Idempotency-Key` para repetir criação com resultado desconhecido; nunca outra chave.
 - Aprovado sem `paid_amount` vira `manual_review`. Nenhum NSU/ID é inventado: tudo vem da resposta.
 - Parcelado exige `installments_cost`; crédito sempre com parcelas explícitas.
-- Enquanto não houver token, o PDV continua no `MockTerminalDriver`.
+- O token do Mercado Pago fica em `payment_provider_secrets`, sem acesso para o aparelho.

@@ -1,7 +1,7 @@
 /** Etapa 0 — Loja (dados, permissões, loja nova) e Nuvem (login do aparelho e envio da fila). */
 import { useEffect, useState } from 'react';
 import { Cloud, CloudDownload, CloudOff, RefreshCw, Store, Users } from 'lucide-react';
-import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
+import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, revertibleRejectedDiscount, selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
 import type { Permission, SyncEvent, UserRole } from '../../types';
 import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../lib/permissions';
 import { ROLE_LABEL } from '../../lib/catalog';
@@ -14,6 +14,7 @@ import { defaultCloudConfig, syncOnce } from '../../lib/sync/useCloudSync';
 import { useOnline } from '../../lib/useOnline';
 import { Btn, Sheet, toast } from '../../components/ui';
 import { ManagerAuthSheet } from '../../components/ManagerAuthSheet';
+import { isRecoverableRejectedPayment, isRecoveredRejectedPayment, recoveryInFlight, resendRejected, withdrawRejectedPayment, type RecoveryResult } from '../../lib/payments/claimRecovery';
 import { Field, FormError, Panel, Select, TextInput, parseMoneyInput } from './fields';
 
 // ---------------------------------------------------------------------------
@@ -698,6 +699,86 @@ function RejectedAuthPin({ eventId }: { eventId: string }) {
   );
 }
 
+/**
+ * Pagamento recusado sem reserva (fila da versão anterior): "Reenviar recusados" pede a reserva sozinho. Se o
+ * servidor recusar de vez, o gerente retira o pagamento daqui com PIN e motivo (nada some sem ele).
+ */
+function RejectedPaymentRecovery({ eventId, result, busy, managerOnly }: { eventId: string; result: RecoveryResult | undefined; busy: boolean; managerOnly: boolean }) {
+  const [pin, setPin] = useState('');
+  const [reason, setReason] = useState('');
+  const text = managerOnly
+    ? 'Pagamento recuperado que a nuvem recusou de novo: não sai sozinho. Confira com o cliente; se não valer, o gerente retira.'
+    : result && !result.ok ? result.error : null;
+  if (!managerOnly) {
+    if (!result) return <span className="mt-1 block text-slate-600">Pagamento sem reserva no servidor: Reenviar recusados pede a reserva dele e reenvia.</span>;
+    if (result.ok) return null;
+    if (result.transient) return <span className="mt-1 block font-semibold text-brasa">{result.error}</span>;
+  }
+  return (
+    <span className="mt-1 block">
+      <span className="block font-semibold text-brasa">{text}</span>
+      <span className="mt-1 flex flex-wrap items-center gap-2">
+        <input
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Motivo (ex.: conferido com o cliente)"
+          aria-label="Motivo da retirada"
+          className="w-56 rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-xs"
+        />
+        <input
+          type="password"
+          inputMode="numeric"
+          maxLength={4}
+          value={pin}
+          onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+          placeholder="PIN do gerente"
+          aria-label="PIN do gerente para retirar"
+          className="w-28 rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-xs"
+        />
+        <Btn
+          variant="danger"
+          disabled={pin.length !== 4 || busy || recoveryInFlight(eventId)}
+          onClick={() => {
+            const r = withdrawRejectedPayment(eventId, { managerPin: pin, reason });
+            if (r.ok) {
+              toast.alert(`⚠️ ${r.message}`);
+              void syncOnce();
+            } else toast.error(r.error);
+            setPin('');
+          }}
+        >
+          Retirar pagamento (não aceito pela nuvem)
+        </Btn>
+      </span>
+    </span>
+  );
+}
+
+/** Desconto recusado com TF012: volta ao desconto de antes (o do servidor) e solta a conta. */
+function RevertRejectedDiscount({ eventId, before }: { eventId: string; before: number }) {
+  const revert = useTcheStore((s) => s.revertRejectedDiscount);
+  const [open, setOpen] = useState(false);
+  return (
+    <span className="mt-1 block">
+      <Btn onClick={() => setOpen(true)}>Desfazer o desconto recusado</Btn>
+      <ManagerAuthSheet
+        open={open}
+        onClose={() => setOpen(false)}
+        title="Desfazer o desconto recusado"
+        summary={<>A nuvem recusou esta troca de desconto. A conta volta ao desconto de <b>{formatBRL(before)}</b>, o mesmo do servidor.</>}
+        confirmLabel="Desfazer com o PIN do gerente"
+        quickReasons={['Desconto recusado pela nuvem', 'Conta com cobrança reservada']}
+        successMessage={`Desconto desfeito: a conta volta a ${formatBRL(before)} de desconto.`}
+        onSubmit={(managerPin, reason) => revert(eventId, { managerPin, reason })}
+        onSuccess={() => {
+          setOpen(false);
+          void syncOnce();
+        }}
+      />
+    </span>
+  );
+}
+
 /** Item recusado por preço diferente do cadastro: o gerente aceita com PIN e motivo. */
 function RejectedItemPrice({ eventId }: { eventId: string }) {
   const approve = useTcheStore((s) => s.approveRejectedItemPrice);
@@ -737,6 +818,9 @@ function RejectedItemPrice({ eventId }: { eventId: string }) {
   );
 }
 
+/** Reenvio dos recusados que não terminou (auditoria interna 2, P2-8). */
+export const RESEND_FAILED = 'Não foi possível reenviar agora: confira a internet e tente de novo. Nada foi tirado da lista.';
+
 function CloudStatus() {
   const cloud = useTcheStore((s) => s.cloud)!;
   const status = useTcheStore((s) => s.syncStatus);
@@ -746,7 +830,23 @@ function CloudStatus() {
   const online = useOnline();
   const [busy, setBusy] = useState(false);
   const rejected = useTcheStore((s) => s.syncRejected) ?? [];
-  const retryRejected = useTcheStore((s) => s.retryRejectedSync);
+  const [recovery, setRecovery] = useState<Map<string, RecoveryResult>>(new Map());
+  const [resending, setResending] = useState(false);
+  const resend = async () => {
+    setResending(true);
+    try {
+      const results = await resendRejected();
+      setRecovery(results);
+      const failed = [...results.values()].filter((r) => !r.ok).length;
+      if (failed > 0) toast.error(`${failed} pagamento(s) sem reserva não puderam ser reenviados: veja o motivo na lista.`);
+      await syncOnce();
+    } catch {
+      // Auditoria interna 2 (P2-8): falha no reenvio aparece (antes o botão só voltava).
+      toast.error(RESEND_FAILED);
+    } finally {
+      setResending(false);
+    }
+  };
   const byTable = outbox.reduce<Record<string, number>>((acc, e) => ({ ...acc, [e.table]: (acc[e.table] ?? 0) + 1 }), {});
   const now = async () => {
     setBusy(true);
@@ -800,10 +900,17 @@ function CloudStatus() {
                   <AdoptCloudDiscount eventId={r.event.id} value={cloudDiscountOf(r.message)!} />
                 )}
                 {r.event.table === 'cashback_ledger' && r.event.cashback_redeem && <UndoRejectedCashback eventId={r.event.id} />}
+                {(() => {
+                  const rev = revertibleRejectedDiscount(useTcheStore.getState(), r);
+                  return rev ? <RevertRejectedDiscount eventId={r.event.id} before={rev.before} /> : null;
+                })()}
+                {(isRecoverableRejectedPayment(r) || isRecoveredRejectedPayment(r)) && (
+                  <RejectedPaymentRecovery eventId={r.event.id} result={recovery.get(r.event.id)} busy={resending} managerOnly={isRecoveredRejectedPayment(r)} />
+                )}
               </li>
             ))}
           </ul>
-          <Btn disabled={!online} onClick={() => { retryRejected(); void syncOnce(); }}>
+          <Btn disabled={!online || resending} onClick={() => void resend()}>
             <RefreshCw className="h-4 w-4" /> Reenviar recusados
           </Btn>
         </div>
