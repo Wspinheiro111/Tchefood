@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useTcheStore, type PickupLine } from '../store/useTcheStore';
 import type { FetchLike } from '../lib/sync/supabaseSync';
 import type { Payment } from '../types';
+import { beginLocalClaim } from '../lib/payments/claimLedger';
 
 // Acerto com o entregador (rodada 11 do PR #54):
 // 1. A nuvem procura o id antes de recusar: recusa na repetição tira a pendente, menos "outro acerto com este id".
@@ -14,6 +15,8 @@ const st = () => useTcheStore.getState();
 const line = (): PickupLine => ({ product_id: st().products.find((p) => p.code === '301')!.id, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' });
 
 function cashPayment(orderId: string, amount: number, key: string) {
+  // Loja na nuvem: todo pagamento aprovado fora da Point tem a reserva no servidor feita antes (PR #49).
+  beginLocalClaim(key, orderId);
   const r = st().registerPayment({
     orderId, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
     acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: key, item_ids: [],

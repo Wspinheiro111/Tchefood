@@ -43,6 +43,7 @@ import type {
   ModifierOption,
   Order,
   OrderItem,
+  OrderStatus,
   Payment,
   Permission,
   PosTerminal,
@@ -85,8 +86,11 @@ import { MAX_REVIEW_COMMENT } from '../lib/reviews';
 import { idbStorage } from '../lib/idbStorage';
 import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
-import { clearReviewHold, getReviewHold } from '../lib/payments/reviewHolds';
+import { clearReviewHold, getReviewHold, getReviewHoldByKey, reviewHoldKey } from '../lib/payments/reviewHolds';
+import type { ServerOrderSnapshot } from '../lib/payments/pointPaymentsServer';
 import { checkReceiptProof } from '../lib/payments/terminalGuard';
+import { isTf012Rejection, reservationExceeds, TOTAL_BELOW_PAID } from '../lib/payments/pointReservation';
+import { localClaim } from '../lib/payments/claimLedger';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
@@ -134,6 +138,13 @@ export const MANAGER_PIN_LOCK_MS = 60_000;
 export const MIN_REASON_LENGTH = 5;
 /** Cobrança na maquininha sem resposta após este tempo é considerada abandonada. */
 export const PENDING_CHARGE_TTL_MS = 5 * 60_000;
+
+/** Trava de reserva liberada: o comprovante não é registrado (o servidor recusaria sem reserva). */
+/** Prova do servidor para tirar a trava de estorno: o id do audit_log dele, ou a reserva que ele não tem (TF005). */
+export type RefundedServerProof = { auditId: string } | { claimMissing: true };
+
+export const CLAIM_RELEASED_REGISTER_ERROR = 'A reserva deste pagamento foi liberada pelo gerente: não dá para registrar. Estorne na maquininha.';
+export const ACQUIRER_MISMATCH_REGISTER_ERROR = 'A reserva foi para outra maquininha: troque a reserva para a adquirente do comprovante antes de registrar.';
 
 /** Cobrança enviada à maquininha e ainda sem resposta: trava a conta até voltar. */
 export interface PendingCharge {
@@ -206,6 +217,9 @@ export interface PaymentInput {
   payment_id?: UUID;
 }
 
+/** Conta reaberta pelo estorno e cobrada de novo: a NFC-e da venda já existe e não se emite outra. */
+export const NFCE_ALREADY_ISSUED = 'NFC-e já emitida para esta venda (a forma de pagamento mudou: confira com o contador)';
+
 export interface PaymentOutcome {
   payment: Payment;
   order: Order;
@@ -217,6 +231,13 @@ export interface PaymentOutcome {
  * aprovada. NSU e autorização são digitados do papel, nunca gerados. Forma e
  * adquirente vêm da trava; só são aceitos aqui quando a trava é antiga e não os tem.
  */
+/**
+ * Cobrança incerta da Point Smart não entra pelo comprovante: o banco só aceita a aprovação do
+ * Mercado Pago confirmada pelo servidor (db/schema_mercado_pago.sql).
+ */
+export const MERCADO_PAGO_MANUAL_ERROR =
+  'Cobrança do Mercado Pago não se registra pelo comprovante: o servidor só aceita a aprovação confirmada pelo Mercado Pago. Use "Conferir no Mercado Pago" (PIN de gerente e motivo): o servidor lê a cobrança e registra o pagamento ou libera o valor, sem cobrar de novo.';
+
 export interface ReviewedChargeInput {
   orderId: UUID;
   nsu: string;
@@ -224,6 +245,10 @@ export interface ReviewedChargeInput {
   card_brand: string | null;
   method?: 'CREDIT' | 'DEBIT' | 'PIX';
   acquirer?: 'STONE' | 'PAGBANK';
+  /** Qual trava da comanda (reviewHoldKey); sem ela, a trava mostrada (a mais antiga). */
+  holdKey?: string;
+  /** Chave do pagamento quando a reserva foi trocada para a adquirente real (tchefood_reclaim_payment). */
+  registerKey?: string;
 }
 
 /** Linha da venda de balcão (Ficha Rápida): unidades inteiras, uma ficha por unidade. */
@@ -353,6 +378,12 @@ export interface PullStatus {
    * apaga a falha dos cadastros, e vice-versa). Ausente nas versões antigas (= cadastros).
    */
   last_error_source?: PullSource | null;
+  /**
+   * GPT r17: até onde este aparelho já leu e aplicou os estornos e encerramentos feitos em outros aparelhos
+   * (audit_logs.server_seq da loja). Mora aqui, junto das contas que descreve (e não no localStorage, que as abas do
+   * navegador dividem): quem avança o ponto é quem aplicou a alteração, na mesma memória e no mesmo estado salvo.
+   */
+  refund_seq?: number;
 }
 
 /** Leitura da nuvem: cadastros (cloudPull.ts) ou contas e mesas (orderPull.ts). */
@@ -524,6 +555,68 @@ interface Actions {
    * PIN de gerente, audit_log) sem cobrar de novo. Libera a trava e fecha a conta se quitou.
    */
   confirmReviewedCharge: (input: ReviewedChargeInput, auth: ManagerAuthInput) => ActionResult<PaymentOutcome>;
+  /**
+   * Trava CLAIM_RELEASED (o gerente liberou a reserva com a maquininha aprovada): o caixa estornou na
+   * maquininha; PIN de gerente e motivo tiram a trava. Registro só local em audit_logs.
+   */
+  /**
+   * "Estornei / devolvi": tira a trava CLAIM_RELEASED / PAYMENT_REJECTED com o PIN de gerente. Ligado à nuvem, só
+   * com o id do audit_log que o servidor gravou (tchefood_authorize_claim_refunded, via claimFlow.confirmClaimRefunded);
+   * o registro daqui fica só neste aparelho (não sobe pela fila) e aponta para esse id.
+   */
+  resolveRefundedClaimHold: (orderId: UUID, auth: ManagerAuthInput, holdKey?: string, server?: RefundedServerProof) => ActionResult<AuditLog>;
+  /**
+   * Confere só o PIN de gerente e o motivo, sem registrar a ação (antes de um passo no servidor). PIN errado conta
+   * para o bloqueio e fica no audit_log como as outras tentativas.
+   */
+  verifyManagerPin: (auth: ManagerAuthInput, context: { orderId: UUID | null; action: AuditActionType }) => ActionResult<StaffUser>;
+  /**
+   * Pagamento APROVADO aqui que o servidor não aceitou (reserva liberada antes de chegar, ou recusado): sai da
+   * conta (status REFUNDED, motivo local), o evento sai da fila, o saldo é recalculado e a conta reabre.
+   * Recusa se o pagamento já subiu (não está na fila nem nos recusados).
+   */
+  withdrawUnacceptedPayment: (idempotencyKey: string, reason: string) => ActionResult<{ payment: Payment; nfceIssued: boolean }>;
+  /**
+   * Estorno da cobrança da Point já GRAVADO no servidor (ação `refund` da point-charge respondeu REFUNDED): espelha
+   * aqui o que o servidor fez — o pagamento da chave vira REFUNDED e o saldo da conta é recalculado (conta fechada
+   * segue fechada, como no servidor) —, tira a trava desta chave e guarda o registro só neste aparelho. Nada sobe pela
+   * fila: o servidor já tem o estorno e o registro dele (POINT_PAYMENT_REFUNDED).
+   */
+  /**
+   * Espelha aqui o estorno da Point que o servidor registrou. opts.paymentRegistered: a resposta do servidor diz se ele
+   * tem o pagamento (point-charge, ação refund); false com a inclusão ainda na fila daqui: desfaz as consequências do
+   * registro (auditoria interna 2, P1-A).
+   */
+  mirrorServerPointRefund: (
+    idempotencyKey: string,
+    reason: string,
+    opts?: {
+      paymentRegistered?: boolean;
+      /** GPT r10 (a verificar 4): o registro do estorno no servidor e o gerente que autorizou, quando a resposta traz. */
+      /** Registro POINT_PAYMENT_REFUNDED do servidor: o local usa o mesmo id (a leitura da nuvem não duplica). */
+      serverAuditId?: string | null;
+      /** Registro da autorização do gerente no servidor. */
+      authorizationAuditId?: string | null;
+      managerId?: string | null;
+    },
+  ) => ActionResult<{ payment: Payment | null; nfceIssued: boolean; reopened: boolean }>;
+  /**
+   * GPT r10 (P1-01): o servidor encerrou a conta reaberta pelo estorno como venda devolvida
+   * (tchefood_close_refunded_order). Só depois da resposta dele: a conta fecha aqui com o saldo baixado e o registro
+   * ORDER_REFUNDED_WRITE_OFF com o mesmo id do servidor (só local; o servidor grava o dele).
+   */
+  mirrorRefundedOrderWriteOff: (
+    orderId: UUID,
+    server: { auditId: UUID; managerId: UUID | null; writtenOffCents: number | null; cumulativeWrittenOffCents?: number | null; closedAt?: string | null },
+    reason: string,
+  ) => ActionResult<{ writtenOff: number }>;
+  /**
+   * GPT r12 (P1-02, P1-03): traz para este aparelho o estado oficial de uma conta (tchefood_order_snapshot): status,
+   * fechamento e totais da conta, situação dos pagamentos e dos itens, e os registros do estorno e da venda devolvida.
+   * Só local (nada vai para a fila: é o que o servidor já tem). Com alteração desta conta ainda na fila daqui, não
+   * mexe (kind 'pending'): o servidor ainda não tem o que este aparelho fez.
+   */
+  applyServerOrderSnapshot: (snapshot: ServerOrderSnapshot) => ActionResult<{ kind: 'applied' | 'pending' | 'rejected'; status: OrderStatus }>;
 
   // Fase 3 — KDS e QR Code
   advanceItemStatus: (itemId: UUID) => ActionResult<OrderItem>;
@@ -633,12 +726,17 @@ interface Actions {
    */
   discardLateItemsOrder: (eventId: UUID, opts?: { preview?: boolean }) => ActionResult<{ orderId: UUID; items: Array<{ name: string; quantity: number }> }>;
   setPullError: (message: string, source?: PullSource) => void;
+  /** Guarda até onde os estornos de outros aparelhos já foram aplicados aqui (só anda para a frente). */
+  setRefundSeq: (seq: number) => void;
   ackSyncedEvents: (eventIds: UUID[]) => void;
   setSyncError: (message: string | null, blockedEventId: UUID | null) => void;
   /** Tira da fila os eventos recusados pela nuvem e guarda em syncRejected. */
   rejectSyncEvents: (rejections: Array<{ eventId: UUID; status: number; message: string }>) => void;
   /** Devolve os recusados para o começo da fila, na ordem original, para nova tentativa. */
-  retryRejectedSync: () => void;
+  /** Volta os recusados para a fila; os de `keep` ficam nos recusados (ex.: pagamento à espera do gerente). */
+  retryRejectedSync: (keep?: ReadonlyArray<string>) => void;
+  /** Volta só estes recusados para a fila, na frente (ex.: pagamento cuja reserva foi pedida agora). */
+  requeueRejectedEvents: (eventIds: ReadonlyArray<string>) => void;
   /** Mudança antiga da mesa sem a lista de campos (tableEditOnly): sai da fila para os recusados. */
   parkLegacyTableReviews: () => void;
   /**
@@ -660,6 +758,12 @@ interface Actions {
    * com o PIN (auth): a autorização da fila descreve a troca a partir do desconto velho.
    */
   adoptCloudDiscount: (eventId: UUID, auth?: ManagerAuthInput) => ActionResult<number>;
+  /**
+   * Desconto recusado pela nuvem com TF012 (abaixo do reservado ou do já pago): desfaz aqui o desconto, voltando ao
+   * de antes (o que o servidor tem), tira a recusa e corrige o desconto das versões seguintes da conta na fila.
+   * Sem isso a recusa segura a conta (inclusive o pagamento que consumiria a reserva).
+   */
+  revertRejectedDiscount: (eventId: UUID, auth: ManagerAuthInput) => ActionResult<{ discount: number }>;
   /**
    * Resgate de cashback recusado pela nuvem (o banco não concedeu o crédito): desfaz aqui o
    * resgate, a baixa dos créditos e o desconto da conta, e refaz as versões seguintes da conta
@@ -838,6 +942,12 @@ function permissionEvent(row: RolePermission): SyncEvent {
   };
 }
 
+/**
+ * Fila antiga (sem caused_by_payment_id): as mudanças da conta gravadas até este tempo depois do pagamento são
+ * dele (withdrawUnacceptedPayment).
+ */
+export const LEGACY_CONSEQUENCE_WINDOW_MS = 1_000;
+
 function syncEvent(table: SyncEvent['table'], op: SyncEvent['op'], row: { id: UUID }): SyncEvent {
   return {
     id: uuid(),
@@ -900,10 +1010,51 @@ function tableEventForOrder(table: DiningTable, orderId: UUID): SyncEvent {
  * loja (TCHEFOOD_REGISTRO_LOJA; antes da rodada 4 vinha como TCHEFOOD_PRECO com "não encontrado
  * nesta loja") não é preço: o PIN não resolve, então fica na lista sem o botão.
  */
+/**
+ * Desconto que dá para desfazer numa recusa TF012 da conta: a versão recusada é a da troca de desconto (a última
+ * autorização da conta até ela é DISCOUNT_APPLIED com este desconto, gravada na mesma ação — até 1 s antes). Recusa
+ * de outro ajuste (retirada dos 10%, cancelamento de item: a autorização deles é a última) não desfaz desconto
+ * nenhum, que pode já estar aceito pela nuvem. Devolve a autorização e o desconto de antes, ou null.
+ */
+export function revertibleRejectedDiscount(
+  state: Pick<TcheState, 'auditLogs'>,
+  r: Pick<RejectedSyncEvent, 'event' | 'message'>,
+): { audit: AuditLog; before: number } | null {
+  const e = r.event;
+  if (e.table !== 'orders' || e.op !== 'UPDATE' || e.payload.discount_amount === undefined || !isTf012Rejection(r.message)) return null;
+  const own = toCents(Number(e.payload.discount_amount));
+  const at = Date.parse(e.created_at);
+  if (!Number.isFinite(own) || !Number.isFinite(at)) return null;
+  const last = state.auditLogs
+    .filter((l) => l.order_id === e.row_id && Date.parse(l.created_at) <= at)
+    .reduce<AuditLog | null>((a, l) => (!a || Date.parse(l.created_at) > Date.parse(a.created_at) ? l : a), null);
+  if (!last || last.action_type !== 'DISCOUNT_APPLIED' || at - Date.parse(last.created_at) > 1_000) return null;
+  if (toCents(Number(last.metadata?.discount_after)) !== own) return null;
+  const before = Number(last.metadata?.discount_before);
+  return Number.isFinite(before) ? { audit: last, before } : null;
+}
+
 export function isRejectedItemPrice(r: RejectedSyncEvent): boolean {
   const message = r.message ?? '';
   return r.event.table === 'order_items' && r.event.op === 'INSERT'
     && /TCHEFOOD_PRECO:/.test(message) && !/não encontrado nesta loja/.test(message);
+}
+
+export const CLAIM_MISSING_REGISTER_ERROR = 'Este pagamento não tem a reserva no servidor feita neste aparelho: nada foi registrado. Tente de novo (a reserva é pedida antes de receber).';
+export const CLAIM_TERMS_REGISTER_ERROR = 'O pagamento não bate com a reserva feita no servidor (forma, maquininha ou valor): nada foi registrado.';
+
+/**
+ * Ligado à nuvem, pagamento aprovado que não é da Point precisa da reserva aberta com a mesma chave (feita
+ * aqui: claimFlow grava chave e termos no registro local antes de pedir). Exceção conferida no servidor: o
+ * dinheiro do entregador (chave entrega-<id>).
+ */
+function claimRequiredBlock(state: { cloud?: unknown }, input: Pick<PaymentInput, 'idempotency_key' | 'method' | 'acquirer'>, amount: number): string | null {
+  if (!state.cloud || input.acquirer === 'MERCADO_PAGO' || input.idempotency_key.startsWith('entrega-')) return null;
+  const c = localClaim(input.idempotency_key);
+  if (!c) return CLAIM_MISSING_REGISTER_ERROR;
+  const t = c.terms;
+  if (t && (t.method !== input.method || t.acquirer !== input.acquirer || t.amount_cents !== toCents(amount))) return CLAIM_TERMS_REGISTER_ERROR;
+  return null;
 }
 
 function managerAuthEvent(log: AuditLog, managerPin: string | null): SyncEvent {
@@ -958,6 +1109,20 @@ function cloudClosedCounter(before: TcheState, orders: readonly Order[], tables:
     const local = before.orders.find((x) => x.id === o.id);
     const closedHere = local?.status === 'CLOSED' && !prev.has(o.id);
     if (!closedHere) out.push(o.id);
+  }
+  return out;
+}
+
+/** Colunas que o aparelho guarda de uma linha do servidor (tchefood_order_snapshot): o resto da linha fica lá. */
+const ORDER_KEYS = ['id', 'tenant_id', 'table_id', 'opened_by_user_id', 'status', 'customer_count', 'customer_cpf', 'subtotal_items', 'charge_service_fee', 'service_fee_pct', 'service_fee_amount', 'discount_amount', 'total_amount', 'paid_amount', 'remaining_balance', 'nfce_status', 'nfce_key', 'opened_at', 'closed_at', 'pickup_number', 'pickup_name', 'fulfillment_type'] as const satisfies readonly (keyof Order)[];
+const PAYMENT_KEYS = ['id', 'order_id', 'tenant_id', 'waiter_id', 'terminal_id', 'amount', 'tip_amount', 'method', 'status', 'acquirer', 'acquirer_cnpj', 'card_brand', 'nsu', 'authorization_code', 'terminal_serial', 'idempotency_key', 'created_at'] as const satisfies readonly (keyof Payment)[];
+const ITEM_KEYS = ['id', 'order_id', 'product_id', 'waiter_id', 'quantity', 'unit_price', 'modifiers_unit_price', 'total_item_price', 'meat_doneness', 'notes', 'sector', 'status', 'is_paid', 'origin', 'created_at', 'prepared_at', 'canceled_at', 'canceled_by_user_id', 'cancel_reason', 'weight_gross_grams', 'weight_tare_grams', 'weight_source', 'keg_volume_ml', 'combo_parent_item_id', 'priced_at', 'half_product_ids', 'modifier_option_ids'] as const satisfies readonly (keyof OrderItem)[];
+const NUMERIC_KEYS = new Set(['customer_count', 'subtotal_items', 'service_fee_pct', 'service_fee_amount', 'discount_amount', 'total_amount', 'paid_amount', 'remaining_balance', 'amount', 'tip_amount', 'quantity', 'unit_price', 'modifiers_unit_price', 'total_item_price']);
+function pickRow(row: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of keys) {
+    const v = row[k];
+    out[k] = NUMERIC_KEYS.has(k) ? Number(v ?? 0) : k === 'half_product_ids' || k === 'modifier_option_ids' ? (Array.isArray(v) ? v : []) : v ?? null;
   }
   return out;
 }
@@ -1197,6 +1362,113 @@ export function isValidCnpj(cnpj: string): boolean {
     return r < 2 ? 0 : 11 - r;
   };
   return calc(12) === Number(cnpj[12]) && calc(13) === Number(cnpj[13]);
+}
+
+/** A inclusão deste pagamento ainda na fila ou nos recusados deste aparelho (o servidor não a tem). */
+function queuedPaymentInsert(state: TcheState, payment: Payment): SyncEvent | null {
+  const isInsert = (e: SyncEvent) => e.table === 'payments' && e.op === 'INSERT' && e.row_id === payment.id;
+  return state.outbox.find(isInsert) ?? (state.syncRejected ?? []).find((r) => isInsert(r.event))?.event ?? null;
+}
+
+/**
+ * Desfaz aqui um pagamento que o servidor nunca recebeu (a inclusão está na fila ou nos recusados): tira da fila as
+ * consequências do registro (itens pagos, comanda fechada, mesa livre), reabre a conta e sobe o estado atual de itens,
+ * conta e mesa. `replacement` é o pagamento depois (estornado). keepInsert (auditoria interna 2, P1-A, Point estornada
+ * no servidor): a inclusão fica, como `replacement`; senão sai junto (retirada do gerente). null: conta não encontrada.
+ */
+function undoQueuedPayment(state: TcheState, payment: Payment, replacement: Payment, keepInsert: boolean): { update: (s: TcheState) => Partial<TcheState>; nfceIssued: boolean } | null {
+  const isInsert = (e: SyncEvent) => e.table === 'payments' && e.op === 'INSERT' && e.row_id === payment.id;
+  const insertEvent = queuedPaymentInsert(state, payment);
+  if (!insertEvent) return null;
+  const order = state.orders.find((o) => o.id === payment.order_id);
+  if (!order) return null;
+  const ts = nowISO();
+  const itemIds = new Set(state.orderItems.filter((i) => i.order_id === order.id).map((i) => i.id));
+  // Consequências do registro deste pagamento na fila (itens pagos, comanda fechada, mesa livre): saem junto.
+  // Fila gravada antes da marca caused_by_payment_id: as mudanças gravadas junto com o pagamento. Elas saem
+  // da mesma ação, mas cada evento lê o relógio de novo e pode cair no milissegundo seguinte: vale a janela
+  // de LEGACY_CONSEQUENCE_WINDOW_MS depois do pagamento, até o próximo pagamento da mesma conta (cujas
+  // consequências seriam dele).
+  const queued = [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)];
+  const t0 = Date.parse(insertEvent.created_at);
+  const nextPayment = queued
+    .filter((e) => e.table === 'payments' && e.op === 'INSERT' && e.row_id !== payment.id && e.payload.order_id === order.id)
+    .map((e) => Date.parse(e.created_at))
+    .filter((t) => t >= t0)
+    .reduce((a, t) => Math.min(a, t), Infinity);
+  const windowEnd = Math.min(t0 + LEGACY_CONSEQUENCE_WINDOW_MS, nextPayment);
+  const inWindow = (e: SyncEvent) => {
+    const t = Date.parse(e.created_at);
+    // O mesmo instante do pagamento sempre conta (a regra antiga).
+    return Number.isFinite(t0) && t >= t0 && (t < windowEnd || t === t0);
+  };
+  const isConsequence = (e: SyncEvent) => {
+    if (e.caused_by_payment_id) return e.caused_by_payment_id === payment.id;
+    if (e.op !== 'UPDATE' || !inWindow(e)) return false;
+    return (e.table === 'orders' && e.row_id === order.id)
+      || (e.table === 'order_items' && itemIds.has(e.row_id))
+      || (e.table === 'dining_tables' && e.depends_on_order_id === order.id);
+  };
+  // keepInsert (Point estornada no servidor): a inclusão fica na fila, como `replacement` (estornado).
+  const dropped = (e: SyncEvent) => (!keepInsert && isInsert(e)) || isConsequence(e);
+  const droppedIds = new Set([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)].filter(dropped).map((e) => e.id));
+
+  const payments = state.payments.map((p) => (p.id === payment.id ? replacement : p));
+  // "Pago" dos itens pelos pagamentos aprovados que sobram. Pagamento antigo sem a lista: mantém o que
+  // estava marcado, menos os itens deste e os marcados só pelo fechamento que ele causou.
+  const approved = payments.filter((p) => p.order_id === order.id && p.status === 'APPROVED');
+  const paidByOthers = new Set(approved.flatMap((p) => p.paid_item_ids ?? []));
+  const legacy = approved.some((p) => p.paid_item_ids === undefined);
+  const closedByThis = order.status === 'CLOSED';
+  const orderItems = state.orderItems.map((i) => {
+    if (i.order_id !== order.id || i.status === 'CANCELED') return i;
+    const paid = paidByOthers.has(i.id)
+      || (legacy && !closedByThis && i.is_paid && !(payment.paid_item_ids ?? []).includes(i.id));
+    return paid === i.is_paid ? i : { ...i, is_paid: paid };
+  });
+  const changedItems = orderItems.filter((i, idx) => i !== state.orderItems[idx]);
+  let recalculated = applyOrderTotals(order, orderItems, payments);
+  let table: DiningTable | null = null;
+  const nfceIssued = Boolean(order.nfce_key);
+  if (closedByThis) {
+    // Reabre: a conta não está quitada no servidor. A NFC-e já emitida fica registrada (a trava pede o cancelamento).
+    recalculated = { ...recalculated, status: 'PAYING', closed_at: null };
+    const t = state.tables.find((x) => x.id === order.table_id);
+    if (t && t.status === 'FREE' && t.current_order_id === null) table = { ...t, status: 'PAYING', current_order_id: order.id, updated_at: ts };
+  }
+  const tableNow = table ?? state.tables.find((x) => x.id === order.table_id) ?? null;
+  // A mesa: se o fechamento dela saiu da fila, sobe o estado atual (que pode já ser de outra comanda).
+  const tableDropped = [...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)].some((e) => droppedIds.has(e.id) && e.table === 'dining_tables');
+  const droppedItemIds = new Set([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]
+    .filter((e) => droppedIds.has(e.id) && e.table === 'order_items').map((e) => e.row_id));
+  const keep = (e: SyncEvent): SyncEvent | null => {
+    if (droppedIds.has(e.id)) return null;
+    return e.depends_on_event_ids?.some((id) => droppedIds.has(id)) ? { ...e, depends_on_event_ids: e.depends_on_event_ids.filter((id) => !droppedIds.has(id)) } : e;
+  };
+  // keepInsert: a inclusão nos recusados volta para a fila (na frente), já como `replacement`.
+  const asReplacement = (e: SyncEvent): SyncEvent => (keepInsert && isInsert(e) ? { ...e, payload: { ...e.payload, status: replacement.status } } : e);
+  const back = keepInsert ? (state.syncRejected ?? []).filter((r) => isInsert(r.event)).map((r) => asReplacement(r.event)) : [];
+  const update = (s: TcheState): Partial<TcheState> => ({
+    payments,
+    orderItems,
+    orders: s.orders.map((o) => (o.id === order.id ? recalculated : o)),
+    tables: table ? s.tables.map((t) => (t.id === table!.id ? table! : t)) : s.tables,
+    outbox: [
+      ...back,
+      ...s.outbox.map(keep).filter((e): e is SyncEvent => e !== null).map(asReplacement),
+      ...changedItems.map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
+      // Item cuja mudança saiu da fila junto (fila antiga: pela janela de tempo, pode ser de outra ação, como o
+      // KDS avançando o preparo): sobe o estado atual dele, para nada que não era do pagamento se perder.
+      ...orderItems
+        .filter((i) => droppedItemIds.has(i.id) && !changedItems.includes(i))
+        .map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
+      syncEvent('orders', 'UPDATE', recalculated),
+      ...(tableNow && (table || tableDropped) ? [tableEventForOrder(tableNow, tableNow.current_order_id ?? order.id)] : []),
+    ],
+    // "Reenviar recusados" não traz de volta o pagamento nem o fechamento retirados.
+    syncRejected: (s.syncRejected ?? []).filter((r) => !droppedIds.has(r.event.id) && !(keepInsert && isInsert(r.event))),
+  });
+  return { update, nfceIssued };
 }
 
 export const useTcheStore = create<TcheState>()(
@@ -1533,12 +1805,36 @@ export const useTcheStore = create<TcheState>()(
         recalculated: Order,
         orderItems: OrderItem[],
         ts: string,
-      ): { order: Order; orderItems: OrderItem[]; nfceSeq: number; table: DiningTable | null; closed: boolean } => {
+      ): { order: Order; orderItems: OrderItem[]; nfceSeq: number; table: DiningTable | null; closed: boolean; nfceKeptLog: AuditLog | null } => {
         if (toCents(recalculated.paid_amount) <= 0 || toCents(recalculated.remaining_balance) !== 0) {
-          return { order: recalculated, orderItems, nfceSeq: s.nfceSeq, table: null, closed: false };
+          return { order: recalculated, orderItems, nfceSeq: s.nfceSeq, table: null, closed: false, nfceKeptLog: null };
+        }
+        const table = s.tables.find((t) => t.id === recalculated.table_id);
+        const freedTable = table ? { ...table, status: 'FREE' as const, current_order_id: null, updated_at: ts } : null;
+        const paidItems = orderItems.map((i) => (i.order_id === recalculated.id && i.status !== 'CANCELED' ? { ...i, is_paid: true } : i));
+        // Conta reaberta pelo estorno e cobrada de novo: a NFC-e autorizada desta venda fica (nunca uma segunda nota para
+        // a mesma venda). A forma de pagamento mudou: fica no registro da conta para o contador conferir.
+        if (recalculated.nfce_key && recalculated.nfce_status === 'AUTORIZADA') {
+          const user = currentUser();
+          const nfceKeptLog = buildAudit({
+            order_id: recalculated.id,
+            performed_by_user_id: user?.id ?? recalculated.opened_by_user_id,
+            authorized_by_manager_id: null,
+            action_type: 'NFCE_ALREADY_ISSUED',
+            amount_impact: 0,
+            reason: NFCE_ALREADY_ISSUED,
+            metadata: { nfce_key: recalculated.nfce_key, paid_amount: recalculated.paid_amount },
+          });
+          return {
+            order: { ...recalculated, status: 'CLOSED', closed_at: ts },
+            orderItems: paidItems,
+            nfceSeq: s.nfceSeq,
+            table: freedTable,
+            closed: true,
+            nfceKeptLog,
+          };
         }
         const nfceSeq = s.nfceSeq + 1;
-        const table = s.tables.find((t) => t.id === recalculated.table_id);
         return {
           order: {
             ...recalculated,
@@ -1547,10 +1843,11 @@ export const useTcheStore = create<TcheState>()(
             nfce_status: 'AUTORIZADA',
             nfce_key: buildAccessKey({ cnpj: s.tenant.cnpj, issuedAt: new Date(ts), number: nfceSeq }),
           },
-          orderItems: orderItems.map((i) => (i.order_id === recalculated.id && i.status !== 'CANCELED' ? { ...i, is_paid: true } : i)),
+          orderItems: paidItems,
           nfceSeq,
-          table: table ? { ...table, status: 'FREE', current_order_id: null, updated_at: ts } : null,
+          table: freedTable,
           closed: true,
+          nfceKeptLog: null,
         };
       };
 
@@ -1562,6 +1859,16 @@ export const useTcheStore = create<TcheState>()(
         toCents(simulated.paid_amount) > 0 && toCents(simulated.remaining_balance) === 0 && get().tray.some((t) => t.order_id === simulated.id)
           ? 'Este ajuste quita a conta, mas há itens na bandeja não enviados. Envie ou remova antes.'
           : null;
+
+      /**
+       * Reduzir o total abaixo do que o servidor tem reservado na comanda (TF012): recusa aqui antes, com a
+       * última leitura da reserva (o servidor recusaria o evento depois). Abaixo do já pago (TF012
+       * total_below_paid) cada ajuste confere antes, com TOTAL_BELOW_PAID; o cashback já é limitado ao saldo.
+       */
+      const reservationBlock = (simulated: Order): string | null => {
+        const paidKeys = new Set(get().payments.filter((p) => p.status === 'APPROVED' && p.idempotency_key).map((p) => p.idempotency_key!));
+        return reservationExceeds(simulated.id, simulated.remaining_balance, paidKeys);
+      };
 
       /** Resultado de um ajuste financeiro: aplica totais e encerra se o saldo zerou. */
       const commitAdjustment = (
@@ -1587,11 +1894,12 @@ export const useTcheStore = create<TcheState>()(
           nfceSeq: settled.nfceSeq,
           orders: s.orders.map((o) => (o.id === recalculated.id ? settled.order : o)),
           tables: settled.table ? s.tables.map((t) => (t.id === settled.table!.id ? settled.table! : t)) : s.tables,
-          auditLogs: [...[...logs].reverse(), ...s.auditLogs],
+          auditLogs: [...(settled.nfceKeptLog ? [settled.nfceKeptLog] : []), ...[...logs].reverse(), ...s.auditLogs],
           outbox: [
             ...s.outbox,
             // O audit_log sobe antes: o banco recusa o ajuste sem a autorização já gravada.
             ...logs.map((l) => managerAuthEvent(l, managerPin)),
+            ...(settled.nfceKeptLog ? [syncEvent('audit_logs', 'INSERT', settled.nfceKeptLog)] : []),
             ...allChanged.map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
             syncEvent('orders', 'UPDATE', settled.order),
             ...(settled.table ? [tableEventForOrder(settled.table, recalculated.id)] : []),
@@ -2089,7 +2397,7 @@ export const useTcheStore = create<TcheState>()(
           const simulatedItems = get().orderItems.map((i) => canceledById.get(i.id) ?? i);
           const simulated = applyOrderTotals(order, simulatedItems, get().payments);
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
-            return fail('Cancelamento deixaria a conta abaixo do valor já pago. Estorne um pagamento primeiro.');
+            return fail(TOTAL_BELOW_PAID);
           }
           // Conta com cashback: se o cancelamento deixa o desconto abaixo do cashback usado,
           // a diferença volta para o cliente (REFUND). Quem grava na nuvem é o banco, no
@@ -2097,6 +2405,8 @@ export const useTcheStore = create<TcheState>()(
           // fica o espelho local, que não sobe.
           const trayBlock = blocksSettleWithTray(simulated);
           if (trayBlock) return fail(trayBlock);
+          const reservedBlock = reservationBlock(simulated);
+          if (reservedBlock) return fail(reservedBlock);
 
           const authRes = authorizeManager(auth, { orderId: order.id, action: 'ITEM_CANCELED' });
           if (!authRes.ok) return authRes;
@@ -2181,10 +2491,12 @@ export const useTcheStore = create<TcheState>()(
           if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
           const simulated = applyOrderTotals({ ...order, charge_service_fee: false }, get().orderItems, get().payments);
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
-            return fail('Remover a taxa deixaria a conta abaixo do valor já pago.');
+            return fail(TOTAL_BELOW_PAID);
           }
           const trayBlock = blocksSettleWithTray(simulated);
           if (trayBlock) return fail(trayBlock);
+          const reservedBlock = reservationBlock(simulated);
+          if (reservedBlock) return fail(reservedBlock);
           const authRes = authorizeManager(auth, { orderId, action: 'SERVICE_FEE_REMOVED' });
           if (!authRes.ok) return authRes;
           const user = currentUser()!;
@@ -2264,10 +2576,12 @@ export const useTcheStore = create<TcheState>()(
           if (toCents(discount) > toCents(gross)) return fail('Desconto maior que o valor da conta.');
           const simulated = applyOrderTotals({ ...order, discount_amount: discount }, get().orderItems, get().payments);
           if (toCents(simulated.total_amount) < toCents(order.paid_amount)) {
-            return fail('Desconto deixaria a conta abaixo do valor já pago.');
+            return fail(TOTAL_BELOW_PAID);
           }
           const trayBlock = blocksSettleWithTray(simulated);
           if (trayBlock) return fail(trayBlock);
+          const reservedBlock = reservationBlock(simulated);
+          if (reservedBlock) return fail(reservedBlock);
           const authRes = authorizeManager(auth, { orderId, action: 'DISCOUNT_APPLIED' });
           if (!authRes.ok) return authRes;
           const user = currentUser()!;
@@ -2349,6 +2663,10 @@ export const useTcheStore = create<TcheState>()(
           if (input.payment_id !== undefined && get().payments.some((p) => p.id === input.payment_id)) {
             return fail('Transação duplicada (pagamento já registrado).');
           }
+          // Ligado à nuvem: o servidor só aceita pagamento aprovado (fora a Point) com a reserva aberta da mesma
+          // chave, forma, credenciadora e valor (TF010). Sem a reserva feita aqui, nem registra.
+          const claimBlock = input.status === 'APPROVED' ? claimRequiredBlock(get(), input, amount) : null;
+          if (claimBlock) return fail(claimBlock);
           if (input.status === 'APPROVED' && toCents(amount) > toCents(order.remaining_balance)) {
             return fail('Valor maior que o saldo restante da mesa.');
           }
@@ -2379,7 +2697,9 @@ export const useTcheStore = create<TcheState>()(
             terminal_serial: input.terminal_serial,
             idempotency_key: input.idempotency_key,
             created_at: ts,
+            ...(input.status === 'APPROVED' ? { paid_item_ids: [...input.item_ids] } : {}),
           };
+          const causedBy = (e: SyncEvent): SyncEvent => ({ ...e, caused_by_payment_id: payment.id });
 
           let outcome: PaymentOutcome | null = null;
           set((s) => {
@@ -2394,9 +2714,11 @@ export const useTcheStore = create<TcheState>()(
             let nfceSeq = s.nfceSeq;
             let updatedTable: DiningTable | null = null;
             let closed = false;
+            let nfceKeptLog: AuditLog | null = null;
             if (input.status === 'APPROVED') {
               const settled = settleIfPaid(s, recalculated, orderItems, ts);
               closed = settled.closed;
+              nfceKeptLog = settled.nfceKeptLog;
               recalculated = settled.order;
               orderItems = settled.orderItems;
               nfceSeq = settled.nfceSeq;
@@ -2415,12 +2737,14 @@ export const useTcheStore = create<TcheState>()(
               pendingCharges: fromLockedCharge ? s.pendingCharges.filter((c) => c.request_id !== input.charge_request_id) : s.pendingCharges,
               orders: s.orders.map((o) => (o.id === order.id ? recalculated : o)),
               tables: updatedTable ? s.tables.map((t) => (t.id === updatedTable!.id ? updatedTable! : t)) : s.tables,
+              ...(nfceKeptLog ? { auditLogs: [nfceKeptLog, ...s.auditLogs] } : {}),
               outbox: [
                 ...s.outbox,
                 syncEvent('payments', 'INSERT', payment),
-                ...changedItems.map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
-                syncEvent('orders', 'UPDATE', recalculated),
-                ...(updatedTable ? [tableEventForOrder(updatedTable, order.id)] : []),
+                ...(nfceKeptLog ? [causedBy(syncEvent('audit_logs', 'INSERT', nfceKeptLog))] : []),
+                ...changedItems.map((i) => causedBy(itemEvent('UPDATE', i, s.kegTapProducts))),
+                causedBy(syncEvent('orders', 'UPDATE', recalculated)),
+                ...(updatedTable ? [causedBy(tableEventForOrder(updatedTable, order.id))] : []),
               ],
             };
           });
@@ -2481,8 +2805,12 @@ export const useTcheStore = create<TcheState>()(
         endTerminalCharge: (requestId) => set((s) => ({ pendingCharges: s.pendingCharges.filter((c) => c.request_id !== requestId) })),
 
         confirmReviewedCharge: (input, auth) => {
-          const hold = getReviewHold(input.orderId);
-          if (!hold) return fail('Não há cobrança sem confirmação para esta conta.');
+          const hold = input.holdKey ? getReviewHoldByKey(input.holdKey) : getReviewHold(input.orderId);
+          if (!hold || hold.order_id !== input.orderId) return fail('Não há cobrança sem confirmação para esta conta.');
+          // A reserva desta cobrança foi liberada no servidor: registrar aqui seria recusado (TF010). Só estornar.
+          if (hold.code === 'CLAIM_RELEASED' || hold.code === 'PAYMENT_REJECTED') return fail(CLAIM_RELEASED_REGISTER_ERROR);
+          // Outra adquirente que a reservada: só com a reserva trocada (chave nova); a antiga o servidor recusaria.
+          if (hold.code === 'ACQUIRER_MISMATCH' && get().cloud && !input.registerKey) return fail(ACQUIRER_MISMATCH_REGISTER_ERROR);
           const res = findEditableOrder(input.orderId);
           if (!res.ok) return res;
           const order = res.data;
@@ -2490,6 +2818,7 @@ export const useTcheStore = create<TcheState>()(
           const method = hold.method ?? input.method;
           const acquirer = hold.acquirer ?? input.acquirer;
           if (method !== 'CREDIT' && method !== 'DEBIT' && method !== 'PIX') return fail('Informe a forma de pagamento que aparece no comprovante.');
+          if (acquirer === 'MERCADO_PAGO') return fail(MERCADO_PAGO_MANUAL_ERROR);
           if (acquirer !== 'STONE' && acquirer !== 'PAGBANK') return fail('Informe a maquininha (Stone ou PagBank) do comprovante.');
           if (input.card_brand !== null && !RECEIPT_CARD_BRANDS.includes(input.card_brand)) return fail('Bandeira do cartão inválida.');
           const proof = checkReceiptProof({ nsu: input.nsu, authorization_code: input.authorization_code });
@@ -2525,7 +2854,7 @@ export const useTcheStore = create<TcheState>()(
               nsu: proof.nsu,
               authorization_code: proof.authorization_code,
               terminal_serial: hold.terminal_serial || null,
-              idempotency_key: hold.idempotency_key ?? uuid(),
+              idempotency_key: input.registerKey ?? hold.idempotency_key ?? uuid(),
               item_ids: hold.item_ids ?? [],
             });
           } finally {
@@ -2561,8 +2890,264 @@ export const useTcheStore = create<TcheState>()(
           // Sobe por tchefood_authorize_manager, depois do pagamento: o servidor confere o
           // PIN e que o pagamento com este NSU já está na conta.
           set((s) => ({ auditLogs: [log, ...s.auditLogs], outbox: [...s.outbox, managerAuthEvent(log, auth.managerPin)] }));
-          clearReviewHold(order.id);
+          clearReviewHold(order.id, reviewHoldKey(hold));
           return pay;
+        },
+
+        verifyManagerPin: (auth, context) => authorizeManager(auth, context),
+
+        resolveRefundedClaimHold: (orderId, auth, holdKey, server) => {
+          const serverAuditId = server && 'auditId' in server ? server.auditId : undefined;
+          const claimMissing = Boolean(server && 'claimMissing' in server);
+          const hold = holdKey ? getReviewHoldByKey(holdKey) : getReviewHold(orderId);
+          if (!hold || hold.order_id !== orderId || (hold.code !== 'CLAIM_RELEASED' && hold.code !== 'PAYMENT_REJECTED')) {
+            return fail('Não há pagamento a estornar ou devolver nesta conta.');
+          }
+          // Ligado à nuvem: o servidor registra primeiro (o aparelho não grava este audit_log pela fila).
+          if (get().cloud && !serverAuditId && !claimMissing) return fail('O estorno precisa ser confirmado no servidor: tente de novo com conexão.');
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada.');
+          const authRes = authorizeManager(auth, { orderId, action: 'CLAIM_RELEASED_REFUNDED' });
+          if (!authRes.ok) return authRes;
+          const manager = authRes.data;
+          const log = buildAudit({
+            order_id: orderId,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: manager.id,
+            action_type: 'CLAIM_RELEASED_REFUNDED',
+            amount_impact: 0,
+            reason: auth.reason.trim(),
+            metadata: {
+              amount: hold.amount,
+              method: hold.method ?? null,
+              acquirer: hold.acquirer ?? null,
+              terminal_serial: hold.terminal_serial ?? null,
+              idempotency_key: hold.idempotency_key ?? null,
+              refund: hold.refund ?? 'TERMINAL',
+              review_code: hold.code,
+              review_reason: hold.reason,
+              review_started_at: hold.created_at,
+              operator_name: user.name,
+              manager_name: manager.name,
+              server_audit_id: serverAuditId ?? null,
+              // O servidor não tem a reserva (TF005): só o PIN e o motivo daqui.
+              ...(claimMissing ? { server_claim_missing: true } : {}),
+            },
+          });
+          // Registro só deste aparelho: o do servidor é o de tchefood_authorize_claim_refunded (server_audit_id).
+          set((s) => ({ auditLogs: [log, ...s.auditLogs] }));
+          clearReviewHold(orderId, reviewHoldKey(hold));
+          return { ok: true, data: log };
+        },
+
+        withdrawUnacceptedPayment: (idempotencyKey, reason) => {
+          const state = get();
+          const payment = state.payments.find((p) => p.idempotency_key === idempotencyKey && p.status === 'APPROVED');
+          if (!payment) return fail('Pagamento aprovado não encontrado neste aparelho.');
+          // Point: quem diz se a cobrança vale é o servidor (point-charge); nunca vira estorno aqui.
+          if (payment.acquirer === 'MERCADO_PAGO') return fail('Pagamento da Point: só o servidor desfaz.');
+          if (!queuedPaymentInsert(state, payment)) return fail('Este pagamento já entrou no servidor: não pode ser retirado aqui.');
+          const withdrawn: Payment = { ...payment, status: 'REFUNDED', withdrawn_reason: reason };
+          const out = undoQueuedPayment(state, payment, withdrawn, false);
+          if (!out) return fail('Conta do pagamento não encontrada.');
+          set(out.update);
+          return { ok: true, data: { payment: withdrawn, nfceIssued: out.nfceIssued } };
+        },
+
+        mirrorServerPointRefund: (idempotencyKey, reason, opts) => {
+          const state = get();
+          const payment = state.payments.find((p) => p.idempotency_key === idempotencyKey && p.acquirer === 'MERCADO_PAGO') ?? null;
+          const hold = getReviewHoldByKey(idempotencyKey);
+          const orderId = payment?.order_id ?? hold?.order_id ?? null;
+          const order = orderId ? state.orders.find((o) => o.id === orderId) ?? null : null;
+          // Já espelhado (pagamento estornado aqui): nada de novo (sem outro registro, sem mexer na trava).
+          if (payment && payment.status === 'REFUNDED') return { ok: true, data: { payment, nfceIssued: Boolean(order?.nfce_key), reopened: false } };
+          let mirrored: Payment | null = payment;
+          let orders = state.orders;
+          let payments = state.payments;
+          let orderItems = state.orderItems;
+          // Auditoria interna 2 (P1-A): o servidor nunca recebeu o pagamento (a inclusão está na fila ou nos recusados
+          // daqui, e ele não diz que tem). As consequências do registro (itens pagos, comanda fechada, mesa livre) seriam
+          // recusadas lá (a conta deve o valor) ou deixariam a mesa livre com a conta aberta: saem, a conta reabre aqui e
+          // o estado atual sobe. A inclusão fica, como estornada (o servidor aceita com a cobrança estornada).
+          const undo = payment && payment.status === 'APPROVED' && opts?.paymentRegistered !== true
+            ? undoQueuedPayment(state, payment, { ...payment, status: 'REFUNDED' }, true)
+            : null;
+          if (payment && payment.status === 'APPROVED' && !undo) {
+            mirrored = { ...payment, status: 'REFUNDED' };
+            payments = state.payments.map((p) => (p.id === payment.id ? mirrored! : p));
+            // O saldo volta a dever, como no servidor (tchefood_refund_point_payment). GPT r10 (P1-01): a conta fechada
+            // reabre (PAYING, sem closed_at), como o servidor faz agora; a mesa fica como está. Os próximos passos (cobrar
+            // de novo ou encerrar como venda devolvida) ficam com o gerente.
+            // GPT r10: os itens pagos por este pagamento (paid_item_ids) voltam a não pagos, como no servidor.
+            const unpaid = new Set(payment.paid_item_ids ?? []);
+            if (unpaid.size > 0) {
+              orderItems = state.orderItems.map((i) => (i.order_id === payment.order_id && unpaid.has(i.id) && i.is_paid ? { ...i, is_paid: false } : i));
+            }
+            if (order) {
+              const recalculated = applyOrderTotals(order, orderItems, payments);
+              const reopen = order.status === 'CLOSED' && toCents(recalculated.remaining_balance) > 0;
+              orders = state.orders.map((o) => (o.id === order.id
+                ? { ...recalculated, status: reopen ? 'PAYING' : order.status, closed_at: reopen ? null : order.closed_at }
+                : o));
+            }
+          }
+          const user = currentUser();
+          // Sem pagamento aqui: nada a registrar neste aparelho (o servidor tem o registro do estorno).
+          const log = user && payment
+            ? buildAudit({
+              order_id: orderId,
+              performed_by_user_id: user.id,
+              authorized_by_manager_id: opts?.managerId ?? null,
+              action_type: 'POINT_PAYMENT_REFUNDED',
+              amount_impact: 0,
+              reason: reason.trim(),
+              metadata: {
+                idempotency_key: idempotencyKey,
+                payment_id: payment?.id ?? null,
+                amount: payment?.amount ?? null,
+                nsu: payment?.nsu ?? null,
+                server_verified: true,
+                // GPT r12: a conta fechada reabriu com este estorno (identifica a conta reaberta, com ou sem NFC-e).
+                order_reopened: Boolean(order && order.status === 'CLOSED'),
+                server_audit_id: opts?.serverAuditId ?? null,
+                authorization_audit_id: opts?.authorizationAuditId ?? null,
+                operator_name: user.name,
+              },
+            })
+            : null;
+          if (log && opts?.serverAuditId) log.id = opts.serverAuditId;
+          const reopened = Boolean(order && order.status === 'CLOSED');
+          // A inclusão deste pagamento ainda na fila ou nos recusados (APROVADO) seria recusada para sempre (TF007: a
+          // cobrança está estornada no servidor): sobe como estornado, que o servidor aceita com a cobrança estornada
+          // (db/schema_mercado_pago.sql), e sai dos recusados.
+          const isInsert = (e: SyncEvent) => payment !== null && e.table === 'payments' && e.op === 'INSERT' && e.row_id === payment.id;
+          const asRefunded = (e: SyncEvent): SyncEvent => (isInsert(e) ? { ...e, payload: { ...e.payload, status: 'REFUNDED' } } : e);
+          if (undo) {
+            set((s) => ({ ...undo.update(s), ...(log ? { auditLogs: [log, ...s.auditLogs] } : {}) }));
+            if (hold && orderId) clearReviewHold(orderId, reviewHoldKey(hold));
+            return { ok: true, data: { payment: { ...payment!, status: 'REFUNDED' }, nfceIssued: undo.nfceIssued, reopened } };
+          }
+          set((s) => {
+            const back = (s.syncRejected ?? []).filter((r) => isInsert(r.event)).map((r) => asRefunded(r.event));
+            return {
+              payments,
+              orders,
+              orderItems,
+              ...(log ? { auditLogs: [log, ...s.auditLogs] } : {}),
+              // Os itens que voltaram a não pagos sobem (PATCH de order_items): o servidor não liga item a pagamento.
+              outbox: [
+                ...back,
+                ...s.outbox.map(asRefunded),
+                ...orderItems.filter((i, idx) => i !== state.orderItems[idx]).map((i) => itemEvent('UPDATE', i, s.kegTapProducts)),
+              ],
+              syncRejected: (s.syncRejected ?? []).filter((r) => !isInsert(r.event)),
+            };
+          });
+          if (hold && orderId) clearReviewHold(orderId, reviewHoldKey(hold));
+          const nowOrder = orders.find((o) => o.id === orderId);
+          return { ok: true, data: { payment: mirrored, nfceIssued: Boolean(order?.nfce_key), reopened: reopened && nowOrder?.status === 'PAYING' } };
+        },
+
+        mirrorRefundedOrderWriteOff: (orderId, server, reason) => {
+          const state = get();
+          const order = state.orders.find((o) => o.id === orderId);
+          if (!order) return fail('Conta não encontrada neste aparelho.');
+          const user = currentUser();
+          if (!user) return fail('Sessão expirada. Faça login novamente.');
+          if (order.status === 'CLOSED') return { ok: true, data: { writtenOff: 0 } };
+          // O valor baixado é o do servidor (written_off_cents); sem ele, o saldo daqui.
+          const writtenOff = server.writtenOffCents !== null ? server.writtenOffCents / 100 : order.remaining_balance;
+          // Total baixado da conta agora (esta baixa e as anteriores), para mostrar ao operador.
+          const totalWrittenOff = server.cumulativeWrittenOffCents != null ? server.cumulativeWrittenOffCents / 100 : writtenOff;
+          const ts = nowISO();
+          // Decisão do Will (15/11): a conta fecha com a hora do primeiro fechamento (turno da venda original), do servidor.
+          const closedAt = server.closedAt ?? ts;
+          const log = buildAudit({
+            order_id: orderId,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: server.managerId,
+            action_type: 'ORDER_REFUNDED_WRITE_OFF',
+            amount_impact: writtenOff,
+            reason: reason.trim(),
+            metadata: { written_off_cents: toCents(writtenOff), cumulative_written_off_cents: toCents(totalWrittenOff), server_verified: true, server_audit_id: server.auditId, operator_name: user.name },
+          });
+          // O mesmo id do registro do servidor: a leitura da nuvem não duplica. Nada vai para a fila: o servidor já fechou
+          // a conta e liberou a mesa (um UPDATE daqui com saldo devendo seria recusado lá).
+          set((s) => ({
+            orders: s.orders.map((o) => (o.id === orderId ? { ...o, status: 'CLOSED', closed_at: closedAt } : o)),
+            tables: s.tables.map((t) => (t.id === order.table_id && t.current_order_id === orderId ? { ...t, status: 'FREE', current_order_id: null, updated_at: ts } : t)),
+            auditLogs: [{ ...log, id: server.auditId }, ...s.auditLogs],
+          }));
+          return { ok: true, data: { writtenOff: totalWrittenOff } };
+        },
+
+        applyServerOrderSnapshot: (snap) => {
+          const state = get();
+          const so = snap.order;
+          const orderId = typeof so.id === 'string' ? so.id : '';
+          const status = so.status as OrderStatus;
+          if (!orderId || !['OPEN', 'PAYING', 'CLOSED', 'CANCELED'].includes(String(status))) return fail('Resposta do servidor sem a conta.');
+          // GPT r16 P0-01: só entra aqui conta da loja deste aparelho. Resposta de outra loja (leitura começada antes de
+          // trocar a loja, com a sessão antiga) é descartada inteira; linha de outra conta ou de outra loja também.
+          const foreign = (r: Record<string, unknown>) => r.order_id !== orderId || (r.tenant_id !== undefined && r.tenant_id !== null && r.tenant_id !== state.tenant.id);
+          if (so.tenant_id !== state.tenant.id || snap.items.some(foreign) || snap.payments.some(foreign) || snap.audits.some(foreign)) {
+            return fail('A resposta do servidor é de outra loja ou de outra conta. Nada foi alterado neste aparelho.');
+          }
+          const itemIds = new Set(snap.items.map((i) => String(i.id)));
+          const paymentIds = new Set(snap.payments.map((p) => String(p.id)));
+          const touches = (e: SyncEvent) => e.row_id === orderId || itemIds.has(e.row_id) || paymentIds.has(e.row_id) || (e.payload as Record<string, unknown> | undefined)?.order_id === orderId;
+          // GPT r14 P1-01: recusado (precisa de ação em Nuvem › recusados) e na fila (sobe sozinho) são ditos à parte.
+          const localStatus = state.orders.find((o) => o.id === orderId)?.status ?? status;
+          if ((state.syncRejected ?? []).some((r) => touches(r.event))) return { ok: true, data: { kind: 'rejected', status: localStatus } };
+          if (state.outbox.some(touches)) return { ok: true, data: { kind: 'pending', status: localStatus } };
+          const num = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+          const money = { subtotal_items: num(so.subtotal_items), service_fee_amount: num(so.service_fee_amount), discount_amount: num(so.discount_amount), total_amount: num(so.total_amount), paid_amount: num(so.paid_amount), remaining_balance: num(so.remaining_balance) };
+          const closedAt = typeof so.closed_at === 'string' ? so.closed_at : null;
+          const local = state.orders.find((o) => o.id === orderId);
+          const merged: Order = local
+            ? {
+              ...local, ...money, status, closed_at: closedAt,
+              nfce_status: (so.nfce_status as string | null) ?? local.nfce_status, nfce_key: (so.nfce_key as string | null) ?? local.nfce_key,
+            }
+            : { ...(pickRow(so, ORDER_KEYS) as unknown as Order), ...money, status, closed_at: closedAt };
+          const payments = [...state.payments];
+          for (const sp of snap.payments) {
+            const i = payments.findIndex((p) => p.id === sp.id);
+            if (i >= 0) payments[i] = { ...payments[i]!, status: sp.status as Payment['status'], amount: num(sp.amount) };
+            else payments.push({ ...(pickRow(sp, PAYMENT_KEYS) as unknown as Payment), amount: num(sp.amount), tip_amount: num(sp.tip_amount) });
+          }
+          const orderItems = [...state.orderItems];
+          for (const si of snap.items) {
+            const i = orderItems.findIndex((x) => x.id === si.id);
+            if (i >= 0) orderItems[i] = { ...orderItems[i]!, is_paid: Boolean(si.is_paid), status: si.status as OrderItem['status'] };
+            else orderItems.push(pickRow(si, ITEM_KEYS) as unknown as OrderItem);
+          }
+          const known = new Set(state.auditLogs.flatMap((l) => [l.id, String(l.metadata?.server_audit_id ?? '')]));
+          const audits: AuditLog[] = snap.audits.filter((a) => !known.has(String(a.id))).map((a) => ({
+            id: String(a.id), tenant_id: merged.tenant_id, order_id: orderId, performed_by_user_id: String(a.performed_by_user_id ?? ''),
+            authorized_by_manager_id: (a.authorized_by_manager_id as string | null) ?? null, action_type: a.action_type as AuditLog['action_type'],
+            amount_impact: num(a.amount_impact), reason: String(a.reason ?? ''), whatsapp_alert_sent: false,
+            metadata: (a.metadata as Record<string, unknown> | null) ?? null, created_at: String(a.created_at),
+          }));
+          const ts = nowISO();
+          set((s) => ({
+            orders: local ? s.orders.map((o) => (o.id === orderId ? merged : o)) : [merged, ...s.orders],
+            payments,
+            orderItems,
+            // Conta encerrada no servidor: a mesa dela fica livre aqui também (como o servidor faz).
+            tables: status === 'CLOSED' || status === 'CANCELED'
+              ? s.tables.map((t) => (t.current_order_id === orderId ? { ...t, status: 'FREE', current_order_id: null, updated_at: ts } : t))
+              : s.tables,
+            auditLogs: audits.length ? [...audits, ...s.auditLogs] : s.auditLogs,
+          }));
+          // A trava local da chave (revisão) de um pagamento que o servidor já resolveu sai.
+          for (const sp of snap.payments) {
+            const key = typeof sp.idempotency_key === 'string' ? sp.idempotency_key : null;
+            const hold = key && sp.status !== 'PENDING' ? getReviewHoldByKey(key) : null;
+            if (hold && hold.order_id === orderId) clearReviewHold(orderId, reviewHoldKey(hold));
+          }
+          return { ok: true, data: { kind: 'applied', status } };
         },
 
         advanceItemStatus: (itemId) => {
@@ -3451,6 +4036,8 @@ export const useTcheStore = create<TcheState>()(
           if (!(available > 0)) return fail('Sem cashback liberado para hoje (o crédito vale a partir do dia seguinte à visita).');
           const amount = cashbackUsable(available, order);
           if (!(amount > 0)) return fail('Conta sem saldo para abater.');
+          const reservedCashback = reservationBlock(applyOrderTotals({ ...order, discount_amount: round2(order.discount_amount + amount) }, get().orderItems, get().payments));
+          if (reservedCashback) return fail(reservedCashback);
           const ts = now.toISOString();
           const entry: CashbackLedgerEntry = {
             id: uuid(),
@@ -4694,6 +5281,7 @@ export const useTcheStore = create<TcheState>()(
 
         setPullError: (message, source = 'catalog') =>
           set((s) => ({ pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), last_error: message, last_error_source: source } })),
+        setRefundSeq: (seq) => set((s) => ((s.pullStatus?.refund_seq ?? 0) >= seq ? {} : { pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), refund_seq: seq } })),
 
         ackSyncedEvents: (eventIds) => {
           if (eventIds.length === 0) return;
@@ -4764,10 +5352,12 @@ export const useTcheStore = create<TcheState>()(
             };
           }),
 
-        retryRejectedSync: () =>
+        retryRejectedSync: (keep = []) =>
           set((s) => {
+            const stay = new Set(keep);
+            const all = s.syncRejected ?? [];
             // Reenviar é a decisão da pessoa: a mudança antiga da mesa sobe como está (sem a marca).
-            const back = (s.syncRejected ?? []).map((r) => {
+            const back = all.filter((r) => !stay.has(r.event.id)).map((r) => {
               if (!r.event.legacy_table_review) return r.event;
               const { legacy_table_review: _l, ...ev } = r.event;
               return ev;
@@ -4775,7 +5365,17 @@ export const useTcheStore = create<TcheState>()(
             if (back.length === 0) return {};
             // Voltam na frente: são mais antigos que tudo o que entrou na fila depois.
             back.sort((a, b) => a.created_at.localeCompare(b.created_at));
-            return { outbox: [...back, ...s.outbox], syncRejected: [] };
+            return { outbox: [...back, ...s.outbox], syncRejected: all.filter((r) => stay.has(r.event.id)) };
+          }),
+
+        requeueRejectedEvents: (eventIds) =>
+          set((s) => {
+            const ids = new Set(eventIds);
+            const all = s.syncRejected ?? [];
+            const back = all.filter((r) => ids.has(r.event.id)).map((r) => r.event);
+            if (back.length === 0) return {};
+            back.sort((a, b) => a.created_at.localeCompare(b.created_at));
+            return { outbox: [...back, ...s.outbox], syncRejected: all.filter((r) => !ids.has(r.event.id)) };
           }),
 
         confirmRejectedAuthorization: (eventId, managerPin) => {
@@ -4844,6 +5444,69 @@ export const useTcheStore = create<TcheState>()(
             outbox: [managerAuthEvent(log, auth.managerPin), ev, ...s.outbox],
           }));
           return { ok: true, data: log };
+        },
+
+        revertRejectedDiscount: (eventId, managerAuth) => {
+          const state = get();
+          const rejected = (state.syncRejected ?? []).find((r) => r.event.id === eventId);
+          if (!rejected || rejected.event.table !== 'orders' || rejected.event.op !== 'UPDATE') return fail('Conta recusada não encontrada.');
+          if (!isTf012Rejection(rejected.message)) return fail('Esta recusa não é de desconto abaixo do reservado ou do já pago.');
+          const revertible = revertibleRejectedDiscount(state, rejected);
+          if (!revertible) return fail('A versão recusada não é a de uma troca de desconto deste aparelho: nada a desfazer aqui. Chame o gerente.');
+          const orderId = rejected.event.row_id;
+          const order = state.orders.find((o) => o.id === orderId);
+          if (!order) return fail('Conta não encontrada neste aparelho.');
+          if (order.status === 'CLOSED') return fail('A conta já foi fechada neste aparelho: chame o gerente para conferir com o cliente.');
+          if (activeCharge(orderId)) return fail(CHARGE_LOCK_ERROR);
+          if (state.cashbackLedger.some((e) => e.order_id === orderId && e.entry_type === 'REDEEM')) {
+            return fail('Esta conta usou cashback (que entra no desconto): chame o gerente para conferir.');
+          }
+          const own = toCents(Number(rejected.event.payload.discount_amount ?? Number.NaN));
+          if (!Number.isFinite(own)) return fail('A recusa não traz o desconto desta conta.');
+          // O desconto de antes: o da autorização da troca recusada.
+          const before = revertible.before;
+          // Versões da conta na fila: as que levam este desconto passam ao de antes; as de antes já estão certas.
+          // Outro desconto (outra troca depois): o gerente decide.
+          const queued = state.outbox.filter((e) => e.table === 'orders' && e.row_id === orderId && e.payload.discount_amount !== undefined);
+          if (queued.some((e) => ![own, toCents(before)].includes(toCents(Number(e.payload.discount_amount))))) {
+            return fail('Há outra troca de desconto desta conta na fila: chame o gerente.');
+          }
+          // Volta o desconto (às vezes para cima, se a troca recusada o baixou): sempre com o PIN do gerente.
+          const authRes = authorizeManager(managerAuth, { orderId, action: 'DISCOUNT_APPLIED' });
+          if (!authRes.ok) return authRes;
+          const user = currentUser()!;
+          const reverted = applyOrderTotals({ ...order, discount_amount: before }, state.orderItems, state.payments);
+          // Registro só deste aparelho: no servidor o desconto nunca mudou (a troca foi recusada).
+          const log = buildAudit({
+            order_id: orderId,
+            performed_by_user_id: user.id,
+            authorized_by_manager_id: authRes.data.id,
+            action_type: 'DISCOUNT_APPLIED',
+            amount_impact: round2(reverted.total_amount - order.total_amount),
+            reason: managerAuth.reason.trim(),
+            metadata: {
+              table: tableLabel(order.table_id),
+              discount_before: own / 100,
+              discount_after: before,
+              reverts_audit_id: revertible.audit.id,
+              server_rejected: rejected.message,
+              local_only: true,
+              waiter_name: user.name,
+              manager_name: authRes.data.name,
+            },
+          });
+          set((s) => ({
+            auditLogs: [log, ...s.auditLogs],
+            orders: s.orders.map((o) => (o.id === orderId ? reverted : o)),
+            syncRejected: (s.syncRejected ?? []).filter((r) => r.event.id !== eventId),
+            outbox: [
+              ...s.outbox.map((e) => (e.table === 'orders' && e.row_id === orderId && e.payload.discount_amount !== undefined && toCents(Number(e.payload.discount_amount)) === own
+                ? { ...e, payload: { ...e.payload, discount_amount: before } }
+                : e)),
+              syncEvent('orders', 'UPDATE', reverted),
+            ],
+          }));
+          return { ok: true, data: { discount: before } };
         },
 
         adoptCloudDiscount: (eventId, auth) => {
@@ -5633,6 +6296,19 @@ export const useTcheStore = create<TcheState>()(
               item_ids: [],
             });
             if (!r.ok) return fail(`Senha ${order.pickup_number ?? ''}: ${r.error} Acerto parado; as anteriores já foram recebidas.`);
+            // O servidor só aceita o dinheiro do entregador (entrega-<id>, sem reserva) com a entrega já DELIVERED
+            // lá: o pagamento espera a marcação de entregue que ainda está na fila (ou recusada).
+            const deliveredIds = [...get().outbox, ...(get().syncRejected ?? []).map((x) => x.event)]
+              .filter((e) => e.table === 'own_deliveries' && e.row_id === d.id && e.payload.status === 'DELIVERED')
+              .map((e) => e.id);
+            if (deliveredIds.length > 0) {
+              const payId = r.data.payment.id;
+              set((s) => ({
+                outbox: s.outbox.map((e) => (e.table === 'payments' && e.op === 'INSERT' && e.row_id === payId
+                  ? { ...e, depends_on_event_ids: [...new Set([...(e.depends_on_event_ids ?? []), ...deliveredIds])] }
+                  : e)),
+              }));
+            }
           }
           const keys = new Set(own.filter((d) => d.pay_on_delivery).map((d) => `entrega-${d.id}`));
           const cashCents = get().payments

@@ -68,6 +68,14 @@ INSERT INTO order_items (id, order_id, product_id, waiter_id, quantity, unit_pri
  ('00000000-0000-4000-8000-000000000201','00000000-0000-4000-8000-0000000000f2','00000000-0000-4000-8000-0000000000b1','00000000-0000-4000-8000-0000000000a1',3,12.90,0,'BAR','SMARTPOS'),
  ('00000000-0000-4000-8000-000000000202','00000000-0000-4000-8000-0000000000f2','00000000-0000-4000-8000-0000000000b3','00000000-0000-4000-8000-0000000000a1',2,34.90,0,'KITCHEN','SMARTPOS');
 SELECT expect_error($$INSERT INTO event_tickets (tenant_id, order_id, order_item_id, product_id, product_name_snapshot, unit_price, ticket_seq, barcode_token) VALUES ('00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-0000000000f2','00000000-0000-4000-8000-000000000201','00000000-0000-4000-8000-0000000000b1','Chopp',12.90,1,'ABCDEFGHJK123450')$$, '%depois da venda paga%');
+-- Com as migrations da reserva aplicadas (supabase/migrations, payment_claims), todo pagamento aprovado fora do
+-- Mercado Pago precisa da reserva aberta antes (auditoria r7 P1-01, TF010): o caixa reserva, depois recebe.
+DO $$ BEGIN
+  IF to_regclass('public.payment_claims') IS NOT NULL THEN
+    EXECUTE $q$INSERT INTO payment_claims (tenant_id, idempotency_key, order_id, method, acquirer, amount_cents, created_by)
+             VALUES ('00000000-0000-4000-8000-000000000001','k1','00000000-0000-4000-8000-0000000000f2','CREDIT','STONE',10850,'00000000-0000-4000-8000-0000000000a1')$q$;
+  END IF;
+END $$;
 INSERT INTO payments (id, order_id, tenant_id, waiter_id, amount, method, acquirer, idempotency_key) VALUES ('00000000-0000-4000-8000-000000000301','00000000-0000-4000-8000-0000000000f2','00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-0000000000a1',108.50,'CREDIT','STONE','k1');
 SELECT assert((SELECT status FROM orders WHERE id='00000000-0000-4000-8000-0000000000f2') = 'CLOSED', 'venda de balcão fechou (108,50 sem 10%)');
 SELECT assert((SELECT status FROM dining_tables WHERE kind='COUNTER') = 'FREE', 'mesa técnica do balcão continua livre');

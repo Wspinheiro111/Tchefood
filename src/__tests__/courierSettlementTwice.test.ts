@@ -90,7 +90,12 @@ describe('acerto com o entregador sem nuvem (demonstração, loja só neste apar
     const tables = st().outbox.map((e) => e.table);
     expect(tables.lastIndexOf('cash_movements')).toBeLessThan(tables.indexOf('courier_settlements'));
     expect(tables.indexOf('courier_settlements')).toBeLessThan(tables.lastIndexOf('own_deliveries'));
-    expect(st().outbox.some((e) => e.depends_on_event_ids?.length)).toBe(false);
+    // Sem espera entre a sangria e o acerto; só o dinheiro da senha espera a marcação de entregue (PR #49).
+    const byId = new Map(st().outbox.map((e) => [e.id, e]));
+    for (const e of st().outbox.filter((x) => x.depends_on_event_ids?.length)) {
+      expect(e.table).toBe('payments');
+      for (const id of e.depends_on_event_ids!) expect(byId.get(id)?.table).toBe('own_deliveries');
+    }
   });
 });
 

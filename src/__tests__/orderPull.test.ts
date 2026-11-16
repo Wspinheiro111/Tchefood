@@ -596,8 +596,8 @@ describe('parseCloudOrders: valor que esta versão não conhece e tipos estritos
     expect(r.orders[0]!.opened_at).toBe('2026-11-14T19:00:00.123Z');
   });
 
-  it('adquirente nova (ex.: MERCADO_PAGO do PR #49): só aquela conta fica de lado; as outras são aplicadas', () => {
-    expectO2Skipped(onO2(body(), 'payments', { acquirer: 'MERCADO_PAGO' }), 'adquirente');
+  it('adquirente nova (ex.: CIELO, de uma versão futura): só aquela conta fica de lado; as outras são aplicadas', () => {
+    expectO2Skipped(onO2(body(), 'payments', { acquirer: 'CIELO' }), 'adquirente');
   });
 
   it('origem de item nova (VARCHAR sem CHECK no banco): só aquela conta fica de lado', () => {
@@ -621,7 +621,7 @@ describe('parseCloudOrders: valor que esta versão não conhece e tipos estritos
   it('tipo errado, número ou data inválidos e outra loja continuam recusando a leitura inteira', () => {
     const cases: Array<[string, (b: B) => unknown]> = [
       ['valor que não é texto', (b) => onO2(b, 'payments', { method: 1 })],
-      ['valor desconhecido junto de número inválido na mesma conta', (b) => onO2(b, 'payments', { acquirer: 'MERCADO_PAGO', amount: 'abc' })],
+      ['valor desconhecido junto de número inválido na mesma conta', (b) => onO2(b, 'payments', { acquirer: 'CIELO', amount: 'abc' })],
       ['valor desconhecido num item de conta que não veio', (b) => ({ ...b, order_items: [b.order_items[0], { ...b.order_items[1], order_id: 'outra', origin: 'WHATSAPP' }] })],
       ['valor desconhecido em conta de outra loja', (b) => onO2(b, 'orders', { tenant_id: 'outra', status: 'REOPENED' })],
       ['mesa com situação desconhecida', (b) => ({ ...b, tables: [{ ...b.tables[0], status: 'RESERVED' }] })],
@@ -677,7 +677,7 @@ describe('parseCloudOrders: valor que esta versão não conhece e tipos estritos
   });
 
   it('conta deixada de lado fica como está neste aparelho no merge; a mesa dela segue a nuvem', () => {
-    const r = parseCloudOrders(onO2(body(), 'payments', { acquirer: 'MERCADO_PAGO' }), TEN);
+    const r = parseCloudOrders(onO2(body(), 'payments', { acquirer: 'CIELO' }), TEN);
     const localO2 = order(O2, { table_id: T2, customer_count: 7 });
     const local = {
       orders: [order(O1, { customer_count: 9 }), localO2],

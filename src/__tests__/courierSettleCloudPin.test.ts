@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { useTcheStore, type PickupLine } from '../store/useTcheStore';
 import type { FetchLike } from '../lib/sync/supabaseSync';
+import { beginLocalClaim } from '../lib/payments/claimLedger';
 import { COURIER_SETTLE_PIN_REFUSED, settleCourierInCloud } from '../lib/sync/courierSettle';
 
 const st = () => useTcheStore.getState();
@@ -59,6 +60,7 @@ describe('acerto pela nuvem: PIN de quem acertou (GPT, rodada 10 do PR #54)', ()
     expect(st().ownDeliveries.find((x) => x.id === d.id)!.settlement_id).toBeNull();
 
     // Pagamento da conta paga na entrega ainda na fila: o acerto espera (a nuvem tem outro saldo).
+    beginLocalClaim('k-parcial', o.data.id);
     const pay = st().registerPayment({
       orderId: o.data.id, amount: 1, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
       acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: 'k-parcial', item_ids: [],

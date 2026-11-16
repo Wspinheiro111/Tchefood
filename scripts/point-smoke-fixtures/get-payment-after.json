@@ -1,0 +1,17 @@
+{
+  "method": "GET",
+  "path": "/v1/payments/123456789",
+  "status": 200,
+  "at": "2026-11-14T12:00:00.000Z",
+  "body": {
+    "id": 123456789,
+    "status": "refunded",
+    "status_detail": "refunded",
+    "transaction_amount": 24.5,
+    "payment_method_id": "master",
+    "payment_type_id": "credit_card",
+    "authorization_code": "A1B2C3",
+    "installments": 1,
+    "external_reference": "55555555-5555-4555-8555-555555555555"
+  }
+}

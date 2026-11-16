@@ -176,7 +176,9 @@ export interface PaymentTerminalProvider {
   // Opcional, para quem não deduplica a criação (createRetryPolicy "never"): procura a ordem de uma criação com resultado
   // desconhecido pela referência enviada. null = não achou AGORA (não prova que não existe).
   // Erro (inclusive mais de uma ordem com a mesma referência) também não prova nada: quem chama trata como "não achou".
-  findChargeByReference?(externalReference: string): Promise<PaymentTerminalChargeResult | null>;
+  // `createdAt` (ISO 8601) é a hora em que a cobrança foi gravada: quem procura por janela de datas (Mercado Pago Point)
+  // precisa dela e recusa (invalid_request) sem ela; quem não precisa ignora.
+  findChargeByReference?(externalReference: string, options?: { createdAt?: string }): Promise<PaymentTerminalChargeResult | null>;
 }
 
 export type EmbeddedTerminalPaymentStatus = "approved" | "rejected" | "cancelled" | "failed" | "manual_review";

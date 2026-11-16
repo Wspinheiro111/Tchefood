@@ -93,9 +93,9 @@ const ORIGIN: Record<OrderItemOrigin, true> = { WAITER: true, SMARTPOS: true, QR
 const WEIGHT_SOURCE: Record<WeightSource, true> = { SCALE: true, MANUAL: true };
 const PAYMENT_METHOD: Record<PaymentMethod, true> = { CREDIT: true, DEBIT: true, PIX: true, VOUCHER: true, CASH: true };
 const PAYMENT_STATUS: Record<PaymentStatus, true> = { PENDING: true, APPROVED: true, DECLINED: true, REFUNDED: true };
-// Lista fechada: um adquirente novo no tipo (ex.: MERCADO_PAGO do PR #49) quebra a compilação
+// Lista fechada: um adquirente novo no tipo quebra a compilação
 // aqui até entrar na lista. Um aparelho com a versão antiga deixa de lado só a conta que o usa.
-const ACQUIRER: Record<AcquirerType, true> = { STONE: true, PAGBANK: true, MOCK: true, CASH_DESK: true };
+const ACQUIRER: Record<AcquirerType, true> = { STONE: true, PAGBANK: true, MERCADO_PAGO: true, MOCK: true, CASH_DESK: true };
 const FULFILLMENT: Record<FulfillmentType, true> = { DINE_IN: true, TAKEOUT: true, DELIVERY: true };
 const TABLE_STATUS: Record<DiningTable['status'], true> = { FREE: true, OCCUPIED: true, WAITING_BILL: true, PAYING: true, DIRTY: true };
 const CASH_STATUS: Record<CashSession['status'], true> = { OPEN: true, CLOSED: true };

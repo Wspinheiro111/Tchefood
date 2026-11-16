@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
+import { ACQUIRER_CNPJ as DEVICE_ACQUIRER_CNPJ } from '../../../src/lib/payments/drivers';
 import {
   ACQUIRER_CNPJ,
   NfceValidationError,
@@ -88,6 +89,21 @@ describe('payload NFC-e', () => {
     const p = buildNfcePayload(source());
     expect(p.formas_pagamento[0]).toEqual({ forma_pagamento: '03', valor_pagamento: 50, indicador_pagamento: 0, tipo_integracao: 1, cnpj_credenciadora: ACQUIRER_CNPJ.STONE, numero_autorizacao: 'A1B2C3', bandeira_operadora: '01' });
     expect(p.formas_pagamento[1]).toEqual({ forma_pagamento: '01', valor_pagamento: 45.65, indicador_pagamento: 0 });
+  });
+
+  it('auditoria 2 (P2-D): cartão da Point (Mercado Pago) com prova sai integrado como na prévia do aparelho', () => {
+    const mp = card({ acquirer: 'MERCADO_PAGO', acquirer_cnpj: DEVICE_ACQUIRER_CNPJ.MERCADO_PAGO, card_brand: 'Mastercard', authorization_code: 'A1B2C3' });
+    expect(paymentGroup(mp)).toEqual({
+      forma_pagamento: '03', valor_pagamento: 10, indicador_pagamento: 0, tipo_integracao: 1,
+      cnpj_credenciadora: '10573521000191', numero_autorizacao: 'A1B2C3', bandeira_operadora: '02',
+    });
+    // Mesmo CNPJ que o aparelho grava (src/lib/payments/drivers.ts), para todas as credenciadoras.
+    expect(ACQUIRER_CNPJ).toEqual(DEVICE_ACQUIRER_CNPJ);
+    expect(validCnpj(ACQUIRER_CNPJ.MERCADO_PAGO)).toBe(true);
+    // Sem prova coerente continua não integrado.
+    expect(paymentGroup({ ...mp, acquirer_cnpj: ACQUIRER_CNPJ.STONE })).toMatchObject({ tipo_integracao: 2 });
+    expect(paymentGroup({ ...mp, authorization_code: null })).toMatchObject({ tipo_integracao: 2 });
+    expect(paymentGroup({ ...mp, acquirer: 'STONE' })).toMatchObject({ tipo_integracao: 2 });
   });
 
   it('nunca atribui CNPJ do PagBank a adquirente que não é PagBank', () => {

@@ -19,7 +19,9 @@ import { KioskScreen } from './screens/KioskScreen';
 import { PickupCounterScreen } from './screens/PickupCounterScreen';
 import { CashRegisterScreen } from './screens/CashRegisterScreen';
 import { useCloudSync } from './lib/sync/useCloudSync';
+import { setClaimAlertHandler } from './lib/payments/claimSupervisor';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
+import { UnsavedStorageBanner } from './components/UnsavedStorageBanner';
 import { PrintSimulatorModal } from './components/PrintSimulator';
 import { ToastHost, toast } from './components/ui';
 import { CloudStaleBanner } from './components/CloudStaleBanner';
@@ -89,6 +91,11 @@ export default function App() {
   // Etapa 0: envia a fila para o Supabase quando há internet e o aparelho está conectado.
   useCloudSync(online);
   const topRef = useStickyTopHeight();
+  // Reserva liberada pelo gerente antes do pagamento chegar ao servidor (laço de sincronização): alerta na tela.
+  useEffect(() => {
+    setClaimAlertHandler((text) => toast.alert(`⚠️ ${text}`));
+    return () => setClaimAlertHandler(null);
+  }, []);
 
   // Perfil Cozinha entra direto no KDS.
   useEffect(() => {
@@ -159,6 +166,7 @@ export default function App() {
         </header>
         <CloudStaleBanner />
       </div>
+      <UnsavedStorageBanner />
 
       <main>
         {view.name === 'map' && <TableMap onOpenOrder={(orderId) => setView({ name: 'order', orderId })} />}
@@ -176,7 +184,7 @@ export default function App() {
         {view.name === 'chopp' && <KegMonitorScreen />}
         {view.name === 'delivery' && <DeliveryScreen />}
         {view.name === 'board' && <OrderBoardScreen />}
-        {view.name === 'backoffice' && <BackOffice onExit={(name) => setView({ name } as View)} />}
+        {view.name === 'backoffice' && <BackOffice onExit={(name) => setView({ name } as View)} onOpenCheckout={(orderId) => setView({ name: 'checkout', orderId })} />}
       </main>
 
       {nav.length > 1 && (

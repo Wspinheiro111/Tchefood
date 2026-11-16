@@ -441,3 +441,147 @@ export function mergeStaffWithoutPins(local: readonly StaffUser[], cloud: readon
 export function mergeStaffWithPins(local: readonly StaffUser[], cloud: readonly StaffUser[], pending: Set<RowKey>): StaffUser[] {
   return mergeRows(local, cloud, pending, { table: 'staff_users', key: (r) => r.id, dropMissing: false });
 }
+
+/** Cobrança da Point desta conta que ainda reserva valor (tchefood_point_reservation → charges). */
+export type CloudPointCharge = {
+  idempotencyKey: string; status: string; amountCents: number; rawStatusDetail: string | null; hasPayment: boolean;
+  /**
+   * Cobrança ainda aberta e já passada do prazo de espera do cartão pelo relógio do banco (tchefood_point_reservation,
+   * revisão PR #49). Só com true outro aparelho oferece "Resolver"; ausente (banco anterior) conta como false.
+   */
+  stale?: boolean;
+  createdAt?: string | null;
+};
+
+/** Reserva de pagamento fora da Point ainda aberta nesta conta (tchefood_point_reservation → claims). */
+export type CloudPaymentClaim = {
+  idempotencyKey: string; amountCents: number; method: string; acquirer: string;
+  createdAt: string | null; createdBy: string | null; createdByName: string | null;
+  /** Prazo da cobrança em andamento (renovado pelo aparelho que a faz) e a hora a partir da qual o gerente libera. */
+  activeUntil: string | null; releasableAt: string | null;
+};
+
+/**
+ * Reserva da Point Smart numa conta, lida agora da nuvem (tchefood_point_reservation, db/schema_point_reserva.sql).
+ * reservedCents soma a Point e as reservas de outros pagamentos (claimsCents); pointCents é só a Point.
+ * claimsCents/pointCents/charges vêm do banco da rodada 6; banco anterior não os manda.
+ */
+export type CloudPointReservation = {
+  reservedCents: number;
+  openCharges: number;
+  manualReview: boolean;
+  claimsCents?: number;
+  pointCents?: number;
+  charges?: CloudPointCharge[];
+  claims?: CloudPaymentClaim[];
+};
+
+/** Prazo da leitura da reserva: sem resposta nele, a leitura falha (quem chama trata como sem resposta). */
+export const POINT_RESERVATION_TIMEOUT_MS = 15_000;
+
+export async function fetchPointReservation(
+  cfg: SyncConfig,
+  fetchFn: FetchLike,
+  orderId: string,
+  timeoutMs = POINT_RESERVATION_TIMEOUT_MS,
+): Promise<CloudPointReservation> {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      ctrl?.abort();
+      reject(new Error('Não foi possível ler a cobrança da Point desta conta: o servidor não respondeu a tempo.'));
+    }, timeoutMs);
+  });
+  let text: string;
+  try {
+    // A corrida também cobre um fetch que ignora o sinal (a leitura nunca fica pendurada para sempre).
+    text = await Promise.race([
+      (async () => {
+        const r = await fetchFn(`${root(cfg)}/rpc/tchefood_point_reservation`, {
+          method: 'POST', headers: headers(cfg), body: JSON.stringify({ p_order: orderId }), ...(ctrl ? { signal: ctrl.signal } : {}),
+        });
+        if (!r.ok) throw new Error(`Não foi possível ler a cobrança da Point desta conta: ${await readError(r)}`);
+        return r.text();
+      })(),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  const body = JSON.parse(text || 'null') as {
+    reserved_cents?: unknown; open_charges?: unknown; manual_review?: unknown; claims_cents?: unknown; point_cents?: unknown; charges?: unknown; claims?: unknown;
+  } | null;
+  const reserved = Number(body?.reserved_cents);
+  const open = Number(body?.open_charges);
+  if (!body || !Number.isSafeInteger(reserved) || reserved < 0 || !Number.isSafeInteger(open) || open < 0) {
+    throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+  }
+  const out: CloudPointReservation = { reservedCents: reserved, openCharges: open, manualReview: body.manual_review === true };
+  const cents = (v: unknown): number | undefined => {
+    if (v === undefined || v === null) return undefined;
+    const n = Number(v);
+    if (!Number.isSafeInteger(n) || n < 0) throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+    return n;
+  };
+  const claims = cents(body.claims_cents);
+  const point = cents(body.point_cents);
+  if (claims !== undefined) out.claimsCents = claims;
+  if (point !== undefined) out.pointCents = point;
+  if (body.charges !== undefined && body.charges !== null) {
+    if (!Array.isArray(body.charges)) throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+    out.charges = body.charges.map((c: unknown) => {
+      const r = (c ?? {}) as Record<string, unknown>;
+      const amount = Number(r.amount_cents);
+      if (typeof r.idempotency_key !== 'string' || typeof r.status !== 'string' || !Number.isSafeInteger(amount) || amount < 0) {
+        throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+      }
+      return {
+        idempotencyKey: r.idempotency_key,
+        status: r.status,
+        amountCents: amount,
+        rawStatusDetail: typeof r.raw_status_detail === 'string' ? r.raw_status_detail : null,
+        hasPayment: r.has_payment === true,
+        // Só quando o banco manda (banco anterior: ausentes, e a tela trata como não vencida).
+        ...(r.stale !== undefined ? { stale: r.stale === true } : {}),
+        ...(typeof r.created_at === 'string' ? { createdAt: r.created_at } : {}),
+      };
+    });
+  }
+  if (body.claims !== undefined && body.claims !== null) {
+    if (!Array.isArray(body.claims)) throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+    const str = (v: unknown) => (typeof v === 'string' ? v : null);
+    out.claims = body.claims.map((c: unknown) => {
+      const r = (c ?? {}) as Record<string, unknown>;
+      const amount = Number(r.amount_cents);
+      if (typeof r.idempotency_key !== 'string' || !Number.isSafeInteger(amount) || amount <= 0) {
+        throw new Error('Não foi possível ler a cobrança da Point desta conta: resposta incompleta.');
+      }
+      return {
+        idempotencyKey: r.idempotency_key, amountCents: amount, method: str(r.method) ?? '', acquirer: str(r.acquirer) ?? '',
+        createdAt: str(r.created_at), createdBy: str(r.created_by), createdByName: str(r.created_by_name),
+        activeUntil: str(r.active_until), releasableAt: str(r.releasable_at),
+      };
+    });
+  }
+  return out;
+}
+
+/** Saldo e situação da conta no servidor, lidos agora (sem a fila deste aparelho). */
+export type ServerOrderBalance = { balanceCents: number; status: string };
+
+/**
+ * Lê `remaining_balance` e `status` da conta na nuvem (orders, pela RLS da loja). Usado pela recuperação do
+ * pagamento recusado sem reserva (claimRecovery): o saldo esperado da reserva é o do servidor, que ainda não tem
+ * este pagamento. Lança se a conta não está lá ou a resposta não serve.
+ */
+export async function fetchServerOrderBalance(cfg: SyncConfig, fetchFn: FetchLike, orderId: string): Promise<ServerOrderBalance> {
+  const r = await fetchFn(`${root(cfg)}/orders?id=eq.${encodeURIComponent(orderId)}&select=remaining_balance,status`, { method: 'GET', headers: headers(cfg) });
+  if (!r.ok) throw new Error(`Não foi possível ler a conta no servidor: ${await readError(r)}`);
+  const rows = JSON.parse((await r.text()) || '[]') as Array<{ remaining_balance?: unknown; status?: unknown }>;
+  const row = Array.isArray(rows) ? rows[0] : undefined;
+  if (!row) throw new Error('A conta não está no servidor.');
+  const cents = Math.round(Number(row.remaining_balance) * 100);
+  if (!Number.isSafeInteger(cents) || cents < 0 || typeof row.status !== 'string') throw new Error('Não foi possível ler a conta no servidor: resposta incompleta.');
+  return { balanceCents: cents, status: row.status };
+}
