@@ -25,14 +25,34 @@ function db(): Promise<IDBDatabase> {
   return dbPromise;
 }
 
+/**
+ * Resolve só quando a transação termina (oncomplete): o pedido pode dar certo e a transação abortar depois,
+ * e aí nada foi gravado (GPT, rodada 18 do PR #54). Aborto e erro rejeitam.
+ */
 function tx<T>(mode: IDBTransactionMode, run: (s: IDBObjectStore) => IDBRequest<T>): Promise<T> {
   return db().then(
     (d) =>
       new Promise<T>((resolve, reject) => {
         const t = d.transaction(STORE, mode);
+        let result: T;
+        let done = false;
+        const fail = (e: unknown) => {
+          if (done) return;
+          done = true;
+          reject(e ?? new Error('IndexedDB: transação abortada'));
+        };
+        t.oncomplete = () => {
+          if (done) return;
+          done = true;
+          resolve(result);
+        };
+        t.onabort = () => fail(t.error);
+        t.onerror = () => fail(t.error);
         const req = run(t.objectStore(STORE));
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
+        req.onsuccess = () => {
+          result = req.result;
+        };
+        req.onerror = () => fail(req.error);
       }),
   );
 }
@@ -75,25 +95,90 @@ export function storedOnlyInMemory(k: string): boolean {
   return memory.has(k);
 }
 
+/**
+ * Cópia no localStorage de uma gravação que o IndexedDB recusou, com o número da gravação ({ seq, v }).
+ * A leitura fica com a mais nova entre o IndexedDB e esta cópia: reabrindo o app com o IndexedDB bom de novo,
+ * o estado gravado na cópia não perde para a versão velha que ficou no IndexedDB (GPT, rodada 18 do PR #54).
+ */
+const FALLBACK_SUFFIX = '::copia';
+interface Stamped {
+  seq: number;
+  v: string;
+}
+let lastSeq = 0;
+const nextSeq = () => (lastSeq = Math.max(lastSeq + 1, Date.now()));
+const seen = (seq: number) => {
+  if (seq > lastSeq) lastSeq = seq;
+};
+const memorySeq = new Map<string, number>();
+
+/** Valor do IndexedDB: { seq, v } desta versão, ou o texto puro das versões anteriores (seq 0). */
+function unpack(raw: unknown): Stamped | null {
+  if (typeof raw === 'string') return { seq: 0, v: raw };
+  if (raw && typeof raw === 'object' && typeof (raw as Stamped).v === 'string' && typeof (raw as Stamped).seq === 'number') return raw as Stamped;
+  return null;
+}
+function readCopy(k: string): Stamped | null {
+  try {
+    const raw = localStorage.getItem(k + FALLBACK_SUFFIX);
+    return raw ? unpack(JSON.parse(raw) as unknown) : null;
+  } catch {
+    return null;
+  }
+}
+
 export const idbStorage: StateStorage = hasIndexedDB
   ? {
       getItem: async (k) => {
+        let fromDb: Stamped | null = null;
+        let dbFailed = false;
         try {
-          const v = await tx<string | undefined>('readonly', (s) => s.get(k) as IDBRequest<string | undefined>);
-          return v ?? null;
+          fromDb = unpack(await tx<unknown>('readonly', (s) => s.get(k) as IDBRequest<unknown>));
         } catch {
-          return fallback.getItem(k) as string | null;
+          dbFailed = true;
         }
+        const candidates: Stamped[] = [];
+        if (fromDb) candidates.push(fromDb);
+        const copy = readCopy(k);
+        if (copy) candidates.push(copy);
+        const mem = memory.get(k);
+        if (mem !== undefined) candidates.push({ seq: memorySeq.get(k) ?? 0, v: mem });
+        if (candidates.length === 0) return dbFailed ? (fallback.getItem(k) as string | null) : null;
+        // Empate: o IndexedDB (a ordem acima) fica.
+        const best = candidates.reduce((a, b) => (b.seq > a.seq ? b : a));
+        for (const c of candidates) seen(c.seq);
+        return best.v;
       },
       setItem: async (k, v) => {
+        const seq = nextSeq();
         try {
-          await tx('readwrite', (s) => s.put(v, k));
+          await tx('readwrite', (s) => s.put({ seq, v } satisfies Stamped, k));
           memory.delete(k);
+          memorySeq.delete(k);
+          try {
+            localStorage.removeItem(k + FALLBACK_SUFFIX);
+          } catch {
+            // a cópia velha perde pelo número da gravação
+          }
         } catch {
-          fallback.setItem(k, v);
+          try {
+            localStorage.setItem(k + FALLBACK_SUFFIX, JSON.stringify({ seq, v } satisfies Stamped));
+            memory.delete(k);
+            memorySeq.delete(k);
+          } catch {
+            memory.set(k, v);
+            memorySeq.set(k, seq);
+          }
         }
       },
       removeItem: async (k) => {
+        memory.delete(k);
+        memorySeq.delete(k);
+        try {
+          localStorage.removeItem(k + FALLBACK_SUFFIX);
+        } catch {
+          // nada a apagar
+        }
         try {
           await tx('readwrite', (s) => s.delete(k));
         } catch {

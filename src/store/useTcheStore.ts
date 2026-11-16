@@ -6959,15 +6959,25 @@ export const useTcheStore = create<TcheState>()(
  * o entregador), espere esta para o app fechado logo depois não perder o que foi guardado
  * (auditoria interna do PR #54). A transação nova fica atrás das anteriores no IndexedDB.
  * Devolve false se a gravação falhou (nunca lança), também quando o estado só ficou na memória porque o
- * IndexedDB e o localStorage recusaram (o adaptador do persist cai para a memória sem avisar; Codex no PR #54).
+ * IndexedDB e o localStorage recusaram (o adaptador do persist cai para a memória sem avisar; Codex no PR #54),
+ * e quando a leitura de volta, a mesma da reabertura do app, não devolve o que foi gravado (GPT, rodada 18 do PR #54).
  */
 export async function awaitPersisted(): Promise<boolean> {
   try {
     const o = useTcheStore.persist.getOptions();
     if (!o.storage || !o.name) return false;
-    const state = o.partialize ? o.partialize(useTcheStore.getState()) : useTcheStore.getState();
-    await o.storage.setItem(o.name, { state, version: o.version });
-    return !storedOnlyInMemory(o.name);
+    // Outra gravação do persist (a leitura da nuvem a cada 10 s) pode cair entre a gravação e a leitura de volta:
+    // tenta de novo com o estado de agora, até 3 vezes.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const state = o.partialize ? o.partialize(useTcheStore.getState()) : useTcheStore.getState();
+      const value = { state, version: o.version };
+      await o.storage.setItem(o.name, value);
+      if (storedOnlyInMemory(o.name)) return false;
+      // Lê de volta pelo mesmo caminho da reabertura do app: só vale o que volta igual (GPT, rodada 18 do PR #54).
+      const back = await o.storage.getItem(o.name);
+      if (JSON.stringify(back) === JSON.stringify(value)) return true;
+    }
+    return false;
   } catch {
     return false;
   }
