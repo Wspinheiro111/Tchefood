@@ -545,3 +545,120 @@ describe('falha de leitura da loja anterior não aparece na loja atual (GPT, rod
     expect(fake.orders).not.toHaveBeenCalled();
   });
 });
+
+describe('GPT, rodada 17 do PR #54', () => {
+  const id = (n: number) => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
+  const empty = (): CloudOrders => ({ tenant_id: st().tenant.id, server_now: new Date().toISOString(), orders: [], orderItems: [], payments: [], ownDeliveries: [], tables: [], cashSessions: [], skippedOrderIds: [] });
+  const login = () => {
+    const r = st().login('5555');
+    if (!r.ok) throw new Error(r.error);
+  };
+  const cash = (orderId: string, key: string) => st().registerPayment({ orderId, amount: 50, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: key, item_ids: [] });
+
+  it('P1-01: conta não conferida não recebe item novo (bandeja nem envio), nem muda pessoas ou pede a conta', async () => {
+    const table = st().tables.find((t) => t.kind === 'TABLE')!;
+    const target = id(500);
+    const local = Array.from({ length: 501 }, (_, n) => openOrder(id(n), n === 500 ? table.id : `mesa-${n}`));
+    useTcheStore.setState((s) => ({
+      orders: [...s.orders, ...local],
+      tables: s.tables.map((t) => (t.id === table.id ? { ...t, status: 'OCCUPIED', current_order_id: target } : t)),
+    }));
+    fake.catalog.mockResolvedValue(catalogOfDemo());
+    fake.orders.mockImplementation(async () => empty());
+    await tick({ forcePull: true });
+    expect(st().cloudUnreconciledOrderIds).toContain(target);
+    login();
+    const p = st().products.find((x) => x.active && x.available && !x.sold_by_weight && !x.requires_meat_doneness && !x.allows_half_and_half)!;
+    const draft = { order_id: target, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector };
+    const added = st().addToTray(draft);
+    expect(added.ok ? '' : added.error).toMatch(/ainda não foi conferida com a nuvem/);
+    // Item que já estava na bandeja antes da leitura: o envio também é recusado, sem item, evento nem pedido da cozinha.
+    useTcheStore.setState((s) => ({ tray: [...s.tray, { ...draft, id: 'tray-1' } as never] }));
+    const items = st().orderItems.length;
+    const outbox = st().outbox.length;
+    const sent = st().dispatchTray(target);
+    expect(sent.ok ? '' : sent.error).toMatch(/ainda não foi conferida com a nuvem/);
+    expect(st().orderItems.length).toBe(items);
+    expect(st().orderItems.some((i) => i.order_id === target)).toBe(false);
+    expect(st().outbox.length).toBe(outbox);
+    expect(st().updateCustomerCount(target, 4).ok).toBe(false);
+    expect(st().requestBill(target).ok).toBe(false);
+    // O pedido pelo QR da mesa também não entra nessa conta.
+    const qr = st().qrPlaceOrder(table.id, [{ product_id: p.id, half_product_ids: [], quantity: 1, modifiers: [], meat_doneness: null, notes: '' } as never]);
+    expect(qr.ok ? '' : qr.error).toMatch(/Conta em conferência/);
+    expect(st().orderItems.some((i) => i.order_id === target)).toBe(false);
+    // Conta já conferida (primeiro lote) continua aceitando item.
+    expect(st().addToTray({ ...draft, order_id: id(0) }).ok).toBe(true);
+  });
+
+  it('P1-01: conta deixada de lado pela leitura (versão do app) também não recebe item', async () => {
+    const table = st().tables.find((t) => t.kind === 'TABLE')!;
+    const target = id(1);
+    useTcheStore.setState((s) => ({ orders: [...s.orders, openOrder(target, table.id)] }));
+    fake.catalog.mockResolvedValue(catalogOfDemo());
+    fake.orders.mockImplementation(async () => ({ ...empty(), skippedOrderIds: [target] }));
+    await tick({ forcePull: true });
+    login();
+    const p = st().products.find((x) => x.active && x.available && !x.sold_by_weight && !x.requires_meat_doneness && !x.allows_half_and_half)!;
+    const r = st().addToTray({ order_id: target, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector });
+    expect(r.ok ? '' : r.error).toMatch(/atualize o app/);
+  });
+
+  it('P2-01: conta deixada de lado no primeiro lote continua bloqueada no lote seguinte, até voltar válida', async () => {
+    const target = id(400);
+    const tableId = st().tables.find((t) => t.kind === 'TABLE')!.id;
+    const local = Array.from({ length: 1200 }, (_, n) => openOrder(id(n), n === 400 ? tableId : `mesa-${n}`));
+    useTcheStore.setState((s) => ({ orders: [...s.orders, ...local] }));
+    fake.catalog.mockResolvedValue(catalogOfDemo());
+    let valid = false;
+    fake.orders.mockImplementation(async (...args: unknown[]) => {
+      const asked = args[3] as string[];
+      if (!asked.includes(target)) return empty();
+      if (!valid) return { ...empty(), skippedOrderIds: [target] };
+      const closed = { ...openOrder(target, tableId), status: 'CLOSED' as const, closed_at: new Date(Date.now() - 2 * 24 * 3600_000).toISOString(), paid_amount: 50, remaining_balance: 0 };
+      return { ...empty(), orders: [closed] };
+    });
+    await tick({ forcePull: true });
+    expect(st().cloudSkippedOrderIds).toContain(target);
+    // Segundo lote (sem a O400): continua de lado e não é cobrada.
+    await tick({ forcePull: true });
+    expect((fake.orders.mock.calls.at(-1)![3] as string[]).includes(target)).toBe(false);
+    expect(st().cloudSkippedOrderIds).toContain(target);
+    login();
+    const paid = cash(target, 'pulada-1');
+    expect(paid.ok ? '' : paid.error).toMatch(/atualize o app/);
+    // Terceiro lote e volta ao primeiro: o app foi atualizado e a conta vem válida (encerrada).
+    valid = true;
+    for (let i = 0; i < 3 && st().orders.find((o) => o.id === target)!.status !== 'CLOSED'; i++) await tick({ forcePull: true });
+    expect(st().orders.find((o) => o.id === target)!.status).toBe('CLOSED');
+    expect(st().cloudSkippedOrderIds).not.toContain(target);
+  });
+
+  it('P2-02: leitura das contas que volta a dar certo não apaga o aviso dos estornos, só a leitura dos estornos', async () => {
+    let refundsFail = true;
+    const fetchFn = (async (url: string) => {
+      const fn = String(url).split('/rpc/')[1] ?? '';
+      if (fn.startsWith('tchefood_list_refund_order_changes') && refundsFail) return { ok: false, status: 500, text: async () => 'erro' };
+      if (fn.startsWith('tchefood_list_refund_order_changes')) return { ok: true, status: 200, text: async () => JSON.stringify({ items: [], next_seq: 0, safe_seq: 0, has_more: false }) };
+      return { ok: true, status: 200, text: async () => JSON.stringify({ items: [], next_cursor: null }) };
+    }) as never;
+    fake.catalog.mockResolvedValue(catalogOfDemo());
+    fake.orders.mockRejectedValueOnce(new Error('Não foi possível ler as contas da nuvem: HTTP 500'));
+    await syncOnce(fetchFn, { forcePull: true });
+    expect(st().pullStatus?.last_error_source).toBe('orders');
+    expect(st().pullStatus?.refund_error ?? '').toMatch(/estornos e encerramentos/);
+    // Dez segundos depois só a leitura das contas roda (a dos estornos é por minuto) e dá certo.
+    fake.orders.mockResolvedValue(empty());
+    advance(10_000);
+    useTcheStore.setState((s) => ({ pullStatus: { ...s.pullStatus!, last_pull_at: new Date().toISOString(), last_orders_pull_at: null } }));
+    await syncOnce(fetchFn, {});
+    expect(fake.orders).toHaveBeenCalledTimes(2);
+    expect(st().pullStatus?.last_error ?? null).toBeNull();
+    expect(st().pullStatus?.refund_error ?? '').toMatch(/estornos e encerramentos/);
+    expect(cloudStaleMessage({ cloud: true, pullStatus: st().pullStatus, sessionSinceMs: Date.now(), nowMs: Date.now() }) ?? '').toMatch(/estornos e encerramentos/);
+    // A leitura dos estornos que dá certo limpa o aviso dela.
+    refundsFail = false;
+    await syncOnce(fetchFn, { forcePull: true });
+    expect(st().pullStatus?.refund_error ?? null).toBeNull();
+  });
+});

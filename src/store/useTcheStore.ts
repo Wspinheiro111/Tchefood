@@ -384,6 +384,11 @@ export interface PullStatus {
    * navegador dividem): quem avança o ponto é quem aplicou a alteração, na mesma memória e no mesmo estado salvo.
    */
   refund_seq?: number;
+  /**
+   * Falha da última leitura dos estornos e encerramentos feitos em outros aparelhos, à parte de last_error: só a
+   * leitura dos estornos que dá certo a limpa, não a das contas nem a dos cadastros (GPT, rodada 17 do PR #54).
+   */
+  refund_error?: string | null;
 }
 
 /** Leitura da nuvem: cadastros (cloudPull.ts) ou contas e mesas (orderPull.ts). */
@@ -728,6 +733,8 @@ interface Actions {
   setPullError: (message: string, source?: PullSource) => void;
   /** Guarda até onde os estornos de outros aparelhos já foram aplicados aqui (só anda para a frente). */
   setRefundSeq: (seq: number) => void;
+  /** Falha (texto) ou sucesso (null) da leitura dos estornos de outros aparelhos (pullStatus.refund_error). */
+  setRefundError: (message: string | null) => void;
   ackSyncedEvents: (eventIds: UUID[]) => void;
   setSyncError: (message: string | null, blockedEventId: UUID | null) => void;
   /** Tira da fila os eventos recusados pela nuvem e guarda em syncRejected. */
@@ -1549,6 +1556,23 @@ export const useTcheStore = create<TcheState>()(
         if (!EDITABLE_ORDER_STATUSES.includes(order.status)) return fail('Comanda já encerrada.');
         return { ok: true, data: order };
       };
+      /**
+       * Conta que o aparelho ainda não conferiu com a nuvem (lote das contas antigas ainda não lido)
+       * ou que a leitura deixou de lado (valor que esta versão não conhece): a situação dela na nuvem
+       * é desconhecida, e ela pode já ter sido encerrada em outro aparelho. Não muda aqui (item,
+       * pessoas, conta pedida, cancelamento, 10%), não só não é cobrada (GPT, rodada 17 do PR #54).
+       * Fora disto: o registro da cobrança que a maquininha já fez (confirmReviewedCharge).
+       */
+      const findChangeableOrder = (orderId: UUID): ActionResult<Order> => {
+        const res = findEditableOrder(orderId);
+        if (!res.ok) return res;
+        if ((get().cloudSkippedOrderIds ?? []).includes(orderId)) return fail(SKIPPED_ORDER_EDIT);
+        if ((get().cloudUnreconciledOrderIds ?? []).includes(orderId)) return fail(UNRECONCILED_ORDER_EDIT);
+        return res;
+      };
+      const SKIPPED_ORDER_EDIT = 'Esta conta tem um valor que esta versão do app não conhece: atualize o app antes de mudar a conta.';
+      const UNRECONCILED_ORDER_EDIT =
+        'Esta conta ainda não foi conferida com a nuvem (este aparelho tem mais de 500 contas antigas, conferidas em lotes): ela pode ter sido encerrada em outro aparelho. Espere alguns segundos e tente de novo.';
 
       /** Usuário logado com a permissão pedida (padrão + exceções da loja). */
       const requirePermission = (permission: Permission): ActionResult<StaffUser> => {
@@ -1975,7 +1999,7 @@ export const useTcheStore = create<TcheState>()(
       };
 
       const voidTechnicalSale = (orderId: UUID, auth: ManagerAuthInput, kind: 'COUNTER' | 'KIOSK'): ActionResult => {
-        const res = findEditableOrder(orderId);
+        const res = findChangeableOrder(orderId);
         if (!res.ok) return res;
         const order = res.data;
         const table = get().tables.find((t) => t.id === order.table_id);
@@ -2133,7 +2157,7 @@ export const useTcheStore = create<TcheState>()(
         },
 
         updateCustomerCount: (orderId, count) => {
-          const res = findEditableOrder(orderId);
+          const res = findChangeableOrder(orderId);
           if (!res.ok) return res;
           const n = Math.floor(count);
           if (n < 1 || n > 99) return fail('Quantidade de pessoas inválida.');
@@ -2146,7 +2170,7 @@ export const useTcheStore = create<TcheState>()(
         },
 
         requestBill: (orderId) => {
-          const res = findEditableOrder(orderId);
+          const res = findChangeableOrder(orderId);
           if (!res.ok) return res;
           const order = res.data;
           if (get().tray.some((t) => t.order_id === orderId)) {
@@ -2164,7 +2188,7 @@ export const useTcheStore = create<TcheState>()(
         },
 
         resumeService: (orderId) => {
-          const res = findEditableOrder(orderId);
+          const res = findChangeableOrder(orderId);
           if (!res.ok) return res;
           const table = get().tables.find((t) => t.id === res.data.table_id);
           if (!table) return fail('Mesa não encontrada.');
@@ -2178,7 +2202,7 @@ export const useTcheStore = create<TcheState>()(
         },
 
         addToTray: (draft) => {
-          const res = findEditableOrder(draft.order_id);
+          const res = findChangeableOrder(draft.order_id);
           if (!res.ok) return res;
           const product = get().products.find((p) => p.id === draft.product_id);
           if (!product || !product.active) return fail('Produto não encontrado.');
@@ -2269,7 +2293,7 @@ export const useTcheStore = create<TcheState>()(
         dispatchTray: (orderId) => {
           const user = currentUser();
           if (!user) return fail('Sessão expirada.');
-          const res = findEditableOrder(orderId);
+          const res = findChangeableOrder(orderId);
           if (!res.ok) return res;
           const pending = get().tray.filter((t) => t.order_id === orderId);
           if (pending.length === 0) return fail('Bandeja vazia.');
@@ -2374,7 +2398,7 @@ export const useTcheStore = create<TcheState>()(
           if (item.status === 'CANCELED') return fail('Item já cancelado.');
           if (item.is_paid) return fail('Item já pago. Estorno deve ser feito pelo módulo de pagamentos.');
           if (item.combo_parent_item_id) return fail('Este item faz parte de um combo. Cancele o combo inteiro.');
-          const orderRes = findEditableOrder(item.order_id);
+          const orderRes = findChangeableOrder(item.order_id);
           if (!orderRes.ok) return orderRes;
           const order = orderRes.data;
           if (activeCharge(order.id)) return fail(CHARGE_LOCK_ERROR);
@@ -2484,7 +2508,7 @@ export const useTcheStore = create<TcheState>()(
         },
 
         removeServiceFee: (orderId, auth) => {
-          const res = findEditableOrder(orderId);
+          const res = findChangeableOrder(orderId);
           if (!res.ok) return res;
           const order = res.data;
           if (!order.charge_service_fee) return fail('A taxa de serviço já foi removida.');
@@ -2529,7 +2553,7 @@ export const useTcheStore = create<TcheState>()(
         },
 
         restoreServiceFee: (orderId) => {
-          const res = findEditableOrder(orderId);
+          const res = findChangeableOrder(orderId);
           if (!res.ok) return res;
           const order = res.data;
           if (order.charge_service_fee) return fail('A taxa de serviço já está ativa.');
@@ -3190,6 +3214,11 @@ export const useTcheStore = create<TcheState>()(
           if (!qrUser) return fail('Autoatendimento indisponível.');
           const ts = nowISO();
           let order = table.current_order_id ? s0.orders.find((o) => o.id === table.current_order_id) : undefined;
+          // Conta da mesa ainda não conferida com a nuvem ou deixada de lado pela leitura: o pedido do QR
+          // não entra nela (GPT, rodada 17 do PR #54, como o envio da bandeja).
+          if (order && ((s0.cloudSkippedOrderIds ?? []).includes(order.id) || (s0.cloudUnreconciledOrderIds ?? []).includes(order.id))) {
+            return fail('Conta em conferência com o sistema. Chame o garçom para fazer o pedido.');
+          }
           const newOrder = !order;
           if (!order) {
             order = {
@@ -5281,6 +5310,8 @@ export const useTcheStore = create<TcheState>()(
 
         setPullError: (message, source = 'catalog') =>
           set((s) => ({ pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), last_error: message, last_error_source: source } })),
+        setRefundError: (message) =>
+          set((s) => ((s.pullStatus?.refund_error ?? null) === message ? {} : { pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), refund_error: message } })),
         setRefundSeq: (seq) => set((s) => ((s.pullStatus?.refund_seq ?? 0) >= seq ? {} : { pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), refund_seq: seq } })),
 
         ackSyncedEvents: (eventIds) => {

@@ -960,6 +960,7 @@ function CloudStatus() {
       const st = useTcheStore.getState();
       if (st.syncStatus.last_error) toast.error(st.syncStatus.last_error);
       else if (st.pullStatus?.last_error) toast.error(st.pullStatus.last_error);
+      else if (st.pullStatus?.refund_error) toast.error(st.pullStatus.refund_error);
       else toast.success(st.outbox.length === 0 ? 'Tudo enviado para a nuvem.' : `${st.outbox.length} evento(s) ainda na fila.`);
     } finally {
       setBusy(false);
@@ -987,6 +988,9 @@ function CloudStatus() {
       )}
       {pull?.last_error && (
         <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm text-brasa">Leitura da nuvem: {pull.last_error}</div>
+      )}
+      {pull?.refund_error && (
+        <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm text-brasa">Leitura da nuvem: {pull.refund_error}</div>
       )}
       <RefreshStaffPanel />
       <CashbackReconcilePanel />

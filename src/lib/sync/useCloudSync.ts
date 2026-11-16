@@ -55,6 +55,13 @@ interface PullLoopState {
    * foto). As que ainda não foram não são cobradas até o lote delas (GPT, rodada 15 do PR #54).
    */
   reconciledIds?: Set<string>;
+  /**
+   * Contas deixadas de lado por uma leitura (valor que esta versão não conhece) que ainda não
+   * vieram de novo, válidas ou de lado: continuam de lado nos lotes seguintes, que não as pedem
+   * (GPT, rodada 17 do PR #54). Saem quando uma leitura as traz válidas, quando o lote delas volta
+   * sem elas de lado ou quando deixam de estar abertas aqui.
+   */
+  skippedIds?: Set<string>;
   /** Início da última leitura dos cadastros pedida pelas contas (deu certo ou não). */
   lastCatalogRereadMs: number | null;
   /**
@@ -117,6 +124,7 @@ function subscribeOrdersRound(l: () => void): () => void {
 export function resetPullLoopForTests(): void {
   pullLoop.clear();
   ordersRoundRan.clear();
+  refundPull = null;
   for (const l of roundListeners) l();
 }
 
@@ -309,6 +317,8 @@ function refundPullDue(key: string, nowMs: number): boolean {
  * sobrescrita) e só com a loja e a sessão em que a rodada começou (P0-01: trocou de loja no meio, nada é lido nem
  * aplicado com a sessão antiga). Import tardio: o módulo usa este para a sessão.
  */
+export const REFUND_PULL_ERROR = 'Não foi possível ler os estornos e encerramentos feitos em outros aparelhos; tentando de novo em um minuto.';
+
 async function pullRefunds(tenantId: string, session: { url: string; email: string; tenant_id: string }, cfg: SyncConfig, fetchFn: FetchLike): Promise<void> {
   const key = sessionKey(tenantId, session);
   try {
@@ -317,15 +327,11 @@ async function pullRefunds(tenantId: string, session: { url: string; email: stri
     if (!m.sameScope(scope)) return;
     refundPull = { key, at: Date.now() };
     const out = await m.pullRefundOrders({ ...c.defaultClaimDeps(), config: async () => cfg, fetch: fetchFn }, scope);
-    // GPT r16 P2-01: a falha desta leitura aparece no estado da nuvem (não fica calada no laço).
-    if ((!out.changesOk || !out.reopened) && m.sameScope(scope)) {
-      const msg = 'Não foi possível ler os estornos e encerramentos feitos em outros aparelhos; tentando de novo em um minuto.';
-      const cur = useTcheStore.getState().pullStatus;
-      // O aviso da leitura das contas (o das telas da equipe) continua: as duas falhas aparecem juntas (PR #54).
-      if (cur?.last_error_source === 'orders' && cur.last_error) {
-        if (!cur.last_error.includes(msg)) useTcheStore.getState().setPullError(`${cur.last_error} ${msg}`, 'orders');
-      } else useTcheStore.getState().setPullError(msg);
-    }
+    // GPT r16 P2-01: a falha desta leitura aparece no estado da nuvem (não fica calada no laço). Num campo só dela:
+    // a leitura das contas ou dos cadastros que dá certo não apaga este aviso, só a dos estornos (GPT, rodada 17 do
+    // PR #54).
+    if (!m.sameScope(scope)) return;
+    useTcheStore.getState().setRefundError(out.changesOk && out.reopened ? null : REFUND_PULL_ERROR);
   } catch {
     // Sem leitura agora: tenta de novo na próxima rodada.
   }
@@ -403,18 +409,28 @@ async function pullOrdersOnce(cfg: SyncConfig, fetchFn: FetchLike, catalogFresh:
     // (GPT, rodada 15 do PR #54). Só as da lista de antes da leitura: conta aberta aqui enquanto
     // a leitura voltava é nova, não está atrasada.
     const loop = loopFor(tenantId);
-    const seen = new Set<string>([...(loop.reconciledIds ?? []), ...batch.ids, ...snapshot.orders.map((o) => o.id), ...(snapshot.skippedOrderIds ?? [])]);
+    // Conta de lado numa leitura anterior e fora desta (o lote dela já passou e ela está encerrada há
+    // mais de 24 h): continua de lado, senão perderia o bloqueio no lote seguinte (GPT, rodada 17).
+    const answered = new Set<string>([...batch.ids, ...snapshot.orders.map((o) => o.id)]);
+    const open = new Set(reconcileIds);
+    const skippedOrderIds = [...new Set([
+      ...(snapshot.skippedOrderIds ?? []),
+      ...[...(loop.skippedIds ?? [])].filter((id) => open.has(id) && !answered.has(id)),
+    ])];
+    const pulled = { ...snapshot, skippedOrderIds };
+    const seen = new Set<string>([...(loop.reconciledIds ?? []), ...batch.ids, ...snapshot.orders.map((o) => o.id), ...skippedOrderIds]);
     const unreconciledOrderIds = reconcileIds.filter((id) => !seen.has(id));
-    const r = st.applyCloudOrders(snapshot, { unreconciledOrderIds });
+    const r = st.applyCloudOrders(pulled, { unreconciledOrderIds });
     if (!r.ok) {
       st.setPullError(r.error, 'orders');
       return 'failed';
     }
     loop.reconcileAfter = batch.next;
     loop.reconciledIds = new Set(reconcileIds.filter((id) => seen.has(id)));
+    loop.skippedIds = new Set(skippedOrderIds);
     // Contas deixadas de lado (valor que este aparelho não reconhece): o resto foi aplicado,
     // mas o aviso fica para a equipe ver (auditoria interna, rodada 8 do PR #54).
-    const skipped = snapshot.skippedOrderIds?.length ? skippedMessage(snapshot) : null;
+    const skipped = skippedOrderIds.length ? skippedMessage(pulled) : null;
     if (skipped) useTcheStore.getState().setPullError(skipped, 'orders');
     return 'ok';
   } catch (e) {
@@ -659,7 +675,7 @@ export function useCloudSync(online: boolean): void {
  */
 export function cloudStaleMessage(input: {
   cloud: boolean;
-  pullStatus: Partial<Pick<PullStatus, 'last_orders_pull_at' | 'last_error' | 'last_error_source'>> | null | undefined;
+  pullStatus: Partial<Pick<PullStatus, 'last_orders_pull_at' | 'last_error' | 'last_error_source' | 'refund_error'>> | null | undefined;
   /** Desde quando este aparelho está com a sessão da nuvem desta loja (nesta abertura do app). */
   sessionSinceMs: number;
   nowMs: number;
@@ -687,7 +703,7 @@ export function cloudStaleMessage(input: {
   const waiting = input.unreconciled && input.unreconciled > 0
     ? `${input.unreconciled === 1 ? '1 conta antiga deste aparelho ainda não foi conferida' : `${input.unreconciled} contas antigas deste aparelho ainda não foram conferidas`} com a nuvem: não são cobradas até lá.`
     : null;
-  const parts = [stale, ordersError, waiting].filter((x): x is string => !!x);
+  const parts = [stale, ordersError, p.refund_error ?? null, waiting].filter((x): x is string => !!x);
   return parts.length > 0 ? parts.join(' ') : null;
 }
 
