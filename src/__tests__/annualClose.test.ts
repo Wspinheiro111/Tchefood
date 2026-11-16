@@ -1,0 +1,1025 @@
+import { describe, expect, it } from 'vitest';
+import { brasiliaDayStart, compareInvoiceCopies, rejectedInvoiceIds, reviewDuplicateInvoices, settlementDayEndBrasilia, clockBeforeYear, duplicateInvoiceMovementIds, ownStore, defaultYear, positionCutoff, expensesByCategory, invoiceDate, inventoryAt, openPositionsAt, revenueByMethod, settlementDayBrasilia, testInvoiceMovementIds, validYear, yearInProgress, yearPeriod, yearsWithData } from '../lib/annualClose';
+import { br, code, escapeHtml, expensesDoc, fileName, inventoryDoc, openDoc, periodLabel, revenueDoc, toCsv, toPrintableHtml, type ReportDoc } from '../lib/annualCloseExport';
+import type { FeeRule } from '../lib/cardFees';
+import type { CashMovement, CashSession, CourierSettlement, OwnDelivery, Payment, Product, PurchaseInvoice, StockMovement, Supplier } from '../types';
+
+const P = yearPeriod(2025);
+const product = (p: Partial<Product>): Product => ({ id: 'p1', code: '001', name: 'Coca-Cola lata', ncm: '22021000', unit: 'UN', active: true, cost_price: 0, stock_quantity: 0, ...p }) as Product;
+const mov = (m: Partial<StockMovement>): StockMovement =>
+  ({ id: Math.random().toString(), tenant_id: 't', product_id: 'p1', type: 'PURCHASE_IN', quantity: 1, unit_cost: 1, balance_after: 1, avg_cost_after: 1, purchase_invoice_item_id: null, performed_by_user_id: 'u', created_at: '2025-06-01T12:00:00-03:00', ...m }) as StockMovement;
+const pay = (p: Partial<Payment>): Payment =>
+  ({ id: Math.random().toString(), order_id: 'o', tenant_id: 't', waiter_id: 'w', terminal_id: null, amount: 100, tip_amount: 0, method: 'CREDIT', status: 'APPROVED', acquirer: 'STONE', acquirer_cnpj: null, card_brand: 'VISA', nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: null, created_at: '2025-03-10T20:00:00-03:00', ...p }) as Payment;
+const rule = (r: Partial<FeeRule>): FeeRule => ({ id: Math.random().toString(), acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false, ...r });
+const emptyRevenueInput = { payments: [] as Payment[], marketplace: [], feeRules: [] as FeeRule[], appCommissionPct: {}, cashSessions: [] as CashSession[], cashMovements: [] as CashMovement[], staff: [] };
+
+describe('ano do fechamento', () => {
+  it('vai de 01/01 00:00 a 01/01 seguinte 00:00 de Brasília', () => {
+    expect(new Date(P.from).toISOString()).toBe('2025-01-01T03:00:00.000Z');
+    expect(new Date(P.to).toISOString()).toBe('2026-01-01T03:00:00.000Z');
+    // Ano com horário de verão em janeiro (2018): UTC-2.
+    expect(new Date(yearPeriod(2018).from).toISOString()).toBe('2018-01-01T02:00:00.000Z');
+  });
+
+  it('recusa ano inválido e lista os anos com dados sem ano futuro', () => {
+    expect(validYear(1999)).toBe(false);
+    expect(validYear(2025.5)).toBe(false);
+    expect(() => yearPeriod(3000)).toThrow();
+    const now = new Date('2026-11-14T15:00:00-03:00');
+    expect(yearsWithData(['2024-12-31T23:30:00-03:00', '2025-01-01T01:00:00Z', 'lixo', null, '2031-01-01T00:00:00Z'], now)).toEqual([2026, 2025, 2024]);
+    expect(yearInProgress(yearPeriod(2026), now)).toBe(true);
+    expect(yearInProgress(yearPeriod(2025), now)).toBe(false);
+  });
+});
+
+describe('1. inventário em 31/12', () => {
+  it('soma as entradas deste aparelho até o fim do dia 31/12 de Brasília', () => {
+    const r = inventoryAt(
+      [product({}), product({ id: 'p2', code: '002', name: 'Alcatra', ncm: '2013000', unit: 'KG', active: false })],
+      [
+        // balance_after vem do estoque da nuvem (loja toda): não é usado.
+        mov({ quantity: 10, unit_cost: 2.5, balance_after: 110, avg_cost_after: 9, created_at: '2025-06-01T12:00:00-03:00' }),
+        mov({ quantity: 12, unit_cost: 2.9167, balance_after: 122, avg_cost_after: 9, created_at: '2025-12-31T23:59:00-03:00' }),
+        mov({ quantity: 18, unit_cost: 3, balance_after: 40, avg_cost_after: 3, created_at: '2026-01-01T00:00:00-03:00' }), // já é 2026
+        mov({ product_id: 'p2', quantity: 3.5, unit_cost: 39.9, balance_after: 3.5, avg_cost_after: 39.9, created_at: '2025-11-01T10:00:00-03:00' }),
+        mov({ product_id: 'p3', quantity: 0, balance_after: 0, created_at: '2025-11-01T10:00:00-03:00' }),
+        mov({ created_at: 'sem-data' }),
+      ],
+      P,
+    );
+    expect(r.rows.map((x) => [x.code, x.quantity, x.unitCost, x.total, x.inactive])).toEqual([
+      ['002', 3.5, 39.9, 139.65, true],
+      ['001', 22, 2.7273, 60, false],
+    ]);
+    expect(r.totalCost).toBe(199.65);
+    expect(r.missingNcm).toBe(1);
+    expect(r.invalidDates).toBe(1);
+  });
+});
+
+describe('2. faturamento por forma', () => {
+  it('separa por forma, desconta a taxa cadastrada e deixa fora estornado, recusado e outro ano', () => {
+    const r = revenueByMethod(
+      {
+        ...emptyRevenueInput,
+        payments: [
+          pay({ amount: 100, tip_amount: 10 }), // crédito com taxa 3% sobre 110 = 3,30
+          pay({ method: 'DEBIT', amount: 50, acquirer: 'PAGBANK' }), // sem taxa cadastrada
+          pay({ method: 'CASH', acquirer: 'CASH_DESK', amount: 30, created_at: '2025-12-31T23:00:00-03:00' }),
+          pay({ method: 'PIX', amount: 20, status: 'REFUNDED' }),
+          pay({ method: 'PIX', amount: 20, status: 'DECLINED' }),
+          pay({ method: 'VOUCHER', amount: 40, created_at: '2026-01-01T00:30:00-03:00' }),
+        ],
+        feeRules: [rule({})],
+        marketplace: [
+          { channel: 'ifood', label: 'iFood', created_at: '2025-07-01T20:00:00-03:00', total_cents: 8000, canceled: false, status: 'concluded' },
+          { channel: 'ifood', label: 'iFood', created_at: '2025-07-01T21:00:00-03:00', total_cents: 5000, canceled: true, status: 'cancelled' },
+        ],
+        appCommissionPct: { ifood: 12 },
+      },
+      P,
+    );
+    const by = Object.fromEntries(r.rows.map((x) => [x.key, x]));
+    expect(by.CREDIT).toMatchObject({ gross: 100, fee: 3.3, net: 96.7, count: 1 });
+    expect(by.DEBIT).toMatchObject({ gross: 50, fee: 0, withoutRule: 50 });
+    expect(by.CASH).toMatchObject({ gross: 30, fee: 0, withoutRule: 0 });
+    expect(by.PIX).toMatchObject({ gross: 0, count: 0 });
+    // Nenhuma tela registra VR/VA hoje: a linha sai como "não registrado", não R$ 0,00.
+    expect(by.VOUCHER).toMatchObject({ gross: 0, notTracked: true });
+    expect(by.PIX!.notTracked).toBe(false);
+    // Dinheiro de 31/12 23:00 sem turno de caixa aberto.
+    expect([r.cashOutsideSessions, r.cashOutsideSessionsCount]).toEqual([30, 1]);
+    const csv = toCsv(revenueDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g' }));
+    expect(csv).toContain('Vale-refeição / alimentação;;não registrado;não registrado;não registrado;');
+    expect(csv).toContain('Estorno feito na maquininha');
+    expect(csv).toContain('sem turno de caixa aberto');
+    expect(csv).toContain('Obs.: SOMENTE os registros gravados NESTE aparelho');
+    // Compras por NF-e descem da nuvem: o aviso manda não somar entre aparelhos.
+    expect(csv).toContain('NÃO some as compras de aparelhos diferentes');
+    expect(toPrintableHtml(revenueDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g' }))).toContain('NESTE aparelho');
+    expect(by['APP:ifood']).toMatchObject({ gross: 80, fee: 9.6, count: 1, marketplace: true });
+    expect(r.totalGross).toBe(260);
+    expect(r.totalFee).toBe(12.9);
+    expect(r.tips).toBe(10);
+    expect(r.monthly.CASH![11]).toBe(30);
+    expect(r.monthly.CREDIT![2]).toBe(100);
+    expect(r.monthlyTotal.reduce((a, b) => a + b, 0)).toBe(260);
+  });
+
+  it('lista os fechamentos de caixa do ano e soma sangrias e suprimentos', () => {
+    const session = (s: Partial<CashSession>): CashSession =>
+      ({ id: Math.random().toString(), tenant_id: 't', opened_by_user_id: 'u1', opened_at: '2025-05-01T10:00:00-03:00', opening_float: 100, status: 'CLOSED', closed_by_user_id: 'u1', closed_at: '2025-05-01T23:00:00-03:00', counted_cash: 290, expected_cash: 300, difference: -10, closing_notes: null, closing_authorized_by_manager_id: null, ...s }) as CashSession;
+    const r = revenueByMethod(
+      {
+        ...emptyRevenueInput,
+        staff: [{ id: 'u1', name: 'Ana' } as never],
+        cashSessions: [session({}), session({ difference: 2.5, closed_at: '2025-02-01T23:00:00-03:00' }), session({ closed_at: '2026-01-02T01:00:00-03:00' }), session({ status: 'OPEN', closed_at: null })],
+        cashMovements: [
+          { id: 'm1', type: 'SUPPLY', amount: 50, created_at: '2025-05-01T12:00:00-03:00' } as CashMovement,
+          { id: 'm2', type: 'WITHDRAWAL', amount: 70.5, created_at: '2025-05-01T13:00:00-03:00' } as CashMovement,
+        ],
+      },
+      P,
+    );
+    expect(r.closings.map((c) => [c.openedBy, c.difference])).toEqual([['Ana', 2.5], ['Ana', -10]]);
+    const inside = revenueByMethod({ ...emptyRevenueInput, cashSessions: [session({})], payments: [pay({ method: 'CASH', acquirer: 'CASH_DESK', created_at: '2025-05-01T20:00:00-03:00' })] }, P);
+    expect(inside.cashOutsideSessionsCount).toBe(0);
+    expect(r.closingsDifference).toBe(-7.5);
+    // Aberto e ainda aberto + aberto em 2025 e fechado só em 2026: os dois estavam abertos na virada.
+    expect(r.openSessions).toBe(2);
+    // Fechamento com data inválida não some calado.
+    expect(revenueByMethod({ ...emptyRevenueInput, cashSessions: [session({ closed_at: 'ontem' })] }, P).invalidDates).toBe(1);
+    expect([r.supplies, r.withdrawals]).toEqual([50, 70.5]);
+  });
+});
+
+describe('3. contas em aberto na virada', () => {
+  it('a receber = venda até 31/12 com repasse em 01/01 ou depois; entregador sem acerto = a pagar', () => {
+    const delivery = (d: Partial<OwnDelivery>): OwnDelivery => ({ id: Math.random().toString(), status: 'DELIVERED', courier_id: 'c1', courier_fee: 8, delivered_at: '2025-12-30T21:00:00-03:00', settlement_id: null, ...d }) as OwnDelivery;
+    const r = openPositionsAt(
+      {
+        payments: [
+          pay({ amount: 100, created_at: '2025-12-20T20:00:00-03:00' }), // D+30 → janeiro: a receber
+          pay({ amount: 100, created_at: '2025-11-01T20:00:00-03:00' }), // caiu em dezembro
+          pay({ amount: 100, created_at: '2026-01-05T20:00:00-03:00' }), // venda de 2026
+          pay({ amount: 70, acquirer: 'PAGBANK', created_at: '2025-12-20T20:00:00-03:00' }), // sem taxa
+          pay({ method: 'CASH', acquirer: 'CASH_DESK', amount: 50, created_at: '2025-12-31T20:00:00-03:00' }),
+        ],
+        feeRules: [rule({})],
+        ownDeliveries: [
+          delivery({}),
+          delivery({ settlement_id: 's-dez' }),
+          delivery({ settlement_id: 's-jan' }),
+          delivery({ delivered_at: '2026-01-01T10:00:00-03:00' }),
+          delivery({ status: 'CANCELED' }),
+        ],
+        courierSettlements: [{ id: 's-dez', created_at: '2025-12-31T23:00:00-03:00' } as CourierSettlement, { id: 's-jan', created_at: '2026-01-02T10:00:00-03:00' } as CourierSettlement],
+        couriers: [{ id: 'c1', name: 'Beto' }],
+        orders: [],
+      },
+      P,
+      new Date('2026-11-14T12:00:00-03:00'),
+    );
+    expect(r.cardReceivables).toEqual([{ acquirer: 'STONE', method: 'CREDIT', gross: 100, fee: 3, net: 97, count: 1 }]);
+    expect(r.cardWithoutRule).toBe(70);
+    expect(r.cutoff).toBe(P.to);
+    expect(r.courierPayables).toEqual([{ courier: 'Beto', deliveries: 2, amount: 16 }]);
+  });
+});
+
+describe('4. despesas por categoria', () => {
+  it('compras pela NF-e de produção, entregadores pelos acertos e sangria do entregador não conta duas vezes', () => {
+    let seq = 0;
+    const inv = (i: Partial<PurchaseInvoice>): PurchaseInvoice => ({ id: Math.random().toString(), supplier_id: 's1', access_key: seq++ === 0 ? '4325'.padEnd(44, '0') : `4325${String(seq).padStart(40, '0')}`, number: '123', series: '1', issued_at: '2025-04-10T10:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 1234.56, imported_at: '2025-04-11T10:00:00-03:00', ...i }) as PurchaseInvoice;
+    const revenue = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ amount: 100 })], feeRules: [rule({})] }, P);
+    const r = expensesByCategory(
+      {
+        purchaseInvoices: [inv({}), inv({ environment: 'HOMOLOGATION' }), inv({ issued_at: null, imported_at: '2025-12-31T22:00:00-03:00', invoice_amount: 100 }), inv({ issued_at: '2024-12-31T10:00:00-03:00' })],
+        suppliers: [{ id: 's1', document: '01234567000189', legal_name: 'Distribuidora X', trade_name: null } as Supplier],
+        courierSettlements: [{ id: 'cs', courier_fees: 40, cash_movement_id: 'mv-courier', created_at: '2025-08-01T23:00:00-03:00' } as CourierSettlement],
+        cashMovements: [
+          { id: 'mv-courier', type: 'WITHDRAWAL', amount: 40, reason: 'Acerto entregador', created_at: '2025-08-01T23:00:00-03:00' } as CashMovement,
+          { id: 'mv-2', type: 'WITHDRAWAL', amount: 25, reason: '=HYPERLINK("x")', created_at: '2025-08-02T23:00:00-03:00' } as CashMovement,
+        ],
+        revenue,
+      },
+      P,
+    );
+    const by = Object.fromEntries(r.rows.map((x) => [x.key, x]));
+    expect(by.PURCHASES).toMatchObject({ amount: 1334.56, count: 2, source: 'REGISTERED' });
+    expect(by.DELIVERY).toMatchObject({ amount: 40, count: 1 });
+    expect(by.CARD_FEES).toMatchObject({ amount: 3, source: 'ESTIMATED' });
+    expect(by.PAYROLL).toMatchObject({ amount: null, source: 'NOT_TRACKED' });
+    expect(by.RENT!.amount).toBeNull();
+    expect(r.total).toBe(1377.56);
+    expect(r.homologationInvoices).toBe(1);
+    expect(r.withdrawals.map((w) => w.amount)).toEqual([25]);
+
+    const base = { period: periodLabel('expenses', P), store: { name: 'Loja', legalName: 'Loja LTDA', cnpj: '12345678000199', city: 'Santo Ângelo', state: 'RS' }, generatedAt: 'agora' };
+    const csv = toCsv(expensesDoc(r, base));
+    expect(csv.startsWith('﻿Despesas operacionais')).toBe(true);
+    expect(csv).toContain(`="${'4325'.padEnd(44, '0')}"`);
+    expect(csv).toContain('="01234567000189"');
+    expect(csv).toContain(`"'=HYPERLINK(""x"")"`);
+    expect(csv).toContain('Folha de pagamento;;Não registrado;');
+    expect(csv).toContain('Total;1377,56;;');
+  });
+});
+
+describe('exportação', () => {
+  const base = { period: periodLabel('inventory', P), store: { name: 'Loja', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+
+  it('número com vírgula, código com zero à esquerda e nome de arquivo sem acento', () => {
+    expect([br(1234.5), br(-10), br(2.7273), br(3.5), br(0.125)]).toEqual(['1234,50', '-10,00', '2,7273', '3,50', '0,125']);
+    const csv = toCsv(inventoryDoc(inventoryAt([product({ ncm: '02013000', name: 'Picanha; "premium"' })], [mov({ quantity: 2, unit_cost: 50, balance_after: 2, avg_cost_after: 50 })], P), base));
+    expect(csv).toContain('="001";"Picanha; ""premium""";="02013000";UN;2,00;50,00;100,00;Ativo');
+    expect(csv).toContain('Posição em 31/12/2025');
+    expect(fileName('revenue', 2025, 'csv')).toBe('fechamento-2025-faturamento-caixa.csv');
+    expect(periodLabel('revenue', P)).toBe('01/01/2025 a 31/12/2025');
+    expect(toCsv({ ...base, title: 'T', notes: [], tables: [{ head: ['A'], rows: [[code('12a=')]] }] } as ReportDoc)).toContain('\r\n12a=\r\n');
+  });
+
+  it('HTML escapa o que vem do cadastro', () => {
+    expect(escapeHtml(`<img src=x onerror="a">'&`)).toBe('&lt;img src=x onerror=&quot;a&quot;&gt;&#39;&amp;');
+    const html = toPrintableHtml(revenueDoc(revenueByMethod({ ...emptyRevenueInput, payments: [pay({})] }, P), { ...base, store: { ...base.store, name: '<script>x</script>' } }));
+    expect(html).not.toContain('<script>');
+    expect(html).toContain('&lt;script&gt;');
+    expect(html).toContain('Cartão de crédito');
+  });
+});
+
+describe('rodada 1 de revisão', () => {
+  const NOW = new Date('2026-11-14T12:00:00-03:00');
+  const openInput = { payments: [] as Payment[], feeRules: [rule({ days: 1 })], ownDeliveries: [] as OwnDelivery[], courierSettlements: [] as CourierSettlement[], couriers: [{ id: 'c1', name: 'Beto' }], orders: [] as { id: string; total_amount: number }[] };
+
+  it('o dia do repasse é o do calendário de Brasília, em qualquer fuso do aparelho', () => {
+    // 31/12/2025 10:00 BRT, D+1 corrido → 01/01/2026 00:00 BRT (= fim do ano).
+    expect(settlementDayBrasilia(Date.parse('2025-12-31T10:00:00-03:00'), { days: 1, businessDays: false })).toBe(P.to);
+    // 31/12/2025 22:30 BRT já é 01/01 em UTC: continua contando de 31/12.
+    expect(settlementDayBrasilia(Date.parse('2025-12-31T22:30:00-03:00'), { days: 0, businessDays: false })).toBe(P.to - 24 * 3600_000);
+    // Sexta 26/12/2025, D+1 útil → segunda 29/12; D+0 no sábado 27/12 → segunda 29/12.
+    expect(settlementDayBrasilia(Date.parse('2025-12-26T20:00:00-03:00'), { days: 1, businessDays: true })).toBe(Date.parse('2025-12-29T00:00:00-03:00'));
+    expect(settlementDayBrasilia(Date.parse('2025-12-27T20:00:00-03:00'), { days: 0, businessDays: true })).toBe(Date.parse('2025-12-29T00:00:00-03:00'));
+    const r = openPositionsAt({ ...openInput, payments: [pay({ created_at: '2025-12-31T10:00:00-03:00' }), pay({ created_at: '2025-12-30T10:00:00-03:00' })] }, P, NOW);
+    expect(r.cardReceivables.map((x) => x.count)).toEqual([1]);
+  });
+
+  it('ano em andamento: a posição é a de agora (repasse de hoje em diante ainda está a receber)', () => {
+    const P26 = yearPeriod(2026);
+    const r = openPositionsAt(
+      {
+        ...openInput,
+        feeRules: [rule({ days: 30 })],
+        payments: [pay({ created_at: '2026-11-10T20:00:00-03:00' }), pay({ created_at: '2026-09-01T20:00:00-03:00' }), pay({ created_at: '2026-11-20T20:00:00-03:00' })],
+      },
+      P26,
+      NOW,
+    );
+    expect(r.cutoff).toBe(NOW.getTime());
+    expect(r.cardReceivables.map((x) => x.count)).toEqual([1]);
+  });
+
+  it('dinheiro com o entregador: entrega paga na entrega sem acerto na posição', () => {
+    const d = (x: Partial<OwnDelivery>): OwnDelivery => ({ id: Math.random().toString(), order_id: 'o9', status: 'DELIVERED', courier_id: 'c1', courier_fee: 7, pay_on_delivery: true, delivered_at: '2025-12-31T21:00:00-03:00', settlement_id: 's1', ...x }) as OwnDelivery;
+    const r = openPositionsAt(
+      {
+        ...openInput,
+        ownDeliveries: [d({}), d({ order_id: 'o10', pay_on_delivery: false })],
+        courierSettlements: [{ id: 's1', created_at: '2026-01-02T10:00:00-03:00' } as CourierSettlement],
+        // O pagamento em dinheiro só nasce no acerto (02/01): na virada estava com o entregador.
+        payments: [pay({ order_id: 'o9', method: 'CASH', acquirer: 'CASH_DESK', amount: 55, created_at: '2026-01-02T10:00:00-03:00' })],
+        orders: [{ id: 'o9', total_amount: 55 }, { id: 'o10', total_amount: 40 }],
+      },
+      P,
+      NOW,
+    );
+    expect(r.courierCash).toEqual([{ courier: 'Beto', deliveries: 1, amount: 55 }]);
+    expect(r.courierPayablesTotal).toBe(14);
+  });
+
+  it('simulador de maquininha fica fora; Pix direto sem taxa não vira "sem taxa cadastrada"', () => {
+    const r = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ acquirer: 'MOCK', amount: 99 }), pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 10 }), pay({ created_at: '2025-06-01 10:00:00' })] }, P);
+    expect(r.totalGross).toBe(10);
+    expect(r.totalWithoutRule).toBe(0);
+    expect([r.simulatorCount, r.simulatorAmount]).toEqual([1, 99]);
+    expect(r.invalidDates).toBe(1);
+    const csv = toCsv(revenueDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '', city: 'C', state: 'RS' }, generatedAt: 'g' }));
+    expect(csv).toContain('simulador');
+    expect(csv).toContain('ATENÇÃO: 1 pagamento(s)');
+    expect(csv).toContain('CNPJ não cadastrado');
+  });
+
+  it('sem pedidos de app, a comissão dos apps é "não registrado", não R$ 0,00', () => {
+    const r = expensesByCategory({ purchaseInvoices: [], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P) }, P);
+    expect(r.rows.find((x) => x.key === 'APP_FEES')).toMatchObject({ amount: null, source: 'NOT_TRACKED' });
+  });
+
+  it('inventário: entrada de NF-e de homologação sai do saldo e do custo; total em centavos exatos', () => {
+    const movs = [
+      mov({ id: 'real', quantity: 10, unit_cost: 2, balance_after: 10, avg_cost_after: 2, purchase_invoice_item_id: 'i1' }),
+      mov({ id: 'teste', quantity: 5, unit_cost: 8, balance_after: 15, avg_cost_after: 4, purchase_invoice_item_id: 'i2', created_at: '2025-07-01T12:00:00-03:00' }),
+      mov({ id: 'real2', quantity: 10, unit_cost: 3, balance_after: 25, avg_cost_after: 3.6, purchase_invoice_item_id: 'i3', created_at: '2025-08-01T12:00:00-03:00' }),
+      mov({ id: 'centavo', product_id: 'p2', quantity: 3, unit_cost: 1.005, balance_after: 3, avg_cost_after: 1.005 }),
+    ];
+    const ids = testInvoiceMovementIds(movs, [{ id: 'i1', invoice_id: 'nf1' }, { id: 'i2', invoice_id: 'nf2' }, { id: 'i3', invoice_id: 'nf1' }], [{ id: 'nf1', environment: 'PRODUCTION' }, { id: 'nf2', environment: 'HOMOLOGATION' }]);
+    expect([...ids]).toEqual(['teste']);
+    const r = inventoryAt([product({}), product({ id: 'p2', code: '002', name: 'Água' })], movs, P, ids);
+    expect(r.rows.map((x) => [x.code, x.quantity, x.unitCost, x.total, x.withoutTestInvoices])).toEqual([
+      ['002', 3, 1.005, 3.02, false],
+      ['001', 20, 2.5, 50, true],
+    ]);
+    expect(r.testMovements).toBe(1);
+  });
+
+  it('ano padrão: de janeiro a abril abre o ano que terminou; relógio errado não quebra', () => {
+    expect(defaultYear([2027, 2026], new Date('2027-01-05T10:00:00-03:00'))).toBe(2026);
+    expect(defaultYear([2027], new Date('2027-01-05T10:00:00-03:00'))).toBe(2027);
+    expect(defaultYear([2026, 2025], new Date('2026-11-14T10:00:00-03:00'))).toBe(2026);
+    expect(defaultYear([], new Date())).toBeNull();
+    // Relógio em 1970: não vira ano do seletor, mas os anos dos dados continuam.
+    expect(yearsWithData(['2025-03-01T10:00:00-03:00'], new Date(0))).toEqual([2025]);
+  });
+
+  it('CSV: CR sozinho, espaço ou aspas antes de = + - @ não viram fórmula', () => {
+    const doc = { period: 'p', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g', title: 'T', notes: [], tables: [{ head: ['A'], rows: [['ACME\r=HYPERLINK("x")'], [' =1+1'], ['"@SUM(A1)'], ['\t-2'], ['+5'], [NaN]] }] } as ReportDoc;
+    const lines = toCsv(doc).split('\r\n');
+    expect(lines).toContain('"ACME =HYPERLINK(""x"")"');
+    expect(lines).toContain("' =1+1");
+    expect(lines).toContain(`"'""@SUM(A1)"`);
+    expect(lines).toContain(`"'\t-2"`);
+    expect(lines).toContain("'+5");
+    expect(toPrintableHtml(doc)).not.toContain('NaN');
+    expect(lines.every((l) => !/^[=+\-@]/.test(l))).toBe(true);
+  });
+});
+
+describe('revisão do Codex', () => {
+  it('ano sem movimento entre dois anos com dados também aparece no seletor', () => {
+    expect(yearsWithData(['2024-03-01T10:00:00-03:00'], new Date('2026-11-14T10:00:00-03:00'))).toEqual([2026, 2025, 2024]);
+  });
+
+  it('NF-e com dEmi (só a data) conta no ano da emissão, não no da importação', () => {
+    expect(invoiceDate('2025-12-31')).toBe(Date.parse('2025-12-31T00:00:00-03:00'));
+    expect(invoiceDate('2026-01-01')).toBe(Date.parse('2026-01-01T00:00:00-03:00'));
+    expect(invoiceDate('2025-02-30')).toBeNull();
+    const inv = { id: 'n', supplier_id: 's', access_key: Math.random().toString(), number: '1', series: '1', issued_at: '2025-12-31', environment: 'PRODUCTION', invoice_amount: 80, imported_at: '2026-01-03T10:00:00-03:00' } as PurchaseInvoice;
+    const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P) };
+    expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).rows[0]!.amount).toBe(80);
+    expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, yearPeriod(2026)).rows[0]!.amount).toBe(0);
+    expect(expensesByCategory({ ...base, purchaseInvoices: [inv] }, P).purchases[0]!.date).toBe('2025-12-31T03:00:00.000Z');
+  });
+
+  it('NF-e com dEmi de hoje entra no relatório do ano em andamento de manhã (Codex, 2012bb1)', () => {
+    const inv = { id: 'h', supplier_id: 's', access_key: 'k-hoje', number: '2', series: '1', issued_at: '2026-11-14', environment: 'PRODUCTION', invoice_amount: 55, imported_at: '2026-11-14T08:00:00-03:00' } as PurchaseInvoice;
+    const amanha = { ...inv, id: 'a', access_key: 'k-amanha', issued_at: '2026-11-15', invoice_amount: 7 } as PurchaseInvoice;
+    const nove = new Date('2026-11-14T09:00:00-03:00');
+    const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, yearPeriod(2026), nove) };
+    const r = expensesByCategory({ ...base, purchaseInvoices: [inv, amanha] }, yearPeriod(2026), nove);
+    expect(r.rows[0]!.amount).toBe(55);
+    expect(r.afterCutoff).toBe(1);
+  });
+
+  it('dEmi em dia de início do horário de verão antigo (meia-noite pulada) fica no mesmo dia', () => {
+    const t = invoiceDate('2018-11-04')!;
+    expect(new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date(t))).toBe('2018-11-04');
+    expect(t).toBe(Date.parse('2018-11-04T01:00:00-02:00'));
+    // Dia comum do horário de verão antigo: meia-noite local (-02:00), não -03:00 fixo.
+    expect(invoiceDate('2018-12-15')).toBe(Date.parse('2018-12-15T00:00:00-02:00'));
+  });
+});
+
+describe('3b. venda na maquininha sem taxa cadastrada (situação de repasse desconhecida)', () => {
+  const now = new Date('2026-11-14T12:00:00-03:00');
+  const base = { period: periodLabel('open', P), store: { name: 'Loja', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+  const open = (payments: Payment[]) => openPositionsAt({ payments, feeRules: [], ownDeliveries: [], courierSettlements: [], couriers: [], orders: [] }, P, now);
+
+  it('venda de dezembro do ano anterior sem taxa aparece no relatório e na exportação do ano escolhido', () => {
+    const r = open([pay({ amount: 123.45, method: 'CREDIT', acquirer: 'STONE', created_at: '2024-12-20T20:00:00-03:00' })]);
+    expect([r.cardWithoutRule, r.cardWithoutRuleCount]).toEqual([123.45, 1]);
+    expect([r.cardWithoutRulePriorYears, r.cardWithoutRulePriorYearsCount]).toEqual([123.45, 1]);
+    expect(r.cardReceivablesNet).toBe(0);
+    const csv = toCsv(openDoc(r, base));
+    expect(csv).toContain('SITUAÇÃO DE REPASSE DESCONHECIDA: 1 venda(s)');
+    expect(csv).toContain('R$ 123,45 (0 deste ano, R$ 0,00; 1 de anos anteriores, R$ 123,45)');
+    expect(csv).toContain('pode já ter sido recebido');
+  });
+
+  it('venda depois da posição não conta; a do próprio ano conta; simulador e recusada ficam fora', () => {
+    const r = open([
+      pay({ amount: 70, acquirer: 'PAGBANK', created_at: '2025-12-20T20:00:00-03:00' }), // do ano: conta
+      pay({ amount: 30, created_at: '2024-12-20T20:00:00-03:00' }), // ano anterior: conta
+      pay({ amount: 500, created_at: '2026-01-01T00:00:00-03:00' }), // já é depois da posição
+      pay({ amount: 40, acquirer: 'MOCK', created_at: '2025-06-01T20:00:00-03:00' }), // simulador
+      pay({ amount: 60, status: 'DECLINED', created_at: '2025-06-01T20:00:00-03:00' }),
+    ]);
+    expect([r.cardWithoutRule, r.cardWithoutRuleCount]).toEqual([100, 2]);
+    expect([r.cardWithoutRulePriorYears, r.cardWithoutRulePriorYearsCount]).toEqual([30, 1]);
+    expect(toCsv(openDoc(r, base))).toContain('R$ 100,00 (1 deste ano, R$ 70,00; 1 de anos anteriores, R$ 30,00)');
+
+    const soDoAno = open([pay({ amount: 70, created_at: '2025-12-31T23:59:00-03:00' }), pay({ amount: 500, created_at: '2026-01-01T00:00:00-03:00' })]);
+    expect([soDoAno.cardWithoutRule, soDoAno.cardWithoutRuleCount, soDoAno.cardWithoutRulePriorYearsCount]).toEqual([70, 1, 0]);
+    expect(toCsv(openDoc(soDoAno, base))).toContain('R$ 70,00 (todas deste ano)');
+    expect(toCsv(openDoc(open([]), base))).not.toContain('SITUAÇÃO DE REPASSE DESCONHECIDA');
+  });
+});
+
+describe('corte único dos relatórios parciais (auditoria P2-02)', () => {
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+  const P26 = yearPeriod(2026);
+  const at9 = '2026-11-14T09:00:00-03:00';
+  const at11 = '2026-11-14T11:00:00-03:00';
+  const base = { period: '', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'g' };
+  const AVISO = (n: number) => `ATENÇÃO: ${n} registro(s) com data a partir de 14/11/2026 10:00:00 (instante deste relatório) ficaram de fora`;
+  const session = (s: Partial<CashSession>): CashSession =>
+    ({ id: Math.random().toString(), status: 'CLOSED', opened_at: '2026-11-14T08:00:00-03:00', closed_at: at9, opened_by_user_id: null, closed_by_user_id: null, opening_float: 0, expected_cash: 0, counted_cash: 0, difference: 0, ...s }) as CashSession;
+  const cashMov = (m: Partial<CashMovement>): CashMovement => ({ id: Math.random().toString(), type: 'SUPPLY', amount: 10, reason: 'troco', created_at: at9, ...m }) as CashMovement;
+  const invoice = (i: Partial<PurchaseInvoice>): PurchaseInvoice =>
+    ({ id: Math.random().toString(), supplier_id: 's', access_key: Math.random().toString(), number: '1', series: '1', issued_at: at9, environment: 'PRODUCTION', invoice_amount: 80, imported_at: at9, ...i }) as PurchaseInvoice;
+  const delivery = (x: Partial<OwnDelivery>): OwnDelivery =>
+    ({ id: Math.random().toString(), order_id: 'o1', status: 'DELIVERED', courier_id: 'c1', courier_fee: 7, pay_on_delivery: false, delivered_at: at9, settlement_id: null, ...x }) as OwnDelivery;
+
+  it('periodLabel mostra a hora do corte no ano em andamento e 31/12 no ano encerrado', () => {
+    expect(periodLabel('inventory', P26, NOW)).toBe('Posição em 14/11/2026 10:00:00 (ano em andamento)');
+    expect(periodLabel('revenue', P26, NOW)).toBe('01/01/2026 a 14/11/2026 10:00:00 (ano em andamento)');
+    expect(periodLabel('inventory', P, NOW)).toBe('Posição em 31/12/2025');
+    expect(periodLabel('expenses', P, NOW)).toBe('01/01/2025 a 31/12/2025');
+  });
+
+  it('inventário: 09:00 entra, 11:00 fica fora e é contado; aviso no CSV', () => {
+    const r = inventoryAt([product({})], [mov({ quantity: 5, unit_cost: 2, balance_after: 5, avg_cost_after: 2, created_at: at9 }), mov({ quantity: 45, unit_cost: 9.78, balance_after: 50, avg_cost_after: 9, created_at: at11 })], P26, new Set(), NOW);
+    expect(r.rows.map((x) => [x.quantity, x.unitCost])).toEqual([[5, 2]]);
+    expect([r.cutoff, r.afterCutoff]).toEqual([NOW.getTime(), 1]);
+    expect(toCsv(inventoryDoc(r, base))).toContain(AVISO(1));
+  });
+
+  it('faturamento: pagamentos, turnos e movimentos de caixa depois do corte ficam fora e são contados', () => {
+    const r = revenueByMethod(
+      {
+        ...emptyRevenueInput,
+        payments: [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 30, created_at: at9 }), pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 70, created_at: at11 })],
+        cashSessions: [session({}), session({ closed_at: at11 }), session({ status: 'OPEN', opened_at: at11, closed_at: null })],
+        cashMovements: [cashMov({}), cashMov({ created_at: at11, amount: 99 })],
+      },
+      P26,
+      NOW,
+    );
+    expect(r.totalGross).toBe(30);
+    expect(r.closings).toHaveLength(1);
+    // Fechado às 11h (depois do corte das 10h): estava aberto no instante do relatório.
+    expect(r.openSessions).toBe(1);
+    expect(r.supplies).toBe(10);
+    expect(r.afterCutoff).toBe(4); // pagamento, turno fechado, turno aberto, suprimento
+    expect(toCsv(revenueDoc(r, base))).toContain(AVISO(4));
+  });
+
+  it('contas em aberto: pagamento, entrega e acerto depois do corte são contados', () => {
+    const r = openPositionsAt(
+      {
+        payments: [pay({ created_at: at9 }), pay({ created_at: at11 })],
+        feeRules: [rule({ days: 30 })],
+        ownDeliveries: [delivery({ settlement_id: 's1' }), delivery({ delivered_at: at11 })],
+        courierSettlements: [{ id: 's1', created_at: at11 } as CourierSettlement],
+        couriers: [{ id: 'c1', name: 'Beto' }],
+        orders: [],
+      },
+      P26,
+      NOW,
+    );
+    expect(r.cardReceivables.map((x) => x.count)).toEqual([1]);
+    // A entrega das 09:00 continua devida: o acerto das 11:00 é depois da posição.
+    expect(r.courierPayables).toEqual([{ courier: 'Beto', deliveries: 1, amount: 7 }]);
+    expect(r.afterCutoff).toBe(3);
+    expect(toCsv(openDoc(r, base))).toContain(AVISO(3));
+  });
+
+  it('despesas: NF-e, acerto e sangria depois do corte ficam fora e são contados', () => {
+    const r = expensesByCategory(
+      {
+        purchaseInvoices: [invoice({}), invoice({ issued_at: at11, invoice_amount: 500 })],
+        suppliers: [],
+        courierSettlements: [{ id: 'a', created_at: at9, courier_fees: 5, cash_movement_id: null } as CourierSettlement, { id: 'b', created_at: at11, courier_fees: 50, cash_movement_id: null } as CourierSettlement],
+        cashMovements: [cashMov({ type: 'WITHDRAWAL', amount: 3 }), cashMov({ type: 'WITHDRAWAL', amount: 30, created_at: at11 })],
+        revenue: revenueByMethod(emptyRevenueInput, P26, NOW),
+      },
+      P26,
+      NOW,
+    );
+    expect(r.rows.find((x) => x.key === 'PURCHASES')!.amount).toBe(80);
+    expect(r.rows.find((x) => x.key === 'DELIVERY')!.amount).toBe(5);
+    expect(r.withdrawalsTotal).toBe(3);
+    expect(r.afterCutoff).toBe(3);
+    expect(toCsv(expensesDoc(r, base))).toContain(AVISO(3));
+  });
+
+  it('ano encerrado: o corte é 01/01 seguinte; 31/12 23:59 entra e 01/01 00:00 fica fora sem aviso', () => {
+    const last = '2025-12-31T23:59:00-03:00';
+    const next = '2026-01-01T00:00:00-03:00';
+    const inv = inventoryAt([product({})], [mov({ quantity: 2, balance_after: 2, created_at: last }), mov({ quantity: 7, balance_after: 9, created_at: next })], P, new Set(), NOW);
+    expect([inv.rows[0]!.quantity, inv.cutoff, inv.afterCutoff]).toEqual([2, P.to, 0]);
+    const rev = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 1, created_at: last }), pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 2, created_at: next })] }, P, NOW);
+    expect([rev.totalGross, rev.cutoff, rev.afterCutoff]).toEqual([1, P.to, 0]);
+    const open = openPositionsAt(
+      { payments: [], feeRules: [], ownDeliveries: [delivery({ delivered_at: last }), delivery({ delivered_at: next })], courierSettlements: [], couriers: [{ id: 'c1', name: 'Beto' }], orders: [] },
+      P,
+      NOW,
+    );
+    expect([open.courierPayablesTotal, open.afterCutoff]).toEqual([7, 0]);
+    const exp = expensesByCategory({ purchaseInvoices: [invoice({ issued_at: last }), invoice({ issued_at: next })], suppliers: [], courierSettlements: [], cashMovements: [], revenue: rev }, P, NOW);
+    expect([exp.rows[0]!.amount, exp.cutoff, exp.afterCutoff]).toEqual([80, P.to, 0]);
+    for (const doc of [inventoryDoc(inv, base), revenueDoc(rev, base), openDoc(open, base), expensesDoc(exp, base)]) expect(toCsv(doc)).not.toContain('instante deste relatório');
+  });
+});
+
+describe('rodada interna após a auditoria 2: nada some calado', () => {
+  const session = (x: Partial<CashSession>): CashSession =>
+    ({ id: Math.random().toString(), tenant_id: 't', opened_by_user_id: 'u1', opened_at: '2025-05-01T10:00:00-03:00', opening_float: 100, status: 'CLOSED', closed_by_user_id: 'u1', closed_at: '2025-05-01T23:00:00-03:00', counted_cash: 0, expected_cash: 0, difference: 0, closing_notes: null, closing_authorized_by_manager_id: null, ...x }) as CashSession;
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+
+  it('turno aberto na virada conta no ano da posição, seja qual for o ano da abertura', () => {
+    const virada = session({ opened_at: '2025-12-31T18:00:00-03:00', closed_at: '2026-01-01T02:00:00-03:00' });
+    const antigo = session({ opened_at: '2024-03-01T10:00:00-03:00', status: 'OPEN', closed_at: null });
+    const r25 = revenueByMethod({ ...emptyRevenueInput, cashSessions: [virada, antigo] }, P, NOW);
+    expect(r25.openSessions).toBe(2);
+    expect(toCsv(revenueDoc(r25, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('2 turno(s) de caixa estavam abertos no fim do período');
+    // Em 2026 o da virada já fechou; o antigo continua aberto.
+    expect(revenueByMethod({ ...emptyRevenueInput, cashSessions: [virada, antigo] }, yearPeriod(2026), NOW).openSessions).toBe(1);
+    // Aberto depois do instante do relatório não conta como aberto.
+    expect(revenueByMethod({ ...emptyRevenueInput, cashSessions: [session({ opened_at: '2026-11-14T11:00:00-03:00', status: 'OPEN', closed_at: null })] }, yearPeriod(2026), NOW).openSessions).toBe(0);
+  });
+
+  it('suprimento ou sangria com data inválida é contado como data inválida', () => {
+    const r = revenueByMethod({ ...emptyRevenueInput, cashMovements: [{ id: 'm1', type: 'SUPPLY', amount: 50, created_at: 'lixo' } as CashMovement] }, P, NOW);
+    expect(r.invalidDates).toBe(1);
+    expect(r.supplies).toBe(0);
+  });
+
+  it('NF-e com data de emissão inválida vai pela importação e é avisada', () => {
+    const inv = { id: 'i1', supplier_id: 's1', access_key: '4325'.padEnd(44, '0'), number: '1', series: '1', issued_at: '2025-02-31', environment: 'PRODUCTION', invoice_amount: 10, imported_at: '2025-03-01T10:00:00-03:00' } as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW) }, P, NOW);
+    expect(r.invalidIssueDates).toBe(1);
+    expect(r.purchases).toHaveLength(1);
+    expect(toCsv(expensesDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('1 NF-e com data de emissão inválida');
+  });
+});
+
+describe('rodada interna 1: corte, futuro e HTML', () => {
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+  const P26 = yearPeriod(2026);
+  const base = { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+
+  it('ano em andamento: registro de ano futuro (relógio errado) também é avisado; ano encerrado não', () => {
+    const payments = [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 5, created_at: '2027-01-05T10:00:00-03:00' })];
+    expect(revenueByMethod({ ...emptyRevenueInput, payments }, P26, NOW).afterCutoff).toBe(1);
+    expect(revenueByMethod({ ...emptyRevenueInput, payments }, P, NOW).afterCutoff).toBe(0);
+    const inv = inventoryAt([product({})], [mov({ created_at: '2027-01-05T10:00:00-03:00' })], P26, new Set(), NOW);
+    expect([inv.rows.length, inv.afterCutoff]).toEqual([0, 1]);
+  });
+
+  it('relógio antes do ano: o ano vale inteiro e nada conta como depois do corte', () => {
+    const clock = new Date('1970-01-02T00:00:00Z');
+    expect(clockBeforeYear(P, clock)).toBe(true);
+    expect(yearInProgress(P, clock)).toBe(false);
+    expect(positionCutoff(P, clock)).toBe(P.to);
+    const r = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 5, created_at: '2025-06-01T10:00:00-03:00' }), pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 7, created_at: '2024-06-01T10:00:00-03:00' })] }, P, clock);
+    expect([r.totalGross, r.afterCutoff]).toEqual([5, 0]);
+    expect(periodLabel('open', P, clock)).toBe('Posição em 31/12/2025');
+  });
+
+  it('dinheiro depois do corte não entra no aviso de dinheiro fora de turno', () => {
+    const r = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'CASH', acquirer: 'CASH_DESK', amount: 9, created_at: '2026-11-14T11:00:00-03:00' })] }, P26, NOW);
+    expect([r.cashOutsideSessionsCount, r.afterCutoff]).toEqual([0, 1]);
+  });
+
+  it('NF-e de homologação com emissão inválida não entra no aviso de emissão inválida', () => {
+    const inv = { id: 'i1', supplier_id: 's1', access_key: '4325'.padEnd(44, '0'), number: '1', series: '1', issued_at: '2025-02-31', environment: 'HOMOLOGATION', invoice_amount: 10, imported_at: '2025-03-01T10:00:00-03:00' } as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P) }, P, NOW);
+    expect([r.invalidIssueDates, r.homologationInvoices]).toEqual([0, 1]);
+  });
+
+  it('os avisos de corte e de repasse desconhecido também saem no HTML para imprimir', () => {
+    const open = openPositionsAt({ payments: [pay({ amount: 12, method: 'CREDIT', acquirer: 'STONE', created_at: '2025-12-20T20:00:00-03:00' }), pay({ amount: 3, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2026-11-14T11:00:00-03:00' })], feeRules: [], ownDeliveries: [], courierSettlements: [], couriers: [], orders: [] }, P26, NOW);
+    const html = toPrintableHtml(openDoc(open, base));
+    expect(html).toContain('SITUAÇÃO DE REPASSE DESCONHECIDA: 1 venda(s)');
+    expect(html).toContain('1 registro(s) com data a partir de 14/11/2026 10:00:00');
+  });
+});
+
+describe('rodada interna 2: contador, dados e exportação', () => {
+  const base = { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+
+  it('inventário soma só as entradas deste aparelho (não o saldo da loja vindo da nuvem)', () => {
+    // Aparelho B: o produto já tinha 10 un. de outro aparelho; B importou 5 (balance_after 15).
+    const r = inventoryAt([product({})], [mov({ quantity: 5, unit_cost: 4, balance_after: 15, avg_cost_after: 3 })], P);
+    expect([r.rows[0]!.quantity, r.rows[0]!.unitCost, r.totalCost]).toEqual([5, 4, 20]);
+    expect(toCsv(inventoryDoc(r, base))).toContain('importadas NESTE aparelho');
+  });
+
+  it('registro de outra loja que sobrou no aparelho fica fora e é contado', () => {
+    const r = ownStore([{ tenant_id: 'a' }, { tenant_id: 'b' }, { tenant_id: undefined }, { tenant_id: null }], 'a');
+    expect([r.rows.length, r.other]).toEqual([1, 3]);
+  });
+
+  it('NF-e repetida (mesma chave) conta uma vez e é avisada', () => {
+    const inv = (id: string) => ({ id, supplier_id: 's1', access_key: '4325'.padEnd(44, '1'), number: '1', series: '1', issued_at: '2025-03-01T10:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 10, imported_at: '2025-03-01T10:00:00-03:00' }) as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv('nuvem'), inv('recusada')], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW) }, P, NOW);
+    expect([r.purchases.length, r.duplicateInvoices, r.rows.find((x) => x.key === 'PURCHASES')!.amount]).toEqual([1, 1, 10]);
+    expect(toCsv(expensesDoc(r, base))).toContain('1 NF-e importada(s) também em outro aparelho');
+  });
+
+  it('taxa de serviço aparece à parte, rateada pelos pagamentos reais do período (está dentro do bruto)', () => {
+    const r = revenueByMethod({
+      ...emptyRevenueInput,
+      payments: [
+        pay({ order_id: 'a', amount: 110, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2025-05-01T21:00:00-03:00' }),
+        // Comanda paga metade em 31/12 e metade em 01/01: metade da taxa em cada ano.
+        pay({ order_id: 'b', amount: 11, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2025-12-31T23:50:00-03:00' }),
+        pay({ order_id: 'b', amount: 11, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2026-01-01T00:05:00-03:00' }),
+        // Simulador: fora do bruto, então a taxa também fica fora.
+        pay({ order_id: 'c', amount: 55, method: 'CREDIT', acquirer: 'MOCK', created_at: '2025-06-01T21:00:00-03:00' }),
+        pay({ order_id: 'd', amount: 33, method: 'PIX', acquirer: 'CASH_DESK', created_at: '2025-06-01T21:00:00-03:00' }),
+      ],
+      orders: [
+        { id: 'a', status: 'CLOSED', service_fee_amount: 10 },
+        { id: 'b', status: 'CLOSED', service_fee_amount: 2 },
+        { id: 'c', status: 'CLOSED', service_fee_amount: 5 },
+        { id: 'd', status: 'OPEN', service_fee_amount: 3 },
+      ],
+    }, P, NOW);
+    expect(r.serviceFee).toBe(11);
+    expect(toCsv(revenueDoc(r, base))).toContain('Taxa de serviço das comandas fechadas (na proporção dos pagamentos do período): R$ 11,00');
+  });
+
+  it('venda sem taxa mais antiga que o maior prazo cadastrável já caiu e fica fora do aviso', () => {
+    const r = openPositionsAt({ payments: [pay({ amount: 50, method: 'CREDIT', acquirer: 'STONE', created_at: '2021-03-01T12:00:00-03:00' }), pay({ amount: 20, method: 'CREDIT', acquirer: 'STONE', created_at: '2025-01-10T12:00:00-03:00' })], feeRules: [], ownDeliveries: [], courierSettlements: [], couriers: [], orders: [] }, P, NOW);
+    expect([r.cardWithoutRule, r.cardWithoutRuleCount]).toEqual([20, 1]);
+  });
+
+  it('CSV: texto com vírgula vai entre aspas (quem separar por vírgula não cria célula com fórmula)', () => {
+    const csv = toCsv({ ...base, title: 'T', notes: [], tables: [{ title: 't', head: ['a'], rows: [['ok,@SUM(1)']] }] });
+    expect(csv).toContain('"ok,@SUM(1)"');
+  });
+});
+
+describe('rodada interna 3', () => {
+  const base = { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+  const NOW = new Date('2026-11-14T10:00:00-03:00');
+
+  it('NF-e importada também em outro aparelho (a nuvem recusou a daqui): as entradas daqui ficam fora do inventário e são avisadas', () => {
+    const key = '4325'.padEnd(44, '7');
+    const invoices = [{ id: 'nuvem', access_key: key, imported_at: '2025-03-01T10:00:00-03:00' }, { id: 'aqui', access_key: key }, { id: 'outra', access_key: '4325'.padEnd(44, '8') }];
+    const items = [{ id: 'it1', invoice_id: 'aqui' }, { id: 'it2', invoice_id: 'outra' }];
+    const movs = [mov({ id: 'm1', quantity: 10, unit_cost: 2, purchase_invoice_item_id: 'it1' }), mov({ id: 'm2', quantity: 3, unit_cost: 5, purchase_invoice_item_id: 'it2' })];
+    const dup = duplicateInvoiceMovementIds(movs, items, invoices, rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'aqui' } }]));
+    expect([...dup]).toEqual(['m1']);
+    const r = inventoryAt([product({})], movs, P, new Set(), NOW, dup);
+    expect([r.rows[0]!.quantity, r.totalCost, r.duplicateMovements]).toEqual([3, 15, 1]);
+    expect(toCsv(inventoryDoc(r, base))).toContain('1 entrada(s) de NF-e repetida ficaram fora deste saldo');
+  });
+
+  it('data de relógio zerado (1970) conta como data inválida, não some', () => {
+    const r = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'PIX', acquirer: 'CASH_DESK', amount: 9, created_at: '1970-01-01T00:05:00Z' })] }, P, NOW);
+    expect([r.totalGross, r.invalidDates]).toEqual([0, 1]);
+    expect(toCsv(revenueDoc(r, base))).toContain('fora de 2000–2100');
+    expect(yearsWithData(['1970-01-01T00:05:00Z'], NOW)).toEqual([2026]);
+  });
+
+  it('contas em aberto: pagamento e acerto com data inválida são avisados', () => {
+    const r = openPositionsAt({ payments: [pay({ amount: 5, method: 'PIX', acquirer: 'CASH_DESK', created_at: 'lixo' })], feeRules: [], ownDeliveries: [], courierSettlements: [{ id: 's', created_at: 'lixo' } as CourierSettlement], couriers: [], orders: [] }, P, NOW);
+    expect(r.invalidDates).toBe(2);
+  });
+
+  it('NF-e repetida de outro ano não aparece no aviso do ano escolhido', () => {
+    const inv = (id: string) => ({ id, supplier_id: 's1', access_key: '4325'.padEnd(44, '9'), number: '1', series: '1', issued_at: '2024-03-01T10:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 10, imported_at: '2024-03-01T10:00:00-03:00' }) as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv('a'), inv('b')], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW) }, P, NOW);
+    expect(r.duplicateInvoices).toBe(0);
+  });
+});
+
+describe('auditoria GPT rodada 2 (119ade2)', () => {
+  const NOW2 = new Date('2026-11-14T12:00:00-03:00');
+
+  it('P0-01: registro sem loja identificada fica fora dos totais e é contado', () => {
+    const r = ownStore([{ tenant_id: 'b' }, { tenant_id: 'a' }, { tenant_id: undefined }, { tenant_id: null }, { tenant_id: '' }], 'b');
+    expect([r.rows.length, r.other]).toEqual([1, 4]);
+    // Troca de loja: o pagamento antigo, sem loja, não entra no faturamento da loja B.
+    const pays = ownStore([pay({ amount: 70, tenant_id: undefined as unknown as string }), pay({ amount: 30, tenant_id: 'b' })], 'b');
+    const rev = revenueByMethod({ ...emptyRevenueInput, payments: pays.rows }, P, NOW2);
+    expect([rev.totalGross, pays.other]).toEqual([30, 1]);
+  });
+
+  it('P1-01: NF-e importada duas vezes NESTE aparelho conta uma vez (nunca zero, nunca em dobro)', () => {
+    const key = '4325'.padEnd(44, '3');
+    const invoices = [
+      { id: 'segunda', access_key: key, imported_at: '2025-03-02T10:00:00-03:00' },
+      { id: 'primeira', access_key: key, imported_at: '2025-03-01T10:00:00-03:00' },
+    ];
+    const items = [{ id: 'i1', invoice_id: 'primeira' }, { id: 'i2', invoice_id: 'segunda' }];
+    const movs = [mov({ id: 'a', quantity: 10, unit_cost: 2, purchase_invoice_item_id: 'i1' }), mov({ id: 'b', quantity: 10, unit_cost: 2, purchase_invoice_item_id: 'i2' })];
+    const dup = duplicateInvoiceMovementIds(movs, items, invoices);
+    expect([...dup]).toEqual(['b']);
+    const r = inventoryAt([product({})], movs, P, new Set(), NOW2, dup);
+    expect([r.rows[0]!.quantity, r.totalCost, r.duplicateMovements]).toEqual([10, 20, 1]);
+    expect(toCsv(inventoryDoc(r, { period: periodLabel('inventory', P), store: { name: 'Loja', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('vale só a primeira importação');
+  });
+
+  it('P2-01: pagamento do simulador (MOCK) não abate o dinheiro com o entregador', () => {
+    const r = openPositionsAt(
+      {
+        payments: [pay({ order_id: 'o1', method: 'CREDIT', acquirer: 'MOCK', amount: 100, created_at: '2025-12-31T20:00:00-03:00' })],
+        feeRules: [],
+        ownDeliveries: [{ id: 'd1', order_id: 'o1', status: 'DELIVERED', courier_id: 'c1', courier_fee: 5, pay_on_delivery: true, delivered_at: '2025-12-31T21:00:00-03:00', settlement_id: null } as OwnDelivery],
+        courierSettlements: [],
+        couriers: [{ id: 'c1', name: 'Beto' }] as never,
+        orders: [{ id: 'o1', total_amount: 100 }],
+      },
+      P,
+      NOW2,
+    );
+    expect(r.courierCashTotal).toBe(100);
+  });
+
+  it('P2-02: cópia sem data não tira a NF-e do ano certo; uma compra só, no ano da emissão', () => {
+    const key = '4325'.padEnd(44, '4');
+    const semData = { id: 'sem', supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: null, environment: 'PRODUCTION', invoice_amount: 80, imported_at: '2026-01-05T10:00:00-03:00' } as PurchaseInvoice;
+    const comData = { ...semData, id: 'com', issued_at: '2025-12-20T10:00:00-03:00', imported_at: '2026-01-06T10:00:00-03:00' } as PurchaseInvoice;
+    const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW2) };
+    for (const list of [[semData, comData], [comData, semData]]) {
+      const r2025 = expensesByCategory({ ...base, purchaseInvoices: list }, P, NOW2);
+      expect([r2025.purchases.length, r2025.rows[0]!.amount, r2025.duplicateInvoices]).toEqual([1, 80, 1]);
+      const r2026 = expensesByCategory({ ...base, purchaseInvoices: list }, yearPeriod(2026), NOW2);
+      expect([r2026.purchases.length, r2026.duplicateInvoices]).toEqual([0, 0]);
+    }
+  });
+
+  it('P1-01: com cópia de homologação e de produção da mesma nota, o inventário fica com a de produção (nunca zero)', () => {
+    const key = '4325'.padEnd(44, '6');
+    const invoices = [
+      { id: 'h', access_key: key, environment: 'HOMOLOGATION' as const, imported_at: '2025-05-01T10:00:00-03:00' },
+      { id: 'p', access_key: key, environment: 'PRODUCTION' as const, imported_at: '2025-05-02T10:00:00-03:00' },
+    ];
+    const items = [{ id: 'ih', invoice_id: 'h' }, { id: 'ip', invoice_id: 'p' }];
+    const movs = [mov({ id: 'mh', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ih' }), mov({ id: 'mp', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ip' })];
+    const r = inventoryAt([product({})], movs, P, testInvoiceMovementIds(movs, items, invoices), NOW2, duplicateInvoiceMovementIds(movs, items, invoices));
+    expect(r.totalCost).toBe(50);
+    // Só a de produção tem entrada aqui e a outra cópia é de homologação: fica.
+    const r2 = inventoryAt([product({})], [movs[1]!], P, new Set(), NOW2, duplicateInvoiceMovementIds([movs[1]!], items, invoices));
+    expect(r2.totalCost).toBe(50);
+  });
+
+  it('P2-02: cópia de produção vale mais que a de homologação com a mesma chave', () => {
+    const key = '4325'.padEnd(44, '5');
+    const homolog = { id: 'h', supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: '2025-05-01T10:00:00-03:00', environment: 'HOMOLOGATION', invoice_amount: 50, imported_at: '2025-05-01T10:00:00-03:00' } as PurchaseInvoice;
+    const prod = { ...homolog, id: 'p', environment: 'PRODUCTION', imported_at: '2025-05-02T10:00:00-03:00' } as PurchaseInvoice;
+    const base = { suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW2) };
+    const r = expensesByCategory({ ...base, purchaseInvoices: [homolog, prod] }, P, NOW2);
+    expect([r.rows[0]!.amount, r.homologationInvoices]).toEqual([50, 0]);
+  });
+});
+
+describe('auditoria GPT rodada 3 (0dd946d)', () => {
+  const base = { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' };
+  const NOW3 = new Date('2026-11-14T12:00:00-03:00');
+  const key = '4325'.padEnd(44, '9');
+
+  it('P1-01: cópia sem entradas aqui e sem recusa da nuvem não zera as 10 un.: ficam, com aviso para conferir', () => {
+    const invoices = [
+      { id: 'sem', access_key: key, environment: 'PRODUCTION' as const, imported_at: '2025-03-01T10:00:00-03:00' },
+      { id: 'com', access_key: key, environment: 'PRODUCTION' as const, imported_at: '2025-03-02T10:00:00-03:00' },
+    ];
+    const items = [{ id: 'i1', invoice_id: 'com' }];
+    const movs = [mov({ id: 'm', quantity: 10, unit_cost: 3, purchase_invoice_item_id: 'i1' })];
+    const rev = reviewDuplicateInvoices(movs, items, invoices);
+    expect([[...rev.excluded], rev.unconfirmed]).toEqual([[], [['m']]]);
+    const r = inventoryAt([product({})], movs, P, new Set(), NOW3, rev.excluded, rev.unconfirmed);
+    expect([r.rows[0]!.quantity, r.totalCost]).toEqual([10, 30]);
+    expect(toCsv(inventoryDoc(r, base))).toContain('sem prova de que é duplicata: as entradas deste aparelho foram MANTIDAS');
+    // Com a prova (a nuvem recusou a nota deste aparelho), saem e não há aviso de conferir.
+    const proved = reviewDuplicateInvoices(movs, items, invoices, new Set(['com']));
+    expect([[...proved.excluded], proved.unconfirmed]).toEqual([['m'], []]);
+    // Entrada depois do corte, ou de nota de homologação: não está no saldo, não avisa.
+    const late = [mov({ id: 'm', quantity: 10, unit_cost: 3, purchase_invoice_item_id: 'i1', created_at: '2026-02-01T10:00:00-03:00' })];
+    const rl = reviewDuplicateInvoices(late, items, invoices);
+    expect(inventoryAt([product({})], late, P, new Set(), NOW3, rl.excluded, rl.unconfirmed).duplicateUnconfirmed).toBe(0);
+    const homolog = [invoices[0]!, { ...invoices[1]!, environment: 'HOMOLOGATION' as const }];
+    const rh = reviewDuplicateInvoices(movs, items, homolog);
+    const ih = inventoryAt([product({})], movs, P, testInvoiceMovementIds(movs, items, homolog), NOW3, rh.excluded, rh.unconfirmed);
+    expect([ih.totalCost, ih.duplicateUnconfirmed]).toEqual([0, 0]);
+    expect(toCsv(inventoryDoc(ih, base))).not.toContain('MANTIDAS');
+  });
+
+  it('P2-01: inventário e compras usam a mesma cópia (data válida antes da importada primeiro)', () => {
+    const semData = { id: 'a', supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: 'lixo', environment: 'PRODUCTION', invoice_amount: 40, imported_at: '2025-03-01T10:00:00-03:00' } as PurchaseInvoice;
+    const comData = { ...semData, id: 'b', issued_at: '2025-03-01T09:00:00-03:00', invoice_amount: 40, imported_at: '2025-03-05T10:00:00-03:00' } as PurchaseInvoice;
+    expect(compareInvoiceCopies(comData, semData)).toBeLessThan(0);
+    const items = [{ id: 'ia', invoice_id: 'a' }, { id: 'ib', invoice_id: 'b' }];
+    const movs = [mov({ id: 'ma', quantity: 4, unit_cost: 1, purchase_invoice_item_id: 'ia' }), mov({ id: 'mb', quantity: 10, unit_cost: 4, purchase_invoice_item_id: 'ib' })];
+    for (const list of [[semData, comData], [comData, semData]]) {
+      const rev = reviewDuplicateInvoices(movs, items, list);
+      expect([...rev.excluded]).toEqual(['ma']);
+      const inv = inventoryAt([product({})], movs, P, new Set(), NOW3, rev.excluded);
+      expect(inv.totalCost).toBe(40);
+      const exp = expensesByCategory({ purchaseInvoices: list, suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, NOW3) }, P, NOW3);
+      expect(exp.purchases.map((x) => x.amount)).toEqual([40]);
+      expect(exp.invalidIssueDates).toBe(0);
+    }
+  });
+
+  it('P2-03: fim do dia do repasse é o começo do dia seguinte em Brasília (dias de 25 h e de 23 h de 2018)', () => {
+    const d0 = rule({ days: 0 });
+    // 17/02/2018 teve 25 h (o horário de verão acabou à meia-noite do dia 18).
+    expect(settlementDayEndBrasilia(Date.parse('2018-02-17T10:00:00-02:00'), d0)).toBe(Date.parse('2018-02-18T00:00:00-03:00'));
+    // 04/11/2018 teve 23 h e começou à 01:00.
+    expect(brasiliaDayStart(2018, 10, 4)).toBe(Date.parse('2018-11-04T01:00:00-02:00'));
+    expect(settlementDayEndBrasilia(Date.parse('2018-11-04T10:00:00-02:00'), d0)).toBe(Date.parse('2018-11-05T00:00:00-02:00'));
+    expect(settlementDayEndBrasilia(Date.parse('2018-11-03T10:00:00-03:00'), d0)).toBe(Date.parse('2018-11-04T01:00:00-02:00'));
+    const P18 = yearPeriod(2018);
+    const open = (sale: string, now: string) =>
+      openPositionsAt({ payments: [pay({ amount: 100, method: 'CREDIT', acquirer: 'STONE', created_at: sale })], feeRules: [d0], ownDeliveries: [], courierSettlements: [], couriers: [], orders: [] }, P18, new Date(now)).cardReceivables.length;
+    // 23:30 do dia de 25 h: o dia do repasse ainda não acabou.
+    expect(open('2018-02-17T10:00:00-02:00', '2018-02-17T23:30:00-03:00')).toBe(1);
+    // 00:30 de 05/11, depois do dia de 23 h: o repasse do dia 04 já caiu.
+    expect(open('2018-11-04T10:00:00-02:00', '2018-11-05T00:30:00-02:00')).toBe(0);
+  });
+});
+
+describe('auditoria GPT rodada 4 (435c529)', () => {
+  it('P2-01: total do inventário sai da soma exata das entradas (R$ 2.000,10), em qualquer ordem', () => {
+    const a = mov({ id: 'a', quantity: 1000, unit_cost: 1, created_at: '2025-03-01T10:00:00-03:00' });
+    const b = mov({ id: 'b', quantity: 1000, unit_cost: 1.0001, created_at: '2025-03-02T10:00:00-03:00' });
+    for (const list of [[a, b], [b, a]]) {
+      const r = inventoryAt([product({})], list, P, new Set(), new Date('2026-11-14T12:00:00-03:00'));
+      expect([r.rows[0]!.quantity, r.rows[0]!.total, r.totalCost]).toEqual([2000, 2000.1, 2000.1]);
+    }
+  });
+
+  it('P2-02: no ano em andamento, NF-e emitida antes do corte mas importada depois fica fora com aviso; ao atualizar, entra', () => {
+    const P26 = yearPeriod(2026);
+    const inv = { id: 'n', supplier_id: 's', access_key: '4325'.padEnd(44, '2'), number: '1', series: '1', issued_at: '2026-11-14T08:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 500, imported_at: '2026-11-14T11:00:00-03:00' } as PurchaseInvoice;
+    const run = (now: Date) => expensesByCategory({ purchaseInvoices: [inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, now) }, P26, now);
+    const nove = run(new Date('2026-11-14T09:00:00-03:00'));
+    expect([nove.purchases.length, nove.afterCutoff, nove.importedAfterCutoff]).toEqual([0, 1, 1]);
+    expect(toCsv(expensesDoc(nove, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('importada(s) neste aparelho depois dele');
+    const doze = run(new Date('2026-11-14T12:00:00-03:00'));
+    expect([doze.purchases.length, doze.rows[0]!.amount, doze.afterCutoff]).toEqual([1, 500, 0]);
+    // Cópia da nuvem já estava aqui (importada às 08:30, sem data válida) e a local veio às 11:00:
+    // conta a que estava aqui, uma vez, sem aviso de repetida nem de fora do instante.
+    const nuvem = { ...inv, id: 'nuvem', issued_at: 'lixo', imported_at: '2026-11-14T08:30:00-03:00' } as PurchaseInvoice;
+    const both = expensesByCategory({ purchaseInvoices: [inv, nuvem], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, new Date('2026-11-14T09:00:00-03:00')) }, P26, new Date('2026-11-14T09:00:00-03:00'));
+    expect([both.purchases.length, both.duplicateInvoices, both.afterCutoff, both.importedAfterCutoff]).toEqual([1, 0, 0, 0]);
+    // As duas cópias chegaram depois do corte: nenhuma conta, um aviso só, e nada de "repetida".
+    const twoLate = expensesByCategory({ purchaseInvoices: [inv, { ...inv, id: 'n2', imported_at: '2026-11-14T10:00:00-03:00' } as PurchaseInvoice], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, new Date('2026-11-14T09:00:00-03:00')) }, P26, new Date('2026-11-14T09:00:00-03:00'));
+    expect([twoLate.purchases.length, twoLate.duplicateInvoices, twoLate.afterCutoff, twoLate.importedAfterCutoff]).toEqual([0, 0, 1, 1]);
+    // Homologação importada depois: não conta nem pede para atualizar.
+    const hom = expensesByCategory({ purchaseInvoices: [{ ...inv, environment: 'HOMOLOGATION' } as PurchaseInvoice], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, new Date('2026-11-14T09:00:00-03:00')) }, P26, new Date('2026-11-14T09:00:00-03:00'));
+    expect([hom.afterCutoff, hom.importedAfterCutoff]).toEqual([0, 0]);
+    // Ano encerrado: nota de dezembro importada em janeiro continua em dezembro.
+    const dez = { ...inv, issued_at: '2025-12-20T10:00:00-03:00', imported_at: '2026-01-05T10:00:00-03:00' } as PurchaseInvoice;
+    const r25 = expensesByCategory({ purchaseInvoices: [dez], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, new Date('2026-11-14T09:00:00-03:00')) }, P, new Date('2026-11-14T09:00:00-03:00'));
+    expect([r25.purchases.length, r25.rows[0]!.amount]).toEqual([1, 500]);
+  });
+});
+
+describe('auditoria GPT rodada 5 (f9f2022)', () => {
+  it('P2-01: cópia de homologação não esconde o aviso da NF-e de produção importada depois do corte', () => {
+    const P26 = yearPeriod(2026);
+    const key = '4326'.padEnd(44, '3');
+    const a = { id: 'a', supplier_id: 's', access_key: key, number: '1', series: '1', issued_at: '2026-11-14T08:00:00-03:00', environment: 'HOMOLOGATION', invoice_amount: 500, imported_at: '2026-11-14T08:00:00-03:00' } as PurchaseInvoice;
+    const b = { ...a, id: 'b', environment: 'PRODUCTION', imported_at: '2026-11-14T11:00:00-03:00' } as PurchaseInvoice;
+    const run = (list: PurchaseInvoice[], now: Date) => expensesByCategory({ purchaseInvoices: list, suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, now) }, P26, now);
+    const nove = new Date('2026-11-14T09:00:00-03:00');
+    const doze = new Date('2026-11-14T12:00:00-03:00');
+    for (const list of [[a, b], [b, a]]) {
+      const r9 = run(list, nove);
+      expect([r9.purchases.length, r9.afterCutoff, r9.importedAfterCutoff]).toEqual([0, 1, 1]);
+      const r12 = run(list, doze);
+      expect([r12.purchases.length, r12.rows[0]!.amount, r12.afterCutoff, r12.importedAfterCutoff]).toEqual([1, 500, 0, 0]);
+    }
+    // Duas cópias chegaram depois: a de homologação vista primeiro não ocupa a chave da de produção.
+    const aLate = { ...a, imported_at: '2026-11-14T10:00:00-03:00' } as PurchaseInvoice;
+    const rl = run([aLate, b], nove);
+    expect([rl.purchases.length, rl.afterCutoff, rl.importedAfterCutoff]).toEqual([0, 1, 1]);
+  });
+});
+
+describe('Codex em 1fbc385', () => {
+  it('P2: cópia aceita importada depois do corte não apaga as entradas daqui (a mercadoria não some dos dois aparelhos)', () => {
+    const key = '4325'.padEnd(44, '6');
+    // A importou offline em 31/12/2025; B importou e sincronizou em 01/01/2026; a nuvem recusou a de A.
+    const nuvem = { id: 'b', access_key: key, environment: 'PRODUCTION', imported_at: '2026-01-01T10:00:00-03:00' } as const;
+    const aqui = { id: 'a', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-31T10:00:00-03:00' } as const;
+    const items = [{ id: 'it', invoice_id: 'a' }];
+    const movs = [mov({ id: 'm', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'it', created_at: '2025-12-31T10:00:00-03:00' })];
+    const rejected = rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a' } }]);
+    const run = (p: ReturnType<typeof yearPeriod>, now: Date) => {
+      const review = reviewDuplicateInvoices(movs, items, [nuvem, aqui], rejected, positionCutoff(p, now));
+      return inventoryAt([product({})], movs, p, new Set(), now, review.excluded, review.unconfirmed);
+    };
+    // 2025 encerrado: a cópia de B tem as entradas em 2026, então as de A ficam (R$ 50,00) e são avisadas.
+    const r25 = run(yearPeriod(2025), new Date('2026-11-14T12:00:00-03:00'));
+    expect([r25.totalCost, r25.duplicateMovements, r25.duplicateUnconfirmed]).toEqual([50, 0, 1]);
+    // 2026 em andamento: a cópia de B já estava na nuvem antes do corte, então as de A saem (contam em B).
+    const r26 = run(yearPeriod(2026), new Date('2026-11-14T12:00:00-03:00'));
+    expect([r26.totalCost, r26.duplicateMovements]).toEqual([0, 1]);
+    const dup26 = reviewDuplicateInvoices(movs, items, [nuvem, aqui], rejected, positionCutoff(yearPeriod(2026), new Date('2026-11-14T12:00:00-03:00')));
+    expect([...dup26.excluded]).toEqual(['m']);
+    // Cópia aceita importada exatamente no corte (00:00 de 01/01/2026) também não prova para 2025.
+    const noCorte = reviewDuplicateInvoices(movs, items, [{ ...nuvem, imported_at: '2026-01-01T00:00:00-03:00' }, aqui], rejected, yearPeriod(2025).to);
+    expect([...noCorte.excluded]).toEqual([]);
+    const antes = reviewDuplicateInvoices(movs, items, [{ ...nuvem, imported_at: '2025-12-31T23:59:59-03:00' }, aqui], rejected, yearPeriod(2025).to);
+    expect([...antes.excluded]).toEqual(['m']);
+    // Sem corte informado, comportamento anterior (prova vale).
+    expect([...reviewDuplicateInvoices(movs, items, [nuvem, aqui], rejected).excluded]).toEqual(['m']);
+  });
+
+  it('cópia de homologação na nuvem (importada antes) não prova a duplicata: as entradas de produção daqui ficam e são avisadas', () => {
+    const key = '4325'.padEnd(44, '5');
+    const hom = { id: 'b', access_key: key, environment: 'HOMOLOGATION', imported_at: '2025-06-01T10:00:00-03:00' } as const;
+    const aqui = { id: 'a', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-31T10:00:00-03:00' } as const;
+    const items = [{ id: 'it', invoice_id: 'a' }];
+    const movs = [mov({ id: 'm', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'it', created_at: '2025-12-31T10:00:00-03:00' })];
+    const rejected = rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a' } }]);
+    const now = new Date('2026-11-14T12:00:00-03:00');
+    const review = reviewDuplicateInvoices(movs, items, [hom, aqui], rejected, positionCutoff(P, now));
+    expect([[...review.excluded], review.unconfirmed]).toEqual([[], [['m']]]);
+    const r = inventoryAt([product({})], movs, P, new Set(), now, review.excluded, review.unconfirmed);
+    expect([r.totalCost, r.duplicateUnconfirmed]).toEqual([50, 1]);
+  });
+
+  it('duas cópias recusadas com entradas aqui e sem prova: fica uma só, nunca em dobro', () => {
+    const key = '4325'.padEnd(44, '4');
+    const c1 = { id: 'a1', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-30T10:00:00-03:00' } as const;
+    const c2 = { id: 'a2', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-31T10:00:00-03:00' } as const;
+    const items = [{ id: 'i1', invoice_id: 'a1' }, { id: 'i2', invoice_id: 'a2' }];
+    const movs = [mov({ id: 'm1', purchase_invoice_item_id: 'i1' }), mov({ id: 'm2', purchase_invoice_item_id: 'i2' })];
+    const rejected = rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a1' } }, { event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a2' } }]);
+    const review = reviewDuplicateInvoices(movs, items, [c2, c1], rejected, positionCutoff(P, new Date('2026-11-14T12:00:00-03:00')));
+    expect([[...review.excluded], review.unconfirmed]).toEqual([['m2'], [['m1']]]);
+  });
+});
+
+describe('auditoria GPT rodada 6 ampliada (1fbc385)', () => {
+  it('P2-01: taxa de serviço de R$ 0,01 paga em dois anos soma R$ 0,01 nos dois relatórios', () => {
+    const order = { id: 'o1', status: 'CLOSED', service_fee_amount: 0.01 } as never;
+    const payments = [
+      pay({ id: 'a', order_id: 'o1', method: 'CASH', acquirer: 'CASH_DESK', amount: 0.5, created_at: '2025-12-20T20:00:00-03:00' }),
+      pay({ id: 'b', order_id: 'o1', method: 'CASH', acquirer: 'CASH_DESK', amount: 0.5, created_at: '2026-01-05T20:00:00-03:00' }),
+    ];
+    const now = new Date('2026-11-14T12:00:00-03:00');
+    const r25 = revenueByMethod({ ...emptyRevenueInput, payments, orders: [order] }, yearPeriod(2025), now);
+    const r26 = revenueByMethod({ ...emptyRevenueInput, payments, orders: [order] }, yearPeriod(2026), now);
+    expect(Math.round((r25.serviceFee + r26.serviceFee) * 100)).toBe(1);
+    // Em qualquer ordem dos pagamentos.
+    const r25b = revenueByMethod({ ...emptyRevenueInput, payments: [...payments].reverse(), orders: [order] }, yearPeriod(2025), now);
+    expect(r25b.serviceFee).toBe(r25.serviceFee);
+  });
+
+  it('P2-02: ano em andamento, NF-e com data de importação inválida fica fora com aviso; ano encerrado vale a emissão', () => {
+    const P26 = yearPeriod(2026);
+    const nove = new Date('2026-11-14T09:00:00-03:00');
+    const inv = { id: 'n', supplier_id: 's', access_key: '4326'.padEnd(44, '1'), number: '1', series: '1', issued_at: '2026-11-14T08:00:00-03:00', environment: 'PRODUCTION', invoice_amount: 500, imported_at: 'sem-data' } as PurchaseInvoice;
+    const r = expensesByCategory({ purchaseInvoices: [inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, nove) }, P26, nove);
+    expect([r.purchases.length, r.unknownImportInvoices, r.invalidDates > 0, r.importedAfterCutoff]).toEqual([0, 1, true, 0]);
+    expect(toCsv(expensesDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('sem data de importação válida');
+    const dez = { ...inv, issued_at: '2025-12-20T10:00:00-03:00' } as PurchaseInvoice;
+    const r25 = expensesByCategory({ purchaseInvoices: [dez], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P, nove) }, P, nove);
+    expect([r25.purchases.length, r25.unknownImportInvoices]).toEqual([1, 0]);
+    // Nota claramente de outro ano (emitida em 2024) sem data de importação: nenhum aviso em 2026.
+    const velha = { ...inv, issued_at: '2024-03-01T10:00:00-03:00' } as PurchaseInvoice;
+    const rv = expensesByCategory({ purchaseInvoices: [velha], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, nove) }, P26, nove);
+    expect([rv.invalidDates, rv.unknownImportInvoices]).toEqual([0, 0]);
+    // O aviso não depende da ordem das cópias.
+    const late = { ...inv, id: 'n2', imported_at: '2026-11-14T11:00:00-03:00' } as PurchaseInvoice;
+    const ab = expensesByCategory({ purchaseInvoices: [late, inv], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, nove) }, P26, nove);
+    const ba = expensesByCategory({ purchaseInvoices: [inv, late], suppliers: [], courierSettlements: [], cashMovements: [], revenue: revenueByMethod(emptyRevenueInput, P26, nove) }, P26, nove);
+    expect([ab.importedAfterCutoff, ab.unknownImportInvoices]).toEqual([ba.importedAfterCutoff, ba.unknownImportInvoices]);
+  });
+
+  it('P2-04: caixa fechado com data de fechamento inválida não vira dinheiro fora de turno', () => {
+    const session = { id: 'c', tenant_id: 't', status: 'CLOSED', opened_at: '2025-05-01T10:00:00-03:00', closed_at: 'sem-data', opening_amount: 0, expected_cash: 0, counted_cash: 0, difference: 0 } as never;
+    const payments = [pay({ method: 'CASH', acquirer: 'CASH_DESK', amount: 100, created_at: '2025-05-01T20:00:00-03:00' })];
+    const r = revenueByMethod({ ...emptyRevenueInput, payments, cashSessions: [session] }, P, new Date('2026-11-14T12:00:00-03:00'));
+    expect([r.cashOutsideSessions, r.cashUndeterminedSession, r.cashUndeterminedSessionCount]).toEqual([0, 100, 1]);
+    expect(toCsv(revenueDoc(r, { period: 'x', store: { name: 'L', legalName: '', cnpj: '1', city: 'C', state: 'RS' }, generatedAt: 'agora' }))).toContain('situação de caixa indeterminada');
+    // Antes da abertura válida continua fora de turno.
+    const cedo = revenueByMethod({ ...emptyRevenueInput, payments: [pay({ method: 'CASH', acquirer: 'CASH_DESK', amount: 7, created_at: '2025-05-01T08:00:00-03:00' })], cashSessions: [session] }, P, new Date('2026-11-14T12:00:00-03:00'));
+    expect([cedo.cashOutsideSessions, cedo.cashUndeterminedSession]).toEqual([7, 0]);
+  });
+});
+
+describe('auditoria GPT rodada 7 (99cde60)', () => {
+  const key = '4325'.padEnd(44, '7');
+  const now = new Date('2026-11-14T12:00:00-03:00');
+  const items = [{ id: 'ia', invoice_id: 'a' }, { id: 'ib', invoice_id: 'b' }];
+  // A: produção, recusada pela nuvem, entrada em 30/12/2025 (10 × R$ 5,00).
+  const A = { id: 'a', access_key: key, environment: 'PRODUCTION', imported_at: '2025-12-30T10:00:00-03:00' } as const;
+  const movA = mov({ id: 'ma', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ia', created_at: '2025-12-30T10:00:00-03:00' });
+  const rejected = rejectedInvoiceIds([{ event: { table: 'purchase_invoices', op: 'INSERT', row_id: 'a' } }]);
+  const run = (list: readonly (typeof A | { id: string; access_key: string; environment: string; imported_at: string })[], movs: ReturnType<typeof mov>[], p: ReturnType<typeof yearPeriod>) => {
+    const review = reviewDuplicateInvoices(movs, items, list as never, rejected, positionCutoff(p, now));
+    return { review, inv: inventoryAt([product({})], movs, p, new Set(), now, review.excluded, review.unconfirmed) };
+  };
+
+  it('P2-01: cópia B não recusada com entrada só em 02/01/2026 não tira a entrada de A do inventário de 2025 (nas duas ordens)', () => {
+    const B = { id: 'b', access_key: key, environment: 'PRODUCTION', imported_at: '2026-01-02T10:00:00-03:00' } as const;
+    const movB = mov({ id: 'mb', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ib', created_at: '2026-01-02T10:00:00-03:00' });
+    for (const list of [[A, B], [B, A]]) {
+      const r25 = run(list, [movA, movB], yearPeriod(2025));
+      expect([r25.inv.totalCost, r25.inv.duplicateUnconfirmed]).toEqual([50, 1]);
+      expect([...r25.review.excluded]).toEqual(['mb']);
+      // 2026: as duas cópias de produção têm entradas na posição; conta uma vez (fica a aceita B).
+      const r26 = run(list, [movA, movB], yearPeriod(2026));
+      expect([r26.inv.totalCost, [...r26.review.excluded]]).toEqual([50, ['ma']]);
+    }
+  });
+
+  it('P2-01: cópia B de homologação não recusada com entradas não tira a entrada de produção de A (nas duas ordens)', () => {
+    const B = { id: 'b', access_key: key, environment: 'HOMOLOGATION', imported_at: '2025-12-29T10:00:00-03:00' } as const;
+    const movB = mov({ id: 'mb', quantity: 10, unit_cost: 5, purchase_invoice_item_id: 'ib', created_at: '2025-12-29T10:00:00-03:00' });
+    for (const list of [[A, B], [B, A]]) {
+      const r25 = run(list, [movA, movB], yearPeriod(2025));
+      expect([r25.inv.totalCost, r25.inv.duplicateUnconfirmed]).toEqual([50, 1]);
+      expect([...r25.review.excluded]).toEqual(['mb']);
+    }
+  });
+});

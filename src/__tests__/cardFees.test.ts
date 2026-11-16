@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { feeCents, leftover, receivables, ruleFor, settlementDate, validateFeeRule, type FeeRule } from '../lib/cardFees';
 import { indexDashboard, type DashboardInput } from '../lib/ownerDashboard';
-import { useOwnerSettings } from '../store/useOwnerSettings';
+import { storeFees, useOwnerSettings } from '../store/useOwnerSettings';
+import { useTcheStore } from '../store/useTcheStore';
 import type { Order, OrderItem, Payment, Product } from '../types';
 
 const rule = (r: Partial<FeeRule>): FeeRule => ({ id: Math.random().toString(), acquirer: 'STONE', method: 'CREDIT', brand: null, pct: 3, fixed: 0, days: 30, businessDays: false, ...r });
@@ -110,8 +111,9 @@ describe('quanto sobrou', () => {
 
 describe('cadastro das taxas no aparelho', () => {
   it('não deixa duas taxas iguais e normaliza o Pix sem bandeira', () => {
-    useOwnerSettings.setState({ feeRules: [], appCommissionPct: {} });
-    const s = () => useOwnerSettings.getState();
+    useOwnerSettings.setState({ feesByTenant: {}, legacyFees: null });
+    const tid = useTcheStore.getState().tenant.id;
+    const s = () => ({ ...useOwnerSettings.getState(), ...storeFees(useOwnerSettings.getState(), tid) });
     expect(s().saveFeeRule({ acquirer: 'STONE', method: 'PIX', brand: 'VISA', pct: 0.99, fixed: 0, days: 0, businessDays: false })).toBeNull();
     expect(s().feeRules[0]!.brand).toBeNull();
     expect(s().saveFeeRule({ acquirer: 'STONE', method: 'PIX', brand: null, pct: 1, fixed: 0, days: 0, businessDays: false })).toMatch(/Já existe/);

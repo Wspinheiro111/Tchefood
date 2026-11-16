@@ -1,0 +1,758 @@
+import { DEFINITE_FAILURES, DeliveryConcurrencyError, DeliveryInbox, DeliverySentNotSavedError, type DeliveryCycleReport, type DeliveryOrderRecord } from "../deliveryInbox";
+import {
+  clipDeliveryText,
+  DeliveryMarketplaceError,
+  type DeliveryDisputeDecision,
+  type DeliveryOrderAction,
+} from "../marketplace";
+import { DeliveryRepositoryError, fetchWithDeadline, type RestFetch } from "../supabaseDeliveryRepository";
+import { IFOOD_POLLING_INTERVAL_MS, ifoodCancellationText, IfoodMerchantApi, isValidIfoodMerchantId } from "./ifoodMerchantApi";
+
+// Servidor do iFood: um processo só, sempre ligado.
+//  - Polling a cada 30 s das lojas com integração ativa (é o polling que mantém a loja aberta no iFood). Um ciclo
+//    nunca começa antes do anterior terminar.
+//  - API para o app: ações do pedido (confirmar, preparar, pronto, despachar), cancelamento com motivo do iFood,
+//    resposta a negociação e pausa da loja. O app manda o JWT da sessão; o servidor só age em pedido/loja que o
+//    RLS do Supabase mostra para esse JWT (a mesma prova de loja da emissão de NFC-e).
+//  - Cancelar, responder negociação, pausar e retomar a loja exigem PIN de gerente e motivo, conferidos no banco
+//    (tchefood_delivery_authorize, com o mesmo bloqueio de 3 erros em 60 s do PIN de gerente) ANTES de chamar o
+//    iFood. A autorização e o resultado ficam em audit_logs.
+// Segredos (IFOOD_CLIENT_SECRET, SUPABASE_SERVICE_ROLE_KEY) ficam nas variáveis de ambiente deste processo.
+
+export type MerchantSource = { activeMerchants(): Promise<Array<{ merchantExternalId: string }>> };
+
+export type IfoodPollerOptions = {
+  api: IfoodMerchantApi;
+  inbox: DeliveryInbox;
+  merchants: MerchantSource;
+  intervalMs?: number;
+  log?: (line: string) => void;
+  now?: () => number;
+};
+
+export type IfoodPollerStatus = {
+  running: boolean;
+  merchants: number;
+  lastCycleAt: string | null;
+  lastReport: DeliveryCycleReport | null;
+  lastError: string | null;
+  // Integrações ativas com merchantId inválido, deixadas fora do polling no último ciclo.
+  invalidMerchants: number;
+};
+
+export class IfoodPoller {
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private stopped = true;
+  private current: Promise<void> | null = null;
+  private readonly status: IfoodPollerStatus = {
+    running: false,
+    merchants: 0,
+    lastCycleAt: null,
+    lastReport: null,
+    lastError: null,
+    invalidMerchants: 0,
+  };
+
+  constructor(private readonly options: IfoodPollerOptions) {}
+
+  start(): void {
+    if (!this.stopped) return;
+    this.stopped = false;
+    this.status.running = true;
+    this.schedule(0);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    this.status.running = false;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    await this.current;
+  }
+
+  snapshot(): IfoodPollerStatus {
+    return structuredClone(this.status);
+  }
+
+  // Um ciclo: relê as lojas ativas, busca os eventos, grava e confirma. Nunca lança.
+  async runOnce(): Promise<DeliveryCycleReport | null> {
+    const log = this.options.log ?? (() => undefined);
+    const now = this.options.now ?? Date.now;
+    try {
+      const merchants = await this.options.merchants.activeMerchants();
+      // merchantId mal cadastrado (espaço no fim, colado errado) fica fora do polling, com log; as outras lojas
+      // seguem. Sem isso setMerchantIds lançaria e nenhuma loja receberia pedido.
+      const valid: string[] = [];
+      const invalid: string[] = [];
+      for (const { merchantExternalId } of merchants) {
+        (isValidIfoodMerchantId(merchantExternalId) ? valid : invalid).push(merchantExternalId);
+      }
+      for (const id of invalid) log(`[ifood] integração ativa com merchantId inválido, fora do polling: ${JSON.stringify(id)}`);
+      const invalidError = invalid.length > 0 ? `${invalid.length} integração(ões) ativa(s) com merchantId inválido fora do polling.` : null;
+      this.status.merchants = valid.length;
+      this.status.invalidMerchants = invalid.length;
+      // Sem loja ligada não há polling: sem o header x-polling-merchants o iFood mandaria eventos de lojas que
+      // ninguém grava, e eles voltariam para sempre.
+      if (valid.length === 0) {
+        this.status.lastError = invalidError;
+        return null;
+      }
+      this.options.api.setMerchantIds(valid);
+      const report = await this.options.inbox.runChannel(this.options.api);
+      this.status.lastReport = report;
+      this.status.lastError = report.error ?? invalidError;
+      if (report.received > 0 || report.error) {
+        log(`[ifood] recebidos=${report.received} novos=${report.newOrders.length} ack=${report.acknowledged} adiados=${report.deferred}${report.error ? ` erro=${report.error}` : ""}`);
+      }
+      // Evento sem pedido que não deu para ler: confirmado (senão volta para sempre), mas fica registrado aqui.
+      if (report.discarded.length > 0) log(`[ifood] eventos ilegíveis sem pedido confirmados: ${report.discarded.join(", ")}`);
+      return report;
+    } catch (error) {
+      this.status.lastError = error instanceof Error ? error.message : String(error);
+      log(`[ifood] ciclo falhou: ${this.status.lastError}`);
+      return null;
+    } finally {
+      this.status.lastCycleAt = new Date(now()).toISOString();
+    }
+  }
+
+  private schedule(delayMs: number): void {
+    if (this.stopped) return;
+    this.timer = setTimeout(() => {
+      const started = (this.options.now ?? Date.now)();
+      this.current = this.runOnce().then(() => {
+        this.current = null;
+        const elapsed = (this.options.now ?? Date.now)() - started;
+        this.schedule(Math.max(0, (this.options.intervalMs ?? IFOOD_POLLING_INTERVAL_MS) - elapsed));
+      });
+    }, delayMs);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Prova de loja: o JWT do app só "vê" pedido/loja do próprio tenant (RLS).
+// ---------------------------------------------------------------------------
+
+export interface TenantAuthorizer {
+  canAccessOrder(accessToken: string, externalOrderId: string): Promise<boolean>;
+  canAccessMerchant(accessToken: string, merchantExternalId: string): Promise<boolean>;
+}
+
+// Prazo das consultas ao Supabase feitas durante uma requisição do app.
+const SUPABASE_TIMEOUT_MS = 8_000;
+
+// JWT do app recusado pelo Supabase (vencido ou inválido): a API responde 401 para a tela pedir login de novo, em vez
+// de "não encontrado".
+export class SessionExpiredError extends Error {
+  constructor() {
+    super("Sessão vencida; entre de novo.");
+    this.name = "SessionExpiredError";
+  }
+}
+
+export class SupabaseCallerAuthorizer implements TenantAuthorizer {
+  private readonly base: string;
+  private readonly fetchImpl: RestFetch;
+  private readonly timeoutMs: number;
+
+  constructor(private readonly options: { url: string; anonKey: string; fetchImpl?: RestFetch; timeoutMs?: number }) {
+    this.base = options.url.replace(/\/+$/, "");
+    this.fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
+    this.timeoutMs = options.timeoutMs ?? SUPABASE_TIMEOUT_MS;
+  }
+
+  canAccessOrder(accessToken: string, externalOrderId: string): Promise<boolean> {
+    return this.visible(`delivery_orders?channel=eq.ifood&external_id=eq.${encodeURIComponent(externalOrderId)}&select=tenant_id`, accessToken);
+  }
+
+  canAccessMerchant(accessToken: string, merchantExternalId: string): Promise<boolean> {
+    return this.visible(
+      `delivery_integrations?channel=eq.ifood&active=eq.true&merchant_external_id=eq.${encodeURIComponent(merchantExternalId)}&select=tenant_id`,
+      accessToken,
+    );
+  }
+
+  // Sem resposta no prazo ou Supabase com 5xx: lança DeliveryRepositoryError (a API responde 503 sem chamar o iFood);
+  // JWT recusado (401): lança SessionExpiredError (401). 403 (permissão faltando no Supabase) e 5xx: 503 com log. Nunca libera.
+  private async visible(query: string, accessToken: string): Promise<boolean> {
+    const response = await fetchWithDeadline(
+      this.fetchImpl,
+      `${this.base}/rest/v1/${query}`,
+      { method: "GET", headers: { apikey: this.options.anonKey, authorization: `Bearer ${accessToken}`, accept: "application/json" } },
+      this.timeoutMs,
+      "prova de loja",
+    );
+    // JWT inválido/vencido: o PostgREST responde 401. 403 com JWT válido é grant faltando (deploy): novo login não
+    // resolve, então vai como banco indisponível (503, registrado no log) em vez de mandar o aparelho entrar de novo.
+    if (response.status === 401) throw new SessionExpiredError();
+    if (response.status === 403 || response.status >= 500) throw new DeliveryRepositoryError(`Supabase recusou a prova de loja (HTTP ${response.status}).`, response.status);
+    // Qualquer outra recusa (ex.: 404) não libera, com a mesma resposta do pedido inexistente ou de outra loja.
+    if (!response.ok) return false;
+    try {
+      const rows = JSON.parse(response.text) as unknown;
+      return Array.isArray(rows) && rows.length > 0;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Alçada de gerente: PIN, motivo e registro em audit_logs
+// ---------------------------------------------------------------------------
+
+export type ManagerAction = "DELIVERY_CANCEL" | "DELIVERY_DISPUTE" | "DELIVERY_PAUSE" | "DELIVERY_RESUME";
+
+export type ManagerRequest = {
+  action: ManagerAction;
+  externalOrderId: string | null;
+  merchantExternalId: string | null;
+  managerPin: string;
+  performedBy: string;
+  reason: string;
+  // Gerado pelo app por tentativa: o reenvio da mesma autorização não grava outra.
+  requestId: string;
+  // O que o gerente aprovou, montado pelo servidor a partir do corpo já validado (gravado na autorização; o
+  // reenvio com outro conteúdo é conflito): cancelamento {code, reason (texto exato enviado ao iFood),
+  // confirmUncertainRetry?}, negociação {disputeId, kind, reason?, detailReason?, alternativeId?, amountCents?,
+  // additionalTimeInMinutes?, additionalTimeReason?, confirmUncertainRetry?} (a resposta como vai ao iFood), pausa
+  // {minutes, description}, retomada {pauseId}.
+  details: Record<string, unknown>;
+};
+
+export type ManagerDecision =
+  // repeated: o banco já tinha esta tentativa (reenvio): a ação já foi mandada, ou está sendo, por outra requisição.
+  | { status: "OK"; auditId: string; repeated?: boolean; lastOutcome?: ManagerOutcome | null }
+  | { status: "PIN_FAILED" | "PIN_LOCKED" | "CONFLICT" | "DENIED"; message: string };
+
+export type ManagerOutcome = "sent" | "failed" | "uncertain";
+
+export interface ManagerApproval {
+  authorize(accessToken: string, request: ManagerRequest): Promise<ManagerDecision>;
+  // Resultado da chamada ao iFood, gravado como outro registro em audit_logs (que é só de inserção).
+  recordResult(auditId: string, outcome: ManagerOutcome, detail: string): Promise<void>;
+}
+
+export class SupabaseManagerApproval implements ManagerApproval {
+  private readonly base: string;
+  private readonly fetchImpl: RestFetch;
+  private readonly timeoutMs: number;
+
+  constructor(private readonly options: { url: string; anonKey: string; serviceRoleKey: string; fetchImpl?: RestFetch; timeoutMs?: number }) {
+    this.base = options.url.replace(/\/+$/, "");
+    this.fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
+    this.timeoutMs = options.timeoutMs ?? SUPABASE_TIMEOUT_MS;
+  }
+
+  // Com o JWT do app: a loja da sessão é a do banco (tchefood_tenant), nunca uma informada pelo app.
+  async authorize(accessToken: string, request: ManagerRequest): Promise<ManagerDecision> {
+    const response = await fetchWithDeadline(
+      this.fetchImpl,
+      `${this.base}/rest/v1/rpc/tchefood_delivery_authorize`,
+      {
+        method: "POST",
+        headers: { apikey: this.options.anonKey, authorization: `Bearer ${accessToken}`, "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({
+          p_channel: "ifood",
+          p_action: request.action,
+          p_external_order_id: request.externalOrderId,
+          p_merchant_external_id: request.merchantExternalId,
+          p_manager_pin: request.managerPin,
+          p_performed_by: request.performedBy,
+          p_reason: request.reason,
+          p_request_id: request.requestId,
+          p_details: request.details,
+        }),
+      },
+      this.timeoutMs,
+      "autorização de gerente",
+    );
+    if (!response.ok) {
+      if (response.status >= 500) throw new DeliveryRepositoryError(`Supabase recusou a autorização (HTTP ${response.status}).`, response.status);
+      return { status: "DENIED", message: postgrestMessage(response.text) ?? "Autorização recusada." };
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(response.text);
+    } catch {
+      throw new DeliveryRepositoryError("Resposta da autorização não é JSON.");
+    }
+    const record = body !== null && typeof body === "object" ? (body as Record<string, unknown>) : {};
+    if (record.status === "OK" && typeof record.auditId === "string") {
+      const lastOutcome = record.lastOutcome === "sent" || record.lastOutcome === "failed" || record.lastOutcome === "uncertain" ? record.lastOutcome : null;
+      return { status: "OK", auditId: record.auditId, repeated: record.repeated === true, lastOutcome };
+    }
+    if (record.status === "PIN_FAILED") return { status: "PIN_FAILED", message: "PIN de gerente incorreto." };
+    if (record.status === "PIN_LOCKED") return { status: "PIN_LOCKED", message: "PIN de gerente bloqueado por 1 minuto (3 erros)." };
+    if (record.status === "CONFLICT") return { status: "CONFLICT", message: "Esta autorização já foi usada para outra ação." };
+    throw new DeliveryRepositoryError("Resposta da autorização inválida.");
+  }
+
+  async recordResult(auditId: string, outcome: ManagerOutcome, detail: string): Promise<void> {
+    const response = await fetchWithDeadline(
+      this.fetchImpl,
+      `${this.base}/rest/v1/rpc/tchefood_delivery_audit_result`,
+      {
+        method: "POST",
+        headers: {
+          apikey: this.options.serviceRoleKey,
+          authorization: `Bearer ${this.options.serviceRoleKey}`,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({ p_audit_id: auditId, p_outcome: outcome, p_detail: detail.slice(0, 500) }),
+      },
+      this.timeoutMs,
+      "resultado da autorização",
+    );
+    if (!response.ok) throw new DeliveryRepositoryError(`Supabase recusou o resultado da autorização (HTTP ${response.status}).`, response.status);
+  }
+}
+
+function postgrestMessage(raw: string): string | null {
+  try {
+    const body = JSON.parse(raw) as { message?: unknown };
+    return typeof body.message === "string" ? body.message.replace(/^TCHEFOOD_[A-Z_]+:\s*/, "").slice(0, 200) : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// API HTTP (independente do node:http, para testar sem abrir porta)
+// ---------------------------------------------------------------------------
+
+export type ApiRequest = { method: string; path: string; headers: Record<string, string | undefined>; body: string };
+export type ApiResponse = { status: number; body: unknown };
+
+const ACTIONS: Readonly<Record<string, DeliveryOrderAction>> = {
+  confirm: "confirm",
+  start_preparation: "start_preparation",
+  ready_for_pickup: "ready_for_pickup",
+  dispatch: "dispatch",
+};
+
+const UNCERTAIN_PAUSE = "A pausa pode ter sido aplicada no iFood (sem resposta clara); confira a lista de pausas antes de tentar de novo.";
+const UNCERTAIN_CANCELLATION =
+  "O cancelamento pode ter sido aplicado no iFood (sem resposta clara); confira o pedido no Portal do Parceiro antes de tentar de novo.";
+
+// Pausa: até 24 h por vez (pausa mais longa é fechar a loja no Portal do Parceiro).
+const MAX_PAUSE_MINUTES = 24 * 60;
+
+// Limite por aparelho (chave = JWT da sessão): a credencial do iFood é uma só para todas as lojas, e um app em loop
+// gastaria o limite de uso dela. Só na memória do processo.
+export const API_RATE_LIMIT = { max: 30, windowMs: 10_000 };
+// Status da loja e motivos de cancelamento do pedido: guardados por 10 s (a tela consulta muito; o iFood muda pouco).
+export const IFOOD_READ_CACHE_MS = 10_000;
+// Teto de chaves em memória (aparelhos e pedidos/lojas): passou, sai primeiro o vencido, depois o mais antigo.
+const MAX_TRACKED_KEYS = 5_000;
+
+class ExpiringMap<V> {
+  private readonly entries = new Map<string, { value: V; expiresAt: number }>();
+  // Geração por chave: delete() avança, e uma leitura que começou antes não grava o valor velho depois (ver cached).
+  private readonly generations = new Map<string, number>();
+
+  generation(key: string): number {
+    return this.generations.get(key) ?? 0;
+  }
+
+  get(key: string, now: number): V | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= now) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  }
+
+  set(key: string, value: V, expiresAt: number, now: number): void {
+    this.entries.delete(key);
+    if (this.entries.size >= MAX_TRACKED_KEYS) {
+      for (const [candidate, entry] of this.entries) if (entry.expiresAt <= now) this.entries.delete(candidate);
+      for (const candidate of this.entries.keys()) {
+        if (this.entries.size < MAX_TRACKED_KEYS) break;
+        this.entries.delete(candidate);
+      }
+    }
+    this.entries.set(key, { value, expiresAt });
+  }
+
+  delete(key: string): void {
+    this.entries.delete(key);
+    if (this.generations.size >= MAX_TRACKED_KEYS) this.generations.clear();
+    this.generations.set(key, this.generation(key) + 1);
+  }
+}
+
+export type IfoodApiOptions = {
+  inbox: DeliveryInbox;
+  api: IfoodMerchantApi;
+  authorizer: TenantAuthorizer;
+  approval: ManagerApproval;
+  poller?: IfoodPoller;
+  now?: () => Date;
+  log?: (line: string) => void;
+  rateLimit?: { max: number; windowMs: number };
+  cacheMs?: number;
+};
+
+export function createIfoodApiHandler(options: IfoodApiOptions): (request: ApiRequest) => Promise<ApiResponse> {
+  const now = options.now ?? (() => new Date());
+  const log = options.log ?? (() => undefined);
+  const rateLimit = options.rateLimit ?? API_RATE_LIMIT;
+  const cacheMs = options.cacheMs ?? IFOOD_READ_CACHE_MS;
+  const requestsByDevice = new ExpiringMap<{ count: number }>();
+  const storeStatusCache = new ExpiringMap<Awaited<ReturnType<IfoodMerchantApi["getStoreStatus"]>>>();
+  const reasonsCache = new ExpiringMap<Awaited<ReturnType<DeliveryInbox["listCancellationReasons"]>>>();
+  // Leitura guardada por cacheMs; só resposta boa entra (erro do iFood não fica guardado).
+  const cached = async <V>(cache: ExpiringMap<V>, key: string, load: () => Promise<V>): Promise<V> => {
+    const hit = cache.get(key, now().getTime());
+    if (hit !== undefined) return hit;
+    const generation = cache.generation(key);
+    const value = await load();
+    const at = now().getTime();
+    // Pausa/retomada (ou POST no pedido) no meio da leitura: o valor lido pode ser de antes; não guarda.
+    if (cache.generation(key) === generation) cache.set(key, value, at + cacheMs, at);
+    return value;
+  };
+
+  // PIN de gerente conferido no banco antes de qualquer chamada ao iFood; o resultado da chamada também fica no
+  // audit_logs. Falha ao gravar o resultado não muda a resposta (a autorização já está gravada), mas vai para o log.
+  // uncertainMessage: com resultado incerto (tempo esgotado, iFood fora do ar ou resposta estranha depois de enviar), a
+  // resposta diz que pode ter sido aplicado (code "uncertain") em vez de só "iFood indisponível", que convida a repetir.
+  const withManager = async (token: string, request: ManagerRequest, run: () => Promise<ApiResponse>, uncertainMessage?: string): Promise<ApiResponse> => {
+    const decision = await options.approval.authorize(token, request);
+    if (decision.status !== "OK") {
+      return { status: decision.status === "CONFLICT" ? 409 : 403, body: { error: decision.message, code: decision.status } };
+    }
+    // Reenvio da mesma tentativa (resposta perdida, toque duplo): a primeira requisição já chamou (ou está chamando)
+    // o iFood. Chamar de novo mandaria um segundo cancelamento ou criaria outra pausa.
+    if (decision.repeated) {
+      // Tentativa que falhou antes de chegar ao iFood (ou que o iFood recusou): nada foi aplicado, mas o mesmo id não
+      // serve mais (a autorização gravada é dela); a tela gera outra tentativa e pede o PIN de novo.
+      if (decision.lastOutcome === "failed") {
+        return { status: 409, body: { error: "Nada foi enviado ao iFood nesta tentativa; faça uma nova tentativa.", code: "RETRY_WITH_NEW_ID" } };
+      }
+      // Sem resultado gravado (lastOutcome null) não dá para saber se chegou ao iFood: a autorização pode ter gravado e
+      // só a resposta do banco se perdido. O texto não afirma que foi enviado, nem convida a repetir com o mesmo id.
+      return { status: 409, body: { error: "Esta tentativa já foi registrada: pode estar em andamento ou não ter chegado ao iFood. Confira o pedido ou a loja no Portal do Parceiro antes de tentar de novo, com uma nova tentativa.", code: "ALREADY_SUBMITTED" } };
+    }
+    const record = (outcome: ManagerOutcome, detail: string) =>
+      options.approval.recordResult(decision.auditId, outcome, detail).catch((error: unknown) => {
+        log(`[ifood] resultado da autorização ${decision.auditId} não gravado (${outcome}): ${error instanceof Error ? error.message : String(error)}`);
+      });
+    try {
+      const response = await run();
+      await record("sent", `HTTP ${response.status}`);
+      return response;
+    } catch (error) {
+      // Recusa clara do iFood, ou falha do banco ANTES da chamada (a reserva não gravou; a falha do banco depois do
+      // iFood aceitar chega como DeliverySentNotSavedError): nada foi aplicado.
+      const definite =
+        (error instanceof DeliveryMarketplaceError && DEFINITE_FAILURES.includes(error.code)) ||
+        error instanceof DeliveryRepositoryError ||
+        error instanceof DeliveryConcurrencyError;
+      // O iFood aceitou e só a gravação local falhou: para a auditoria, foi enviado.
+      const outcome: ManagerOutcome = error instanceof DeliverySentNotSavedError ? "sent" : definite ? "failed" : "uncertain";
+      await record(outcome, error instanceof Error ? error.message : String(error));
+      if (outcome === "uncertain" && uncertainMessage && error instanceof DeliveryMarketplaceError) {
+        log(`[ifood] ${request.action} com resultado incerto: ${error.message}`);
+        return { status: errorResponse(error).status, body: { error: uncertainMessage, code: "uncertain" } };
+      }
+      throw error;
+    }
+  };
+
+  return async (request) => {
+    const path = request.path.split("?")[0] ?? "";
+    // Ação que muda o pedido ou a loja: a leitura guardada dele deixa de valer (limpa depois da ação, dê certo ou não).
+    let invalidate: (() => void) | null = null;
+    try {
+      if (request.method === "GET" && path === "/health") {
+        // Rota pública: só o estado geral. O texto do erro (pode ter merchantId e resposta do iFood) fica no log.
+        const status = options.poller?.snapshot() ?? null;
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            poller: status && { running: status.running, merchants: status.merchants, lastCycleAt: status.lastCycleAt, hasError: status.lastError !== null },
+          },
+        };
+      }
+
+      const token = /^Bearer\s+(\S+)$/i.exec(request.headers.authorization ?? "")?.[1];
+      if (!token) return { status: 401, body: { error: "Sessão ausente." } };
+      // Antes da prova de loja (que também consulta o Supabase) e de qualquer chamada ao iFood.
+      const at = now().getTime();
+      const device = requestsByDevice.get(token, at);
+      if (device) device.count += 1;
+      else requestsByDevice.set(token, { count: 1 }, at + rateLimit.windowMs, at);
+      if ((device?.count ?? 1) > rateLimit.max) {
+        return { status: 429, body: { error: "Muitas requisições; aguarde alguns segundos.", code: "rate_limited" } };
+      }
+
+      const order = /^\/ifood\/orders\/([A-Za-z0-9-]{1,64})\/(actions\/([a-z_]+)|cancellation-reasons|cancellation|dispute)$/.exec(path);
+      if (order) {
+        const orderId = order[1]!;
+        if (!(await options.authorizer.canAccessOrder(token, orderId))) return { status: 404, body: { error: "Pedido não encontrado." } };
+        const route = order[2]!;
+        if (request.method !== "GET") invalidate = () => reasonsCache.delete(orderId);
+        if (request.method === "POST" && order[3]) {
+          const action = ACTIONS[order[3]];
+          if (!action) return { status: 404, body: { error: "Ação desconhecida." } };
+          // O pedido volta com o status de antes: o novo só chega com o evento do iFood. actionSent diz à tela que a ação
+          // foi aceita ("enviado, aguardando o app"); repetir a mesma ação logo em seguida é 409 sem chamar o iFood.
+          return { status: 200, body: { ...publicRecord(await options.inbox.performAction("ifood", orderId, action)), actionSent: action } };
+        }
+        if (request.method === "GET" && route === "cancellation-reasons") {
+          return { status: 200, body: await cached(reasonsCache, orderId, () => options.inbox.listCancellationReasons("ifood", orderId)) };
+        }
+        if (request.method === "POST" && route === "cancellation") {
+          const body = parseBody(request.body);
+          const code = text(body.code, 32);
+          const description = text(body.description, 250);
+          if (!code || !description) return { status: 400, body: { error: "Escolha um motivo de cancelamento do iFood." } };
+          // Texto adicional do cancelamento: conferido aqui, antes de consultar os motivos no iFood.
+          const extra = typeof body.details === "string" ? body.details : undefined;
+          if (extra !== undefined) rejectControlCharacters(extra);
+          const manager = parseManager(body.authorization);
+          if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
+          // O motivo tem que ser um dos que o iFood oferece agora para este pedido (conferido antes do PIN).
+          const reasons = await options.inbox.listCancellationReasons("ifood", orderId);
+          // Sem nenhum motivo (pedido concluído, cancelado ou fora da janela), o iFood não deixa cancelar agora.
+          if (reasons.length === 0) return { status: 400, body: { error: "O iFood não aceita cancelamento deste pedido agora." } };
+          const reason = reasons.find((candidate) => candidate.code === code);
+          if (!reason) return { status: 400, body: { error: "Motivo não está entre os aceitos pelo iFood para este pedido." } };
+          // Repetir um cancelamento que ficou sem confirmação (prazo da reserva vencido) é decisão do gerente depois de
+          // conferir no Portal do Parceiro; a decisão vai junto da autorização.
+          if (body.confirmUncertainRetry !== undefined && typeof body.confirmUncertainRetry !== "boolean") {
+            return { status: 400, body: { error: "confirmUncertainRetry precisa ser true ou false." } };
+          }
+          const confirmUncertainRetry = body.confirmUncertainRetry === true;
+          // O registro do gerente leva o código e o texto exatos que vão ao iFood (o texto adicional ou, sem ele, a
+          // descrição do motivo); a chamada usa esse mesmo texto.
+          const sent = ifoodCancellationText(reason, extra);
+          const cancel = {
+            ...manager,
+            action: "DELIVERY_CANCEL" as const,
+            externalOrderId: orderId,
+            merchantExternalId: null,
+            details: { code: reason.code, reason: sent, ...(confirmUncertainRetry ? { confirmUncertainRetry } : {}) },
+          };
+          return await withManager(
+            token,
+            cancel,
+            async () => ({
+              status: 200,
+              body: publicRecord(await options.inbox.requestCancellation("ifood", orderId, reason, sent, { confirmUncertainRetry })),
+            }),
+            UNCERTAIN_CANCELLATION,
+          );
+        }
+        if (request.method === "POST" && route === "dispute") {
+          const body = parseBody(request.body);
+          const decision = parseDecision(body);
+          if (!decision) return { status: 400, body: { error: "Resposta da negociação inválida." } };
+          const manager = parseManager(body.authorization);
+          if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
+          // Motivo do aceite, valor e prazo da proposta conferidos contra a negociação gravada antes do PIN.
+          // A tela manda o id da negociação que mostrou ao gerente (obrigatório): sem ele, ou fora do formato, 400 antes
+          // do PIN; id de outra negociação, 409 antes do PIN. Nunca vale "a negociação de agora" por padrão.
+          const disputeId = typeof body.disputeId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(body.disputeId) ? body.disputeId : null;
+          if (!disputeId) return { status: 400, body: { error: "Informe a negociação que está respondendo." } };
+          // Repetir uma resposta que ficou sem confirmação (falha incerta do iFood, ou processo que caiu no meio) é
+          // decisão do gerente depois de conferir no Portal do Parceiro; a decisão vai junto da autorização.
+          if (body.confirmUncertainRetry !== undefined && typeof body.confirmUncertainRetry !== "boolean") {
+            return { status: 400, body: { error: "confirmUncertainRetry precisa ser true ou false." } };
+          }
+          const confirmUncertainRetry = body.confirmUncertainRetry === true;
+          const checked = await options.inbox.checkDisputeDecision("ifood", orderId, decision, disputeId, { confirmUncertainRetry });
+          // O registro do gerente leva a negociação e a resposta como vai ao iFood (aceite com motivo, recusa, valor ou
+          // prazo da proposta); a resposta só vai para essa negociação.
+          const details = JSON.parse(
+            JSON.stringify({ disputeId: checked.disputeId, ...checked.decision, ...(confirmUncertainRetry ? { confirmUncertainRetry } : {}) }),
+          ) as Record<string, unknown>;
+          return await withManager(token, { ...manager, action: "DELIVERY_DISPUTE", externalOrderId: orderId, merchantExternalId: null, details }, async () => ({
+            status: 200,
+            body: publicRecord(await options.inbox.respondToDispute("ifood", orderId, decision, checked.disputeId, { confirmUncertainRetry })),
+          }));
+        }
+        return { status: 405, body: { error: "Método não permitido." } };
+      }
+
+      const merchant = /^\/ifood\/merchants\/([A-Za-z0-9-]{1,64})\/(status|pauses)(?:\/([A-Za-z0-9-]{1,64}))?$/.exec(path);
+      if (merchant) {
+        const merchantId = merchant[1]!;
+        if (!(await options.authorizer.canAccessMerchant(token, merchantId))) return { status: 404, body: { error: "Loja não encontrada." } };
+        if (request.method !== "GET") invalidate = () => storeStatusCache.delete(merchantId);
+        if (request.method === "GET" && merchant[2] === "status" && !merchant[3]) {
+          return { status: 200, body: await cached(storeStatusCache, merchantId, () => options.api.getStoreStatus(merchantId)) };
+        }
+        if (request.method === "GET" && merchant[2] === "pauses" && !merchant[3]) {
+          return { status: 200, body: await options.api.listPauses(merchantId) };
+        }
+        if (request.method === "POST" && merchant[2] === "pauses" && !merchant[3]) {
+          const body = parseBody(request.body);
+          const description = text(body.description, 200);
+          const minutes = body.minutes;
+          if (!description) return { status: 400, body: { error: "Informe o motivo da pausa." } };
+          if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes < 1 || minutes > MAX_PAUSE_MINUTES) {
+            return { status: 400, body: { error: `Pausa de 1 a ${MAX_PAUSE_MINUTES} minutos.` } };
+          }
+          const manager = parseManager(body.authorization);
+          if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
+          const pause = { ...manager, action: "DELIVERY_PAUSE" as const, externalOrderId: null, merchantExternalId: merchantId, details: { minutes, description } };
+          return await withManager(token, pause, async () => {
+            // Início e fim pelo relógio do servidor, nunca pelo do aparelho (contados depois da autorização).
+            const start = now();
+            const end = new Date(start.getTime() + minutes * 60_000);
+            // O id da interrupção é o id da tentativa. O reenvio da mesma tentativa já para no 409 ALREADY_SUBMITTED
+            // acima; que o iFood não crie uma segunda pausa com o mesmo id depende de ele aceitar o id mandado pelo
+            // cliente (a confirmar na homologação).
+            const created = await options.api.pauseStore(merchantId, { id: manager.requestId, description, start: start.toISOString(), end: end.toISOString() });
+            return { status: 201, body: created };
+          }, UNCERTAIN_PAUSE);
+        }
+        if (request.method === "DELETE" && merchant[2] === "pauses" && merchant[3]) {
+          const pauseId = merchant[3];
+          const manager = parseManager(parseBody(request.body).authorization);
+          if (!manager) return { status: 400, body: { error: MANAGER_FIELDS_ERROR } };
+          return await withManager(token, { ...manager, action: "DELIVERY_RESUME", externalOrderId: null, merchantExternalId: merchantId, details: { pauseId } }, async () => {
+            await options.api.resumeStore(merchantId, pauseId);
+            return { status: 204, body: null };
+          });
+        }
+        return { status: 405, body: { error: "Método não permitido." } };
+      }
+
+      return { status: 404, body: { error: "Rota não encontrada." } };
+    } catch (error) {
+      const response = errorResponse(error);
+      if (response.status >= 500) log(`[ifood] ${request.method} ${path}: ${error instanceof Error ? error.message : String(error)}`);
+      return response;
+    } finally {
+      invalidate?.();
+    }
+  };
+}
+
+class BadRequest extends Error {}
+
+function parseBody(raw: string): Record<string, unknown> {
+  if (!raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+  } catch {
+    // cai no erro abaixo
+  }
+  throw new BadRequest("JSON inválido.");
+}
+
+// Texto do corpo: aparado e cortado como o que vai ao iFood (clipDeliveryText, por caractere e sem espaço no fim),
+// para que o registro do gerente leve exatamente o texto enviado.
+function text(value: unknown, max: number): string | null {
+  if (typeof value !== "string") return null;
+  rejectControlCharacters(value);
+  const clipped = clipDeliveryText(value, max);
+  return clipped || null;
+}
+
+// Caractere de controle (C0 menos tab e quebras de linha, DEL; NUL o Postgres recusa com erro cru) e marcas de direção
+// do texto (U+202A-202E, U+2066-2069: mudam como o texto aparece na auditoria e no Portal) não vão ao iFood nem à
+// auditoria: 400 antes do PIN.
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/;
+
+function rejectControlCharacters(value: string): void {
+  if (CONTROL_CHARACTERS.test(value)) throw new BadRequest("Texto com caractere inválido.");
+}
+
+const MANAGER_FIELDS_ERROR = "Ação de gerente: informe o PIN de gerente, o operador, o motivo (5 caracteres ou mais) e o id da tentativa.";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function parseManager(raw: unknown): Omit<ManagerRequest, "action" | "externalOrderId" | "merchantExternalId" | "details"> | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const body = raw as Record<string, unknown>;
+  const managerPin = typeof body.managerPin === "string" && /^\d{4,6}$/.test(body.managerPin) ? body.managerPin : null;
+  const performedBy = typeof body.performedBy === "string" && UUID_PATTERN.test(body.performedBy) ? body.performedBy : null;
+  const requestId = typeof body.requestId === "string" && UUID_PATTERN.test(body.requestId) ? body.requestId : null;
+  const reason = text(body.reason, 250);
+  if (!managerPin || !performedBy || !requestId || !reason || reason.length < 5) return null;
+  return { managerPin, performedBy, requestId, reason };
+}
+
+// Corpo da rota /dispute (sempre com disputeId da negociação mostrada e authorization; confirmUncertainRetry opcional):
+//   aceite      {kind: "accept", reason?, detailReason?}  reason = código da lista do iFood (obrigatório se houver lista)
+//   recusa      {kind: "reject", reason}
+//   proposta    {kind: "alternative", alternativeId, amountCents?}                                (REFUND/BENEFIT)
+//               {kind: "alternative", alternativeId, additionalTimeInMinutes?, additionalTimeReason?} (ADDITIONAL_TIME)
+// Aqui só se confere o formato; os limites da negociação são conferidos pela caixa de entrada.
+function parseDecision(body: Record<string, unknown>): DeliveryDisputeDecision | null {
+  const code = (value: unknown) => {
+    const parsed = text(value, 80);
+    return parsed && /^[A-Z0-9_]+$/.test(parsed) ? parsed : null;
+  };
+  const positiveInteger = (value: unknown) => (typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null);
+  if (body.kind === "accept") {
+    if (body.reason !== undefined && !code(body.reason)) return null;
+    const reason = code(body.reason);
+    const detailReason = text(body.detailReason, 250);
+    return { kind: "accept", ...(reason ? { reason } : {}), ...(detailReason ? { detailReason } : {}) };
+  }
+  if (body.kind === "reject") {
+    const reason = text(body.reason, 250);
+    return reason ? { kind: "reject", reason } : null;
+  }
+  if (body.kind === "alternative") {
+    const alternativeId = text(body.alternativeId, 64);
+    if (!alternativeId || !/^[A-Za-z0-9-]+$/.test(alternativeId)) return null;
+    const amountCents = positiveInteger(body.amountCents);
+    const additionalTimeInMinutes = positiveInteger(body.additionalTimeInMinutes);
+    const additionalTimeReason = code(body.additionalTimeReason);
+    if (body.amountCents !== undefined && amountCents === null) return null;
+    if (body.additionalTimeInMinutes !== undefined && additionalTimeInMinutes === null) return null;
+    if (body.additionalTimeReason !== undefined && additionalTimeReason === null) return null;
+    return {
+      kind: "alternative",
+      alternativeId,
+      ...(amountCents !== null ? { amountCents } : {}),
+      ...(additionalTimeInMinutes !== null ? { additionalTimeInMinutes } : {}),
+      ...(additionalTimeReason !== null ? { additionalTimeReason } : {}),
+    };
+  }
+  return null;
+}
+
+// O que volta para o app: o pedido e o estado, sem a versão interna.
+function publicRecord(record: DeliveryOrderRecord): Omit<DeliveryOrderRecord, "version"> {
+  const { version: _version, ...rest } = record;
+  return rest;
+}
+
+function errorResponse(error: unknown): ApiResponse {
+  if (error instanceof BadRequest) return { status: 400, body: { error: error.message } };
+  if (error instanceof SessionExpiredError) return { status: 401, body: { error: error.message, code: "session_expired" } };
+  if (error instanceof DeliveryConcurrencyError) return { status: 409, body: { error: error.message, code: "conflict" } };
+  // O iFood aceitou e a gravação no banco falhou depois: repetir às cegas mandaria a ação de novo.
+  if (error instanceof DeliverySentNotSavedError) {
+    return { status: 503, body: { error: "Enviado ao iFood, mas não deu para gravar; confira o pedido antes de repetir.", code: "sent_not_saved" } };
+  }
+  // Supabase fora do ar ou lento antes da chamada ao iFood (prova de loja, autorização, reserva): nada foi feito lá.
+  if (error instanceof DeliveryRepositoryError) return { status: 503, body: { error: "Banco indisponível; tente de novo.", code: "unavailable" } };
+  if (error instanceof DeliveryMarketplaceError) {
+    const status = {
+      invalid_request: 400,
+      not_found: 404,
+      conflict: 409,
+      rate_limited: 429,
+      unavailable: 503,
+      // Credencial do app ou resposta estranha do iFood: problema do servidor, não do aparelho.
+      auth_failed: 502,
+      invalid_response: 502,
+    }[error.code];
+    return { status, body: { error: error.message, code: error.code } };
+  }
+  // Erro interno (banco, bug): mensagem genérica; o detalhe fica no log do servidor.
+  return { status: 500, body: { error: "Erro interno do servidor de delivery." } };
+}
