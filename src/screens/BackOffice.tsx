@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { AlertTriangle, BarChart3, CalendarCheck, Bike, CreditCard, Gauge, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
+import { AlertTriangle, BarChart3, CalendarCheck, Bike, CreditCard, Gauge, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Smartphone, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
 import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { ReportHeader } from '../components/Brand';
 import { formatBRL } from '../lib/money';
@@ -22,9 +22,10 @@ import { OwnDeliveryAdmin } from './admin/OwnDeliveryAdmin';
 import { OwnerDashboard, type DashboardNavTarget } from './OwnerDashboard';
 import { CardsAdmin, StaffAdmin, TablesAdmin } from './admin/TablesStaffAdmin';
 import { CloudAdmin, StoreAdmin } from './admin/StoreCloudAdmin';
+import { PointAdmin } from './admin/PointAdmin';
 import type { Payment, Permission } from '../types';
 
-type Tab = 'owner' | 'annual' | 'fees' | 'entrega' | 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 'nfce' | 'purchases' | 'menu' | 'tables' | 'staff' | 'store' | 'cloud' | 'printers' | 'config';
+type Tab = 'owner' | 'annual' | 'fees' | 'entrega' | 'dash' | 'recon' | 'waiters' | 'audit' | 'chopp' | 'crm' | 'nfce' | 'purchases' | 'menu' | 'tables' | 'staff' | 'store' | 'point' | 'cloud' | 'printers' | 'config';
 
 /**
  * Abas da retaguarda. As de relatório seguem o perfil (gerente, proprietário, caixa);
@@ -47,6 +48,7 @@ const TABS: Array<{ key: Tab; label: string; icon: typeof BarChart3; needs: 'rep
   { key: 'tables', label: 'Salão', icon: LayoutGrid, needs: 'TABLES_MANAGE' },
   { key: 'staff', label: 'Equipe', icon: UserCog, needs: 'STAFF_MANAGE' },
   { key: 'store', label: 'Loja', icon: Store, needs: 'STORE_SETTINGS' },
+  { key: 'point', label: 'Point Smart', icon: Smartphone, needs: 'STORE_SETTINGS' },
   { key: 'cloud', label: 'Nuvem', icon: Cloud, needs: 'SYNC_MANAGE' },
   { key: 'printers', label: 'Impressoras', icon: Printer, needs: 'reports' },
   { key: 'config', label: 'Ajustes', icon: Settings, needs: 'reports' },
@@ -125,6 +127,7 @@ export function BackOffice({ onExit, onOpenCheckout }: { onExit?: (view: BackOff
       )}
       {tab === 'staff' && <StaffAdmin />}
       {tab === 'store' && <StoreAdmin />}
+      {tab === 'point' && <PointAdmin />}
       {tab === 'cloud' && <CloudAdmin />}
       {tab === 'printers' && <PrinterSettings />}
       {tab === 'config' && <Config />}

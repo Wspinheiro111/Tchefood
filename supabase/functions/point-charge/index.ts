@@ -18,6 +18,9 @@
 //                                                             leitura, quem libera é o que o MP mostrar; ver charge.ts).
 //                                                             Cobrança ainda não final: segue no MP como a consulta e o
 //                                                             encerramento por prazo; estornada: só confere o estorno.
+//   { "action": "terminals" }                               (só leitura: as maquininhas da conta do Mercado Pago da loja,
+//                                                             com o modo de operação, para a tela de cadastro da Point;
+//                                                             resposta { terminals: [{ id, operating_mode }] }, ver terminals.ts)
 //   { "action": "refund", "idempotency_key": "...", "staff_id": "<uuid>", "manager_pin": "1234", "reason_text": "..." }
 //                                                             (estorno da cobrança aprovada com pagamento já registrado:
 //                                                             só grava com o próprio pagamento lido no MP mostrando o
@@ -36,6 +39,7 @@ import { MercadoPagoPointProvider } from '../../../server/payments/mercadoPagoPo
 import { ChargeInputError, cancelCharge, pollCharge, reconcileCharge, refundCharge, startCharge, validKey, validateCancel, validateReconcile, voidCharge, type ChargeContext } from './charge.ts';
 import { createMercadoPagoPayments } from './mpPayments.ts';
 import { supabaseChargeStore } from './repository.ts';
+import { listStoreTerminals } from './terminals.ts';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -64,15 +68,33 @@ Deno.serve(async (req: Request) => {
     return json({ error: 'json', message: 'JSON inválido.' }, 400);
   }
   const action = body.action;
-  if (action !== 'create' && action !== 'status' && action !== 'cancel' && action !== 'reconcile' && action !== 'refund') return json({ error: 'action', message: 'Ação inválida.' }, 400);
-  if (!validKey(body.idempotency_key)) return json({ error: 'invalid_key', message: 'Chave da cobrança inválida.' }, 400);
-  const key = body.idempotency_key;
+  if (action !== 'create' && action !== 'status' && action !== 'cancel' && action !== 'reconcile' && action !== 'refund' && action !== 'terminals') return json({ error: 'action', message: 'Ação inválida.' }, 400);
 
   const url = Deno.env.get('SUPABASE_URL')!;
   const asCaller = createClient(url, Deno.env.get('SUPABASE_ANON_KEY')!, {
     global: { headers: { Authorization: authHeader } },
     auth: { persistSession: false },
   });
+
+  if (action === 'terminals') {
+    // Só leitura, sem cobrança: a loja é a linha de tenants que o RLS deixa o chamador ler (a dele).
+    const { data, error } = await asCaller.from('tenants').select('id').maybeSingle();
+    if (error || !data) return json({ error: 'auth', message: 'Não foi possível validar a sessão.' }, 401);
+    const admin = createClient(url, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!, { auth: { persistSession: false } });
+    const secret = await admin.from('payment_provider_secrets').select('access_token').eq('tenant_id', data.id).eq('provider', 'mercado_pago_point').maybeSingle();
+    if (secret.error) return json({ error: 'internal', message: 'Falha ao ler a configuração do Mercado Pago.' }, 500);
+    const accessToken = secret.data?.access_token as string | undefined;
+    if (!accessToken) return json({ error: 'not_configured', message: 'Mercado Pago sem Access Token nesta loja.' }, 412);
+    try {
+      return json(await listStoreTerminals(new MercadoPagoPointProvider({ accessToken, fetchImpl: (input, init) => fetch(input, init) })), 200);
+    } catch (error) {
+      console.error('[point-charge] terminals', error instanceof Error ? error.message : error);
+      return json({ error: 'mp_unavailable', message: 'O Mercado Pago não devolveu a lista de maquininhas. Tente de novo.' }, 502);
+    }
+  }
+
+  if (!validKey(body.idempotency_key)) return json({ error: 'invalid_key', message: 'Chave da cobrança inválida.' }, 400);
+  const key = body.idempotency_key;
 
   // 1) Prova de loja pelo RLS.
   let tenantId: string;

@@ -91,6 +91,7 @@ import { checkReceiptProof } from '../lib/payments/terminalGuard';
 import { isTf012Rejection, reservationExceeds, TOTAL_BELOW_PAID } from '../lib/payments/pointReservation';
 import { localClaim } from '../lib/payments/claimLedger';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
+import { MP_TERMINAL_ID } from '../lib/payments/pointTerminals';
 import { buildAccessKey } from '../lib/nfce';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
@@ -660,6 +661,11 @@ interface Actions {
   // Entrega própria
   saveDeliveryZone: (draft: Pick<DeliveryZone, 'name' | 'fee' | 'eta_minutes' | 'active'> & { id?: UUID }) => ActionResult<DeliveryZone>;
   saveCourier: (draft: Pick<Courier, 'name' | 'phone' | 'fee_per_delivery' | 'active'> & { id?: UUID }) => ActionResult<Courier>;
+  /**
+   * Cadastro da Point Smart (Mercado Pago) desta loja: nome, terminal_id do Mercado Pago (vai em serial_number) e
+   * ativa/desativada (online). O ID não muda depois do cadastro: trocar de aparelho = desativar e cadastrar outro.
+   */
+  savePointTerminal: (draft: { id?: UUID; name: string; serial_number: string; active: boolean }) => ActionResult<PosTerminal>;
   /** Pronto (saiu da cozinha) ou entregue. */
   setOwnDeliveryStatus: (deliveryId: UUID, status: 'READY' | 'DELIVERED') => ActionResult<OwnDelivery>;
   /** Entregador sai com as entregas escolhidas (rota). */
@@ -5187,6 +5193,40 @@ export const useTcheStore = create<TcheState>()(
           set((s) => ({
             couriers: existing ? s.couriers.map((c) => (c.id === row.id ? row : c)) : [...s.couriers, row],
             outbox: [...s.outbox, syncEvent('couriers', existing ? 'UPDATE' : 'INSERT', row)],
+          }));
+          return { ok: true, data: row };
+        },
+
+        savePointTerminal: (draft) => {
+          const perm = requirePermission('STORE_SETTINGS');
+          if (!perm.ok) return perm;
+          if (!get().cloud) return fail('A Point cobra pela nuvem: conecte este aparelho à nuvem (aba Nuvem) antes de cadastrar a maquininha.');
+          const name = draft.name.trim();
+          if (!name) return fail('Informe o nome da maquininha (ex.: Point Caixa).');
+          if (name.length > 50) return fail('Nome da maquininha com no máximo 50 caracteres.');
+          const serial = draft.serial_number.trim();
+          const existing = draft.id ? get().terminals.find((t) => t.id === draft.id) : undefined;
+          if (draft.id && !existing) return fail('Maquininha não encontrada.');
+          if (existing && existing.acquirer !== 'MERCADO_PAGO') return fail('Só a Point (Mercado Pago) é cadastrada aqui.');
+          if (existing && existing.serial_number !== serial) {
+            return fail('O ID da maquininha não muda depois do cadastro. Para trocar de aparelho, desative esta e cadastre a nova.');
+          }
+          if (!MP_TERMINAL_ID.test(serial)) return fail('ID da maquininha inválido: use o ID do Mercado Pago (ex.: NEWLAND_N950__N950NCB801293324).');
+          const dup = get().terminals.find((t) => t.id !== existing?.id && t.serial_number.toUpperCase() === serial.toUpperCase());
+          if (dup) return fail(`Este ID já está cadastrado em "${dup.name}".`);
+          const row: PosTerminal = {
+            id: existing?.id ?? uuid(),
+            tenant_id: get().tenant.id,
+            name,
+            serial_number: serial,
+            acquirer: 'MERCADO_PAGO',
+            mode: 'TEF_POS_WIRELESS',
+            online: draft.active,
+            battery_level: existing?.battery_level ?? null,
+          };
+          set((s) => ({
+            terminals: existing ? s.terminals.map((t) => (t.id === row.id ? row : t)) : [...s.terminals, row],
+            outbox: [...s.outbox, syncEvent('pos_terminals', existing ? 'UPDATE' : 'INSERT', row)],
           }));
           return { ok: true, data: row };
         },

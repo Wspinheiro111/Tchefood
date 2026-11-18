@@ -66,8 +66,10 @@ As migrations podem ser reaplicadas sem erro (conferido no teste) se a primeira 
 
 - [ ] `supabase functions deploy point-charge` (CLI atual: a função importa `server/payments/`).
 - [ ] `supabase functions deploy emit-nfce` (o `payload.ts` mudou neste PR: sem esse deploy a NFC-e da venda na Point não sai como pagamento integrado).
-- [ ] Só com Point: gravar o token em `payment_provider_secrets` e cadastrar a maquininha em `pos_terminals`
-      (SQL em `mercado-pago-point.md`).
+- [ ] Só com Point: gravar o token em `payment_provider_secrets` (SQL em `mercado-pago-point.md`). A maquininha
+      se cadastra pelo app: Retaguarda › Point Smart › "Conferir no Mercado Pago" (lista as Points da conta com o
+      ID), "Cadastrar Point" com esse ID, e conferir que ela fica **Pronta** (na conta e no modo PDV). O SQL de
+      `pos_terminals` em `mercado-pago-point.md` continua valendo como alternativa.
 
 ## 4. App novo em todos os aparelhos
 

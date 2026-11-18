@@ -3,6 +3,7 @@ import { BarChart3, Beer, Bike, ChefHat, CloudOff, LayoutGrid, LogOut, MonitorPl
 import { BrandLogo, BrandMark } from './components/Brand';
 import { selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
+import { OfflineCloudBanner } from './components/OfflineCloudBanner';
 import { useTerminalBus } from './lib/payments/drivers';
 import { LoginScreen } from './screens/LoginScreen';
 import { TableMap } from './screens/TableMap';
@@ -89,6 +90,7 @@ export default function App() {
   if (!user) {
     return (
       <>
+        <OfflineCloudBanner online={online} />
         <LoginScreen />
         <ToastHost />
       </>
@@ -136,6 +138,7 @@ export default function App() {
         <button aria-label="Sair" onClick={() => { const r = logout(); if (!r.ok) toast.error(r.error); }}className="grid h-11 w-11 place-items-center rounded-xl bg-surface"><LogOut className="h-5 w-5" /></button>
       </header>
       <UnsavedStorageBanner />
+      <OfflineCloudBanner online={online} underHeader />
 
       <main>
         {view.name === 'map' && <TableMap onOpenOrder={(orderId) => setView({ name: 'order', orderId })} />}
