@@ -322,6 +322,33 @@ describe('DANFE da nota real', () => {
     expect(c).not.toContain('Protocolo de Autorizacao');
   });
 
+  it('P2-02 r5: data e hora do DANFE saem no fuso de Brasília, igual em qualquer fuso do aparelho', () => {
+    const base = process.env.TZ;
+    const cases: Array<[string, string]> = [
+      ['2026-11-14T23:30:00-03:00', '14/11/2026'],
+      ['2026-11-14T23:30:00-03:00', '23:30:00'],
+      ['2026-11-15T02:30:00Z', '14/11/2026'],
+    ];
+    const outs: string[] = [];
+    try {
+      for (const tz of ['UTC', 'America/Sao_Paulo', 'Asia/Tokyo']) {
+        process.env.TZ = tz;
+        const doc = serverNfceDocument({ ...server(), issued_at: '2026-11-14T23:30:00-03:00' })!;
+        const text = danfeLines({ tenant: st().tenant, doc, environment: 'homologacao', showTributos: false }).top.join('\n');
+        for (const [, expected] of cases.slice(0, 2)) expect(text).toContain(expected);
+        const z = serverNfceDocument({ ...server(), issued_at: cases[2]![0] })!;
+        outs.push(text, danfeLines({ tenant: st().tenant, doc: z, environment: 'homologacao', showTributos: false }).top.join('\n'));
+      }
+    } finally {
+      if (base === undefined) delete process.env.TZ;
+      else process.env.TZ = base;
+    }
+    // Mesmo texto nos três fusos.
+    expect(new Set([outs[0], outs[2], outs[4]]).size).toBe(1);
+    expect(new Set([outs[1], outs[3], outs[5]]).size).toBe(1);
+    expect(outs[1]).toContain('14/11/2026');
+  });
+
   it('P1-01 r3: cabeçalho do DANFE vem do emitente gravado no servidor, nunca do cadastro deste aparelho', async () => {
     // Aparelho B com cadastro desatualizado (mesmo CNPJ, outra razão social e IE).
     useTcheStore.setState({ cloud: session(st().tenant.id), tenant: { ...st().tenant, cnpj: '12.345.678/0001-95', legal_name: 'RAZAO DESATUALIZADA', state_registration: '999' } });

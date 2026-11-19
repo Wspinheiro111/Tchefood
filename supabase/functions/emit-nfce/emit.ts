@@ -252,6 +252,12 @@ async function transmit(deps: EmitDeps, doc: NfceDocumentRow, token: string, pay
   return apply(deps, doc, classifyTransmission(result));
 }
 
+// Sem token não há como consultar a Focus: em consulta devolve o documento gravado como está;
+// fora dela, o token continua obrigatório.
+function consultOnlyWithoutToken(input: { consultOnly?: boolean }, doc: NfceDocumentRow, noToken: () => EmitResponse): EmitResponse {
+  return input.consultOnly ? respond(doc) : noToken();
+}
+
 /**
  * consultOnly (mode "consult"): só devolve ou consulta na Focus o documento que já existe
  * (inclusive autorizada sem QR Code). Sem documento responde status "none" e não transmite
@@ -262,7 +268,7 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
   const source = await deps.repo.loadSource(input.tenantId, input.orderId);
   if (!source) return failure(404, 'not_found', env, 'Comanda não encontrada para este estabelecimento.');
   const token = source.tenant.focus_nfe_token?.trim() ?? '';
-  if (!token) return failure(422, 'invalid', env, 'Token Focus NFe do estabelecimento não configurado.');
+  const noToken = () => failure(422, 'invalid', env, 'Token Focus NFe do estabelecimento não configurado.');
 
   let reference: string;
   try {
@@ -275,14 +281,18 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
   if (doc && doc.environment !== env) {
     return failure(409, 'conflict', env, `Esta comanda já tem NFC-e em ${doc.environment}; o servidor está em ${env}. Nada foi transmitido.`, doc.reference);
   }
+  // O documento gravado é devolvido sem token: o token só é exigido para falar com a Focus
+  // (consultar ou transmitir).
+  if (doc && doc.status === 'authorized' && doc.qrcode_url) return respond(doc);
+  if (doc && doc.status === 'cancelled') return respond(doc);
   // Autorizada sem o QR Code assinado: consulta a Focus (só GET) para completar o DANFE.
-  if (doc && doc.status === 'authorized' && !doc.qrcode_url) return reconcile(deps, doc, token);
-  if (doc && (doc.status === 'authorized' || doc.status === 'cancelled')) return respond(doc);
-  if (doc && (doc.status === 'processing' || doc.status === 'contingency')) return reconcile(deps, doc, token);
+  if (doc && doc.status === 'authorized') return token ? reconcile(deps, doc, token) : consultOnlyWithoutToken(input, doc, noToken);
+  if (doc && (doc.status === 'processing' || doc.status === 'contingency')) return token ? reconcile(deps, doc, token) : consultOnlyWithoutToken(input, doc, noToken);
   if (input.consultOnly) {
     if (doc) return respond(doc);
     return failure(404, 'none', env, 'Esta comanda não tem NFC-e no servidor. Nada foi transmitido.', reference);
   }
+  if (!token) return noToken();
 
   let payload;
   try {

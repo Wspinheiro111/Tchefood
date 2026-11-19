@@ -257,6 +257,32 @@ describe('emitNfce', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('P2-01 r5: consulta do documento já gravado não exige o token Focus; emissão nova sem token continua bloqueada', async () => {
+    for (const token of [null, '', '   ']) {
+      const repo = new MemoryRepo(source({ tenant: { ...source().tenant, focus_nfe_token: token } }));
+      repo.doc = {
+        id: 'd1', tenant_id: TENANT, order_id: ORDER, reference: nfceReference(ORDER), environment: 'homologacao', payload_hash: 'h', payload: { data_emissao: '2026-11-14T10:00:00-03:00' }, issuer: null, issued_at: '2026-11-14T10:00:00-03:00',
+        status: 'authorized', access_key: KEY, protocol: '143260000000001', number: 42, series: '1', qrcode_url: QR, danfe_path: '/x.html', xml_path: null, sefaz_status: '100', sefaz_message: 'Autorizado', offline_contingency: false, transmissions: 1,
+      } as NfceDocumentRow;
+      const { calls, focus } = fakeFocus([]);
+      const deps = { repo, environment: 'homologacao' as const, focus, sha256Hex };
+      const r = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+      expect(r.httpStatus).toBe(200);
+      expect(r.body).toMatchObject({ status: 'authorized', authorized: true, access_key: KEY, qrcode_url: QR });
+      expect(calls).toHaveLength(0);
+      // Sem documento, consultar não transmite e nada pede token.
+      const empty = new MemoryRepo(source({ tenant: { ...source().tenant, focus_nfe_token: token } }));
+      const none = await emitNfce({ ...deps, repo: empty }, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+      expect(none.body.status).toBe('none');
+      // Emissão nova sem token: bloqueada, nada gravado nem enviado.
+      const blocked = await emitNfce({ ...deps, repo: empty }, { tenantId: TENANT, orderId: ORDER });
+      expect(blocked.httpStatus).toBe(422);
+      expect(blocked.body.status).toBe('invalid');
+      expect(empty.doc).toBeNull();
+      expect(calls).toHaveLength(0);
+    }
+  });
+
   it('consulta de rejeitada não reenvia', async () => {
     const repo = new MemoryRepo(source());
     const { calls, focus } = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', mensagem_sefaz: 'NCM' } }]);
