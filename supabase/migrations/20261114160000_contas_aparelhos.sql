@@ -772,6 +772,13 @@ BEGIN
      WHERE o.tenant_id = v_tenant
        AND o.id IN (SELECT d.order_id FROM own_deliveries d WHERE d.id = ANY(v_ids) AND d.tenant_id = v_tenant AND d.pay_on_delivery)
      ORDER BY o.id FOR UPDATE;
+    -- Conta paga na entrega com saldo e fora de PAYING (ainda OPEN, por exemplo) não vira R$ 0 devido:
+    -- o acerto é recusado e nada é gravado (GPT, rodada 19 do PR #54). Conta que sumiu também.
+    IF EXISTS (SELECT 1 FROM own_deliveries d LEFT JOIN orders o ON o.id = d.order_id AND o.tenant_id = v_tenant
+                WHERE d.id = ANY(v_ids) AND d.tenant_id = v_tenant AND d.pay_on_delivery
+                  AND (o.id IS NULL OR (o.status <> 'PAYING' AND o.remaining_balance > 0))) THEN
+        RAISE EXCEPTION 'TCHEFOOD_ENTREGA: uma conta paga na entrega ainda tem saldo e não está em pagamento (ou não chegou à nuvem). Nada sai da gaveta por este acerto; confira a conta e acerte de novo.';
+    END IF;
     SELECT COALESCE(sum(
                CASE WHEN o.status = 'PAYING' AND o.remaining_balance > 0 THEN o.remaining_balance ELSE 0 END
              + COALESCE((SELECT sum(p.amount) FROM payments p

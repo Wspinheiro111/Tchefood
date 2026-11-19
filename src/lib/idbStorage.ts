@@ -112,9 +112,14 @@ const seen = (seq: number) => {
 };
 const memorySeq = new Map<string, number>();
 
-/** Valor do IndexedDB: { seq, v } desta versão, ou o texto puro das versões anteriores (seq 0). */
+/**
+ * No IndexedDB o valor continua sendo o texto puro da chave `k`, como nas versões anteriores (voltar o app
+ * para uma versão anterior lê o mesmo registro; GPT, rodada 19 do PR #54). O número da gravação fica numa
+ * chave ao lado (`k::seq`), gravada na mesma transação; sem ela, vale 0.
+ */
+const SEQ_SUFFIX = '::seq';
+/** Valor da cópia no localStorage: { seq, v }. */
 function unpack(raw: unknown): Stamped | null {
-  if (typeof raw === 'string') return { seq: 0, v: raw };
   if (raw && typeof raw === 'object' && typeof (raw as Stamped).v === 'string' && typeof (raw as Stamped).seq === 'number') return raw as Stamped;
   return null;
 }
@@ -133,7 +138,11 @@ export const idbStorage: StateStorage = hasIndexedDB
         let fromDb: Stamped | null = null;
         let dbFailed = false;
         try {
-          fromDb = unpack(await tx<unknown>('readonly', (s) => s.get(k) as IDBRequest<unknown>));
+          const text = await tx<unknown>('readonly', (s) => s.get(k) as IDBRequest<unknown>);
+          if (typeof text === 'string') {
+            const n = await tx<unknown>('readonly', (s) => s.get(k + SEQ_SUFFIX) as IDBRequest<unknown>);
+            fromDb = { seq: typeof n === 'number' ? n : 0, v: text };
+          }
         } catch {
           dbFailed = true;
         }
@@ -152,7 +161,10 @@ export const idbStorage: StateStorage = hasIndexedDB
       setItem: async (k, v) => {
         const seq = nextSeq();
         try {
-          await tx('readwrite', (s) => s.put({ seq, v } satisfies Stamped, k));
+          await tx('readwrite', (s) => {
+            s.put(seq, k + SEQ_SUFFIX);
+            return s.put(v, k);
+          });
           memory.delete(k);
           memorySeq.delete(k);
           try {
@@ -180,7 +192,10 @@ export const idbStorage: StateStorage = hasIndexedDB
           // nada a apagar
         }
         try {
-          await tx('readwrite', (s) => s.delete(k));
+          await tx('readwrite', (s) => {
+            s.delete(k + SEQ_SUFFIX);
+            return s.delete(k);
+          });
         } catch {
           fallback.removeItem(k);
         }

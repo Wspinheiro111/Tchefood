@@ -5287,6 +5287,30 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(settlementsOf([frac.d.id])).toBe('0');
     });
 
+    it('acerto pela nuvem: conta paga na entrega com saldo e ainda OPEN não vira R$ 0 devido; recusado, nada gravado; em PAYING com o valor exato passa (GPT, rodada 19 do PR #54)', async () => {
+      forgetPinFailures();
+      const cod = await nicoDelivers('Rua 312, 1', true);
+      const owed = owedOf(cod.orderId);
+      expect(owed).toBeGreaterThan(0);
+      const payments = () => sql(`SELECT count(*) FROM payments WHERE order_id = '${cod.orderId}'`);
+      const paymentsBefore = payments();
+      sql(`UPDATE orders SET status = 'OPEN' WHERE id = '${cod.orderId}'`);
+      expect(sql(`SELECT status FROM orders WHERE id = '${cod.orderId}'`)).toBe('OPEN');
+      for (const cash of [0, owed]) {
+        const r = await settleRpc({ ...nicoTerms([cod.d.id], cash, CASHIER_PIN), p_payments: [] });
+        expect(r.status, `${cash}: ${r.body}`).toBeGreaterThanOrEqual(400);
+        expect(r.body).toMatch(/ainda tem saldo e não está em pagamento/);
+        expect(settlementsOf([cod.d.id])).toBe('0');
+        expect(unsettled([cod.d.id])).toBe('1');
+        expect(payments()).toBe(paymentsBefore);
+      }
+      // Volta para PAYING: o fluxo válido (recebimento exato) funciona.
+      sql(`UPDATE orders SET status = 'PAYING' WHERE id = '${cod.orderId}'`);
+      const good = await settleRpc(nicoTerms([cod.d.id], owed, CASHIER_PIN));
+      expect(good.status, good.body).toBe(200);
+      expect(unsettled([cod.d.id])).toBe('0');
+    });
+
     it('acerto pela nuvem: o recebimento das senhas entra na mesma transação; a conta fica paga e outro aparelho não cobra o mesmo saldo (GPT, rodada 11 do PR #54)', async () => {
       forgetPinFailures();
       const cod = await nicoDelivers('Rua 312, 1', true);

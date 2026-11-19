@@ -112,6 +112,24 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     expect(await again.idbStorage.getItem(name)).toContain('acerto-S2');
   });
 
+  it('GPT r19 P2-01: o IndexedDB guarda o texto puro na chave do estado (a versão anterior do app lê o mesmo registro)', async () => {
+    vi.resetModules();
+    const store = await import('../store/useTcheStore');
+    await tick();
+    const name = store.useTcheStore.persist.getOptions().name!;
+    store.useTcheStore.setState({ courierSettlePending: [{ id: 'acerto-R1' } as never] });
+    expect(await store.awaitPersisted()).toBe(true);
+    const raw = disk.get(name);
+    expect(typeof raw).toBe('string');
+    // Leitor da versão anterior: JSON.parse direto do valor, sem conhecer o número da gravação.
+    expect(JSON.parse(raw as string).state.courierSettlePending[0].id).toBe('acerto-R1');
+    // Registro antigo (texto puro, sem número): continua lido.
+    disk.delete(name + '::seq');
+    vi.resetModules();
+    const again = await import('../lib/idbStorage');
+    expect(await again.idbStorage.getItem(name)).toBe(raw);
+  });
+
   it('IndexedDB e localStorage recusam: awaitPersisted devolve false (o acerto não sai)', async () => {
     vi.resetModules();
     const store = await import('../store/useTcheStore');
