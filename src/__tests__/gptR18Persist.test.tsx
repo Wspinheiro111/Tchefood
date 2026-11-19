@@ -16,6 +16,8 @@ import type { ActionResult } from '../types';
 type Mode = 'ok' | 'throw' | 'abort';
 const disk = new Map<string, unknown>();
 let mode: Mode = 'ok';
+/** Chamado depois de cada leitura (get) de uma chave no IndexedDB de mentira: simula outra gravação no meio. */
+let afterGet: ((key: string) => void) | null = null;
 const later = (f: () => void) => setTimeout(f, 0);
 
 function fakeIndexedDB() {
@@ -25,6 +27,8 @@ function fakeIndexedDB() {
     transaction: (_store: string, txMode: IDBTransactionMode) => {
       const t: Record<string, unknown> & { oncomplete?: (() => void) | null; onabort?: (() => void) | null; onerror?: (() => void) | null } = { error: null };
       const staged: (() => void)[] = [];
+      // Transação só de leitura enxerga o disco como estava quando abriu (como o IndexedDB de verdade).
+      const snapshot = txMode === 'readonly' ? new Map(disk) : null;
       const request = (run: () => unknown) => {
         const req: { onsuccess?: (() => void) | null; onerror?: (() => void) | null; result?: unknown; error?: unknown } = {};
         later(() => {
@@ -51,7 +55,11 @@ function fakeIndexedDB() {
         return req;
       };
       t.objectStore = () => ({
-        get: (k: string) => request(() => disk.get(k)),
+        get: (k: string) => request(() => {
+          const v = (snapshot ?? disk).get(k);
+          later(() => afterGet?.(k));
+          return v;
+        }),
         put: (v: unknown, k: string) => request(() => { staged.push(() => disk.set(k, structuredClone(v))); return k; }),
         delete: (k: string) => request(() => { staged.push(() => disk.delete(k)); return undefined; }),
       });
@@ -74,6 +82,7 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     disk.clear();
     localStorage.clear();
     mode = 'ok';
+    afterGet = null;
     (globalThis as { indexedDB?: unknown }).indexedDB = fakeIndexedDB();
   });
   afterEach(() => {
@@ -128,6 +137,79 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     vi.resetModules();
     const again = await import('../lib/idbStorage');
     expect(await again.idbStorage.getItem(name)).toBe(raw);
+  });
+
+  it('GPT r20 P2-01: S0, gravação S1 recusada, volta a versão anterior, grava S2, atualiza de novo: S2 fica (a cópia velha não ganha)', async () => {
+    vi.resetModules();
+    const store = await import('../store/useTcheStore');
+    await tick();
+    const S = store.useTcheStore;
+    const name = S.persist.getOptions().name!;
+    S.setState({ courierSettlePending: [{ id: 'acerto-S0' } as never] });
+    expect(await store.awaitPersisted()).toBe(true);
+    mode = 'throw';
+    S.setState({ courierSettlePending: [{ id: 'acerto-S1' } as never] });
+    expect(await store.awaitPersisted()).toBe(true);
+    await tick();
+    expect(localStorage.getItem(name + '::copia')).toContain('acerto-S1');
+    // A versão anterior do app lê o IndexedDB (S0) e grava S2 direto na chave do estado, sem mexer em `::seq`.
+    mode = 'ok';
+    const s2 = '{"state":{"courierSettlePending":[{"id":"acerto-S2"}]},"version":12}';
+    disk.set(name, s2);
+    // Atualiza de novo: o texto que a versão anterior gravou é o mais novo; a cópia S1 não volta por cima.
+    vi.resetModules();
+    const { idbStorage } = await import('../lib/idbStorage');
+    expect(await idbStorage.getItem(name)).toBe(s2);
+    expect(await idbStorage.getItem(name)).toBe(s2);
+  });
+
+  it('GPT r20 P2-01: cópia mais nova com o IndexedDB bom de novo entra no IndexedDB (a versão anterior passa a ler S1) e a cópia some', async () => {
+    vi.resetModules();
+    const store = await import('../store/useTcheStore');
+    await tick();
+    const S = store.useTcheStore;
+    const name = S.persist.getOptions().name!;
+    S.setState({ courierSettlePending: [{ id: 'acerto-S0' } as never] });
+    expect(await store.awaitPersisted()).toBe(true);
+    mode = 'throw';
+    S.setState({ courierSettlePending: [{ id: 'acerto-S1' } as never] });
+    expect(await store.awaitPersisted()).toBe(true);
+    await tick();
+    mode = 'ok';
+    vi.resetModules();
+    const { idbStorage } = await import('../lib/idbStorage');
+    expect(await idbStorage.getItem(name)).toContain('acerto-S1');
+    await tick();
+    expect(String(disk.get(name))).toContain('acerto-S1');
+    expect(localStorage.getItem(name + '::copia')).toBeNull();
+    expect(await idbStorage.getItem(name)).toContain('acerto-S1');
+  });
+
+  it('GPT r20 P2-02: gravação concorrente entre a leitura do texto e a do número: nunca o texto de uma versão com o número de outra', async () => {
+    vi.resetModules();
+    const { idbStorage } = await import('../lib/idbStorage');
+    const name = 'tchefood-teste';
+    // IndexedDB com S0 (número 100); cópia de recuperação com S1 (número 101).
+    const fp = (v: string) => {
+      let h = 5381;
+      for (let i = 0; i < v.length; i++) h = ((h << 5) + h + v.charCodeAt(i)) | 0;
+      return (h >>> 0).toString(16) + '.' + v.length;
+    };
+    mode = 'ok';
+    await idbStorage.getItem(name); // abre o banco
+    disk.set(name, 'S0');
+    disk.set(name + '::seq', `100:${fp('S0')}`);
+    localStorage.setItem(name + '::copia', JSON.stringify({ seq: 101, v: 'S1' }));
+    // Outra gravação confirma S2 (número 102) logo depois de o texto ser lido (a cópia ainda não foi removida).
+    afterGet = (key) => {
+      if (key !== name) return;
+      afterGet = null;
+      disk.set(name, 'S2');
+      disk.set(name + '::seq', `102:${fp('S2')}`);
+    };
+    const got = await idbStorage.getItem(name);
+    // Antes: texto S0 com o número 102 (mistura que nunca foi gravada) → devolvia S0. Agora: uma versão inteira.
+    expect(['S1', 'S2']).toContain(got);
   });
 
   it('IndexedDB e localStorage recusam: awaitPersisted devolve false (o acerto não sai)', async () => {
