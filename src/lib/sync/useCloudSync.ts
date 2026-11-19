@@ -7,6 +7,8 @@ import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, recordKeys, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
+import { dueNfceCalls, dueNfceOrders, nfceCallNow, requestNfceEmission } from './nfceEmission';
+import type { CloudSession } from '../../store/useTcheStore';
 import { pendingRelease } from '../payments/claimLedger';
 import type { SyncEvent, UUID } from '../../types';
 
@@ -141,6 +143,32 @@ async function pullRefunds(tenantId: string, session: { url: string; email: stri
 }
 
 /**
+ * NFC-e real: pede/consulta na emit-nfce as comandas fechadas que já subiram inteiras
+ * (no máximo 3 por rodada). A resposta só é gravada se o aparelho ainda é da mesma loja.
+ */
+async function emitDueNfce(cfg: SyncConfig, session: CloudSession, fetchFn: FetchLike): Promise<void> {
+  // A rodada inteira fica presa à loja e ao projeto da sessão que a começou: as comandas são
+  // escolhidas, pedidas e gravadas só enquanto o aparelho continua nessa mesma loja.
+  const sameStore = () => {
+    const st = useTcheStore.getState();
+    return st.cloud !== null && st.cloud.tenant_id === session.tenant_id && st.cloud.url === session.url && st.tenant.id === session.tenant_id;
+  };
+  if (!sameStore()) return;
+  for (const { orderId } of dueNfceCalls(useTcheStore.getState(), Date.now())) {
+    if (!sameStore()) return;
+    const now = useTcheStore.getState();
+    if (!now.orders.some((o) => o.id === orderId && o.tenant_id === session.tenant_id)) continue;
+    // Elegibilidade conferida de novo logo antes da chamada: durante a chamada anterior a comanda pode
+    // ter sido reaberta ou ganhado evento na fila; aí ela fica para uma rodada em que estiver inteira na nuvem.
+    const mode = nfceCallNow(now, orderId, Date.now());
+    if (!mode) continue;
+    const outcome = await requestNfceEmission(cfg, orderId, fetchFn, mode);
+    if (!sameStore()) return;
+    useTcheStore.getState().applyNfceOutcome(orderId, outcome);
+  }
+}
+
+/**
  * Uma rodada: envia a fila e, com ela vazia, lê os cadastros da nuvem quando passou
  * um minuto da última leitura (ou sempre, com forcePull). Exportada para o botão
  * "Sincronizar agora" e para testes.
@@ -158,9 +186,11 @@ async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): 
   const wantsPull = pull === 'force' || (pull === 'due' && pullDue(state.pullStatus?.last_pull_at, Date.now()));
   const tenantId = state.tenant.id;
   const wantsRefunds = pull === 'force' || (pull === 'due' && refundPullDue(sessionKey(tenantId, session), Date.now()));
-  if (state.outbox.length === 0 && !wantsPull && !wantsRefunds) return;
+  // NFC-e real: só nas rodadas normais; a preparação da cobrança (never) só sobe a fila.
+  const wantsNfce = pull !== 'never' && dueNfceOrders(state, Date.now(), 1).length > 0;
+  if (state.outbox.length === 0 && !wantsPull && !wantsRefunds && !wantsNfce) return;
   running = true;
-  const round = runRound(session, withRequestTimeout(fetchFn), wantsPull, wantsRefunds, tenantId);
+  const round = runRound(session, withRequestTimeout(fetchFn), wantsPull, wantsRefunds, tenantId, pull !== 'never');
   current = round;
   try {
     await round;
@@ -169,11 +199,13 @@ async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): 
   }
 }
 
-async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getState>['cloud']>, fetchFn: FetchLike, wantsPull: boolean, wantsRefunds: boolean, tenantId: string): Promise<void> {
+async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getState>['cloud']>, fetchFn: FetchLike, wantsPull: boolean, wantsRefunds: boolean, tenantId: string, nfce = true): Promise<void> {
   try {
     const cfg = await sendAndPull(session, fetchFn, wantsPull, tenantId);
     // À parte da fila e dos cadastros: roda mesmo com evento preso na fila ou com a leitura dos cadastros falhando.
     if (cfg && wantsRefunds) await pullRefunds(tenantId, session, cfg, fetchFn);
+    // NFC-e real das contas que já subiram inteiras (conta com evento na fila ou recusado fica de fora).
+    if (cfg && nfce) await emitDueNfce(cfg, session, fetchFn);
   } finally {
     running = false;
   }
