@@ -87,7 +87,8 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     await rejects(clientFor({ role: 'authenticated', sub: ADMIN, tenant_id: HAND_TENANT }).me(), /acesso restrito/, 403);
     await rejects(clientFor({ role: 'authenticated', sub: ADMIN, app_metadata: { tenant_id: HAND_TENANT } }).stores(), /acesso restrito/, 403);
     await rejects(clientFor({ role: 'authenticated', sub: OTHER_USER }).overview(), /acesso restrito/, 403);
-    await rejects(clientFor({ role: 'anon' }).stores(), /acesso restrito/, 403);
+    // anon nem chega na função: sem EXECUTE (o emulador usa o papel do JWT, como o PostgREST).
+    await rejects(clientFor({ role: 'anon' }).stores(), /permission denied for function tchefood_admin_stores/);
     await rejects(clientFor({ role: 'authenticated', sub: 'nao-e-uuid' }).me(), /acesso restrito/, 403);
     await rejects(clientFor({ role: 'authenticated', sub: OTHER_USER }).createStore(store()), /acesso restrito/, 403);
 

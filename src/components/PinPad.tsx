@@ -10,10 +10,12 @@ interface PinPadProps {
   disabled?: boolean;
   error?: boolean;
   compact?: boolean;
+  /** Nome acessível do teclado (auditoria interna 2, P2-7), por exemplo "PIN do gerente". */
+  label?: string;
 }
 
 /** Teclado numérico gigante para PIN (zero dependência de hover). */
-export function PinPad({ value, onChange, onComplete, length = 4, disabled, error, compact }: PinPadProps) {
+export function PinPad({ value, onChange, onComplete, length = 4, disabled, error, compact, label }: PinPadProps) {
   const press = (d: string) => {
     if (disabled || value.length >= length) return;
     playTap();
@@ -35,8 +37,8 @@ export function PinPad({ value, onChange, onComplete, length = 4, disabled, erro
 
   const keySize = compact ? 'h-14 text-2xl' : 'h-16 text-3xl sm:h-20';
   return (
-    <div className="mx-auto w-full max-w-xs">
-      <div className={`mb-4 flex justify-center gap-3 ${error ? 'animate-pulse' : ''}`}>
+    <div className="mx-auto w-full max-w-xs" {...(label ? { role: 'group', 'aria-label': label } : {})}>
+      <div aria-hidden={label ? true : undefined} className={`mb-4 flex justify-center gap-3 ${error ? 'animate-pulse' : ''}`}>
         {Array.from({ length }).map((_, i) => (
           <span
             key={i}

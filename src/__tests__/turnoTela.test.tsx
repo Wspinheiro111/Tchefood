@@ -130,7 +130,7 @@ describe('Retaguarda: relógio reativo sem mudar os arrays', () => {
     expect(screen.getAllByText((_, el) => el?.textContent === brl(50)).length).toBeGreaterThanOrEqual(2);
     expect(has(brl(160))).toBe(false);
     expect(has(brl(110))).toBe(false);
-    expect(screen.getByText(/aprovados desde 11\/11, 05:00/)).toBeTruthy();
+    expect(screen.getByText(/desde 11\/11, 05:00/)).toBeTruthy();
   });
 
   it('venda nova entra na hora, sem esperar o próximo minuto', () => {

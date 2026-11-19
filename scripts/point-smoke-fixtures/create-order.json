@@ -1,0 +1,33 @@
+{
+  "method": "POST",
+  "path": "/v1/orders",
+  "status": 201,
+  "at": "2026-11-14T12:00:00.000Z",
+  "body": {
+    "id": "ORD01",
+    "type": "point",
+    "status": "created",
+    "status_detail": "created",
+    "external_reference": "55555555-5555-4555-8555-555555555555",
+    "config": {
+      "point": {
+        "terminal_id": "NEWLAND_N950__N950NCB801293324",
+        "print_on_terminal": "no_ticket"
+      },
+      "payment_method": {
+        "default_type": "credit_card",
+        "default_installments": 1
+      }
+    },
+    "transactions": {
+      "payments": [
+        {
+          "id": "PAY01",
+          "amount": "24.50",
+          "status": "created",
+          "status_detail": "ready_to_process"
+        }
+      ]
+    }
+  }
+}

@@ -27,6 +27,7 @@
  *    o operador reenvia os recusados depois de corrigir a causa.
  */
 import type { SyncEvent } from '../../types';
+import { describeReservedExceeds, describeTotalBelowPaid } from '../payments/pointReservation';
 
 export interface SyncConfig {
   url: string;
@@ -120,6 +121,8 @@ const NEVER_UPLOAD: Partial<Record<SyncEvent['table'], ReadonlyArray<string>>> =
   // O banco calcula o esperado e a diferença no fechamento e liga o gerente pela
   // autorização gravada; o valor do aparelho nunca vale.
   cash_sessions: ['expected_cash', 'difference', 'closing_authorized_by_manager_id'],
+  // Só do aparelho: itens quitados por este pagamento e motivo da retirada local.
+  payments: ['paid_item_ids', 'withdrawn_reason'],
 };
 
 export function sanitizePayload(event: SyncEvent): Record<string, unknown> {
@@ -337,7 +340,7 @@ function patchedNothing(req: SyncRequest, body: string): boolean {
   }
 }
 
-export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{
+export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{
   ok: boolean;
   status: number;
   text: () => Promise<string>;
@@ -355,6 +358,12 @@ export interface FlushResult {
   retryLater: string | null;
   /** 4xx: o servidor recusou estes eventos. O envio seguiu com os demais. */
   rejected: SyncRejection[];
+  /**
+   * Recusado que não move dinheiro e não deve parar a conta: o registro de uma recusa da maquininha (DECLINED,
+   * fora do Mercado Pago) que o servidor recusou com TF010 (não bate com a reserva da chave). Sai da fila (quem
+   * chama confirma como os enviados) e não segura os eventos seguintes da conta.
+   */
+  dropped?: SyncRejection[];
 }
 
 /**
@@ -446,9 +455,12 @@ export async function flushOutbox(
   fetchFn: FetchLike,
   limit = 50,
   held: SyncEvent[] = [],
+  /** Evento que ainda não pode subir (ex.: recusa da maquininha antes de a reserva ser liberada): espera na fila. */
+  waitFor: (event: SyncEvent) => boolean = () => false,
 ): Promise<FlushResult> {
   const sent: string[] = [];
   const rejected: SyncRejection[] = [];
+  const dropped: SyncRejection[] = [];
   const blocked = new Set(held.flatMap(recordKeys));
   // Eventos que ainda não subiram: recusados guardados e toda a fila, até cada um ser aceito
   // nesta rodada. Quem depende de um deles (depends_on_event_ids) espera, também quando a
@@ -459,12 +471,14 @@ export async function flushOutbox(
     unsent.add(event.id);
     for (const k of recordKeys(event)) blocked.add(k);
   };
+  // Toda saída leva os descartados (senão o evento descartado antes de uma queda de rede subiria de novo).
+  const done = (retryLater: string | null): FlushResult => ({ sent, retryLater, rejected, ...(dropped.length > 0 ? { dropped } : {}) });
   let attempts = 0;
   for (const event of serverOrder(events)) {
     // Eventos segurados não contam no limite: senão um bloco segurado no começo da fila
     // impediria para sempre que registros sem relação subissem.
     const keys = recordKeys(event);
-    if (keys.some((k) => blocked.has(k)) || (event.depends_on_event_ids ?? []).some((id) => unsent.has(id))) {
+    if (keys.some((k) => blocked.has(k)) || (event.depends_on_event_ids ?? []).some((id) => unsent.has(id)) || waitFor(event)) {
       // O segurado também segura o que vem depois dele em QUALQUER registro que ele
       // toca: a liberação da mesa da comanda A, segurada pelo pagamento recusado de A,
       // não pode ser ultrapassada pela ocupação da mesma mesa pela comanda B (senão,
@@ -493,7 +507,7 @@ export async function flushOutbox(
         text = await res.text().catch(() => '');
       }
     } catch (e) {
-      return { sent, retryLater: `Sem conexão com a nuvem: ${(e as Error).message}`, rejected };
+      return done(`Sem conexão com a nuvem: ${(e as Error).message}`);
     }
     if (res.ok) {
       // A RPC responde null quando o PIN não confere no servidor (ou está bloqueado):
@@ -512,13 +526,33 @@ export async function flushOutbox(
       unsent.delete(event.id);
       continue;
     }
-    if (res.status === 401) return { sent, retryLater: 'Sessão da nuvem expirada. Renovando o acesso.', rejected };
+    if (res.status === 401) return done('Sessão da nuvem expirada. Renovando o acesso.');
     if (res.status >= 500 || res.status === 408 || res.status === 429) {
-      return { sent, retryLater: `Nuvem indisponível (HTTP ${res.status}).`, rejected };
+      return done(`Nuvem indisponível (HTTP ${res.status}).`);
+    }
+    if (isDroppableDeclined(event, text)) {
+      dropped.push({ eventId: event.id, status: res.status, message: describeError(text, res.status) });
+      unsent.delete(event.id);
+      continue;
     }
     reject(event, res.status, describeError(text, res.status));
   }
-  return { sent, retryLater: null, rejected };
+  return done(null);
+}
+
+/**
+ * Registro de recusa da maquininha (INSERT de pagamento DECLINED fora do Mercado Pago) recusado com TF010: não
+ * move dinheiro e nada depende dele; ficar guardado pararia a conta inteira. Qualquer outro caso (outro código,
+ * outro status, UPDATE, Mercado Pago) segue recusado e visível.
+ */
+function isDroppableDeclined(event: SyncEvent, body: string): boolean {
+  if (event.table !== 'payments' || event.op !== 'INSERT') return false;
+  if (event.payload.status !== 'DECLINED' || event.payload.acquirer === 'MERCADO_PAGO') return false;
+  try {
+    return (JSON.parse(body) as { code?: unknown }).code === 'TF010';
+  } catch {
+    return false;
+  }
 }
 
 function isNullResponse(body: string): boolean {
@@ -537,8 +571,21 @@ function isUuidResponse(body: string): boolean {
 
 function describeError(body: string, status: number): string {
   try {
-    const j = JSON.parse(body) as { message?: string; details?: string; hint?: string };
-    return [j.message, j.details].filter(Boolean).join(' — ') || `HTTP ${status}`;
+    const j = JSON.parse(body) as { code?: string; message?: string; details?: string; hint?: string };
+    // TF010 claim_required: pagamento sem a reserva do servidor (toda loja na nuvem; db/schema_point_reserva.sql).
+    // TF012 reserved_exceeds_balance: desconto, cancelamento ou cashback deixaria o total abaixo do reservado.
+    // TF012 total_below_paid: o total ficaria abaixo do já pago; o DETAIL vira os valores em reais.
+    const belowPaid = j.code === 'TF012' ? describeTotalBelowPaid(`${j.details ?? ''} ${j.message ?? ''}`) : null;
+    if (belowPaid) return belowPaid;
+    const reservedOver = j.code === 'TF012' ? describeReservedExceeds(`${j.details ?? ''} ${j.message ?? ''}`) : null;
+    if (reservedOver) return reservedOver;
+    const lead = j.code === 'TF010'
+      // O mesmo texto de CLAIM_REQUIRED_ERROR (paymentClaim.ts).
+      ? 'Loja conectada à nuvem: todo pagamento é reservado no servidor antes. Este pagamento chegou sem a reserva: confira na Retaguarda e registre de novo pelo caixa.'
+      : j.code === 'TF012'
+        ? 'Há cobrança reservada nesta comanda: conclua ou libere antes de reduzir o total.'
+        : undefined;
+    return [lead, j.message, j.details].filter(Boolean).join(' — ') || `HTTP ${status}`;
   } catch {
     return body.slice(0, 200) || `HTTP ${status}`;
   }

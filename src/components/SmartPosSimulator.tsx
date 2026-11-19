@@ -94,7 +94,10 @@ export function SmartPosSimulator() {
 
   if (!bus.simulatorOpen) return null;
 
-  const serial = pending?.terminal?.serial_number ?? `${chassis}-SMART-EMB`;
+  // A adquirente da cobrança é a do começo dela (a reserva foi feita para ela): trocar o chassi no meio não
+  // muda o resultado.
+  const chargeChassis = pending?.chassis ?? chassis;
+  const serial = pending?.terminal?.serial_number ?? `${chargeChassis}-SMART-EMB`;
   const canSwitchChassis = !pending || pending.mode === 'SMARTPOS_EMBEDDED';
 
   const approve = () => {
@@ -105,8 +108,8 @@ export function SmartPosSimulator() {
       playDispatchChime();
       bus.finish({
         status: 'APPROVED',
-        acquirer: chassis,
-        acquirer_cnpj: ACQUIRER_CNPJ[chassis],
+        acquirer: chargeChassis,
+        acquirer_cnpj: ACQUIRER_CNPJ[chargeChassis],
         card_brand: brand,
         nsu: generateNsu(),
         authorization_code: generateAuthorizationCode(),
@@ -121,7 +124,7 @@ export function SmartPosSimulator() {
   const decline = (reason = 'Saldo insuficiente') => {
     if (!pending) return;
     playDeniedBuzz();
-    bus.finish({ status: 'DECLINED', acquirer: chassis, reason, terminal_serial: serial, terminal_id: pending.terminal?.id ?? null });
+    bus.finish({ status: 'DECLINED', acquirer: chargeChassis, reason, terminal_serial: serial, terminal_id: pending.terminal?.id ?? null });
   };
 
   const job = bus.printQueue[0];

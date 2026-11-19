@@ -112,7 +112,7 @@ Para a equipe do Tchê Food (não para as lojas): cadastro das lojas, planos, me
 
 Instalar:
 ```bash
-supabase db push                                  # inclui 20261114150000_painel_admin.sql
+supabase db push                                  # inclui 20261119090000_painel_admin.sql
 supabase functions deploy admin-device-account
 ```
 1. Crie a sua conta em Authentication → Users (e-mail e senha, **sem** `tenant_id` no app_metadata).
