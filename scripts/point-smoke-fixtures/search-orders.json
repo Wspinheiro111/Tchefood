@@ -1,0 +1,22 @@
+{
+  "method": "GET",
+  "path": "/v1/orders?external_reference=55555555-5555-4555-8555-555555555555&begin_date=2026-11-14T11%3A50%3A00.000Z&end_date=2026-11-14T12%3A01%3A00.000Z",
+  "status": 200,
+  "at": "2026-11-14T12:00:00.000Z",
+  "body": {
+    "data": [
+      {
+        "id": "ORD01",
+        "type": "point",
+        "external_reference": "55555555-5555-4555-8555-555555555555",
+        "status": "processed",
+        "status_detail": "processed"
+      }
+    ],
+    "paging": {
+      "total": 1,
+      "offset": 0,
+      "limit": 50
+    }
+  }
+}

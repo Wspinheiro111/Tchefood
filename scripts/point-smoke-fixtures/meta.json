@@ -1,0 +1,10 @@
+{
+  "_comment": "Fixtures montados com os mocks de server/payments/mercadoPagoPoint.test.ts e supabase/functions/tests/point-charge.test.ts (não são respostas reais).",
+  "amountCents": 2450,
+  "terminalId": "NEWLAND_N950__N950NCB801293324",
+  "externalReference": "55555555-5555-4555-8555-555555555555",
+  "method": "credit",
+  "createdAt": "2026-11-14T12:00:00.000Z",
+  "simulate": null,
+  "finish": "refund"
+}

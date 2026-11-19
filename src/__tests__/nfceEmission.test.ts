@@ -5,6 +5,7 @@ import { syncOnce } from '../lib/sync/useCloudSync';
 import { serverNfceDocument } from '../lib/nfce';
 import { danfeLines } from '../lib/receipts';
 import type { FetchLike } from '../lib/sync/supabaseSync';
+import { beginLocalClaim, resetClaimLedger } from '../lib/payments/claimLedger';
 
 const st = () => useTcheStore.getState();
 const KEY = '43261112345678000195650010000000421000000427';
@@ -68,6 +69,8 @@ function closeOrder(): string {
   expect(st().dispatchTray(id).ok).toBe(true);
   st().startCheckout(id);
   const order = st().orders.find((o) => o.id === id)!;
+  // Loja na nuvem: o fluxo real pede a reserva ao servidor antes de receber (#49); aqui só o registro local dela.
+  if (st().cloud) beginLocalClaim(`k-${id}`, id, null);
   const paid = st().registerPayment({
     orderId: id, amount: order.remaining_balance, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK',
     acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: `k-${id}`, item_ids: [],
@@ -80,7 +83,10 @@ function closeOrder(): string {
 const order = (id: string) => st().orders.find((o) => o.id === id)!;
 const doc = (body: unknown): NfceEmitOutcome => parseEmitResponse(200, JSON.stringify(body));
 
-beforeEach(() => st().resetDemo());
+beforeEach(() => {
+  resetClaimLedger();
+  st().resetDemo();
+});
 
 describe('resposta da emit-nfce', () => {
   it('autorizada só com authorized=true, chave e protocolo', () => {
@@ -254,6 +260,8 @@ describe('fechamento da conta com a loja na nuvem', () => {
     useTcheStore.setState({ outbox: [], pullStatus: { last_pull_at: new Date().toISOString(), last_error: null, cloud_staff_unknown: 0 } });
     const urls: string[] = [];
     const f: FetchLike = async (url) => {
+      // A rodada também lê os estornos de outros aparelhos (#49): aqui só conta a emit-nfce.
+      if (!url.includes('/functions/v1/emit-nfce')) return { ok: true, status: 200, text: async () => '[]' };
       urls.push(url);
       return { ok: true, status: 200, text: async () => JSON.stringify(authorizedBody()) };
     };
