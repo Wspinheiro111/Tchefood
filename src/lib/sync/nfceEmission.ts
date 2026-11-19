@@ -16,9 +16,9 @@
  *  - Falha de rede ou do servidor não muda o status da nota: só a mensagem e a próxima
  *    tentativa.
  */
-import type { NfceCallProblem, NfceCloudRecord, NfceCloudStatus, NfceDanfePayload, Order, SyncEvent } from '../../types';
+import type { NfceCallProblem, NfceCloudRecord, NfceCloudStatus, NfceDanfePayload, NfceIssuer, Order, SyncEvent } from '../../types';
 import { toCents } from '../money';
-import { isValidNfceQrCodeContent } from '../nfce';
+import { isValidNfceQrCodeContent, serverNfceDocument, type ServerNfceFields } from '../nfce';
 import { recordKeys, type FetchLike, type SyncConfig } from './supabaseSync';
 
 const DOC_STATUSES: ReadonlyArray<NfceCloudStatus> = ['processing', 'authorized', 'rejected', 'contingency', 'cancelled'];
@@ -64,6 +64,8 @@ export interface NfceDocumentOutcome {
   danfe_path: string | null;
   issued_at: string | null;
   payload: NfceDanfePayload | null;
+  /** Emitente gravado no servidor junto do payload transmitido (nunca o cadastro deste aparelho). */
+  issuer: NfceIssuer | null;
   message: string | null;
 }
 
@@ -109,6 +111,8 @@ export function parseDanfePayload(value: unknown): NfceDanfePayload | null {
     if (typeof numero !== 'number' || !Number.isInteger(numero) || numero < 1) return null;
     if (typeof qty !== 'number' || !Number.isFinite(qty) || qty <= 0) return null;
     if (!codigo || !descricao || !un || unit === null || bruto === null) return null;
+    // Mesma conta da emit-nfce (e do trigger dos itens): round(quantidade em milésimos × unitário em centavos / 1000).
+    if (Math.round((Math.round(qty * 1000) * Math.round(unit * 100)) / 1000) !== Math.round(bruto * 100)) return null;
     items.push({ numero_item: numero, codigo_produto: codigo, descricao, unidade_comercial: un, quantidade_comercial: qty, valor_unitario_comercial: unit, valor_bruto: bruto });
   }
   const formas: NfceDanfePayload['formas_pagamento'] = [];
@@ -138,6 +142,21 @@ export function parseDanfePayload(value: unknown): NfceDanfePayload | null {
     out.cpf_destinatario = cpf;
   }
   return out;
+}
+
+/** Emitente devolvido pelo servidor: só passa inteiro (nome, razão social, CNPJ de 14, UF de 2). */
+export function parseNfceIssuer(value: unknown): NfceIssuer | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  const name = text(v.name, 150);
+  const legal = text(v.legal_name, 200);
+  const cnpj = text(v.cnpj, 14);
+  const city = text(v.city, 100);
+  const state = text(v.state, 2);
+  const ie = v.state_registration === null || v.state_registration === undefined ? null : text(v.state_registration, 20);
+  if (!name || !legal || !cnpj || !/^[0-9A-Z]{14}$/.test(cnpj) || !city || !state || !/^[A-Z]{2}$/.test(state)) return null;
+  if (v.state_registration !== null && v.state_registration !== undefined && ie === null) return null;
+  return { name, legal_name: legal, cnpj, state_registration: ie, city, state };
 }
 
 /**
@@ -186,6 +205,7 @@ export function parseEmitResponse(httpStatus: number, body: string): NfceEmitOut
       danfe_path: danfeRaw && /^\/[A-Za-z0-9_./-]+$/.test(danfeRaw) && !danfeRaw.includes('..') && !danfeRaw.startsWith('//') ? danfeRaw : null,
       issued_at: issuedRaw && !Number.isNaN(Date.parse(issuedRaw)) ? issuedRaw : null,
       payload: parseDanfePayload(r.payload),
+      issuer: parseNfceIssuer(r.issuer),
       message: docMessage,
     };
   }
@@ -256,28 +276,44 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
   }
   if (!canNfceTransition(base.status, outcome.status) || (base.environment && base.environment !== outcome.environment)) {
     // Resposta atrasada não regride uma situação mais confiável (ex.: autorizada → processamento).
+    // Autorizada ainda sem DANFE imprimível continua consultando (só leitura), no mesmo limite.
+    if (base.status === 'authorized' && missingPrintData(base)) {
+      const printAttempts = (base.print_attempts ?? 0) + 1;
+      const more = printAttempts < NFCE_PRINT_DATA_MAX_ATTEMPTS;
+      return { ...base, attempts, print_attempts: printAttempts, next_attempt_at: more ? new Date(nowMs + nfceBackoffMs(printAttempts)).toISOString() : null, updated_at: ts };
+    }
     const done = base.status === 'authorized' || base.status === 'cancelled';
     return { ...base, attempts, next_attempt_at: done ? null : retryAt, updated_at: ts };
   }
-  // Autorizada sem tudo o que o DANFE precisa: consulta (só leitura) com intervalo crescente, até um limite.
-  // Contador próprio, a partir da primeira autorização: tentativas de emissão não gastam este limite.
-  const missing = outcome.status === 'authorized' && missingPrintData({ ...base, ...outcome, payload: outcome.payload ?? base.payload, qrcode_url: outcome.qrcode_url ?? base.qrcode_url, issued_at: outcome.issued_at ?? base.issued_at });
-  const printAttempts = missing ? (base.status === 'authorized' ? (base.print_attempts ?? 0) : 0) + 1 : 0;
+  // Chave nova (ex.: rejeitada e corrigida com outra numeração): nada da nota anterior completa esta.
+  const keyChanged = !!outcome.access_key && !!base.access_key && outcome.access_key !== base.access_key;
+  const carry = keyChanged
+    ? { protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, issued_at: null, payload: null, issuer: null }
+    : base;
+  const merged = {
+    status: outcome.status,
+    environment: outcome.environment,
+    access_key: outcome.access_key ?? base.access_key,
+    protocol: outcome.protocol ?? (outcome.status === 'authorized' || outcome.status === 'cancelled' ? carry.protocol : null),
+    number: outcome.number ?? carry.number,
+    series: outcome.series ?? carry.series,
+    qrcode_url: outcome.qrcode_url ?? carry.qrcode_url,
+    danfe_path: outcome.danfe_path ?? carry.danfe_path,
+    issued_at: outcome.issued_at ?? carry.issued_at,
+    payload: outcome.payload ?? carry.payload,
+    // Emitente de nota já autorizada (mesma chave) fica como chegou: o servidor também não o deixa mudar.
+    issuer: (base.status === 'authorized' || base.status === 'cancelled') && !keyChanged && carry.issuer ? carry.issuer : (outcome.issuer ?? carry.issuer ?? null),
+  };
+  // Autorizada sem DANFE imprimível (falta dado ou o dado não confere com a chave): consulta (só leitura)
+  // com intervalo crescente, até um limite. Contador próprio, a partir da primeira autorização.
+  const missing = outcome.status === 'authorized' && missingPrintData(merged);
+  const printAttempts = missing ? (base.status === 'authorized' && !keyChanged ? (base.print_attempts ?? 0) : 0) + 1 : 0;
   const printPolling = missing && printAttempts < NFCE_PRINT_DATA_MAX_ATTEMPTS;
   const polling = outcome.status === 'processing' || outcome.status === 'contingency' || printPolling;
   const nextAt = printPolling ? new Date(nowMs + nfceBackoffMs(printAttempts)).toISOString() : retryAt;
   return {
     ...base,
-    status: outcome.status,
-    environment: outcome.environment,
-    access_key: outcome.access_key ?? base.access_key,
-    protocol: outcome.protocol ?? (outcome.status === 'authorized' || outcome.status === 'cancelled' ? base.protocol : null),
-    number: outcome.number ?? base.number,
-    series: outcome.series ?? base.series,
-    qrcode_url: outcome.qrcode_url ?? base.qrcode_url,
-    danfe_path: outcome.danfe_path ?? base.danfe_path,
-    issued_at: outcome.issued_at ?? base.issued_at,
-    payload: outcome.payload ?? base.payload,
+    ...merged,
     message: outcome.message,
     problem: null,
     attempts,
@@ -287,9 +323,13 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
   };
 }
 
-/** Nota autorizada sem os dados do servidor que o DANFE da bobina exige. */
-export function missingPrintData(rec: Pick<NfceCloudRecord, 'protocol' | 'qrcode_url' | 'issued_at' | 'payload'>): boolean {
-  return !rec.protocol || !rec.qrcode_url || !rec.issued_at || !rec.payload;
+/**
+ * Nota autorizada cujo DANFE da bobina não sai: falta dado do servidor ou o dado não confere
+ * (QR, número/série, modelo, emitente com a chave). Mesma regra da impressão (serverNfceDocument),
+ * então o que não imprime pode ser consultado de novo (fila e botão).
+ */
+export function missingPrintData(rec: ServerNfceFields): boolean {
+  return serverNfceDocument(rec) === null;
 }
 
 /** Comandas com evento ainda na fila ou recusado: não estão inteiras na nuvem. */
@@ -364,6 +404,18 @@ export function dueNfceCalls(state: NfceQueueState, nowMs: number, limit = 3): A
     .sort((a, b) => a.closed.localeCompare(b.closed))
     .slice(0, limit)
     .map(({ orderId, mode }) => ({ orderId, mode }));
+}
+
+/**
+ * A chamada que esta comanda pede agora, conferida de novo no estado atual (situação, fila,
+ * recusados, registro e botão). A rodada usa antes de cada chamada: a lista escolhida no
+ * começo pode ter mudado durante a chamada anterior (comanda reaberta, evento novo na fila).
+ */
+export function nfceCallNow(state: NfceQueueState, orderId: string, nowMs: number): NfceCallMode | null {
+  const order = state.orders.find((o) => o.id === orderId);
+  if (!order) return null;
+  const pending = ordersWithPendingEvents([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]);
+  return nfceCall(order, state.nfceCloud?.[orderId], pending, (state.nfceForced ?? []).includes(orderId), nowMs);
 }
 
 export function dueNfceOrders(state: NfceQueueState, nowMs: number, limit = 3): string[] {

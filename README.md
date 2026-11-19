@@ -121,7 +121,7 @@ supabase functions deploy emit-nfce
 ```sql
 UPDATE tenants SET focus_nfe_token = '<token de homologação da Focus>' WHERE id = '<tenant_id>';
 ```
-CNPJ, IE, regime tributário, certificado A1 e CSC ficam no cadastro da empresa no painel da Focus (a Focus assina a nota e o QR Code). `FOCUS_AMBIENTE` fica sem valor (homologação) até a loja ter certificado e CSC de produção.
+CNPJ, IE, regime tributário, certificado A1 e CSC ficam no cadastro da empresa no painel da Focus (a Focus assina a nota e o QR Code). O cabeçalho do DANFE da bobina (nome, razão social, IE, cidade, UF) sai do emitente que a `emit-nfce` grava em `nfce_documents.issuer` junto do payload, na transmissão, a partir de `tenants` no servidor (migration `20261119090000_nfce_emitente.sql`, aplicada à mão): mantenha `tenants` igual ao cadastro da Focus. Sem esses dados (ou documento anterior à migration), o aparelho não imprime a bobina e indica o DANFE da Focus. `FOCUS_AMBIENTE` fica sem valor (homologação) até a loja ter certificado e CSC de produção.
 
 ## Banco de dados
 `db/schema_purchases.sql` (rodar depois do `schema.sql`): `suppliers`, `purchase_invoices` (`UNIQUE (tenant_id, access_key)`), `purchase_invoice_items`, `stock_movements` (somente inserção), `supplier_product_links` e as colunas `cost_price`, `stock_quantity`, `barcode` em `products`.
@@ -165,7 +165,7 @@ Sem `TCHEFOOD_PG`, o teste é pulado.
 
 ## O que ainda é simulado
 - Stone Connect / PlugPag: sem credenciais, as cobranças caem no simulador visual (`MockTerminalDriver`). Com `window.StoneBridge`/`window.PlugPagBridge` presentes, os drivers usam o hardware. O cliente Stone Connect 2.0 está pronto em `server/`, mas falta o servidor (rotas de cobrança e webhook) e a credencial de parceiro.
-- NFC-e: o app ainda gera payload e DANFE localmente em **homologação**; a emissão real está pronta em `supabase/functions/emit-nfce`, mas as telas ainda não chamam a função e ela precisa do token Focus, certificado A1 e CSC cadastrados na Focus.
+- NFC-e: na loja ligada à nuvem as telas emitem pela `supabase/functions/emit-nfce` (homologação); falta o token Focus, o certificado A1 e o CSC cadastrados na Focus. A demonstração continua simulando a nota no aparelho.
 - Balança: a leitura pela Web Serial segue o protocolo Toledo/Filizola, mas não foi testada numa balança física; sem cabo, use o simulador ou o peso digitado.
 - Barril: a leitura real é digitada (balança de barril ou medidor de vazão); não há integração com medidor físico.
 - Fichas: o QR Code sai no simulador de bobina; na impressora real o comando de QR do ESC/POS ainda precisa ser ligado ao layout da ficha.

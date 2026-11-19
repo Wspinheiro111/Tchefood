@@ -122,4 +122,17 @@ describe('supabase/migrations', () => {
       expect(['OWNER', ...inDb].sort(), perm).toEqual([...roles].sort());
     }
   });
+  it('emitente da NFC-e (PR #55): coluna issuer e guarda que o mantém imutável depois de autorizada, na última versão de tchefood_nfce_guard', () => {
+    const defines = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes('CREATE OR REPLACE FUNCTION tchefood_nfce_guard('));
+    expect(defines.at(-1)).toBe('20261119090000_nfce_emitente.sql');
+    const sql = readFileSync(join(MIGRATIONS, '20261119090000_nfce_emitente.sql'), 'utf8');
+    expect(sql).toContain('ALTER TABLE nfce_documents ADD COLUMN IF NOT EXISTS issuer JSONB');
+    expect(sql).toContain('NEW.issuer IS DISTINCT FROM OLD.issuer');
+    // Mantém todas as regras da versão original.
+    for (const rule of ["TG_OP = 'DELETE'", "(OLD.status = 'authorized'  AND NEW.status = 'cancelled')", 'NEW.reference IS DISTINCT FROM OLD.reference', 'NEW.payload IS DISTINCT FROM OLD.payload OR NEW.access_key IS DISTINCT FROM OLD.access_key']) {
+      expect(sql, rule).toContain(rule);
+    }
+    // Vem depois da última já publicada na main.
+    expect(files.at(-1)).toBe('20261119090000_nfce_emitente.sql');
+  });
 });

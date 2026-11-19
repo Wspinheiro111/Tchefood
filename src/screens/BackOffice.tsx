@@ -419,7 +419,7 @@ function AuditCenter() {
   );
 }
 
-function NfceList() {
+export function NfceList() {
   const orders = useTcheStore((s) => s.orders);
   const tables = useTcheStore((s) => s.tables);
   const cloud = useTcheStore(isRealFiscalStore);
@@ -432,16 +432,23 @@ function NfceList() {
   return (
     <div className="space-y-2">
       {closed.length === 0 && <p className="rounded-2xl bg-surface p-6 text-center text-slate-500">Feche uma conta (saldo R$ 0,00) para gerar a NFC-e modelo 65.</p>}
-      {closed.map((o) => (
+      {closed.map((o) => {
+        const rec = (records ?? {})[o.id];
+        // Loja real: número e chave só do documento do servidor; a chave local de antes da nuvem é simulada.
+        const serverKey = rec && (rec.status === 'authorized' || rec.status === 'contingency' || rec.status === 'cancelled') ? rec.access_key : null;
+        const key = cloud ? serverKey : o.nfce_key;
+        const title = key ? `NFC-e nº ${Number(key.slice(25, 34))}` : cloud && o.nfce_key ? 'Nota simulada — sem emissão fiscal' : 'NFC-e';
+        return (
         <button key={o.id} onClick={() => setOpen(o.id)} className="flex w-full items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-surface p-4 text-left">
           <div className="min-w-0">
-            <div className="font-bold">{o.nfce_key ? `NFC-e nº ${(records ?? {})[o.id]?.number ?? Number(o.nfce_key.slice(25, 34))}` : 'NFC-e'} · {tables.find((t) => t.id === o.table_id)?.label}</div>
-            {o.nfce_key && <div className="truncate font-mono text-xs text-slate-500">{o.nfce_key}</div>}
-            <div className="text-xs text-slate-500">{o.closed_at ? new Date(o.closed_at).toLocaleString('pt-BR') : ''} · {cloud ? nfceCloudLabel(o, (records ?? {})[o.id], false) : o.nfce_status}</div>
+            <div className="font-bold">{title} · {tables.find((t) => t.id === o.table_id)?.label}</div>
+            {key && <div className="truncate font-mono text-xs text-slate-500">{key}</div>}
+            <div className="text-xs text-slate-500">{o.closed_at ? new Date(o.closed_at).toLocaleString('pt-BR') : ''} · {cloud ? nfceCloudLabel(o, rec, false) : o.nfce_status}</div>
           </div>
           <div className="text-right font-black tabular-nums text-verde">{formatBRL(o.total_amount)}</div>
         </button>
-      ))}
+        );
+      })}
       {open && <NfceViewer orderId={open} onClose={() => setOpen(null)} />}
     </div>
   );

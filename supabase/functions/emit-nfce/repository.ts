@@ -14,7 +14,7 @@ export interface SupabaseLike {
 }
 
 const DOC_COLUMNS =
-  'id, tenant_id, order_id, reference, environment, status, payload_hash, access_key, protocol, number, series, qrcode_url, danfe_path, xml_path, sefaz_status, sefaz_message, offline_contingency, transmissions, payload, issued_at:payload->>data_emissao';
+  'id, tenant_id, order_id, reference, environment, status, payload_hash, access_key, protocol, number, series, qrcode_url, danfe_path, xml_path, sefaz_status, sefaz_message, offline_contingency, transmissions, payload, issuer, issued_at:payload->>data_emissao';
 
 function check(result: { data: Query; error: { message: string; code?: string } | null }, what: string): Query {
   if (result.error) throw new Error(`Falha ao ${what}: ${result.error.message}`);
@@ -35,7 +35,7 @@ export function supabaseNfceRepository(db: SupabaseLike): NfceRepository {
       );
       if (!order) return null;
       const [tenant, items, payments] = await Promise.all([
-        db.from('tenants').select('id, cnpj, state, focus_nfe_token').eq('id', tenantId).maybeSingle(),
+        db.from('tenants').select('id, cnpj, state, focus_nfe_token, name, legal_name, state_registration, city').eq('id', tenantId).maybeSingle(),
         db
           .from('order_items')
           .select('id, order_id, product_id, quantity, unit_price, modifiers_unit_price, total_item_price, meat_doneness, status, created_at')
@@ -81,11 +81,11 @@ export function supabaseNfceRepository(db: SupabaseLike): NfceRepository {
       return check(result, 'reservar o documento NFC-e');
     },
 
-    async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown): Promise<NfceDocumentRow | null> {
+    async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown, issuer: unknown): Promise<NfceDocumentRow | null> {
       return check(
         await db
           .from('nfce_documents')
-          .update({ status: 'processing', payload_hash: payloadHash, payload, transmissions: expectedTransmissions + 1, sefaz_message: null })
+          .update({ status: 'processing', payload_hash: payloadHash, payload, issuer, transmissions: expectedTransmissions + 1, sefaz_message: null })
           .eq('id', id)
           .eq('status', 'rejected')
           .eq('transmissions', expectedTransmissions)

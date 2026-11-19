@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { useTcheStore, type CloudSession } from '../store/useTcheStore';
-import { dueNfceCalls, dueNfceOrders, nextNfceRecord, parseEmitResponse, requestNfceEmission, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
+import { dueNfceCalls, dueNfceOrders, nextNfceRecord, nfceCallNow, parseDanfePayload, parseEmitResponse, requestNfceEmission, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
 import { syncOnce } from '../lib/sync/useCloudSync';
 import { serverNfceDocument } from '../lib/nfce';
 import { danfeLines } from '../lib/receipts';
@@ -39,6 +39,7 @@ const authorizedBody = (over: Record<string, unknown> = {}) => ({
   danfe_path: '/notas_fiscais_consumidor/NFe43261112345678000195650010000000421000000427.html',
   issued_at: ISSUED,
   payload: PAYLOAD,
+  issuer: ISSUER,
   message: null,
   ...over,
 });
@@ -321,22 +322,45 @@ describe('DANFE da nota real', () => {
     expect(c).not.toContain('Protocolo de Autorizacao');
   });
 
-  it('editar o cardápio ou o cadastro da loja depois da autorização não muda o DANFE', async () => {
-    useTcheStore.setState({ cloud: session(st().tenant.id), tenant: { ...st().tenant, cnpj: '12.345.678/0001-95', legal_name: 'RAZAO ORIGINAL' } });
+  it('P1-01 r3: cabeçalho do DANFE vem do emitente gravado no servidor, nunca do cadastro deste aparelho', async () => {
+    // Aparelho B com cadastro desatualizado (mesmo CNPJ, outra razão social e IE).
+    useTcheStore.setState({ cloud: session(st().tenant.id), tenant: { ...st().tenant, cnpj: '12.345.678/0001-95', legal_name: 'RAZAO DESATUALIZADA', state_registration: '999' } });
     const id = closeOrder();
     useTcheStore.setState({ outbox: [], pullStatus: { last_pull_at: new Date().toISOString(), last_error: null, cloud_staff_unknown: 0 } });
-    const f: FetchLike = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(authorizedBody()) });
+    const f: FetchLike = async (url) =>
+      url.includes('/functions/v1/emit-nfce')
+        ? { ok: true, status: 200, text: async () => JSON.stringify(authorizedBody()) }
+        : { ok: true, status: 200, text: async () => '[]' };
     await syncOnce(f);
     const before = danfeLines({ tenant: st().tenant, doc: serverNfceDocument(st().nfceCloud[id]!)!, environment: 'homologacao', showTributos: false }).top.join('\n');
-    expect(before).toContain('RAZAO ORIGINAL');
+    expect(before).toContain('FLIP LTDA');
+    expect(before).not.toContain('RAZAO DESATUALIZADA');
+    expect(st().nfceCloud[id]!.issuer).toEqual(ISSUER);
+    // Editar cardápio e cadastro depois; nova consulta (mesmo documento) e até um emitente diferente
+    // numa resposta posterior não trocam o emitente da nota autorizada.
     useTcheStore.setState({ products: st().products.map((p) => ({ ...p, name: 'NOME NOVO', price: 999, ncm: '99999999' })) });
     useTcheStore.setState({ tenant: { ...st().tenant, name: 'LOJA NOVA', legal_name: 'RAZAO NOVA', state_registration: '111' } });
-    // Nova consulta (mesmo documento) não troca o emitente congelado.
-    st().applyNfceOutcome(id, doc(authorizedBody()));
+    st().applyNfceOutcome(id, doc(authorizedBody({ issuer: { ...ISSUER, legal_name: 'OUTRA' } })));
     const after = danfeLines({ tenant: st().tenant, doc: serverNfceDocument(st().nfceCloud[id]!)!, environment: 'homologacao', showTributos: false }).top.join('\n');
     expect(after).toBe(before);
     expect(after).not.toContain('NOME NOVO');
     expect(after).not.toContain('RAZAO NOVA');
+  });
+
+  it('P1-01 r3: sem emitente do servidor (documento antigo) ou emitente malformado, o DANFE não sai da bobina', async () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const id = closeOrder();
+    useTcheStore.setState({ outbox: [] });
+    st().applyNfceOutcome(id, doc(authorizedBody({ issuer: null })));
+    expect(st().nfceCloud[id]!.issuer).toBeNull();
+    expect(serverNfceDocument(st().nfceCloud[id]!)).toBeNull();
+    // O cadastro local não preenche o que faltou; a nota segue consultável (só leitura).
+    expect(dueNfceCalls(st(), Date.now() + 3_600_000)).toEqual([{ orderId: id, mode: 'consult' }]);
+    expect((doc(authorizedBody({ issuer: { ...ISSUER, cnpj: '123' } })) as { issuer: unknown }).issuer).toBeNull();
+    expect((doc(authorizedBody({ issuer: { ...ISSUER, state: 'Rio Grande' } })) as { issuer: unknown }).issuer).toBeNull();
+    // Chega depois com o emitente: imprime.
+    st().applyNfceOutcome(id, doc(authorizedBody()));
+    expect(serverNfceDocument(st().nfceCloud[id]!)).not.toBeNull();
   });
 
   it('payload incoerente ou malformado é descartado', () => {
@@ -447,5 +471,111 @@ describe('achados da auditoria (rodada 8b171a7)', () => {
     expect(st().nfceCloud[a]).toBeUndefined();
     expect(order(a).nfce_status).toBe('PENDING');
     expect(tenantA).not.toBe('tenant-b');
+  });
+});
+
+describe('achados da auditoria (rodada 68cf69a)', () => {
+  const ready = () => useTcheStore.setState({ outbox: [], syncRejected: [], pullStatus: { last_pull_at: new Date().toISOString(), last_error: null, cloud_staff_unknown: 0 } });
+  const KEY2 = `${KEY.slice(0, 25)}000000043${KEY.slice(34)}`;
+  const QR2 = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY2}|2|2|1|ABCDEF`;
+
+  it('P0-01: comanda que volta a ter evento na fila durante a chamada anterior não é pedida', async () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const a = closeOrder();
+    const b = closeOrder();
+    const events = st().outbox;
+    ready();
+    const asked: string[] = [];
+    const f: FetchLike = async (url, init) => {
+      if (!url.includes('/functions/v1/emit-nfce')) return { ok: true, status: 200, text: async () => '[]' };
+      const id = (JSON.parse(String(init?.body)) as { order_id: string }).order_id;
+      asked.push(id);
+      // Enquanto a primeira chamada espera, a outra comanda ganha evento na fila (ex.: ajuste ainda não subiu).
+      const other = id === a ? b : a;
+      const ev = events.find((e) => e.table === 'orders' && e.row_id === other)!;
+      useTcheStore.setState({ outbox: [ev] });
+      return { ok: true, status: 202, text: async () => JSON.stringify(authorizedBody({ status: 'processing', authorized: false, protocol: null, qrcode_url: null, payload: null, issuer: null })) };
+    };
+    await syncOnce(f);
+    expect(asked).toHaveLength(1);
+    const skipped = asked[0] === a ? b : a;
+    expect(st().nfceCloud[skipped]).toBeUndefined();
+    expect(order(skipped).nfce_status).toBe('PENDING');
+    // Reaberta (não está mais fechada) também não é pedida.
+    useTcheStore.setState({ outbox: [], orders: st().orders.map((o) => (o.id === skipped ? { ...o, status: 'PAYING' as const } : o)) });
+    expect(nfceCallNow(st(), skipped, Date.now())).toBeNull();
+    // Inteira na nuvem e fechada de novo: volta a ser pedida.
+    useTcheStore.setState({ orders: st().orders.map((o) => (o.id === skipped ? { ...o, status: 'CLOSED' as const } : o)) });
+    expect(nfceCallNow(st(), skipped, Date.now())).toBe('emit');
+  });
+
+  it('P2-01: número ou série que não conferem com a chave bloqueiam a bobina e a nota segue consultável', () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const id = closeOrder();
+    ready();
+    st().applyNfceOutcome(id, doc(authorizedBody({ number: 43 })));
+    const rec = st().nfceCloud[id]!;
+    expect(rec.status).toBe('authorized');
+    expect(serverNfceDocument(rec)).toBeNull();
+    expect(rec.next_attempt_at).not.toBeNull();
+    expect(dueNfceCalls(st(), Date.parse(rec.next_attempt_at!) + 1)).toEqual([{ orderId: id, mode: 'consult' }]);
+    expect(st().requestNfceNow(id).ok).toBe(true);
+    expect(dueNfceCalls(st(), Date.now())).toEqual([{ orderId: id, mode: 'consult' }]);
+    // Série divergente também.
+    st().applyNfceOutcome(id, doc(authorizedBody({ series: '2' })));
+    expect(serverNfceDocument(st().nfceCloud[id]!)).toBeNull();
+    // A consulta traz dados coerentes: imprime e para de consultar.
+    st().applyNfceOutcome(id, doc(authorizedBody()));
+    expect(serverNfceDocument(st().nfceCloud[id]!)).not.toBeNull();
+    expect(st().nfceCloud[id]!.next_attempt_at).toBeNull();
+    expect(st().requestNfceNow(id).ok).toBe(false);
+  });
+
+  it('P2-02: resposta regressiva (processamento) numa autorizada sem QR não encerra a busca do QR', () => {
+    const start = nextNfceRecord('o1', undefined, doc(authorizedBody({ qrcode_url: null })), 0);
+    expect(start.status).toBe('authorized');
+    expect(start.next_attempt_at).not.toBeNull();
+    const late = nextNfceRecord('o1', start, doc(authorizedBody({ status: 'processing', authorized: false, protocol: null })), 1000);
+    expect(late.status).toBe('authorized');
+    expect(late.protocol).toBe('143260000000042');
+    expect(late.next_attempt_at).not.toBeNull();
+    expect(late.print_attempts).toBe(2);
+    // Respeita o limite de consultas.
+    let r = late;
+    for (let i = 0; i < 20; i++) r = nextNfceRecord('o1', r, doc(authorizedBody({ status: 'processing', authorized: false, protocol: null })), 2000 + i);
+    expect(r.next_attempt_at).toBeNull();
+    // Autorizada imprimível: a regressiva não agenda nada.
+    const ok = nextNfceRecord('o1', undefined, doc(authorizedBody()), 0);
+    expect(nextNfceRecord('o1', ok, doc(authorizedBody({ status: 'processing', authorized: false, protocol: null })), 1).next_attempt_at).toBeNull();
+  });
+
+  it('P2-03: chave nova não reaproveita payload, QR, protocolo nem emitente da nota anterior', () => {
+    const k1 = nextNfceRecord('o1', undefined, doc(authorizedBody({ status: 'contingency', authorized: false, contingency: true, protocol: null })), 0);
+    expect(k1.payload).not.toBeNull();
+    expect(serverNfceDocument(k1)).not.toBeNull();
+    const k2 = nextNfceRecord('o1', k1, doc(authorizedBody({ access_key: KEY2, qrcode_url: QR2, number: 43, payload: { ...PAYLOAD, valor_total: 99 }, issuer: null })), 1000);
+    expect(k2.access_key).toBe(KEY2);
+    expect(k2.payload).toBeNull();
+    expect(k2.issuer).toBeNull();
+    expect(serverNfceDocument(k2)).toBeNull();
+    expect(k2.next_attempt_at).not.toBeNull();
+    // Sem QR da chave nova, o QR da anterior também não fica.
+    const k2b = nextNfceRecord('o1', k1, doc(authorizedBody({ access_key: KEY2, qrcode_url: null, number: 43 })), 1000);
+    expect(k2b.qrcode_url).toBeNull();
+    // Com o payload e o emitente da chave nova: imprime, com o número da chave nova.
+    const k2c = nextNfceRecord('o1', k2, doc(authorizedBody({ access_key: KEY2, qrcode_url: QR2, number: 43 })), 2000);
+    expect(serverNfceDocument(k2c)?.payload.numero).toBe(43);
+  });
+
+  it('P2-05: item com quantidade × unitário diferente do bruto é recusado; peso e arredondamento legítimos passam', () => {
+    const one = (item: Record<string, unknown>) => {
+      const bruto = item.valor_bruto as number;
+      return parseDanfePayload({ ...PAYLOAD, items: [{ ...PAYLOAD.items[0], ...item }], valor_produtos: bruto, valor_total: bruto, formas_pagamento: [{ forma_pagamento: '01', valor_pagamento: bruto }] });
+    };
+    expect(one({ quantidade_comercial: 2, valor_unitario_comercial: 10, valor_bruto: 32 })).toBeNull();
+    expect(one({ quantidade_comercial: 2, valor_unitario_comercial: 10, valor_bruto: 20 })).not.toBeNull();
+    // 0,347 kg × R$ 59,90 = 20,7853 → R$ 20,79 (mesma conta da emit-nfce).
+    expect(one({ quantidade_comercial: 0.347, valor_unitario_comercial: 59.9, valor_bruto: 20.79 })).not.toBeNull();
+    expect(one({ quantidade_comercial: 0.347, valor_unitario_comercial: 59.9, valor_bruto: 20.78 })).toBeNull();
   });
 });

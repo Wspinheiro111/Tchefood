@@ -22,7 +22,7 @@ import {
   type FocusNfceResponse,
   type NfceDocumentStatus,
 } from './focus.ts';
-import { NfceValidationError, buildNfcePayload, canonicalJson, fiscalIssuedAt, nfceReference, type NfceSource } from './payload.ts';
+import { NfceValidationError, buildNfcePayload, canonicalJson, fiscalIssuedAt, issuerSnapshot, nfceReference, type NfceSource } from './payload.ts';
 
 export interface NfceDocumentRow {
   id: string;
@@ -47,10 +47,13 @@ export interface NfceDocumentRow {
   issued_at: string | null;
   /** Payload congelado que foi transmitido (itens, valores, pagamentos). */
   payload: unknown;
+  /** Emitente gravado junto do payload na transmissão (cadastro da loja no servidor); imutável depois de autorizada. */
+  issuer?: unknown;
 }
 
 export type NewNfceDocument = Pick<NfceDocumentRow, 'tenant_id' | 'order_id' | 'reference' | 'environment' | 'payload_hash'> & {
   payload: unknown;
+  issuer: unknown;
 };
 
 export type ProviderFields = Pick<
@@ -78,7 +81,7 @@ export interface NfceRepository {
    * UPDATE ... SET status='processing', transmissions=expected+1 WHERE id=? AND status='rejected'
    * AND transmissions=expected; null se outra requisição venceu. Cada tentativa tem número único.
    */
-  claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown): Promise<NfceDocumentRow | null>;
+  claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown, issuer: unknown): Promise<NfceDocumentRow | null>;
   /**
    * UPDATE condicionado ao status E à tentativa (transmissions) lidos; null se mudou no meio.
    * Sem a tentativa, um GET atrasado da tentativa anterior gravaria "rejected" sobre um reenvio em curso.
@@ -118,6 +121,8 @@ export interface EmitResponse {
      * cancelada): a tela imprime o DANFE com ele, nunca com o cadastro atual do aparelho.
      */
     payload: unknown;
+    /** Emitente gravado com o payload (mesma regra do payload); a tela não usa o cadastro do aparelho. */
+    issuer: unknown;
     message: string | null;
   };
 }
@@ -150,6 +155,7 @@ function respond(doc: NfceDocumentRow, message?: string | null): EmitResponse {
       danfe_path: doc.danfe_path,
       issued_at: doc.issued_at,
       payload: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.payload ?? null : null,
+      issuer: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.issuer ?? null : null,
       message: message ?? doc.sefaz_message,
     },
   };
@@ -172,6 +178,7 @@ function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict
       danfe_path: null,
       issued_at: null,
       payload: null,
+      issuer: null,
       message,
     },
   };
@@ -288,14 +295,14 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
 
   if (doc) {
     // Rejeitada: a Focus aceita reenviar a mesma referência com o payload corrigido.
-    const claimed = await deps.repo.claimRejected(doc.id, doc.transmissions, payloadHash, payload);
+    const claimed = await deps.repo.claimRejected(doc.id, doc.transmissions, payloadHash, payload, issuerSnapshot(source.tenant));
     if (!claimed) {
       const current = await deps.repo.getDocument(input.tenantId, input.orderId);
       return current ? respond(current, 'Outra solicitação já está emitindo esta NFC-e.') : failure(409, 'conflict', env, 'Documento NFC-e em disputa.');
     }
     doc = claimed;
   } else {
-    const inserted = await deps.repo.insertProcessing({ tenant_id: input.tenantId, order_id: input.orderId, reference, environment: env, payload_hash: payloadHash, payload });
+    const inserted = await deps.repo.insertProcessing({ tenant_id: input.tenantId, order_id: input.orderId, reference, environment: env, payload_hash: payloadHash, payload, issuer: issuerSnapshot(source.tenant) });
     if (!inserted) {
       const current = await deps.repo.getDocument(input.tenantId, input.orderId);
       return current ? respond(current, 'Outra solicitação já está emitindo esta NFC-e.') : failure(409, 'conflict', env, 'Documento NFC-e em disputa.');

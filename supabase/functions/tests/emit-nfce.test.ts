@@ -6,6 +6,7 @@ import {
   NfceValidationError,
   buildNfcePayload,
   fiscalIssuedAt,
+  issuerSnapshot,
   nfceReference,
   paymentGroup,
   toCents,
@@ -15,7 +16,7 @@ import {
 } from '../emit-nfce/payload.ts';
 import { classifyTransmission, createFocusClient, focusEnvironment, normalizeProviderStatus, type FetchLike } from '../emit-nfce/focus.ts';
 import { emitNfce, type NfceDocumentRow, type NfceRepository } from '../emit-nfce/emit.ts';
-import { parseDanfePayload } from '../../../src/lib/sync/nfceEmission.ts';
+import { parseDanfePayload, parseNfceIssuer } from '../../../src/lib/sync/nfceEmission.ts';
 
 const TENANT = '11111111-1111-4111-8111-111111111111';
 const ORDER = '22222222-2222-4222-8222-222222222222';
@@ -24,7 +25,7 @@ const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF
 
 function source(overrides: Partial<NfceSource> = {}): NfceSource {
   return {
-    tenant: { id: TENANT, cnpj: '12345678000195', state: 'RS', focus_nfe_token: 'tok' },
+    tenant: { id: TENANT, cnpj: '12345678000195', state: 'RS', focus_nfe_token: 'tok', name: 'Flip', legal_name: 'FLIP LTDA', state_registration: '0960000000', city: 'Santo Angelo' },
     order: {
       id: ORDER,
       tenant_id: TENANT,
@@ -195,15 +196,15 @@ class MemoryRepo implements NfceRepository {
   async getDocument() {
     return this.doc ? { ...this.doc } : null;
   }
-  async insertProcessing(d: { tenant_id: string; order_id: string; reference: string; environment: 'homologacao' | 'producao'; payload_hash: string | null; payload: unknown }) {
+  async insertProcessing(d: { tenant_id: string; order_id: string; reference: string; environment: 'homologacao' | 'producao'; payload_hash: string | null; payload: unknown; issuer: unknown }) {
     if (this.doc) return null;
     const { payload, ...rest } = d;
     this.doc = { id: 'd1', ...rest, payload, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null, status: 'processing', access_key: null, protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, xml_path: null, sefaz_status: null, sefaz_message: null, offline_contingency: false, transmissions: 1 };
     return { ...this.doc };
   }
-  async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown = {}) {
+  async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown = {}, issuer: unknown = null) {
     if (!this.doc || this.doc.id !== id || this.doc.status !== 'rejected' || this.doc.transmissions !== expectedTransmissions) return null;
-    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, payload, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
+    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, payload, issuer, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
     return { ...this.doc };
   }
   async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
@@ -300,6 +301,31 @@ describe('emitNfce', () => {
     const r2 = await emitNfce({ repo: rej, environment: 'homologacao', focus: f2.focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
     expect(r2.body.status).toBe('rejected');
     expect(r2.body.payload).toBeNull();
+  });
+
+  it('P1-01 r3: emitente gravado com o payload na transmissão, devolvido só com chave e aceito pelo aparelho', async () => {
+    const repo = new MemoryRepo(source());
+    const { focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const deps = { repo, environment: 'homologacao' as const, focus, sha256Hex };
+    const r = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER });
+    const expected = { name: 'Flip', legal_name: 'FLIP LTDA', cnpj: '12345678000195', state_registration: '0960000000', city: 'Santo Angelo', state: 'RS' };
+    expect(repo.doc!.issuer).toEqual(expected);
+    expect(r.body.issuer).toEqual(expected);
+    expect(parseNfceIssuer(JSON.parse(JSON.stringify(r.body.issuer)))).toEqual(expected);
+    // Cadastro mudado depois no servidor: a consulta devolve o emitente gravado, não o novo.
+    repo.src = source({ tenant: { ...source().tenant, legal_name: 'RAZAO NOVA' } });
+    const again = await emitNfce(deps, { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(again.body.issuer).toEqual(expected);
+    // Rejeitada não devolve emitente; o reenvio grava o do cadastro atual com o payload novo.
+    const rej = new MemoryRepo(source());
+    const f2 = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', mensagem_sefaz: 'NCM' } }, { status: 201, body: AUTHORIZED }]);
+    const d2 = { repo: rej, environment: 'homologacao' as const, focus: f2.focus, sha256Hex };
+    expect((await emitNfce(d2, { tenantId: TENANT, orderId: ORDER })).body.issuer).toBeNull();
+    rej.src = source({ tenant: { ...source().tenant, legal_name: 'RAZAO CORRIGIDA' } });
+    const ok = await emitNfce(d2, { tenantId: TENANT, orderId: ORDER });
+    expect((ok.body.issuer as { legal_name: string }).legal_name).toBe('RAZAO CORRIGIDA');
+    // Cadastro do servidor incompleto: sem emitente (o aparelho não imprime; fica o DANFE da Focus).
+    expect(issuerSnapshot({ ...source().tenant, legal_name: null })).toBeNull();
   });
 
   it('falha de rede NÃO vira contingência nem sucesso; a próxima chamada só consulta', async () => {

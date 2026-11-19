@@ -7,7 +7,7 @@ import { useEffect } from 'react';
 import { useTcheStore } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, recordKeys, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
-import { dueNfceCalls, dueNfceOrders, requestNfceEmission } from './nfceEmission';
+import { dueNfceCalls, dueNfceOrders, nfceCallNow, requestNfceEmission } from './nfceEmission';
 import type { CloudSession } from '../../store/useTcheStore';
 import { pendingRelease } from '../payments/claimLedger';
 import type { SyncEvent, UUID } from '../../types';
@@ -154,8 +154,14 @@ async function emitDueNfce(cfg: SyncConfig, session: CloudSession, fetchFn: Fetc
     return st.cloud !== null && st.cloud.tenant_id === session.tenant_id && st.cloud.url === session.url && st.tenant.id === session.tenant_id;
   };
   if (!sameStore()) return;
-  for (const { orderId, mode } of dueNfceCalls(useTcheStore.getState(), Date.now())) {
-    if (!sameStore() || !useTcheStore.getState().orders.some((o) => o.id === orderId && o.tenant_id === session.tenant_id)) return;
+  for (const { orderId } of dueNfceCalls(useTcheStore.getState(), Date.now())) {
+    if (!sameStore()) return;
+    const now = useTcheStore.getState();
+    if (!now.orders.some((o) => o.id === orderId && o.tenant_id === session.tenant_id)) continue;
+    // Elegibilidade conferida de novo logo antes da chamada: durante a chamada anterior a comanda pode
+    // ter sido reaberta ou ganhado evento na fila; aí ela fica para uma rodada em que estiver inteira na nuvem.
+    const mode = nfceCallNow(now, orderId, Date.now());
+    if (!mode) continue;
     const outcome = await requestNfceEmission(cfg, orderId, fetchFn, mode);
     if (!sameStore()) return;
     useTcheStore.getState().applyNfceOutcome(orderId, outcome);
