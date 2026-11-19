@@ -23,6 +23,32 @@ export interface TenantRow {
   cnpj: string;
   state: string | null;
   focus_nfe_token: string | null;
+  name?: string | null;
+  legal_name?: string | null;
+  state_registration?: string | null;
+  city?: string | null;
+}
+
+/** Emitente gravado no documento junto do payload, do cadastro da loja no servidor no momento da transmissão. */
+export interface NfceIssuerSnapshot {
+  name: string;
+  legal_name: string;
+  cnpj: string;
+  state_registration: string | null;
+  city: string;
+  state: string;
+}
+
+/** Retrato do emitente para o DANFE; null se o cadastro do servidor não tem o necessário (aí só o DANFE da Focus). */
+export function issuerSnapshot(tenant: TenantRow): NfceIssuerSnapshot | null {
+  const t = (v: string | null | undefined) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+  const cnpj = (tenant.cnpj ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+  const name = t(tenant.name);
+  const legal = t(tenant.legal_name);
+  const city = t(tenant.city);
+  const state = t(tenant.state)?.toUpperCase() ?? null;
+  if (!name || !legal || !city || !state || !/^[A-Z]{2}$/.test(state) || !/^[0-9A-Z]{14}$/.test(cnpj)) return null;
+  return { name, legal_name: legal, cnpj, state_registration: t(tenant.state_registration), city, state };
 }
 
 export interface OrderRow {

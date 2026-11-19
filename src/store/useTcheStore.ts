@@ -14,6 +14,7 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import type {
+  NfceCloudRecord,
   ActionResult,
   AuditActionType,
   AuditLog,
@@ -93,6 +94,7 @@ import { isTf012Rejection, reservationExceeds, TOTAL_BELOW_PAID } from '../lib/p
 import { localClaim } from '../lib/payments/claimLedger';
 import { ACQUIRER_CNPJ } from '../lib/payments/drivers';
 import { buildAccessKey } from '../lib/nfce';
+import { NFCE_ORDER_STATUS, missingPrintData, nextNfceRecord, nfceEligible, ordersWithPendingEvents, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
 import type { PrinterConfig } from '../services/printer/escposBuilder';
 import { NfeImportError, parsePurchaseNfeXml } from '../lib/nfeImport';
 import { nextPurchaseProductCode, planPurchaseImport, type PurchaseImportPlan, type PurchaseItemDecision } from '../lib/purchaseImport';
@@ -523,6 +525,15 @@ interface DeviceSlice {
    * contas lida antes do acerto não as devolve para "sem acerto". Ausente = [].
    */
   courierSettledRecently?: CourierSettledRecently[];
+  /** NFC-e real (emit-nfce) por comanda, como o servidor respondeu. Ver src/lib/sync/nfceEmission.ts. */
+  nfceCloud: Record<UUID, NfceCloudRecord>;
+  /** Comandas que o operador pediu para emitir/consultar já (botão da tela). */
+  nfceForced: UUID[];
+  /**
+   * Loja da nuvem a que os dados deste aparelho pertencem, mesmo com a sessão
+   * desconectada. Enquanto for a loja atual, a NFC-e é real (servidor), nunca simulada.
+   */
+  cloudTenantId: UUID | null;
 }
 
 interface Actions {
@@ -731,6 +742,10 @@ interface Actions {
    */
   discardLateItemsOrder: (eventId: UUID, opts?: { preview?: boolean }) => ActionResult<{ orderId: UUID; items: Array<{ name: string; quantity: number }> }>;
   setPullError: (message: string, source?: PullSource) => void;
+  /** Grava a resposta da emit-nfce (só com a loja na nuvem) e espelha a situação na comanda. */
+  applyNfceOutcome: (orderId: UUID, outcome: NfceEmitOutcome, nowMs?: number) => ActionResult<NfceCloudRecord>;
+  /** Botão "Emitir / consultar agora": a próxima rodada da sincronização chama a emit-nfce. */
+  requestNfceNow: (orderId: UUID) => ActionResult;
   /** Guarda até onde os estornos de outros aparelhos já foram aplicados aqui (só anda para a frente). */
   setRefundSeq: (seq: number) => void;
   /** Falha (texto) ou sucesso (null) da leitura dos estornos de outros aparelhos (pullStatus.refund_error). */
@@ -923,6 +938,9 @@ function initialDevice(): DeviceSlice {
     pendingCharges: [],
     syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
     pullStatus: EMPTY_PULL_STATUS,
+    nfceCloud: {},
+    nfceForced: [],
+    cloudTenantId: null,
   };
 }
 
@@ -1369,6 +1387,14 @@ export function isValidCnpj(cnpj: string): boolean {
     return r < 2 ? 0 : 11 - r;
   };
   return calc(12) === Number(cnpj[12]) && calc(13) === Number(cnpj[13]);
+}
+
+/**
+ * NFC-e real (servidor) ou simulada (demonstração)? Real quando há sessão da nuvem ou
+ * quando os dados do aparelho são de uma loja da nuvem que só foi desconectada.
+ */
+export function isRealFiscalStore(s: { cloud: CloudSession | null; cloudTenantId?: UUID | null; tenant: { id: UUID } }): boolean {
+  return s.cloud !== null || (s.cloudTenantId != null && s.cloudTenantId === s.tenant.id);
 }
 
 /** A inclusão deste pagamento ainda na fila ou nos recusados deste aparelho (o servidor não a tem). */
@@ -1858,14 +1884,18 @@ export const useTcheStore = create<TcheState>()(
             nfceKeptLog,
           };
         }
-        const nfceSeq = s.nfceSeq + 1;
+        // Loja na nuvem (mesmo desconectada): a NFC-e é real e sai do servidor (emit-nfce)
+        // depois que a conta sobe; até lá fica pendente, sem chave. Demonstração: simulada.
+        const real = isRealFiscalStore(s);
+        const nfceSeq = real ? s.nfceSeq : s.nfceSeq + 1;
         return {
           order: {
             ...recalculated,
             status: 'CLOSED',
             closed_at: ts,
-            nfce_status: 'AUTORIZADA',
-            nfce_key: buildAccessKey({ cnpj: s.tenant.cnpj, issuedAt: new Date(ts), number: nfceSeq }),
+            // Nuvem: uma nota do servidor que já tem chave (ex.: contingência) continua a mesma; o servidor é idempotente por comanda.
+            nfce_status: real ? (recalculated.nfce_key ? recalculated.nfce_status : 'PENDING') : 'AUTORIZADA',
+            nfce_key: real ? recalculated.nfce_key ?? null : buildAccessKey({ cnpj: s.tenant.cnpj, issuedAt: new Date(ts), number: nfceSeq }),
           },
           orderItems: paidItems,
           nfceSeq,
@@ -4725,6 +4755,9 @@ export const useTcheStore = create<TcheState>()(
             managerPinFailures: 0,
             managerPinLockedUntil: null,
             nfceSeq: 1,
+            nfceCloud: {},
+            nfceForced: [],
+            cloudTenantId: linkedCloud ? tenantId : null,
             syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
             pullStatus: EMPTY_PULL_STATUS,
           });
@@ -4744,11 +4777,19 @@ export const useTcheStore = create<TcheState>()(
             const settling = courierSettleBlocksStoreChange(get());
             if (settling) return fail(settling.replace('trocar a loja deste aparelho', 'desconectar da nuvem'));
           }
-          // Desconectar guarda a loja que estava ligada, também no aparelho que veio de uma versão
-          // anterior sem o vínculo gravado (GPT, rodada 11 do PR #54).
-          set(session
-            ? { cloud: session, cloudLinkedTenantId: session.tenant_id }
-            : { cloud: null, cloudLinkedTenantId: get().cloud?.tenant_id ?? get().cloudLinkedTenantId ?? null });
+          // Desconectar (session null) não volta a loja para demonstração: cloudTenantId fica.
+          // Aparelho atualizado com sessão já salva (cloudTenantId ainda null): a loja vem da sessão que sai.
+          // cloudLinkedTenantId (acerto sem nuvem recusado) segue a mesma regra e também vale para o aparelho
+          // que veio de uma versão anterior sem o vínculo gravado (GPT, rodada 11 do PR #54).
+          set((s) =>
+            session
+              ? { cloud: session, cloudTenantId: session.tenant_id, cloudLinkedTenantId: session.tenant_id }
+              : {
+                  cloud: null,
+                  cloudTenantId: s.cloudTenantId ?? s.cloud?.tenant_id ?? null,
+                  cloudLinkedTenantId: s.cloud?.tenant_id ?? s.cloudLinkedTenantId ?? null,
+                },
+          );
           return { ok: true, data: undefined };
         },
 
@@ -4837,6 +4878,9 @@ export const useTcheStore = create<TcheState>()(
             managerPinFailures: 0,
             managerPinLockedUntil: null,
             nfceSeq: 1,
+            nfceCloud: {},
+            nfceForced: [],
+            cloudTenantId: tenantId,
             syncStatus: { last_success_at: null, last_error: null, last_error_at: null, blocked_event_id: null },
             pullStatus: { last_pull_at: ts, last_error: null, cloud_staff_unknown: 0 },
           });
@@ -5313,6 +5357,45 @@ export const useTcheStore = create<TcheState>()(
         setRefundError: (message) =>
           set((s) => ((s.pullStatus?.refund_error ?? null) === message ? {} : { pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), refund_error: message } })),
         setRefundSeq: (seq) => set((s) => ((s.pullStatus?.refund_seq ?? 0) >= seq ? {} : { pullStatus: { ...(s.pullStatus ?? EMPTY_PULL_STATUS), refund_seq: seq } })),
+
+        applyNfceOutcome: (orderId, outcome, nowMs = Date.now()) => {
+          const state = get();
+          if (!state.cloud || state.cloud.tenant_id !== state.tenant.id) return fail('Loja sem nuvem: a NFC-e real não se aplica.');
+          const order = state.orders.find((o) => o.id === orderId);
+          if (!order || order.status !== 'CLOSED') return fail('Comanda não encontrada ou não encerrada.');
+          const prev = (state.nfceCloud ?? {})[orderId];
+          const next = nextNfceRecord(orderId, prev, outcome, nowMs);
+          // Emitente: só o que o servidor gravou junto do payload transmitido (nextNfceRecord); o cadastro
+          // deste aparelho nunca entra no DANFE real.
+          const record: NfceCloudRecord = next;
+          // Situação fiscal da comanda só muda pelo documento (o upload ignora nfce_status/nfce_key).
+          const fiscalChanged = record.status !== null && record.status !== (prev?.status ?? null);
+          const keyed = record.status === 'authorized' || record.status === 'contingency' || record.status === 'cancelled';
+          const mirrored: Order | null =
+            fiscalChanged || (keyed && record.access_key && record.access_key !== order.nfce_key)
+              ? { ...order, nfce_status: NFCE_ORDER_STATUS[record.status!], nfce_key: keyed && record.access_key ? record.access_key : order.nfce_key }
+              : null;
+          set((s) => ({
+            nfceCloud: { ...(s.nfceCloud ?? {}), [orderId]: record },
+            nfceForced: (s.nfceForced ?? []).filter((id) => id !== orderId),
+            orders: mirrored ? s.orders.map((o) => (o.id === orderId ? mirrored : o)) : s.orders,
+          }));
+          return { ok: true, data: record };
+        },
+
+        requestNfceNow: (orderId) => {
+          const state = get();
+          if (!state.cloud) return fail('Conecte a loja à nuvem para emitir a NFC-e real.');
+          const order = state.orders.find((o) => o.id === orderId);
+          if (!order) return fail('Comanda não encontrada.');
+          const rec = (state.nfceCloud ?? {})[orderId];
+          if (rec?.status === 'cancelled' || (rec?.status === 'authorized' && !missingPrintData(rec))) return fail('Esta NFC-e já tem situação final no servidor.');
+          const pending = ordersWithPendingEvents([...state.outbox, ...(state.syncRejected ?? []).map((r) => r.event)]);
+          if (pending.has(orderId)) return fail('A conta ainda não terminou de subir para a nuvem (ou tem evento recusado). A NFC-e sai depois disso.');
+          if (!nfceEligible(order, pending, rec)) return fail('Esta comanda não tem NFC-e a emitir.');
+          set((s) => ({ nfceForced: [...(s.nfceForced ?? []).filter((id) => id !== orderId), orderId] }));
+          return { ok: true, data: undefined };
+        },
 
         ackSyncedEvents: (eventIds) => {
           if (eventIds.length === 0) return;
@@ -6941,15 +7024,16 @@ export const useTcheStore = create<TcheState>()(
       onRehydrateStorage: () => () => {
         // Com o fallback síncrono (localStorage), este callback roda ainda dentro de
         // create(), antes de useTcheStore existir; adiamos para depois da atribuição.
+        // Sessão salva antes de cloudTenantId existir: a loja dos dados é a da sessão.
         // Aparelho de uma versão anterior, ligado à nuvem, sem o vínculo gravado: grava agora
         // (GPT, rodada 11 do PR #54).
-        queueMicrotask(() => {
-          const s = useTcheStore.getState();
-          useTcheStore.setState({
+        queueMicrotask(() =>
+          useTcheStore.setState((s) => ({
             hydrated: true,
+            cloudTenantId: s.cloudTenantId ?? (s.cloud && s.cloud.tenant_id === s.tenant.id ? s.cloud.tenant_id : null),
             ...(s.cloud && s.cloudLinkedTenantId === undefined ? { cloudLinkedTenantId: s.cloud.tenant_id } : {}),
-          });
-        });
+          })),
+        );
       },
     },
   ),

@@ -8,7 +8,8 @@
  * - Cada pagamento aprovado da rachadinha vira uma entrada em formas_pagamento
  *   com tipo_integracao = 1 (tpIntegra — pagamento integrado TEF/SmartPOS).
  */
-import type { Order, OrderItem, Payment, Product, Tenant } from '../types';
+import type { NfceDanfePayload, NfceIssuer, Order, OrderItem, Payment, Product, Tenant } from '../types';
+import type { DanfeDoc } from './receipts';
 import { allocateCents, fromCents, toCents } from './money';
 import { sha1Hex } from './sha1';
 
@@ -320,5 +321,55 @@ export function buildNfce(params: {
     tributos_federais: fromCents(fed),
     tributos_estaduais: fromCents(est),
     payload,
+  };
+}
+
+/** O que o servidor (emit-nfce) devolveu de uma NFC-e real; ver NfceCloudRecord em types.ts. */
+export interface ServerNfceFields {
+  status: 'processing' | 'authorized' | 'rejected' | 'contingency' | 'cancelled' | null;
+  access_key: string | null;
+  protocol: string | null;
+  number: number | null;
+  series: string | null;
+  qrcode_url: string | null;
+  issued_at: string | null;
+  payload: NfceDanfePayload | null;
+  issuer?: NfceIssuer | null;
+}
+
+/**
+ * DANFE da NFC-e real, montado só com o que o servidor devolveu: o payload transmitido
+ * (itens, valores, pagamentos, CPF) mais chave, protocolo, número, série, data de emissão
+ * e QR Code. Nada vem do cadastro atual do aparelho, que pode ter mudado depois da nota.
+ * Só para autorizada (com protocolo) ou contingência, com QR Code da SEFAZ para esta
+ * chave; senão null (não imprime). Tributos aproximados não foram enviados: ficam zero e o
+ * DANFE não os mostra (showTributos: false).
+ */
+export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_url: string }) | null {
+  const authorized = server.status === 'authorized';
+  if (!authorized && server.status !== 'contingency') return null;
+  const key = server.access_key;
+  if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key) || !server.issued_at || !server.payload) return null;
+  if (authorized && !server.protocol) return null;
+  const parsed = parseAccessKey(key);
+  // Número, série e modelo devolvidos precisam ser os da chave (modelo 65 = NFC-e).
+  if (parsed.modelo !== '65') return null;
+  if (server.number !== null && server.number !== parsed.numero) return null;
+  if (server.series !== null && (!/^\d{1,3}$/.test(server.series) || Number(server.series) !== parsed.serie)) return null;
+  // Emitente: o CNPJ transmitido e o congelado precisam ser os da chave; senão, só o DANFE da Focus.
+  if (!server.issuer || server.issuer.cnpj !== parsed.cnpj || server.payload.cnpj_emitente !== parsed.cnpj) return null;
+  return {
+    access_key: key,
+    protocol: authorized ? server.protocol! : '',
+    issued_at: server.issued_at,
+    qr_url: server.qrcode_url!,
+    tributos_federais: 0,
+    tributos_estaduais: 0,
+    issuer: server.issuer,
+    payload: {
+      ...server.payload,
+      numero: parsed.numero,
+      serie: parsed.serie,
+    },
   };
 }
