@@ -97,7 +97,8 @@ describe('supabase/migrations', () => {
     }
     // O painel administrativo (lojas e mensalidades) vem depois da última já publicada na main (a do
     // delivery pelo servidor, #57): data anterior fica fora do `supabase db push` normal.
-    expect(idx('schema_painel_admin.sql')).toBe(files.length - 1);
+    // Só a migration do emitente da NFC-e (PR #55) vem depois dele, por ser mais nova.
+    expect(idx('schema_painel_admin.sql')).toBe(files.length - 2);
     expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_pin_equipe_trava.sql'));
     // A trava do PIN da equipe refaz tchefood_check_pin, tchefood_save_staff e tchefood_start_store
     // (versão de schema_equipe.sql) e usa a mesma chave da conciliação do cashback: é a última que as define.
@@ -124,5 +125,18 @@ describe('supabase/migrations', () => {
       const inDb = m![1]!.trim() === 'FALSE' ? [] : [...m![1]!.matchAll(/'([A-Z]+)'/g)].map((x) => x[1]);
       expect(['OWNER', ...inDb].sort(), perm).toEqual([...roles].sort());
     }
+  });
+  it('emitente da NFC-e (PR #55): coluna issuer e guarda que o mantém imutável depois de autorizada, na última versão de tchefood_nfce_guard', () => {
+    const defines = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes('CREATE OR REPLACE FUNCTION tchefood_nfce_guard('));
+    expect(defines.at(-1)).toBe('20261119100000_nfce_emitente.sql');
+    const sql = readFileSync(join(MIGRATIONS, '20261119100000_nfce_emitente.sql'), 'utf8');
+    expect(sql).toContain('ALTER TABLE nfce_documents ADD COLUMN IF NOT EXISTS issuer JSONB');
+    expect(sql).toContain('NEW.issuer IS DISTINCT FROM OLD.issuer');
+    // Mantém todas as regras da versão original.
+    for (const rule of ["TG_OP = 'DELETE'", "(OLD.status = 'authorized'  AND NEW.status = 'cancelled')", 'NEW.reference IS DISTINCT FROM OLD.reference', 'NEW.payload IS DISTINCT FROM OLD.payload OR NEW.access_key IS DISTINCT FROM OLD.access_key']) {
+      expect(sql, rule).toContain(rule);
+    }
+    // Vem depois da última já publicada na main.
+    expect(files.at(-1)).toBe('20261119100000_nfce_emitente.sql');
   });
 });

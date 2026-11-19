@@ -22,7 +22,7 @@ import {
   type FocusNfceResponse,
   type NfceDocumentStatus,
 } from './focus.ts';
-import { NfceValidationError, buildNfcePayload, canonicalJson, fiscalIssuedAt, nfceReference, type NfceSource } from './payload.ts';
+import { NfceValidationError, buildNfcePayload, canonicalJson, fiscalIssuedAt, issuerSnapshot, nfceReference, type NfceSource } from './payload.ts';
 
 export interface NfceDocumentRow {
   id: string;
@@ -43,10 +43,17 @@ export interface NfceDocumentRow {
   sefaz_message: string | null;
   offline_contingency: boolean;
   transmissions: number;
+  /** data_emissao do payload transmitido (lido de payload->>data_emissao); a tela imprime no DANFE. */
+  issued_at: string | null;
+  /** Payload congelado que foi transmitido (itens, valores, pagamentos). */
+  payload: unknown;
+  /** Emitente gravado junto do payload na transmissão (cadastro da loja no servidor); imutável depois de autorizada. */
+  issuer?: unknown;
 }
 
 export type NewNfceDocument = Pick<NfceDocumentRow, 'tenant_id' | 'order_id' | 'reference' | 'environment' | 'payload_hash'> & {
   payload: unknown;
+  issuer: unknown;
 };
 
 export type ProviderFields = Pick<
@@ -74,7 +81,7 @@ export interface NfceRepository {
    * UPDATE ... SET status='processing', transmissions=expected+1 WHERE id=? AND status='rejected'
    * AND transmissions=expected; null se outra requisição venceu. Cada tentativa tem número único.
    */
-  claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown): Promise<NfceDocumentRow | null>;
+  claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown, issuer: unknown): Promise<NfceDocumentRow | null>;
   /**
    * UPDATE condicionado ao status E à tentativa (transmissions) lidos; null se mudou no meio.
    * Sem a tentativa, um GET atrasado da tentativa anterior gravaria "rejected" sobre um reenvio em curso.
@@ -94,7 +101,7 @@ export interface EmitDeps {
 export interface EmitResponse {
   httpStatus: number;
   body: {
-    status: NfceDocumentStatus | 'invalid' | 'not_found' | 'conflict';
+    status: NfceDocumentStatus | 'invalid' | 'not_found' | 'conflict' | 'none';
     /** true somente com protocolo de autorização da SEFAZ. */
     authorized: boolean;
     /** Emitida em contingência offline e ainda não efetivada na SEFAZ. */
@@ -107,6 +114,15 @@ export interface EmitResponse {
     series: string | null;
     qrcode_url: string | null;
     danfe_path: string | null;
+    /** data_emissao enviada à SEFAZ (null antes da primeira transmissão). */
+    issued_at: string | null;
+    /**
+     * Payload transmitido, só para nota com chave da SEFAZ (autorizada, contingência,
+     * cancelada): a tela imprime o DANFE com ele, nunca com o cadastro atual do aparelho.
+     */
+    payload: unknown;
+    /** Emitente gravado com o payload (mesma regra do payload); a tela não usa o cadastro do aparelho. */
+    issuer: unknown;
     message: string | null;
   };
 }
@@ -137,12 +153,15 @@ function respond(doc: NfceDocumentRow, message?: string | null): EmitResponse {
       series: doc.series,
       qrcode_url: doc.qrcode_url,
       danfe_path: doc.danfe_path,
+      issued_at: doc.issued_at,
+      payload: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.payload ?? null : null,
+      issuer: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.issuer ?? null : null,
       message: message ?? doc.sefaz_message,
     },
   };
 }
 
-function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict', environment: FocusEnvironment, message: string, reference: string | null = null): EmitResponse {
+function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict' | 'none', environment: FocusEnvironment, message: string, reference: string | null = null): EmitResponse {
   return {
     httpStatus,
     body: {
@@ -157,6 +176,9 @@ function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict
       series: null,
       qrcode_url: null,
       danfe_path: null,
+      issued_at: null,
+      payload: null,
+      issuer: null,
       message,
     },
   };
@@ -204,6 +226,7 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
 async function reconcile(deps: EmitDeps, doc: NfceDocumentRow, token: string): Promise<EmitResponse> {
   const result = await deps.focus(token).query(doc.reference);
   if (!result.ok) {
+    if (doc.status === 'authorized') return respond(doc, `A NFC-e segue autorizada; a consulta do QR Code na Focus não respondeu (HTTP ${result.httpStatus || 'sem resposta'}).`);
     const note = result.httpStatus === 404
       ? 'A Focus ainda não reconhece esta referência. A NFC-e continua em processamento; não reemita sem conferir no painel da Focus.'
       : `Consulta inconclusiva (HTTP ${result.httpStatus || 'sem resposta'}). A NFC-e continua em ${doc.status === 'contingency' ? 'contingência' : 'processamento'}.`;
@@ -229,12 +252,23 @@ async function transmit(deps: EmitDeps, doc: NfceDocumentRow, token: string, pay
   return apply(deps, doc, classifyTransmission(result));
 }
 
-export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderId: string }): Promise<EmitResponse> {
+// Sem token não há como consultar a Focus: em consulta devolve o documento gravado como está;
+// fora dela, o token continua obrigatório.
+function consultOnlyWithoutToken(input: { consultOnly?: boolean }, doc: NfceDocumentRow, noToken: () => EmitResponse): EmitResponse {
+  return input.consultOnly ? respond(doc) : noToken();
+}
+
+/**
+ * consultOnly (mode "consult"): só devolve ou consulta na Focus o documento que já existe
+ * (inclusive autorizada sem QR Code). Sem documento responde status "none" e não transmite
+ * nada; rejeitada é devolvida como está, sem reenvio.
+ */
+export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderId: string; consultOnly?: boolean }): Promise<EmitResponse> {
   const env = deps.environment;
   const source = await deps.repo.loadSource(input.tenantId, input.orderId);
   if (!source) return failure(404, 'not_found', env, 'Comanda não encontrada para este estabelecimento.');
   const token = source.tenant.focus_nfe_token?.trim() ?? '';
-  if (!token) return failure(422, 'invalid', env, 'Token Focus NFe do estabelecimento não configurado.');
+  const noToken = () => failure(422, 'invalid', env, 'Token Focus NFe do estabelecimento não configurado.');
 
   let reference: string;
   try {
@@ -247,8 +281,18 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
   if (doc && doc.environment !== env) {
     return failure(409, 'conflict', env, `Esta comanda já tem NFC-e em ${doc.environment}; o servidor está em ${env}. Nada foi transmitido.`, doc.reference);
   }
-  if (doc && (doc.status === 'authorized' || doc.status === 'cancelled')) return respond(doc);
-  if (doc && (doc.status === 'processing' || doc.status === 'contingency')) return reconcile(deps, doc, token);
+  // O documento gravado é devolvido sem token: o token só é exigido para falar com a Focus
+  // (consultar ou transmitir).
+  if (doc && doc.status === 'authorized' && doc.qrcode_url) return respond(doc);
+  if (doc && doc.status === 'cancelled') return respond(doc);
+  // Autorizada sem o QR Code assinado: consulta a Focus (só GET) para completar o DANFE.
+  if (doc && doc.status === 'authorized') return token ? reconcile(deps, doc, token) : consultOnlyWithoutToken(input, doc, noToken);
+  if (doc && (doc.status === 'processing' || doc.status === 'contingency')) return token ? reconcile(deps, doc, token) : consultOnlyWithoutToken(input, doc, noToken);
+  if (input.consultOnly) {
+    if (doc) return respond(doc);
+    return failure(404, 'none', env, 'Esta comanda não tem NFC-e no servidor. Nada foi transmitido.', reference);
+  }
+  if (!token) return noToken();
 
   let payload;
   try {
@@ -261,14 +305,14 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
 
   if (doc) {
     // Rejeitada: a Focus aceita reenviar a mesma referência com o payload corrigido.
-    const claimed = await deps.repo.claimRejected(doc.id, doc.transmissions, payloadHash, payload);
+    const claimed = await deps.repo.claimRejected(doc.id, doc.transmissions, payloadHash, payload, issuerSnapshot(source.tenant));
     if (!claimed) {
       const current = await deps.repo.getDocument(input.tenantId, input.orderId);
       return current ? respond(current, 'Outra solicitação já está emitindo esta NFC-e.') : failure(409, 'conflict', env, 'Documento NFC-e em disputa.');
     }
     doc = claimed;
   } else {
-    const inserted = await deps.repo.insertProcessing({ tenant_id: input.tenantId, order_id: input.orderId, reference, environment: env, payload_hash: payloadHash, payload });
+    const inserted = await deps.repo.insertProcessing({ tenant_id: input.tenantId, order_id: input.orderId, reference, environment: env, payload_hash: payloadHash, payload, issuer: issuerSnapshot(source.tenant) });
     if (!inserted) {
       const current = await deps.repo.getDocument(input.tenantId, input.orderId);
       return current ? respond(current, 'Outra solicitação já está emitindo esta NFC-e.') : failure(409, 'conflict', env, 'Documento NFC-e em disputa.');

@@ -1,16 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { AlertTriangle, BarChart3, CalendarCheck, Bike, CreditCard, Gauge, Beer, Cloud, FileText, Gift, LayoutGrid, MessageCircle, PackageOpen, Printer, Receipt, Settings, ShieldAlert, Smartphone, Store, UserCog, Users, UtensilsCrossed } from 'lucide-react';
-import { isManagerRole, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
+import { isManagerRole, isRealFiscalStore, selectCan, selectCurrentUser, useTcheStore } from '../store/useTcheStore';
 import { ReportHeader } from '../components/Brand';
-import { formatBRL } from '../lib/money';
+import { formatBRL, toCents } from '../lib/money';
 import { kegStatus } from '../lib/kegs';
 import { AUDIT_LABEL, declinedInShift, formatShiftStart, loadServerPointPayments, reconciliationMovements, shiftKpis, waiterSplit, whatsappAlertText, type ShiftPeriod } from '../lib/reports';
 import { listPointPayments, listPointRefunds, type ServerPointPayment } from '../lib/payments/pointPaymentsServer';
 import { PointRefunds, RefundReopenedOrders } from '../components/PointRefund';
 import { useShiftPeriod } from '../lib/useShiftStart';
 import { Badge, Btn, toast } from '../components/ui';
-import { NfceViewer } from './NfceViewer';
+import { NfceViewer, nfceCloudLabel } from './NfceViewer';
 import { PrinterSettings } from './PrinterSettings';
 import { CrmPanel } from './CrmPanel';
 import { PurchaseImport } from './PurchaseImport';
@@ -422,24 +422,36 @@ function AuditCenter() {
   );
 }
 
-function NfceList() {
+export function NfceList() {
   const orders = useTcheStore((s) => s.orders);
   const tables = useTcheStore((s) => s.tables);
-  const closed = orders.filter((o) => o.status === 'CLOSED' && o.nfce_key).sort((a, b) => (b.closed_at ?? '').localeCompare(a.closed_at ?? ''));
+  const cloud = useTcheStore(isRealFiscalStore);
+  const records = useTcheStore((s) => s.nfceCloud);
+  // Nuvem: toda conta fechada com valor tem NFC-e real (mesmo pendente, sem chave ainda).
+  const closed = orders
+    .filter((o) => o.status === 'CLOSED' && (o.nfce_key || (cloud && toCents(o.total_amount) > 0 && o.nfce_status !== 'DISPENSADA')))
+    .sort((a, b) => (b.closed_at ?? '').localeCompare(a.closed_at ?? ''));
   const [open, setOpen] = useState<string | null>(null);
   return (
     <div className="space-y-2">
       {closed.length === 0 && <p className="rounded-2xl bg-surface p-6 text-center text-slate-500">Feche uma conta (saldo R$ 0,00) para gerar a NFC-e modelo 65.</p>}
-      {closed.map((o) => (
+      {closed.map((o) => {
+        const rec = (records ?? {})[o.id];
+        // Loja real: número e chave só do documento do servidor; a chave local de antes da nuvem é simulada.
+        const serverKey = rec && (rec.status === 'authorized' || rec.status === 'contingency' || rec.status === 'cancelled') ? rec.access_key : null;
+        const key = cloud ? serverKey : o.nfce_key;
+        const title = key ? `NFC-e nº ${Number(key.slice(25, 34))}` : cloud && o.nfce_key ? 'Nota simulada — sem emissão fiscal' : 'NFC-e';
+        return (
         <button key={o.id} onClick={() => setOpen(o.id)} className="flex w-full items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-surface p-4 text-left">
           <div className="min-w-0">
-            <div className="font-bold">NFC-e nº {Number(o.nfce_key!.slice(25, 34))} · {tables.find((t) => t.id === o.table_id)?.label}</div>
-            <div className="truncate font-mono text-xs text-slate-500">{o.nfce_key}</div>
-            <div className="text-xs text-slate-500">{o.closed_at ? new Date(o.closed_at).toLocaleString('pt-BR') : ''} · {o.nfce_status}</div>
+            <div className="font-bold">{title} · {tables.find((t) => t.id === o.table_id)?.label}</div>
+            {key && <div className="truncate font-mono text-xs text-slate-500">{key}</div>}
+            <div className="text-xs text-slate-500">{o.closed_at ? new Date(o.closed_at).toLocaleString('pt-BR') : ''} · {cloud ? nfceCloudLabel(o, rec, false) : o.nfce_status}</div>
           </div>
           <div className="text-right font-black tabular-nums text-verde">{formatBRL(o.total_amount)}</div>
         </button>
-      ))}
+        );
+      })}
       {open && <NfceViewer orderId={open} onClose={() => setOpen(null)} />}
     </div>
   );

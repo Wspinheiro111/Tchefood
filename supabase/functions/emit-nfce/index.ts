@@ -43,12 +43,17 @@ Deno.serve(async (req: Request) => {
   if (!/^Bearer\s+\S+$/.test(authHeader)) return json({ authorized: false, message: 'Sessão ausente.' }, 401);
 
   let orderId: unknown;
+  let mode: unknown;
   try {
-    orderId = (await req.json())?.order_id;
+    const body = await req.json();
+    orderId = body?.order_id;
+    mode = body?.mode ?? 'emit';
   } catch {
     return json({ authorized: false, message: 'JSON inválido.' }, 400);
   }
   if (typeof orderId !== 'string' || !UUID.test(orderId)) return json({ authorized: false, message: 'order_id inválido.' }, 400);
+  // consult: só lê/consulta o documento que já existe; nunca cria nem retransmite.
+  if (mode !== 'emit' && mode !== 'consult') return json({ authorized: false, message: 'mode inválido.' }, 400);
 
   const url = Deno.env.get('SUPABASE_URL')!;
   // 1) Prova de tenant pelo RLS: com o JWT do chamador, a comanda só aparece se for do tenant dele.
@@ -70,7 +75,7 @@ Deno.serve(async (req: Request) => {
         focus: (token) => createFocusClient({ environment, token, fetch: (input, init) => fetch(input, init) }),
         sha256Hex,
       },
-      { tenantId: owned.tenant_id, orderId },
+      { tenantId: owned.tenant_id, orderId, consultOnly: mode === 'consult' },
     );
     return json(result.body, result.httpStatus);
   } catch (error) {
