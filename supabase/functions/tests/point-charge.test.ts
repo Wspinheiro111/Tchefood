@@ -473,6 +473,13 @@ describe('point-charge: criação', () => {
     }
   });
 
+  it('lista do Mercado Pago que não responde: recusa no prazo (424), nada reservado (auditoria #59 r2, a verificar)', async () => {
+    const { ctx, store, calls } = setup({ terminals: () => new Promise(() => undefined) });
+    await expect(startCharge({ ...ctx, terminalCheckTimeoutMs: 20 }, terminal, input())).rejects.toMatchObject({ code: 'mp_unavailable', httpStatus: 424 });
+    expect(calls.create).toHaveLength(0);
+    expect(store.rows).toHaveLength(0);
+  });
+
   it('repetição de chave já gravada não depende da lista (a cobrança já está na Point)', async () => {
     let listed = 0;
     let fail = false;

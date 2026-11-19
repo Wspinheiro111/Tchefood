@@ -254,6 +254,8 @@ export interface ChargeContext {
   payments: PaymentDetailsSource;
   /** Relógio monotônico local (ms), só para medir quanto a barreira demorou a responder. Padrão: performance.now(). */
   monotonicMs?: () => number;
+  /** Prazo da conferência da Point na lista do Mercado Pago (padrão TERMINAL_CHECK_TIMEOUT_MS). */
+  terminalCheckTimeoutMs?: number;
 }
 
 export interface CreateInput {
@@ -687,12 +689,21 @@ async function applyOrder(ctx: ChargeContext, row: TerminalChargeRow, order: Pay
  * A maquininha da cobrança nova precisa estar, pela lista lida agora no Mercado Pago, na conta da loja e no modo PDV.
  * Recusa antes de reservar o saldo e de enviar: nada foi cobrado. As respostas 409/424 o aparelho trata como recusa.
  */
-async function assertTerminalReady(provider: ChargeContext['provider'], serial: string): Promise<void> {
+/** Prazo da lista inteira (cada página já tem o seu no provedor): a criação não fica esperando o Mercado Pago. */
+export const TERMINAL_CHECK_TIMEOUT_MS = 10_000;
+
+async function assertTerminalReady(provider: ChargeContext['provider'], serial: string, timeoutMs = TERMINAL_CHECK_TIMEOUT_MS): Promise<void> {
   let list: Awaited<ReturnType<ChargeContext['provider']['listTerminals']>>;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    list = await provider.listTerminals();
+    list = await Promise.race([
+      provider.listTerminals(),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), timeoutMs); }),
+    ]);
   } catch {
     throw new ChargeInputError('mp_unavailable', 'O Mercado Pago não confirmou a maquininha agora. Nada foi cobrado: tente de novo.', 424);
+  } finally {
+    clearTimeout(timer);
   }
   const found = list.find((t) => t.externalTerminalId === serial);
   if (!found) throw new ChargeInputError('terminal_not_ready', 'Esta Point não está na conta do Mercado Pago da loja. Nada foi cobrado: confira na aba Point Smart.', 409);
@@ -710,7 +721,7 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
     return replyFor(await resume(ctx, existing, true));
   }
   // Cobrança nova: só reserva e envia se a Point está agora na conta do Mercado Pago da loja e no modo PDV.
-  await assertTerminalReady(ctx.provider, terminal.serial_number);
+  await assertTerminalReady(ctx.provider, terminal.serial_number, ctx.terminalCheckTimeoutMs);
   const fresh = {
     tenant_id: terminal.tenant_id,
     idempotency_key: req.idempotency_key,

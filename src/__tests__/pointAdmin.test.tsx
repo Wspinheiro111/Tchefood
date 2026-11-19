@@ -9,7 +9,7 @@ import { PointAdmin } from '../screens/admin/PointAdmin';
 import { OFFLINE_OLD_SYSTEM_TEXT, OfflineCloudBanner } from '../components/OfflineCloudBanner';
 import { fetchPointTerminals, pairingState, parseTerminalsReply, type PointListing } from '../lib/payments/pointTerminals';
 import { cloudUnreachable, resetCloudReachability, trackCloudReachability } from '../lib/sync/cloudReachability';
-import { syncOnce } from '../lib/sync/useCloudSync';
+import { PROBE_EVERY_MS, probeCloudIfIdle, syncOnce, useCloudSync } from '../lib/sync/useCloudSync';
 
 const st = () => useTcheStore.getState();
 const MP_ID = 'NEWLAND_N950__N950NCB801293324';
@@ -302,5 +302,57 @@ describe('aviso de loja em nuvem sem internet', () => {
     await act(async () => { await syncOnce(async () => ({ ok: true, status: 200, text: async () => '[]' }), { forcePull: true }); });
     expect(cloudUnreachable()).toBe(false);
     expect(screen.queryByText(OFFLINE_OLD_SYSTEM_TEXT)).toBeNull();
+  });
+
+  it('fila vazia e leitura recente: a verificação leve acha a nuvem fora sem venda nem sincronização forçada (auditoria #59 r2 P2-01)', async () => {
+    withCloud();
+    useTcheStore.setState({ outbox: [], pullStatus: { ...(st().pullStatus ?? {}), last_pull_at: new Date().toISOString() } } as never);
+    render(<OfflineCloudBanner online />);
+    const calls: { url: string; method: string; auth: string }[] = [];
+    const via = (fail: boolean) => async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
+      calls.push({ url, method: init.method, auth: init.headers.Authorization ?? '' });
+      expect(init.body).toBeUndefined(); // não grava nada
+      if (fail) throw new TypeError('Failed to fetch');
+      return { ok: true, status: 200, text: async () => '[]' };
+    };
+    // Nenhum contato com a nuvem há mais de 15 s e o Supabase fora: a verificação acha e o aviso aparece.
+    await act(async () => { await probeCloudIfIdle(via(true), Date.now() + PROBE_EVERY_MS); });
+    expect(calls).toEqual([{ url: 'https://x.supabase.co/rest/v1/tenants?select=id&limit=1', method: 'GET', auth: 'Bearer jwt' }]);
+    expect(screen.getByRole('alert').textContent).toContain(OFFLINE_OLD_SYSTEM_TEXT);
+    // Contato recente (a própria verificação): não repete antes do intervalo.
+    await act(async () => { await probeCloudIfIdle(via(true), Date.now() + 1_000); });
+    expect(calls).toHaveLength(1);
+    // A nuvem volta: a próxima verificação tira o aviso (401 de sessão vencida também prova que ela responde).
+    await act(async () => { await probeCloudIfIdle(via(false), Date.now() + PROBE_EVERY_MS); });
+    expect(screen.queryByText(OFFLINE_OLD_SYSTEM_TEXT)).toBeNull();
+    // Sem loja na nuvem não verifica nada.
+    act(() => { useTcheStore.setState({ cloud: null } as never); });
+    await probeCloudIfIdle(via(true), Date.now() + 10 * PROBE_EVERY_MS);
+    expect(calls).toHaveLength(2);
+  });
+
+  it('o laço da nuvem faz a verificação sozinho: Supabase mudo, nenhuma resposta, aviso antes do prazo da rodada (auditoria #59 r2 P2-01)', async () => {
+    vi.useFakeTimers();
+    try {
+      withCloud();
+      const urls: string[] = [];
+      // Nenhum pedido responde nem falha (servidor mudo): a rodada fica esperando o prazo dela (30 s).
+      vi.stubGlobal('fetch', vi.fn((url: string) => {
+        urls.push(new URL(url).pathname + new URL(url).search);
+        return new Promise(() => undefined);
+      }));
+      function Shell() {
+        useCloudSync(true);
+        return <OfflineCloudBanner online />;
+      }
+      render(<Shell />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000 + 10_000 + 1_000); });
+      // A verificação (prazo de 10 s) já achou a nuvem fora, antes de a rodada vencer.
+      expect(urls).toContain('/rest/v1/tenants?select=id&limit=1');
+      expect(cloudUnreachable()).toBe(true);
+      expect(screen.getByRole('alert').textContent).toContain(OFFLINE_OLD_SYSTEM_TEXT);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
