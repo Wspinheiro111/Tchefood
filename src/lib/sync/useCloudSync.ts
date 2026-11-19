@@ -321,11 +321,11 @@ export async function probeCloudIfIdle(fetchFn: FetchLike = browserFetch, now: n
   probing = true;
   try {
     const get = trackCloudReachability(withRequestTimeout(fetchFn, PROBE_TIMEOUT_MS));
-    const res = await get(`${session.url.replace(/\/+$/, '')}/rest/v1/tenants?select=id&limit=1`, {
+    // Só o status importa: o corpo não é lido (auditoria #59 r3 P2-01: corpo pendurado não segura a verificação).
+    await get(`${session.url.replace(/\/+$/, '')}/rest/v1/tenants?select=id&limit=1`, {
       method: 'GET',
       headers: { apikey: session.anon_key, Authorization: `Bearer ${session.access_token}` },
     });
-    await res.text().catch(() => undefined);
   } catch {
     // a falha já ficou registrada em cloudReachability
   } finally {

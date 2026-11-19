@@ -331,6 +331,18 @@ describe('aviso de loja em nuvem sem internet', () => {
     expect(calls).toHaveLength(2);
   });
 
+  it('resposta 200 com corpo que nunca termina não trava a verificação seguinte (auditoria #59 r3 P2-01)', async () => {
+    withCloud();
+    let n = 0;
+    const hanging = async () => { n += 1; return { ok: true, status: 200, text: () => new Promise<string>(() => undefined) }; };
+    const first = probeCloudIfIdle(hanging, Date.now() + PROBE_EVERY_MS);
+    await expect(Promise.race([first.then(() => 'fim'), new Promise((r) => setTimeout(() => r('pendurada'), 200))])).resolves.toBe('fim');
+    expect(cloudUnreachable()).toBe(false);
+    await probeCloudIfIdle(async () => { n += 1; throw new TypeError('Failed to fetch'); }, Date.now() + 2 * PROBE_EVERY_MS);
+    expect(n).toBe(2);
+    expect(cloudUnreachable()).toBe(true);
+  });
+
   it('o laço da nuvem faz a verificação sozinho: Supabase mudo, nenhuma resposta, aviso antes do prazo da rodada (auditoria #59 r2 P2-01)', async () => {
     vi.useFakeTimers();
     try {
