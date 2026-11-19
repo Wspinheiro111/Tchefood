@@ -98,14 +98,17 @@ export function storedOnlyInMemory(k: string): boolean {
 }
 
 /**
- * Cópia no localStorage de uma gravação que o IndexedDB recusou, com o número da gravação ({ seq, v }).
+ * Cópia no localStorage de uma gravação que o IndexedDB recusou, com o número da gravação ({ seq, v, base }).
  * A leitura fica com a mais nova entre o IndexedDB e esta cópia: reabrindo o app com o IndexedDB bom de novo,
  * o estado gravado na cópia não perde para a versão velha que ficou no IndexedDB (GPT, rodada 18 do PR #54).
+ * `base` é a impressão do texto que o IndexedDB tinha quando a cópia foi feita (null: não se sabe): a cópia foi
+ * feita em cima desse texto, então só um texto diferente dele é uma escrita posterior à cópia (GPT, rodada 21).
  */
 const FALLBACK_SUFFIX = '::copia';
 interface Stamped {
   seq: number;
   v: string;
+  base?: string | null;
 }
 let lastSeq = 0;
 const nextSeq = () => (lastSeq = Math.max(lastSeq + 1, Date.now()));
@@ -113,25 +116,37 @@ const seen = (seq: number) => {
   if (seq > lastSeq) lastSeq = seq;
 };
 const memorySeq = new Map<string, number>();
+const memoryBase = new Map<string, string | null>();
+/** Impressão do texto que o IndexedDB tinha na última leitura ou gravação boa desta chave (ausente: não se sabe). */
+const dbKnown = new Map<string, string | null>();
 
 /**
  * No IndexedDB o valor continua sendo o texto puro da chave `k`, como nas versões anteriores (voltar o app
  * para uma versão anterior lê o mesmo registro; GPT, rodada 19 do PR #54). O número da gravação fica numa
  * chave ao lado (`k::seq`), gravada na mesma transação, no formato `<número>:<impressão do texto>`.
  * Se o texto de `k` não bate com a impressão, ele foi gravado por uma versão anterior do app (que não mexe
- * em `k::seq`) depois da última gravação desta versão: é o mais novo e vale mais que qualquer cópia
- * (GPT, rodada 20 do PR #54). Sem `k::seq`, vale 0.
+ * em `k::seq`) depois da última gravação desta versão: é o mais novo, a não ser que haja uma cópia feita em
+ * cima dele (`base`). Sem `k::seq`, vale 0.
  */
 const SEQ_SUFFIX = '::seq';
 interface Candidate extends Stamped {
-  /** Texto gravado por versão que não conhece `k::seq`: vale mais que qualquer número. */
+  /** Texto gravado por versão que não conhece `k::seq`. */
   foreign?: boolean;
 }
-const fingerprint = (v: string): string => {
-  let h = 5381;
-  for (let i = 0; i < v.length; i++) h = ((h << 5) + h + v.charCodeAt(i)) | 0;
-  return (h >>> 0).toString(16) + '.' + v.length;
-};
+/** Duas somas de 53 bits (cyrb53, sementes diferentes) e o tamanho: colisão por acaso é praticamente impossível. */
+function cyrb53(str: string, seed: number): number {
+  let h1 = 0xdeadbeef ^ seed;
+  let h2 = 0x41c6ce57 ^ seed;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+export const fingerprint = (v: string): string => `${cyrb53(v, 0).toString(16)}.${cyrb53(v, 1).toString(16)}.${v.length}`;
 const seqRecord = (seq: number, v: string) => `${seq}:${fingerprint(v)}`;
 /** Lê `k::seq` (texto `<número>:<impressão>`, ou só o número de uma versão intermediária) para o texto `v`. */
 function parseSeq(raw: unknown, v: string): { seq: number; foreign: boolean } {
@@ -159,6 +174,7 @@ function readCopy(k: string): Stamped | null {
 function dropCopy(k: string) {
   memory.delete(k);
   memorySeq.delete(k);
+  memoryBase.delete(k);
   try {
     localStorage.removeItem(k + FALLBACK_SUFFIX);
   } catch {
@@ -170,86 +186,127 @@ async function writeDb(k: string, v: string, seq: number) {
     s.put(seqRecord(seq, v), k + SEQ_SUFFIX);
     return s.put(v, k);
   });
+  dbKnown.set(k, fingerprint(v));
   dropCopy(k);
 }
+
+/** O que o IndexedDB tinha em `k` e `k::seq`, lido na mesma transação (nunca o texto de uma gravação com o número de outra). */
+interface Snapshot {
+  text: unknown;
+  seqRaw: unknown;
+}
+async function readSnapshot(k: string): Promise<Snapshot> {
+  let seqReq: IDBRequest<unknown> | undefined;
+  const text = await tx<unknown>('readonly', (st) => {
+    seqReq = st.get(k + SEQ_SUFFIX) as IDBRequest<unknown>;
+    return st.get(k) as IDBRequest<unknown>;
+  });
+  return { text, seqRaw: seqReq?.result };
+}
+const same = (a: unknown, b: unknown) => (typeof a === 'string' || typeof b === 'string' ? a === b : JSON.stringify(a) === JSON.stringify(b));
+
 /**
- * Cópia mais nova que o IndexedDB e o IndexedDB voltou a funcionar: a cópia entra no IndexedDB (o registro que a
- * versão anterior do app lê), só se ele ainda estiver com número menor, na mesma transação (GPT, rodada 20).
+ * O mais novo entre o IndexedDB (`db`) e o que está fora dele (cópia no localStorage, memória): o IndexedDB com texto
+ * de versão anterior (foreign) vale mais, a não ser que a cópia tenha sido feita em cima desse mesmo texto
+ * (`base`), e então a cópia é posterior; sem texto de versão anterior, vale o número maior, empate para o IndexedDB.
  */
-async function healFromCopy(k: string, copy: Stamped) {
+function pick(db: Candidate | null, outside: Candidate[]): Candidate | null {
+  const newer = outside.reduce<Candidate | null>((a, b) => (a && a.seq >= b.seq ? a : b), null);
+  if (!db) return newer;
+  if (!newer) return db;
+  if (db.foreign) return newer.base === fingerprint(db.v) ? newer : db;
+  return newer.seq > db.seq ? newer : db;
+}
+
+/**
+ * A cópia é mais nova que o IndexedDB e ele voltou a funcionar: a cópia entra no IndexedDB (o registro que a versão
+ * anterior do app lê), na mesma transação em que `k` e `k::seq` são lidos de novo, e só se continuarem exatamente
+ * como na leitura que escolheu a cópia: se outra versão gravou nesse meio tempo, nada é sobrescrito (devolve false e
+ * quem chamou lê de novo; GPT, rodada 21 do PR #54).
+ */
+async function healFromCopy(k: string, copy: Stamped, snap: Snapshot): Promise<boolean> {
+  let applied = false;
   await tx('readwrite', (s) => {
-    const cur = s.get(k + SEQ_SUFFIX);
-    cur.onsuccess = () => {
-      const raw = cur.result as unknown;
-      const n = typeof raw === 'string' ? Number(raw.slice(0, raw.indexOf(':'))) : typeof raw === 'number' ? raw : 0;
-      if (!(n >= copy.seq)) {
+    const text = s.get(k);
+    const seq = s.get(k + SEQ_SUFFIX);
+    seq.onsuccess = () => {
+      if (same(text.result, snap.text) && same(seq.result, snap.seqRaw)) {
         s.put(seqRecord(copy.seq, copy.v), k + SEQ_SUFFIX);
         s.put(copy.v, k);
+        applied = true;
       }
     };
-    return cur;
+    return seq;
   });
-  dropCopy(k);
+  if (applied) {
+    dbKnown.set(k, fingerprint(copy.v));
+    dropCopy(k);
+  }
+  return applied;
 }
 
 export const idbStorage: StateStorage = hasIndexedDB
   ? {
       getItem: async (k) => {
-        let fromDb: Candidate | null = null;
-        let dbFailed = false;
-        try {
-          // Texto e número na mesma transação: nunca o texto de uma gravação com o número de outra.
-          let seqReq: IDBRequest<unknown> | undefined;
-          const text = await tx<unknown>('readonly', (st) => {
-            seqReq = st.get(k + SEQ_SUFFIX) as IDBRequest<unknown>;
-            return st.get(k) as IDBRequest<unknown>;
-          });
-          if (typeof text === 'string') {
-            const r = parseSeq(seqReq?.result, text);
-            fromDb = { seq: r.seq, v: text, foreign: r.foreign };
-          } else {
-            fromDb = unpack(text);
-          }
-        } catch {
-          dbFailed = true;
-        }
-        const copy = readCopy(k);
-        const mem = memory.get(k);
-        const candidates: Candidate[] = [];
-        if (fromDb) candidates.push(fromDb);
-        if (copy) candidates.push(copy);
-        if (mem !== undefined) candidates.push({ seq: memorySeq.get(k) ?? 0, v: mem });
-        if (candidates.length === 0) return dbFailed ? (fallback.getItem(k) as string | null) : null;
-        // O texto de versão anterior vale mais que tudo; senão o número maior; empate: o IndexedDB (ordem acima) fica.
-        const best = candidates.find((c) => c.foreign) ?? candidates.reduce((a, b) => (b.seq > a.seq ? b : a));
-        for (const c of candidates) if (!c.foreign) seen(c.seq);
-        if (!dbFailed && copy && best === copy) {
+        for (let attempt = 0; ; attempt++) {
+          let snap: Snapshot | null = null;
+          let fromDb: Candidate | null = null;
           try {
-            await healFromCopy(k, copy);
+            snap = await readSnapshot(k);
           } catch {
-            // continua só na cópia; a próxima gravação boa tira
+            snap = null;
           }
+          if (snap) {
+            if (typeof snap.text === 'string') {
+              const r = parseSeq(snap.seqRaw, snap.text);
+              fromDb = { seq: r.seq, v: snap.text, foreign: r.foreign };
+              dbKnown.set(k, fingerprint(snap.text));
+            } else {
+              fromDb = unpack(snap.text);
+              dbKnown.set(k, null);
+            }
+          }
+          const copy = readCopy(k);
+          const mem = memory.get(k);
+          const outside: Candidate[] = [];
+          if (copy) outside.push(copy);
+          if (mem !== undefined) outside.push({ seq: memorySeq.get(k) ?? 0, v: mem, base: memoryBase.get(k) });
+          const best = pick(fromDb, outside);
+          if (!best) return snap ? null : (fallback.getItem(k) as string | null);
+          for (const c of [fromDb, ...outside]) if (c && !c.foreign) seen(c.seq);
+          if (snap && copy && best === copy) {
+            try {
+              if (!(await healFromCopy(k, copy, snap)) && attempt < 2) continue;
+            } catch {
+              // continua só na cópia; a próxima gravação boa tira
+            }
+          }
+          return best.v;
         }
-        return best.v;
       },
       setItem: async (k, v) => {
         const seq = nextSeq();
         try {
           await writeDb(k, v, seq);
         } catch {
+          const base = dbKnown.get(k) ?? null;
           try {
-            localStorage.setItem(k + FALLBACK_SUFFIX, JSON.stringify({ seq, v } satisfies Stamped));
+            localStorage.setItem(k + FALLBACK_SUFFIX, JSON.stringify({ seq, v, base } satisfies Stamped));
             memory.delete(k);
             memorySeq.delete(k);
+            memoryBase.delete(k);
           } catch {
             memory.set(k, v);
             memorySeq.set(k, seq);
+            memoryBase.set(k, base);
           }
         }
       },
       removeItem: async (k) => {
         memory.delete(k);
         memorySeq.delete(k);
+        memoryBase.delete(k);
+        dbKnown.delete(k);
         try {
           localStorage.removeItem(k + FALLBACK_SUFFIX);
         } catch {
