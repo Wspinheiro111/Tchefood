@@ -1,10 +1,12 @@
 import type { AdminClient, Overview as OverviewData } from '../lib/api';
 import { dateBr, money, trialDetail } from '../lib/format';
-import { Erro, Numero, useLoad } from './ui';
+import { Erro, Numero, useAutoReload, useLoad } from './ui';
 
 export default function Overview({ client, today, irPara }: { client: AdminClient; today: string; irPara: (aba: 'lojas' | 'cobrancas') => void }) {
-  // Valores com a data do servidor: relê quando o dia muda.
-  const { data, error } = useLoad<OverviewData>(() => client.overview(), [client, today]);
+  // Valores com a data do servidor: relê quando o dia muda, ao voltar para a aba e a cada 5
+  // minutos (pagamento registrado por outro admin aparece sem trocar de tela; P2-02 da rodada 4).
+  const { data, error, reload } = useLoad<OverviewData>(() => client.overview(), [client, today]);
+  useAutoReload(reload);
   if (error) return <Erro>{error}</Erro>;
   if (!data) return <p className="text-sm text-slate-500">Carregando…</p>;
   const s = data.stores;

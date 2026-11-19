@@ -691,6 +691,11 @@ BEGIN
     IF p_due_date IS NOT NULL AND (p_due_date < v_month - 31 OR p_due_date > (v_month + INTERVAL '2 months')::date) THEN
         RAISE EXCEPTION 'TCHEFOOD_ADMIN: vencimento longe do mês da cobrança';
     END IF;
+    -- Nem à mão a mensalidade vence durante o teste grátis (P2-01 da rodada 4 do GPT): senão a
+    -- cobrança nasce vencida e entra na inadimplência de uma loja que ainda não paga.
+    IF p_due_date IS NOT NULL AND v_s.trial_ends_on IS NOT NULL AND p_due_date <= v_s.trial_ends_on THEN
+        RAISE EXCEPTION 'TCHEFOOD_ADMIN: vencimento precisa ser depois do fim do teste (%)', to_char(v_s.trial_ends_on, 'DD/MM/YYYY');
+    END IF;
     v_due := COALESCE(p_due_date, GREATEST(tchefood_admin_due_date(v_month, v_s.billing_day), tchefood_admin_today(),
                                            v_s.trial_ends_on + 1));
     v_link := NULLIF(tchefood_admin_trim(COALESCE(p_payment_link, '')), '');

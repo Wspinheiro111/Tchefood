@@ -865,3 +865,131 @@ describe('revisão 4: avisos da assinatura sobre cobranças já criadas', () => 
 function byDia() {
   return [...document.querySelectorAll('label')].find((l) => l.textContent?.startsWith('Dia de vencimento'))!.querySelector('input')!;
 }
+
+describe('rodada 4 do GPT: visão geral atualizada e falha ao reler a data', () => {
+  const visivel = async () => {
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+  };
+  const ov = (received: number, open: number, overdue: number) => ({
+    today: '2026-11-19', stores: { trial: 0, active: 1, suspended: 0, cancelled: 0, without_subscription: 0 }, mrr: 199, open_amount: open, open_count: open ? 1 : 0,
+    overdue_amount: overdue, overdue_count: overdue ? 1 : 0, received_this_month: received, trials_ending_7d: 0, trials_expired: 0,
+  });
+
+  it('P2-02: pagamento registrado em outra sessão aparece ao voltar para a aba, sem trocar de tela', async () => {
+    let atual = ov(1000, 199, 199);
+    const overview = vi.fn(async () => atual);
+    render(<Overview client={fakeClient({ overview })} today="2026-11-19" irPara={() => {}} />);
+    expect(await screen.findByText('R$ 1.000,00')).toBeTruthy();
+    atual = ov(1199, 0, 0);
+    await visivel();
+    expect(await screen.findByText('R$ 1.199,00')).toBeTruthy();
+    expect(screen.getByText('0 cobrança(s) em aberto, vencidas incluídas')).toBeTruthy();
+    expect(screen.getByText('0 cobrança(s) com vencimento passado')).toBeTruthy();
+  });
+
+  it('P2-02: a visão geral também relê sozinha a cada 5 minutos', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      let atual = ov(1000, 0, 0);
+      const overview = vi.fn(async () => atual);
+      render(<Overview client={fakeClient({ overview })} today="2026-11-19" irPara={() => {}} />);
+      expect(await screen.findByText('R$ 1.000,00')).toBeTruthy();
+      atual = ov(1199, 0, 0);
+      await act(async () => {
+        vi.advanceTimersByTime(5 * 60_000);
+      });
+      expect(await screen.findByText('R$ 1.199,00')).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  const comPainel = (me: () => Response, today = () => '2026-11-19') => {
+    sessionStorage.setItem('tchefood-admin-session', JSON.stringify({ accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() + 3_600_000, email: 'will@x.com', url: 'https://p.supabase.co' }));
+    localStorage.setItem('tchefood-admin-config', JSON.stringify({ url: 'https://p.supabase.co', anonKey: 'k' }));
+    const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { 'Content-Type': 'application/json' } });
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      const fn = String(url).split('/rpc/')[1];
+      if (fn === 'tchefood_admin_me') return me();
+      if (fn === 'tchefood_admin_overview') return json({ ...ov(1000, 0, 0), today: today() });
+      return json(null);
+    }));
+    return json;
+  };
+  const limpar = () => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+    localStorage.clear();
+  };
+
+  it('P2-03: falha 503 ao reler a data com dados na tela mostra aviso; ao voltar a conexão o aviso some e a data é a nova', async () => {
+    let resposta: 'ok19' | 'falha' | 'ok20' = 'ok19';
+    const json = comPainel(() =>
+      resposta === 'falha' ? json({ message: 'Serviço indisponível' }, 503) : json({ user_id: 'u', email: 'will@x.com', name: 'Will', today: resposta === 'ok19' ? '2026-11-19' : '2026-11-20' }),
+      // A visão geral do servidor já está no dia 20 depois da virada.
+      () => (resposta === 'ok19' ? '2026-11-19' : '2026-11-20'),
+    );
+    try {
+      render(<App />);
+      expect(await screen.findByText('Visão geral · 19/11/2026')).toBeTruthy();
+      resposta = 'falha';
+      await visivel();
+      const aviso = await screen.findByRole('alert');
+      expect(aviso.textContent).toMatch(/Não deu para atualizar com o servidor/);
+      expect(aviso.textContent).toMatch(/A data usada ainda é 19\/11\/2026/);
+      resposta = 'ok20';
+      fireEvent.click(within(aviso).getByRole('button', { name: 'Tentar de novo' }));
+      expect(await screen.findByText('Visão geral · 20/11/2026')).toBeTruthy();
+      await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+    } finally {
+      limpar();
+    }
+  });
+
+  it('P2-03: conta recusada (403) numa releitura tira a navegação e os dados antigos', async () => {
+    let negar = false;
+    const json = comPainel(() => (negar ? json({ message: 'TCHEFOOD_ADMIN: acesso restrito à equipe' }, 403) : json({ user_id: 'u', email: 'will@x.com', name: 'Will', today: '2026-11-19' })));
+    try {
+      render(<App />);
+      expect(await screen.findByText('Visão geral · 19/11/2026')).toBeTruthy();
+      expect(screen.getByRole('navigation', { name: 'Seções' })).toBeTruthy();
+      negar = true;
+      await visivel();
+      expect(await screen.findByText(/Esta conta não é da equipe do Tchê Food/)).toBeTruthy();
+      expect(screen.queryByText('Visão geral · 19/11/2026')).toBeNull();
+      expect(screen.queryByRole('navigation', { name: 'Seções' })).toBeNull();
+    } finally {
+      limpar();
+    }
+  });
+});
+
+describe('rodada 4 do GPT: listas também se atualizam sozinhas', () => {
+  it('lojas e cobranças do dia releem ao voltar para a aba e a cada 5 minutos', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const stores = vi.fn(async () => [] as StoreRow[]);
+      const chargesDue = vi.fn(async () => [] as DueCharge[]);
+      render(<Stores client={fakeClient({ stores })} today="2026-11-19" onOpenStore={() => {}} />);
+      render(<Charges client={fakeClient({ chargesDue })} today="2026-11-19" onOpenStore={() => {}} />);
+      await waitFor(() => expect(stores).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(chargesDue).toHaveBeenCalledTimes(1));
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      await waitFor(() => expect(stores).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(chargesDue).toHaveBeenCalledTimes(2));
+      await act(async () => {
+        vi.advanceTimersByTime(5 * 60_000);
+      });
+      await waitFor(() => expect(stores).toHaveBeenCalledTimes(3));
+      await waitFor(() => expect(chargesDue).toHaveBeenCalledTimes(3));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

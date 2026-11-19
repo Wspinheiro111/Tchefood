@@ -517,7 +517,7 @@ function ChargesSection({ client, detail, today, onChanged }: { client: AdminCli
               required
             /></Campo>
           <Campo rotulo="Valor" dica={cortesia ? 'Loja em cortesia: informe o valor.' : `Vazio = ${money(s.monthly_price)}`}><input className="campo" aria-label="Valor" inputMode="decimal" value={valor} onChange={(e) => setValor(e.target.value)} /></Campo>
-          <Campo rotulo="Vencimento" dica={`Vazio = dia ${s.billing_day}, nunca antes de hoje nem antes do fim do teste.`}><input className="campo" type="date" value={vence} onChange={(e) => setVence(e.target.value)} /></Campo>
+          <Campo rotulo="Vencimento" dica={`Vazio = dia ${s.billing_day}, nunca antes de hoje nem antes do fim do teste.`}><input className="campo" aria-label="Vencimento" type="date" min={s.trial_ends_on ? addDays(s.trial_ends_on, 1) : undefined} value={vence} onChange={(e) => setVence(e.target.value)} /></Campo>
           <Campo rotulo="Link do boleto/Pix (Asaas)"><input className="campo" aria-label="Link do boleto/Pix (Asaas)" placeholder="https://…" value={link} onChange={(e) => setLink(e.target.value)} /></Campo>
           <button type="submit" className="btn-primario sm:mt-5" disabled={enviando}>Criar cobrança</button>
         </form>

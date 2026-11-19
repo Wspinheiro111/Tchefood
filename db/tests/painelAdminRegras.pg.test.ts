@@ -133,6 +133,8 @@ const subInput = async (tenant: string, over: Partial<SubscriptionInput> = {}): 
     for (const [initial, ref] of [['TRIAL', 'T'], ['SUSPENDED', 'S']] as const) {
       const t = await admin().createStore(store({ trialDays: initial === 'TRIAL' ? 10 : 0 }));
       if (initial === 'SUSPENDED') sql(`UPDATE store_subscriptions SET status = 'SUSPENDED' WHERE tenant_id = '${t}'`);
+      // Teste já acabado (ainda TRIAL até alguém mudar): só assim outubro e novembro podem vencer à mão.
+      if (initial === 'TRIAL') sql(`UPDATE store_subscriptions SET trial_ends_on = '2026-09-30' WHERE tenant_id = '${t}'`);
       expect((await admin().store(t)).subscription!.status).toBe(initial);
       const oct = await admin().createCharge(t, '2026-10-01', null, '2026-10-10', null);
       const nov = await admin().createCharge(t, '2026-11-01', null, '2026-11-10', null);
@@ -172,6 +174,34 @@ const subInput = async (tenant: string, over: Partial<SubscriptionInput> = {}): 
     expect(sql(`SELECT count(*) FROM store_charges WHERE tenant_id = '${active}'`)).toBe('1');
 
     for (const t of [trialLate, billingLate, todayLate, active]) sql(`UPDATE store_subscriptions SET status = 'CANCELLED' WHERE tenant_id = '${t}'`);
+  });
+
+  it('vencimento à mão nunca dentro do teste grátis (P2-01 da rodada 4); automático e lote sem mudança', async () => {
+    setToday('2026-11-19');
+    // Loja em teste até 30/11/2026, hoje 19/11: vencimento à mão em 10/11 ou 30/11 é recusado.
+    const t = await admin().createStore(store({ trialDays: 11, billingDay: 10 }));
+    expect((await admin().store(t)).subscription!.trial_ends_on).toBe('2026-11-30');
+    await rejects(admin().createCharge(t, '2026-11-01', null, '2026-11-10', null), /depois do fim do teste \(30\/11\/2026\)/);
+    await rejects(admin().createCharge(t, '2026-11-01', null, '2026-11-30', null), /depois do fim do teste/);
+    expect(sql(`SELECT count(*) FROM store_charges WHERE tenant_id = '${t}'`)).toBe('0');
+    expect(sql(`SELECT count(*) FROM platform_admin_audit WHERE tenant_id = '${t}' AND action = 'CHARGE_CREATED'`)).toBe('0');
+    // No dia seguinte ao fim do teste é aceito.
+    const nov = await admin().createCharge(t, '2026-11-01', null, '2026-12-01', null);
+    expect(sql(`SELECT due_date FROM store_charges WHERE id = '${nov}'`)).toBe('2026-12-01');
+    await admin().cancelCharge(nov, 'teste do vencimento automático');
+    // Sem vencimento: o automático continua (dia seguinte ao fim do teste).
+    const auto = await admin().createCharge(t, '2026-11-01', null, null, null);
+    expect(sql(`SELECT due_date FROM store_charges WHERE id = '${auto}'`)).toBe('2026-12-01');
+    // Lote de dezembro: a loja (teste terminado antes de dezembro) entra, vencendo no dia 10.
+    setToday('2026-12-02');
+    await admin().generateMonth('2026-12-01');
+    expect(sql(`SELECT due_date FROM store_charges WHERE tenant_id = '${t}' AND reference_month = '2026-12-01' AND status = 'OPEN'`)).toBe('2026-12-10');
+    // Teste acabado há muito tempo: vencimento à mão no passado continua aceito (cobrança atrasada).
+    setToday('2026-11-19');
+    const old = await admin().createStore(store({ trialDays: 0, billingDay: 5 }));
+    const sep = await admin().createCharge(old, '2026-09-01', null, '2026-09-05', null);
+    expect(sql(`SELECT due_date FROM store_charges WHERE id = '${sep}'`)).toBe('2026-09-05');
+    for (const x of [t, old]) sql(`UPDATE store_subscriptions SET status = 'CANCELLED' WHERE tenant_id = '${x}'`);
   });
 
   it('loja nova: CNPJ de loja feita à mão em minúsculas bloqueia o mesmo CNPJ', async () => {

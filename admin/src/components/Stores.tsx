@@ -3,12 +3,14 @@ import { Plus } from 'lucide-react';
 import type { AdminClient, StoreRow } from '../lib/api';
 import { cnpjMatches, dateBr, dateTimeBr, formatCnpj, money } from '../lib/format';
 import NewStoreForm from './NewStoreForm';
-import { Erro, Selo, useLoad } from './ui';
+import { Erro, Selo, useAutoReload, useLoad } from './ui';
 
 type Filtro = 'todas' | 'TRIAL' | 'ACTIVE' | 'SUSPENDED' | 'CANCELLED' | 'sem' | 'vencidas';
 
 export default function Stores({ client, today, onOpenStore }: { client: AdminClient; today: string; onOpenStore: (id: string) => void }) {
   const { data, error, reload } = useLoad<StoreRow[]>(() => client.stores(), [client, today]);
+  // Vencidas e em aberto de cada loja mudam pela mão de outro admin: relê ao voltar para a aba e a cada 5 minutos.
+  useAutoReload(reload);
   const [filtro, setFiltro] = useState<Filtro>('todas');
   const [busca, setBusca] = useState('');
   const [criando, setCriando] = useState(false);

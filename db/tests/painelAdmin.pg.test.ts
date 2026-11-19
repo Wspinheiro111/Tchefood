@@ -186,10 +186,14 @@ const store = (over: Partial<NewStoreInput> = {}): NewStoreInput => ({
     await rejects(admin().createCharge(tenant, '2026-11-01', null, null, 'http://inseguro.com'), /https/);
     // Criada no dia 5 (antes do vencimento do dia 10).
     setToday('2026-11-05');
-    // Loja em teste até 29/11: sem vencimento, venceria em 30/11 (dia seguinte ao fim do teste);
-    // aqui o vencimento é informado à mão (dia 10) para testar a cobrança vencida.
+    // Loja em teste até 29/11: vencimento à mão no dia 10 cai dentro do teste e é recusado
+    // (P2-01 da rodada 4). Para testar a cobrança vencida de uma loja ainda em TRIAL, o teste
+    // fica como se tivesse acabado em 04/11 só enquanto a cobrança é criada.
     expect(sql(`SELECT tchefood_admin_due_date('2026-11-01', 10)`)).toBe('2026-11-10');
+    await rejects(admin().createCharge(tenant, '2026-11-14', null, '2026-11-10', null), /depois do fim do teste \(29\/11\/2026\)/);
+    sql(`UPDATE store_subscriptions SET trial_ends_on = '2026-11-04' WHERE tenant_id = '${tenant}'`);
     const chargeId = await admin().createCharge(tenant, '2026-11-14', null, '2026-11-10', 'https://www.asaas.com/i/abc');
+    sql(`UPDATE store_subscriptions SET trial_ends_on = '2026-11-29' WHERE tenant_id = '${tenant}'`);
     setToday('2026-11-14');
     let charge = (await admin().store(tenant)).charges[0]!;
     expect(charge).toMatchObject({ id: chargeId, reference_month: '2026-11-01', amount: 199, due_date: '2026-11-10', status: 'OPEN' });

@@ -2,14 +2,14 @@ import { useState } from 'react';
 import { MessageCircle } from 'lucide-react';
 import type { AdminClient, DueCharge } from '../lib/api';
 import { chargeMessage, dateBr, formatPhone, money, monthBr, monthStart, whatsappLink } from '../lib/format';
-import { Aviso, Erro, Selo, errorText, useLoad, useOnVisible } from './ui';
+import { Aviso, Erro, Selo, errorText, useAutoReload, useLoad } from './ui';
 
 // As listas usam a data do servidor (atraso e janela de 3 dias): today nas dependências faz
 // a tela reler quando o dia muda com o painel aberto.
 export default function Charges({ client, today, onOpenStore }: { client: AdminClient; today: string; onOpenStore: (id: string) => void }) {
   const { data, error, reload } = useLoad<DueCharge[]>(() => client.chargesDue(3), [client, today]);
   // Aba que volta a ficar visível relê a lista (pagamento registrado em outra aba, por exemplo).
-  useOnVisible(reload);
+  useAutoReload(reload);
   const [gerando, setGerando] = useState(false);
   const [aviso, setAviso] = useState<string | null>(null);
   const [erro, setErro] = useState<string | null>(null);

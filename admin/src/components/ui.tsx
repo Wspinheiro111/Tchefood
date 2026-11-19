@@ -55,6 +55,20 @@ export function useOnVisible(onVisible: () => void): void {
   }, []);
 }
 
+/**
+ * Indicadores que mudam pela mão de outro admin (pagamento, cobrança nova): relê ao voltar para
+ * a aba e a cada `everyMs` (5 minutos), mesmo sem o dia mudar.
+ */
+export function useAutoReload(reload: () => void, everyMs = 5 * 60_000): void {
+  useOnVisible(reload);
+  const ref = useRef(reload);
+  ref.current = reload;
+  useEffect(() => {
+    const timer = window.setInterval(() => ref.current(), everyMs);
+    return () => window.clearInterval(timer);
+  }, [everyMs]);
+}
+
 export function Erro({ children }: { children: ReactNode }) {
   if (!children) return null;
   return <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">{children}</p>;

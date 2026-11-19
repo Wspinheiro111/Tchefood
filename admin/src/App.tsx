@@ -8,7 +8,8 @@ import Overview from './components/Overview';
 import Stores from './components/Stores';
 import StoreDetail from './components/StoreDetail';
 import Charges from './components/Charges';
-import { useLoad, Erro } from './components/ui';
+import { useLoad, Erro, Aviso } from './components/ui';
+import { dateBr } from './lib/format';
 
 type Aba = 'visao' | 'lojas' | 'cobrancas';
 
@@ -72,6 +73,9 @@ function Painel({ client, email, onLogout }: { client: AdminClient; email: strin
     };
   }, []);
 
+  // O banco recusou a conta numa releitura: some a navegação e o conteúdo antigo.
+  const bloqueado = me.error !== null && ACESSO_NEGADO.has(me.errorStatus ?? -1);
+
   const abrirLoja = (id: string) => {
     setLoja(id);
     setAba('lojas');
@@ -89,6 +93,7 @@ function Painel({ client, email, onLogout }: { client: AdminClient; email: strin
               <span className="ml-2 text-sm font-semibold text-slate-500">Painel</span>
             </span>
           </span>
+          {!bloqueado && (
           <nav className="flex gap-1" aria-label="Seções">
             {(
               [
@@ -110,6 +115,7 @@ function Painel({ client, email, onLogout }: { client: AdminClient; email: strin
               </button>
             ))}
           </nav>
+          )}
           <span className="ml-auto hidden text-sm text-slate-600 sm:inline">{me.data?.name ?? email}</span>
           <button type="button" className="btn-secundario" onClick={onLogout}>
             <LogOut className="h-4 w-4" /> Sair
@@ -117,23 +123,49 @@ function Painel({ client, email, onLogout }: { client: AdminClient; email: strin
         </div>
       </header>
       <main className="mx-auto max-w-6xl space-y-4 px-4 py-6">
-        {me.error && !me.data ? (
+        {me.error && (!me.data || bloqueado) ? (
+          // Sem dados, ou o banco recusou a conta (sessão vencida, fora da equipe, painel
+          // removido): não continua navegando com os dados antigos (P2-03 da rodada 4).
           <ErroEntrada texto={me.error} status={me.errorStatus} onRetry={me.reload} />
         ) : !me.data ? (
           <p className="text-sm text-slate-500">Carregando…</p>
-        ) : aba === 'visao' ? (
-          <Overview client={client} today={me.data.today} irPara={setAba} />
-        ) : aba === 'cobrancas' ? (
-          <Charges client={client} today={me.data.today} onOpenStore={abrirLoja} />
-        ) : loja ? (
-          <StoreDetail client={client} tenantId={loja} today={me.data.today} onBack={() => setLoja(null)} />
         ) : (
-          <Stores client={client} today={me.data.today} onOpenStore={setLoja} />
+          <>
+            {me.error && (
+              // Falha ao reler a data do servidor com dados anteriores na tela: avisa que a data
+              // e os números podem estar velhos até a próxima leitura dar certo.
+              <div role="alert" className="flex flex-wrap items-center gap-2">
+                <Aviso>
+                  Não deu para atualizar com o servidor ({me.error}). A data usada ainda é {dateBr(me.data.today)} e os números podem estar
+                  desatualizados.
+                </Aviso>
+                <button type="button" className="btn-secundario" onClick={me.reload}>
+                  Tentar de novo
+                </button>
+              </div>
+            )}
+            {conteudo(me.data.today)}
+          </>
         )}
       </main>
     </div>
   );
+
+  function conteudo(today: string) {
+    return aba === 'visao' ? (
+      <Overview client={client} today={today} irPara={setAba} />
+    ) : aba === 'cobrancas' ? (
+      <Charges client={client} today={today} onOpenStore={abrirLoja} />
+    ) : loja ? (
+      <StoreDetail client={client} tenantId={loja} today={today} onBack={() => setLoja(null)} />
+    ) : (
+      <Stores client={client} today={today} onOpenStore={setLoja} />
+    );
+  }
 }
+
+/** Status em que o banco recusou a conta: o painel não continua com os dados antigos. */
+const ACESSO_NEGADO = new Set([401, 403, 404]);
 
 /**
  * Falha ao ler quem entrou. 403 = o banco recusou a conta; 404 = a função do painel não existe
