@@ -7,7 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useTcheStore } from '../store/useTcheStore';
 import { PointAdmin } from '../screens/admin/PointAdmin';
 import { OFFLINE_OLD_SYSTEM_TEXT, OfflineCloudBanner } from '../components/OfflineCloudBanner';
-import { fetchPointTerminals, pairingState, parseTerminalsReply } from '../lib/payments/pointTerminals';
+import { fetchPointTerminals, pairingState, parseTerminalsReply, type PointListing } from '../lib/payments/pointTerminals';
+import { cloudUnreachable, resetCloudReachability, trackCloudReachability } from '../lib/sync/cloudReachability';
+import { syncOnce } from '../lib/sync/useCloudSync';
 
 const st = () => useTcheStore.getState();
 const MP_ID = 'NEWLAND_N950__N950NCB801293324';
@@ -20,6 +22,8 @@ function withCloud() {
 }
 const points = () => st().terminals.filter((t) => t.acquirer === 'MERCADO_PAGO');
 const terminalEvents = () => st().outbox.filter((e) => e.table === 'pos_terminals');
+/** Lista do Mercado Pago lida agora mostrando a Point na conta e no modo PDV. */
+const READY: PointListing = { kind: 'ok', terminals: [{ id: MP_ID, operating_mode: 'pdv' }] };
 
 function mockFunction(status: number, body: unknown) {
   const fn = vi.fn(async () => ({ status, text: async () => JSON.stringify(body) }));
@@ -28,6 +32,7 @@ function mockFunction(status: number, body: unknown) {
 }
 
 beforeEach(() => {
+  resetCloudReachability();
   st().resetDemo();
   useTcheStore.setState({ outbox: [] } as never);
 });
@@ -40,7 +45,7 @@ describe('savePointTerminal', () => {
   it('cadastra a Point com o ID do Mercado Pago e sobe para a nuvem', () => {
     withCloud();
     expect(st().login('8888').ok).toBe(true);
-    const r = st().savePointTerminal({ name: ' Point Caixa ', serial_number: ` ${MP_ID} `, active: true });
+    const r = st().savePointTerminal({ name: ' Point Caixa ', serial_number: ` ${MP_ID} `, active: true }, READY);
     expect(r.ok).toBe(true);
     expect(points()).toEqual([expect.objectContaining({ name: 'Point Caixa', serial_number: MP_ID, acquirer: 'MERCADO_PAGO', mode: 'TEF_POS_WIRELESS', online: true, tenant_id: st().tenant.id })]);
     expect(terminalEvents().map((e) => `${e.op}:${(e.payload as { serial_number: string }).serial_number}`)).toEqual([`INSERT:${MP_ID}`]);
@@ -65,7 +70,7 @@ describe('savePointTerminal', () => {
     expect(st().login('8888').ok).toBe(true);
     expect(st().savePointTerminal({ name: 'Point', serial_number: 'id com espaço', active: true })).toMatchObject({ ok: false, error: expect.stringMatching(/ID da maquininha inválido/) });
     expect(st().savePointTerminal({ name: '  ', serial_number: MP_ID, active: true })).toMatchObject({ ok: false, error: expect.stringMatching(/nome/) });
-    expect(st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: true }).ok).toBe(true);
+    expect(st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: true }, READY).ok).toBe(true);
     expect(st().savePointTerminal({ name: 'Outra', serial_number: MP_ID.toLowerCase(), active: true })).toMatchObject({ ok: false, error: expect.stringMatching(/já está cadastrado/) });
     expect(st().savePointTerminal({ name: 'Outra', serial_number: 'STONE-01', active: true })).toMatchObject({ ok: false, error: expect.stringMatching(/Stone Salão 01/) });
     expect(points()).toHaveLength(1);
@@ -74,7 +79,7 @@ describe('savePointTerminal', () => {
   it('o ID não muda depois do cadastro; nome e ativa/desativada mudam (UPDATE na nuvem)', () => {
     withCloud();
     expect(st().login('8888').ok).toBe(true);
-    const row = st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: true });
+    const row = st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: true }, READY);
     if (!row.ok) throw new Error(row.error);
     expect(st().savePointTerminal({ id: row.data.id, name: 'Point', serial_number: 'NEWLAND_N950__OUTRA', active: true })).toMatchObject({ ok: false, error: expect.stringMatching(/não muda/) });
     expect(st().savePointTerminal({ id: row.data.id, name: 'Point Salão', serial_number: MP_ID, active: false }).ok).toBe(true);
@@ -83,6 +88,31 @@ describe('savePointTerminal', () => {
     // Stone/PagBank não são editadas por aqui.
     const stone = st().terminals.find((t) => t.acquirer === 'STONE')!;
     expect(st().savePointTerminal({ id: stone.id, name: 'x', serial_number: stone.serial_number, active: true })).toMatchObject({ ok: false, error: expect.stringMatching(/Só a Point/) });
+  });
+});
+
+describe('Point só vai para o caixa depois de conferida (auditoria #59 r1 P1-01)', () => {
+  it('cadastrar ativa ou religar exige a lista do Mercado Pago mostrando a Point pronta', () => {
+    withCloud();
+    expect(st().login('8888').ok).toBe(true);
+    const notPdv: PointListing = { kind: 'ok', terminals: [{ id: MP_ID, operating_mode: 'standalone' }] };
+    const otherAccount: PointListing = { kind: 'ok', terminals: [{ id: 'NEWLAND_N950__OUTRA', operating_mode: 'pdv' }] };
+    for (const check of [undefined, null, { kind: 'error', message: 'x' } as PointListing, { kind: 'not_configured' } as PointListing]) {
+      expect(st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: true }, check)).toMatchObject({ ok: false, error: expect.stringMatching(/Conferir no Mercado Pago/) });
+    }
+    expect(st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: true }, notPdv)).toMatchObject({ ok: false, error: expect.stringMatching(/fora do modo PDV/) });
+    expect(st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: true }, otherAccount)).toMatchObject({ ok: false, error: expect.stringMatching(/Não aparece na conta/) });
+    expect(points()).toEqual([]);
+    // Desativada entra sem conferir; religar pede a conferência; com ela pronta, liga.
+    const row = st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: false });
+    if (!row.ok) throw new Error(row.error);
+    expect(st().savePointTerminal({ id: row.data.id, name: 'Point', serial_number: MP_ID, active: true })).toMatchObject({ ok: false });
+    expect(st().savePointTerminal({ id: row.data.id, name: 'Point', serial_number: MP_ID, active: true }, notPdv)).toMatchObject({ ok: false });
+    expect(points()[0]!.online).toBe(false);
+    expect(st().savePointTerminal({ id: row.data.id, name: 'Point', serial_number: MP_ID, active: true }, READY).ok).toBe(true);
+    expect(points()[0]!.online).toBe(true);
+    // Já ativa: trocar o nome não pede nova conferência (o servidor confere a cada cobrança).
+    expect(st().savePointTerminal({ id: row.data.id, name: 'Point Salão', serial_number: MP_ID, active: true }).ok).toBe(true);
   });
 });
 
@@ -109,6 +139,24 @@ describe('lista do Mercado Pago (ação terminals)', () => {
     expect(parseTerminalsReply('nada')).toBeNull();
   });
 
+  it('consulta que nunca responde vira erro no prazo e aborta o pedido (auditoria #59 r1 P2-01)', async () => {
+    let fire: () => void = () => undefined;
+    let signal: AbortSignal | undefined;
+    const pending = fetchPointTerminals({
+      config: async () => ({ url: 'https://x', anonKey: 'a', accessToken: 'j' }),
+      fetch: (_u, init) => { signal = init.signal; return new Promise(() => undefined); },
+      setTimer: (fn) => { fire = fn; return () => undefined; },
+    });
+    await Promise.resolve();
+    fire();
+    expect(await pending).toEqual({ kind: 'error', message: expect.stringMatching(/não respondeu a tempo/) });
+    expect(signal?.aborted).toBe(true);
+    // A sessão que nunca vem também acaba no prazo.
+    const noSession = fetchPointTerminals({ config: () => new Promise(() => undefined), fetch: async () => { throw new Error('não chega'); }, setTimer: (fn) => { fire = fn; return () => undefined; } });
+    fire();
+    expect(await noSession).toMatchObject({ kind: 'error' });
+  });
+
   it('estado da maquininha cadastrada', () => {
     const ok = { kind: 'ok' as const, terminals: [{ id: MP_ID, operating_mode: 'pdv' as const }, { id: 'B', operating_mode: 'standalone' as const }] };
     expect(pairingState({ serial_number: MP_ID, online: true }, null)).toBe('unchecked');
@@ -128,7 +176,7 @@ describe('tela Point Smart', () => {
     expect(screen.queryByRole('button', { name: 'Cadastrar Point' })).toBeNull();
   });
 
-  it('cadastra, confere no Mercado Pago e mostra o estado de cada uma; desativa no caixa', async () => {
+  it('cadastra desativada, só ativa depois de Pronta, mostra o estado de cada uma e desativa no caixa', async () => {
     withCloud();
     expect(st().login('8888').ok).toBe(true);
     render(<PointAdmin />);
@@ -136,18 +184,32 @@ describe('tela Point Smart', () => {
     fireEvent.change(screen.getByPlaceholderText(/NEWLAND/), { target: { value: MP_ID } });
     fireEvent.click(screen.getByRole('button', { name: 'Cadastrar Point' }));
     const row = () => screen.getByTestId(`point-${MP_ID}`);
-    expect(within(row()).getByText('Não conferida')).toBeTruthy();
+    // Sem conferir: entra desativada (não aparece no caixa) e não liga.
+    expect(within(row()).getByText('Desativada')).toBeTruthy();
+    expect(points()[0]!.online).toBe(false);
+    fireEvent.click(within(row()).getByRole('switch', { name: /Ativa no caixa/ }));
+    expect(within(row()).getByText(/Antes de ativar/)).toBeTruthy();
+    expect(points()[0]!.online).toBe(false);
 
     mockFunction(200, { terminals: [{ id: MP_ID, operating_mode: 'standalone' }, { id: 'NEWLAND_N950__SEGUNDA', operating_mode: 'pdv' }] });
     fireEvent.click(screen.getByRole('button', { name: /Conferir no Mercado Pago/ }));
-    await waitFor(() => expect(within(row()).getByText('Fora do modo PDV')).toBeTruthy());
-    // A outra maquininha da conta aparece para cadastrar, com o ID sugerido.
+    await waitFor(() => expect(within(row()).getByTestId('mp-state').textContent).toMatch(/fora do modo PDV/));
+    fireEvent.click(within(row()).getByRole('switch', { name: /Ativa no caixa/ }));
+    expect(within(row()).getByText(/Não dá para ativar/)).toBeTruthy();
+    expect(points()[0]!.online).toBe(false);
+    // A outra maquininha da conta aparece para cadastrar, com o ID sugerido; pronta, entra ativa.
     expect(screen.getByText('NEWLAND_N950__SEGUNDA')).toBeTruthy();
     expect((screen.getByPlaceholderText(/NEWLAND/) as HTMLInputElement).placeholder).toBe('NEWLAND_N950__SEGUNDA');
+    fireEvent.change(screen.getByPlaceholderText(/NEWLAND/), { target: { value: 'NEWLAND_N950__SEGUNDA' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Cadastrar Point' }));
+    expect(within(screen.getByTestId('point-NEWLAND_N950__SEGUNDA')).getByText('Pronta')).toBeTruthy();
 
     mockFunction(200, { terminals: [{ id: MP_ID, operating_mode: 'pdv' }] });
     fireEvent.click(screen.getByRole('button', { name: /Conferir no Mercado Pago/ }));
-    await waitFor(() => expect(within(row()).getByText('Pronta')).toBeTruthy());
+    await waitFor(() => expect(within(row()).getByTestId('mp-state').textContent).toMatch(/pode ativar/));
+    fireEvent.click(within(row()).getByRole('switch', { name: /Ativa no caixa/ }));
+    expect(within(row()).getByText('Pronta')).toBeTruthy();
+    expect(points().find((p) => p.serial_number === MP_ID)!.online).toBe(true);
 
     mockFunction(200, { terminals: [] });
     fireEvent.click(screen.getByRole('button', { name: /Conferir no Mercado Pago/ }));
@@ -155,7 +217,50 @@ describe('tela Point Smart', () => {
 
     fireEvent.click(within(row()).getByRole('switch', { name: /Ativa no caixa/ }));
     expect(within(row()).getByText('Desativada')).toBeTruthy();
-    expect(points()[0]!.online).toBe(false);
+    expect(points().find((p) => p.serial_number === MP_ID)!.online).toBe(false);
+  });
+
+  it('consulta pendurada: o botão volta no prazo com o erro (auditoria #59 r1 P2-01)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      withCloud();
+      expect(st().login('8888').ok).toBe(true);
+      vi.stubGlobal('fetch', vi.fn(() => new Promise(() => undefined)));
+      render(<PointAdmin />);
+      const button = () => screen.getByRole('button', { name: /Conferir no Mercado Pago/ }) as HTMLButtonElement;
+      fireEvent.click(button());
+      await waitFor(() => expect(button().disabled).toBe(true));
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/não respondeu a tempo/));
+      expect(button().disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resposta que chega depois de trocar a sessão da nuvem é ignorada (auditoria #59 r1, a verificar)', async () => {
+    withCloud();
+    expect(st().login('8888').ok).toBe(true);
+    const row = st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: false });
+    if (!row.ok) throw new Error(row.error);
+    let answer: (v: { status: number; text: () => Promise<string> }) => void = () => undefined;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((r) => { answer = r; })));
+    render(<PointAdmin />);
+    fireEvent.click(screen.getByRole('button', { name: /Conferir no Mercado Pago/ }));
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalled());
+    act(() => {
+      useTcheStore.setState({ cloud: { ...CLOUD, email: 'outra@loja', tenant_id: st().tenant.id } } as never);
+    });
+    await act(async () => {
+      answer({ status: 200, text: async () => JSON.stringify({ terminals: [{ id: MP_ID, operating_mode: 'pdv' }] }) });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    const r = screen.getByTestId(`point-${MP_ID}`);
+    expect(within(r).queryByTestId('mp-state')).toBeNull();
+    // Sem a lista desta sessão, ativar continua pedindo a conferência.
+    fireEvent.click(within(r).getByRole('switch', { name: /Ativa no caixa/ }));
+    expect(within(r).getByText(/Antes de ativar/)).toBeTruthy();
+    expect((screen.getByRole('button', { name: /Conferir no Mercado Pago/ }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('loja sem Access Token do Mercado Pago: aviso claro', async () => {
@@ -176,6 +281,26 @@ describe('aviso de loja em nuvem sem internet', () => {
     view.rerender(<OfflineCloudBanner online={false} />);
     expect(screen.getByRole('alert').textContent).toContain('Sem internet: use o sistema antigo até voltar');
     view.rerender(<OfflineCloudBanner online />);
+    expect(screen.queryByText(OFFLINE_OLD_SYSTEM_TEXT)).toBeNull();
+  });
+
+  it('com rede mas a nuvem sem responder também aparece, e some quando ela volta (auditoria #59 r1 P2-02)', async () => {
+    withCloud();
+    render(<OfflineCloudBanner online />);
+    expect(screen.queryByText(OFFLINE_OLD_SYSTEM_TEXT)).toBeNull();
+    // O laço da sincronização: todo pedido à nuvem falha na rede (navigator.onLine segue true).
+    useTcheStore.setState({ outbox: [] } as never);
+    await act(async () => { await syncOnce(async () => { throw new TypeError('Failed to fetch'); }, { forcePull: true }); });
+    expect(cloudUnreachable()).toBe(true);
+    expect(screen.getByRole('alert').textContent).toContain(OFFLINE_OLD_SYSTEM_TEXT);
+    // Gateway fora (502/503/504) conta como sem nuvem; qualquer outra resposta, como nuvem no ar.
+    const answer = (status: number) => trackCloudReachability(async () => ({ status }));
+    await act(async () => { await answer(200)(); });
+    expect(screen.queryByText(OFFLINE_OLD_SYSTEM_TEXT)).toBeNull();
+    await act(async () => { await answer(503)(); });
+    expect(screen.getByRole('alert')).toBeTruthy();
+    await act(async () => { await syncOnce(async () => ({ ok: true, status: 200, text: async () => '[]' }), { forcePull: true }); });
+    expect(cloudUnreachable()).toBe(false);
     expect(screen.queryByText(OFFLINE_OLD_SYSTEM_TEXT)).toBeNull();
   });
 });

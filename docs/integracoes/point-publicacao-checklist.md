@@ -68,8 +68,10 @@ As migrations podem ser reaplicadas sem erro (conferido no teste) se a primeira 
 - [ ] `supabase functions deploy emit-nfce` (o `payload.ts` mudou neste PR: sem esse deploy a NFC-e da venda na Point não sai como pagamento integrado).
 - [ ] Só com Point: gravar o token em `payment_provider_secrets` (SQL em `mercado-pago-point.md`). A maquininha
       se cadastra pelo app: Retaguarda › Point Smart › "Conferir no Mercado Pago" (lista as Points da conta com o
-      ID), "Cadastrar Point" com esse ID, e conferir que ela fica **Pronta** (na conta e no modo PDV). O SQL de
-      `pos_terminals` em `mercado-pago-point.md` continua valendo como alternativa.
+      ID), "Cadastrar Point" com esse ID, e conferir que ela fica **Pronta** (na conta e no modo PDV). Sem a
+      conferência mostrando Pronta ela entra desativada e não liga no caixa; a cada cobrança nova o servidor confere
+      de novo na lista do Mercado Pago e recusa (nada cobrado) se ela saiu da conta ou do modo PDV. O SQL de
+      `pos_terminals` em `mercado-pago-point.md` continua valendo como alternativa (o servidor confere igual).
 
 ## 4. App novo em todos os aparelhos
 

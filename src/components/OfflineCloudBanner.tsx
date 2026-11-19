@@ -1,16 +1,19 @@
 import { CloudOff } from 'lucide-react';
 import { useTcheStore } from '../store/useTcheStore';
+import { useCloudUnreachable } from '../lib/sync/cloudReachability';
 
 /** Texto combinado com o Will (15/11/2026): no piloto, sem internet a loja usa o sistema antigo. */
 export const OFFLINE_OLD_SYSTEM_TEXT = 'Sem internet: use o sistema antigo até voltar';
 
 /**
- * Loja ligada à nuvem e aparelho sem internet: nenhum pagamento é recebido (todo pagamento é reservado no
- * servidor antes, ver CLAIM_OFFLINE_ERROR). O aviso fica no topo de todas as telas da equipe até a rede voltar.
+ * Loja ligada à nuvem e aparelho sem internet (ou com rede mas a nuvem sem responder, ver cloudReachability):
+ * nenhum pagamento é recebido (todo pagamento é reservado no servidor antes, ver CLAIM_OFFLINE_ERROR). O aviso fica
+ * no topo de todas as telas da equipe até a nuvem voltar a responder.
  */
 export function OfflineCloudBanner({ online, underHeader = false }: { online: boolean; underHeader?: boolean }) {
   const cloud = useTcheStore((s) => s.cloud !== null);
-  if (online || !cloud) return null;
+  const unreachable = useCloudUnreachable();
+  if ((online && !unreachable) || !cloud) return null;
   return (
     <div role="alert" className={`${underHeader ? 'sticky top-14 z-20' : ''} flex items-center gap-3 border-b-2 border-brasa bg-brasa px-4 py-3 text-white shadow`}>
       <CloudOff aria-hidden className="h-6 w-6 shrink-0" />

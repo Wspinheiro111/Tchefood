@@ -683,6 +683,22 @@ async function applyOrder(ctx: ChargeContext, row: TerminalChargeRow, order: Pay
 }
 
 /** Cria (ou retoma, com a mesma chave) a cobrança e devolve o estado atual. */
+/**
+ * A maquininha da cobrança nova precisa estar, pela lista lida agora no Mercado Pago, na conta da loja e no modo PDV.
+ * Recusa antes de reservar o saldo e de enviar: nada foi cobrado. As respostas 409/424 o aparelho trata como recusa.
+ */
+async function assertTerminalReady(provider: ChargeContext['provider'], serial: string): Promise<void> {
+  let list: Awaited<ReturnType<ChargeContext['provider']['listTerminals']>>;
+  try {
+    list = await provider.listTerminals();
+  } catch {
+    throw new ChargeInputError('mp_unavailable', 'O Mercado Pago não confirmou a maquininha agora. Nada foi cobrado: tente de novo.', 424);
+  }
+  const found = list.find((t) => t.externalTerminalId === serial);
+  if (!found) throw new ChargeInputError('terminal_not_ready', 'Esta Point não está na conta do Mercado Pago da loja. Nada foi cobrado: confira na aba Point Smart.', 409);
+  if (found.operatingMode !== 'pdv') throw new ChargeInputError('terminal_not_ready', 'Esta Point está fora do modo PDV. Nada foi cobrado: ative o modo PDV e confira na aba Point Smart.', 409);
+}
+
 export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, input: CreateInput): Promise<ChargeReply> {
   const req = validateCreate(input);
   if (terminal.acquirer !== 'MERCADO_PAGO') throw new ChargeInputError('not_mercado_pago', 'Esta maquininha não é Mercado Pago Point.');
@@ -693,6 +709,8 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
     // Repetição do pedido de criação (resposta anterior perdida): este pode mandar o primeiro envio.
     return replyFor(await resume(ctx, existing, true));
   }
+  // Cobrança nova: só reserva e envia se a Point está agora na conta do Mercado Pago da loja e no modo PDV.
+  await assertTerminalReady(ctx.provider, terminal.serial_number);
   const fresh = {
     tenant_id: terminal.tenant_id,
     idempotency_key: req.idempotency_key,

@@ -3,12 +3,13 @@
  * aqui a loja cadastra o terminal_id do Mercado Pago, confere na conta da loja se a maquininha está lá e no modo
  * PDV, e ativa ou desativa a maquininha no caixa.
  */
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { CheckCircle2, CircleAlert, CloudOff, RefreshCw, Smartphone } from 'lucide-react';
 import { Btn, toast } from '../../components/ui';
 import { selectCan, useTcheStore } from '../../store/useTcheStore';
 import { useOnline } from '../../lib/useOnline';
 import { freshCloudConfig } from '../../lib/sync/useCloudSync';
+import { trackCloudReachability } from '../../lib/sync/cloudReachability';
 import { fetchPointTerminals, PAIRING_TEXT, pairingState, type PairingState, type PointListing } from '../../lib/payments/pointTerminals';
 import type { PosTerminal } from '../../types';
 import { Field, FormError, Panel, TextInput, Toggle } from './fields';
@@ -40,17 +41,28 @@ export function PointAdmin() {
   const terminals = useTcheStore((s) => s.terminals);
   const canEdit = useTcheStore((s) => selectCan(s, 'STORE_SETTINGS'));
   const online = useOnline();
+  const tenantId = useTcheStore((s) => s.tenant.id);
   const [listing, setListing] = useState<PointListing | null>(null);
   const [busy, setBusy] = useState(false);
+  // Cada consulta leva o número da vez: resposta de consulta antiga (outra loja, outra sessão, tela fechada) não vale.
+  const gen = useRef(0);
   const points = terminals.filter((t) => t.acquirer === 'MERCADO_PAGO');
 
+  useEffect(() => {
+    // Trocou de loja ou de sessão da nuvem: a lista anterior não é desta loja.
+    gen.current += 1;
+    setListing(null);
+    setBusy(false);
+  }, [tenantId, cloud?.tenant_id, cloud?.email, cloud?.url]);
+  useEffect(() => () => { gen.current += 1; }, []);
+
   const check = async () => {
+    const mine = ++gen.current;
     setBusy(true);
-    try {
-      setListing(await fetchPointTerminals({ config: () => freshCloudConfig(), fetch: (u, init) => fetch(u, init) }));
-    } finally {
-      setBusy(false);
-    }
+    const result = await fetchPointTerminals({ config: () => freshCloudConfig(), fetch: trackCloudReachability((u: string, init: RequestInit) => fetch(u, init)) });
+    if (mine !== gen.current) return;
+    setListing(result);
+    setBusy(false);
   };
 
   if (!cloud) {
@@ -85,7 +97,7 @@ export function PointAdmin() {
         ) : (
           <ul className="space-y-2">
             {points.map((t) => (
-              <PointRow key={t.id} terminal={t} state={pairingState(t, listing)} canEdit={canEdit} />
+              <PointRow key={t.id} terminal={t} state={pairingState(t, listing)} mpState={pairingState({ ...t, online: true }, listing)} listing={listing} canEdit={canEdit} />
             ))}
           </ul>
         )}
@@ -102,17 +114,17 @@ export function PointAdmin() {
           <p className="mt-2 text-xs text-slate-500">Copie o ID para o cadastro abaixo.</p>
         </Panel>
       )}
-      {canEdit ? <NewPointForm suggestion={unregistered[0]?.id ?? ''} /> : <p className="text-sm text-slate-500">Só quem tem acesso a Loja cadastra a Point.</p>}
+      {canEdit ? <NewPointForm suggestion={unregistered[0]?.id ?? ''} listing={listing} /> : <p className="text-sm text-slate-500">Só quem tem acesso a Loja cadastra a Point.</p>}
     </div>
   );
 }
 
-function PointRow({ terminal, state, canEdit }: { terminal: PosTerminal; state: PairingState; canEdit: boolean }) {
+function PointRow({ terminal, state, mpState, listing, canEdit }: { terminal: PosTerminal; state: PairingState; mpState: PairingState; listing: PointListing | null; canEdit: boolean }) {
   const save = useTcheStore((s) => s.savePointTerminal);
   const [name, setName] = useState(terminal.name);
   const [error, setError] = useState<string | null>(null);
   const apply = (draft: { name: string; active: boolean }) => {
-    const r = save({ id: terminal.id, name: draft.name, serial_number: terminal.serial_number, active: draft.active });
+    const r = save({ id: terminal.id, name: draft.name, serial_number: terminal.serial_number, active: draft.active }, listing);
     if (!r.ok) return setError(r.error);
     setError(null);
     toast.success(draft.active ? `${r.data.name}: salva.` : `${r.data.name}: desativada no caixa.`);
@@ -127,6 +139,9 @@ function PointRow({ terminal, state, canEdit }: { terminal: PosTerminal; state: 
       </div>
       <div className="mb-1 break-all font-mono text-xs text-slate-600">{terminal.serial_number}</div>
       <p className="text-sm">{PAIRING_TEXT[state]}</p>
+      {state === 'inactive' && mpState !== 'unchecked' && (
+        <p className="mt-1 text-sm font-semibold" data-testid="mp-state">{mpState === 'ready' ? 'Pronta no Mercado Pago: pode ativar no caixa.' : PAIRING_TEXT[mpState]}</p>
+      )}
       {canEdit && (
         <div className="mt-2 grid gap-2 sm:grid-cols-[1fr_auto] sm:items-end">
           <Field label="Nome no caixa"><TextInput value={name} maxLength={50} onChange={(e) => setName(e.target.value)} /></Field>
@@ -139,17 +154,20 @@ function PointRow({ terminal, state, canEdit }: { terminal: PosTerminal; state: 
   );
 }
 
-function NewPointForm({ suggestion }: { suggestion: string }) {
+function NewPointForm({ suggestion, listing }: { suggestion: string; listing: PointListing | null }) {
   const save = useTcheStore((s) => s.savePointTerminal);
   const [name, setName] = useState('Point Caixa');
   const [serial, setSerial] = useState('');
   const [error, setError] = useState<string | null>(null);
   const submit = () => {
-    const r = save({ name, serial_number: serial, active: true });
+    // Só entra ativa no caixa se a lista do Mercado Pago mostrou esta Point pronta; senão fica desativada.
+    const ready = pairingState({ serial_number: serial.trim(), online: true }, listing) === 'ready';
+    const r = save({ name, serial_number: serial, active: ready }, listing);
     if (!r.ok) return setError(r.error);
     setError(null);
     setSerial('');
-    toast.success(`${r.data.name} cadastrada. Toque em "Conferir no Mercado Pago" para ver se está pronta.`);
+    if (ready) toast.success(`${r.data.name} cadastrada e pronta: já aparece no caixa.`);
+    else toast.success(`${r.data.name} cadastrada, ainda desativada. Toque em "Conferir no Mercado Pago" e ative quando estiver Pronta.`);
   };
   return (
     <Panel title="Cadastrar Point">

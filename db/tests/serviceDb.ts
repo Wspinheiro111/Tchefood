@@ -9,8 +9,15 @@ import { psql, type PgTarget } from './postgrestEmulator';
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
 
-export function serviceDb(target: PgTarget, db: string): SupabaseLike {
-  const asService = (stmt: string) => psql(target, `BEGIN; SET LOCAL ROLE service_role; ${stmt} COMMIT;`, db);
+/**
+ * `as` troca a service role por outro papel com as claims do JWT (ex.: o cliente do chamador da Edge Function,
+ * `authenticated` com tenant_id, sujeito ao RLS como no PostgREST).
+ */
+export function serviceDb(target: PgTarget, db: string, as?: { role: string; claims: Record<string, unknown> }): SupabaseLike {
+  const prelude = as
+    ? `SET LOCAL ROLE ${as.role}; SELECT set_config('request.jwt.claims', ${lit(JSON.stringify(as.claims))}, true) \\g /dev/null\n`
+    : 'SET LOCAL ROLE service_role;';
+  const asService = (stmt: string) => psql(target, `BEGIN; ${prelude} ${stmt} COMMIT;`, db);
   const quoteValue = (v: unknown) => (v === null ? 'NULL' : lit(typeof v === 'string' ? v : JSON.stringify(v)));
   // "metadata->>charge_id" (filtro em campo de JSON, como no PostgREST) ou coluna simples.
   const column = (col: string) => {
@@ -81,3 +88,14 @@ export function serviceDb(target: PgTarget, db: string): SupabaseLike {
     },
   };
 }
+
+/** Cliente de sessão recusada (JWT inválido ou vencido): o PostgREST responde erro a qualquer leitura. */
+export const rejectedSession: SupabaseLike = (() => {
+  const error = { message: 'JWT expired', code: 'PGRST301' };
+  const q = {
+    select: () => q, eq: () => q, is: () => q, not: () => q, update: () => q,
+    maybeSingle: async () => ({ data: null, error }),
+    then: (resolve: (v: { data: null; error: typeof error }) => unknown) => Promise.resolve(resolve({ data: null, error })),
+  };
+  return { from: () => q, rpc: async () => ({ data: null, error }) };
+})();

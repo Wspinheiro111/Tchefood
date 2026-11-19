@@ -11,8 +11,8 @@
  *  - revisão manual: o Mercado Pago não confirma; a reserva fica; o gerente confere no Mercado Pago (PIN + motivo),
  *    o servidor lê a aprovação e o pagamento entra uma vez só.
  *
- * O aparelho fala com o emulador do PostgREST (db/tests/postgrestEmulator) e com a Edge Function point-charge
- * emulada aqui com o código de verdade (charge.ts + repository.ts sobre a service role, db/tests/serviceDb). Só o
+ * O aparelho fala com o emulador do PostgREST (db/tests/postgrestEmulator) e com a Edge Function point-charge de
+ * verdade (handler.ts, o mesmo de index.ts: RLS do chamador + service role no banco, db/tests/serviceDb). Só o
  * Mercado Pago é falso (estado de cada ordem controlado pelo teste).
  *
  * Só roda com TCHEFOOD_PG=host:porta:usuario (ex.: /var/tmp/tfpg:5499:postgres).
@@ -22,9 +22,9 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PaymentTerminalChargeResult, PaymentTerminalProvider, PaymentTerminalTransactionStatus } from '../../server/shared/paymentTerminal';
-import { ChargeInputError, cancelCharge, pollCharge, reconcileCharge, startCharge, validateCancel, validateReconcile, voidCharge, type ChargeContext, type PointPaymentDetails } from '../../supabase/functions/point-charge/charge';
-import { supabaseChargeStore } from '../../supabase/functions/point-charge/repository';
-import { listStoreTerminals } from '../../supabase/functions/point-charge/terminals';
+import type { PointPaymentDetails } from '../../supabase/functions/point-charge/charge';
+import { handlePointCharge } from '../../supabase/functions/point-charge/handler';
+import { rejectedSession } from '../../db/tests/serviceDb';
 import { createSupabaseLikeDb, pgTargetFromEnv, postgrestFetch, psql, psqlFile, type PgTarget } from '../../db/tests/postgrestEmulator';
 import { serviceDb } from '../../db/tests/serviceDb';
 
@@ -132,50 +132,22 @@ const payments = {
   },
 };
 
-// ---------------------------------------------------------------- Edge Function point-charge emulada
+// ---------------------------------------------------------------- Edge Function point-charge (código de verdade)
 
-/** O despacho de supabase/functions/point-charge/index.ts, com a loja já provada (a do JWT do aparelho). */
-async function pointChargeFunction(body: Record<string, unknown>): Promise<{ status: number; body: unknown }> {
-  const ctx: ChargeContext = { store: supabaseChargeStore(serviceDb(target!, DB), TENANT), provider, payments };
-  const terminalRow = (id: unknown) => {
-    const out = sql(`SELECT coalesce((SELECT to_jsonb(t) FROM (SELECT id, tenant_id, serial_number, acquirer FROM pos_terminals WHERE id::text = ${`'${String(id).replace(/'/g, "''")}'`} AND tenant_id = '${TENANT}') t)::text, 'null')`);
-    return JSON.parse(out) as { id: string; tenant_id: string; serial_number: string; acquirer: string } | null;
-  };
-  try {
-    switch (body.action) {
-      case 'terminals':
-        return { status: 200, body: await listStoreTerminals(provider) };
-      case 'create': {
-        const t = terminalRow(body.terminal_id);
-        if (!t) return { status: 404, body: { error: 'not_found', message: 'Maquininha não encontrada nesta loja.' } };
-        return { status: 200, body: await startCharge(ctx, t, body as never) };
-      }
-      case 'status': {
-        const row = await ctx.store.findByKey(String(body.idempotency_key));
-        if (!row) return { status: 404, body: { error: 'not_found', message: 'Cobrança não encontrada nesta loja.' } };
-        return { status: 200, body: await pollCharge(ctx, row) };
-      }
-      case 'cancel': {
-        validateCancel(body as never);
-        const row = await ctx.store.findByKey(String(body.idempotency_key));
-        if (row) return { status: 200, body: await cancelCharge(ctx, row, body as never) };
-        const t = terminalRow(body.terminal_id);
-        if (!t) return { status: 404, body: { error: 'not_found', message: 'Maquininha não encontrada nesta loja.' } };
-        return { status: 200, body: await voidCharge(ctx, t, body as never) };
-      }
-      case 'reconcile': {
-        validateReconcile(body as never);
-        const row = await ctx.store.findByKey(String(body.idempotency_key));
-        if (!row) return { status: 404, body: { error: 'not_found', message: 'Cobrança não encontrada nesta loja.' } };
-        return { status: 200, body: await reconcileCharge(ctx, body as never) };
-      }
-      default:
-        return { status: 400, body: { error: 'action', message: 'Ação inválida.' } };
-    }
-  } catch (error) {
-    if (error instanceof ChargeInputError) return { status: error.httpStatus, body: { error: error.code, message: error.message } };
-    throw error;
-  }
+/** Tokens de sessão do app que a "Supabase Auth" deste teste conhece (JWT → claims). */
+const SESSIONS: Record<string, Record<string, unknown>> = { jwt: { role: 'authenticated', tenant_id: TENANT, sub: 'device' } };
+
+/** handler.ts de verdade (o mesmo que index.ts liga no Deno), com o RLS do chamador e a service role no banco real. */
+async function callPointCharge(authHeader: string, body: string): Promise<Response> {
+  return handlePointCharge(new Request('http://cloud.test/functions/v1/point-charge', { method: 'POST', headers: { Authorization: authHeader, 'Content-Type': 'application/json' }, body }), {
+    callerDb: (auth) => {
+      const claims = SESSIONS[auth.replace(/^Bearer\s+/, '')];
+      return claims ? serviceDb(target!, DB, { role: 'authenticated', claims }) : rejectedSession;
+    },
+    adminDb: () => serviceDb(target!, DB),
+    provider: () => provider,
+    payments: () => payments,
+  });
 }
 
 // ---------------------------------------------------------------- rede
@@ -188,8 +160,7 @@ function installFetch() {
     if (path === '/functions/v1/point-charge') {
       const body = JSON.parse(init.body ?? '{}') as Record<string, unknown>;
       net.calls.push(`point-charge:${String(body.action)}`);
-      const out = await pointChargeFunction(body);
-      return new Response(JSON.stringify(out.body), { status: out.status, headers: { 'Content-Type': 'application/json' } });
+      return callPointCharge(init.headers?.Authorization ?? '', init.body ?? '');
     }
     net.calls.push(path.replace(/^\/rest\/v1\/(rpc\/)?/, ''));
     return rest(url, { ...init, headers: init.headers ?? {} } as never);
@@ -271,6 +242,7 @@ async function otherDeviceCashIsRefused(orderId: string) {
   beforeAll(async () => {
     applySchema(target!, DB);
     sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT}', 'Loja Point', 'Loja Point Ltda', '11222333000181');`);
+    sql(`INSERT INTO payment_provider_secrets (tenant_id, provider, access_token) VALUES ('${TENANT}', 'mercado_pago_point', 'APP_USR-loja-point');`);
     installFetch();
     try { localStorage.clear(); } catch { /* sem armazenamento */ }
     ledger.resetClaimLedger();
@@ -298,7 +270,7 @@ async function otherDeviceCashIsRefused(orderId: string) {
     }));
     productId = p.id;
     productPrice = p.price;
-    for (let n = 1; n <= 4; n++) ok(st().saveTable({ number: n, label: `Mesa ${n}`, area: 'Salão', capacity: 4, active: true }));
+    for (let n = 1; n <= 5; n++) ok(st().saveTable({ number: n, label: `Mesa ${n}`, area: 'Salão', capacity: 4, active: true }));
     await expectSynced('equipe, cardápio e mesas');
     createDriver.mockImplementation((params: { terminal: import('../types').PosTerminal | null; mode: import('../types').OperationMode }) => {
       if (params.terminal?.acquirer !== 'MERCADO_PAGO') throw new Error('o teste só cobra na Point');
@@ -317,29 +289,51 @@ async function otherDeviceCashIsRefused(orderId: string) {
   });
   afterEach(() => cleanup());
 
-  it('cadastro pela tela: a Point sobe para a nuvem e a conferência no Mercado Pago mostra "Pronta"', async () => {
+  it('cadastro pela tela: sem conferir entra desativada; só liga no caixa depois de "Pronta" no Mercado Pago', async () => {
     login(OWNER_PIN);
     mp.terminals = [{ id: MP_ID, mode: 'standalone' as never }];
     render(<PointAdmin />);
     fireEvent.change(screen.getByPlaceholderText(/NEWLAND/), { target: { value: MP_ID } });
     fireEvent.click(screen.getByRole('button', { name: 'Cadastrar Point' }));
     await expectSynced('cadastro da Point');
-    expect(sql(`SELECT name || '|' || serial_number || '|' || acquirer || '|' || online FROM pos_terminals WHERE serial_number = '${MP_ID}' AND tenant_id = '${TENANT}'`)).toBe(`Point Caixa|${MP_ID}|MERCADO_PAGO|true`);
+    expect(sql(`SELECT name || '|' || serial_number || '|' || acquirer || '|' || online FROM pos_terminals WHERE serial_number = '${MP_ID}' AND tenant_id = '${TENANT}'`)).toBe(`Point Caixa|${MP_ID}|MERCADO_PAGO|false`);
     const row = () => screen.getByTestId(`point-${MP_ID}`);
+    const toggle = () => within(row()).getByRole('switch', { name: /Ativa no caixa/ });
     fireEvent.click(screen.getByRole('button', { name: /Conferir no Mercado Pago/ }));
-    await waitFor(() => expect(within(row()).getByText('Fora do modo PDV')).toBeTruthy());
+    await waitFor(() => expect(within(row()).getByTestId('mp-state').textContent).toMatch(/fora do modo PDV/));
+    fireEvent.click(toggle());
+    expect(within(row()).getByText(/Não dá para ativar/)).toBeTruthy();
     mp.terminals = [{ id: MP_ID, mode: 'pdv' }];
     fireEvent.click(screen.getByRole('button', { name: /Conferir no Mercado Pago/ }));
-    await waitFor(() => expect(within(row()).getByText('Pronta')).toBeTruthy());
+    await waitFor(() => expect(within(row()).getByTestId('mp-state').textContent).toMatch(/pode ativar/));
+    fireEvent.click(toggle());
+    expect(within(row()).getByText('Pronta')).toBeTruthy();
+    await expectSynced('Point ativada');
+    expect(sql(`SELECT online FROM pos_terminals WHERE serial_number = '${MP_ID}'`)).toBe('t');
     expect(net.calls.filter((c) => c === 'point-charge:terminals')).toHaveLength(2);
     // Desativar e reativar no caixa sobe como UPDATE da mesma linha.
-    const toggle = () => within(row()).getByRole('switch', { name: /Ativa no caixa/ });
     fireEvent.click(toggle());
     await expectSynced('Point desativada');
     expect(sql(`SELECT online FROM pos_terminals WHERE serial_number = '${MP_ID}'`)).toBe('f');
     fireEvent.click(toggle());
     await expectSynced('Point reativada');
     expect(sql(`SELECT count(*) || '|' || bool_and(online) FROM pos_terminals WHERE serial_number = '${MP_ID}'`)).toBe('1|true');
+  }, 60_000);
+
+  it('Point ativa mas fora do modo PDV no Mercado Pago na hora de cobrar: o servidor recusa antes de reservar; nada vai à Point', async () => {
+    const id = openTableWith(5);
+    await renderCheckout(id);
+    mp.terminals = [{ id: MP_ID, mode: 'standalone' as never }];
+    const creates = mp.calls.filter((c) => c.startsWith('create:')).length;
+    try {
+      await chargeOnPoint();
+      await waitFor(() => expect(toastLog.join(' | ')).toMatch(/fora do modo PDV/), { timeout: 10_000 });
+      expect(serverCharges(id)).toEqual([]);
+      expect(mp.calls.filter((c) => c.startsWith('create:'))).toHaveLength(creates);
+      expect(localApproved(id)).toEqual([]);
+    } finally {
+      mp.terminals = [{ id: MP_ID, mode: 'pdv' }];
+    }
   }, 60_000);
 
   it('aprovada: reserva no servidor (outro aparelho não recebe por cima), Mercado Pago aprova, o pagamento sobe e a conta fecha zerada', async () => {

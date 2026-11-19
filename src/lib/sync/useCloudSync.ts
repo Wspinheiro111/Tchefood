@@ -8,6 +8,7 @@ import { useTcheStore } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, recordKeys, refreshDevice, type FetchLike, type SyncConfig } from './supabaseSync';
 import { fetchCloudSnapshot } from './cloudPull';
 import { pendingRelease } from '../payments/claimLedger';
+import { cloudUnreachable, trackCloudReachability } from './cloudReachability';
 import type { SyncEvent, UUID } from '../../types';
 
 const INTERVAL_MS = 5_000;
@@ -160,7 +161,7 @@ async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): 
   const wantsRefunds = pull === 'force' || (pull === 'due' && refundPullDue(sessionKey(tenantId, session), Date.now()));
   if (state.outbox.length === 0 && !wantsPull && !wantsRefunds) return;
   running = true;
-  const round = runRound(session, withRequestTimeout(fetchFn), wantsPull, wantsRefunds, tenantId);
+  const round = runRound(session, trackCloudReachability(withRequestTimeout(fetchFn)), wantsPull, wantsRefunds, tenantId);
   current = round;
   try {
     await round;
@@ -316,7 +317,8 @@ export function useCloudSync(online: boolean): void {
     void syncOnce();
     retryReleases();
     const timer = setInterval(() => {
-      void syncOnce();
+      // Nuvem sem responder: lê a cada volta (não só a cada minuto), para o aviso sumir assim que ela voltar.
+      void syncOnce(browserFetch, { forcePull: cloudUnreachable() });
       retryReleases();
     }, INTERVAL_MS);
     return () => clearInterval(timer);

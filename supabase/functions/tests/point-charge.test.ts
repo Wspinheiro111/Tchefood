@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { PaymentTerminalProviderError, type PaymentTerminalChargeRequest, type PaymentTerminalChargeResult, type PaymentTerminalProvider } from '../../../server/shared/paymentTerminal.ts';
+import { PaymentTerminalProviderError, type PaymentTerminalChargeRequest, type PaymentTerminalChargeResult, type PaymentTerminalInfo, type PaymentTerminalProvider } from '../../../server/shared/paymentTerminal.ts';
 import {
   ChargeInputError,
   ChargeRefusedError,
@@ -377,6 +377,7 @@ const approvedPayment = (over: Partial<PointPaymentDetails> = {}): PointPaymentD
 function setup(opts: {
   create?: () => Promise<PaymentTerminalChargeResult>; get?: () => Promise<PaymentTerminalChargeResult>; payment?: (id: string) => Promise<PointPaymentDetails>; cancel?: () => Promise<void>;
   find?: () => Promise<PaymentTerminalChargeResult | null>;
+  terminals?: () => Promise<PaymentTerminalInfo[]>;
 } = {}) {
   const calls: { create: PaymentTerminalChargeRequest[]; get: string[]; cancel: { id: string; key: string }[]; payment: string[]; find: { ref: string; createdAt: string | undefined }[] } = { create: [], get: [], cancel: [], payment: [], find: [] };
   const provider: PaymentTerminalProvider = {
@@ -384,7 +385,7 @@ function setup(opts: {
     createRetryPolicy: 'same_key',
     approvalIdentity: 'reference_and_terminal',
     supportedMethods: ['credit', 'debit', 'pix'],
-    listTerminals: async () => [],
+    listTerminals: async () => (opts.terminals ?? (async () => [{ provider: 'mercado_pago_point', externalTerminalId: MP_TERMINAL, operatingMode: 'pdv', externalStoreId: null, externalPosId: null }]))(),
     createCharge: async (r) => {
       calls.create.push(r);
       return (opts.create ?? (async () => order()))();
@@ -454,6 +455,33 @@ describe('point-charge: criação', () => {
     await expect(startCharge(ctx, { ...terminal, acquirer: 'STONE' }, input())).rejects.toMatchObject({ code: 'not_mercado_pago' });
     await expect(startCharge(ctx, { ...terminal, serial_number: '  ' }, input())).rejects.toMatchObject({ code: 'terminal_without_id' });
     expect(calls.create).toHaveLength(0);
+  });
+
+  it('Point fora da conta, fora do modo PDV ou lista indisponível: nada reserva nem envia (auditoria #59 r1 P1-01)', async () => {
+    const cases: [() => Promise<PaymentTerminalInfo[]>, string, number][] = [
+      [async () => [], 'terminal_not_ready', 409],
+      [async () => [{ provider: 'mercado_pago_point', externalTerminalId: 'NEWLAND_N950__OUTRA', operatingMode: 'pdv', externalStoreId: null, externalPosId: null }], 'terminal_not_ready', 409],
+      [async () => [{ provider: 'mercado_pago_point', externalTerminalId: MP_TERMINAL, operatingMode: 'standalone', externalStoreId: null, externalPosId: null }], 'terminal_not_ready', 409],
+      [async () => [{ provider: 'mercado_pago_point', externalTerminalId: MP_TERMINAL, operatingMode: 'unknown', externalStoreId: null, externalPosId: null }], 'terminal_not_ready', 409],
+      [async () => { throw new Error('mp fora'); }, 'mp_unavailable', 424],
+    ];
+    for (const [terminals, code, httpStatus] of cases) {
+      const { ctx, store, calls } = setup({ terminals });
+      await expect(startCharge(ctx, terminal, input())).rejects.toMatchObject({ code, httpStatus });
+      expect(calls.create).toHaveLength(0);
+      expect(store.rows).toHaveLength(0);
+    }
+  });
+
+  it('repetição de chave já gravada não depende da lista (a cobrança já está na Point)', async () => {
+    let listed = 0;
+    let fail = false;
+    const { ctx, calls } = setup({ terminals: async () => { listed++; if (fail) throw new Error('mp fora'); return [{ provider: 'mercado_pago_point', externalTerminalId: MP_TERMINAL, operatingMode: 'pdv', externalStoreId: null, externalPosId: null }]; } });
+    await startCharge(ctx, terminal, input());
+    fail = true;
+    await startCharge(ctx, terminal, input());
+    expect(listed).toBe(1);
+    expect(calls.create).toHaveLength(1);
   });
 
   it('mesma chave com pedido diferente é recusada (409) e não cria outra ordem', async () => {

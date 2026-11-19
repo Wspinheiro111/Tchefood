@@ -20,12 +20,19 @@ export type PointListing =
   | { kind: 'not_configured' }
   | { kind: 'error'; message: string };
 
-type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string }) => Promise<{ status: number; text(): Promise<string> }>;
+type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }) => Promise<{ status: number; text(): Promise<string> }>;
 
 export interface PointListingDeps {
   config: () => Promise<SyncConfig | null>;
   fetch: FetchLike;
+  /** Prazo da consulta inteira (sessão + resposta). Padrão 15 s. */
+  timeoutMs?: number;
+  /** Relógio do prazo (os testes trocam). Padrão: setTimeout/clearTimeout. */
+  setTimer?: (fn: () => void, ms: number) => () => void;
 }
+
+export const POINT_LISTING_TIMEOUT_MS = 15_000;
+const TIMEOUT_MESSAGE = 'A nuvem não respondeu a tempo. Confira a internet e tente de novo.';
 
 const MODES: ReadonlySet<string> = new Set(['pdv', 'standalone', 'unknown']);
 
@@ -48,14 +55,32 @@ export function parseTerminalsReply(text: string): MpTerminal[] | null {
   return out;
 }
 
+/** Nunca fica pendurada: passado o prazo, devolve erro (e aborta o pedido), para a tela liberar o botão. */
 export async function fetchPointTerminals(deps: PointListingDeps): Promise<PointListing> {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const setTimer = deps.setTimer ?? ((fn, ms) => { const t = setTimeout(fn, ms); return () => clearTimeout(t); });
+  let clear: () => void = () => undefined;
+  const deadline = new Promise<PointListing>((resolve) => {
+    clear = setTimer(() => {
+      controller?.abort();
+      resolve({ kind: 'error', message: TIMEOUT_MESSAGE });
+    }, deps.timeoutMs ?? POINT_LISTING_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([listOnce(deps, controller?.signal), deadline]);
+  } finally {
+    clear();
+  }
+}
+
+async function listOnce(deps: PointListingDeps, signal: AbortSignal | undefined): Promise<PointListing> {
   const cfg = await deps.config().catch(() => null);
   if (!cfg) return { kind: 'no_cloud' };
   const endpoint = pointChargeEndpoint(cfg);
   let status: number;
   let text: string;
   try {
-    const res = await deps.fetch(endpoint.url, { method: 'POST', headers: endpoint.headers, body: JSON.stringify({ action: 'terminals' }) });
+    const res = await deps.fetch(endpoint.url, { method: 'POST', headers: endpoint.headers, body: JSON.stringify({ action: 'terminals' }), ...(signal ? { signal } : {}) });
     status = res.status;
     text = await res.text();
   } catch {
