@@ -79,6 +79,9 @@ function fakeIndexedDB() {
   };
 }
 
+/** Cópias de emergência no localStorage (uma chave por gravação) e conflitos guardados. */
+const copies = (name: string) => Object.keys(localStorage).filter((key) => key.startsWith(name + '::copia')).sort().map((key) => ({ key, ...(JSON.parse(localStorage.getItem(key)!) as { seq: number; v: string; id?: string }) }));
+const conflicts = (name: string) => Object.keys(localStorage).filter((key) => key.startsWith(name + '::conflito')).map((key) => JSON.parse(localStorage.getItem(key)!) as { v: string });
 const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms));
 
 describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reiniciar', () => {
@@ -156,7 +159,7 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     S.setState({ courierSettlePending: [{ id: 'acerto-S1' } as never] });
     expect(await store.awaitPersisted()).toBe(true);
     await tick();
-    expect(localStorage.getItem(name + '::copia')).toContain('acerto-S1');
+    expect(JSON.stringify(copies(name))).toContain('acerto-S1');
     // A versão anterior do app lê o IndexedDB (S0) e grava S2 direto na chave do estado, sem mexer em `::seq`.
     mode = 'ok';
     const s2 = '{"state":{"courierSettlePending":[{"id":"acerto-S2"}]},"version":12}';
@@ -186,7 +189,7 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     expect(await idbStorage.getItem(name)).toContain('acerto-S1');
     await tick();
     expect(String(disk.get(name))).toContain('acerto-S1');
-    expect(localStorage.getItem(name + '::copia')).toBeNull();
+    expect(copies(name)).toEqual([]);
     expect(await idbStorage.getItem(name)).toContain('acerto-S1');
   });
 
@@ -227,7 +230,7 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     // O operador altera; o IndexedDB recusa; a cópia no localStorage fica com S3.
     mode = 'throw';
     await app.idbStorage.setItem(name, 'S3');
-    expect(localStorage.getItem(name + '::copia')).toContain('S3');
+    expect(JSON.stringify(copies(name))).toContain('S3');
     // Reinício com o IndexedDB bom outra vez (ainda com S2 no disco): S3, não S2.
     mode = 'ok';
     vi.resetModules();
@@ -235,7 +238,7 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     expect(await app.idbStorage.getItem(name)).toBe('S3');
     // E S3 entrou no IndexedDB (a versão anterior do app lê o mesmo registro).
     expect(disk.get(name)).toBe('S3');
-    expect(localStorage.getItem(name + '::copia')).toBeNull();
+    expect(copies(name)).toEqual([]);
   });
 
   it('GPT r21 P2-01: a versão antiga grava S4 depois da cópia S3: S4 (escrita posterior) vale mais que a cópia', async () => {
@@ -280,66 +283,161 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     expect(disk.get(name)).toBe('S2');
   });
 
-  it('GPT r23 P2-01: cópia mais nova de outra aba, gravada depois da leitura e antes do descarte, não some (recuperação)', async () => {
+  it('GPT r24 P2-01/P2-02: cópia de outra aba surgida durante a recuperação: a leitura recomeça, devolve S2 e nada a apaga', async () => {
     vi.resetModules();
     const { idbStorage, fingerprint: fp } = await import('../lib/idbStorage');
-    const name = 'tchefood-r23a';
-    mode = 'ok';
-    await idbStorage.getItem(name); // abre o banco
-    disk.set(name, 'S0');
-    disk.set(name + '::seq', `100:${fp('S0')}`);
-    localStorage.setItem(name + '::copia', JSON.stringify({ seq: 101, v: 'S1', base: fp('S0') }));
-    // Outra aba, depois de esta ler S1 e antes de descartar, grava a cópia S2 (102) no localStorage.
-    let reads = 0;
-    afterGet = (key) => {
-      if (key !== name || ++reads !== 2) return; // 1ª: leitura do texto; 2ª: leitura dentro da recuperação
-      localStorage.setItem(name + '::copia', JSON.stringify({ seq: 102, v: 'S2', base: fp('S0') }));
-    };
-    expect(await idbStorage.getItem(name)).toBe('S1');
-    await tick();
-    expect(JSON.parse(localStorage.getItem(name + '::copia')!)).toMatchObject({ seq: 102, v: 'S2' });
-    // Próxima abertura: S2, não S1.
-    afterGet = null;
-    vi.resetModules();
-    const again = await import('../lib/idbStorage');
-    expect(await again.idbStorage.getItem(name)).toBe('S2');
-    await tick();
-    expect(disk.get(name)).toBe('S2');
-  });
-
-  it('GPT r23 P2-01: cópia mais nova de outra aba, gravada durante a gravação no IndexedDB, não some (writeDb)', async () => {
-    vi.resetModules();
-    const { idbStorage, fingerprint: fp } = await import('../lib/idbStorage');
-    const name = 'tchefood-r23b';
+    const name = 'tchefood-r24a';
     mode = 'ok';
     await idbStorage.getItem(name);
     disk.set(name, 'S0');
     disk.set(name + '::seq', `100:${fp('S0')}`);
-    localStorage.setItem(name + '::copia', JSON.stringify({ seq: 101, v: 'S1', base: fp('S0') }));
-    // Esta aba grava S3 no IndexedDB; no meio, outra aba (relógio um pouco à frente) grava a cópia S2.
+    localStorage.setItem(name + '::copia::5.a', JSON.stringify({ seq: 101, id: 'a', v: 'S1', base: fp('S0') }));
+    let reads = 0;
+    afterGet = (key) => {
+      if (key !== name || ++reads !== 2) return; // 2ª leitura de `name`: dentro da recuperação de S1
+      localStorage.setItem(name + '::copia::6.b', JSON.stringify({ seq: 102, id: 'b', v: 'S2', base: fp('S0') }));
+    };
+    expect(await idbStorage.getItem(name)).toBe('S2'); // antes: S1
+    await tick();
+    expect(disk.get(name)).toBe('S2');
+    expect(copies(name)).toEqual([]); // S1 e S2 já estão no IndexedDB
+  });
+
+  it('GPT r24 P2-02: a cópia só sai pela chave exata que foi lida: outra aba não perde a dela entre a conferência e a remoção', async () => {
+    vi.resetModules();
+    const { idbStorage, fingerprint: fp } = await import('../lib/idbStorage');
+    const name = 'tchefood-r24b';
+    mode = 'ok';
+    await idbStorage.getItem(name);
+    disk.set(name, 'S0');
+    disk.set(name + '::seq', `100:${fp('S0')}`);
+    // Esta aba (A) grava com o IndexedDB recusando: cópia própria.
+    mode = 'throw';
+    await idbStorage.setItem(name, 'S1');
+    await tick();
+    expect(copies(name)).toHaveLength(1);
+    // Volta o IndexedDB; A grava S3 e, no meio, outra aba (B) grava a cópia S2 com número maior.
+    mode = 'ok';
     onPut = (key) => {
       if (key !== name) return;
       onPut = null;
-      localStorage.setItem(name + '::copia', JSON.stringify({ seq: Date.now() + 5_000, v: 'S2', base: fp('S0') }));
+      localStorage.setItem(name + '::copia::zzzzzz.b', JSON.stringify({ seq: Date.now() + 5_000, id: 'b', v: 'S2', base: fp('S0') }));
     };
     await idbStorage.setItem(name, 'S3');
     await tick();
-    expect(JSON.parse(localStorage.getItem(name + '::copia')!)).toMatchObject({ v: 'S2' });
+    expect(copies(name).map((c) => c.v)).toEqual(['S2']); // a de A (S1) saiu; a de B ficou
     vi.resetModules();
     const again = await import('../lib/idbStorage');
     expect(await again.idbStorage.getItem(name)).toBe('S2');
   });
 
-  it('GPT r23 P2-01 (vizinho): gravação recusada no IndexedDB não troca por uma cópia mais velha a cópia mais nova de outra aba', async () => {
+  it('GPT r24 P2-01 (store real): S2 chega durante a recuperação de S1; hidratar, gravar sozinho e reiniciar mantém a pendência que só existe em S2', async () => {
+    vi.resetModules();
+    let store = await import('../store/useTcheStore');
+    await tick();
+    const name = store.useTcheStore.persist.getOptions().name!;
+    store.useTcheStore.setState({ courierSettlePending: [{ id: 'acerto-S0' } as never] });
+    expect(await store.awaitPersisted()).toBe(true);
+    await tick();
+    const s0 = disk.get(name) as string;
+    const { fingerprint: fp } = await import('../lib/idbStorage');
+    const mk = (id: string) => s0.replace('acerto-S0', id);
+    const seq0 = Number(String(disk.get(name + '::seq')).split(':')[0]);
+    localStorage.setItem(name + '::copia::1.a', JSON.stringify({ seq: seq0 + 1, id: 'a', v: mk('acerto-S1'), base: fp(s0) }));
+    let reads = 0;
+    afterGet = (key) => {
+      if (key !== name || ++reads !== 2) return;
+      localStorage.setItem(name + '::copia::2.b', JSON.stringify({ seq: seq0 + 2, id: 'b', v: mk('acerto-S2'), base: fp(s0) }));
+    };
+    // App reabre: getItem recupera S1, vê S2 chegar, recomeça e devolve S2; o onRehydrateStorage grava o estado hidratado.
+    vi.resetModules();
+    store = await import('../store/useTcheStore');
+    await tick(60);
+    afterGet = null;
+    expect(store.useTcheStore.getState().courierSettlePending?.[0]?.id).toBe('acerto-S2');
+    expect(await store.awaitPersisted()).toBe(true);
+    await tick();
+    // Reinício de novo: o persistido é S2.
+    vi.resetModules();
+    store = await import('../store/useTcheStore');
+    await tick(60);
+    expect(store.useTcheStore.getState().courierSettlePending?.[0]?.id).toBe('acerto-S2');
+    expect(JSON.stringify(disk.get(name))).toContain('acerto-S2');
+  });
+
+  describe('GPT r24 P2-03: mesmo número de gravação em duas instâncias, conteúdos diferentes', () => {
+    const T = 5_000_000_000_000;
+    const instance = async () => {
+      vi.resetModules();
+      return (await import('../lib/idbStorage')).idbStorage;
+    };
+    afterEach(() => vi.restoreAllMocks());
+
+    it('fallback recusado nas duas: as duas cópias existem; vale a de id maior e a outra vai para conflito, nada some', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(T);
+      const name = 'tchefood-r24c';
+      mode = 'throw';
+      await (await instance()).setItem(name, 'X');
+      await (await instance()).setItem(name, 'Y');
+      const found = copies(name);
+      expect(found.map((c) => c.v).sort()).toEqual(['X', 'Y']);
+      expect(found[0]!.seq).toBe(found[1]!.seq);
+      mode = 'ok';
+      const winner = [...found].sort((a, b) => ((a.id ?? '') < (b.id ?? '') ? -1 : 1)).at(-1)!;
+      const loser = found.find((c) => c.v !== winner.v)!;
+      expect(await (await instance()).getItem(name)).toBe(winner.v);
+      await tick();
+      expect(conflicts(name).map((c) => c.v)).toEqual([loser.v]);
+      expect(disk.get(name)).toBe(winner.v);
+    });
+
+    it('escrita boa de uma instância com o mesmo número de uma cópia de outra: a cópia não é apagada e o conflito é guardado', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(T);
+      const name = 'tchefood-r24d';
+      mode = 'throw';
+      await (await instance()).setItem(name, 'X'); // cópia da instância A, número T
+      mode = 'ok';
+      await (await instance()).setItem(name, 'Y'); // instância B grava no IndexedDB, também número T
+      await tick();
+      expect(copies(name).map((c) => c.v)).toEqual(['X']); // B não conhecia a cópia de A: não apagou
+      expect(await (await instance()).getItem(name)).toBe('Y'); // empate: o IndexedDB
+      await tick();
+      expect(conflicts(name).map((c) => c.v)).toEqual(['X']); // e a de A ficou guardada
+      expect(copies(name)).toEqual([]);
+    });
+
+    it('recuperação com duas cópias do mesmo número: a de id maior entra, a outra vai para conflito', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(T);
+      const name = 'tchefood-r24e';
+      mode = 'ok';
+      const first = await instance();
+      await first.getItem(name);
+      const { fingerprint: fp } = await import('../lib/idbStorage');
+      disk.set(name, 'S0');
+      disk.set(name + '::seq', `100:${fp('S0')}`);
+      localStorage.setItem(name + '::copia::5.a', JSON.stringify({ seq: 101, id: 'a', v: 'S1a', base: fp('S0') }));
+      localStorage.setItem(name + '::copia::5.b', JSON.stringify({ seq: 101, id: 'b', v: 'S1b', base: fp('S0') }));
+      expect(await first.getItem(name)).toBe('S1b');
+      await tick();
+      expect(disk.get(name)).toBe('S1b');
+      expect(conflicts(name).map((c) => c.v)).toEqual(['S1a']);
+      expect(copies(name)).toEqual([]);
+    });
+  });
+
+  it('GPT r23 P2-01 (vizinho): gravação recusada no IndexedDB não troca nem apaga a cópia mais nova de outra aba', async () => {
     vi.resetModules();
     const { idbStorage } = await import('../lib/idbStorage');
     const name = 'tchefood-r23c';
     mode = 'ok';
     await idbStorage.getItem(name);
-    localStorage.setItem(name + '::copia', JSON.stringify({ seq: Date.now() + 60_000, v: 'S2', base: null }));
+    localStorage.setItem(name + '::copia::zzzzzz.b', JSON.stringify({ seq: Date.now() + 60_000, id: 'b', v: 'S2', base: null }));
     mode = 'throw';
     await idbStorage.setItem(name, 'S1');
-    expect(JSON.parse(localStorage.getItem(name + '::copia')!)).toMatchObject({ v: 'S2' });
+    expect(copies(name).map((c) => c.v).sort()).toEqual(['S1', 'S2']);
+    mode = 'ok';
+    vi.resetModules();
+    expect(await (await import('../lib/idbStorage')).idbStorage.getItem(name)).toBe('S2');
   });
 
   it('GPT r21 P2-03: JSONs que colidiam na impressão de 32 bits não se confundem', async () => {
