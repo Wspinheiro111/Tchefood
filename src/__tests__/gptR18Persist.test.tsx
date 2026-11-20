@@ -507,53 +507,149 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
       expect(kept + JSON.stringify(disk.get(name))).toContain('acerto-S1'); // S1 continua recuperável
     });
 
-    it('P2-04: chega cópia nova em todas as tentativas: devolve o mais novo visto, nada some, nada é apagado enquanto provisório, e a próxima leitura estável resolve', async () => {
+    it('P2-04 (r25): chega cópia nova em todas as tentativas: devolve o mais novo visto e nada se perde (cada conteúdo fica em cópia, ::conflito ou IndexedDB)', async () => {
       const { idbStorage, fingerprint: fp } = await seed('tchefood-r25d');
       const name = 'tchefood-r25d';
       localStorage.setItem(name + '::copia::0.a', JSON.stringify({ seq: 101, id: 'a', v: 'C101', base: fp('S0') }));
       let n = 101;
-      const inject = () => {
+      onPut = (key) => {
+        if (key !== name) return;
         n++;
-        localStorage.setItem(`${name}::copia::${n.toString(36)}.z`, JSON.stringify({ seq: n, id: 'z', v: `C${n}`, base: fp('S0') }));
+        localStorage.setItem(`${name}::copia::${n.toString(36)}.z${n}`, JSON.stringify({ seq: n, id: `z${n}`, v: `C${n}`, base: fp('S0') }));
       };
-      onPut = (key) => { if (key === name) inject(); }; // cada recuperação é interrompida por uma cópia nova
       const got = await idbStorage.getItem(name);
       onPut = null;
       expect(got).not.toBeNull();
       await tick();
-      // Provisório: nada se perdeu (cada conteúdo está numa cópia, em ::conflito ou no IndexedDB) e a gravação abaixo não apaga cópia.
       const where = () => [...copies(name).map((c) => c.v), ...conflicts(name).map((c) => c.v), String(disk.get(name))];
       for (let i = 101; i <= n; i++) expect(where()).toContain(`C${i}`);
-      const before = copies(name).map((c) => c.v);
-      await idbStorage.setItem(name, 'MINHA');
+    });
+  });
+
+  describe('GPT r26 (PR #54): um escritor por aparelho, chave antiga só preservada, provisório não vira definitivo', () => {
+    const seed = async (name: string) => {
+      vi.resetModules();
+      const mod = await import('../lib/idbStorage');
+      mode = 'ok';
+      await mod.idbStorage.getItem(name);
+      disk.set(name, 'S0');
+      disk.set(name + '::seq', `100:${mod.fingerprint('S0')}`);
+      return mod;
+    };
+    const where = (name: string) => [...copies(name).map((c) => c.v), ...conflicts(name).map((c) => c.v), String(disk.get(name))];
+
+    it('P2-01a: a chave antiga ::copia é reutilizada por outra instância com conteúdo novo e número menor que a cópia independente: o conteúdo novo continua lá', async () => {
+      const { idbStorage, fingerprint: fp } = await seed('tchefood-r26a');
+      const name = 'tchefood-r26a';
+      localStorage.setItem(name + '::copia::5.n', JSON.stringify({ seq: 200, id: 'n', v: 'N', base: fp('S0'), absorbs: [name + '::copia'] }));
+      localStorage.setItem(name + '::copia', JSON.stringify({ seq: 150, v: 'S3', base: fp('S0') })); // versão antiga reutiliza K
+      expect(await idbStorage.getItem(name)).toBe('N');
       await tick();
-      expect(copies(name).map((c) => c.v)).toEqual(expect.arrayContaining(before));
-      // Leitura estável: resolve, e o que não entrou vai para ::conflito.
-      const final = await idbStorage.getItem(name);
-      await tick();
-      expect(final).toBe(disk.get(name));
-      const preserved = [...copies(name).map((c) => c.v), ...conflicts(name).map((c) => c.v), String(disk.get(name))];
-      // MINHA substitui o estado devolvido (`got`, a base dela); todo o resto segue guardado.
-      for (let i = 101; i <= n; i++) if (`C${i}` !== got) expect(preserved).toContain(`C${i}`);
-      expect(preserved).toContain('MINHA');
+      expect(JSON.parse(localStorage.getItem(name + '::copia')!).v).toBe('S3'); // antes: apagada sem registro
+      expect(disk.get(name)).toBe('N');
     });
 
-    it('chave antiga única ::copia trocada por outra instância entre a leitura e a exclusão: não é apagada', async () => {
-      const { idbStorage, fingerprint: fp } = await seed('tchefood-r25e');
-      const name = 'tchefood-r25e';
+    it('P2-01b: a chave antiga é trocada entre a conferência e a remoção: nunca é removida, o conteúdo novo segue íntegro', async () => {
+      const { idbStorage, fingerprint: fp } = await seed('tchefood-r26b');
+      const name = 'tchefood-r26b';
       localStorage.setItem(name + '::copia', JSON.stringify({ seq: 101, v: 'S1', base: fp('S0') }));
+      const removed: string[] = [];
+      const realRemove = Storage.prototype.removeItem;
+      vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (this: Storage, key: string) {
+        removed.push(key);
+        return realRemove.call(this, key);
+      });
       afterGet = (key) => {
         if (key !== name) return;
         afterGet = null;
-        // outra instância (versão anterior) troca o conteúdo da mesma chave antiga
-        localStorage.setItem(name + '::copia', JSON.stringify({ seq: 150, v: 'S9', base: fp('S0') }));
+        localStorage.setItem(name + '::copia', JSON.stringify({ seq: 300, v: 'S9', base: null })); // outra aba escreve entre a leitura e a recuperação
+      };
+      expect(await idbStorage.getItem(name)).toBe('S9'); // a leitura recomeça e vê a troca
+      await tick();
+      expect(removed).not.toContain(name + '::copia'); // a chave antiga nunca é removida
+      expect(JSON.parse(localStorage.getItem(name + '::copia')!).v).toBe('S9');
+      expect(disk.get(name)).toBe('S9');
+    });
+
+    it('P2-02: seis seleções instáveis, hidrata C106 com C107 disponível, a gravação automática é recusada e, ao reiniciar, C107 volta', async () => {
+      const { idbStorage, fingerprint: fp } = await seed('tchefood-r26c');
+      const name = 'tchefood-r26c';
+      localStorage.setItem(name + '::copia::0.a', JSON.stringify({ seq: 101, id: 'a', v: 'C101', base: fp('S0') }));
+      let n = 101;
+      onPut = (key) => {
+        if (key !== name) return;
+        n++;
+        localStorage.setItem(`${name}::copia::${n.toString(36)}.z${n}`, JSON.stringify({ seq: n, id: `z${n}`, v: `C${n}`, base: fp('S0') }));
+      };
+      const hydrated = await idbStorage.getItem(name);
+      onPut = null;
+      expect(hydrated).toBe(`C${n - 1}`); // C106; C107 ficou fora
+      await idbStorage.setItem(name, 'DERIVADO-DE-C106');
+      await tick();
+      expect(where(name)).not.toContain('DERIVADO-DE-C106'); // antes: promovido a estado definitivo por cima de C107
+      vi.resetModules();
+      expect(await (await import('../lib/idbStorage')).idbStorage.getItem(name)).toBe(`C${n}`);
+    });
+
+    it('P2-03: recuperação de S1 recusada e o IndexedDB passa a S2 sem mexer em nenhuma cópia: S1 não é promovido sobre S2', async () => {
+      const { idbStorage, fingerprint: fp } = await seed('tchefood-r26d');
+      const name = 'tchefood-r26d';
+      localStorage.setItem(name + '::copia::5.a', JSON.stringify({ seq: 101, id: 'a', v: 'S1', base: fp('S0') }));
+      mode = 'throw';
+      onFail = () => {
+        onFail = null;
+        disk.set(name, 'S2'); // outro app grava no IndexedDB com número maior
+        disk.set(name + '::seq', `500:${fp('S2')}`);
       };
       const got = await idbStorage.getItem(name);
+      mode = 'ok';
+      expect(got).toBe('S2'); // antes: S1
+      await idbStorage.setItem(name, 'S2');
       await tick();
-      expect(got).toBe('S9'); // a leitura recomeça e vê a troca
-      expect([...copies(name).map((c) => c.v), ...conflicts(name).map((c) => c.v), String(disk.get(name))]).toEqual(expect.arrayContaining(['S9']));
-      expect(copies(name).map((c) => c.v).concat(String(disk.get(name)))).toContain('S9'); // a troca feita pela outra instância não é apagada por esta
+      expect(disk.get(name)).toBe('S2');
+      expect(where(name)).toContain('S1');
     });
+
+    it('P2-04: 400 gravações seguidas com o IndexedDB recusando: os metadados da cópia não crescem com o histórico', async () => {
+      const { idbStorage } = await seed('tchefood-r26e');
+      const name = 'tchefood-r26e';
+      mode = 'throw';
+      await idbStorage.getItem(name);
+      for (let i = 0; i < 400; i++) await idbStorage.setItem(name, `estado-${i}`);
+      const found = copies(name);
+      expect(found).toHaveLength(1);
+      expect(localStorage.getItem(found[0]!.key)!.length).toBeLessThan(200); // antes: ~ 20 bytes por gravação acumulada
+      expect(conflicts(name)).toEqual([]);
+    });
+
+    it('P3-01: cadeia de cópias do mesmo escritor (A, B absorve A, C absorve B): nenhum conflito desnecessário', async () => {
+      const { idbStorage, fingerprint: fp } = await seed('tchefood-r26f');
+      const name = 'tchefood-r26f';
+      localStorage.setItem(name + '::copia::1.x', JSON.stringify({ seq: 101, id: 'x', v: 'A', base: fp('S0'), absorbs: [] }));
+      localStorage.setItem(name + '::copia::2.x', JSON.stringify({ seq: 102, id: 'x', v: 'B', base: fp('S0'), absorbs: [name + '::copia::1.x'] }));
+      localStorage.setItem(name + '::copia::3.x', JSON.stringify({ seq: 103, id: 'x', v: 'C', base: fp('S0'), absorbs: [name + '::copia::2.x'] }));
+      expect(await idbStorage.getItem(name)).toBe('C');
+      await tick();
+      expect(conflicts(name)).toEqual([]); // antes: A guardada sem necessidade
+      expect(copies(name)).toEqual([]);
+    });
+
+    it('segunda instância (sem o lock): só lê, não grava, não recupera e não apaga nada', async () => {
+      Object.defineProperty(navigator, 'locks', { configurable: true, value: { request: (_n: string, _o: unknown, cb: (l: null) => void) => Promise.resolve(cb(null)) } });
+      try {
+        const { idbStorage, fingerprint: fp } = await seed('tchefood-r26g');
+        const name = 'tchefood-r26g';
+        localStorage.setItem(name + '::copia::5.a', JSON.stringify({ seq: 101, id: 'a', v: 'S1', base: fp('S0') }));
+        expect(await idbStorage.getItem(name)).toBe('S1'); // vê o mais novo
+        await idbStorage.setItem(name, 'S2');
+        await tick();
+        expect(disk.get(name)).toBe('S0'); // não recuperou nem gravou
+        expect(copies(name).map((c) => c.v)).toEqual(['S1']); // não apagou
+        expect(conflicts(name)).toEqual([]);
+      } finally {
+        delete (navigator as { locks?: unknown }).locks;
+      }
+    }, 10_000);
   });
 
   it('GPT r23 P2-01 (vizinho): gravação recusada no IndexedDB não troca nem apaga a cópia mais nova de outra aba', async () => {

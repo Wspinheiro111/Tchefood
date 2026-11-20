@@ -1,55 +1,49 @@
-# idbStorage: invariantes das cópias de emergência (PR #54, rodada 26)
+# idbStorage: invariantes das cópias de emergência (PR #54, rodada 27)
 
 Arquivo: `src/lib/idbStorage.ts`. Testes: `src/__tests__/gptR18Persist.test.tsx`.
 
-## Regra, em uma frase
+## Modelo (simplificado na r27)
 
-**Nenhum conteúdo é apagado sem antes ter sido provado incluído no estado que fica, ou guardado em `::conflito`.**
-Resultado de leitura que não completou uma seleção estável nunca vira estado definitivo.
-
-1. Cada cópia no localStorage é uma chave **própria e só de escrita**: `<nome>::copia::<seq>.<instância>` (a chave antiga
-   única `<nome>::copia` continua lida, como cópia de id vazio). Duas gravações com o mesmo número viram duas chaves.
-2. **Um único caminho apaga cópia: `retire`.** Para cada cópia lida: se a chave já não tem o texto lido, não faz nada
-   (outra instância trocou ou apagou); se a cópia está provadamente incluída no estado que vale (é ele, tem o mesmo
-   conteúdo, ou está em `absorbs` de uma cópia que ele inclui), apaga sem registro; qualquer outra, de conteúdo diferente,
-   é guardada em `<nome>::conflito::<seq>.<id>.<impressão>` **antes**, e só é apagada se a guarda deu certo.
-3. Ordem total: (número, id da instância); o IndexedDB fica com o empate. Texto de versão anterior do app (impressão de
-   106 bits não bate com `k::seq`) vale mais que qualquer cópia, menos a feita em cima desse mesmo texto (`base`).
-4. `getItem` só dá o resultado por concluído numa **seleção estável**: depois de qualquer espera (recuperação no
-   IndexedDB, com sucesso ou erro) confere se apareceu ou mudou cópia e, se sim, escolhe de novo (até 6 vezes).
-5. Esgotadas as 6 tentativas, o resultado é **provisório**: devolve o mais novo visto (nunca `null`, que hidrataria uma
-   loja vazia), não apaga nada e, enquanto durar, `setItem` também não apaga cópia. A próxima leitura estável resolve e
-   guarda em `::conflito` o que não entrou.
-6. O IndexedDB só é sobrescrito pela recuperação se `k` e `k::seq` continuarem exatamente como na leitura (mesma transação).
-   Se a cópia foi feita em cima de outro texto que não é o de agora (bifurcação), o texto de agora é guardado em
-   `::conflito` antes de ser sobrescrito.
+A. **Um único escritor por aparelho.** Só a instância que obtém o lock exclusivo `navigator.locks` (`tchefood-idb-writer`)
+   grava, recupera ou apaga. Outra aba/instância do app no mesmo aparelho só **lê** (devolve o mais novo que vê, sem mudar
+   nada); a gravação dela é ignorada com aviso no console. Sem `navigator.locks` (jsdom, navegadores antigos), a instância é
+   a escritora. No APK há uma WebView por aparelho. Isso fecha a classe de concorrência entre escritores do app novo; sobram
+   só o texto que uma **versão anterior** do app deixa (foreign) e a chave antiga `<nome>::copia`.
+B. **Nenhum conteúdo é apagado sem estar provado incluído no estado que fica, ou guardado em `::conflito`.** Único caminho
+   de exclusão: `retire`. Sai sem registro só a cópia de mesmo conteúdo do estado que vale ou de gravação **anterior do mesmo
+   escritor** (mesmo id, número menor ou igual: o estado de um escritor só avança). Qualquer outra de conteúdo diferente é
+   guardada em `<nome>::conflito::…` antes e só é apagada se a guarda deu certo. Confere o texto lido antes de apagar.
+   **A chave antiga `<nome>::copia` nunca é apagada** (mutável por versões anteriores; só preservada e lida como candidata).
+   Não há mais lista `absorbs` nem fecho transitivo.
+C. **`select` (getItem) só conclui numa seleção estável**: depois de qualquer espera (recuperação com sucesso ou erro)
+   confere se mudou cópia **ou o próprio IndexedDB** e escolhe de novo (até 6 vezes). Esgotadas as tentativas, ou com o
+   IndexedDB ilegível depois de uma recuperação recusada, o resultado é **provisório**: devolve o mais novo visto (nunca
+   null), não apaga nada e **toda gravação é recusada** até uma nova seleção estável devolver exatamente o que foi hidratado
+   (se devolver outra coisa, a gravação segue recusada e a próxima abertura do app hidrata o estado certo).
 
 ## Todo caminho que apaga, sobrescreve ou ignora uma cópia
 
 | Caminho | O que faz | Por que não se perde conteúdo | Teste |
 |---|---|---|---|
-| `setItem`, IndexedDB bom (`writeDb`) | `retire` das cópias lidas na última seleção | só as incluídas saem sem registro; as lidas com conteúdo diferente vão para conflito; cópia não lida fica | r24 P2-02, r24 P2-03 escrita boa |
-| `setItem`, IndexedDB bom, seleção provisória | não apaga nenhuma cópia | nada é removido | r25 P2-04 |
-| `setItem`, IndexedDB recusando | grava chave nova; `retire` das lidas | chave única por gravação; `absorbs` registra o que ela inclui | r23 vizinho, r24 P2-03 fallback |
-| `setItem`, as duas recusando | guarda na memória (com `base` e `absorbs`) | memória é só desta aba; cópias de outras ficam | falha total devolve false |
-| `getItem` escolhe o IndexedDB | `retire` das cópias lidas | as de conteúdo diferente vão para conflito | r24 P2-03, r25 P2-01 |
-| `getItem`: IndexedDB com texto de versão anterior vence (foreign) | `retire` das cópias | a cópia feita em cima dele ganha; as outras (ex.: S1 com S2 antigo no lugar) vão para conflito, também depois de reiniciar | r21 P2-01, **r25 P2-01** |
-| `getItem` escolhe uma cópia (`healFromCopy`) | grava no IndexedDB só se `k`/`k::seq` não mudaram; depois `retire` | se mudou, relê; se chegou cópia no meio, relê; texto bifurcado do IndexedDB é guardado antes | r21 P2-02, r24 P2-01, r25 P2-04 |
-| `getItem`, recuperação **recusada** (`healFromCopy` lança) | confere se apareceu ou mudou cópia: se sim, escolhe de novo; se não, devolve a escolhida sem apagar nada | o resultado só é dado por concluído numa seleção estável | **r25 P2-03** (store real) |
-| `getItem`, leitura do IndexedDB **recusada** (`snap` nulo) | escolhe entre cópias e memória; não apaga | empate com conteúdo diferente: o de id maior vale e o outro vai para conflito na próxima gravação boa (`retire` do `setItem`) | **r25 P2-02** |
-| `getItem`, 6 seleções instáveis | devolve o mais novo visto, marca provisório | nada é apagado; leitura estável seguinte resolve | **r25 P2-04** |
-| Cópia da chave antiga única trocada por outra instância | `retire` confere o texto lido antes de apagar | a troca não é apagada; a leitura recomeça e vê o conteúdo novo | r25 chave antiga |
-| Hidratação do Zustand + gravação automática | grava o estado hidratado | o estado hidratado é o resultado de uma seleção estável (ou o provisório, que não apaga) | r24 P2-01 e r25 P2-03 com a store real |
-| `removeItem` | apaga estado, cópias e conflitos | decisão explícita de limpar a loja | — |
+| Instância sem o lock | `getItem` só lê; `setItem`/`removeItem` não fazem nada | não muda disco nem cópias | r26 segunda instância |
+| `setItem`, IndexedDB bom (`writeDb`) | `retire` das cópias lidas | mesmo escritor anterior: sem registro; outras: conflito; chave antiga: fica | r24 P2-02/P2-03, r26 P3-01 |
+| `setItem` com seleção provisória | recusado (a menos que a seleção estável devolva o hidratado) | provisório nunca vira definitivo | **r26 P2-02** |
+| `setItem`, IndexedDB recusando | grava chave nova `{seq,id,v,base}`; `retire` das lidas | chave por gravação; tamanho constante, sem histórico | r23 vizinho, r24 P2-03, **r26 P2-04** |
+| `setItem`, as duas recusando | guarda na memória (com `base`) | memória só desta instância; cópias ficam | falha total devolve false |
+| `select` escolhe o IndexedDB | `retire` das cópias lidas | conflito para as de conteúdo diferente | r24 P2-03, r25 P2-01 |
+| `select`: texto de versão anterior vence (foreign) | `retire` com vencedor sem escritor | a feita em cima dele ganha; as outras vão para conflito | r21 P2-01, r25 P2-01 |
+| `select` escolhe uma cópia (`healFromCopy`) | grava no IndexedDB só se `k`/`k::seq` não mudaram; texto bifurcado do IndexedDB vai para conflito antes; depois `retire` | se mudou, relê; cópia que chegou no meio, relê | r21 P2-02, r24 P2-01, r25 P2-04 |
+| `select`, recuperação **recusada** | relê o IndexedDB: mudou texto/número ou cópia → escolhe de novo; igual → devolve sem apagar; ilegível → provisório | atualização concorrente do IndexedDB não é sobrescrita | r25 P2-03, **r26 P2-03** |
+| `select`, leitura do IndexedDB recusada (`snap` nulo) | escolhe entre cópias e memória; não apaga | empate com conteúdo diferente: o de id maior vale, o outro vai para conflito na próxima gravação boa | r25 P2-02 |
+| `select`, 6 seleções instáveis | devolve o mais novo visto, provisório | nada apagado; gravação recusada | r25 P2-04, **r26 P2-02** |
+| Chave antiga `::copia` trocada por outra instância | nunca removida por `retire` | conteúdo novo continua lá e é candidato | **r26 P2-01a/b** |
+| Hidratação do Zustand + gravação automática | grava o estado hidratado só se a seleção foi estável | ver provisório | r24 P2-01 e r25 P2-03 com a store real |
+| `removeItem` (só escritor) | apaga estado, cópias e conflitos | decisão explícita de limpar a loja | — |
 
-## Limitações conhecidas (o que o navegador não garante)
+## Limitações conhecidas
 
-- Não há transação entre localStorage e IndexedDB nem "apagar se igual" no localStorage; por isso há chaves imutáveis,
-  exclusão pela chave exata e conferência do texto lido antes de cada exclusão.
-- Cópia que outra aba grava **depois** do fim da leitura desta e antes de esta gravar de volta concorre com a gravação
-  desta pela regra do último que grava (como duas abas no IndexedDB). Ela não é apagada e, se perder, vai para
-  `::conflito` na próxima leitura.
-- No resultado provisório, o estado hidratado pode ser o da penúltima cópia; a mais nova segue na chave dela e é
-  resolvida na próxima leitura estável.
-- Os testes usam IndexedDB e localStorage simulados no mesmo processo: provam a lógica de ordem e de chaves, não a
-  intercalação entre processos reais.
+- Sem `navigator.locks` não há exclusão entre instâncias; vale então a regra de conflito/leitura estável das rodadas anteriores
+  (chaves por gravação, exclusão pela chave exata, conferência do texto lido).
+- Se a instância escritora morre, outra só vira escritora ao recarregar (o lock é solto ao fechar a página; há 4 tentativas
+  de 200 ms ao abrir).
+- Os testes usam IndexedDB e localStorage simulados no mesmo processo.

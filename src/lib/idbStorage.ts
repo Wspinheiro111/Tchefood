@@ -100,32 +100,28 @@ export function storedOnlyInMemory(k: string): boolean {
 /**
  * COPIAS DE EMERGENCIA (gravação que o IndexedDB recusou) e a regra que as protege.
  *
- * O navegador não dá transação entre localStorage e IndexedDB, nem "apagar se igual" no localStorage, e abas
- * diferentes do mesmo app podem intercalar qualquer par de operações (WHATWG: não presumir travas entre grupos de
- * execução). A regra, em uma frase: NENHUM CONTEÚDO É APAGADO SEM ANTES TER SIDO PROVADO INCLUÍDO NO ESTADO QUE
- * FICA, OU GUARDADO EM `::conflito`. Em partes (a tabela de todos os caminhos está em docs/idbStorage-invariantes.md):
+ * MODELO (simplificado na rodada 27 do PR #54, depois de oito rodadas de casos de concorrência entre abas):
  *
- *  1. Cada cópia é uma chave PRÓPRIA e só de escrita (`<nome>::copia::<seq>.<instância>`): ninguém troca o valor da
- *     cópia de outra aba, e duas gravações com o mesmo número viram duas chaves.
- *  2. Toda exclusão de cópia passa por `retire`: a cópia sai sem registro só se está provadamente incluída no estado
- *     que vale (é ele, tem o mesmo conteúdo, ou está na lista `absorbs` de uma cópia que o estado inclui); qualquer
- *     outra, de conteúdo diferente, é guardada em `<nome>::conflito::…` ANTES de ser apagada, e só é apagada se a
- *     guarda deu certo. Nada apaga `::conflito` sozinho (só `removeItem`). Cada exclusão confere que a chave ainda
- *     tem o mesmo texto que foi lido (a chave antiga única `<nome>::copia` é mutável).
- *  3. Ordem total: (número, id da instância). O IndexedDB fica com o empate de número.
- *  4. `getItem` só dá o resultado por concluído numa seleção estável: depois de qualquer espera (recuperação no
- *     IndexedDB, com sucesso ou erro) confere se apareceu ou mudou cópia e, se sim, escolhe de novo. Esgotadas as
- *     tentativas, o resultado é PROVISÓRIO: devolve o mais novo visto (nunca null, que hidrataria loja vazia), não
- *     apaga nada e, enquanto durar, as gravações também não apagam nenhuma cópia; o que sobra é guardado em
- *     `::conflito` na próxima leitura estável.
+ *  A. UM ÚNICO ESCRITOR POR APARELHO. Só a instância que obtém o lock exclusivo `navigator.locks` grava, recupera ou
+ *     apaga qualquer coisa. Outra aba ou instância do app no mesmo aparelho só LÊ (devolve o mais novo que vê, não
+ *     muda nada, não grava). Onde `navigator.locks` não existe, a instância é a escritora (APK: uma WebView por aparelho).
+ *     Isso fecha a classe inteira de concorrência entre escritores do app novo; o que resta é só o texto que uma
+ *     VERSÃO ANTERIOR do app deixa (ver "foreign" abaixo) e a chave antiga `<nome>::copia`.
+ *  B. NENHUM CONTEÚDO É APAGADO SEM ANTES TER SIDO PROVADO INCLUÍDO NO ESTADO QUE FICA, OU GUARDADO EM `::conflito`.
+ *     Toda exclusão passa por `retire`: a cópia sai sem registro só se tem o mesmo conteúdo do estado que vale ou se é
+ *     de uma gravação ANTERIOR DO MESMO ESCRITOR (a mesma instância; o estado dela só avança, então o mais novo inclui o
+ *     mais velho); qualquer outra, de conteúdo diferente, é guardada em `<nome>::conflito::…` antes e só é apagada se a
+ *     guarda deu certo. A chave antiga única `<nome>::copia` (mutável, escrita por versões anteriores) NUNCA é apagada
+ *     automaticamente: só é lida como candidata e, se perder, o conteúdo dela continua lá.
+ *  C. `getItem` só dá o resultado por concluído numa seleção estável: depois de qualquer espera (recuperação no
+ *     IndexedDB, com sucesso ou erro) confere se apareceu ou mudou cópia, ou se o próprio IndexedDB mudou, e escolhe de
+ *     novo. Esgotadas as tentativas (ou com o IndexedDB ilegível depois de uma recuperação recusada) o resultado é
+ *     PROVISÓRIO: devolve o mais novo visto (nunca null, que hidrataria loja vazia), não apaga nada, e QUALQUER
+ *     GRAVAÇÃO é recusada até uma nova seleção estável devolver exatamente o que foi hidratado; se devolver outra coisa
+ *     (uma cópia mais nova), a gravação continua recusada e a próxima abertura do app hidrata o estado certo.
  *
- * O que o navegador não garante (limite conhecido): uma cópia que outra aba grava DEPOIS do fim da leitura desta e antes
- * de ela gravar de volta concorre com a gravação desta pela regra do último que grava (como duas abas no IndexedDB);
- * ela não é apagada e, se perder, vai para `::conflito` na próxima leitura.
- *
- * Formato da cópia: { seq, id, v, base, absorbs }. `base` é a impressão do texto que o IndexedDB tinha quando a cópia
- * foi feita (null: não se sabe); ver `pick`. `absorbs` são as chaves das cópias que o estado dela já inclui. A chave
- * antiga única `<nome>::copia` (sem `id`) continua lida, como cópia de id vazio.
+ * Formato da cópia: { seq, id, v, base }, chave `<nome>::copia::<seq>.<instância>` (uma por gravação, nunca trocada).
+ * `base` é a impressão do texto que o IndexedDB tinha quando a cópia foi feita (null: não se sabe); ver `pick`.
  */
 const FALLBACK_SUFFIX = '::copia';
 const CONFLICT_SUFFIX = '::conflito';
@@ -134,12 +130,11 @@ interface Stamped {
   v: string;
   base?: string | null;
 }
-/** Cópia no localStorage: `key` é a chave exata, `raw` o texto lido dela, `id` a instância que gravou ('' no formato antigo). */
+/** Cópia no localStorage: `key` é a chave exata, `raw` o texto lido dela, `id` a instância que gravou ('' na chave antiga). */
 interface Entry extends Stamped {
   id: string;
   key: string;
   raw: string;
-  absorbs: string[];
 }
 const INSTANCE = (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36)).slice(0, 12);
 let lastSeq = 0;
@@ -149,14 +144,41 @@ const seen = (seq: number) => {
 };
 const memorySeq = new Map<string, number>();
 const memoryBase = new Map<string, string | null>();
-const memoryAbsorbs = new Map<string, Set<string>>();
 /** Impressão do texto que o IndexedDB tinha na última leitura ou gravação boa desta chave (ausente: não se sabe). */
 const dbKnown = new Map<string, string | null>();
-/** Cópias vistas na última seleção, e as chaves que o estado desta aba já inclui (só estas saem sem registro). */
+/** Cópias vistas na última seleção (o `retire` age só sobre elas). */
 const seenCopies = new Map<string, Entry[]>();
-const absorbedKeys = new Map<string, Set<string>>();
-/** Seleção não concluída (tentativas esgotadas): nenhuma gravação desta aba apaga cópia até a próxima leitura estável. */
+/** Seleção não concluída: o que foi hidratado e que nenhuma gravação pode promover a estado definitivo. */
 const provisional = new Set<string>();
+const provisionalValue = new Map<string, string>();
+const WRITER_LOCK = 'tchefood-idb-writer';
+let writerPromise: Promise<boolean> | null = null;
+/** Esta instância é a única escritora do aparelho? (lock exclusivo; sem `navigator.locks`, é.) */
+export function isStorageWriter(): Promise<boolean> {
+  if (writerPromise) return writerPromise;
+  const locks = typeof navigator !== 'undefined' ? (navigator as { locks?: LockManager }).locks : undefined;
+  if (!locks) return (writerPromise = Promise.resolve(true));
+  writerPromise = (async () => {
+    for (let i = 0; i < 4; i++) {
+      const got = await new Promise<boolean>((resolve) => {
+        locks
+          .request(WRITER_LOCK, { ifAvailable: true }, (lock) => {
+            if (!lock) {
+              resolve(false);
+              return undefined;
+            }
+            resolve(true);
+            return new Promise<void>(() => undefined); // segura o lock até a página fechar
+          })
+          .catch(() => resolve(true));
+      });
+      if (got) return true;
+      await new Promise((r) => setTimeout(r, 200)); // a instância anterior pode estar fechando
+    }
+    return false;
+  })();
+  return writerPromise;
+}
 
 /**
  * No IndexedDB o valor continua sendo o texto puro da chave `k`, como nas versões anteriores (voltar o app
@@ -222,8 +244,8 @@ function listEntries(k: string): Entry[] {
         const parsed = JSON.parse(raw) as unknown;
         const st = unpack(parsed);
         if (!st) continue;
-        const extra = parsed as { id?: unknown; absorbs?: unknown };
-        out.push({ ...st, id: typeof extra.id === 'string' ? extra.id : '', key, raw, absorbs: Array.isArray(extra.absorbs) ? extra.absorbs.filter((x): x is string => typeof x === 'string') : [] });
+        const extra = parsed as { id?: unknown };
+        out.push({ ...st, id: typeof extra.id === 'string' ? extra.id : '', key, raw });
       } catch {
         // cópia ilegível: fica onde está, não é lida
       }
@@ -241,29 +263,20 @@ function copiesChanged(k: string, seenNow: Entry[]): boolean {
   const known = new Set(seenNow.map(signature));
   return listEntries(k).some((e) => !known.has(signature(e)));
 }
-/** A cópia `e` mais tudo o que ela já inclui (`absorbs`, transitivamente). */
-function closure(e: Entry, all: Entry[]): Set<string> {
-  const byKey = new Map(all.map((x) => [x.key, x]));
-  const out = new Set<string>();
-  const walk = (x: Entry) => {
-    if (out.has(x.key)) return;
-    out.add(x.key);
-    for (const a of x.absorbs) out.add(a), byKey.get(a) && walk(byKey.get(a)!);
-  };
-  walk(e);
-  return out;
-}
 /**
- * ÚNICO caminho que apaga cópias. Cada cópia lida (`covered`) sai sem registro só se está provadamente incluída no
- * estado que vale (`absorbed`) ou tem o mesmo conteúdo dele (`winnerV`); qualquer outra de conteúdo diferente é
- * guardada em `::conflito` primeiro, e só é apagada se a guarda deu certo. A exclusão confere que a chave ainda tem o
- * texto lido (a antiga chave única pode ter sido trocada por outra instância): se mudou, fica.
+ * ÚNICO caminho que apaga cópias. A chave antiga única nunca é apagada. Cada outra cópia lida (`covered`) sai sem
+ * registro só se tem o mesmo conteúdo do estado que vale (`winnerV`) ou é de uma gravação anterior do mesmo escritor
+ * (`winnerId`, número menor ou igual): o estado de um escritor só avança, então o mais novo inclui o mais velho. Qualquer
+ * outra, de conteúdo diferente, é guardada em `::conflito` primeiro, e só é apagada se a guarda deu certo. Confere que a
+ * chave ainda tem o texto lido.
  */
-function retire(k: string, covered: Entry[], absorbed: Set<string>, winnerV: string) {
+function retire(k: string, covered: Entry[], winnerV: string, winnerId: string | null, winnerSeq: number) {
   for (const e of covered) {
     try {
+      if (e.key === k + FALLBACK_SUFFIX) continue; // chave antiga: mutável por versões anteriores, só preservada
       if (localStorage.getItem(e.key) !== e.raw) continue; // trocada ou já removida: não é a que foi lida
-      if (!absorbed.has(e.key) && e.v !== winnerV) {
+      const superseded = e.v === winnerV || (winnerId !== null && e.id === winnerId && e.seq <= winnerSeq);
+      if (!superseded) {
         localStorage.setItem(conflictKey(k, e.seq, e.id, e.v), JSON.stringify({ seq: e.seq, id: e.id, v: e.v, base: e.base ?? null } satisfies Stamped & { id: string }));
       }
       localStorage.removeItem(e.key);
@@ -276,11 +289,10 @@ function dropMemory(k: string) {
   memory.delete(k);
   memorySeq.delete(k);
   memoryBase.delete(k);
-  memoryAbsorbs.delete(k);
 }
-function forgetSelection(k: string) {
-  seenCopies.delete(k);
-  absorbedKeys.delete(k);
+function clearProvisional(k: string) {
+  provisional.delete(k);
+  provisionalValue.delete(k);
 }
 async function writeDb(k: string, v: string, seq: number) {
   await tx('readwrite', (s) => {
@@ -289,10 +301,9 @@ async function writeDb(k: string, v: string, seq: number) {
   });
   dbKnown.set(k, fingerprint(v));
   dropMemory(k);
-  // As cópias lidas saem pelo `retire` (as incluídas sem registro, as outras guardadas); cópia que esta aba
-  // ainda não leu fica onde está. Com seleção provisória nada é apagado.
-  if (!provisional.has(k)) retire(k, seenCopies.get(k) ?? [], absorbedKeys.get(k) ?? new Set(), v);
-  forgetSelection(k);
+  // As cópias lidas saem pelo `retire` (as do mesmo escritor sem registro, as outras guardadas); a que esta instância ainda não leu fica.
+  retire(k, seenCopies.get(k) ?? [], v, INSTANCE, seq);
+  seenCopies.delete(k);
 }
 
 /** O que o IndexedDB tinha em `k` e `k::seq`, lido na mesma transação (nunca o texto de uma gravação com o número de outra). */
@@ -351,115 +362,136 @@ async function healFromCopy(k: string, copy: Stamped, snap: Snapshot): Promise<b
   return applied;
 }
 
-/** Quantas seleções seguidas getItem faz até ficar estável; esgotadas, o resultado é provisório (ver acima, item 4). */
+/** Quantas seleções seguidas `select` faz até ficar estável; esgotadas, o resultado é provisório (ver acima, item C). */
 const MAX_SELECTIONS = 6;
+
+async function select(k: string): Promise<string | null> {
+  const writer = await isStorageWriter();
+  let last: Candidate | null = null;
+  for (let attempt = 0; attempt < MAX_SELECTIONS; attempt++) {
+    let snap: Snapshot | null = null;
+    let fromDb: Candidate | null = null;
+    try {
+      snap = await readSnapshot(k);
+    } catch {
+      snap = null;
+    }
+    if (snap) {
+      if (typeof snap.text === 'string') {
+        const r = parseSeq(snap.seqRaw, snap.text);
+        fromDb = { seq: r.seq, v: snap.text, foreign: r.foreign };
+        dbKnown.set(k, fingerprint(snap.text));
+      } else {
+        fromDb = unpack(snap.text);
+        dbKnown.set(k, null);
+      }
+    }
+    const entries = listEntries(k);
+    const mem = memory.get(k);
+    const outside: Candidate[] = entries.map((e) => ({ seq: e.seq, v: e.v, base: e.base, id: e.id, entry: e }));
+    if (mem !== undefined) outside.push({ seq: memorySeq.get(k) ?? 0, v: mem, base: memoryBase.get(k), id: INSTANCE, mem: true });
+    const best = pick(fromDb, outside);
+    if (!best) {
+      clearProvisional(k);
+      return snap ? null : (fallback.getItem(k) as string | null);
+    }
+    last = best;
+    if (!writer) return best.v; // instância só de leitura: não grava, não recupera, não apaga
+    for (const c of [fromDb, ...outside]) if (c && !c.foreign) seen(c.seq);
+    seenCopies.set(k, entries);
+    if (best.entry && snap) {
+      let healed = false;
+      try {
+        // A cópia foi feita em cima de OUTRO texto do IndexedDB que não é o de agora: o de agora é uma bifurcação
+        // e sobrescrevê-lo só vale se ele ficar guardado antes.
+        if (fromDb && !fromDb.foreign && typeof snap.text === 'string' && best.base != null && best.base !== fingerprint(snap.text)) {
+          localStorage.setItem(conflictKey(k, fromDb.seq, 'db', snap.text), JSON.stringify({ seq: fromDb.seq, id: 'db', v: snap.text, base: null }));
+        }
+        healed = await healFromCopy(k, best, snap);
+      } catch {
+        // A recuperação foi recusada. Durante a espera pode ter mudado cópia OU o próprio IndexedDB: só é resultado
+        // concluído se tudo continua como na leitura; se o IndexedDB não puder ser relido, o resultado é provisório.
+        let again: Snapshot | null = null;
+        try {
+          again = await readSnapshot(k);
+        } catch {
+          again = null;
+        }
+        if (again === null) {
+          provisional.add(k);
+          provisionalValue.set(k, best.v);
+          return best.v;
+        }
+        if (!same(again.text, snap.text) || !same(again.seqRaw, snap.seqRaw) || copiesChanged(k, entries)) continue;
+        clearProvisional(k);
+        return best.v;
+      }
+      if (!healed) continue; // o IndexedDB mudou: lê de novo
+      retire(k, entries, best.v, best.entry.id, best.seq);
+      seenCopies.delete(k);
+      // Seleção estável: se apareceu ou mudou cópia durante a recuperação, é mais um candidato; recomeça.
+      if (copiesChanged(k, entries)) continue;
+      clearProvisional(k);
+      return best.v;
+    }
+    if (best === fromDb && snap) {
+      // O IndexedDB já é o mais novo: as cópias lidas que ele não inclui vão para `::conflito`.
+      retire(k, entries, best.v, fromDb.foreign ? null : INSTANCE, best.seq);
+      seenCopies.delete(k);
+    }
+    clearProvisional(k);
+    return best.v;
+  }
+  // Seleção que não ficou estável: devolve o mais novo visto (null hidrataria uma loja vazia), sem apagar nada,
+  // e nenhuma gravação é aceita até uma seleção estável devolver exatamente isto.
+  provisional.add(k);
+  if (last) provisionalValue.set(k, last.v);
+  return last?.v ?? null;
+}
 
 export const idbStorage: StateStorage = hasIndexedDB
   ? {
-      getItem: async (k) => {
-        let last: Candidate | null = null;
-        for (let attempt = 0; attempt < MAX_SELECTIONS; attempt++) {
-          let snap: Snapshot | null = null;
-          let fromDb: Candidate | null = null;
-          try {
-            snap = await readSnapshot(k);
-          } catch {
-            snap = null;
-          }
-          if (snap) {
-            if (typeof snap.text === 'string') {
-              const r = parseSeq(snap.seqRaw, snap.text);
-              fromDb = { seq: r.seq, v: snap.text, foreign: r.foreign };
-              dbKnown.set(k, fingerprint(snap.text));
-            } else {
-              fromDb = unpack(snap.text);
-              dbKnown.set(k, null);
-            }
-          }
-          const entries = listEntries(k);
-          const mem = memory.get(k);
-          const outside: Candidate[] = entries.map((e) => ({ seq: e.seq, v: e.v, base: e.base, id: e.id, entry: e }));
-          if (mem !== undefined) outside.push({ seq: memorySeq.get(k) ?? 0, v: mem, base: memoryBase.get(k), id: INSTANCE, mem: true });
-          const best = pick(fromDb, outside);
-          if (!best) {
-            provisional.delete(k);
-            return snap ? null : (fallback.getItem(k) as string | null);
-          }
-          last = best;
-          for (const c of [fromDb, ...outside]) if (c && !c.foreign) seen(c.seq);
-          // Só o que o estado escolhido inclui sai sem registro: ele mesmo e o que ele absorveu.
-          const absorbed = best.entry ? closure(best.entry, entries) : best.mem ? new Set(memoryAbsorbs.get(k) ?? []) : new Set<string>();
-          seenCopies.set(k, entries);
-          absorbedKeys.set(k, absorbed);
-          if (best.entry && snap) {
-            let healed = false;
-            try {
-              // A cópia foi feita em cima de OUTRO texto do IndexedDB que não é o de agora: o de agora é uma bifurcação
-              // (outra aba gravou depois) e sobrescrevê-lo só vale se ele ficar guardado antes.
-              if (fromDb && !fromDb.foreign && typeof snap.text === 'string' && best.base != null && best.base !== fingerprint(snap.text)) {
-                localStorage.setItem(conflictKey(k, fromDb.seq, 'db', snap.text), JSON.stringify({ seq: fromDb.seq, id: 'db', v: snap.text, base: null }));
-              }
-              healed = await healFromCopy(k, best, snap);
-            } catch {
-              // O IndexedDB recusa a recuperação. A cópia segue de pé (nada é apagado), mas durante a espera
-              // pode ter chegado outra mais nova: só é resultado concluído se nada mudou.
-              if (copiesChanged(k, entries)) continue;
-              provisional.delete(k);
-              return best.v;
-            }
-            if (!healed) continue; // o IndexedDB mudou: lê de novo
-            retire(k, entries, absorbed, best.v);
-            forgetSelection(k);
-            // Seleção estável: se apareceu ou mudou cópia durante a recuperação, é mais um candidato; recomeça.
-            if (copiesChanged(k, entries)) continue;
-            provisional.delete(k);
-            return best.v;
-          }
-          if (best === fromDb && snap) {
-            // O IndexedDB já é o mais novo: as cópias lidas que ele não inclui vão para `::conflito`.
-            retire(k, entries, absorbed, best.v);
-            forgetSelection(k);
-          }
-          provisional.delete(k);
-          return best.v;
-        }
-        // Seleção que não ficou estável: devolve o mais novo visto (null hidrataria uma loja vazia), sem apagar nada.
-        provisional.add(k);
-        return last?.v ?? null;
-      },
+      getItem: (k) => select(k),
       setItem: async (k, v) => {
+        if (!(await isStorageWriter())) {
+          console.warn('[idbStorage] outra instância do app é a escritora neste aparelho: esta só lê');
+          return;
+        }
+        if (provisional.has(k)) {
+          // O estado hidratado não veio de uma seleção estável: só grava se agora a seleção estável devolve o mesmo.
+          const expected = provisionalValue.get(k);
+          const now = await select(k);
+          if (provisional.has(k) || now !== expected) {
+            console.warn('[idbStorage] gravação recusada: o estado hidratado não era o mais novo; reabra o app');
+            return;
+          }
+        }
         const seq = nextSeq();
         try {
           await writeDb(k, v, seq);
         } catch {
           const base = dbKnown.get(k) ?? null;
           const key = entryKey(k, seq, INSTANCE);
-          const absorbs = [...(absorbedKeys.get(k) ?? [])];
-          const raw = JSON.stringify({ seq, id: INSTANCE, v, base, absorbs });
+          const raw = JSON.stringify({ seq, id: INSTANCE, v, base });
           try {
             // Chave própria desta gravação: não troca a de outra aba, mesmo com o mesmo número.
             localStorage.setItem(key, raw);
             dropMemory(k);
-            const mine: Entry = { seq, id: INSTANCE, v, base, absorbs, key, raw };
-            const prior = seenCopies.get(k) ?? [];
-            const absorbed = new Set([...(absorbedKeys.get(k) ?? []), key]);
-            // O estado desta cópia inclui o que a aba já tinha absorvido: sai sem registro; o resto lido é guardado.
-            if (!provisional.has(k)) retire(k, prior, absorbed, v);
-            seenCopies.set(k, provisional.has(k) ? [...prior, mine] : [mine]);
-            absorbedKeys.set(k, absorbed);
+            retire(k, seenCopies.get(k) ?? [], v, INSTANCE, seq);
+            seenCopies.set(k, [{ seq, id: INSTANCE, v, base, key, raw }]);
           } catch {
             memory.set(k, v);
             memorySeq.set(k, seq);
             memoryBase.set(k, base);
-            memoryAbsorbs.set(k, new Set(absorbedKeys.get(k) ?? []));
           }
         }
       },
       removeItem: async (k) => {
+        if (!(await isStorageWriter())) return;
         dropMemory(k);
         dbKnown.delete(k);
-        forgetSelection(k);
-        provisional.delete(k);
+        seenCopies.delete(k);
+        clearProvisional(k);
         // Apagar o estado é decisão explícita (sair da loja): vão também as cópias e os conflitos guardados.
         try {
           const doomed: string[] = [];
