@@ -102,23 +102,30 @@ export function storedOnlyInMemory(k: string): boolean {
  *
  * O navegador não dá transação entre localStorage e IndexedDB, nem "apagar se igual" no localStorage, e abas
  * diferentes do mesmo app podem intercalar qualquer par de operações (WHATWG: não presumir travas entre grupos de
- * execução). Por isso nenhuma cópia é sobrescrita nem apagada por comparação de número:
+ * execução). A regra, em uma frase: NENHUM CONTEÚDO É APAGADO SEM ANTES TER SIDO PROVADO INCLUÍDO NO ESTADO QUE
+ * FICA, OU GUARDADO EM `::conflito`. Em partes (a tabela de todos os caminhos está em docs/idbStorage-invariantes.md):
  *
- *  1. Cada cópia é uma chave PRÓPRIA e só de escrita (`<nome>::copia::<seq>.<instância>`): ninguém troca o valor de
- *     uma cópia de outra aba, e duas gravações com o mesmo número (mesmo milissegundo) viram duas chaves.
- *  2. Uma aba só apaga cópias pela chave exata que ELA LEU (ou escreveu) e cujo conteúdo o estado dela já inclui:
- *     as lidas na última seleção e as suas. Cópia que apareceu depois da leitura não é conhecida e nunca é apagada.
- *  3. Ordem total: (número, id da instância). Mesmo número com conteúdos diferentes: o desempate é pelo id, e a perdedora
- *     não é apagada: vai para `<nome>::conflito::…`, que nada apaga sozinho, para a pessoa poder recuperar.
- *  4. getItem só devolve depois de uma seleção estável: depois de recuperar uma cópia no IndexedDB, lê tudo de novo, e
- *     se apareceu cópia mais nova, recomeça. O que o Zustand hidrata é, portanto, o mais novo que existia ao fim da leitura.
+ *  1. Cada cópia é uma chave PRÓPRIA e só de escrita (`<nome>::copia::<seq>.<instância>`): ninguém troca o valor da
+ *     cópia de outra aba, e duas gravações com o mesmo número viram duas chaves.
+ *  2. Toda exclusão de cópia passa por `retire`: a cópia sai sem registro só se está provadamente incluída no estado
+ *     que vale (é ele, tem o mesmo conteúdo, ou está na lista `absorbs` de uma cópia que o estado inclui); qualquer
+ *     outra, de conteúdo diferente, é guardada em `<nome>::conflito::…` ANTES de ser apagada, e só é apagada se a
+ *     guarda deu certo. Nada apaga `::conflito` sozinho (só `removeItem`). Cada exclusão confere que a chave ainda
+ *     tem o mesmo texto que foi lido (a chave antiga única `<nome>::copia` é mutável).
+ *  3. Ordem total: (número, id da instância). O IndexedDB fica com o empate de número.
+ *  4. `getItem` só dá o resultado por concluído numa seleção estável: depois de qualquer espera (recuperação no
+ *     IndexedDB, com sucesso ou erro) confere se apareceu ou mudou cópia e, se sim, escolhe de novo. Esgotadas as
+ *     tentativas, o resultado é PROVISÓRIO: devolve o mais novo visto (nunca null, que hidrataria loja vazia), não
+ *     apaga nada e, enquanto durar, as gravações também não apagam nenhuma cópia; o que sobra é guardado em
+ *     `::conflito` na próxima leitura estável.
  *
- * O que o navegador não garante (limite conhecido): uma cópia que outra aba grava DEPOIS do fim da leitura desta, e antes
- * de ela gravar de volta, concorre com a gravação desta pela regra do último que grava (como duas abas gravando no
- * IndexedDB); ela continua na chave dela até alguém a ler e vale se tiver número maior.
+ * O que o navegador não garante (limite conhecido): uma cópia que outra aba grava DEPOIS do fim da leitura desta e antes
+ * de ela gravar de volta concorre com a gravação desta pela regra do último que grava (como duas abas no IndexedDB);
+ * ela não é apagada e, se perder, vai para `::conflito` na próxima leitura.
  *
- * Formato da cópia: { seq, id, v, base }. `base` é a impressão do texto que o IndexedDB tinha quando a cópia foi feita
- * (null: não se sabe); ver `pick`. O formato antigo, uma chave única `<nome>::copia` sem `id`, continua lido (id vazio).
+ * Formato da cópia: { seq, id, v, base, absorbs }. `base` é a impressão do texto que o IndexedDB tinha quando a cópia
+ * foi feita (null: não se sabe); ver `pick`. `absorbs` são as chaves das cópias que o estado dela já inclui. A chave
+ * antiga única `<nome>::copia` (sem `id`) continua lida, como cópia de id vazio.
  */
 const FALLBACK_SUFFIX = '::copia';
 const CONFLICT_SUFFIX = '::conflito';
@@ -127,10 +134,12 @@ interface Stamped {
   v: string;
   base?: string | null;
 }
-/** Cópia no localStorage: `key` é a chave exata, `id` a instância que gravou ('' no formato antigo). */
+/** Cópia no localStorage: `key` é a chave exata, `raw` o texto lido dela, `id` a instância que gravou ('' no formato antigo). */
 interface Entry extends Stamped {
   id: string;
   key: string;
+  raw: string;
+  absorbs: string[];
 }
 const INSTANCE = (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36)).slice(0, 12);
 let lastSeq = 0;
@@ -140,10 +149,14 @@ const seen = (seq: number) => {
 };
 const memorySeq = new Map<string, number>();
 const memoryBase = new Map<string, string | null>();
+const memoryAbsorbs = new Map<string, Set<string>>();
 /** Impressão do texto que o IndexedDB tinha na última leitura ou gravação boa desta chave (ausente: não se sabe). */
 const dbKnown = new Map<string, string | null>();
-/** Chaves exatas das cópias que o estado desta aba já inclui (lidas na última seleção ou gravadas por ela). */
-const knownCopies = new Map<string, Set<string>>();
+/** Cópias vistas na última seleção, e as chaves que o estado desta aba já inclui (só estas saem sem registro). */
+const seenCopies = new Map<string, Entry[]>();
+const absorbedKeys = new Map<string, Set<string>>();
+/** Seleção não concluída (tentativas esgotadas): nenhuma gravação desta aba apaga cópia até a próxima leitura estável. */
+const provisional = new Set<string>();
 
 /**
  * No IndexedDB o valor continua sendo o texto puro da chave `k`, como nas versões anteriores (voltar o app
@@ -159,6 +172,8 @@ interface Candidate extends Stamped {
   foreign?: boolean;
   /** Cópia do localStorage, quando é uma. */
   entry?: Entry;
+  /** Estado em memória desta aba (as duas gravações recusadas). */
+  mem?: boolean;
   id?: string;
 }
 /** Duas somas de 53 bits (cyrb53, sementes diferentes) e o tamanho: colisão por acaso é praticamente impossível. */
@@ -202,9 +217,13 @@ function listEntries(k: string): Entry[] {
       const key = localStorage.key(i);
       if (key === null || !(key === prefix || key.startsWith(prefix + '::'))) continue;
       try {
-        const raw = JSON.parse(localStorage.getItem(key) ?? 'null') as unknown;
-        const st = unpack(raw);
-        if (st) out.push({ ...st, id: typeof (raw as { id?: unknown }).id === 'string' ? (raw as { id: string }).id : '', key });
+        const raw = localStorage.getItem(key);
+        if (raw === null) continue;
+        const parsed = JSON.parse(raw) as unknown;
+        const st = unpack(parsed);
+        if (!st) continue;
+        const extra = parsed as { id?: unknown; absorbs?: unknown };
+        out.push({ ...st, id: typeof extra.id === 'string' ? extra.id : '', key, raw, absorbs: Array.isArray(extra.absorbs) ? extra.absorbs.filter((x): x is string => typeof x === 'string') : [] });
       } catch {
         // cópia ilegível: fica onde está, não é lida
       }
@@ -216,38 +235,52 @@ function listEntries(k: string): Entry[] {
 }
 /** Ordem total das cópias: número e, no empate, id da instância. */
 const compare = (a: { seq: number; id?: string }, b: { seq: number; id?: string }) => a.seq - b.seq || ((a.id ?? '') < (b.id ?? '') ? -1 : (a.id ?? '') > (b.id ?? '') ? 1 : 0);
-/** Tira exatamente estas chaves (nada além delas). */
-function removeKeys(keys: Iterable<string>) {
-  for (const key of keys) {
-    try {
-      localStorage.removeItem(key);
-    } catch {
-      // fica; é lida de novo e perde pelo número
-    }
-  }
+const signature = (e: Entry) => `${e.key}\0${e.raw}`;
+/** Chegou ou mudou cópia desde a leitura `seenNow`? */
+function copiesChanged(k: string, seenNow: Entry[]): boolean {
+  const known = new Set(seenNow.map(signature));
+  return listEntries(k).some((e) => !known.has(signature(e)));
+}
+/** A cópia `e` mais tudo o que ela já inclui (`absorbs`, transitivamente). */
+function closure(e: Entry, all: Entry[]): Set<string> {
+  const byKey = new Map(all.map((x) => [x.key, x]));
+  const out = new Set<string>();
+  const walk = (x: Entry) => {
+    if (out.has(x.key)) return;
+    out.add(x.key);
+    for (const a of x.absorbs) out.add(a), byKey.get(a) && walk(byKey.get(a)!);
+  };
+  walk(e);
+  return out;
 }
 /**
- * Cópias que o estado `winner` já cobre (lidas e menores na ordem, ou iguais em conteúdo): saem pela chave exata.
- * Cópia com o MESMO número e conteúdo diferente não é descartada: vai para `::conflito` (nada a apaga sozinho).
+ * ÚNICO caminho que apaga cópias. Cada cópia lida (`covered`) sai sem registro só se está provadamente incluída no
+ * estado que vale (`absorbed`) ou tem o mesmo conteúdo dele (`winnerV`); qualquer outra de conteúdo diferente é
+ * guardada em `::conflito` primeiro, e só é apagada se a guarda deu certo. A exclusão confere que a chave ainda tem o
+ * texto lido (a antiga chave única pode ter sido trocada por outra instância): se mudou, fica.
  */
-function retire(k: string, covered: Entry[], winner: { seq: number; v: string; id?: string }) {
-  const keys: string[] = [];
+function retire(k: string, covered: Entry[], absorbed: Set<string>, winnerV: string) {
   for (const e of covered) {
-    if (e.seq === winner.seq && e.v !== winner.v) {
-      try {
+    try {
+      if (localStorage.getItem(e.key) !== e.raw) continue; // trocada ou já removida: não é a que foi lida
+      if (!absorbed.has(e.key) && e.v !== winnerV) {
         localStorage.setItem(conflictKey(k, e.seq, e.id, e.v), JSON.stringify({ seq: e.seq, id: e.id, v: e.v, base: e.base ?? null } satisfies Stamped & { id: string }));
-      } catch {
-        continue; // sem como guardar o conflito: a cópia fica onde está
       }
+      localStorage.removeItem(e.key);
+    } catch {
+      // sem como guardar ou apagar: a cópia fica onde está e é lida de novo
     }
-    keys.push(e.key);
   }
-  removeKeys(keys);
 }
 function dropMemory(k: string) {
   memory.delete(k);
   memorySeq.delete(k);
   memoryBase.delete(k);
+  memoryAbsorbs.delete(k);
+}
+function forgetSelection(k: string) {
+  seenCopies.delete(k);
+  absorbedKeys.delete(k);
 }
 async function writeDb(k: string, v: string, seq: number) {
   await tx('readwrite', (s) => {
@@ -256,9 +289,10 @@ async function writeDb(k: string, v: string, seq: number) {
   });
   dbKnown.set(k, fingerprint(v));
   dropMemory(k);
-  // Só as cópias que o estado desta aba já inclui; cópia de outra aba que ainda não foi lida fica.
-  removeKeys(knownCopies.get(k) ?? []);
-  knownCopies.delete(k);
+  // As cópias lidas saem pelo `retire` (as incluídas sem registro, as outras guardadas); cópia que esta aba
+  // ainda não leu fica onde está. Com seleção provisória nada é apagado.
+  if (!provisional.has(k)) retire(k, seenCopies.get(k) ?? [], absorbedKeys.get(k) ?? new Set(), v);
+  forgetSelection(k);
 }
 
 /** O que o IndexedDB tinha em `k` e `k::seq`, lido na mesma transação (nunca o texto de uma gravação com o número de outra). */
@@ -279,8 +313,8 @@ const same = (a: unknown, b: unknown) => (typeof a === 'string' || typeof b === 
 /**
  * O mais novo entre o IndexedDB (`db`) e o que está fora dele (cópias, memória): o IndexedDB com texto de versão anterior
  * (foreign) vale mais, a não ser que a cópia tenha sido feita em cima desse mesmo texto (`base`), e então a cópia é
- * posterior; sem texto de versão anterior, vale o número maior (empate com conteúdo igual ou diferente: o IndexedDB fica
- * e a cópia empatada e diferente vai para `::conflito`, ver `retire`).
+ * posterior; sem texto de versão anterior, vale o número maior (empate: o IndexedDB). As que perdem não somem: `retire`
+ * guarda em `::conflito` o que o estado escolhido não inclui.
  */
 function pick(db: Candidate | null, outside: Candidate[]): Candidate | null {
   const top = (list: Candidate[]) => list.reduce<Candidate | null>((a, b) => (a && compare(a, b) >= 0 ? a : b), null);
@@ -317,7 +351,7 @@ async function healFromCopy(k: string, copy: Stamped, snap: Snapshot): Promise<b
   return applied;
 }
 
-/** Quantas leituras seguidas getItem faz até a seleção ficar estável (cópia nova no meio da recuperação). */
+/** Quantas seleções seguidas getItem faz até ficar estável; esgotadas, o resultado é provisório (ver acima, item 4). */
 const MAX_SELECTIONS = 6;
 
 export const idbStorage: StateStorage = hasIndexedDB
@@ -345,33 +379,52 @@ export const idbStorage: StateStorage = hasIndexedDB
           const entries = listEntries(k);
           const mem = memory.get(k);
           const outside: Candidate[] = entries.map((e) => ({ seq: e.seq, v: e.v, base: e.base, id: e.id, entry: e }));
-          if (mem !== undefined) outside.push({ seq: memorySeq.get(k) ?? 0, v: mem, base: memoryBase.get(k), id: INSTANCE });
+          if (mem !== undefined) outside.push({ seq: memorySeq.get(k) ?? 0, v: mem, base: memoryBase.get(k), id: INSTANCE, mem: true });
           const best = pick(fromDb, outside);
-          if (!best) return snap ? null : (fallback.getItem(k) as string | null);
+          if (!best) {
+            provisional.delete(k);
+            return snap ? null : (fallback.getItem(k) as string | null);
+          }
           last = best;
           for (const c of [fromDb, ...outside]) if (c && !c.foreign) seen(c.seq);
-          // O estado desta aba passa a incluir as cópias lidas: só estas chaves podem ser apagadas por ela.
-          knownCopies.set(k, new Set(entries.map((e) => e.key)));
+          // Só o que o estado escolhido inclui sai sem registro: ele mesmo e o que ele absorveu.
+          const absorbed = best.entry ? closure(best.entry, entries) : best.mem ? new Set(memoryAbsorbs.get(k) ?? []) : new Set<string>();
+          seenCopies.set(k, entries);
+          absorbedKeys.set(k, absorbed);
           if (best.entry && snap) {
+            let healed = false;
             try {
-              if (!(await healFromCopy(k, best, snap))) continue; // o IndexedDB mudou: lê de novo
+              // A cópia foi feita em cima de OUTRO texto do IndexedDB que não é o de agora: o de agora é uma bifurcação
+              // (outra aba gravou depois) e sobrescrevê-lo só vale se ele ficar guardado antes.
+              if (fromDb && !fromDb.foreign && typeof snap.text === 'string' && best.base != null && best.base !== fingerprint(snap.text)) {
+                localStorage.setItem(conflictKey(k, fromDb.seq, 'db', snap.text), JSON.stringify({ seq: fromDb.seq, id: 'db', v: snap.text, base: null }));
+              }
+              healed = await healFromCopy(k, best, snap);
             } catch {
-              return best.v; // o IndexedDB ainda recusa: segue na cópia, que fica onde está
+              // O IndexedDB recusa a recuperação. A cópia segue de pé (nada é apagado), mas durante a espera
+              // pode ter chegado outra mais nova: só é resultado concluído se nada mudou.
+              if (copiesChanged(k, entries)) continue;
+              provisional.delete(k);
+              return best.v;
             }
-            retire(k, entries, best);
-            knownCopies.delete(k);
-            // Seleção estável: se apareceu cópia que esta leitura não viu, ela é mais um candidato; recomeça.
-            const known = new Set(entries.map((e) => e.key));
-            if (listEntries(k).some((e) => !known.has(e.key))) continue;
+            if (!healed) continue; // o IndexedDB mudou: lê de novo
+            retire(k, entries, absorbed, best.v);
+            forgetSelection(k);
+            // Seleção estável: se apareceu ou mudou cópia durante a recuperação, é mais um candidato; recomeça.
+            if (copiesChanged(k, entries)) continue;
+            provisional.delete(k);
             return best.v;
           }
           if (best === fromDb && snap) {
-            // O IndexedDB já é o mais novo: as cópias lidas são mais velhas (ou empatadas: ver retire).
-            retire(k, entries, best);
-            knownCopies.delete(k);
+            // O IndexedDB já é o mais novo: as cópias lidas que ele não inclui vão para `::conflito`.
+            retire(k, entries, absorbed, best.v);
+            forgetSelection(k);
           }
+          provisional.delete(k);
           return best.v;
         }
+        // Seleção que não ficou estável: devolve o mais novo visto (null hidrataria uma loja vazia), sem apagar nada.
+        provisional.add(k);
         return last?.v ?? null;
       },
       setItem: async (k, v) => {
@@ -381,25 +434,32 @@ export const idbStorage: StateStorage = hasIndexedDB
         } catch {
           const base = dbKnown.get(k) ?? null;
           const key = entryKey(k, seq, INSTANCE);
+          const absorbs = [...(absorbedKeys.get(k) ?? [])];
+          const raw = JSON.stringify({ seq, id: INSTANCE, v, base, absorbs });
           try {
             // Chave própria desta gravação: não troca a de outra aba, mesmo com o mesmo número.
-            localStorage.setItem(key, JSON.stringify({ seq, id: INSTANCE, v, base }));
+            localStorage.setItem(key, raw);
             dropMemory(k);
-            // Esta cópia já inclui o que o estado tinha: as cópias conhecidas e mais velhas saem pela chave exata.
-            const known = knownCopies.get(k) ?? new Set<string>();
-            removeKeys([...known].filter((x) => x !== key));
-            knownCopies.set(k, new Set([key]));
+            const mine: Entry = { seq, id: INSTANCE, v, base, absorbs, key, raw };
+            const prior = seenCopies.get(k) ?? [];
+            const absorbed = new Set([...(absorbedKeys.get(k) ?? []), key]);
+            // O estado desta cópia inclui o que a aba já tinha absorvido: sai sem registro; o resto lido é guardado.
+            if (!provisional.has(k)) retire(k, prior, absorbed, v);
+            seenCopies.set(k, provisional.has(k) ? [...prior, mine] : [mine]);
+            absorbedKeys.set(k, absorbed);
           } catch {
             memory.set(k, v);
             memorySeq.set(k, seq);
             memoryBase.set(k, base);
+            memoryAbsorbs.set(k, new Set(absorbedKeys.get(k) ?? []));
           }
         }
       },
       removeItem: async (k) => {
         dropMemory(k);
         dbKnown.delete(k);
-        knownCopies.delete(k);
+        forgetSelection(k);
+        provisional.delete(k);
         // Apagar o estado é decisão explícita (sair da loja): vão também as cópias e os conflitos guardados.
         try {
           const doomed: string[] = [];
@@ -407,7 +467,7 @@ export const idbStorage: StateStorage = hasIndexedDB
             const key = localStorage.key(i);
             if (key !== null && (key.startsWith(k + FALLBACK_SUFFIX) || key.startsWith(k + CONFLICT_SUFFIX + '::'))) doomed.push(key);
           }
-          removeKeys(doomed);
+          for (const key of doomed) localStorage.removeItem(key);
         } catch {
           // nada a apagar
         }

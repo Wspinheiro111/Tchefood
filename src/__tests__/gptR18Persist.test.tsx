@@ -19,6 +19,10 @@ let mode: Mode = 'ok';
 /** Chamado depois de cada leitura (get) de uma chave no IndexedDB de mentira: simula outra gravação no meio. */
 let afterGet: ((key: string) => void) | null = null;
 let onPut: ((key: string) => void) | null = null;
+/** Chamado quando uma transação de escrita é recusada (modo 'throw'): simula outra aba agindo durante a recuperação recusada. */
+let onFail: (() => void) | null = null;
+/** true: toda transação só de leitura falha (leitura degradada). */
+let readFails = false;
 const later = (f: () => void) => setTimeout(f, 0);
 
 function fakeIndexedDB() {
@@ -35,7 +39,8 @@ function fakeIndexedDB() {
         pending++;
         const req: { onsuccess?: (() => void) | null; onerror?: (() => void) | null; result?: unknown; error?: unknown } = {};
         later(() => {
-          if (txMode === 'readwrite' && mode === 'throw') {
+          if ((txMode === 'readwrite' && mode === 'throw') || (txMode === 'readonly' && readFails)) {
+            onFail?.();
             req.error = new DOMException('cheio', 'QuotaExceededError');
             t.error = req.error;
             req.onerror?.();
@@ -91,6 +96,8 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     mode = 'ok';
     afterGet = null;
     onPut = null;
+    onFail = null;
+    readFails = false;
     (globalThis as { indexedDB?: unknown }).indexedDB = fakeIndexedDB();
   });
   afterEach(() => {
@@ -422,6 +429,130 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
       expect(disk.get(name)).toBe('S1b');
       expect(conflicts(name).map((c) => c.v)).toEqual(['S1a']);
       expect(copies(name)).toEqual([]);
+    });
+  });
+
+  describe('GPT r25 (PR #54): toda cópia que sai é provada incluída ou guardada; resultado sem seleção estável não vira estado definitivo', () => {
+    const seed = async (name: string) => {
+      vi.resetModules();
+      const mod = await import('../lib/idbStorage');
+      mode = 'ok';
+      await mod.idbStorage.getItem(name);
+      disk.set(name, 'S0');
+      disk.set(name + '::seq', `100:${mod.fingerprint('S0')}`);
+      return mod;
+    };
+
+    it('P2-01: cópia S1 (feita em cima de S0), versão antiga grava S2: S2 vale e S1 fica guardada em ::conflito (também depois de reiniciar)', async () => {
+      const { idbStorage, fingerprint: fp } = await seed('tchefood-r25a');
+      const name = 'tchefood-r25a';
+      localStorage.setItem(name + '::copia::5.a', JSON.stringify({ seq: 101, id: 'a', v: 'S1', base: fp('S0') }));
+      disk.set(name, 'S2'); // versão antiga: texto novo, sem mexer em ::seq
+      expect(await idbStorage.getItem(name)).toBe('S2');
+      await tick();
+      expect(disk.get(name)).toBe('S2');
+      expect(copies(name)).toEqual([]);
+      expect(conflicts(name).map((c) => c.v)).toEqual(['S1']); // antes: S1 apagada sem registro
+      vi.resetModules();
+      expect(await (await import('../lib/idbStorage')).idbStorage.getItem(name)).toBe('S2');
+      expect(conflicts(name).map((c) => c.v)).toEqual(['S1']);
+    });
+
+    it('P2-02: leitura degradada com duas cópias do mesmo número; ao voltar, setItem(Y) deixa Y e guarda X em ::conflito', async () => {
+      const { idbStorage } = await seed('tchefood-r25b');
+      const name = 'tchefood-r25b';
+      localStorage.setItem(name + '::copia::5.a', JSON.stringify({ seq: 101, id: 'a', v: 'X', base: null }));
+      localStorage.setItem(name + '::copia::5.b', JSON.stringify({ seq: 101, id: 'b', v: 'Y', base: null }));
+      readFails = true;
+      expect(await idbStorage.getItem(name)).toBe('Y'); // sem o IndexedDB: a de id maior
+      readFails = false;
+      await idbStorage.setItem(name, 'Y');
+      await tick();
+      expect(disk.get(name)).toBe('Y');
+      expect(copies(name)).toEqual([]);
+      expect(conflicts(name).map((c) => c.v)).toEqual(['X']); // antes: X apagada sem registro
+    });
+
+    it('P2-03 (store real): a recuperação de S1 é recusada e S2 chega nesse meio tempo; hidratar, gravar sozinho e reiniciar mantém S2', async () => {
+      vi.resetModules();
+      let store = await import('../store/useTcheStore');
+      await tick();
+      const name = store.useTcheStore.persist.getOptions().name!;
+      store.useTcheStore.setState({ courierSettlePending: [{ id: 'acerto-S0' } as never] });
+      expect(await store.awaitPersisted()).toBe(true);
+      await tick();
+      const s0 = disk.get(name) as string;
+      const { fingerprint: fp } = await import('../lib/idbStorage');
+      const mk = (id: string) => s0.replace('acerto-S0', id);
+      const seq0 = Number(String(disk.get(name + '::seq')).split(':')[0]);
+      localStorage.setItem(name + '::copia::1.a', JSON.stringify({ seq: seq0 + 1, id: 'a', v: mk('acerto-S1'), base: fp(s0) }));
+      mode = 'throw'; // a leitura funciona, a recuperação (escrita) é recusada
+      onFail = () => {
+        onFail = null;
+        localStorage.setItem(name + '::copia::2.b', JSON.stringify({ seq: seq0 + 2, id: 'b', v: mk('acerto-S2'), base: fp(s0) }));
+      };
+      vi.resetModules();
+      store = await import('../store/useTcheStore');
+      await tick(80);
+      mode = 'ok';
+      expect(store.useTcheStore.getState().courierSettlePending?.[0]?.id).toBe('acerto-S2'); // antes: S1
+      expect(await store.awaitPersisted()).toBe(true);
+      await tick();
+      vi.resetModules();
+      store = await import('../store/useTcheStore');
+      await tick(80);
+      expect(store.useTcheStore.getState().courierSettlePending?.[0]?.id).toBe('acerto-S2');
+      expect(JSON.stringify(disk.get(name))).toContain('acerto-S2');
+      const kept = [...copies(name).map((c) => c.v), ...conflicts(name).map((c) => c.v)].join('');
+      expect(kept + JSON.stringify(disk.get(name))).toContain('acerto-S1'); // S1 continua recuperável
+    });
+
+    it('P2-04: chega cópia nova em todas as tentativas: devolve o mais novo visto, nada some, nada é apagado enquanto provisório, e a próxima leitura estável resolve', async () => {
+      const { idbStorage, fingerprint: fp } = await seed('tchefood-r25d');
+      const name = 'tchefood-r25d';
+      localStorage.setItem(name + '::copia::0.a', JSON.stringify({ seq: 101, id: 'a', v: 'C101', base: fp('S0') }));
+      let n = 101;
+      const inject = () => {
+        n++;
+        localStorage.setItem(`${name}::copia::${n.toString(36)}.z`, JSON.stringify({ seq: n, id: 'z', v: `C${n}`, base: fp('S0') }));
+      };
+      onPut = (key) => { if (key === name) inject(); }; // cada recuperação é interrompida por uma cópia nova
+      const got = await idbStorage.getItem(name);
+      onPut = null;
+      expect(got).not.toBeNull();
+      await tick();
+      // Provisório: nada se perdeu (cada conteúdo está numa cópia, em ::conflito ou no IndexedDB) e a gravação abaixo não apaga cópia.
+      const where = () => [...copies(name).map((c) => c.v), ...conflicts(name).map((c) => c.v), String(disk.get(name))];
+      for (let i = 101; i <= n; i++) expect(where()).toContain(`C${i}`);
+      const before = copies(name).map((c) => c.v);
+      await idbStorage.setItem(name, 'MINHA');
+      await tick();
+      expect(copies(name).map((c) => c.v)).toEqual(expect.arrayContaining(before));
+      // Leitura estável: resolve, e o que não entrou vai para ::conflito.
+      const final = await idbStorage.getItem(name);
+      await tick();
+      expect(final).toBe(disk.get(name));
+      const preserved = [...copies(name).map((c) => c.v), ...conflicts(name).map((c) => c.v), String(disk.get(name))];
+      // MINHA substitui o estado devolvido (`got`, a base dela); todo o resto segue guardado.
+      for (let i = 101; i <= n; i++) if (`C${i}` !== got) expect(preserved).toContain(`C${i}`);
+      expect(preserved).toContain('MINHA');
+    });
+
+    it('chave antiga única ::copia trocada por outra instância entre a leitura e a exclusão: não é apagada', async () => {
+      const { idbStorage, fingerprint: fp } = await seed('tchefood-r25e');
+      const name = 'tchefood-r25e';
+      localStorage.setItem(name + '::copia', JSON.stringify({ seq: 101, v: 'S1', base: fp('S0') }));
+      afterGet = (key) => {
+        if (key !== name) return;
+        afterGet = null;
+        // outra instância (versão anterior) troca o conteúdo da mesma chave antiga
+        localStorage.setItem(name + '::copia', JSON.stringify({ seq: 150, v: 'S9', base: fp('S0') }));
+      };
+      const got = await idbStorage.getItem(name);
+      await tick();
+      expect(got).toBe('S9'); // a leitura recomeça e vê a troca
+      expect([...copies(name).map((c) => c.v), ...conflicts(name).map((c) => c.v), String(disk.get(name))]).toEqual(expect.arrayContaining(['S9']));
+      expect(copies(name).map((c) => c.v).concat(String(disk.get(name)))).toContain('S9'); // a troca feita pela outra instância não é apagada por esta
     });
   });
 
