@@ -171,11 +171,19 @@ function readCopy(k: string): Stamped | null {
     return null;
   }
 }
-function dropCopy(k: string) {
+/**
+ * Tira a cópia desta chave, menos uma com número maior que `upToSeq`: outra aba pode ter gravado uma cópia mais nova
+ * depois de a leitura escolher a cópia que está sendo recuperada, ou depois de começar a gravação no IndexedDB, e essa
+ * não pode sumir (GPT, rodada 23 do PR #54). O localStorage não tem apagar-se-igual entre abas; a conferência e a
+ * remoção ficam juntas no mesmo trecho síncrono, sem esperar nada no meio.
+ */
+function dropCopy(k: string, upToSeq = Infinity) {
   memory.delete(k);
   memorySeq.delete(k);
   memoryBase.delete(k);
   try {
+    const current = readCopy(k);
+    if (current && current.seq > upToSeq) return;
     localStorage.removeItem(k + FALLBACK_SUFFIX);
   } catch {
     // a cópia velha perde pelo número da gravação
@@ -187,7 +195,7 @@ async function writeDb(k: string, v: string, seq: number) {
     return s.put(v, k);
   });
   dbKnown.set(k, fingerprint(v));
-  dropCopy(k);
+  dropCopy(k, seq);
 }
 
 /** O que o IndexedDB tinha em `k` e `k::seq`, lido na mesma transação (nunca o texto de uma gravação com o número de outra). */
@@ -240,7 +248,7 @@ async function healFromCopy(k: string, copy: Stamped, snap: Snapshot): Promise<b
   });
   if (applied) {
     dbKnown.set(k, fingerprint(copy.v));
-    dropCopy(k);
+    dropCopy(k, copy.seq);
   }
   return applied;
 }
@@ -291,7 +299,9 @@ export const idbStorage: StateStorage = hasIndexedDB
         } catch {
           const base = dbKnown.get(k) ?? null;
           try {
-            localStorage.setItem(k + FALLBACK_SUFFIX, JSON.stringify({ seq, v, base } satisfies Stamped));
+            // Cópia mais nova de outra aba não é trocada por esta, mais velha.
+            const current = readCopy(k);
+            if (!current || current.seq < seq) localStorage.setItem(k + FALLBACK_SUFFIX, JSON.stringify({ seq, v, base } satisfies Stamped));
             memory.delete(k);
             memorySeq.delete(k);
             memoryBase.delete(k);

@@ -18,6 +18,7 @@ const disk = new Map<string, unknown>();
 let mode: Mode = 'ok';
 /** Chamado depois de cada leitura (get) de uma chave no IndexedDB de mentira: simula outra gravação no meio. */
 let afterGet: ((key: string) => void) | null = null;
+let onPut: ((key: string) => void) | null = null;
 const later = (f: () => void) => setTimeout(f, 0);
 
 function fakeIndexedDB() {
@@ -63,7 +64,7 @@ function fakeIndexedDB() {
           later(() => afterGet?.(k));
           return v;
         }),
-        put: (v: unknown, k: string) => request(() => { staged.push(() => disk.set(k, structuredClone(v))); return k; }),
+        put: (v: unknown, k: string) => request(() => { onPut?.(k); staged.push(() => disk.set(k, structuredClone(v))); return k; }),
         delete: (k: string) => request(() => { staged.push(() => disk.delete(k)); return undefined; }),
       });
       return t;
@@ -86,6 +87,7 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     localStorage.clear();
     mode = 'ok';
     afterGet = null;
+    onPut = null;
     (globalThis as { indexedDB?: unknown }).indexedDB = fakeIndexedDB();
   });
   afterEach(() => {
@@ -276,6 +278,68 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
     const got = await idbStorage.getItem(name);
     expect(got).toBe('S2');
     expect(disk.get(name)).toBe('S2');
+  });
+
+  it('GPT r23 P2-01: cópia mais nova de outra aba, gravada depois da leitura e antes do descarte, não some (recuperação)', async () => {
+    vi.resetModules();
+    const { idbStorage, fingerprint: fp } = await import('../lib/idbStorage');
+    const name = 'tchefood-r23a';
+    mode = 'ok';
+    await idbStorage.getItem(name); // abre o banco
+    disk.set(name, 'S0');
+    disk.set(name + '::seq', `100:${fp('S0')}`);
+    localStorage.setItem(name + '::copia', JSON.stringify({ seq: 101, v: 'S1', base: fp('S0') }));
+    // Outra aba, depois de esta ler S1 e antes de descartar, grava a cópia S2 (102) no localStorage.
+    let reads = 0;
+    afterGet = (key) => {
+      if (key !== name || ++reads !== 2) return; // 1ª: leitura do texto; 2ª: leitura dentro da recuperação
+      localStorage.setItem(name + '::copia', JSON.stringify({ seq: 102, v: 'S2', base: fp('S0') }));
+    };
+    expect(await idbStorage.getItem(name)).toBe('S1');
+    await tick();
+    expect(JSON.parse(localStorage.getItem(name + '::copia')!)).toMatchObject({ seq: 102, v: 'S2' });
+    // Próxima abertura: S2, não S1.
+    afterGet = null;
+    vi.resetModules();
+    const again = await import('../lib/idbStorage');
+    expect(await again.idbStorage.getItem(name)).toBe('S2');
+    await tick();
+    expect(disk.get(name)).toBe('S2');
+  });
+
+  it('GPT r23 P2-01: cópia mais nova de outra aba, gravada durante a gravação no IndexedDB, não some (writeDb)', async () => {
+    vi.resetModules();
+    const { idbStorage, fingerprint: fp } = await import('../lib/idbStorage');
+    const name = 'tchefood-r23b';
+    mode = 'ok';
+    await idbStorage.getItem(name);
+    disk.set(name, 'S0');
+    disk.set(name + '::seq', `100:${fp('S0')}`);
+    localStorage.setItem(name + '::copia', JSON.stringify({ seq: 101, v: 'S1', base: fp('S0') }));
+    // Esta aba grava S3 no IndexedDB; no meio, outra aba (relógio um pouco à frente) grava a cópia S2.
+    onPut = (key) => {
+      if (key !== name) return;
+      onPut = null;
+      localStorage.setItem(name + '::copia', JSON.stringify({ seq: Date.now() + 5_000, v: 'S2', base: fp('S0') }));
+    };
+    await idbStorage.setItem(name, 'S3');
+    await tick();
+    expect(JSON.parse(localStorage.getItem(name + '::copia')!)).toMatchObject({ v: 'S2' });
+    vi.resetModules();
+    const again = await import('../lib/idbStorage');
+    expect(await again.idbStorage.getItem(name)).toBe('S2');
+  });
+
+  it('GPT r23 P2-01 (vizinho): gravação recusada no IndexedDB não troca por uma cópia mais velha a cópia mais nova de outra aba', async () => {
+    vi.resetModules();
+    const { idbStorage } = await import('../lib/idbStorage');
+    const name = 'tchefood-r23c';
+    mode = 'ok';
+    await idbStorage.getItem(name);
+    localStorage.setItem(name + '::copia', JSON.stringify({ seq: Date.now() + 60_000, v: 'S2', base: null }));
+    mode = 'throw';
+    await idbStorage.setItem(name, 'S1');
+    expect(JSON.parse(localStorage.getItem(name + '::copia')!)).toMatchObject({ v: 'S2' });
   });
 
   it('GPT r21 P2-03: JSONs que colidiam na impressão de 32 bits não se confundem', async () => {
