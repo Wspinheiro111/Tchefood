@@ -162,7 +162,7 @@ function respond(doc: NfceDocumentRow, message?: string | null): EmitResponse {
       protocol: doc.status === 'authorized' || doc.status === 'cancelled' ? doc.protocol : null,
       number: doc.number,
       series: doc.series,
-      qrcode_url: doc.qrcode_url,
+      qrcode_url: isValidQrCodeUrl(doc.qrcode_url, doc.access_key, doc.environment) ? doc.qrcode_url : null,
       danfe_path: doc.danfe_path,
       issued_at: doc.issued_at,
       payload: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.payload ?? null : null,
@@ -205,7 +205,11 @@ function providerFields(doc: NfceDocumentRow, next: NfceDocumentStatus, response
   const rawKey = response.accessKey?.replace(/^NFe/i, '') ?? null;
   const accessKey = rawKey === null ? doc.access_key : isValidAccessKey(rawKey) ? rawKey : doc.access_key;
   // QR Code só se for a URL assinada da SEFAZ para ESTA chave; url_danfe nunca é QR Code.
-  const qr = response.qrCodeUrl && isValidQrCodeUrl(response.qrCodeUrl, accessKey, doc.environment) ? response.qrCodeUrl : doc.qrcode_url;
+  const qr = response.qrCodeUrl && isValidQrCodeUrl(response.qrCodeUrl, accessKey, doc.environment)
+    ? response.qrCodeUrl
+    : isValidQrCodeUrl(doc.qrcode_url, accessKey, doc.environment) // QR gravado por versão anterior é revalidado pela regra atual
+      ? doc.qrcode_url
+      : null;
   return {
     status: next,
     access_key: accessKey,
@@ -316,7 +320,7 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
   }
   // O documento gravado é devolvido sem token: o token só é exigido para falar com a Focus
   // (consultar ou transmitir).
-  if (doc && doc.status === 'authorized' && doc.qrcode_url && doc.authorized_at && doc.issuer_address) return respond(doc);
+  if (doc && doc.status === 'authorized' && isValidQrCodeUrl(doc.qrcode_url, doc.access_key, doc.environment) && doc.authorized_at && doc.issuer_address) return respond(doc);
   if (doc && doc.status === 'cancelled') return respond(doc);
   // Autorizada sem o QR Code assinado: consulta a Focus (só GET) para completar o DANFE.
   if (doc && doc.status === 'authorized') return token ? reconcile(deps, doc, token) : consultOnlyWithoutToken(input, doc, noToken);

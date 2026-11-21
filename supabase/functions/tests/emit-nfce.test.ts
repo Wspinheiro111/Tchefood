@@ -579,6 +579,10 @@ describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no apa
       [`${KEY}`, false, 'homologacao'],
       [`${KEY}|2`, false, 'homologacao'],
       [`${KEY}|3`, false, 'homologacao'],
+      [`${KEY}|2|2`, false, 'homologacao'],
+      [`${KEY}|2|2|1`, false, 'homologacao'],
+      [`${KEY}|9|2|1|ABCDEF`, false, 'homologacao'],
+      [`${KEY}||2|1|ABCDEF`, false, 'homologacao'],
       [`${KEY}|2||1|ABCDEF`, false, 'homologacao'],
       [`${KEY}|3|`, false, 'homologacao'],
       [`${KEY}|2|1|1|ABCDEF`, false, 'homologacao'],
@@ -662,5 +666,41 @@ describe('Codex #63: endereço de contingência rejeitada não sobrevive ao reen
     const db = { from: () => ({ update: (v: Record<string, unknown>) => { updated = v; return chain; } }) };
     await supabaseNfceRepository(db).claimRejected('d1', 1, 'h', {}, {});
     expect(updated).toMatchObject({ status: 'processing', transmissions: 2, authorized_at: null, issuer_address: null });
+  });
+});
+
+describe('P2-04 (auditoria do #63): QR legado inválido nunca deixa o documento "recuperado"', () => {
+  const HTTP_QR = `http://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF`;
+  const legacyRepo = () => {
+    const repo = new MemoryRepo(source());
+    repo.doc = {
+      id: 'd1', tenant_id: TENANT, order_id: ORDER, reference: 'tchefood', environment: 'homologacao', status: 'authorized', payload_hash: 'h', payload: {}, issuer: null,
+      access_key: KEY, protocol: '143260000000001', number: 42, series: '1', qrcode_url: HTTP_QR, danfe_path: null, xml_path: XML_PATH, sefaz_status: '100', sefaz_message: null,
+      offline_contingency: false, transmissions: 1, issued_at: null, authorized_at: '2026-11-09T06:00:07.000Z', issuer_address: { street: 'R', number: '1', complement: null, district: 'C', city: 'S', state: 'RS', zip: '98800000' },
+    } as never;
+    return repo;
+  };
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+
+  it('documento autorizado com QR HTTP gravado: não é devolvido como completo, consulta a Focus e o QR válido o substitui', async () => {
+    const repo = legacyRepo();
+    const f = fakeFocus([{ status: 200, body: AUTHORIZED }]);
+    const r = await emitNfce(deps(repo, f.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(f.calls).toHaveLength(1); // consultou, não devolveu "completo" pelo campo não vazio
+    expect(r.body).toMatchObject({ status: 'authorized', qrcode_url: QR });
+    expect(repo.doc?.qrcode_url).toBe(QR);
+  });
+
+  it('se a Focus não devolve QR válido, o QR legado inválido é descartado (nunca devolvido) e a nota segue autorizada', async () => {
+    const repo = legacyRepo();
+    const f = fakeFocus([{ status: 200, body: { ...AUTHORIZED, qrcode_url: null } }]);
+    const r = await emitNfce(deps(repo, f.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'authorized', authorized: true, qrcode_url: null });
+    expect(repo.doc).toMatchObject({ status: 'authorized', qrcode_url: null });
+    // Sem token, o documento gravado é devolvido sem o QR inválido.
+    const noToken = new MemoryRepo(source({ tenant: { ...source().tenant, focus_nfe_token: null } }));
+    noToken.doc = { ...legacyRepo().doc! };
+    const again = await emitNfce(deps(noToken, fakeFocus([]).focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(again.body.qrcode_url).toBeNull();
   });
 });
