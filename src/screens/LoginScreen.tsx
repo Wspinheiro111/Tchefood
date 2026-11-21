@@ -1,12 +1,12 @@
 import { useState } from 'react';
-import { Wifi, WifiOff } from 'lucide-react';
+import { HelpCircle, Wifi, WifiOff } from 'lucide-react';
 import { BrandLogo } from '../components/Brand';
 import { PinPad } from '../components/PinPad';
 import { useTcheStore } from '../store/useTcheStore';
 import { playDeniedBuzz, vibrate } from '../lib/sound';
 import { useOnline } from '../lib/useOnline';
 
-export function LoginScreen() {
+export function LoginScreen({ onHelp }: { onHelp?: () => void } = {}) {
   const login = useTcheStore((s) => s.login);
   const tenant = useTcheStore((s) => s.tenant);
   const online = useOnline();
@@ -37,6 +37,11 @@ export function LoginScreen() {
       <p className="mb-4 text-lg font-semibold">Digite seu PIN</p>
       <PinPad value={pin} onChange={(v) => { setPin(v); setError(null); }} onComplete={attempt} error={Boolean(error)} />
       <p className="mt-4 h-6 text-center text-sm font-semibold text-rose-600">{error}</p>
+      {onHelp && (
+        <button onClick={onHelp} className="mt-4 inline-flex min-h-touch items-center gap-2 rounded-xl px-4 text-sm font-bold text-brasa">
+          <HelpCircle className="h-5 w-5" /> Central de ajuda (esqueci meu PIN, primeiros passos)
+        </button>
+      )}
       <div className="mt-6 grid w-full max-w-xs grid-cols-2 gap-2 text-xs text-slate-500">
         <span>1111 · Garçom Tião</span>
         <span>2222 · Garçom Duda</span>
