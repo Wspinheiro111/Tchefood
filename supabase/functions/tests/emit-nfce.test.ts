@@ -14,14 +14,16 @@ import {
   type NfceSource,
   type PaymentRow,
 } from '../emit-nfce/payload.ts';
-import { classifyTransmission, createFocusClient, focusEnvironment, normalizeProviderStatus, type FetchLike } from '../emit-nfce/focus.ts';
+import { classifyTransmission, createFocusClient, focusEnvironment, isValidAccessKey, isValidQrCodeUrl, normalizeProviderStatus, parseAuthorizedXml, type FetchLike } from '../emit-nfce/focus.ts';
+import { parseEmitResponse } from '../../../src/lib/sync/nfceEmission.ts';
+import { supabaseNfceRepository } from '../emit-nfce/repository.ts';
 import { emitNfce, type NfceDocumentRow, type NfceRepository } from '../emit-nfce/emit.ts';
 import { parseDanfePayload, parseNfceIssuer } from '../../../src/lib/sync/nfceEmission.ts';
 
 const TENANT = '11111111-1111-4111-8111-111111111111';
 const ORDER = '22222222-2222-4222-8222-222222222222';
-const KEY = '43261112345678000195650010000000421000000427';
-const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF`;
+const KEY = '43261112345678000195650010000000421000000420';
+const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
 
 function source(overrides: Partial<NfceSource> = {}): NfceSource {
   return {
@@ -204,7 +206,7 @@ class MemoryRepo implements NfceRepository {
   }
   async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown = {}, issuer: unknown = null) {
     if (!this.doc || this.doc.id !== id || this.doc.status !== 'rejected' || this.doc.transmissions !== expectedTransmissions) return null;
-    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, payload, issuer, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
+    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, payload, issuer, authorized_at: null, issuer_address: null, access_key: null, protocol: null, qrcode_url: null, danfe_path: null, xml_path: null, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
     return { ...this.doc };
   }
   async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
@@ -214,19 +216,31 @@ class MemoryRepo implements NfceRepository {
   }
 }
 
-function fakeFocus(responses: Array<{ status: number; body: unknown } | 'network'>) {
+const XML_PATH = '/arquivos_development/x/NFe.xml';
+/** XML autorizado como a Focus devolve (trecho): Id da chave, emitente com endereço, dhRecbto do protocolo. */
+function authorizedXml(key = KEY, over: { cnpj?: string; id?: string; ender?: string; dh?: string; protKey?: string; nprot?: string } = {}) {
+  const ender = over.ender ?? '<enderEmit><xLgr>Rua das Flores</xLgr><nro>120</nro><xBairro>Centro</xBairro><cMun>4317103</cMun><xMun>Santo Angelo</xMun><UF>RS</UF><CEP>98800000</CEP></enderEmit>';
+  return `<nfeProc><NFe><infNFe versao="4.00" Id="NFe${over.id ?? key}"><emit><CNPJ>${over.cnpj ?? key.slice(6, 20)}</CNPJ><xNome>FLIP</xNome>${ender}<IE>0960000000</IE></emit></infNFe></NFe><protNFe><infProt><chNFe>${over.protKey ?? key}</chNFe><dhRecbto>${over.dh ?? '2026-11-09T03:00:07-03:00'}</dhRecbto><nProt>${over.nprot ?? '143260000000001'}</nProt></infProt></protNFe></nfeProc>`;
+}
+
+function fakeFocus(responses: Array<{ status: number; body: unknown } | 'network'>, xml: string | null = authorizedXml()) {
   const calls: Array<{ method: string; url: string }> = [];
+  const xmlCalls: string[] = [];
   const fetch: FetchLike = async (url, init) => {
+    if (url.endsWith(XML_PATH)) {
+      xmlCalls.push(url);
+      return xml === null ? { status: 404, ok: false, text: async () => '' } : { status: 200, ok: true, text: async () => xml };
+    }
     calls.push({ method: init.method, url });
     const next = responses.shift();
     if (!next || next === 'network') throw new Error('network');
     return { status: next.status, ok: next.status >= 200 && next.status < 300, text: async () => JSON.stringify(next.body) };
   };
-  return { calls, focus: (token: string) => createFocusClient({ environment: 'homologacao', token, fetch }) };
+  return { calls, xmlCalls, focus: (token: string) => createFocusClient({ environment: 'homologacao', token, fetch }) };
 }
 
 const sha256Hex = async (t: string) => createHash('sha256').update(t).digest('hex');
-const AUTHORIZED = { status: 'autorizado', status_sefaz: '100', mensagem_sefaz: 'Autorizado o uso da NF-e', chave_nfe: `NFe${KEY}`, protocolo: '143260000000001', numero: '42', serie: '1', qrcode_url: QR, caminho_danfe: '/notas_fiscais_consumidor/x.html' };
+const AUTHORIZED = { status: 'autorizado', status_sefaz: '100', mensagem_sefaz: 'Autorizado o uso da NF-e', chave_nfe: `NFe${KEY}`, protocolo: '143260000000001', numero: '42', serie: '1', qrcode_url: QR, caminho_danfe: '/notas_fiscais_consumidor/x.html', caminho_xml_nota_fiscal: XML_PATH };
 
 describe('emitNfce', () => {
   it('autoriza, grava protocolo e QR Code, e não reenvia na segunda chamada', async () => {
@@ -475,5 +489,523 @@ describe('emitNfce', () => {
     const { focus } = fakeFocus([]);
     const r = await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: '33333333-3333-4333-8333-333333333333', orderId: ORDER });
     expect(r.httpStatus).toBe(404);
+  });
+});
+
+
+describe('P1-02 e P1-03 (2ª auditoria do #55): endereço do emitente e dhRecbto vêm do XML autorizado', () => {
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+  const ADDRESS = { street: 'Rua das Flores', number: '120', complement: null, district: 'Centro', city: 'Santo Angelo', state: 'RS', zip: '98800000' };
+
+  it('grava e devolve endereço (enderEmit) e data de autorização (dhRecbto) do XML, e não consulta de novo depois', async () => {
+    const repo = new MemoryRepo(source());
+    const { calls, xmlCalls, focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const first = await emitNfce(deps(repo, focus), { tenantId: TENANT, orderId: ORDER });
+    expect(first.body).toMatchObject({ authorized: true, issuer_address: ADDRESS, authorized_at: '2026-11-09T06:00:07.000Z' });
+    expect(xmlCalls).toHaveLength(1);
+    const again = await emitNfce(deps(repo, focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(again.body).toMatchObject({ issuer_address: ADDRESS, authorized_at: '2026-11-09T06:00:07.000Z' });
+    expect(calls).toHaveLength(1);
+    expect(xmlCalls).toHaveLength(1);
+  });
+
+  it('XML de outra nota (Id ou CNPJ diferentes) ou ausente não preenche nada: nem endereço, nem data inventada a partir da emissão', async () => {
+    for (const xml of [authorizedXml(KEY, { id: `${KEY.slice(0, 43)}9` }), authorizedXml(KEY, { cnpj: '48291736000155' }), authorizedXml(KEY, { ender: '' }), null]) {
+      const repo = new MemoryRepo(source());
+      const { focus } = fakeFocus([{ status: 201, body: AUTHORIZED }], xml);
+      const r = await emitNfce(deps(repo, focus), { tenantId: TENANT, orderId: ORDER });
+      expect(r.body.authorized).toBe(true);
+      expect(r.body.issuer_address).toBeNull();
+      // data_emissao do payload nunca vira data de autorização.
+      expect(r.body.authorized_at).not.toBe(r.body.issued_at);
+    }
+  });
+
+  it('a data do protocolo da Focus vale quando o XML não vem, e uma consulta posterior completa o endereço sem mudar a data', async () => {
+    const repo = new MemoryRepo(source());
+    const withProtocol = { ...AUTHORIZED, protocolo_nota_fiscal: { numero_protocolo: '143260000000001', data_recebimento: '2026-11-09T03:03:00-03:00' } };
+    const first = fakeFocus([{ status: 201, body: withProtocol }], null);
+    const r1 = await emitNfce(deps(repo, first.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r1.body).toMatchObject({ issuer_address: null, authorized_at: '2026-11-09T06:03:00.000Z' });
+    // Documento com QR mas sem endereço: a consulta (GET) busca o XML; a data já gravada não muda.
+    const second = fakeFocus([{ status: 200, body: withProtocol }], authorizedXml(KEY, { dh: '2026-11-09T03:09:00-03:00' }));
+    const r2 = await emitNfce(deps(repo, second.focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r2.body).toMatchObject({ issuer_address: ADDRESS, authorized_at: '2026-11-09T06:03:00.000Z' });
+    expect(second.calls.every((c) => c.method === 'GET')).toBe(true);
+  });
+
+  it('parseAuthorizedXml: chave inválida, XML sem enderEmit ou com CEP/UF malformados não devolve endereço', () => {
+    expect(parseAuthorizedXml(authorizedXml(), KEY).address).toEqual(ADDRESS);
+    expect(parseAuthorizedXml(authorizedXml(), 'x').address).toBeNull();
+    expect(parseAuthorizedXml(authorizedXml(KEY, { ender: '<enderEmit><xLgr>R</xLgr><nro>1</nro><xBairro>B</xBairro><xMun>M</xMun><UF>rs</UF><CEP>12</CEP></enderEmit>' }), KEY).address).toBeNull();
+    expect(parseAuthorizedXml(authorizedXml(KEY, { dh: 'ontem' }), KEY).authorizedAt).toBeNull();
+  });
+
+  it('QR Code do servidor: só https e só o portal da SEFAZ da UF da chave', () => {
+    expect(isValidQrCodeUrl(QR, KEY, 'homologacao')).toBe(true);
+    expect(isValidQrCodeUrl(QR.replace('https:', 'http:'), KEY, 'homologacao')).toBe(false);
+    expect(isValidQrCodeUrl(QR.replace('www.sefaz.rs.gov.br', 'evil.gov.br'), KEY, 'homologacao')).toBe(false);
+    expect(isValidQrCodeUrl(QR.replace('/NFCE/NFCE-COM.aspx', '/x'), KEY, 'homologacao')).toBe(false);
+  });
+});
+
+
+describe('achados do Codex no #63', () => {
+  it('P1: o CNPJ do emitente no XML tem 14 caracteres e é comparado inteiro com o da chave', () => {
+    const xml = authorizedXml().replace(/<CNPJ>\d+<\/CNPJ>/, '<CNPJ>12345678000195</CNPJ>');
+    expect(parseAuthorizedXml(xml, KEY).address).toMatchObject({ street: 'Rua das Flores', zip: '98800000' });
+    expect(parseAuthorizedXml(xml.replace('12345678000195', '12345678000196'), KEY).address).toBeNull();
+    expect(parseAuthorizedXml(xml.replace('<CNPJ>12345678000195', '<CNPJ>123456780001'), KEY).address).toBeNull();
+  });
+
+  it('P2: nota em contingência também devolve o endereço do emitente (sem data de autorização, que ainda não existe)', async () => {
+    const repo = new MemoryRepo(source());
+    const { focus } = fakeFocus([{ status: 201, body: { ...AUTHORIZED, contingencia_offline: true, contingencia_offline_efetivada: false } }]);
+    const r = await emitNfce({ repo, environment: 'homologacao' as const, focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'contingency', contingency: true, authorized_at: null });
+    expect(r.body.issuer_address).toMatchObject({ street: 'Rua das Flores', zip: '98800000' });
+  });
+});
+
+
+describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no aparelho', () => {
+  const BAD_DV = `${KEY.slice(0, 43)}7`; // DV certo é 0
+  const qr = (p: string) => `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${p}`;
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+
+  it('P2-01: QR sem versão/tpAmb, com tpAmb vazio ou de outro ambiente é recusado; o correto passa (versões 2 e 3), nos dois validadores', async () => {
+    const { isValidNfceQrCodeContent } = await import('../../../src/lib/nfce.ts');
+    const H = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
+    const cases: Array<[string, boolean, 'homologacao' | 'producao']> = [
+      [`${KEY}`, false, 'homologacao'], [`${KEY}|2`, false, 'homologacao'], [`${KEY}|3`, false, 'homologacao'],
+      [`${KEY}|2|2`, false, 'homologacao'], [`${KEY}|2|2|1`, false, 'homologacao'],
+      [`${KEY}|2||1|${H}`, false, 'homologacao'], [`${KEY}|3|`, false, 'homologacao'],
+      [`${KEY}|2|1|1|${H}`, false, 'homologacao'], [`${KEY}|3|1`, false, 'homologacao'],
+      [`${KEY}|9|2|1|${H}`, false, 'homologacao'], [`${KEY}||2|1|${H}`, false, 'homologacao'],
+      [`${KEY}|2|2|1|ABCDEF`, false, 'homologacao'], [`${KEY}|2|2|1|${'Z'.repeat(40)}`, false, 'homologacao'],
+      [`${KEY}|2|2|1|${H}|EXTRA`, false, 'homologacao'], [`${KEY}|2|2||${H}`, false, 'homologacao'],
+      [`${KEY}|3|2|EXTRA`, false, 'homologacao'], [`${KEY}|3|2|`, false, 'homologacao'],
+      [`${KEY}|2|1|1|${H}`, true, 'producao'], [`${KEY}|3|1`, true, 'producao'],
+      [`${KEY}|2|2|1|${H}`, true, 'homologacao'], [`${KEY}|3|2`, true, 'homologacao'],
+      [`${KEY}|2|2|1|${H}`, false, 'producao'], // ambiente da nota é outro
+    ];
+    for (const [p, expected, env] of cases) {
+      expect(isValidQrCodeUrl(qr(p), KEY, env), `servidor ${p} ${env}`).toBe(expected);
+      expect(isValidNfceQrCodeContent(qr(p), KEY, env), `aparelho ${p} ${env}`).toBe(expected);
+    }
+  });
+
+  it('r16 P2-01: matriz por versão e modalidade (2.0 online 5, 2.0 offline 8 com digVal de 56 hex, 3.0 online 3, 3.0 offline 8) e tpEmis coerente, nos dois validadores', async () => {
+    const dev = await import('../../../src/lib/nfce.ts');
+    const H = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
+    const DIG56 = 'AB'.repeat(28);
+    const key9 = (() => { const k = `${KEY.slice(0, 34)}9${KEY.slice(35, 43)}`; return k + dev.accessKeyCheckDigit(k); })();
+    expect(key9[34]).toBe('9');
+    expect(isValidAccessKey(key9)).toBe(true);
+    const SIG = `${'A+b/'.repeat(42)}Zg==`; // 172 caracteres Base64 (RSA 1024 → 128 bytes)
+    const cases: Array<[string, string, boolean]> = [
+      // [chave, p depois da chave, esperado] (ambiente homologação = tpAmb 2)
+      [KEY, `|2|2|1|${H}`, true], // 2.0 online, tpEmis 1
+      [key9, `|2|2|1|${H}`, false], // 2.0 online com chave de contingência
+      [key9, `|2|2|09|15.50|${DIG56}|1|${H}`, true], // 2.0 offline, tpEmis 9, digVal 56
+      [key9, `|2|2|09|15.50|${'AB'.repeat(20)}|1|${H}`, false], // digVal de 40 hex
+      [key9, `|2|2|09|15.50|${'AB'.repeat(29)}|1|${H}`, false], // digVal de 58 hex
+      [key9, `|2|2|09|15.50|${DIG56}|1`, false], // faltando hash (7 campos)
+      [key9, `|2|2|09|15.50|${DIG56}|1|${H}|EXTRA`, false], // 9 campos
+      [KEY, `|2|2|09|15.50|${DIG56}|1|${H}`, false], // 2.0 offline com chave de emissão normal
+      [KEY, `|3|2`, true], // 3.0 online
+      [key9, `|3|2`, false], // 3.0 online com chave de contingência
+      [key9, `|3|2|09|15.50|1|12345678000195|${SIG}`, true], // CNPJ
+      [key9, `|3|2|09|15.50|2|12345678901|${SIG}`, true], // CPF
+      [key9, `|3|2|09|15.50|3|AB12345|${SIG}`, false], // estrangeiro com idDest preenchido (Tabela 7 exige vazio)
+      [key9, `|3|2|09|15.50|||${SIG}`, true], // consumidor não identificado (campos 6 e 7 vazios), como no manual 6.0
+      [key9, `|3|2|09|15.50|12345678901|1|${SIG}`, false], // campos invertidos (CPF no lugar do tipo)
+      [key9, `|3|2|09|15.50|2||${SIG}`, false], // tipo sem identificação
+      [key9, `|3|2|09|15.50||12345678901|${SIG}`, false], // identificação sem tipo
+      [key9, `|3|2|09|15.50|2|1234567890|${SIG}`, false], // CPF com 10 dígitos
+      [key9, `|3|2|09|15.50|4|12345678901|${SIG}`, false], // tipo desconhecido
+      [key9, `|3|2|09|15.50|2|12345678901|${SIG.slice(0, 170)}`, false], // assinatura malformada (tamanho não múltiplo de 4)
+      [key9, `|3|2|09|15.50|2|12345678901|${'!'.repeat(172)}`, false], // assinatura fora do Base64
+      [key9, `|3|2|09|15.50|2|12345678901|`, false], // assinatura ausente
+      [key9, `|3|2|09|15.50|12345678901|1`, false], // 7 campos
+      [key9, `|3|2|9|15.50|2|12345678901|${SIG}`, false], // dia com 1 dígito
+      [KEY, `|3|2|09|15.50|2|12345678901|${SIG}`, false], // 3.0 offline com chave normal
+      [key9, `|3|1|09|15.50|2|12345678901|${SIG}`, false], // tpAmb de outro ambiente
+    ];
+    for (const [k, rest, expected] of cases) {
+      const url = qr(`${k}${rest}`);
+      expect(isValidQrCodeUrl(url, k, 'homologacao'), `servidor ${k.slice(34, 35)} ${rest}`).toBe(expected);
+      expect(dev.isValidNfceQrCodeContent(url, k, 'homologacao'), `aparelho ${k.slice(34, 35)} ${rest}`).toBe(expected);
+    }
+  });
+
+  it('P2-02: DV da chave: `...427` recusada e `...420` aceita, também com CNPJ alfanumérico, igual ao aparelho', async () => {
+    const dev = await import('../../../src/lib/nfce.ts');
+    expect(isValidAccessKey(KEY)).toBe(true);
+    expect(isValidAccessKey(BAD_DV)).toBe(false);
+    const alpha43 = `${KEY.slice(0, 6)}12ABC45678AB95${KEY.slice(20, 43)}`;
+    const good = alpha43 + dev.accessKeyCheckDigit(alpha43);
+    const bad = alpha43 + ((Number(dev.accessKeyCheckDigit(alpha43)) + 1) % 10);
+    for (const k of [KEY, BAD_DV, good, bad]) expect(isValidAccessKey(k), k).toBe(dev.isValidAccessKey(k));
+    expect(isValidAccessKey(good)).toBe(true);
+    expect(isValidAccessKey(bad)).toBe(false);
+  });
+
+  it('P2-02: resposta autorizada da Focus com chave de DV errado não vira autorizada nem grava a chave; com DV certo autoriza, e o aparelho entende igual', async () => {
+    const repoBad = new MemoryRepo(source());
+    const bad = fakeFocus([{ status: 201, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD_DV}`, qrcode_url: qr(`${BAD_DV}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`) } }]);
+    const r = await emitNfce(deps(repoBad, bad.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'processing', authorized: false, access_key: null, qrcode_url: null });
+    expect(repoBad.doc).toMatchObject({ status: 'processing', access_key: null });
+    // O aparelho interpreta o retorno do servidor do mesmo jeito (sem desacordo).
+    expect(parseEmitResponse(r.httpStatus, JSON.stringify(r.body))).toMatchObject({ kind: 'document', status: 'processing', access_key: null });
+    const repoOk = new MemoryRepo(source());
+    const ok = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const r2 = await emitNfce(deps(repoOk, ok.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r2.body).toMatchObject({ status: 'authorized', authorized: true, access_key: KEY });
+    expect(parseEmitResponse(r2.httpStatus, JSON.stringify(r2.body))).toMatchObject({ kind: 'document', status: 'authorized', access_key: KEY });
+  });
+
+  it('P2-03: Focus de homologação devolvendo QR de produção: o QR não é gravado e o documento autorizado não perde o estado', async () => {
+    const repo = new MemoryRepo(source());
+    const prodQr = qr(`${KEY}|2|1|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`);
+    const first = fakeFocus([{ status: 201, body: { ...AUTHORIZED, qrcode_url: prodQr } }]);
+    const r = await emitNfce(deps(repo, first.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'authorized', authorized: true, qrcode_url: null });
+    expect(repo.doc?.qrcode_url).toBeNull();
+    // Consulta posterior com o QR certo completa; um QR de produção depois não sobrescreve o bom.
+    const second = fakeFocus([{ status: 200, body: AUTHORIZED }]);
+    await emitNfce(deps(repo, second.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(repo.doc).toMatchObject({ status: 'authorized', qrcode_url: QR });
+    const third = fakeFocus([{ status: 200, body: { ...AUTHORIZED, qrcode_url: prodQr } }]);
+    const r3 = await emitNfce(deps(repo, third.focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r3.body).toMatchObject({ status: 'authorized', qrcode_url: QR });
+  });
+});
+
+
+describe('Codex #63: endereço de contingência rejeitada não sobrevive ao reenvio', () => {
+  it('claimRejected zera endereço e data; o endereço do XML novo é o que fica', async () => {
+    const repo = new MemoryRepo(source());
+    const cont = fakeFocus([{ status: 201, body: { ...AUTHORIZED, contingencia_offline: true, contingencia_offline_efetivada: false } }], authorizedXml());
+    await emitNfce({ repo, environment: 'homologacao' as const, focus: cont.focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(repo.doc?.issuer_address).toMatchObject({ street: 'Rua das Flores' });
+    // A Focus rejeita a nota em contingência; o cadastro é corrigido e a nota reenviada.
+    repo.doc = { ...repo.doc!, status: 'rejected' };
+    const fixed = authorizedXml(KEY, { ender: '<enderEmit><xLgr>Rua Nova</xLgr><nro>9</nro><xBairro>Centro</xBairro><xMun>Santo Angelo</xMun><UF>RS</UF><CEP>98800000</CEP></enderEmit>' });
+    const resend = fakeFocus([{ status: 201, body: AUTHORIZED }], fixed);
+    const r = await emitNfce({ repo, environment: 'homologacao' as const, focus: resend.focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'authorized' });
+    expect(r.body.issuer_address).toMatchObject({ street: 'Rua Nova' });
+  });
+
+  it('o repositório real zera authorized_at e issuer_address ao reservar o reenvio da rejeitada', async () => {
+    let updated: Record<string, unknown> | null = null;
+    const chain = { eq: () => chain, select: () => chain, maybeSingle: async () => ({ data: { id: 'd1' }, error: null }) };
+    const db = { from: () => ({ update: (v: Record<string, unknown>) => { updated = v; return chain; } }) };
+    await supabaseNfceRepository(db).claimRejected('d1', 1, 'h', {}, {});
+    expect(updated).toMatchObject({ status: 'processing', transmissions: 2, authorized_at: null, issuer_address: null, access_key: null, protocol: null, qrcode_url: null });
+  });
+});
+
+describe('P2-04 (auditoria do #63): QR legado inválido nunca deixa o documento "recuperado"', () => {
+  const HTTP_QR = `http://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
+  const legacyRepo = () => {
+    const repo = new MemoryRepo(source());
+    repo.doc = {
+      id: 'd1', tenant_id: TENANT, order_id: ORDER, reference: 'tchefood', environment: 'homologacao', status: 'authorized', payload_hash: 'h', payload: {}, issuer: null,
+      access_key: KEY, protocol: '143260000000001', number: 42, series: '1', qrcode_url: HTTP_QR, danfe_path: null, xml_path: XML_PATH, sefaz_status: '100', sefaz_message: null,
+      offline_contingency: false, transmissions: 1, issued_at: null, authorized_at: '2026-11-09T06:00:07.000Z', issuer_address: { street: 'R', number: '1', complement: null, district: 'C', city: 'S', state: 'RS', zip: '98800000' },
+    } as never;
+    return repo;
+  };
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+
+  it('documento autorizado com QR HTTP gravado: não é devolvido como completo, consulta a Focus e o QR válido o substitui', async () => {
+    const repo = legacyRepo();
+    const f = fakeFocus([{ status: 200, body: AUTHORIZED }]);
+    const r = await emitNfce(deps(repo, f.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(f.calls).toHaveLength(1); // consultou, não devolveu "completo" pelo campo não vazio
+    expect(r.body).toMatchObject({ status: 'authorized', qrcode_url: QR });
+    expect(repo.doc?.qrcode_url).toBe(QR);
+  });
+
+  it('se a Focus não devolve QR válido, o QR legado inválido é descartado (nunca devolvido) e a nota segue autorizada', async () => {
+    const repo = legacyRepo();
+    const f = fakeFocus([{ status: 200, body: { ...AUTHORIZED, qrcode_url: null } }]);
+    const r = await emitNfce(deps(repo, f.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'authorized', authorized: true, qrcode_url: null });
+    expect(repo.doc).toMatchObject({ status: 'authorized', qrcode_url: null });
+    // Sem token, o documento gravado é devolvido sem o QR inválido.
+    const noToken = new MemoryRepo(source({ tenant: { ...source().tenant, focus_nfe_token: null } }));
+    noToken.doc = { ...legacyRepo().doc! };
+    const again = await emitNfce(deps(noToken, fakeFocus([]).focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(again.body.qrcode_url).toBeNull();
+  });
+});
+
+
+describe('P0 (auditoria do #63, r14): resposta com chave inválida nunca autoriza com a chave de outra tentativa', () => {
+  const BAD = `${KEY.slice(0, 43)}7`;
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+
+  it('rejeição (chave A) → claimRejected → reenvio autorizado com chave B de DV inválido: não vira authorized com a chave A; reconcilia depois com resposta válida', async () => {
+    const repo = new MemoryRepo(source());
+    const rejected = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', chave_nfe: `NFe${KEY}`, mensagem_sefaz: 'Rejeicao' } }]);
+    const r1 = await emitNfce(deps(repo, rejected.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r1.body).toMatchObject({ status: 'rejected', access_key: KEY });
+    // Reenvio: a Focus devolve protocolo novo e chave nova com DV errado.
+    const resend = fakeFocus([{ status: 201, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD}`, protocolo: '143260000000099', qrcode_url: null } }]);
+    const r2 = await emitNfce(deps(repo, resend.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r2.body).toMatchObject({ status: 'processing', authorized: false, access_key: null, protocol: null });
+    expect(repo.doc).toMatchObject({ status: 'processing', access_key: null });
+    expect(repo.doc?.access_key).not.toBe(KEY); // a chave da tentativa rejeitada não volta
+    // O aparelho não vê nota autorizada nem chave (nada a espelhar em orders).
+    expect(parseEmitResponse(r2.httpStatus, JSON.stringify(r2.body))).toMatchObject({ kind: 'document', status: 'processing', access_key: null });
+    // Consulta posterior com resposta válida reconcilia.
+    const ok = fakeFocus([{ status: 200, body: AUTHORIZED }]);
+    const r3 = await emitNfce(deps(repo, ok.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r3.body).toMatchObject({ status: 'authorized', authorized: true, access_key: KEY });
+  });
+
+  it('resposta sem chave, em reenvio de rejeitada, também não autoriza com a chave anterior', async () => {
+    const repo = new MemoryRepo(source());
+    await emitNfce(deps(repo, fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', chave_nfe: `NFe${KEY}` } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    const r = await emitNfce(deps(repo, fakeFocus([{ status: 201, body: { status: 'autorizado', protocolo: '143260000000099', numero: '42', serie: '1' } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'processing', authorized: false, access_key: null });
+  });
+
+  it('mesmo que o repositório preserve a chave antiga no reenvio, a resposta com chave inválida não confirma a autorização', async () => {
+    class KeepKeyRepo extends MemoryRepo {
+      override async claimRejected(id: string, expected: number, hash: string, payload: unknown = {}, issuer: unknown = null) {
+        const key = this.doc?.access_key ?? null;
+        const claimed = await super.claimRejected(id, expected, hash, payload, issuer);
+        if (claimed && this.doc) this.doc = { ...this.doc, access_key: key };
+        return claimed && this.doc ? { ...this.doc } : null;
+      }
+    }
+    const repo = new KeepKeyRepo(source());
+    await emitNfce(deps(repo, fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', chave_nfe: `NFe${KEY}` } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(repo.doc?.access_key).toBe(KEY);
+    const r = await emitNfce(deps(repo, fakeFocus([{ status: 201, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD}`, protocolo: '143260000000099' } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'processing', authorized: false, protocol: null });
+    expect(repo.doc).toMatchObject({ status: 'processing' });
+  });
+});
+
+
+describe('auditoria do #63 (r16): consulta de nota autorizada com chave inválida, XML de outra nota e reenvio', () => {
+  /** Repositório que aplica a regra do trigger tchefood_nfce_guard: authorized não volta a processing. */
+  class GuardedRepo extends MemoryRepo {
+    override async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
+      if (this.doc?.status === 'authorized' && fields.status === 'processing') throw new Error('trigger: authorized não volta a processing');
+      return super.saveProviderResult(id, expected, expectedTransmissions, fields);
+    }
+  }
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+  const BAD = `${KEY.slice(0, 43)}7`;
+
+  it('P2-02: consulta de nota JÁ autorizada (QR legado incompleto) com chave inválida mantém chave/protocolo/status e não tenta gravar (trigger do banco intacto)', async () => {
+    const repo = new GuardedRepo(source());
+    const first = fakeFocus([{ status: 201, body: { ...AUTHORIZED, qrcode_url: null } }], null);
+    await emitNfce(deps(repo, first.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(repo.doc).toMatchObject({ status: 'authorized', access_key: KEY, protocol: '143260000000001', qrcode_url: null });
+    const before = { ...repo.doc! };
+    const bad = fakeFocus([{ status: 200, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD}` } }]);
+    const r = await emitNfce(deps(repo, bad.focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r.body).toMatchObject({ status: 'authorized', access_key: KEY, protocol: '143260000000001' });
+    expect(String(r.body.message)).toMatch(/inconclusiva/i);
+    expect(repo.doc).toEqual(before);
+  });
+
+  it('P2-02: o mesmo retorno inválido em nota ainda em processamento continua indo para processing (sem regressão)', async () => {
+    const repo = new GuardedRepo(source());
+    const proc = fakeFocus([{ status: 201, body: { status: 'processando_autorizacao' } }]);
+    await emitNfce(deps(repo, proc.focus), { tenantId: TENANT, orderId: ORDER });
+    const bad = fakeFocus([{ status: 200, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD}` } }]);
+    const r = await emitNfce(deps(repo, bad.focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r.body).toMatchObject({ status: 'processing', authorized: false });
+    expect(repo.doc?.access_key).toBeNull();
+  });
+
+  it('A verificar: dhRecbto de protocolo de OUTRA nota (chNFe ou nProt diferentes) não vira authorized_at', () => {
+    const ok = parseAuthorizedXml(authorizedXml(), KEY, '143260000000001');
+    expect(ok.authorizedAt).toBe('2026-11-09T06:00:07.000Z');
+    const otherKey = `${KEY.slice(0, 33)}99${KEY.slice(35)}`;
+    expect(parseAuthorizedXml(authorizedXml(KEY, { protKey: otherKey }), KEY, '143260000000001').authorizedAt).toBeNull();
+    expect(parseAuthorizedXml(authorizedXml(KEY, { nprot: '143260000000999' }), KEY, '143260000000001').authorizedAt).toBeNull();
+    // Endereço (que não depende do protocolo) continua lido.
+    expect(parseAuthorizedXml(authorizedXml(KEY, { protKey: otherKey }), KEY, '143260000000001').address).toMatchObject({ street: 'Rua das Flores' });
+  });
+
+  it('A verificar: reservar o reenvio da rejeitada zera também danfe_path e xml_path (repositório real e de teste)', async () => {
+    let updated: Record<string, unknown> | null = null;
+    const chain = { eq: () => chain, select: () => chain, maybeSingle: async () => ({ data: { id: 'd1' }, error: null }) };
+    const db = { from: () => ({ update: (v: Record<string, unknown>) => { updated = v; return chain; } }) };
+    await supabaseNfceRepository(db).claimRejected('d1', 1, 'h', {}, {});
+    expect(updated).toMatchObject({ danfe_path: null, xml_path: null });
+    const repo = new MemoryRepo(source());
+    const cont = fakeFocus([{ status: 201, body: { ...AUTHORIZED, contingencia_offline: true, contingencia_offline_efetivada: false } }]);
+    await emitNfce(deps(repo, cont.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(repo.doc?.danfe_path).toBeTruthy();
+    repo.doc = { ...repo.doc!, status: 'rejected' };
+    await repo.claimRejected('d1', repo.doc.transmissions, 'h2');
+    expect(repo.doc).toMatchObject({ danfe_path: null, xml_path: null });
+  });
+});
+
+
+describe('auditoria do #63 (r17): cancelamento com chave inválida e data de protocolo divergente', () => {
+  class GuardedRepo extends MemoryRepo {
+    override async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
+      // Reproduz o gatilho: cancelamento só de nota com chave e protocolo; processing não vem de authorized.
+      if (this.doc?.status === 'authorized' && fields.status === 'processing') throw new Error('trigger');
+      return super.saveProviderResult(id, expected, expectedTransmissions, fields);
+    }
+  }
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+  const BAD = `${KEY.slice(0, 43)}7`;
+  const INCOMPLETE = { ...AUTHORIZED, qrcode_url: null }; // autorizada sem QR: precisa de consulta de reconciliação
+  const CANCELLED = { ...AUTHORIZED, status: 'cancelado' };
+
+  it('P1-01: retorno cancelado com chave de DV inválido não cancela nota autorizada nem em processamento', async () => {
+    const auth = new GuardedRepo(source());
+    await emitNfce(deps(auth, fakeFocus([{ status: 201, body: INCOMPLETE }], null).focus), { tenantId: TENANT, orderId: ORDER });
+    const before = { ...auth.doc! };
+    const r = await emitNfce(deps(auth, fakeFocus([{ status: 200, body: { ...CANCELLED, chave_nfe: `NFe${BAD}` } }]).focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r.body).toMatchObject({ status: 'authorized', access_key: KEY });
+    expect(String(r.body.message)).toMatch(/inconclusiva/i);
+    expect(auth.doc).toEqual(before);
+    const proc = new GuardedRepo(source());
+    await emitNfce(deps(proc, fakeFocus([{ status: 201, body: { status: 'processando_autorizacao' } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    const r2 = await emitNfce(deps(proc, fakeFocus([{ status: 200, body: { ...CANCELLED, chave_nfe: `NFe${BAD}` } }]).focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r2.body.status).toBe('processing');
+    expect(proc.doc?.status).toBe('processing');
+  });
+
+  it('P1-01 (contraprova): cancelado com chave válida (ou sem chave) continua cancelando', async () => {
+    for (const body of [CANCELLED, { ...CANCELLED, chave_nfe: undefined }]) {
+      const repo = new GuardedRepo(source());
+      await emitNfce(deps(repo, fakeFocus([{ status: 201, body: INCOMPLETE }], null).focus), { tenantId: TENANT, orderId: ORDER });
+      await emitNfce(deps(repo, fakeFocus([{ status: 200, body }]).focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+      expect(repo.doc?.status).toBe('cancelled');
+    }
+  });
+
+  it('P2-02: protocolo principal A com número aninhado B e data de B: authorized_at fica nulo; com protocolos iguais a data é gravada', async () => {
+    const nestedBody = (nested: string) => ({ ...AUTHORIZED, protocolo: '111', protocolo_nota_fiscal: { numero_protocolo: nested, data_recebimento: '2026-11-09T03:03:00-03:00' } });
+    const xmlOther = authorizedXml(KEY, { nprot: '222', dh: '2026-11-09T03:03:00-03:00' }); // XML não confirma o protocolo 111
+    const diverge = new MemoryRepo(source());
+    const r = await emitNfce(deps(diverge, fakeFocus([{ status: 201, body: nestedBody('222') }], xmlOther).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ protocol: '111', authorized_at: null });
+    expect(parseAuthorizedXml(xmlOther, KEY, '111').authorizedAt).toBeNull();
+    const same = new MemoryRepo(source());
+    const ok = await emitNfce(deps(same, fakeFocus([{ status: 201, body: nestedBody('111') }], authorizedXml(KEY, { nprot: '111', dh: '2026-11-09T03:03:00-03:00' })).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(ok.body).toMatchObject({ protocol: '111', authorized_at: '2026-11-09T06:03:00.000Z' });
+  });
+});
+
+describe('auditoria do #63 (r18): QR 3.0 offline (estrangeiro, assinatura URL-safe) e vínculo da data com o protocolo', () => {
+  const qr = (p: string) => `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${p}`;
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+
+  it('QR 3.0 offline: matriz de destinatário e assinatura, igual nos dois validadores', async () => {
+    const dev = await import('../../../src/lib/nfce.ts');
+    const key9 = (() => { const k = `${KEY.slice(0, 34)}9${KEY.slice(35, 43)}`; return k + dev.accessKeyCheckDigit(k); })();
+    const SIG = `${'A+b/'.repeat(42)}Zg==`; // 172
+    const URLSAFE = `${'A-b_'.repeat(42)}Zg==`; // variante URL-safe, como no exemplo oficial (contém `_`)
+    const base = `|3|2|09|15.50`;
+    const cases: Array<[string, boolean]> = [
+      [`${base}|3||${URLSAFE}`, true], // estrangeiro, idDest vazio (manual 6.0 §4.4.2)
+      [`${base}|3|AB12345|${SIG}`, false], // estrangeiro com idDest preenchido: Tabela 7 exige vazio
+      [`${base}|||${URLSAFE}`, true], // consumidor não identificado
+      [`${base}|1|12345678000195|${SIG}`, true], // CNPJ
+      [`${base}|2|12345678901|${SIG}`, true], // CPF
+      [`${base}|1|1234567800019|${SIG}`, false], // CNPJ incompleto
+      [`${base}|2|1234567890|${SIG}`, false], // CPF incompleto
+      [`${base}|1||${SIG}`, false], // CNPJ sem número
+      [`${base}|2||${SIG}`, false], // CPF sem número
+      [`${base}||12345678901|${SIG}`, false], // identificação sem tipo
+      [`${base}|3||${SIG.slice(0, 170)}`, false], // assinatura truncada
+      [`${base}|3||`, false], // assinatura vazia
+      [`${base}|3||${'A'.repeat(171)}!`, false], // caractere proibido
+      [`${base}|3||${'A'.repeat(168)}=A==`, false], // padding no meio
+      [`${base}|3||${'A'.repeat(36)}`, false], // curta demais
+      [`|3|2|00|15.50|3||${SIG}`, false], // dia 00
+      [`|3|2|32|15.50|3||${SIG}`, false], // dia 32
+      [`|3|2|31|15.50|3||${SIG}`, true],
+    ];
+    for (const [rest, expected] of cases) {
+      const url = qr(`${key9}${rest}`);
+      expect(isValidQrCodeUrl(url, key9, 'homologacao'), `servidor ${rest}`).toBe(expected);
+      expect(dev.isValidNfceQrCodeContent(url, key9, 'homologacao'), `aparelho ${rest}`).toBe(expected);
+    }
+  });
+
+  it('data aninhada: só com protocolo aninhado válido e igual ao do topo (ou sem topo); authorized_at gravado por emitNfce, sem XML', async () => {
+    const DATE = '2026-11-09T03:03:00-03:00';
+    const run = async (top: string | undefined, nested: string | undefined) => {
+      const repo = new MemoryRepo(source());
+      const body: Record<string, unknown> = { ...AUTHORIZED, protocolo: top, protocolo_nota_fiscal: { ...(nested ? { numero_protocolo: nested } : {}), data_recebimento: DATE } };
+      if (top === undefined) delete body.protocolo;
+      await emitNfce(deps(repo, fakeFocus([{ status: 201, body }], null).focus), { tenantId: TENANT, orderId: ORDER });
+      return repo.doc!;
+    };
+    expect((await run('111', '111')).authorized_at).toBe('2026-11-09T06:03:00.000Z');
+    expect((await run('111', '222')).authorized_at).toBeNull();
+    expect((await run('111', undefined)).authorized_at).toBeNull();
+    expect((await run(undefined, '111')).authorized_at).toBe('2026-11-09T06:03:00.000Z');
+    expect((await run(undefined, 'abc')).authorized_at ?? null).toBeNull(); // aninhado não numérico
+    expect((await run('111', '222')).status).toBe('authorized'); // a nota segue autorizada; só a data fica pendente
+  });
+
+  it('XML com mais de um protocolo (lote): vale o infProt desta chave e do protocolo conhecido', () => {
+    const other = `${KEY.slice(0, 33)}99${KEY.slice(35)}`;
+    const xml = authorizedXml().replace('</protNFe>', `</protNFe><protNFe><infProt><chNFe>${other}</chNFe><dhRecbto>2026-01-01T00:00:00-03:00</dhRecbto><nProt>143260000000001</nProt></infProt></protNFe>`)
+      .replace('<protNFe>', `<protNFe><infProt><chNFe>${other}</chNFe><dhRecbto>2026-02-02T00:00:00-03:00</dhRecbto><nProt>143260000000001</nProt></infProt></protNFe><protNFe>`);
+    expect(parseAuthorizedXml(xml, KEY, '143260000000001').authorizedAt).toBe('2026-11-09T06:00:07.000Z');
+    expect(parseAuthorizedXml(xml, KEY, '143260000000555').authorizedAt).toBeNull();
+  });
+});
+
+
+describe('auditoria do #63 (r19): matriz única do QR Code (Tabelas 2, 3, 6 e 7 do manual 6.0), idêntica no servidor e no aparelho', () => {
+  const qr = (p: string) => `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${p}`;
+  const H = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
+  const DIG = 'AB'.repeat(28);
+  const SIG = `${'A-b_'.repeat(42)}Zg==`;
+
+  it('aceita/recusa por campo: cIdToken, hash, digVal, dia, vNF, tpAmb, tp_idDest/idDest e assinatura', async () => {
+    const dev = await import('../../../src/lib/nfce.ts');
+    const key9 = (() => { const k = `${KEY.slice(0, 34)}9${KEY.slice(35, 43)}`; return k + dev.accessKeyCheckDigit(k); })();
+    // [chave, resto do p, esperado]
+    const rows: Array<[string, string, boolean]> = [
+      // 2.0 online: chave|2|tpAmb|cIdToken|hash
+      [KEY, `|2|2|1|${H}`, true], [KEY, `|2|2|999999|${H}`, true], [KEY, `|2|2|000001|${H}`, false], [KEY, `|2|2|01|${H}`, false],
+      [KEY, `|2|2|0|${H}`, false], [KEY, `|2|2|1000000|${H}`, false], [KEY, `|2|2|1a|${H}`, false], [KEY, `|2|2|1|${H.slice(0, 39)}`, false],
+      [KEY, `|2|2|1|${H}0`, false], [KEY, `|2|0|1|${H}`, false], [KEY, `|2|3|1|${H}`, false],
+      // 2.0 offline: chave|2|tpAmb|dia|vNF|digVal|cIdToken|hash
+      [key9, `|2|2|09|15.50|${DIG}|1|${H}`, true], [key9, `|2|2|09|15.50|${DIG}|000001|${H}`, false], [key9, `|2|2|09|0.00|${DIG}|1|${H}`, true],
+      [key9, `|2|2|09|100|${DIG}|1|${H}`, true], [key9, `|2|2|09|015.50|${DIG}|1|${H}`, false], [key9, `|2|2|09|15.5|${DIG}|1|${H}`, true],
+      [key9, `|2|2|09|15.505|${DIG}|1|${H}`, false], [key9, `|2|2|09|-1.00|${DIG}|1|${H}`, false],
+      [key9, `|2|2|09|123456789012.34|${DIG}|1|${H}`, true], // 15 bytes (limite)
+      [key9, `|2|2|09|1234567890123.45|${DIG}|1|${H}`, false], // 16 bytes
+      [key9, `|2|2|00|15.50|${DIG}|1|${H}`, false], [key9, `|2|2|32|15.50|${DIG}|1|${H}`, false], [key9, `|2|2|9|15.50|${DIG}|1|${H}`, false],
+      [key9, `|2|2|09|15.50|${'AB'.repeat(27)}|1|${H}`, false], [key9, `|2|2|09|15.50|${'ZZ'.repeat(28)}|1|${H}`, false],
+      // 3.0 online e offline
+      [KEY, `|3|2`, true], [KEY, `|3|1`, false], [KEY, `|3|0`, false], [KEY, `|3|2|`, false],
+      [key9, `|3|2|09|15.50|||${SIG}`, true], [key9, `|3|2|09|15.50|3||${SIG}`, true], [key9, `|3|2|09|15.50|3|AB12345|${SIG}`, false],
+      [key9, `|3|2|09|15.50|1|12345678000195|${SIG}`, true], [key9, `|3|2|09|15.50|1|1234567800019|${SIG}`, false],
+      [key9, `|3|2|09|15.50|2|12345678901|${SIG}`, true], [key9, `|3|2|09|15.50|2|1234567890|${SIG}`, false],
+      [key9, `|3|2|09|15.50|2||${SIG}`, false], [key9, `|3|2|09|15.50||12345678901|${SIG}`, false], [key9, `|3|2|09|15.50|4||${SIG}`, false],
+      [key9, `|3|2|09|15.50|12345678901|1|${SIG}`, false], // campos invertidos
+      [key9, `|3|2|09|015.50|||${SIG}`, false], [key9, `|3|2|09|15.50|||${SIG.slice(0, 170)}`, false], [key9, `|3|2|09|15.50|||`, false],
+      [key9, `|3|2|09|15.50|||${'A'.repeat(171)}!`, false],
+    ];
+    for (const [k, rest, expected] of rows) {
+      const url = qr(`${k}${rest}`);
+      expect(isValidQrCodeUrl(url, k, 'homologacao'), `servidor ${rest}`).toBe(expected);
+      expect(dev.isValidNfceQrCodeContent(url, k, 'homologacao'), `aparelho ${rest}`).toBe(expected);
+    }
   });
 });
