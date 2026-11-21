@@ -158,6 +158,7 @@ describe('supabase/migrations', () => {
     const sql = readFileSync(join(MIGRATIONS, '20261121100000_nfce_autorizacao.sql'), 'utf8');
     expect(sql).toContain('ADD COLUMN IF NOT EXISTS authorized_at TIMESTAMPTZ');
     expect(sql).toContain('ADD COLUMN IF NOT EXISTS issuer_address JSONB');
+    expect(sql).toContain("OLD.status IN ('authorized', 'cancelled') AND (");
     expect(sql).toContain('OLD.authorized_at IS NOT NULL AND NEW.authorized_at IS DISTINCT FROM OLD.authorized_at');
     expect(sql).toContain('OLD.issuer_address IS NOT NULL AND NEW.issuer_address IS DISTINCT FROM OLD.issuer_address');
     for (const rule of ["TG_OP = 'DELETE'", "(OLD.status = 'authorized'  AND NEW.status = 'cancelled')", 'NEW.reference IS DISTINCT FROM OLD.reference', 'NEW.issuer IS DISTINCT FROM OLD.issuer']) {

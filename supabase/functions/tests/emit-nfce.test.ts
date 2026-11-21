@@ -16,6 +16,7 @@ import {
 } from '../emit-nfce/payload.ts';
 import { classifyTransmission, createFocusClient, focusEnvironment, isValidAccessKey, isValidQrCodeUrl, normalizeProviderStatus, parseAuthorizedXml, type FetchLike } from '../emit-nfce/focus.ts';
 import { parseEmitResponse } from '../../../src/lib/sync/nfceEmission.ts';
+import { supabaseNfceRepository } from '../emit-nfce/repository.ts';
 import { emitNfce, type NfceDocumentRow, type NfceRepository } from '../emit-nfce/emit.ts';
 import { parseDanfePayload, parseNfceIssuer } from '../../../src/lib/sync/nfceEmission.ts';
 
@@ -205,7 +206,7 @@ class MemoryRepo implements NfceRepository {
   }
   async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown = {}, issuer: unknown = null) {
     if (!this.doc || this.doc.id !== id || this.doc.status !== 'rejected' || this.doc.transmissions !== expectedTransmissions) return null;
-    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, payload, issuer, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
+    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, payload, issuer, authorized_at: null, issuer_address: null, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
     return { ...this.doc };
   }
   async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
@@ -636,5 +637,30 @@ describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no apa
     const third = fakeFocus([{ status: 200, body: { ...AUTHORIZED, qrcode_url: prodQr } }]);
     const r3 = await emitNfce(deps(repo, third.focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
     expect(r3.body).toMatchObject({ status: 'authorized', qrcode_url: QR });
+  });
+});
+
+
+describe('Codex #63: endereço de contingência rejeitada não sobrevive ao reenvio', () => {
+  it('claimRejected zera endereço e data; o endereço do XML novo é o que fica', async () => {
+    const repo = new MemoryRepo(source());
+    const cont = fakeFocus([{ status: 201, body: { ...AUTHORIZED, contingencia_offline: true, contingencia_offline_efetivada: false } }], authorizedXml());
+    await emitNfce({ repo, environment: 'homologacao' as const, focus: cont.focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(repo.doc?.issuer_address).toMatchObject({ street: 'Rua das Flores' });
+    // A Focus rejeita a nota em contingência; o cadastro é corrigido e a nota reenviada.
+    repo.doc = { ...repo.doc!, status: 'rejected' };
+    const fixed = authorizedXml(KEY, { ender: '<enderEmit><xLgr>Rua Nova</xLgr><nro>9</nro><xBairro>Centro</xBairro><xMun>Santo Angelo</xMun><UF>RS</UF><CEP>98800000</CEP></enderEmit>' });
+    const resend = fakeFocus([{ status: 201, body: AUTHORIZED }], fixed);
+    const r = await emitNfce({ repo, environment: 'homologacao' as const, focus: resend.focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'authorized' });
+    expect(r.body.issuer_address).toMatchObject({ street: 'Rua Nova' });
+  });
+
+  it('o repositório real zera authorized_at e issuer_address ao reservar o reenvio da rejeitada', async () => {
+    let updated: Record<string, unknown> | null = null;
+    const chain = { eq: () => chain, select: () => chain, maybeSingle: async () => ({ data: { id: 'd1' }, error: null }) };
+    const db = { from: () => ({ update: (v: Record<string, unknown>) => { updated = v; return chain; } }) };
+    await supabaseNfceRepository(db).claimRejected('d1', 1, 'h', {}, {});
+    expect(updated).toMatchObject({ status: 'processing', transmissions: 2, authorized_at: null, issuer_address: null });
   });
 });

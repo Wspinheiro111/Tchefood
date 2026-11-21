@@ -30,9 +30,11 @@ BEGIN
        OR NEW.issuer IS DISTINCT FROM OLD.issuer) THEN
         RAISE EXCEPTION 'TCHEFOOD_FISCAL: NFC-e autorizada não pode ter payload, chave ou emitente alterados.';
     END IF;
-    -- Preenchido uma vez (nulo -> valor); depois disso nunca muda.
-    IF (OLD.authorized_at IS NOT NULL AND NEW.authorized_at IS DISTINCT FROM OLD.authorized_at)
-       OR (OLD.issuer_address IS NOT NULL AND NEW.issuer_address IS DISTINCT FROM OLD.issuer_address) THEN
+    -- Depois de autorizada (ou cancelada), preenchido uma vez (nulo -> valor) e nunca mais muda. Antes disso
+    -- (contingência rejeitada e reenviada com o cadastro corrigido) o servidor pode zerar para reler do XML novo.
+    IF OLD.status IN ('authorized', 'cancelled') AND (
+       (OLD.authorized_at IS NOT NULL AND NEW.authorized_at IS DISTINCT FROM OLD.authorized_at)
+       OR (OLD.issuer_address IS NOT NULL AND NEW.issuer_address IS DISTINCT FROM OLD.issuer_address)) THEN
         RAISE EXCEPTION 'TCHEFOOD_FISCAL: data de autorização e endereço do emitente não podem ser alterados.';
     END IF;
     NEW.updated_at := NOW();
