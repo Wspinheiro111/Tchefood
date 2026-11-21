@@ -1,4 +1,4 @@
-# idbStorage: invariantes das cópias de emergência (PR #54, rodada 28)
+# idbStorage: invariantes das cópias de emergência (PR #54, rodada 29)
 
 Arquivo: `src/lib/idbStorage.ts`. Testes: `src/__tests__/gptR18Persist.test.tsx`.
 
@@ -22,8 +22,9 @@ C. **`select` (getItem) só conclui numa seleção estável**: depois de qualque
    confere se mudou cópia **ou o próprio IndexedDB** e escolhe de novo (até 6 vezes). Esgotadas as tentativas, ou com o
    IndexedDB ilegível depois de uma recuperação recusada, o resultado é **provisório**: devolve o mais novo visto (nunca
    null), não apaga nada e **toda gravação é recusada** até uma nova seleção estável devolver exatamente o que foi hidratado
-   (se devolver outra coisa, o estado continua marcado provisório: toda gravação seguinte também lança, a tela fica
-   bloqueada e só reabrir o app hidrata o estado certo).
+   (se devolver outra coisa, o estado continua marcado provisório, **mesmo que outra leitura estável, como a conferência
+   do `awaitPersisted`, devolva o estado certo**: toda gravação e `removeItem` seguintes lançam, a tela fica bloqueada e só
+   reabrir o app hidrata o estado certo).
 
 ## Todo caminho que apaga, sobrescreve ou ignora uma cópia
 
@@ -43,6 +44,22 @@ C. **`select` (getItem) só conclui numa seleção estável**: depois de qualque
 | Chave antiga `::copia` trocada por outra instância | nunca removida por `retire` | conteúdo novo continua lá e é candidato | **r26 P2-01a/b** |
 | Hidratação do Zustand + gravação automática | grava o estado hidratado só se a seleção foi estável | ver provisório | r24 P2-01 e r25 P2-03 com a store real |
 | `removeItem` (só escritor) | apaga estado, cópias e conflitos | decisão explícita de limpar a loja | — |
+
+## O que foi antecipado para o piloto (rodada 29)
+
+| Situação | Tratamento |
+|---|---|
+| Leitura estável qualquer durante o provisório liberava a gravação do estado velho | provisório é pegajoso (`settleProvisional`); teste |
+| `removeItem` na instância sem lock ou no provisório | lança; o persist engole só esse erro (a tela já está bloqueada) |
+| `awaitPersisted` com a instância bloqueada | devolve false de antemão e depois de gravar |
+| Rodadas em segundo plano (envio da fila, reservas, acertos) na instância bloqueada | `syncOnce` e o laço de `useCloudSync` não rodam enquanto o status não for ok |
+| Foco/teclado/leitor de código atrás da tela cheia | `StorageGuard` põe `inert` no `#root` |
+| A escritora fecha com a segunda aba aberta | a segunda entra na fila do lock e, ao receber, recarrega sozinha para assumir |
+| Lock demora a soltar ao recarregar (> 4 x 200 ms) | a instância entra só leitura, mas a fila do lock a recarrega assim que ele soltar |
+| Página restaurada do bfcache (lock solto ao congelar) | `pageshow` com `persisted` recarrega |
+| APK suspenso/morto | a WebView solta o lock ao morrer; a abertura seguinte pede o lock de novo e hidrata do disco |
+| Armazenamento cheio (IndexedDB e localStorage recusam) | já tratado antes: estado só em memória, `storedOnlyInMemory`, faixa de aviso e `awaitPersisted` false |
+| Sem `navigator.locks` na WebView | instância escritora sem exclusão; vale a regra das rodadas anteriores. Confirmar no aparelho do piloto |
 
 ## Limitações conhecidas
 

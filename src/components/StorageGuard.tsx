@@ -1,5 +1,5 @@
-import { useSyncExternalStore } from 'react';
-import { getStorageStatus, subscribeStorageStatus } from '../lib/idbStorage';
+import { useEffect, useSyncExternalStore } from 'react';
+import { getStorageStatus, onWriterAvailable, subscribeStorageStatus } from '../lib/idbStorage';
 
 export const STORAGE_READONLY_MESSAGE =
   'O Tchê Food já está aberto em outra janela ou aba deste aparelho. Esta aqui só mostra a tela e NÃO grava nada: vendas, pagamentos e alterações feitas aqui não ficam salvas. Feche esta janela e use a outra.';
@@ -9,6 +9,39 @@ export const STORAGE_BLOCKED_MESSAGE =
 /** Tela cheia que impede o trabalho sobre um estado que não pode ser gravado (GPT, rodada 27 do PR #54, P1-02). */
 export function StorageGuard() {
   const status = useSyncExternalStore(subscribeStorageStatus, getStorageStatus, getStorageStatus);
+  // Atrás da tela cheia nada pode receber foco nem teclado (leitor de código de barras): o app todo fica inerte.
+  useEffect(() => {
+    if (status === 'ok') return;
+    const root = document.getElementById('root');
+    root?.setAttribute('inert', '');
+    return () => root?.removeAttribute('inert');
+  }, [status]);
+  // A instância escritora fechou: esta (só leitura) recarrega para assumir e hidratar o estado gravado.
+  useEffect(() => {
+    if (status !== 'readonly') return;
+    return onWriterAvailable(() => {
+      try {
+        window.location.reload();
+      } catch {
+        // o botão Recarregar continua valendo
+      }
+    });
+  }, [status]);
+  // Página restaurada do cache de navegação (bfcache): o lock de escritor é solto ao congelar a página, então o estado em
+  // memória pode estar velho e já não há exclusividade. Recarrega para hidratar de novo e pedir o lock.
+  useEffect(() => {
+    const onShow = (e: Event) => {
+      if ((e as PageTransitionEvent).persisted) {
+        try {
+          window.location.reload();
+        } catch {
+          // sem como recarregar
+        }
+      }
+    };
+    window.addEventListener('pageshow', onShow);
+    return () => window.removeEventListener('pageshow', onShow);
+  }, []);
   if (status === 'ok') return null;
   return (
     <div role="alertdialog" aria-modal="true" aria-label="Armazenamento bloqueado" className="fixed inset-0 z-[100] grid place-items-center bg-black/80 p-6">

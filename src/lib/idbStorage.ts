@@ -179,9 +179,24 @@ export class StorageNotWritableError extends Error {
   }
 }
 function markProvisional(k: string, v: string) {
+  if (!provisional.has(k)) provisionalValue.set(k, v); // o que vale é o que foi hidratado primeiro
   provisional.add(k);
-  provisionalValue.set(k, v);
   refreshStatus();
+}
+/**
+ * Uma seleção estável só encerra o estado provisório se devolve exatamente o que foi hidratado. Se devolve outra coisa
+ * (uma cópia mais nova), o estado em memória segue velho: continua provisório (gravação bloqueada) até reabrir o app,
+ * mesmo que outra leitura (ex.: a conferência do `awaitPersisted`) já devolva o estado certo.
+ */
+function settleProvisional(k: string, v: string | null) {
+  if (provisional.has(k) && provisionalValue.get(k) !== v) return;
+  clearProvisional(k);
+}
+const writerAvailableListeners = new Set<() => void>();
+/** Chamado quando a instância escritora fechou e esta (só leitura) pode assumir: quem escuta recarrega o app. */
+export function onWriterAvailable(f: () => void): () => void {
+  writerAvailableListeners.add(f);
+  return () => writerAvailableListeners.delete(f);
 }
 const WRITER_LOCK = 'tchefood-idb-writer';
 let writerPromise: Promise<boolean> | null = null;
@@ -222,6 +237,19 @@ export function isStorageWriter(): Promise<boolean> {
   })().then((ok) => {
     writerKnown = ok;
     refreshStatus();
+    if (!ok) {
+      // Fila pelo lock: quando a escritora fecha, esta instância (só leitura) é avisada e recarrega para assumir.
+      try {
+        void locks
+          .request(WRITER_LOCK, () => {
+            for (const f of [...writerAvailableListeners]) f();
+            return new Promise<void>(() => undefined);
+          })
+          .catch(() => undefined);
+      } catch {
+        // sem como esperar: o botão Recarregar da tela continua valendo
+      }
+    }
     return ok;
   });
   return writerPromise;
@@ -440,7 +468,7 @@ async function select(k: string): Promise<string | null> {
     if (mem !== undefined) outside.push({ seq: memorySeq.get(k) ?? 0, v: mem, base: memoryBase.get(k), id: INSTANCE, mem: true });
     const best = pick(fromDb, outside);
     if (!best) {
-      clearProvisional(k);
+      settleProvisional(k, null);
       return snap ? null : (fallback.getItem(k) as string | null);
     }
     last = best;
@@ -470,7 +498,7 @@ async function select(k: string): Promise<string | null> {
           return best.v;
         }
         if (!same(again.text, snap.text) || !same(again.seqRaw, snap.seqRaw) || copiesChanged(k, entries)) continue;
-        clearProvisional(k);
+        settleProvisional(k, best.v);
         return best.v;
       }
       if (!healed) continue; // o IndexedDB mudou: lê de novo
@@ -478,7 +506,7 @@ async function select(k: string): Promise<string | null> {
       seenCopies.delete(k);
       // Seleção estável: se apareceu ou mudou cópia durante a recuperação, é mais um candidato; recomeça.
       if (copiesChanged(k, entries)) continue;
-      clearProvisional(k);
+      settleProvisional(k, best.v);
       return best.v;
     }
     if (best === fromDb && snap) {
@@ -486,7 +514,7 @@ async function select(k: string): Promise<string | null> {
       retire(k, entries, best.v, fromDb.foreign ? null : INSTANCE, best.seq);
       seenCopies.delete(k);
     }
-    clearProvisional(k);
+    settleProvisional(k, best.v);
     return best.v;
   }
   // Seleção que não ficou estável: devolve o mais novo visto (null hidrataria uma loja vazia), sem apagar nada,
@@ -502,13 +530,9 @@ export const idbStorage: StateStorage = hasIndexedDB
         if (!(await isStorageWriter())) throw new StorageNotWritableError('readonly');
         if (provisional.has(k)) {
           // O estado hidratado não veio de uma seleção estável: só grava se agora a seleção estável devolve o mesmo.
-          const expected = provisionalValue.get(k) ?? '';
-          const now = await select(k);
-          if (provisional.has(k) || now !== expected) {
-            // O que está em memória não é o mais novo: continua bloqueado até reabrir (o estado hidratado nunca será igual).
-            markProvisional(k, expected);
-            throw new StorageNotWritableError('blocked');
-          }
+          await select(k);
+          // Sticky: só sai do provisório se a seleção estável devolveu exatamente o hidratado.
+          if (provisional.has(k)) throw new StorageNotWritableError('blocked');
         }
         const seq = nextSeq();
         try {
@@ -531,7 +555,8 @@ export const idbStorage: StateStorage = hasIndexedDB
         }
       },
       removeItem: async (k) => {
-        if (!(await isStorageWriter())) return;
+        if (!(await isStorageWriter())) throw new StorageNotWritableError('readonly');
+        if (provisional.has(k)) throw new StorageNotWritableError('blocked'); // apagar agora poderia apagar um estado mais novo
         dropMemory(k);
         dbKnown.delete(k);
         seenCopies.delete(k);
@@ -567,7 +592,13 @@ export const idbStorage: StateStorage = hasIndexedDB
  */
 export const idbPersistStorage: StateStorage = {
   getItem: (k) => idbStorage.getItem(k),
-  removeItem: (k) => idbStorage.removeItem(k),
+  removeItem: async (k) => {
+    try {
+      await idbStorage.removeItem(k);
+    } catch (e) {
+      if (!(e instanceof StorageNotWritableError)) throw e;
+    }
+  },
   setItem: async (k, v) => {
     try {
       await idbStorage.setItem(k, v);

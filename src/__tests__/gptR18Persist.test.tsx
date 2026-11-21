@@ -700,6 +700,87 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
       view.unmount();
     });
 
+    const unstable = async (name: string) => {
+      const mod = await seed(name);
+      localStorage.setItem(name + '::copia::0.a', JSON.stringify({ seq: 101, id: 'a', v: 'C101', base: mod.fingerprint('S0') }));
+      let n = 101;
+      onPut = (key) => {
+        if (key !== name) return;
+        n++;
+        localStorage.setItem(`${name}::copia::${n.toString(36)}.z${n}`, JSON.stringify({ seq: n, id: `z${n}`, v: `C${n}`, base: mod.fingerprint('S0') }));
+      };
+      const hydrated = await mod.idbStorage.getItem(name);
+      onPut = null;
+      return { ...mod, hydrated, last: `C${n}` };
+    };
+
+    it('antecipado: depois do provisório, uma leitura estável qualquer (ex.: a conferência do awaitPersisted) NÃO libera a gravação do estado velho', async () => {
+      const name = 'tchefood-r27d';
+      const { idbStorage, getStorageStatus, hydrated, last } = await unstable(name);
+      expect(getStorageStatus()).toBe('blocked');
+      expect(await idbStorage.getItem(name)).toBe(last); // leitura estável devolve a cópia mais nova...
+      expect(getStorageStatus()).toBe('blocked'); // ...mas o estado em memória (hidratado) segue velho: continua bloqueado
+      await expect(idbStorage.setItem(name, 'DERIVADO-DO-HIDRATADO')).rejects.toThrow(); // antes: gravava por cima da cópia mais nova
+      expect(hydrated).not.toBe(last);
+      expect(where(name)).not.toContain('DERIVADO-DO-HIDRATADO');
+    });
+
+    it('antecipado: removeItem também é recusado (sem lock e com hidratação provisória), com o erro visível', async () => {
+      const name = 'tchefood-r27e';
+      const { idbStorage } = await unstable(name);
+      await expect(idbStorage.removeItem(name)).rejects.toThrow();
+      expect(where(name).length).toBeGreaterThan(1); // nada foi apagado
+      await withLocks((_n, _o, cb) => Promise.resolve(typeof cb === 'function' ? cb(null) : undefined), async () => {
+        const mod = await seed('tchefood-r27f');
+        await expect(mod.idbStorage.removeItem('tchefood-r27f')).rejects.toThrow();
+        expect(disk.get('tchefood-r27f')).toBe('S0');
+      });
+    }, 10_000);
+
+    it('antecipado: awaitPersisted é false com a instância bloqueada mesmo que o texto lido de volta seja igual', async () => {
+      await withLocks((_n, _o, cb) => Promise.resolve(typeof cb === 'function' ? cb(null) : undefined), async () => {
+        vi.resetModules();
+        const store = await import('../store/useTcheStore');
+        const idb = await import('../lib/idbStorage');
+        await idb.isStorageWriter();
+        expect(await store.awaitPersisted()).toBe(false); // sem nenhuma mudança de estado (guarda de regressão)
+      });
+    }, 15_000);
+
+    it('antecipado: a escritora fecha (o lock é concedido à instância só de leitura): ela é avisada para recarregar e assumir', async () => {
+      let queued: (() => unknown) | null = null;
+      await withLocks((_n, optsOrCb, cb) => {
+        if (typeof optsOrCb === 'function') { queued = optsOrCb as () => unknown; return new Promise(() => undefined); } // pedido em fila
+        return Promise.resolve(cb(null)); // ifAvailable: negado
+      }, async () => {
+        const { isStorageWriter, onWriterAvailable } = await seed('tchefood-r27g');
+        const fired = vi.fn();
+        onWriterAvailable(fired);
+        expect(await isStorageWriter()).toBe(false);
+        expect(queued).not.toBeNull(); // entrou na fila do lock
+        queued!(); // a escritora fechou: o lock é concedido
+        expect(fired).toHaveBeenCalledTimes(1);
+      });
+    }, 10_000);
+
+    it('antecipado: com a tela bloqueada o app fica inerte (foco e teclado/leitor de código não alcançam o que está atrás) e volta ao normal', async () => {
+      const name = 'tchefood-r27h';
+      const root = document.createElement('div');
+      root.id = 'root';
+      document.body.appendChild(root);
+      try {
+        const mod = await unstable(name);
+        const { StorageGuard } = await import('../components/StorageGuard');
+        const view = render(createElement(StorageGuard));
+        expect(mod.getStorageStatus()).toBe('blocked');
+        expect(root.hasAttribute('inert')).toBe(true);
+        view.unmount();
+        expect(root.hasAttribute('inert')).toBe(false);
+      } finally {
+        root.remove();
+      }
+    });
+
     it('segunda instância (sem o lock): só lê, não grava, não recupera e não apaga nada', async () => {
       Object.defineProperty(navigator, 'locks', { configurable: true, value: { request: (_n: string, _o: unknown, cb: (l: null) => void) => Promise.resolve(cb(null)) } });
       try {

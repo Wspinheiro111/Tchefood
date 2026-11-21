@@ -4,6 +4,7 @@
  * aparelho mudou: as contas e a ocupação das mesas a cada 10 s, mesmo com a fila cheia
  * (src/lib/sync/orderPull.ts), e os cadastros a cada minuto, com a fila vazia.
  */
+import { getStorageStatus } from '../idbStorage';
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import { useTcheStore, type PullSource, type PullStatus } from '../../store/useTcheStore';
 import { flushOutbox, needsRefresh, recordKeys, refreshDevice, withRequestTimeout, type FetchLike, type SyncConfig } from './supabaseSync';
@@ -469,6 +470,7 @@ async function emitDueNfce(cfg: SyncConfig, session: CloudSession, fetchFn: Fetc
  * "Sincronizar agora" e para testes.
  */
 export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forcePull?: boolean } = {}): Promise<void> {
+  if (getStorageStatus() !== 'ok') return; // ver `useCloudSync`: nada sai de um estado que não pode ser gravado
   return startRound(fetchFn, opts.forcePull === true ? 'force' : 'due');
 }
 
@@ -660,12 +662,15 @@ export function useCloudSync(online: boolean): void {
       void import('../payments/paymentClaim').then((m) => m.retryPendingClaimReleases()).catch(() => undefined);
       void import('../payments/claimSupervisor').then((m) => m.superviseSettledClaims()).catch(() => undefined);
     };
-    void syncOnce();
-    retryReleases();
-    const timer = setInterval(() => {
+    // Instância sem lock de escrita ou hidratação provisória: nenhuma rodada em segundo plano (envio da fila, trocas
+    // de reserva, acertos) sai de um estado que não pode ser gravado (GPT, rodada 27 do PR #54).
+    const run = () => {
+      if (getStorageStatus() !== 'ok') return;
       void syncOnce();
       retryReleases();
-    }, INTERVAL_MS);
+    };
+    run();
+    const timer = setInterval(run, INTERVAL_MS);
     return () => clearInterval(timer);
   }, [online, hasSession]);
 }

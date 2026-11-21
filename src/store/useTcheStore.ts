@@ -84,7 +84,7 @@ import {
 import { can, PERMISSION_LABEL } from '../lib/permissions';
 import { nowISO, stableUuid, uuid } from '../lib/ids';
 import { MAX_REVIEW_COMMENT } from '../lib/reviews';
-import { idbPersistStorage, storedOnlyInMemory } from '../lib/idbStorage';
+import { getStorageStatus, idbPersistStorage, storedOnlyInMemory } from '../lib/idbStorage';
 import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, reviewHoldKey } from '../lib/payments/reviewHolds';
@@ -7052,13 +7052,15 @@ export async function awaitPersisted(): Promise<boolean> {
   try {
     const o = useTcheStore.persist.getOptions();
     if (!o.storage || !o.name) return false;
+    // Instância sem lock de escrita ou hidratação provisória: nada do que se grava aqui conta como gravado.
+    if (getStorageStatus() !== 'ok') return false;
     // Outra gravação do persist (a leitura da nuvem a cada 10 s) pode cair entre a gravação e a leitura de volta:
     // tenta de novo com o estado de agora, até 3 vezes.
     for (let attempt = 0; attempt < 3; attempt++) {
       const state = o.partialize ? o.partialize(useTcheStore.getState()) : useTcheStore.getState();
       const value = { state, version: o.version };
       await o.storage.setItem(o.name, value);
-      if (storedOnlyInMemory(o.name)) return false;
+      if (storedOnlyInMemory(o.name) || getStorageStatus() !== 'ok') return false;
       // Lê de volta pelo mesmo caminho da reabertura do app: só vale o que volta igual (GPT, rodada 18 do PR #54).
       const back = await o.storage.getItem(o.name);
       if (JSON.stringify(back) === JSON.stringify(value)) return true;
