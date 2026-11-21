@@ -3,6 +3,7 @@ import { BarChart3, Beer, Bike, ChefHat, CloudOff, LayoutGrid, LogOut, MonitorPl
 import { BrandLogo, BrandMark } from './components/Brand';
 import { selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
+import { OfflineCloudBanner } from './components/OfflineCloudBanner';
 import { useTerminalBus } from './lib/payments/drivers';
 import { LoginScreen } from './screens/LoginScreen';
 import { TableMap } from './screens/TableMap';
@@ -124,6 +125,7 @@ function AppBody() {
   if (!user) {
     return (
       <>
+        <OfflineCloudBanner online={online} />
         <LoginScreen />
         <ToastHost />
       </>
@@ -177,6 +179,7 @@ function AppBody() {
         <CloudStaleBanner />
       </div>
       <UnsavedStorageBanner />
+      <OfflineCloudBanner online={online} underHeader />
 
       <main>
         {view.name === 'map' && <TableMap onOpenOrder={(orderId) => setView({ name: 'order', orderId })} />}
