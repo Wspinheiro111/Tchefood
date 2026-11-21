@@ -138,7 +138,7 @@ function qrParamsStructureOk(parts: string[], accessKey: string): boolean {
     if (parts.length === 5) return /^\d{1,6}$/.test(parts[3] ?? '') && hash(parts[4]);
     if (parts.length === 8) {
       // digVal = DigestValue (28 caracteres base64) em hexadecimal: exatamente 56 hex.
-      return /^\d{2}$/.test(parts[3] ?? '') && /^\d+(\.\d{1,2})?$/.test(parts[4] ?? '') && /^[0-9A-Fa-f]{56}$/.test(parts[5] ?? '') && /^\d{1,6}$/.test(parts[6] ?? '') && hash(parts[7]);
+      return /^(0[1-9]|[12]\d|3[01])$/.test(parts[3] ?? '') && /^\d+(\.\d{1,2})?$/.test(parts[4] ?? '') && /^[0-9A-Fa-f]{56}$/.test(parts[5] ?? '') && /^\d{1,6}$/.test(parts[6] ?? '') && hash(parts[7]);
     }
     return false;
   }
@@ -146,16 +146,17 @@ function qrParamsStructureOk(parts: string[], accessKey: string): boolean {
   if (parts.length === 3) return true;
   // 3.0 offline (Manual DANFE NFC-e 6.0), por posição: chave|3|tpAmb|dia|vNF|tp_idDest|idDest|assinatura.
   // tp_idDest e idDest ficam ambos vazios (consumidor não identificado) ou ambos preenchidos
-  // (1 CNPJ, 2 CPF, 3 identificação estrangeira); a assinatura é Base64 (estrutura apenas, sem recalcular).
+  // (1 CNPJ, 2 CPF, 3 estrangeiro, cujo idDest pode ficar vazio); a assinatura é Base64 ou Base64 URL-safe (`_` e `-`),
+  // só estrutura e tamanho, sem recalcular.
   if (parts.length !== 8) return false;
   const [, , , day, value, idType, id, signature] = parts;
-  if (!/^\d{2}$/.test(day ?? '') || !/^\d+(\.\d{1,2})?$/.test(value ?? '')) return false;
+  if (!/^(0[1-9]|[12]\d|3[01])$/.test(day ?? '') || !/^\d+(\.\d{1,2})?$/.test(value ?? '')) return false;
   if (!(idType === '' && id === '')) {
-    const idOk = idType === '1' ? /^[0-9A-Z]{14}$/.test(id ?? '') : idType === '2' ? /^\d{11}$/.test(id ?? '') : idType === '3' ? /^[0-9A-Za-z]{5,20}$/.test(id ?? '') : false;
+    const idOk = idType === '1' ? /^[0-9A-Z]{14}$/.test(id ?? '') : idType === '2' ? /^\d{11}$/.test(id ?? '') : idType === '3' ? id === '' || /^[0-9A-Za-z]{5,20}$/.test(id ?? '') : false;
     if (!idOk) return false;
   }
   const sig = signature ?? '';
-  return sig.length >= 40 && sig.length <= 400 && sig.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(sig);
+  return sig.length >= 40 && sig.length <= 400 && sig.length % 4 === 0 && /^[A-Za-z0-9+/_-]+={0,2}$/.test(sig);
 }
 
 /**

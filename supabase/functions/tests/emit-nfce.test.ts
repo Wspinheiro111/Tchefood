@@ -904,3 +904,67 @@ describe('auditoria do #63 (r17): cancelamento com chave inválida e data de pro
     expect(ok.body).toMatchObject({ protocol: '111', authorized_at: '2026-11-09T06:03:00.000Z' });
   });
 });
+
+describe('auditoria do #63 (r18): QR 3.0 offline (estrangeiro, assinatura URL-safe) e vínculo da data com o protocolo', () => {
+  const qr = (p: string) => `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${p}`;
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+
+  it('QR 3.0 offline: matriz de destinatário e assinatura, igual nos dois validadores', async () => {
+    const dev = await import('../../../src/lib/nfce.ts');
+    const key9 = (() => { const k = `${KEY.slice(0, 34)}9${KEY.slice(35, 43)}`; return k + dev.accessKeyCheckDigit(k); })();
+    const SIG = `${'A+b/'.repeat(42)}Zg==`; // 172
+    const URLSAFE = `${'A-b_'.repeat(42)}Zg==`; // variante URL-safe, como no exemplo oficial (contém `_`)
+    const base = `|3|2|09|15.50`;
+    const cases: Array<[string, boolean]> = [
+      [`${base}|3||${URLSAFE}`, true], // estrangeiro, idDest vazio (manual 6.0 §4.4.2)
+      [`${base}|3|AB12345|${SIG}`, true], // estrangeiro com identificação
+      [`${base}|||${URLSAFE}`, true], // consumidor não identificado
+      [`${base}|1|12345678000195|${SIG}`, true], // CNPJ
+      [`${base}|2|12345678901|${SIG}`, true], // CPF
+      [`${base}|1|1234567800019|${SIG}`, false], // CNPJ incompleto
+      [`${base}|2|1234567890|${SIG}`, false], // CPF incompleto
+      [`${base}|1||${SIG}`, false], // CNPJ sem número
+      [`${base}|2||${SIG}`, false], // CPF sem número
+      [`${base}||12345678901|${SIG}`, false], // identificação sem tipo
+      [`${base}|3|AB1|${SIG}`, false], // estrangeiro com id curto demais
+      [`${base}|3||${SIG.slice(0, 170)}`, false], // assinatura truncada
+      [`${base}|3||`, false], // assinatura vazia
+      [`${base}|3||${'A'.repeat(171)}!`, false], // caractere proibido
+      [`${base}|3||${'A'.repeat(168)}=A==`, false], // padding no meio
+      [`${base}|3||${'A'.repeat(36)}`, false], // curta demais
+      [`|3|2|00|15.50|3||${SIG}`, false], // dia 00
+      [`|3|2|32|15.50|3||${SIG}`, false], // dia 32
+      [`|3|2|31|15.50|3||${SIG}`, true],
+    ];
+    for (const [rest, expected] of cases) {
+      const url = qr(`${key9}${rest}`);
+      expect(isValidQrCodeUrl(url, key9, 'homologacao'), `servidor ${rest}`).toBe(expected);
+      expect(dev.isValidNfceQrCodeContent(url, key9, 'homologacao'), `aparelho ${rest}`).toBe(expected);
+    }
+  });
+
+  it('data aninhada: só com protocolo aninhado válido e igual ao do topo (ou sem topo); authorized_at gravado por emitNfce, sem XML', async () => {
+    const DATE = '2026-11-09T03:03:00-03:00';
+    const run = async (top: string | undefined, nested: string | undefined) => {
+      const repo = new MemoryRepo(source());
+      const body: Record<string, unknown> = { ...AUTHORIZED, protocolo: top, protocolo_nota_fiscal: { ...(nested ? { numero_protocolo: nested } : {}), data_recebimento: DATE } };
+      if (top === undefined) delete body.protocolo;
+      await emitNfce(deps(repo, fakeFocus([{ status: 201, body }], null).focus), { tenantId: TENANT, orderId: ORDER });
+      return repo.doc!;
+    };
+    expect((await run('111', '111')).authorized_at).toBe('2026-11-09T06:03:00.000Z');
+    expect((await run('111', '222')).authorized_at).toBeNull();
+    expect((await run('111', undefined)).authorized_at).toBeNull();
+    expect((await run(undefined, '111')).authorized_at).toBe('2026-11-09T06:03:00.000Z');
+    expect((await run(undefined, 'abc')).authorized_at ?? null).toBeNull(); // aninhado não numérico
+    expect((await run('111', '222')).status).toBe('authorized'); // a nota segue autorizada; só a data fica pendente
+  });
+
+  it('XML com mais de um protocolo (lote): vale o infProt desta chave e do protocolo conhecido', () => {
+    const other = `${KEY.slice(0, 33)}99${KEY.slice(35)}`;
+    const xml = authorizedXml().replace('</protNFe>', `</protNFe><protNFe><infProt><chNFe>${other}</chNFe><dhRecbto>2026-01-01T00:00:00-03:00</dhRecbto><nProt>143260000000001</nProt></infProt></protNFe>`)
+      .replace('<protNFe>', `<protNFe><infProt><chNFe>${other}</chNFe><dhRecbto>2026-02-02T00:00:00-03:00</dhRecbto><nProt>143260000000001</nProt></infProt></protNFe><protNFe>`);
+    expect(parseAuthorizedXml(xml, KEY, '143260000000001').authorizedAt).toBe('2026-11-09T06:00:07.000Z');
+    expect(parseAuthorizedXml(xml, KEY, '143260000000555').authorizedAt).toBeNull();
+  });
+});
