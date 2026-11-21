@@ -246,6 +246,8 @@ export interface TerminalRecord {
   tenant_id: string;
   serial_number: string;
   acquirer: string;
+  /** Ativa no caixa (pos_terminals.online): quem desativa a Point na Retaguarda não cobra mais nela (auditoria #59 r5 P1-01). */
+  online: boolean;
 }
 
 export interface ChargeContext {
@@ -720,7 +722,10 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
     // Repetição do pedido de criação (resposta anterior perdida): este pode mandar o primeiro envio.
     return replyFor(await resume(ctx, existing, true));
   }
-  // Cobrança nova: só reserva e envia se a Point está agora na conta do Mercado Pago da loja e no modo PDV.
+  // Cobrança nova: só reserva e envia se a Point está ativa na loja (o banco manda, não a cópia do aparelho) e agora na
+  // conta do Mercado Pago da loja e no modo PDV. Cobrança já criada (ramo acima), consulta, conciliação e cancelamento
+  // seguem mesmo com a Point desativada.
+  if (terminal.online !== true) throw new ChargeInputError('terminal_inactive', 'Esta Point está desativada na loja. Nada foi cobrado: ative na aba Point Smart ou use outra maquininha.', 409);
   await assertTerminalReady(ctx.provider, terminal.serial_number, ctx.terminalCheckTimeoutMs);
   const fresh = {
     tenant_id: terminal.tenant_id,

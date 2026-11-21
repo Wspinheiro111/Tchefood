@@ -11,6 +11,10 @@ import { fetchPointTerminals, pairingState, parseTerminalsReply, type PointListi
 import { cloudUnreachable, resetCloudReachability, trackCloudReachability } from '../lib/sync/cloudReachability';
 import { PROBE_EVERY_MS, probeCloudIfIdle, syncOnce, useCloudSync } from '../lib/sync/useCloudSync';
 
+// Estado do armazenamento controlável (auditoria #59 r5 P2-02): 'ok' por padrão, como nos outros testes.
+const storage = vi.hoisted(() => ({ status: 'ok' as 'ok' | 'readonly' | 'blocked' }));
+vi.mock('../lib/idbStorage', async (orig) => ({ ...(await orig<typeof import('../lib/idbStorage')>()), getStorageStatus: () => storage.status }));
+
 const st = () => useTcheStore.getState();
 const MP_ID = 'NEWLAND_N950__N950NCB801293324';
 const CLOUD = { url: 'https://x.supabase.co', anon_key: 'anon', email: 'a@b', access_token: 'jwt', refresh_token: 'r', expires_at: 9_999_999_999 };
@@ -131,7 +135,7 @@ describe('lista do Mercado Pago (ação terminals)', () => {
     const cfg = async () => ({ url: 'https://x', anonKey: 'a', accessToken: 'j' });
     const reply = (status: number, body: unknown) => async () => ({ status, text: async () => JSON.stringify(body) });
     expect(await fetchPointTerminals({ config: cfg, fetch: reply(412, { error: 'not_configured', message: 'x' }) })).toEqual({ kind: 'not_configured' });
-    expect(await fetchPointTerminals({ config: cfg, fetch: reply(502, { error: 'mp_unavailable', message: 'O Mercado Pago não devolveu' }) })).toEqual({ kind: 'error', message: 'O Mercado Pago não devolveu' });
+    expect(await fetchPointTerminals({ config: cfg, fetch: reply(424, { error: 'mp_unavailable', message: 'O Mercado Pago não devolveu' }) })).toEqual({ kind: 'error', message: 'O Mercado Pago não devolveu' });
     expect(await fetchPointTerminals({ config: cfg, fetch: async () => { throw new TypeError('Failed to fetch'); } })).toMatchObject({ kind: 'error' });
     expect(await fetchPointTerminals({ config: async () => null, fetch: reply(200, {}) })).toEqual({ kind: 'no_cloud' });
     expect(parseTerminalsReply(JSON.stringify({ terminals: [{ id: MP_ID, operating_mode: 'pdv' }, { id: '', operating_mode: 'pdv' }] }))).toBeNull();
@@ -341,6 +345,88 @@ describe('aviso de loja em nuvem sem internet', () => {
     await probeCloudIfIdle(async () => { n += 1; throw new TypeError('Failed to fetch'); }, Date.now() + 2 * PROBE_EVERY_MS);
     expect(n).toBe(2);
     expect(cloudUnreachable()).toBe(true);
+  });
+
+  it('resposta antiga não sobrescreve a nova, nem na mesma loja nem depois da troca de loja (auditoria #59 r5 P2-03)', async () => {
+    resetCloudReachability();
+    const pending = () => {
+      let resolve!: (r: { status: number }) => void;
+      let reject!: (e: unknown) => void;
+      const p = new Promise<{ status: number }>((res, rej) => { resolve = res; reject = rej; });
+      return { p, resolve, reject };
+    };
+    // Mesma loja: o pedido mais antigo termina por último, falhando; o mais novo já mostrou a nuvem no ar.
+    const oldReq = pending();
+    const newReq = pending();
+    const fOld = trackCloudReachability(() => oldReq.p, 'loja-a');
+    const fNew = trackCloudReachability(() => newReq.p, 'loja-a');
+    const a = fOld().catch(() => undefined);
+    const b = fNew();
+    newReq.resolve({ status: 200 });
+    await b;
+    expect(cloudUnreachable()).toBe(false);
+    oldReq.reject(new TypeError('Failed to fetch'));
+    await a;
+    expect(cloudUnreachable()).toBe(false);
+    // O mais antigo também não apaga uma falha mais nova.
+    resetCloudReachability();
+    const o2 = pending();
+    const n2 = pending();
+    const p1 = trackCloudReachability(() => o2.p, 'loja-a')().catch(() => undefined);
+    const p2 = trackCloudReachability(() => n2.p, 'loja-a')().catch(() => undefined);
+    n2.reject(new TypeError('Failed to fetch'));
+    await p2;
+    expect(cloudUnreachable()).toBe(true);
+    o2.resolve({ status: 200 });
+    await p1;
+    expect(cloudUnreachable()).toBe(true);
+    // Troca de loja: pedido pendente da A falha depois de a B responder 200.
+    resetCloudReachability();
+    const a3 = pending();
+    const b3 = pending();
+    const pa = trackCloudReachability(() => a3.p, 'loja-a')().catch(() => undefined);
+    const pb = trackCloudReachability(() => b3.p, 'loja-b')();
+    b3.resolve({ status: 200 });
+    await pb;
+    a3.reject(new TypeError('Failed to fetch'));
+    await pa;
+    expect(cloudUnreachable()).toBe(false);
+    // E o pedido pendente da A que termina com 503 depois também não acende o aviso da B.
+    const a4 = pending();
+    const pa4 = trackCloudReachability(() => a4.p, 'loja-a')().catch(() => undefined);
+    const pb4 = trackCloudReachability(async () => ({ status: 200 }), 'loja-b')();
+    await pb4;
+    a4.resolve({ status: 503 });
+    await pa4;
+    expect(cloudUnreachable()).toBe(false);
+    resetCloudReachability();
+  });
+
+  it('sem lock de escrita ou armazenamento provisório: o laço ainda verifica a nuvem (só GET, nenhuma escrita) e o aviso aparece (auditoria #59 r5 P2-02)', async () => {
+    vi.useFakeTimers();
+    storage.status = 'readonly';
+    try {
+      withCloud();
+      const calls: { url: string; method: string; body?: string }[] = [];
+      vi.stubGlobal('fetch', vi.fn((url: string, init?: { method?: string; body?: string }) => {
+        calls.push({ url: new URL(url).pathname + new URL(url).search, method: init?.method ?? 'GET', body: init?.body });
+        return Promise.reject(new TypeError('Failed to fetch'));
+      }));
+      function Shell() {
+        useCloudSync(true);
+        return <OfflineCloudBanner online />;
+      }
+      render(<Shell />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000 + PROBE_EVERY_MS + 1_000); });
+      expect(calls.length).toBeGreaterThan(0);
+      // Só a leitura leve de diagnóstico: nada de fila, leitura de contas, NFC-e nem escrita.
+      expect(calls.every((c) => c.method === 'GET' && c.body === undefined && c.url === '/rest/v1/tenants?select=id&limit=1')).toBe(true);
+      expect(cloudUnreachable()).toBe(true);
+      expect(screen.getByRole('alert').textContent).toContain(OFFLINE_OLD_SYSTEM_TEXT);
+    } finally {
+      storage.status = 'ok';
+      vi.useRealTimers();
+    }
   });
 
   it('o laço da nuvem faz a verificação sozinho: Supabase mudo, nenhuma resposta, aviso antes do prazo da rodada (auditoria #59 r2 P2-01)', async () => {

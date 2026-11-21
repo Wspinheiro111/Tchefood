@@ -9,7 +9,7 @@ import { Btn, toast } from '../../components/ui';
 import { selectCan, useTcheStore } from '../../store/useTcheStore';
 import { useOnline } from '../../lib/useOnline';
 import { freshCloudConfig } from '../../lib/sync/useCloudSync';
-import { trackCloudReachability } from '../../lib/sync/cloudReachability';
+import { cloudKey, trackCloudReachability } from '../../lib/sync/cloudReachability';
 import { fetchPointTerminals, PAIRING_TEXT, pairingState, type PairingState, type PointListing } from '../../lib/payments/pointTerminals';
 import type { PosTerminal } from '../../types';
 import { Field, FormError, Panel, TextInput, Toggle } from './fields';
@@ -59,7 +59,7 @@ export function PointAdmin() {
   const check = async () => {
     const mine = ++gen.current;
     setBusy(true);
-    const result = await fetchPointTerminals({ config: () => freshCloudConfig(), fetch: trackCloudReachability((u: string, init: RequestInit) => fetch(u, init)) });
+    const result = await fetchPointTerminals({ config: () => freshCloudConfig(), fetch: trackCloudReachability((u: string, init: RequestInit) => fetch(u, init), cloud ? cloudKey(cloud) : '') });
     if (mine !== gen.current) return;
     setListing(result);
     setBusy(false);

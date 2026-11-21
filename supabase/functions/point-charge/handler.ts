@@ -61,7 +61,7 @@ export async function handlePointCharge(req: Request, deps: PointChargeDeps): Pr
       return json(await listStoreTerminals(deps.provider(accessToken)), 200);
     } catch (error) {
       console.error('[point-charge] terminals', error instanceof Error ? error.message : error);
-      return json({ error: 'mp_unavailable', message: 'O Mercado Pago não devolveu a lista de maquininhas. Tente de novo.' }, 502);
+      return json({ error: 'mp_unavailable', message: 'O Mercado Pago não devolveu a lista de maquininhas. Tente de novo.' }, 424);
     }
   }
 
@@ -70,10 +70,10 @@ export async function handlePointCharge(req: Request, deps: PointChargeDeps): Pr
 
   // 1) Prova de loja pelo RLS.
   let tenantId: string;
-  let terminal: { id: string; tenant_id: string; serial_number: string; acquirer: string } | null = null;
+  let terminal: { id: string; tenant_id: string; serial_number: string; acquirer: string; online: boolean } | null = null;
   const loadTerminal = async (): Promise<Response | null> => {
     if (typeof body.terminal_id !== 'string' || !UUID.test(body.terminal_id)) return json({ error: 'invalid_terminal', message: 'Maquininha inválida.' }, 400);
-    const { data, error } = await asCaller.from('pos_terminals').select('id, tenant_id, serial_number, acquirer').eq('id', body.terminal_id).maybeSingle();
+    const { data, error } = await asCaller.from('pos_terminals').select('id, tenant_id, serial_number, acquirer, online').eq('id', body.terminal_id).maybeSingle();
     if (error) return json({ error: 'auth', message: 'Não foi possível validar a sessão.' }, 401);
     if (!data) return json({ error: 'not_found', message: 'Maquininha não encontrada nesta loja.' }, 404);
     terminal = data;

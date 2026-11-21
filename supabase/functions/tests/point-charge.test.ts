@@ -31,7 +31,7 @@ const STAFF = '44444444-4444-4444-8444-444444444444';
 const MP_TERMINAL = 'NEWLAND_N950__N950NCB801293324';
 const KEY = '55555555-5555-4555-8555-555555555555';
 
-const terminal: TerminalRecord = { id: TERMINAL_UUID, tenant_id: TENANT, serial_number: MP_TERMINAL, acquirer: 'MERCADO_PAGO' };
+const terminal: TerminalRecord = { id: TERMINAL_UUID, tenant_id: TENANT, serial_number: MP_TERMINAL, acquirer: 'MERCADO_PAGO', online: true };
 
 const FINAL_STATES = new Set(['approved', 'rejected', 'cancelled', 'expired', 'refunded']);
 
@@ -455,6 +455,23 @@ describe('point-charge: criação', () => {
     await expect(startCharge(ctx, { ...terminal, acquirer: 'STONE' }, input())).rejects.toMatchObject({ code: 'not_mercado_pago' });
     await expect(startCharge(ctx, { ...terminal, serial_number: '  ' }, input())).rejects.toMatchObject({ code: 'terminal_without_id' });
     expect(calls.create).toHaveLength(0);
+  });
+
+  it('Point desativada na loja: cobrança nova recusada sem reservar nem enviar; cobrança já criada segue pela mesma chave (auditoria #59 r5 P1-01)', async () => {
+    const { ctx, store, calls } = setup();
+    await expect(startCharge(ctx, { ...terminal, online: false }, input())).rejects.toMatchObject({ code: 'terminal_inactive', httpStatus: 409 });
+    expect(calls.create).toHaveLength(0);
+    expect(store.rows).toHaveLength(0);
+    // Criada com a Point ativa; depois a loja desativa. A repetição da mesma chave não cria outra, e consulta/cancelamento seguem.
+    const first = await startCharge(ctx, terminal, input());
+    expect(calls.create).toHaveLength(1);
+    const again = await startCharge(ctx, { ...terminal, online: false }, input());
+    expect(again.status).toBe(first.status);
+    expect(calls.create).toHaveLength(1);
+    expect(store.rows).toHaveLength(1);
+    // Outra chave com a Point desativada continua recusada.
+    await expect(startCharge(ctx, { ...terminal, online: false }, input({ idempotency_key: 'outra-chave-1' }))).rejects.toMatchObject({ code: 'terminal_inactive' });
+    expect(store.rows).toHaveLength(1);
   });
 
   it('Point fora da conta, fora do modo PDV ou lista indisponível: nada reserva nem envia (auditoria #59 r1 P1-01)', async () => {

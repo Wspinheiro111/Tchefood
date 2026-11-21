@@ -18,6 +18,11 @@ function set(value: boolean): void {
   for (const l of listeners) l();
 }
 
+/** Chave da loja/sessão que um pedido serve: só a observação do pedido mais novo desta chave vale. */
+export function cloudKey(session: { url: string; tenant_id: string }): string {
+  return `${session.url}|${session.tenant_id}`;
+}
+
 export function cloudUnreachable(): boolean {
   return unreachable;
 }
@@ -31,21 +36,53 @@ export function lastCloudContactAt(): number {
 export function resetCloudReachability(): void {
   set(false);
   lastContactAt = 0;
+  appliedSeq = startedSeq; // pedidos que já estavam no ar não valem mais
 }
 
 const GATEWAY_DOWN = new Set([502, 503, 504]);
 
-/** Embrulha um fetch: cada resposta ou falha de rede atualiza o estado. O resultado passa adiante sem mudança. */
-export function trackCloudReachability<A extends unknown[], R extends { status: number }>(fetchFn: (...args: A) => Promise<R>): (...args: A) => Promise<R> {
+// Pedidos terminam fora de ordem (e podem ser de outra loja, depois de uma troca de sessão): só vale a observação do
+// pedido mais novo já visto, da loja de agora (auditoria #59 r5 P2-03).
+let startedSeq = 0;
+let appliedSeq = 0;
+let currentKey = '';
+
+function begin(key: string): number {
+  if (key !== currentKey) {
+    // Outra loja/sessão: o que a anterior viu não vale mais. Recomeça sem aviso até a primeira observação.
+    currentKey = key;
+    appliedSeq = startedSeq;
+    if (unreachable) {
+      unreachable = false;
+      for (const l of listeners) l();
+    }
+  }
+  startedSeq += 1;
+  return startedSeq;
+}
+
+function observe(seq: number, key: string, value: boolean): void {
+  if (key !== currentKey || seq < appliedSeq) return;
+  appliedSeq = seq;
+  set(value);
+}
+
+/**
+ * Embrulha um fetch: cada resposta ou falha de rede atualiza o estado. O resultado passa adiante sem mudança.
+ * `key` identifica a loja/sessão do pedido: a resposta de um pedido mais antigo, ou de outra loja, não sobrescreve a
+ * observação mais nova.
+ */
+export function trackCloudReachability<A extends unknown[], R extends { status: number }>(fetchFn: (...args: A) => Promise<R>, key = ''): (...args: A) => Promise<R> {
   return async (...args: A) => {
+    const seq = begin(key);
     let res: R;
     try {
       res = await fetchFn(...args);
     } catch (e) {
-      set(true);
+      observe(seq, key, true);
       throw e;
     }
-    set(GATEWAY_DOWN.has(res.status));
+    observe(seq, key, GATEWAY_DOWN.has(res.status));
     return res;
   };
 }

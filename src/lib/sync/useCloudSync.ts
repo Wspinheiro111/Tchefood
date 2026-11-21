@@ -14,7 +14,7 @@ import { fetchCloudOrders, missingCatalog, orderIdsToReconcile, missingHalves, m
 import { dueNfceCalls, dueNfceOrders, nfceCallNow, requestNfceEmission } from './nfceEmission';
 import type { CloudSession } from '../../store/useTcheStore';
 import { pendingRelease } from '../payments/claimLedger';
-import { cloudUnreachable, lastCloudContactAt, trackCloudReachability } from './cloudReachability';
+import { cloudKey, cloudUnreachable, lastCloudContactAt, trackCloudReachability } from './cloudReachability';
 import type { SyncEvent, UUID } from '../../types';
 
 const INTERVAL_MS = 5_000;
@@ -496,7 +496,7 @@ async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): 
   const wantsNfce = pull !== 'never' && dueNfceOrders(state, Date.now(), 1).length > 0;
   if (state.outbox.length === 0 && !wantsPull && !wantsRefunds && !wantsNfce) return;
   running = true;
-  const round = runRound(session, trackCloudReachability(withRequestTimeout(fetchFn)), due, force, wantsRefunds, tenantId, pull !== 'never');
+  const round = runRound(session, trackCloudReachability(withRequestTimeout(fetchFn), cloudKey(session)), due, force, wantsRefunds, tenantId, pull !== 'never');
   current = round;
   try {
     await round;
@@ -672,7 +672,7 @@ export async function probeCloudIfIdle(fetchFn: FetchLike = browserFetch, now: n
   if (now - lastCloudContactAt() < PROBE_EVERY_MS) return;
   probing = true;
   try {
-    const get = trackCloudReachability(withRequestTimeout(fetchFn, PROBE_TIMEOUT_MS));
+    const get = trackCloudReachability(withRequestTimeout(fetchFn, PROBE_TIMEOUT_MS), cloudKey(session));
     // Só o status importa: o corpo não é lido (auditoria #59 r3 P2-01: corpo pendurado não segura a verificação).
     await get(`${session.url.replace(/\/+$/, '')}/rest/v1/tenants?select=id&limit=1`, {
       method: 'GET',
@@ -701,9 +701,15 @@ export function useCloudSync(online: boolean): void {
     // Instância sem lock de escrita ou hidratação provisória: nenhuma rodada em segundo plano (envio da fila, trocas
     // de reserva, acertos) sai de um estado que não pode ser gravado (GPT, rodada 27 do PR #54).
     const run = () => {
-      if (getStorageStatus() !== 'ok') return;
+      if (getStorageStatus() !== 'ok') {
+        // A verificação do aviso é uma leitura (GET) e não grava nada no aparelho: segue mesmo sem lock de escrita
+        // (auditoria #59 r5 P2-02). Fila, leituras de conta, NFC-e e liberações continuam barradas acima.
+        void probeCloudIfIdle();
+        return;
+      }
       // Nuvem sem responder: lê a cada volta (não só a cada minuto), para o aviso sumir assim que ela voltar.
-      void syncOnce(browserFetch, { forcePull: cloudUnreachable() }).then(() => probeCloudIfIdle());
+      // A verificação não depende de a rodada terminar bem.
+      void syncOnce(browserFetch, { forcePull: cloudUnreachable() }).catch(() => undefined).then(() => probeCloudIfIdle());
       retryReleases();
     };
     run();
