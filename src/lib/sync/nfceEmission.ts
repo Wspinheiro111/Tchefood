@@ -16,7 +16,7 @@
  *  - Falha de rede ou do servidor não muda o status da nota: só a mensagem e a próxima
  *    tentativa.
  */
-import type { NfceCallProblem, NfceCloudRecord, NfceCloudStatus, NfceDanfePayload, NfceIssuer, Order, SyncEvent } from '../../types';
+import type { NfceCallProblem, NfceCloudRecord, NfceCloudStatus, NfceDanfePayload, NfceIssuer, NfceIssuerAddress, Order, SyncEvent } from '../../types';
 import { toCents } from '../money';
 import { isValidAccessKey, isValidNfceQrCodeContent, serverNfceDocument, type ServerNfceFields } from '../nfce';
 import { recordKeys, type FetchLike, type SyncConfig } from './supabaseSync';
@@ -68,6 +68,8 @@ export interface NfceDocumentOutcome {
   payload: NfceDanfePayload | null;
   /** Emitente gravado no servidor junto do payload transmitido (nunca o cadastro deste aparelho). */
   issuer: NfceIssuer | null;
+  issuer_address: NfceIssuerAddress | null;
+  authorized_at: string | null;
   message: string | null;
 }
 
@@ -159,6 +161,22 @@ export function parseNfceIssuer(value: unknown): NfceIssuer | null {
   return { name, legal_name: legal, cnpj, state_registration: ie, city, state };
 }
 
+/** Endereço do emitente do servidor: todos os campos obrigatórios do cabeçalho do DANFE, ou null. */
+export function parseIssuerAddress(value: unknown): NfceIssuerAddress | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  const street = text(v.street, 120);
+  const number = text(v.number, 60);
+  const district = text(v.district, 60);
+  const city = text(v.city, 60);
+  const state = text(v.state, 2);
+  const zip = text(v.zip, 8);
+  const complement = v.complement === null || v.complement === undefined ? null : text(v.complement, 60);
+  if (!street || !number || !district || !city || !state || !/^[A-Z]{2}$/.test(state) || !zip || !/^\d{8}$/.test(zip)) return null;
+  if (v.complement !== null && v.complement !== undefined && complement === null) return null;
+  return { street, number, complement, district, city, state, zip };
+}
+
 /**
  * Lê a resposta da emit-nfce. Nada que não passe na conferência vai para a tela:
  * chave fora do formato vira null, QR Code de outra chave ou de fora da SEFAZ vira null,
@@ -189,6 +207,7 @@ export function parseEmitResponse(httpStatus: number, body: string): NfceEmitOut
     const qrRaw = text(r.qrcode_url, 1000);
     const danfeRaw = text(r.danfe_path, 512);
     const issuedRaw = text(r.issued_at, 40);
+    const authorizedRaw = text(r.authorized_at, 40);
     const number = typeof r.number === 'number' && Number.isInteger(r.number) && r.number > 0 ? r.number : null;
     const seriesRaw = text(r.series, 3);
     let docStatus = status as NfceCloudStatus;
@@ -211,6 +230,8 @@ export function parseEmitResponse(httpStatus: number, body: string): NfceEmitOut
       issued_at: issuedRaw && !Number.isNaN(Date.parse(issuedRaw)) ? issuedRaw : null,
       payload: parseDanfePayload(r.payload),
       issuer: parseNfceIssuer(r.issuer),
+      issuer_address: parseIssuerAddress(r.issuer_address),
+      authorized_at: authorizedRaw && !Number.isNaN(Date.parse(authorizedRaw)) ? authorizedRaw : null,
       message: docMessage,
     };
   }
@@ -293,7 +314,7 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
   // Chave nova (ex.: rejeitada e corrigida com outra numeração): nada da nota anterior completa esta.
   const keyChanged = !!outcome.access_key && !!base.access_key && outcome.access_key !== base.access_key;
   const carry = keyChanged
-    ? { protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, issued_at: null, payload: null, issuer: null }
+    ? { protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, issued_at: null, payload: null, issuer: null, issuer_address: null, authorized_at: null }
     : base;
   const merged = {
     status: outcome.status,
@@ -308,6 +329,9 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
     payload: outcome.payload ?? carry.payload,
     // Emitente de nota já autorizada (mesma chave) fica como chegou: o servidor também não o deixa mudar.
     issuer: (base.status === 'authorized' || base.status === 'cancelled') && !keyChanged && carry.issuer ? carry.issuer : (outcome.issuer ?? carry.issuer ?? null),
+    // Endereço e hora da autorização: vêm do documento autorizado; depois de gravados não mudam.
+    issuer_address: carry.issuer_address ?? outcome.issuer_address ?? null,
+    authorized_at: carry.authorized_at ?? outcome.authorized_at ?? null,
   };
   // Autorizada sem DANFE imprimível (falta dado ou o dado não confere com a chave): consulta (só leitura)
   // com intervalo crescente, até um limite. Contador próprio, a partir da primeira autorização.
@@ -379,6 +403,13 @@ export function nfceCall(
     return due ? 'consult' : null;
   }
   if (OPEN_ORDER_STATUSES.includes(order.nfce_status ?? '')) {
+    // Situação que veio de outro aparelho (rejeitada, processando, contingência) sem documento conhecido
+    // aqui: primeiro só se consulta. Reenviar uma rejeitada pede ação explícita do operador (botão).
+    const known = !!rec && rec.status !== null;
+    if (order.nfce_status === 'REJEITADA' || (order.nfce_status !== 'PENDING' && !known)) {
+      if (forced) return 'emit';
+      return !known && (!rec || due) ? 'consult' : null;
+    }
     if (!rec || due) return 'emit';
     return null;
   }

@@ -30,6 +30,8 @@ export interface FocusNfceResponse {
   xmlPath: string | null;
   danfePath: string | null;
   qrCodeUrl: string | null;
+  /** protocolo_nota_fiscal.data_recebimento (dhRecbto da SEFAZ) como ISO; null se ausente/ilegível. */
+  authorizedAt: string | null;
   /** Focus emitiu em contingência offline (tpEmis 9) porque a SEFAZ não respondeu. */
   offlineContingency: boolean | null;
   /** A nota em contingência já foi transmitida e aceita pela SEFAZ. */
@@ -63,6 +65,8 @@ export function sanitizeFocusResponse(value: unknown): FocusNfceResponse {
     ? (r.protocolo_nota_fiscal as Record<string, unknown>)
     : null;
   const nested = str(details?.numero_protocolo, 80);
+  const receivedRaw = str(details?.data_recebimento, 40);
+  const receivedMs = receivedRaw && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(receivedRaw) ? Date.parse(receivedRaw) : NaN;
   return {
     status: str(r.status, 40),
     statusSefaz: str(r.status_sefaz, 12),
@@ -75,6 +79,7 @@ export function sanitizeFocusResponse(value: unknown): FocusNfceResponse {
     danfePath: str(r.caminho_danfe, 512),
     // QR Code de consulta assinado; url_danfe NÃO é o QR Code.
     qrCodeUrl: str(r.qrcode_url ?? r.url_qrcode, 2048),
+    authorizedAt: Number.isNaN(receivedMs) ? null : new Date(receivedMs).toISOString(),
     offlineContingency: typeof r.contingencia_offline === 'boolean' ? r.contingencia_offline : null,
     offlineContingencyEffective: typeof r.contingencia_offline_efetivada === 'boolean' ? r.contingencia_offline_efetivada : null,
   };
@@ -154,7 +159,71 @@ export function createFocusClient(options: FocusClientOptions) {
         return indeterminate('Consulta à Focus sem resposta. A NFC-e continua em processamento.');
       }
     },
+    /** Baixa o XML autorizado (caminho relativo devolvido pela Focus); null em qualquer falha. */
+    async fetchXml(path: string | null): Promise<string | null> {
+      if (!path || !/^\/[A-Za-z0-9_\-./]{1,500}$/.test(path) || path.includes('..')) return null;
+      try {
+        const response = await options.fetch(`${BASE_URL[options.environment]}${path}`, {
+          method: 'GET',
+          headers: { Authorization: auth, Accept: 'application/xml' },
+          signal: AbortSignal.timeout(timeout),
+        });
+        if (!response.ok) return null;
+        const text = await response.text();
+        return text.length <= 500_000 ? text : null;
+      } catch {
+        return null;
+      }
+    },
   };
+}
+
+export interface IssuerAddress {
+  street: string;
+  number: string;
+  complement: string | null;
+  district: string;
+  city: string;
+  state: string;
+  zip: string;
+}
+
+function xmlTag(xml: string, tag: string): string | null {
+  const m = new RegExp(`<${tag}>([^<]{1,200})</${tag}>`).exec(xml);
+  const v = m?.[1].trim();
+  return v ? v.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'") : null;
+}
+
+/**
+ * Lê do XML AUTORIZADO o endereço do emitente (enderEmit) e a data de recebimento (dhRecbto),
+ * conferindo que o XML é desta nota: Id do infNFe = chave e CNPJ do emitente = o da chave.
+ * Qualquer divergência devolve null nos dois campos (o aparelho então não imprime pela bobina).
+ */
+export function parseAuthorizedXml(xml: string | null, accessKey: string | null): { address: IssuerAddress | null; authorizedAt: string | null } {
+  const none = { address: null, authorizedAt: null };
+  const key = (accessKey ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '').replace(/^NFE/, '');
+  if (!xml || !/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return none;
+  const id = /<infNFe[^>]*\sId="NFe([0-9A-Z]{44})"/.exec(xml)?.[1];
+  if (id !== key) return none;
+  const emit = /<emit>([\s\S]*?)<\/emit>/.exec(xml)?.[1] ?? '';
+  const cnpj = xmlTag(emit, 'CNPJ');
+  if (cnpj !== key.slice(6, 18)) return none;
+  const ender = /<enderEmit>([\s\S]*?)<\/enderEmit>/.exec(emit)?.[1];
+  let address: IssuerAddress | null = null;
+  if (ender) {
+    const street = xmlTag(ender, 'xLgr');
+    const number = xmlTag(ender, 'nro');
+    const district = xmlTag(ender, 'xBairro');
+    const city = xmlTag(ender, 'xMun');
+    const state = xmlTag(ender, 'UF');
+    const zip = xmlTag(ender, 'CEP');
+    if (street && number && district && city && state && /^[A-Z]{2}$/.test(state) && zip && /^\d{8}$/.test(zip)) {
+      address = { street, number, complement: xmlTag(ender, 'xCpl'), district, city, state, zip };
+    }
+  }
+  const received = xmlTag(xml, 'dhRecbto');
+  const ms = received && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(received) ? Date.parse(received) : NaN;
+  return { address, authorizedAt: Number.isNaN(ms) ? null : new Date(ms).toISOString() };
 }
 
 export type FocusClient = ReturnType<typeof createFocusClient>;
@@ -234,8 +303,12 @@ export function classifyTransmission(result: FocusResult): FocusNfceResponse {
   };
 }
 
+const QR_PORTALS: Readonly<Record<string, { host: string; path: string }>> = {
+  '43': { host: 'www.sefaz.rs.gov.br', path: '/nfce/nfce-com.aspx' },
+};
+
 /**
- * Só aceita como QR Code impresso uma URL de SEFAZ (.gov.br) cujo parâmetro p começa pela
+ * Só aceita como QR Code impresso uma URL https de SEFAZ (.gov.br) cujo parâmetro p começa pela
  * chave desta nota (mesma regra de src/lib/nfce.ts isValidNfceQrCodeContent).
  */
 export function isValidQrCodeUrl(content: string | null, accessKey: string | null, environment?: 'homologacao' | 'producao' | null): boolean {
@@ -248,8 +321,10 @@ export function isValidQrCodeUrl(content: string | null, accessKey: string | nul
   } catch {
     return false;
   }
-  if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password) return false;
-  if (!/(^|\.)gov\.br$/i.test(url.hostname)) return false;
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return false;
+  // Portal da SEFAZ da UF da chave (mesma lista de src/lib/nfce.ts NFCE_QR_PORTALS); outro domínio .gov.br não vale.
+  const portal = QR_PORTALS[key.slice(0, 2)];
+  if (!portal || url.hostname.toLowerCase() !== portal.host || url.pathname.toLowerCase() !== portal.path) return false;
   const p = url.searchParams.get('p');
   if (!p) return false;
   const parts = p.split('|');

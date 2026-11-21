@@ -8,7 +8,7 @@
  * - Cada pagamento aprovado da rachadinha vira uma entrada em formas_pagamento
  *   com tipo_integracao = 1 (tpIntegra — pagamento integrado TEF/SmartPOS).
  */
-import type { NfceDanfePayload, NfceIssuer, Order, OrderItem, Payment, Product, Tenant } from '../types';
+import type { NfceDanfePayload, NfceIssuer, NfceIssuerAddress, Order, OrderItem, Payment, Product, Tenant } from '../types';
 import type { DanfeDoc } from './receipts';
 import { allocateCents, fromCents, toCents } from './money';
 import { sha1Hex } from './sha1';
@@ -124,6 +124,14 @@ export function buildConsultaQrUrl(key: string, tenant: Pick<Tenant, 'csc_id' | 
 export const CONSULTA_URL_RS = 'www.sefaz.rs.gov.br/nfce/consulta';
 
 /**
+ * Portais de consulta NFC-e (destino do QR Code) por cUF da chave. Só entra UF com endereço oficial
+ * conferido; as demais não imprimem QR próprio (o DANFE oficial da Focus cobre). RS é a UF do piloto.
+ */
+export const NFCE_QR_PORTALS: Readonly<Record<string, { host: string; path: string }>> = {
+  '43': { host: 'www.sefaz.rs.gov.br', path: '/nfce/nfce-com.aspx' },
+};
+
+/**
  * Portado do Tchê Vendas (server/danfceQrCode.ts): só aceita como QR Code do
  * DANFE uma URL http(s) de SEFAZ (.gov.br) cujo parâmetro p começa pela chave
  * de acesso DESTA NFC-e. Um endereço de consulta (sem p), de outra nota ou de
@@ -144,8 +152,11 @@ export function isValidNfceQrCodeContent(
   } catch {
     return false;
   }
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
-  if (url.username || url.password || !/(^|\.)gov\.br$/i.test(url.hostname)) return false;
+  // Só o portal de consulta NFC-e da UF da chave (HTTPS, host e caminho exatos). Conferência de endereço
+  // e de estrutura, não prova criptográfica da assinatura do QR Code.
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return false;
+  const portal = NFCE_QR_PORTALS[key.slice(0, 2)];
+  if (!portal || url.hostname.toLowerCase() !== portal.host || url.pathname.toLowerCase() !== portal.path) return false;
   const p = url.searchParams.get('p');
   if (!p) return false;
   const parts = p.split('|');
@@ -354,6 +365,8 @@ export interface ServerNfceFields {
   issued_at: string | null;
   payload: NfceDanfePayload | null;
   issuer?: NfceIssuer | null;
+  issuer_address?: NfceIssuerAddress | null;
+  authorized_at?: string | null;
   environment?: 'homologacao' | 'producao' | null;
 }
 
@@ -380,6 +393,11 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
   if (!server.issuer || server.issuer.cnpj !== parsed.cnpj || server.payload.cnpj_emitente !== parsed.cnpj) return null;
   // IE ausente no cadastro não prova "ISENTO": sem a IE comprovada a bobina não imprime (DANFE oficial da Focus).
   if (!server.issuer.state_registration) return null;
+  // Endereço completo do emitente (XML autorizado) e hora real da autorização: sem eles não imprime,
+  // fica o DANFE oficial da Focus. Nada é reconstruído a partir do cadastro ou da data de emissão.
+  const address = server.issuer_address;
+  if (!address || !address.street || !address.number || !address.district || !address.city || !address.state || !/^\d{8}$/.test(address.zip)) return null;
+  if (authorized && (!server.authorized_at || Number.isNaN(Date.parse(server.authorized_at)))) return null;
   return {
     access_key: key,
     protocol: authorized ? server.protocol! : '',
@@ -388,6 +406,8 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
     tributos_federais: 0,
     tributos_estaduais: 0,
     issuer: server.issuer,
+    issuer_address: address,
+    ...(authorized ? { authorized_at: server.authorized_at! } : {}),
     payload: {
       ...server.payload,
       numero: parsed.numero,

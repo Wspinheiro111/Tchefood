@@ -14,7 +14,7 @@ import {
   type NfceSource,
   type PaymentRow,
 } from '../emit-nfce/payload.ts';
-import { classifyTransmission, createFocusClient, focusEnvironment, normalizeProviderStatus, type FetchLike } from '../emit-nfce/focus.ts';
+import { classifyTransmission, createFocusClient, focusEnvironment, isValidQrCodeUrl, normalizeProviderStatus, parseAuthorizedXml, type FetchLike } from '../emit-nfce/focus.ts';
 import { emitNfce, type NfceDocumentRow, type NfceRepository } from '../emit-nfce/emit.ts';
 import { parseDanfePayload, parseNfceIssuer } from '../../../src/lib/sync/nfceEmission.ts';
 
@@ -214,19 +214,31 @@ class MemoryRepo implements NfceRepository {
   }
 }
 
-function fakeFocus(responses: Array<{ status: number; body: unknown } | 'network'>) {
+const XML_PATH = '/arquivos_development/x/NFe.xml';
+/** XML autorizado como a Focus devolve (trecho): Id da chave, emitente com endereço, dhRecbto do protocolo. */
+function authorizedXml(key = KEY, over: { cnpj?: string; id?: string; ender?: string; dh?: string } = {}) {
+  const ender = over.ender ?? '<enderEmit><xLgr>Rua das Flores</xLgr><nro>120</nro><xBairro>Centro</xBairro><cMun>4317103</cMun><xMun>Santo Angelo</xMun><UF>RS</UF><CEP>98800000</CEP></enderEmit>';
+  return `<nfeProc><NFe><infNFe versao="4.00" Id="NFe${over.id ?? key}"><emit><CNPJ>${over.cnpj ?? key.slice(6, 18)}</CNPJ><xNome>FLIP</xNome>${ender}<IE>0960000000</IE></emit></infNFe></NFe><protNFe><infProt><dhRecbto>${over.dh ?? '2026-11-09T03:00:07-03:00'}</dhRecbto><nProt>143260000000001</nProt></infProt></protNFe></nfeProc>`;
+}
+
+function fakeFocus(responses: Array<{ status: number; body: unknown } | 'network'>, xml: string | null = authorizedXml()) {
   const calls: Array<{ method: string; url: string }> = [];
+  const xmlCalls: string[] = [];
   const fetch: FetchLike = async (url, init) => {
+    if (url.endsWith(XML_PATH)) {
+      xmlCalls.push(url);
+      return xml === null ? { status: 404, ok: false, text: async () => '' } : { status: 200, ok: true, text: async () => xml };
+    }
     calls.push({ method: init.method, url });
     const next = responses.shift();
     if (!next || next === 'network') throw new Error('network');
     return { status: next.status, ok: next.status >= 200 && next.status < 300, text: async () => JSON.stringify(next.body) };
   };
-  return { calls, focus: (token: string) => createFocusClient({ environment: 'homologacao', token, fetch }) };
+  return { calls, xmlCalls, focus: (token: string) => createFocusClient({ environment: 'homologacao', token, fetch }) };
 }
 
 const sha256Hex = async (t: string) => createHash('sha256').update(t).digest('hex');
-const AUTHORIZED = { status: 'autorizado', status_sefaz: '100', mensagem_sefaz: 'Autorizado o uso da NF-e', chave_nfe: `NFe${KEY}`, protocolo: '143260000000001', numero: '42', serie: '1', qrcode_url: QR, caminho_danfe: '/notas_fiscais_consumidor/x.html' };
+const AUTHORIZED = { status: 'autorizado', status_sefaz: '100', mensagem_sefaz: 'Autorizado o uso da NF-e', chave_nfe: `NFe${KEY}`, protocolo: '143260000000001', numero: '42', serie: '1', qrcode_url: QR, caminho_danfe: '/notas_fiscais_consumidor/x.html', caminho_xml_nota_fiscal: XML_PATH };
 
 describe('emitNfce', () => {
   it('autoriza, grava protocolo e QR Code, e não reenvia na segunda chamada', async () => {
@@ -475,5 +487,62 @@ describe('emitNfce', () => {
     const { focus } = fakeFocus([]);
     const r = await emitNfce({ repo, environment: 'homologacao', focus, sha256Hex }, { tenantId: '33333333-3333-4333-8333-333333333333', orderId: ORDER });
     expect(r.httpStatus).toBe(404);
+  });
+});
+
+
+describe('P1-02 e P1-03 (2ª auditoria do #55): endereço do emitente e dhRecbto vêm do XML autorizado', () => {
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+  const ADDRESS = { street: 'Rua das Flores', number: '120', complement: null, district: 'Centro', city: 'Santo Angelo', state: 'RS', zip: '98800000' };
+
+  it('grava e devolve endereço (enderEmit) e data de autorização (dhRecbto) do XML, e não consulta de novo depois', async () => {
+    const repo = new MemoryRepo(source());
+    const { calls, xmlCalls, focus } = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const first = await emitNfce(deps(repo, focus), { tenantId: TENANT, orderId: ORDER });
+    expect(first.body).toMatchObject({ authorized: true, issuer_address: ADDRESS, authorized_at: '2026-11-09T06:00:07.000Z' });
+    expect(xmlCalls).toHaveLength(1);
+    const again = await emitNfce(deps(repo, focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(again.body).toMatchObject({ issuer_address: ADDRESS, authorized_at: '2026-11-09T06:00:07.000Z' });
+    expect(calls).toHaveLength(1);
+    expect(xmlCalls).toHaveLength(1);
+  });
+
+  it('XML de outra nota (Id ou CNPJ diferentes) ou ausente não preenche nada: nem endereço, nem data inventada a partir da emissão', async () => {
+    for (const xml of [authorizedXml(KEY, { id: `${KEY.slice(0, 43)}9` }), authorizedXml(KEY, { cnpj: '48291736000155' }), authorizedXml(KEY, { ender: '' }), null]) {
+      const repo = new MemoryRepo(source());
+      const { focus } = fakeFocus([{ status: 201, body: AUTHORIZED }], xml);
+      const r = await emitNfce(deps(repo, focus), { tenantId: TENANT, orderId: ORDER });
+      expect(r.body.authorized).toBe(true);
+      expect(r.body.issuer_address).toBeNull();
+      // data_emissao do payload nunca vira data de autorização.
+      expect(r.body.authorized_at).not.toBe(r.body.issued_at);
+    }
+  });
+
+  it('a data do protocolo da Focus vale quando o XML não vem, e uma consulta posterior completa o endereço sem mudar a data', async () => {
+    const repo = new MemoryRepo(source());
+    const withProtocol = { ...AUTHORIZED, protocolo_nota_fiscal: { numero_protocolo: '143260000000001', data_recebimento: '2026-11-09T03:03:00-03:00' } };
+    const first = fakeFocus([{ status: 201, body: withProtocol }], null);
+    const r1 = await emitNfce(deps(repo, first.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r1.body).toMatchObject({ issuer_address: null, authorized_at: '2026-11-09T06:03:00.000Z' });
+    // Documento com QR mas sem endereço: a consulta (GET) busca o XML; a data já gravada não muda.
+    const second = fakeFocus([{ status: 200, body: withProtocol }], authorizedXml(KEY, { dh: '2026-11-09T03:09:00-03:00' }));
+    const r2 = await emitNfce(deps(repo, second.focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r2.body).toMatchObject({ issuer_address: ADDRESS, authorized_at: '2026-11-09T06:03:00.000Z' });
+    expect(second.calls.every((c) => c.method === 'GET')).toBe(true);
+  });
+
+  it('parseAuthorizedXml: chave inválida, XML sem enderEmit ou com CEP/UF malformados não devolve endereço', () => {
+    expect(parseAuthorizedXml(authorizedXml(), KEY).address).toEqual(ADDRESS);
+    expect(parseAuthorizedXml(authorizedXml(), 'x').address).toBeNull();
+    expect(parseAuthorizedXml(authorizedXml(KEY, { ender: '<enderEmit><xLgr>R</xLgr><nro>1</nro><xBairro>B</xBairro><xMun>M</xMun><UF>rs</UF><CEP>12</CEP></enderEmit>' }), KEY).address).toBeNull();
+    expect(parseAuthorizedXml(authorizedXml(KEY, { dh: 'ontem' }), KEY).authorizedAt).toBeNull();
+  });
+
+  it('QR Code do servidor: só https e só o portal da SEFAZ da UF da chave', () => {
+    expect(isValidQrCodeUrl(QR, KEY, 'homologacao')).toBe(true);
+    expect(isValidQrCodeUrl(QR.replace('https:', 'http:'), KEY, 'homologacao')).toBe(false);
+    expect(isValidQrCodeUrl(QR.replace('www.sefaz.rs.gov.br', 'evil.gov.br'), KEY, 'homologacao')).toBe(false);
+    expect(isValidQrCodeUrl(QR.replace('/NFCE/NFCE-COM.aspx', '/x'), KEY, 'homologacao')).toBe(false);
   });
 });

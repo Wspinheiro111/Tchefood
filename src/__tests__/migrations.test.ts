@@ -119,7 +119,9 @@ describe('supabase/migrations', () => {
     }
     // Data depois da última migration publicada na main (o delivery pelo servidor, #57): uma
     // migration com data anterior à última aplicada fica fora do `supabase db push` normal.
-    expect(idx('schema_contas_aparelhos.sql')).toBe(files.length - 1);
+    // A única depois dela é a data/endereço de autorização da NFC-e (PR #63), que só mexe em nfce_documents.
+    expect(idx('schema_contas_aparelhos.sql')).toBe(files.length - 2);
+    expect(files.at(-1)).toBe('20261121100000_nfce_autorizacao.sql');
     expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_pin_gerente_trava.sql'));
     expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_delivery_servidor.sql'));
     expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_point_reserva.sql'));
@@ -139,7 +141,8 @@ describe('supabase/migrations', () => {
   });
   it('emitente da NFC-e (PR #55): coluna issuer e guarda que o mantém imutável depois de autorizada, na última versão de tchefood_nfce_guard', () => {
     const defines = files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes('CREATE OR REPLACE FUNCTION tchefood_nfce_guard('));
-    expect(defines.at(-1)).toBe('20261119100000_nfce_emitente.sql');
+    expect(defines.at(-1)).toBe('20261121100000_nfce_autorizacao.sql');
+    expect(defines.at(-2)).toBe('20261119100000_nfce_emitente.sql');
     const sql = readFileSync(join(MIGRATIONS, '20261119100000_nfce_emitente.sql'), 'utf8');
     expect(sql).toContain('ALTER TABLE nfce_documents ADD COLUMN IF NOT EXISTS issuer JSONB');
     expect(sql).toContain('NEW.issuer IS DISTINCT FROM OLD.issuer');
@@ -148,7 +151,17 @@ describe('supabase/migrations', () => {
       expect(sql, rule).toContain(rule);
     }
     // Vem depois da última já publicada antes dela (o painel, #56); só a das contas (PR #54), mais nova, vem depois.
-    expect(files.at(-2)).toBe('20261119100000_nfce_emitente.sql');
-    expect(files.at(-1)).toBe('20261119110000_contas_aparelhos.sql');
+    expect(files.indexOf('20261119100000_nfce_emitente.sql')).toBeGreaterThan(files.indexOf('20261119090000_painel_admin.sql'));
+    expect(files.at(-2)).toBe('20261119110000_contas_aparelhos.sql');
+  });
+  it('autorização da NFC-e (PR #63): data de recebimento e endereço do emitente, preenchidos uma vez e imutáveis, mantendo todas as regras do guarda', () => {
+    const sql = readFileSync(join(MIGRATIONS, '20261121100000_nfce_autorizacao.sql'), 'utf8');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS authorized_at TIMESTAMPTZ');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS issuer_address JSONB');
+    expect(sql).toContain('OLD.authorized_at IS NOT NULL AND NEW.authorized_at IS DISTINCT FROM OLD.authorized_at');
+    expect(sql).toContain('OLD.issuer_address IS NOT NULL AND NEW.issuer_address IS DISTINCT FROM OLD.issuer_address');
+    for (const rule of ["TG_OP = 'DELETE'", "(OLD.status = 'authorized'  AND NEW.status = 'cancelled')", 'NEW.reference IS DISTINCT FROM OLD.reference', 'NEW.issuer IS DISTINCT FROM OLD.issuer']) {
+      expect(sql, rule).toContain(rule);
+    }
   });
 });

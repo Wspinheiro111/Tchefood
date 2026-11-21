@@ -21,6 +21,8 @@ import {
   type FocusEnvironment,
   type FocusNfceResponse,
   type NfceDocumentStatus,
+  type IssuerAddress,
+  parseAuthorizedXml,
 } from './focus.ts';
 import { NfceValidationError, buildNfcePayload, canonicalJson, fiscalIssuedAt, issuerSnapshot, nfceReference, type NfceSource } from './payload.ts';
 
@@ -49,6 +51,10 @@ export interface NfceDocumentRow {
   payload: unknown;
   /** Emitente gravado junto do payload na transmissão (cadastro da loja no servidor); imutável depois de autorizada. */
   issuer?: unknown;
+  /** dhRecbto: data/hora da autorização na SEFAZ (ISO), lida do protocolo/XML da Focus. */
+  authorized_at?: string | null;
+  /** enderEmit do XML autorizado; o DANFE próprio só imprime com ele. */
+  issuer_address?: IssuerAddress | null;
 }
 
 export type NewNfceDocument = Pick<NfceDocumentRow, 'tenant_id' | 'order_id' | 'reference' | 'environment' | 'payload_hash'> & {
@@ -69,7 +75,7 @@ export type ProviderFields = Pick<
   | 'sefaz_status'
   | 'sefaz_message'
   | 'offline_contingency'
->;
+> & { authorized_at?: string | null; issuer_address?: IssuerAddress | null };
 
 export interface NfceRepository {
   /** Comanda + itens + produtos + pagamentos + emitente, sempre filtrados pelo tenant. */
@@ -123,6 +129,10 @@ export interface EmitResponse {
     payload: unknown;
     /** Emitente gravado com o payload (mesma regra do payload); a tela não usa o cadastro do aparelho. */
     issuer: unknown;
+    /** Endereço do emitente do XML autorizado (só autorizada/cancelada); null = não imprime pela bobina. */
+    issuer_address: IssuerAddress | null;
+    /** dhRecbto da SEFAZ (ISO); nunca derivado de data_emissao. */
+    authorized_at: string | null;
     message: string | null;
   };
 }
@@ -156,6 +166,8 @@ function respond(doc: NfceDocumentRow, message?: string | null): EmitResponse {
       issued_at: doc.issued_at,
       payload: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.payload ?? null : null,
       issuer: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.issuer ?? null : null,
+      issuer_address: doc.status === 'authorized' || doc.status === 'cancelled' ? doc.issuer_address ?? null : null,
+      authorized_at: doc.status === 'authorized' || doc.status === 'cancelled' ? doc.authorized_at ?? null : null,
       message: message ?? doc.sefaz_message,
     },
   };
@@ -179,6 +191,8 @@ function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict
       issued_at: null,
       payload: null,
       issuer: null,
+      issuer_address: null,
+      authorized_at: null,
       message,
     },
   };
@@ -203,7 +217,7 @@ function providerFields(doc: NfceDocumentRow, next: NfceDocumentStatus, response
   };
 }
 
-async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceResponse): Promise<EmitResponse> {
+async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceResponse, token?: string): Promise<EmitResponse> {
   const next = normalizeProviderStatus(response.status, doc.status, response);
   if (!canTransition(doc.status, next)) {
     // Retorno obsoleto não regride status mais confiável (ex.: authorized → rejected).
@@ -213,6 +227,18 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
   if (next === 'authorized' && (!fields.protocol || !fields.access_key)) {
     // "autorizado" sem protocolo/chave não é prova de autorização: fica em processamento.
     fields = { ...fields, status: 'processing', sefaz_message: 'Focus respondeu autorizado sem protocolo ou chave. Consulte novamente.' };
+  }
+  if (fields.status === 'authorized' && token && (!doc.authorized_at || !doc.issuer_address)) {
+    // Endereço e dhRecbto só do XML autorizado (conferido com a chave e o CNPJ); nunca do aparelho.
+    const xml = await deps.focus(token).fetchXml?.(fields.xml_path ?? null);
+    const parsed = parseAuthorizedXml(xml ?? null, fields.access_key);
+    fields = {
+      ...fields,
+      authorized_at: doc.authorized_at ?? parsed.authorizedAt ?? response.authorizedAt,
+      issuer_address: doc.issuer_address ?? parsed.address,
+    };
+  } else if (fields.status === 'authorized') {
+    fields = { ...fields, authorized_at: doc.authorized_at ?? response.authorizedAt, issuer_address: doc.issuer_address ?? null };
   }
   const saved = await deps.repo.saveProviderResult(doc.id, doc.status, doc.transmissions, fields);
   if (!saved) {
@@ -232,7 +258,7 @@ async function reconcile(deps: EmitDeps, doc: NfceDocumentRow, token: string): P
       : `Consulta inconclusiva (HTTP ${result.httpStatus || 'sem resposta'}). A NFC-e continua em ${doc.status === 'contingency' ? 'contingência' : 'processamento'}.`;
     return respond(doc, note);
   }
-  return apply(deps, doc, result.response);
+  return apply(deps, doc, result.response, token);
 }
 
 async function transmit(deps: EmitDeps, doc: NfceDocumentRow, token: string, payload: unknown): Promise<EmitResponse> {
@@ -242,14 +268,14 @@ async function transmit(deps: EmitDeps, doc: NfceDocumentRow, token: string, pay
     // A Focus já conhece a referência: consulta, nunca reenvia.
     const known = await client.query(doc.reference);
     const status = known.ok ? normalizeProviderStatus(known.response.status, 'processing', known.response) : null;
-    if (known.ok && status && ['authorized', 'processing', 'contingency'].includes(status)) return apply(deps, doc, known.response);
+    if (known.ok && status && ['authorized', 'processing', 'contingency'].includes(status)) return apply(deps, doc, known.response, token);
     return apply(deps, doc, {
       ...result.response,
       status: 'processing',
       message: `A Focus já conhecia a referência e a consulta retornou "${known.response.status ?? 'sem status'}". Mantida em processamento para conferência; não reenvie.`,
-    });
+    }, token);
   }
-  return apply(deps, doc, classifyTransmission(result));
+  return apply(deps, doc, classifyTransmission(result), token);
 }
 
 // Sem token não há como consultar a Focus: em consulta devolve o documento gravado como está;
@@ -283,7 +309,7 @@ export async function emitNfce(deps: EmitDeps, input: { tenantId: string; orderI
   }
   // O documento gravado é devolvido sem token: o token só é exigido para falar com a Focus
   // (consultar ou transmitir).
-  if (doc && doc.status === 'authorized' && doc.qrcode_url) return respond(doc);
+  if (doc && doc.status === 'authorized' && doc.qrcode_url && doc.authorized_at && doc.issuer_address) return respond(doc);
   if (doc && doc.status === 'cancelled') return respond(doc);
   // Autorizada sem o QR Code assinado: consulta a Focus (só GET) para completar o DANFE.
   if (doc && doc.status === 'authorized') return token ? reconcile(deps, doc, token) : consultOnlyWithoutToken(input, doc, noToken);

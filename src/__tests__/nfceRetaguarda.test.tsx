@@ -7,6 +7,7 @@ import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { NfceList } from '../screens/BackOffice';
 import { NFCE_REFUNDED_WARNING, NFCE_REFUNDED_WARNING_REAL, NfceViewer } from '../screens/NfceViewer';
+import { DEMO_TENANT_ID } from '../data/seed';
 import { useTcheStore } from '../store/useTcheStore';
 import type { NfceCloudRecord, Order } from '../types';
 
@@ -42,7 +43,7 @@ describe('Retaguarda › NFC-e na loja real', () => {
 
   it('demonstração continua mostrando a nota simulada', () => {
     act(() => {
-      useTcheStore.setState({ cloud: null, cloudTenantId: null, orders: [order], tables: [], nfceCloud: {} } as never);
+      useTcheStore.setState({ cloud: null, cloudTenantId: null, tenant: { ...useTcheStore.getState().tenant, id: DEMO_TENANT_ID }, orders: [order], tables: [], nfceCloud: {} } as never);
     });
     render(<NfceList />);
     expect(screen.getByText(/NFC-e nº 77/)).toBeTruthy();
@@ -59,6 +60,8 @@ describe('NfceViewer › aviso de estorno na nota real (P2-04, rodada 8c07a77)',
     status: 'authorized', environment: 'homologacao', access_key: REAL_KEY, protocol: '143260000000042', number: 42, series: '1',
     qrcode_url: `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${REAL_KEY}|2|2|1|ABCDEF`, issued_at: '2026-11-14T10:00:00-03:00', payload,
     issuer: { name: 'Flip', legal_name: 'FLIP LTDA', cnpj: '12345678000195', state_registration: '0960000000', city: 'Santo Angelo', state: 'RS' },
+    issuer_address: { street: 'Rua das Missoes', number: '123', complement: null, district: 'Centro', city: 'Santo Angelo', state: 'RS', zip: '98800000' },
+    authorized_at: '2026-11-14T10:03:00-03:00',
   } as never);
 
   it('nota real reimpressa depois do estorno: a mensagem diz que a bobina reproduz o pagamento original', () => {
