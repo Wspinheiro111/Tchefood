@@ -829,4 +829,24 @@ describe('achados da auditoria (2ª rodada em 8c07a77, PR de correção do #55)'
     expect(doc(authorizedBody({ qrcode_url: QR.replace('https:', 'http:') }))).toMatchObject({ qrcode_url: null });
     expect(serverNfceDocument(server({ qrcode_url: QR.replace('www.sefaz.rs.gov.br', 'evil.gov.br') }))).toBeNull();
   });
+
+  it('Codex P2: registro autorizado salvo antes dos campos novos, sem consulta agendada, consulta sozinho uma vez e depois respeita o limite', () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const id = closeOrder();
+    useTcheStore.setState({ outbox: [] });
+    const old = nextNfceRecord(id, undefined, doc(authorizedBody({ issuer_address: undefined, authorized_at: undefined })), Date.now());
+    // Como o aparelho antigo gravou: sem os campos novos, sem agendamento.
+    const legacy = { ...old, issuer_address: null, authorized_at: null, next_attempt_at: null, print_attempts: 0, problem: null };
+    expect(serverNfceDocument(legacy)).toBeNull();
+    useTcheStore.setState({ nfceCloud: { [id]: legacy } });
+    expect(nfceCallNow(st(), id, Date.now())).toBe('consult');
+    // Consulta que falha (erro) não repete sozinha em laço.
+    const failed = nextNfceRecord(id, legacy, { kind: 'error', httpStatus: 500, message: 'x' }, Date.now());
+    useTcheStore.setState({ nfceCloud: { [id]: { ...failed, next_attempt_at: null } } });
+    expect(nfceCallNow(st(), id, Date.now())).toBeNull();
+    // Nota completa não consulta.
+    const full = nextNfceRecord(id, undefined, doc(authorizedBody()), Date.now());
+    useTcheStore.setState({ nfceCloud: { [id]: full } });
+    expect(nfceCallNow(st(), id, Date.now())).toBeNull();
+  });
 });

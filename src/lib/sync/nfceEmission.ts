@@ -400,7 +400,11 @@ export function nfceCall(
   if (rec?.status === 'cancelled') return null;
   if (rec?.status === 'authorized') {
     if (!missingPrintData(rec)) return null;
-    return due ? 'consult' : null;
+    // Registro salvo por versão anterior, imprimível pelas regras de então e sem tentativa agendada:
+    // uma consulta (só leitura) busca endereço e data de autorização. Depois dela o contador próprio e o
+    // problema da última chamada limitam as seguintes.
+    const legacy = !rec.next_attempt_at && !rec.problem && (rec.print_attempts ?? 0) === 0;
+    return due || legacy ? 'consult' : null;
   }
   if (OPEN_ORDER_STATUSES.includes(order.nfce_status ?? '')) {
     // Situação que veio de outro aparelho (rejeitada, processando, contingência) sem documento conhecido
