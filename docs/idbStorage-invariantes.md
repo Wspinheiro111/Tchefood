@@ -88,3 +88,10 @@ C. **`select` (getItem) só conclui numa seleção estável**: depois de qualque
 - Não coberto: morte abrupta/suspensão da WebView do APK (só no aparelho), IndexedDB ilegível por falha real do disco. Observação:
   com o IndexedDB ilegível de forma permanente, a seleção seguinte devolve o mesmo valor pelas cópias e encerra o provisório
   (as gravações seguem só nas cópias); é o comportamento desenhado, não foi alterado.
+
+## Rodada 32: estorno por pagamento (SQL, não é IndexedDB)
+
+- Nenhuma mudança em IndexedDB. O servidor passa a saber quais itens cada pagamento quitou (`payment_items`), e só o item ligado a
+  pagamento estornado (e a nenhum aprovado) pode voltar a não pago pela cópia de um aparelho. Item sem vínculo (pagamento antigo,
+  lista ausente) nunca é desmarcado pela cópia: é o lado conservador. Limite conhecido: um aparelho que mente na lista pode
+  desmarcar item que ele mesmo declarou pago; item ligado a pagamento aprovado fica protegido.

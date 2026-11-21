@@ -45,6 +45,16 @@ describe('dados para o servidor refazer o preço', () => {
     expect(() => buildSyncRequest({ id: 'e', table: 'payments', op: 'UPDATE', row_id: 'P', payload: { id: 'P' }, created_at: '' }, cfg)).toThrow();
   });
 
+  it('pagamento leva a lista dos itens que quitou (item_ids), sem paid_item_ids, só com UUIDs em texto', () => {
+    const cfg = { url: 'https://abc.supabase.co', anonKey: 'anon', accessToken: 'jwt' };
+    const body = (payload: Record<string, unknown>) =>
+      JSON.parse(buildSyncRequest({ id: 'e', table: 'payments', op: 'INSERT', row_id: 'P', payload: { id: 'P', amount: 5, ...payload }, created_at: '' }, cfg).body ?? '{}').p_payment;
+    expect(body({ paid_item_ids: ['i1', 'i2', 7, null] })).toMatchObject({ id: 'P', item_ids: ['i1', 'i2'] });
+    expect(body({ paid_item_ids: ['i1'] }).paid_item_ids).toBeUndefined();
+    expect(body({ paid_item_ids: [] }).item_ids).toBeUndefined();
+    expect(body({}).item_ids).toBeUndefined();
+  });
+
   it('migração v9: a regra do aparelho vira a da loja e os itens antigos ficam sem os campos novos', () => {
     const out = migratePersisted({ tenant: { id: 't' }, halfAndHalfPricing: 'AVERAGE', orderItems: [{ id: 'i' }] }, 8) as Record<string, unknown>;
     expect(out.tenant).toEqual({ id: 't', half_and_half_pricing: 'AVERAGE' });

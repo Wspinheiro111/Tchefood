@@ -256,7 +256,11 @@ function buildPermissionRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest 
  */
 function buildPaymentRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   if (event.op !== 'INSERT') throw new Error('Pagamento gravado não muda: estorno é um pagamento novo.');
-  return rpcRequest(cfg, REGISTER_PAYMENT_RPC, { p_payment: sanitizePayload(event) });
+  // A lista dos itens que o pagamento quitou vai ao servidor (item_ids, não é coluna de payments): é ela que liga o
+  // estorno do pagamento aos itens que voltam a não pagos (payment_items; GPT r31 P0-01).
+  const items = event.payload.paid_item_ids;
+  const itemIds = Array.isArray(items) ? items.filter((x): x is string => typeof x === 'string') : [];
+  return rpcRequest(cfg, REGISTER_PAYMENT_RPC, { p_payment: itemIds.length > 0 ? { ...sanitizePayload(event), item_ids: itemIds } : sanitizePayload(event) });
 }
 
 /**

@@ -333,22 +333,92 @@ CREATE TRIGGER trg_order_items_000_keg_order_lock BEFORE UPDATE OF status ON ord
     FOR EACH ROW EXECUTE FUNCTION tchefood_item_keg_locks_order();
 
 -- -----------------------------------------------------------------------------
--- 6. Item pago não volta a "não pago"
+-- 6. Item pago não volta a "não pago", a não ser pelo estorno do pagamento que o pagou
 -- -----------------------------------------------------------------------------
 -- A atualização de cozinha de um aparelho manda o item inteiro, com o is_paid da cópia
 -- dele. Se outro aparelho recebeu esse item antes de a cópia chegar, o is_paid = false
 -- velho desmarcaria o pagamento por item (Codex no PR #54). O item fica pago e o resto da
 -- linha (situação na cozinha) passa: a atualização não é recusada.
--- Exceção (Codex no PR #54, r31): o estorno verificado de um pagamento da Point devolve os
--- itens que ele pagou a não pagos (mirrorServerPointRefund sobe o PATCH de order_items, o
--- banco não liga item a pagamento). Com um pagamento ESTORNADO na conta, a desmarcação vale.
--- O estorno só chega a REFUNDED pelo servidor (tchefood_refund_point_payment), então uma
--- cópia velha não consegue forjar essa condição.
+--
+-- Exceção (Codex no PR #54, r31; GPT r31 P0-01): o estorno verificado de um pagamento da Point devolve
+-- os itens que ELE pagou a não pagos (mirrorServerPointRefund sobe o PATCH de order_items). Para o
+-- banco saber quais itens são desse pagamento, o aparelho manda a lista junto com o pagamento
+-- (item_ids) e tchefood_register_payment a grava em payment_items. A desmarcação vale só se o item
+-- está ligado a um pagamento ESTORNADO e a nenhum pagamento ainda APROVADO:
+--   * dois itens pagos por pagamentos diferentes, só o primeiro estornado: o segundo continua pago;
+--   * item coberto por dois pagamentos, um estornado e outro aprovado: continua pago;
+--   * pagamento antigo sem lista (ou sem item ligado): nenhuma desmarcação (fica pago);
+--   * o item pago de novo depois do estorno (outro pagamento aprovado): continua pago.
+-- A lista é gravada na criação do pagamento (INSERT-only, nunca trocada) e só liga itens da mesma
+-- conta e não cancelados; o aparelho que mente sobre ela só consegue desmarcar item que ele mesmo
+-- declarou ter pago, nunca um item ligado a pagamento aprovado.
+CREATE TABLE IF NOT EXISTS payment_items (
+    payment_id UUID NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+    item_id    UUID NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+    PRIMARY KEY (payment_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_payment_items_item ON payment_items(item_id);
+ALTER TABLE payment_items ENABLE ROW LEVEL SECURITY;
+DO $$
+DECLARE
+    v_role TEXT;
+BEGIN
+    FOREACH v_role IN ARRAY ARRAY['anon', 'authenticated'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
+            EXECUTE format('REVOKE ALL ON payment_items FROM %I', v_role);
+        END IF;
+    END LOOP;
+END $$;
+
+-- tchefood_register_payment (a versão em vigor, de db/schema_point_reserva.sql) passa a ser o miolo
+-- tchefood_register_payment_core; a função com o nome de sempre chama o miolo e depois grava a lista
+-- de itens. Só renomeia se o miolo ainda não existe (reaplicar este arquivo não renomeia de novo).
+DO $$
+BEGIN
+    IF to_regprocedure('tchefood_register_payment_core(jsonb)') IS NULL THEN
+        ALTER FUNCTION tchefood_register_payment(JSONB) RENAME TO tchefood_register_payment_core;
+    END IF;
+END $$;
+CREATE OR REPLACE FUNCTION tchefood_register_payment(p_payment JSONB)
+RETURNS UUID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+    v_id UUID;
+    v_tenant UUID := tchefood_tenant();
+BEGIN
+    v_id := tchefood_register_payment_core(p_payment);
+    IF jsonb_typeof(p_payment -> 'item_ids') = 'array' THEN
+        INSERT INTO payment_items (payment_id, item_id)
+        SELECT p.id, i.id
+          FROM payments p
+          JOIN order_items i ON i.order_id = p.order_id AND i.status <> 'CANCELED'
+         WHERE p.id = v_id AND p.tenant_id = v_tenant
+           AND i.id IN (SELECT e::uuid FROM jsonb_array_elements_text(p_payment -> 'item_ids') AS e
+                         WHERE e ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+        ON CONFLICT DO NOTHING;
+    END IF;
+    RETURN v_id;
+END;
+$$;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE ALL ON FUNCTION tchefood_register_payment_core(JSONB) FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_register_payment(JSONB) FROM PUBLIC, anon;
+        GRANT EXECUTE ON FUNCTION tchefood_register_payment(JSONB) TO authenticated;
+    END IF;
+END $$;
+
 CREATE OR REPLACE FUNCTION tchefood_item_paid_stays()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 BEGIN
     IF OLD.is_paid AND NOT NEW.is_paid
-       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = OLD.order_id AND p.status = 'REFUNDED') THEN
+       AND NOT (
+           EXISTS (SELECT 1 FROM payment_items pi JOIN payments p ON p.id = pi.payment_id
+                    WHERE pi.item_id = OLD.id AND p.status = 'REFUNDED')
+           AND NOT EXISTS (SELECT 1 FROM payment_items pi JOIN payments p ON p.id = pi.payment_id
+                            WHERE pi.item_id = OLD.id AND p.status = 'APPROVED')
+       ) THEN
         RAISE NOTICE 'TCHEFOOD_ITEM_PAGO: o item % já está pago e continua pago (atualização velha).', OLD.id;
         NEW.is_paid := TRUE;
     END IF;
