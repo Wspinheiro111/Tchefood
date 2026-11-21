@@ -187,7 +187,7 @@ function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict
 function providerFields(doc: NfceDocumentRow, next: NfceDocumentStatus, response: FocusNfceResponse): ProviderFields {
   const accessKey = response.accessKey?.replace(/^NFe/i, '') ?? doc.access_key;
   // QR Code só se for a URL assinada da SEFAZ para ESTA chave; url_danfe nunca é QR Code.
-  const qr = response.qrCodeUrl && isValidQrCodeUrl(response.qrCodeUrl, accessKey) ? response.qrCodeUrl : doc.qrcode_url;
+  const qr = response.qrCodeUrl && isValidQrCodeUrl(response.qrCodeUrl, accessKey, doc.environment) ? response.qrCodeUrl : doc.qrcode_url;
   return {
     status: next,
     access_key: accessKey,

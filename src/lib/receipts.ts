@@ -50,6 +50,16 @@ function wrap(text: string, indent = ''): string[] {
   return out;
 }
 
+/**
+ * Onde consultar a nota: só imprime endereço de SEFAZ comprovado para a UF da chave (RS, cUF 43).
+ * Para outra UF não inventa URL: manda consultar no portal da SEFAZ do estado emitente (o QR Code
+ * da própria nota já leva ao endereço certo).
+ */
+function consultaLines(accessKey: string): string[] {
+  if (accessKey.startsWith('43')) return [center('Consulte pela Chave de Acesso em'), center(CONSULTA_URL_RS)];
+  return [center('Consulte pela Chave de Acesso'), center('no portal da SEFAZ do estado'), center('emitente ou pelo QR Code')];
+}
+
 function fmtDate(iso: string): string {
   const d = new Date(iso);
   return d.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'America/Sao_Paulo' });
@@ -212,8 +222,7 @@ export function danfeLines(params: {
     ...(homologacao ? [center('EMITIDA EM AMBIENTE DE HOMOLOGACAO'), center('SEM VALOR FISCAL')] : []),
     ...(params.contingency ? [center('EMITIDA EM CONTINGENCIA'), center('Pendente de autorizacao')] : []),
     LINE,
-    center('Consulte pela Chave de Acesso em'),
-    center(CONSULTA_URL_RS),
+    ...consultaLines(doc.access_key),
     ...wrap(formatAccessKey(doc.access_key)).map(center),
     LINE,
     center(pl.cpf_destinatario ? `CONSUMIDOR CPF ${pl.cpf_destinatario.replace(/^(\d{3})(\d{3})(\d{3})(\d{2})$/, '$1.$2.$3-$4')}` : 'CONSUMIDOR NAO IDENTIFICADO'),

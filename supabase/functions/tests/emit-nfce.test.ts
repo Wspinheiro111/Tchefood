@@ -20,7 +20,7 @@ import { parseDanfePayload, parseNfceIssuer } from '../../../src/lib/sync/nfceEm
 
 const TENANT = '11111111-1111-4111-8111-111111111111';
 const ORDER = '22222222-2222-4222-8222-222222222222';
-const KEY = '43261112345678000195650010000000421000000427';
+const KEY = '43261112345678000195650010000000421000000420';
 const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF`;
 
 function source(overrides: Partial<NfceSource> = {}): NfceSource {

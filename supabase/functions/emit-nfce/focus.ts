@@ -238,7 +238,7 @@ export function classifyTransmission(result: FocusResult): FocusNfceResponse {
  * Só aceita como QR Code impresso uma URL de SEFAZ (.gov.br) cujo parâmetro p começa pela
  * chave desta nota (mesma regra de src/lib/nfce.ts isValidNfceQrCodeContent).
  */
-export function isValidQrCodeUrl(content: string | null, accessKey: string | null): boolean {
+export function isValidQrCodeUrl(content: string | null, accessKey: string | null, environment?: 'homologacao' | 'producao' | null): boolean {
   if (!content || content.length > 1000 || /[\s<>"']/.test(content)) return false;
   const key = (accessKey ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '').replace(/^NFE/, '');
   if (!/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return false;
@@ -251,5 +251,10 @@ export function isValidQrCodeUrl(content: string | null, accessKey: string | nul
   if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password) return false;
   if (!/(^|\.)gov\.br$/i.test(url.hostname)) return false;
   const p = url.searchParams.get('p');
-  return Boolean(p) && p!.split('|')[0] === key;
+  if (!p) return false;
+  const parts = p.split('|');
+  if (parts[0] !== key) return false;
+  // Versões do QR Code com tpAmb (chave|versão|tpAmb|...): o ambiente do QR precisa ser o da nota.
+  if (environment && parts.length >= 3 && parts[2] !== (environment === 'producao' ? '1' : '2')) return false;
+  return true;
 }

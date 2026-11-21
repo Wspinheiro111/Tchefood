@@ -55,12 +55,22 @@ export function accessKeyCheckDigit(key43: string): string {
   let weight = 2;
   let sum = 0;
   for (let i = key43.length - 1; i >= 0; i--) {
-    sum += Number(key43[i]) * weight;
+    // CNPJ alfanumérico (NT 2025.001): valor do caractere = código ASCII - 48 (0-9 → 0-9, A-Z → 17-42).
+    sum += (key43.charCodeAt(i) - 48) * weight;
     weight = weight === 9 ? 2 : weight + 1;
   }
   const mod = sum % 11;
   const dv = mod < 2 ? 0 : 11 - mod;
   return dv.toString();
+}
+
+/**
+ * Chave de acesso de 44 posições com o DV (módulo 11) conferido. Não corrige nem reconstrói a chave:
+ * só diz se ela é aceitável. Aceita letras só nas posições do CNPJ (NT 2025.001).
+ */
+export function isValidAccessKey(key: string | null | undefined): key is string {
+  if (!key || !/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return false;
+  return accessKeyCheckDigit(key.slice(0, 43)) === key[43];
 }
 
 export function buildAccessKey(params: { cnpj: string; issuedAt: Date; number: number; cNF?: string }): string {
@@ -119,11 +129,15 @@ export const CONSULTA_URL_RS = 'www.sefaz.rs.gov.br/nfce/consulta';
  * de acesso DESTA NFC-e. Um endereço de consulta (sem p), de outra nota ou de
  * outro domínio nunca vira QR Code impresso.
  */
-export function isValidNfceQrCodeContent(content: string | null | undefined, accessKey: string | null | undefined): content is string {
+export function isValidNfceQrCodeContent(
+  content: string | null | undefined,
+  accessKey: string | null | undefined,
+  environment?: 'homologacao' | 'producao' | null,
+): content is string {
   if (!content || content.length > 1000 || /[\s<>"']/.test(content)) return false;
   // Chave pode ter letras nas posições do CNPJ alfanumérico do emitente (NT 2025.001).
   const key = (accessKey ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '').replace(/^NFE/, '');
-  if (!/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return false;
+  if (!isValidAccessKey(key)) return false;
   let url: URL;
   try {
     url = new URL(content);
@@ -133,7 +147,12 @@ export function isValidNfceQrCodeContent(content: string | null | undefined, acc
   if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
   if (url.username || url.password || !/(^|\.)gov\.br$/i.test(url.hostname)) return false;
   const p = url.searchParams.get('p');
-  return Boolean(p) && p!.split('|')[0] === key;
+  if (!p) return false;
+  const parts = p.split('|');
+  if (parts[0] !== key) return false;
+  // Nas versões do QR Code com tpAmb (chave|versão|tpAmb|...), o ambiente do QR precisa ser o da nota.
+  if (environment && parts.length >= 3 && parts[2] !== (environment === 'producao' ? '1' : '2')) return false;
+  return true;
 }
 
 /** Extrai o QR Code assinado do XML autorizado (infNFeSupl/qrCode), quando a Focus devolver o XML. */
@@ -335,6 +354,7 @@ export interface ServerNfceFields {
   issued_at: string | null;
   payload: NfceDanfePayload | null;
   issuer?: NfceIssuer | null;
+  environment?: 'homologacao' | 'producao' | null;
 }
 
 /**
@@ -349,7 +369,7 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
   const authorized = server.status === 'authorized';
   if (!authorized && server.status !== 'contingency') return null;
   const key = server.access_key;
-  if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key) || !server.issued_at || !server.payload) return null;
+  if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key, server.environment) || !server.issued_at || !server.payload) return null;
   if (authorized && !server.protocol) return null;
   const parsed = parseAccessKey(key);
   // Número, série e modelo devolvidos precisam ser os da chave (modelo 65 = NFC-e).
@@ -358,6 +378,8 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
   if (server.series !== null && (!/^\d{1,3}$/.test(server.series) || Number(server.series) !== parsed.serie)) return null;
   // Emitente: o CNPJ transmitido e o congelado precisam ser os da chave; senão, só o DANFE da Focus.
   if (!server.issuer || server.issuer.cnpj !== parsed.cnpj || server.payload.cnpj_emitente !== parsed.cnpj) return null;
+  // IE ausente no cadastro não prova "ISENTO": sem a IE comprovada a bobina não imprime (DANFE oficial da Focus).
+  if (!server.issuer.state_registration) return null;
   return {
     access_key: key,
     protocol: authorized ? server.protocol! : '',

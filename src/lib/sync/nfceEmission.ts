@@ -18,9 +18,11 @@
  */
 import type { NfceCallProblem, NfceCloudRecord, NfceCloudStatus, NfceDanfePayload, NfceIssuer, Order, SyncEvent } from '../../types';
 import { toCents } from '../money';
-import { isValidNfceQrCodeContent, serverNfceDocument, type ServerNfceFields } from '../nfce';
+import { isValidAccessKey, isValidNfceQrCodeContent, serverNfceDocument, type ServerNfceFields } from '../nfce';
 import { recordKeys, type FetchLike, type SyncConfig } from './supabaseSync';
 
+/** HTTP que a emit-nfce devolve para cada situação do documento. */
+const DOC_HTTP: Record<NfceCloudStatus, number> = { authorized: 200, cancelled: 200, contingency: 200, processing: 202, rejected: 422 };
 const DOC_STATUSES: ReadonlyArray<NfceCloudStatus> = ['processing', 'authorized', 'rejected', 'contingency', 'cancelled'];
 const PROBLEMS: ReadonlyArray<Exclude<NfceCallProblem, 'error' | 'network'>> = ['invalid', 'not_found', 'conflict', 'none'];
 
@@ -76,8 +78,6 @@ export interface NfceProblemOutcome {
 }
 
 export type NfceEmitOutcome = NfceDocumentOutcome | NfceProblemOutcome;
-
-const KEY_RE = /^\d{6}[0-9A-Z]{12}\d{26}$/;
 
 function text(value: unknown, max: number): string | null {
   return typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : null;
@@ -174,11 +174,16 @@ export function parseEmitResponse(httpStatus: number, body: string): NfceEmitOut
   const r = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const message = text(r.message, 1000);
   const status = r.status;
+  // Documento só vale com o HTTP que a emit-nfce usa para aquele status; erro 4xx/5xx com corpo de
+  // "autorizada" não muda a situação fiscal.
   if (typeof status === 'string' && (DOC_STATUSES as string[]).includes(status)) {
+    if (httpStatus !== DOC_HTTP[status as NfceCloudStatus]) {
+      return { kind: 'error', httpStatus, message: `Resposta inconsistente do servidor (HTTP ${httpStatus}). A NFC-e não foi confirmada.` };
+    }
     const environment = r.environment === 'producao' || r.environment === 'homologacao' ? r.environment : null;
     if (!environment) return { kind: 'error', httpStatus, message: 'Resposta do servidor sem ambiente fiscal válido.' };
     const keyRaw = text(r.access_key, 60)?.toUpperCase().replace(/^NFE/, '') ?? null;
-    const accessKey = keyRaw && KEY_RE.test(keyRaw) ? keyRaw : null;
+    const accessKey = keyRaw && isValidAccessKey(keyRaw) ? keyRaw : null;
     const protocolRaw = text(r.protocol, 80);
     const protocol = protocolRaw && /^\d{1,80}$/.test(protocolRaw) ? protocolRaw : null;
     const qrRaw = text(r.qrcode_url, 1000);
@@ -200,7 +205,7 @@ export function parseEmitResponse(httpStatus: number, body: string): NfceEmitOut
       protocol: docStatus === 'authorized' || docStatus === 'cancelled' ? protocol : null,
       number,
       series: seriesRaw && /^\d{1,3}$/.test(seriesRaw) ? seriesRaw : null,
-      qrcode_url: qrRaw && accessKey && isValidNfceQrCodeContent(qrRaw, accessKey) ? qrRaw : null,
+      qrcode_url: qrRaw && accessKey && isValidNfceQrCodeContent(qrRaw, accessKey, environment) ? qrRaw : null,
       // Caminho relativo da Focus (ex.: /notas_fiscais_consumidor/NFe...html); nada de outro host.
       danfe_path: danfeRaw && /^\/[A-Za-z0-9_./-]+$/.test(danfeRaw) && !danfeRaw.includes('..') && !danfeRaw.startsWith('//') ? danfeRaw : null,
       issued_at: issuedRaw && !Number.isNaN(Date.parse(issuedRaw)) ? issuedRaw : null,

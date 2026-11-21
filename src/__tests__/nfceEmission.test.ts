@@ -2,13 +2,13 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { useTcheStore, type CloudSession } from '../store/useTcheStore';
 import { dueNfceCalls, dueNfceOrders, nextNfceRecord, nfceCallNow, parseDanfePayload, parseEmitResponse, requestNfceEmission, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
 import { syncOnce } from '../lib/sync/useCloudSync';
-import { serverNfceDocument } from '../lib/nfce';
+import { accessKeyCheckDigit, isValidAccessKey, serverNfceDocument } from '../lib/nfce';
 import { danfeLines } from '../lib/receipts';
 import type { FetchLike } from '../lib/sync/supabaseSync';
 import { beginLocalClaim, resetClaimLedger } from '../lib/payments/claimLedger';
 
 const st = () => useTcheStore.getState();
-const KEY = '43261112345678000195650010000000421000000427';
+const KEY = '43261112345678000195650010000000421000000420';
 const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF`;
 const ISSUED = '2026-11-14T10:00:00-03:00';
 
@@ -36,7 +36,7 @@ const authorizedBody = (over: Record<string, unknown> = {}) => ({
   number: 42,
   series: '1',
   qrcode_url: QR,
-  danfe_path: '/notas_fiscais_consumidor/NFe43261112345678000195650010000000421000000427.html',
+  danfe_path: '/notas_fiscais_consumidor/NFe43261112345678000195650010000000421000000420.html',
   issued_at: ISSUED,
   payload: PAYLOAD,
   issuer: ISSUER,
@@ -82,7 +82,9 @@ function closeOrder(): string {
 }
 
 const order = (id: string) => st().orders.find((o) => o.id === id)!;
-const doc = (body: unknown): NfceEmitOutcome => parseEmitResponse(200, JSON.stringify(body));
+// HTTP que a emit-nfce devolve para cada situação (processamento 202, rejeitada 422, demais 200).
+const HTTP_OF: Record<string, number> = { processing: 202, rejected: 422 };
+const doc = (body: unknown): NfceEmitOutcome => parseEmitResponse(HTTP_OF[(body as { status?: string }).status ?? ''] ?? 200, JSON.stringify(body));
 
 beforeEach(() => {
   resetClaimLedger();
@@ -503,7 +505,7 @@ describe('achados da auditoria (rodada 8b171a7)', () => {
 
 describe('achados da auditoria (rodada 68cf69a)', () => {
   const ready = () => useTcheStore.setState({ outbox: [], syncRejected: [], pullStatus: { last_pull_at: new Date().toISOString(), last_error: null, cloud_staff_unknown: 0 } });
-  const KEY2 = `${KEY.slice(0, 25)}000000043${KEY.slice(34)}`;
+  const KEY2 = '43261112345678000195650010000000431000000435';
   const QR2 = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY2}|2|2|1|ABCDEF`;
 
   it('P0-01: comanda que volta a ter evento na fila durante a chamada anterior não é pedida', async () => {
@@ -606,3 +608,82 @@ describe('achados da auditoria (rodada 68cf69a)', () => {
     expect(one({ quantidade_comercial: 0.347, valor_unitario_comercial: 59.9, valor_bruto: 20.78 })).toBeNull();
   });
 });
+
+describe('achados da auditoria (rodada 8c07a77, PR de correção do #55)', () => {
+  const server = (over: Record<string, unknown> = {}) => ({
+    status: 'authorized' as const, access_key: KEY, protocol: '143260000000042', number: 42, series: '1', qrcode_url: QR,
+    issued_at: ISSUED, payload: PAYLOAD, issuer: ISSUER, environment: 'homologacao' as const, ...over,
+  });
+  const printed = (d: NonNullable<ReturnType<typeof serverNfceDocument>>) => danfeLines({ tenant: st().tenant, doc: d, environment: 'homologacao', showTributos: false }).top.join('\n');
+
+  it('P1-01: IE ausente em tenants não vira "ISENTO" na bobina; IE presente e isento declarado imprimem como são', () => {
+    // IE nula (Focus pode ter a IE; o cadastro não): não imprime, fica o DANFE oficial da Focus.
+    expect(serverNfceDocument(server({ issuer: { ...ISSUER, state_registration: null } }))).toBeNull();
+    expect(missingPrintOf(server({ issuer: { ...ISSUER, state_registration: null } }))).toBe(true);
+    const withIe = serverNfceDocument(server())!;
+    expect(printed(withIe)).toContain('IE 0960000000');
+    expect(printed(withIe)).not.toContain('ISENTO');
+    // Emitente efetivamente isento: declarado como ISENTO no cadastro, imprime assim.
+    const isento = serverNfceDocument(server({ issuer: { ...ISSUER, state_registration: 'ISENTO' } }))!;
+    expect(printed(isento)).toContain('IE ISENTO');
+  });
+
+  it('P2-01: chave com dígito verificador errado é recusada; a válida passa', () => {
+    const bad = '43261112345678000195650010000000421000000427';
+    expect(isValidAccessKey(bad)).toBe(false);
+    expect(isValidAccessKey(KEY)).toBe(true);
+    const r = doc(authorizedBody({ access_key: bad, qrcode_url: `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${bad}|2|2|1|ABCDEF` })) as { status: string; access_key: string | null; qrcode_url: string | null };
+    expect(r.access_key).toBeNull();
+    expect(r.qrcode_url).toBeNull();
+    expect(r.status).toBe('processing'); // "autorizada" sem chave válida não vale
+    expect((doc(authorizedBody()) as { access_key: string | null }).access_key).toBe(KEY);
+    // DV de chave com CNPJ alfanumérico (NT 2025.001): letra vale código ASCII - 48.
+    const alpha43 = '4326111234567800019565001000000042100000042'.replace('12345678000195', '12ABC45678AB95');
+    const dv = accessKeyCheckDigit(alpha43);
+    expect(isValidAccessKey(alpha43 + dv)).toBe(true);
+    expect(isValidAccessKey(alpha43 + ((Number(dv) + 1) % 10))).toBe(false);
+  });
+
+  it('P2-02: QR Code com tpAmb de outro ambiente é descartado', () => {
+    const qrProd = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|1|1|ABCDEF`;
+    expect(doc(authorizedBody({ qrcode_url: qrProd }))).toMatchObject({ environment: 'homologacao', qrcode_url: null });
+    expect(doc(authorizedBody({ environment: 'producao', qrcode_url: qrProd }))).toMatchObject({ environment: 'producao', qrcode_url: qrProd });
+    expect(doc(authorizedBody({ environment: 'producao' }))).toMatchObject({ qrcode_url: null }); // QR de homologação em produção
+    expect(doc(authorizedBody())).toMatchObject({ qrcode_url: QR });
+    // QR 3.0 (chave|3|tpAmb): mesma regra.
+    const q3 = (amb: string) => `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|3|${amb}`;
+    expect(doc(authorizedBody({ qrcode_url: q3('1') }))).toMatchObject({ qrcode_url: null });
+    expect(doc(authorizedBody({ qrcode_url: q3('2') }))).toMatchObject({ qrcode_url: q3('2') });
+    // Na hora de imprimir também: QR de produção numa nota de homologação não imprime.
+    expect(serverNfceDocument(server({ qrcode_url: qrProd }))).toBeNull();
+  });
+
+  it('P2-03: HTTP de erro com corpo "autorizada" não vira documento nem muda a situação fiscal', () => {
+    for (const code of [500, 502, 503, 401, 404]) {
+      const out = parseEmitResponse(code, JSON.stringify(authorizedBody()));
+      expect(out.kind).toBe('error');
+    }
+    const prev = nextNfceRecord('o', undefined, doc(authorizedBody({ status: 'processing', authorized: false })), 0);
+    const after = nextNfceRecord('o', prev, parseEmitResponse(503, JSON.stringify(authorizedBody())), 0);
+    expect(after.status).toBe('processing');
+    expect(after.protocol).toBeNull();
+    // Os HTTP do contrato continuam valendo.
+    expect(parseEmitResponse(200, JSON.stringify(authorizedBody())).kind).toBe('document');
+    expect(parseEmitResponse(202, JSON.stringify(authorizedBody({ status: 'processing', authorized: false }))).kind).toBe('document');
+    expect(parseEmitResponse(422, JSON.stringify(authorizedBody({ status: 'rejected', authorized: false }))).kind).toBe('document');
+    expect(parseEmitResponse(200, JSON.stringify(authorizedBody({ status: 'rejected', authorized: false }))).kind).toBe('error');
+  });
+
+  it('P2-05: orientação de consulta no DANFE é a da UF da chave; fora do RS não imprime URL do RS', () => {
+    const rs = serverNfceDocument(server())!;
+    expect(printed(rs)).toMatch(/sefaz\.rs\.gov\.br\/nfce\/consul/);
+    const sp = { ...rs, access_key: `35${KEY.slice(2)}` };
+    const text = printed(sp);
+    expect(text).not.toContain('rs.gov.br');
+    expect(text).toContain('SEFAZ do estado');
+  });
+});
+
+function missingPrintOf(rec: Parameters<typeof serverNfceDocument>[0]): boolean {
+  return serverNfceDocument(rec) === null;
+}
