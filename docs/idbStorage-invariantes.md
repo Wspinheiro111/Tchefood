@@ -73,3 +73,18 @@ C. **`select` (getItem) só conclui numa seleção estável**: depois de qualque
   de 200 ms ao abrir).
 - A tela bloqueada cobre todas as telas (App); o fluxo do totem e do login também ficam atrás dela.
 - Os testes usam IndexedDB e localStorage simulados no mesmo processo.
+
+## Rodada 31: cobertura dos gates e navegador real
+
+- `src/__tests__/storageGates.test.ts`: `ensureOrderSynced` (único caminho que chega a `startRound` sem passar por `syncOnce`),
+  `superviseSettledClaims` e `retryPendingClaimReleases`, cada um com readonly e blocked, mais o controle com o armazenamento ok.
+  Conferido removendo cada gate: o teste correspondente falha (useCloudSync.ts:479, claimSupervisor.ts:135, paymentClaim.ts:377 e
+  a verificação entre as etapas da rodada, useCloudSync.ts:511).
+- Rodada já em andamento quando o status muda (envio no ar): a rodada para antes dos estornos e da NFC-e; o que já foi enviado é
+  idempotente pelo id do evento (teste "rodada já em andamento").
+- `scripts/e2e-storage-guard.mjs` (Chromium real) agora prova a assunção da escrita: entra com o PIN, espera o texto no
+  IndexedDB, recarrega e confere que o texto lido é idêntico; e reproduz `blocked` em navegador real fazendo cada leitura do
+  estado principal trazer uma cópia nova (seleção nunca estável): mensagem, `#root` inerte, diálogo fora do `#root`, Recarregar por teclado.
+- Não coberto: morte abrupta/suspensão da WebView do APK (só no aparelho), IndexedDB ilegível por falha real do disco. Observação:
+  com o IndexedDB ilegível de forma permanente, a seleção seguinte devolve o mesmo valor pelas cópias e encerra o provisório
+  (as gravações seguem só nas cópias); é o comportamento desenhado, não foi alterado.

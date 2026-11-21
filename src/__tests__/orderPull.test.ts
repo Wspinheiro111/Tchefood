@@ -47,6 +47,19 @@ const ev = (table: SyncEvent['table'], rowId: string, payload: Record<string, un
 const none = pendingOrderKeys([]);
 
 describe('mergeCloudOrders', () => {
+  it('pagamento que já subiu mantém aqui o que só existe neste aparelho (paid_item_ids): o estorno por item precisa dele (Codex no PR #54, r31)', () => {
+    const local = {
+      orders: [order(O1)], orderItems: [item('i1', O1, { is_paid: true })],
+      payments: [{ ...payment('pg1', O1, 55), paid_item_ids: ['i1'] }], ownDeliveries: [], tables: [],
+    };
+    const r = mergeCloudOrders(local, cloud({ orders: [order(O1)], orderItems: [item('i1', O1, { is_paid: true })], payments: [payment('pg1', O1, 55)] }), none);
+    expect(r.payments).toHaveLength(1);
+    expect(r.payments[0]?.paid_item_ids).toEqual(['i1']);
+    // Os campos da nuvem continuam valendo (valor, situação).
+    const r2 = mergeCloudOrders(local, cloud({ orders: [order(O1)], orderItems: [], payments: [{ ...payment('pg1', O1, 60), status: 'REFUNDED' }] }), none);
+    expect(r2.payments[0]).toMatchObject({ amount: 60, status: 'REFUNDED', paid_item_ids: ['i1'] });
+  });
+
   it('conta sem nada pendente fica igual à da nuvem: totais, itens e pagamentos do banco', () => {
     const local = { orders: [order(O1)], orderItems: [item('i1', O1)], payments: [], ownDeliveries: [], tables: [table(T1, { status: 'OCCUPIED', current_order_id: O1 })] };
     const c = cloud({

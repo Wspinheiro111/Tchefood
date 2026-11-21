@@ -337,13 +337,18 @@ CREATE TRIGGER trg_order_items_000_keg_order_lock BEFORE UPDATE OF status ON ord
 -- -----------------------------------------------------------------------------
 -- A atualização de cozinha de um aparelho manda o item inteiro, com o is_paid da cópia
 -- dele. Se outro aparelho recebeu esse item antes de a cópia chegar, o is_paid = false
--- velho desmarcaria o pagamento por item (Codex no PR #54). Nenhum caminho do app nem do
--- banco desmarca um item pago (estorno é pelo pagamento), então o item fica pago e o resto
--- da linha (situação na cozinha) passa: a atualização não é recusada.
+-- velho desmarcaria o pagamento por item (Codex no PR #54). O item fica pago e o resto da
+-- linha (situação na cozinha) passa: a atualização não é recusada.
+-- Exceção (Codex no PR #54, r31): o estorno verificado de um pagamento da Point devolve os
+-- itens que ele pagou a não pagos (mirrorServerPointRefund sobe o PATCH de order_items, o
+-- banco não liga item a pagamento). Com um pagamento ESTORNADO na conta, a desmarcação vale.
+-- O estorno só chega a REFUNDED pelo servidor (tchefood_refund_point_payment), então uma
+-- cópia velha não consegue forjar essa condição.
 CREATE OR REPLACE FUNCTION tchefood_item_paid_stays()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    IF OLD.is_paid AND NOT NEW.is_paid THEN
+    IF OLD.is_paid AND NOT NEW.is_paid
+       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = OLD.order_id AND p.status = 'REFUNDED') THEN
         RAISE NOTICE 'TCHEFOOD_ITEM_PAGO: o item % já está pago e continua pago (atualização velha).', OLD.id;
         NEW.is_paid := TRUE;
     END IF;
@@ -626,6 +631,23 @@ BEGIN
         RAISE NOTICE 'TCHEFOOD_ENTREGA_COPIA_VELHA: a entrega % já foi acertada e fica como está.', OLD.id;
         NEW.settlement_id := OLD.settlement_id;
         NEW.status := OLD.status;
+        NEW.courier_id := OLD.courier_id;
+        NEW.courier_fee := OLD.courier_fee;
+        NEW.out_at := OLD.out_at;
+        NEW.delivered_at := OLD.delivered_at;
+        RETURN NEW;
+    END IF;
+    -- Cópia velha de outro aparelho de uma entrega CANCELADA (pronto/saiu/entregue mandado por quem não viu
+    -- o cancelamento): o cancelamento fica e a atualização é aceita sem mudar nada. Recusada, ela prenderia
+    -- a cópia velha daquele aparelho para sempre (a recusa não tem como ser descartada na tela) (Codex no PR #54,
+    -- r31). Só vale quando a linha, fora do andamento, é a mesma: cliente, endereço, taxa e pagamento
+    -- mudados continuam recusados por schema_entrega.sql.
+    IF OLD.status = 'CANCELED' AND NEW.status <> 'CANCELED'
+       AND (to_jsonb(NEW) - ARRAY['status', 'courier_id', 'courier_fee', 'out_at', 'delivered_at', 'settlement_id'])
+           = (to_jsonb(OLD) - ARRAY['status', 'courier_id', 'courier_fee', 'out_at', 'delivered_at', 'settlement_id']) THEN
+        RAISE NOTICE 'TCHEFOOD_ENTREGA_COPIA_VELHA: a entrega % foi cancelada e fica cancelada (atualização velha com %).', OLD.id, NEW.status;
+        NEW.status := OLD.status;
+        NEW.settlement_id := OLD.settlement_id;
         NEW.courier_id := OLD.courier_id;
         NEW.courier_fee := OLD.courier_fee;
         NEW.out_at := OLD.out_at;

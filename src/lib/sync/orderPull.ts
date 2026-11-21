@@ -515,6 +515,13 @@ function withFiscal(cloud: Order, local: Order | undefined): Order {
   return serverHas ? cloud : { ...cloud, nfce_status: local.nfce_status, nfce_key: local.nfce_key };
 }
 
+/**
+ * Campos que só existem neste aparelho (o servidor não os guarda, supabaseSync.LOCAL_ONLY): a linha da nuvem
+ * os traz vazios, e a troca não pode apagá-los. paid_item_ids é o que o estorno da Point usa para devolver
+ * os itens a não pagos (Codex no PR #54, r31).
+ */
+const LOCAL_ONLY_FIELDS = { order_items: [] as string[], payments: ['paid_item_ids', 'withdrawn_reason'] };
+
 /** Linhas filhas (itens, pagamentos): as das contas trocadas vêm da nuvem, menos as pendentes daqui. */
 function mergeChildren<T extends { id: UUID; order_id: UUID }>(
   local: readonly T[],
@@ -534,8 +541,14 @@ function mergeChildren<T extends { id: UUID; order_id: UUID }>(
       continue;
     }
     const c = fromCloud.get(l.id);
-    if (c) out.push(c);
-    else if (!replaced.has(l.order_id)) out.push(l);
+    if (c) {
+      const kept: Record<string, unknown> = {};
+      for (const k of LOCAL_ONLY_FIELDS[table]) {
+        const v = (l as Record<string, unknown>)[k];
+        if (v !== undefined && (c as Record<string, unknown>)[k] === undefined) kept[k] = v;
+      }
+      out.push(Object.keys(kept).length > 0 ? { ...c, ...kept } : c);
+    } else if (!replaced.has(l.order_id)) out.push(l);
     // Linha de conta trocada que a nuvem não tem e não está pendente: o banco não a tem, sai.
   }
   for (const c of fromCloud.values()) if (!seen.has(c.id)) out.push(c);

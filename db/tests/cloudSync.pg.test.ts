@@ -4168,6 +4168,33 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().orderItems.find((i) => i.id === item.id)!.is_paid).toBe(true);
     });
 
+    it('estorno do pagamento libera os itens: o item volta a não pago, mas a cópia velha sem estorno ainda não o desmarca (Codex no PR #54, r31)', async () => {
+      login(CASHIER_PIN);
+      const mesa = tableNo(53);
+      await expectSynced('mesa 53');
+      const order = ok(st().openTable(mesa.id, 1, null));
+      const p = st().products.find((x) => x.id === productId)!;
+      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
+      ok(st().dispatchTray(order.id));
+      await expectSynced('conta 53');
+      const item = st().orderItems.find((i) => i.order_id === order.id)!;
+      const paid = await payCash(order.id);
+      await expectSynced('pagamento 53');
+      expect(sql(`SELECT is_paid FROM order_items WHERE id = '${item.id}'`)).toBe('t');
+      // Sem estorno no banco: o false de uma cópia velha não desmarca (regra existente).
+      expect((await rawB('PATCH', `order_items?id=eq.${item.id}`, { is_paid: false })).status).toBeLessThan(300);
+      expect(sql(`SELECT is_paid FROM order_items WHERE id = '${item.id}'`)).toBe('t');
+      // Com o pagamento estornado no banco (estorno verificado da Point), o item que o aparelho desmarca
+      // (mirrorServerPointRefund sobe o PATCH de order_items) volta a não pago, e a conta pode cobrar de novo.
+      // (o estorno verificado exige a Edge Function; aqui só o resultado dele no banco é preciso)
+      sql(`ALTER TABLE payments DISABLE TRIGGER USER; UPDATE payments SET status = 'REFUNDED' WHERE id = '${paid.payment.id}'; ALTER TABLE payments ENABLE TRIGGER USER;`);
+      // O servidor também reabre a conta (tchefood_refund_point_payment): sem isso o fechamento remarcaria os itens.
+      sql(`ALTER TABLE orders DISABLE TRIGGER USER; UPDATE orders SET status = 'PAYING', closed_at = NULL, paid_amount = 0, remaining_balance = total_amount WHERE id = '${order.id}'; ALTER TABLE orders ENABLE TRIGGER USER;`);
+      const res = await rawB('PATCH', `order_items?id=eq.${item.id}`, { is_paid: false });
+      expect(res.status, res.body).toBeLessThan(300);
+      expect(sql(`SELECT is_paid FROM order_items WHERE id = '${item.id}'`)).toBe('f');
+    });
+
     it('pagamento em A com a cópia velha do item não devolve à cozinha o item que B já entregou (Codex no PR #54)', async () => {
       login(CASHIER_PIN);
       const mesa = tableNo(52);
@@ -5391,6 +5418,31 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       // Entrega só entra em acerto pela função.
       const sid = crypto.randomUUID();
       expect((await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { settlement_id: sid })).body).toMatch(/TCHEFOOD_ENTREGA_ACERTO_ONLINE/);
+    });
+
+    it('cópia velha de pronto/saiu de uma entrega que outro aparelho cancelou: aceita sem mudar nada, não trava a fila (Codex no PR #54, r31)', async () => {
+      login(OWNER_PIN);
+      const zone = st().deliveryZones.find((z) => z.active)!;
+      const courier = st().couriers.find((c) => c.phone === '53999990290')!;
+      login(CASHIER_PIN);
+      const line: PickupLine = { product_id: productId, quantity: 1, modifiers: [], meat_doneness: null, half_product_ids: [], quick_tags: [], free_notes: '' };
+      const order = ok(st().createPickupOrder({
+        lines: [line], fulfillment: 'DELIVERY', customerName: 'Vera',
+        delivery: { customerName: 'Vera', phone: '53 98888-0293', address: 'Rua 293, 1', reference: '', zoneId: zone.id, changeFor: null, payOnDelivery: false },
+      }));
+      await payCash(order.id);
+      const d = st().ownDeliveries.find((x) => x.order_id === order.id)!;
+      await expectSynced('entrega 293 criada');
+      // B cancela a entrega; A ainda tem a cópia PREPARING e manda "pronto" e depois "saiu".
+      expect((await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { status: 'CANCELED' })).status).toBeLessThan(300);
+      expect(sql(`SELECT status FROM own_deliveries WHERE id = '${d.id}'`)).toBe('CANCELED');
+      const ready = await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { ...d, status: 'READY' });
+      expect(ready.status, ready.body).toBeLessThan(300);
+      const out = await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { ...d, status: 'OUT', courier_id: courier.id, courier_fee: 7, out_at: new Date().toISOString() });
+      expect(out.status, out.body).toBeLessThan(300);
+      expect(sql(`SELECT status || ' ' || coalesce(courier_id::text, '-') FROM own_deliveries WHERE id = '${d.id}'`)).toBe('CANCELED -');
+      // Mudança de verdade numa entrega cancelada continua recusada.
+      expect((await rawB('PATCH', `own_deliveries?id=eq.${d.id}`, { address: 'Rua 293, 99' })).status).toBeGreaterThanOrEqual(400);
     });
 
     describe('acerto pela nuvem: a repetição do mesmo id vem antes do PIN', () => {

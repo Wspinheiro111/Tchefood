@@ -1,22 +1,9 @@
 name: APK Android
 
+# O Actions da conta está travado por cobrança: com PR/push ele falhava em todo PR (check "apk" vermelho
+# sem relação com o código). Agora só roda quando alguém o dispara (Actions > APK Android > Run workflow),
+# depois que a cobrança for resolvida. O APK sai por `bash scripts/build-apk.sh` (Google Cloud Shell, grátis).
 on:
-  pull_request:
-    paths:
-      - "android/**"
-      - "src/**"
-      - "public/**"
-      - "index.html"
-      - "package*.json"
-      - "vite.config.ts"
-      - ".github/workflows/android-apk.yml"
-  push:
-    branches: [main]
-    paths:
-      - "android/**"
-      - "src/**"
-      - "public/**"
-      - ".github/workflows/android-apk.yml"
   workflow_dispatch:
 
 jobs:
