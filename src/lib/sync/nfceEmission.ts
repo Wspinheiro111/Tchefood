@@ -415,8 +415,12 @@ export function nfceCall(
     // aqui: primeiro só se consulta. Reenviar uma rejeitada pede ação explícita do operador (botão).
     const known = !!rec && rec.status !== null;
     if (order.nfce_status === 'REJEITADA' || (order.nfce_status !== 'PENDING' && !known)) {
-      if (forced) return 'emit';
-      return !known && (!rec || due) ? 'consult' : null;
+      // Só o registro local rejeitado libera o botão de reenvio: antes disso o operador ainda não viu o motivo.
+      if (forced) return rec?.status === 'rejected' || (!rec && order.nfce_status !== 'REJEITADA') ? 'emit' : 'consult';
+      if (!known) return !rec || due ? 'consult' : null;
+      // Registro local em processamento/contingência que não soube da rejeição de outro aparelho: só leitura.
+      if (order.nfce_status === 'REJEITADA' && rec!.status !== 'rejected') return due || (!rec!.next_attempt_at && !rec!.problem) ? 'consult' : null;
+      return null;
     }
     if (!rec || due) return 'emit';
     return null;

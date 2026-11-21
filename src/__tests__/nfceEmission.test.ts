@@ -865,4 +865,25 @@ describe('achados da auditoria (2ª rodada em 8c07a77, PR de correção do #55)'
     const again = nextNfceRecord('o', auth, doc(authorizedBody({ issuer_address: OLD })), Date.now());
     expect(again.issuer_address?.street).toBe('Rua das Missoes');
   });
+
+  it('Codex: registro local em processamento/contingência que não soube da rejeição de outro aparelho consulta (só leitura) e o botão não reenvia antes do motivo', () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const id = closeOrder();
+    for (const status of ['processing', 'contingency'] as const) {
+      const local = nextNfceRecord(id, undefined, doc(authorizedBody({ status, authorized: false, contingency: status === 'contingency', protocol: null, authorized_at: null })), Date.now());
+      useTcheStore.setState({
+        outbox: [], nfceForced: [], nfceCloud: { [id]: { ...local, next_attempt_at: new Date(Date.now() - 1000).toISOString() } },
+        orders: st().orders.map((o) => (o.id === id ? { ...o, nfce_status: 'REJEITADA' as const, nfce_key: null } : o)),
+      });
+      expect(nfceCallNow(st(), id, Date.now())).toBe('consult'); // antes: nada, a tela ficava em processamento
+      useTcheStore.setState({ nfceForced: [id] });
+      expect(nfceCallNow(st(), id, Date.now())).toBe('consult'); // botão: consulta, não reenvia
+      // A consulta traz a rejeição: para as chamadas automáticas e só então o botão reenvia.
+      const learned = nextNfceRecord(id, st().nfceCloud[id], doc(authorizedBody({ status: 'rejected', authorized: false, protocol: null, authorized_at: null, issuer_address: null })), Date.now());
+      useTcheStore.setState({ nfceCloud: { [id]: learned }, nfceForced: [] });
+      expect(nfceCallNow(st(), id, Date.now() + 3_600_000)).toBeNull();
+      useTcheStore.setState({ nfceForced: [id] });
+      expect(nfceCallNow(st(), id, Date.now())).toBe('emit');
+    }
+  });
 });
