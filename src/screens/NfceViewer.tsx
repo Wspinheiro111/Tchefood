@@ -33,6 +33,7 @@ export function nfceCloudLabel(order: Order, rec: NfceCloudRecord | undefined, w
  * Auditoria interna 2 (P2-C): a nota foi emitida com um pagamento que depois foi estornado; a reimpressão monta a nota
  * pelos pagamentos de agora (sem o estornado).
  */
+export const NFCE_REFUNDED_WARNING_REAL = 'Nota emitida com o pagamento estornado: o estorno financeiro não cancela a NFC-e. A reimpressão reproduz a nota como foi emitida, inclusive o pagamento estornado. Confira o cancelamento fiscal na SEFAZ.';
 export const NFCE_REFUNDED_WARNING = 'Nota emitida com o pagamento estornado: confira o cancelamento na SEFAZ. A reimpressão abaixo não mostra o pagamento estornado.';
 
 /** Visualizador do payload Focus NFe + DANFE NFC-e em bobina de 58mm. */
@@ -129,7 +130,7 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
   // Nota real: os tributos aproximados do aparelho não foram enviados à SEFAZ, então não saem no DANFE.
   const danfe = danfeLines({ tenant: s.tenant, doc, environment, contingency, showTributos: !cloud });
   const json = JSON.stringify(demoDoc?.payload ?? null, null, 2);
-  const qrValid = isValidNfceQrCodeContent(doc.qr_url, doc.access_key);
+  const qrValid = isValidNfceQrCodeContent(doc.qr_url, doc.access_key, cloud ? rec?.environment : undefined);
   const printDanfe = () => {
     if (!qrValid) return toast.error('QR Code da NFC-e não confere com a chave de acesso. DANFE não impresso.');
     const first = s.payments.find((p) => p.order_id === orderId && p.status === 'APPROVED' && p.acquirer === 'PAGBANK');
@@ -174,7 +175,7 @@ export function NfceViewer({ orderId, onClose }: { orderId: string; onClose: () 
       }
     >
       {order.nfce_key && s.payments.some((p) => p.order_id === orderId && p.status === 'REFUNDED') && (
-        <p role="alert" className="mb-3 rounded-xl border-2 border-ouro bg-ouro/10 p-3 text-sm font-semibold text-brasa">{NFCE_REFUNDED_WARNING}</p>
+        <p role="alert" className="mb-3 rounded-xl border-2 border-ouro bg-ouro/10 p-3 text-sm font-semibold text-brasa">{cloud ? NFCE_REFUNDED_WARNING_REAL : NFCE_REFUNDED_WARNING}</p>
       )}
       <div className="mb-3 rounded-xl bg-base p-3 text-xs">
         <div><b>Chave de acesso:</b> <span className="font-mono">{formatAccessKey(doc.access_key)}</span></div>

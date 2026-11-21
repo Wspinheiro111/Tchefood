@@ -3,7 +3,7 @@
  * Usados tanto pelo simulador visual quanto pelos drivers reais
  * (PlugPag printText / Stone printer), por isso são texto puro.
  */
-import type { DiningTable, NfceDanfePayload, NfceIssuer, Order, OrderItem, Payment, Product, StaffUser, Tenant } from '../types';
+import type { NfceIssuerAddress, DiningTable, NfceDanfePayload, NfceIssuer, Order, OrderItem, Payment, Product, StaffUser, Tenant } from '../types';
 import { formatBRL, formatQty } from './money';
 import { CONSULTA_URL_RS, formatAccessKey } from './nfce';
 
@@ -50,6 +50,16 @@ function wrap(text: string, indent = ''): string[] {
   return out;
 }
 
+/**
+ * Onde consultar a nota: só imprime endereço de SEFAZ comprovado para a UF da chave (RS, cUF 43).
+ * Para outra UF não inventa URL: manda consultar no portal da SEFAZ do estado emitente (o QR Code
+ * da própria nota já leva ao endereço certo).
+ */
+function consultaLines(accessKey: string): string[] {
+  if (accessKey.startsWith('43')) return [center('Consulte pela Chave de Acesso em'), center(CONSULTA_URL_RS)];
+  return [center('Consulte pela Chave de Acesso'), center('no portal da SEFAZ do estado'), center('emitente ou pelo QR Code')];
+}
+
 function fmtDate(iso: string): string {
   const d = new Date(iso);
   return d.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'America/Sao_Paulo' });
@@ -59,8 +69,25 @@ function formatCnpj(c: string): string {
   return c.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5');
 }
 
-function header(tenant: Pick<Tenant, 'name' | 'legal_name' | 'cnpj' | 'city' | 'state'>): string[] {
-  return [center(tenant.name.toUpperCase()), ...wrap(tenant.legal_name).map(center), center(`CNPJ ${formatCnpj(tenant.cnpj)}`), center(`${tenant.city}/${tenant.state}`)];
+function header(tenant: Pick<Tenant, 'name' | 'legal_name' | 'cnpj' | 'city' | 'state'>, address?: NfceIssuerAddress | null): string[] {
+  const out = [center(tenant.name.toUpperCase()), ...wrap(tenant.legal_name).map(center), center(`CNPJ ${formatCnpj(tenant.cnpj)}`)];
+  if (address) {
+    // Nota real: endereço completo do XML autorizado.
+    out.push(
+      ...wrap(`${address.street}, ${address.number}${address.complement ? ` ${address.complement}` : ''}`).map(center),
+      ...wrap(`${address.district} - ${address.city}/${address.state}`).map(center),
+      center(`CEP ${address.zip.replace(/^(\d{5})(\d{3})$/, '$1-$2')}`),
+    );
+  } else {
+    out.push(center(`${tenant.city}/${tenant.state}`));
+  }
+  return out;
+}
+
+/** Valor em reais no padrão brasileiro: vírgula decimal e ponto de milhar (R$ 1.234,50 -> 1.234,50). */
+export function brMoney(value: number): string {
+  const [int, dec] = value.toFixed(2).split('.');
+  return `${int!.replace(/\B(?=(\d{3})+(?!\d))/g, '.')},${dec}`;
 }
 
 /** Extrato de conferência de mesa (não é documento fiscal). */
@@ -157,6 +184,10 @@ export interface DanfeDoc {
   payload: NfceDanfePayload & { numero: number; serie: number };
   /** Nota real: emitente congelado (ver NfceCloudRecord.issuer). Sem ele, usa o cadastro (demonstração). */
   issuer?: NfceIssuer;
+  /** Nota real: endereço completo do emitente (XML autorizado). */
+  issuer_address?: NfceIssuerAddress | null;
+  /** Nota real autorizada: data/hora da autorização (dhRecbto). Demonstração: igual à emissão. */
+  authorized_at?: string;
 }
 
 /** DANFE NFC-e simplificado (layout 58mm). O QR Code é desenhado à parte. */
@@ -175,8 +206,10 @@ export function danfeLines(params: {
   const pl = doc.payload;
   const em = doc.issuer ?? params.tenant;
   const top: string[] = [
-    ...header(em),
+    ...header(em, doc.issuer_address),
     center(`IE ${em.state_registration ?? 'ISENTO'}`),
+    // Contingência: a mensagem aparece logo abaixo do cabeçalho e de novo junto da identificação da nota.
+    ...(params.contingency ? [LINE, center('EMITIDA EM CONTINGENCIA'), center('Pendente de autorizacao')] : []),
     LINE,
     ...wrap('DANFE NFC-e - Documento Auxiliar da Nota Fiscal de Consumidor Eletronica').map(center),
     LINE,
@@ -185,23 +218,23 @@ export function danfeLines(params: {
   ];
   for (const it of pl.items) {
     top.push(...wrap(`${it.numero_item.toString().padStart(3, '0')} ${it.codigo_produto} ${it.descricao}`));
-    top.push(leftRight(`   ${it.quantidade_comercial} ${it.unidade_comercial} x ${it.valor_unitario_comercial.toFixed(2)}`, it.valor_bruto.toFixed(2)));
+    top.push(leftRight(`   ${String(it.quantidade_comercial).replace(".", ",")} ${it.unidade_comercial} x ${brMoney(it.valor_unitario_comercial)}`, brMoney(it.valor_bruto)));
   }
   top.push(
     LINE,
     leftRight('Qtd. total de itens', pl.items.length.toString()),
-    leftRight('Valor total R$', pl.valor_produtos.toFixed(2)),
+    leftRight('Valor total R$', brMoney(pl.valor_produtos)),
   );
-  if (pl.valor_outras_despesas > 0) top.push(leftRight('Outras despesas (servico)', pl.valor_outras_despesas.toFixed(2)));
-  if (pl.valor_desconto > 0) top.push(leftRight('Descontos R$', pl.valor_desconto.toFixed(2)));
-  top.push(leftRight('VALOR A PAGAR R$', pl.valor_total.toFixed(2)), LINE, leftRight('FORMA PAGAMENTO', 'VALOR PAGO R$'));
+  if (pl.valor_outras_despesas > 0) top.push(leftRight('Outras despesas (servico)', brMoney(pl.valor_outras_despesas)));
+  if (pl.valor_desconto > 0) top.push(leftRight('Descontos R$', brMoney(pl.valor_desconto)));
+  top.push(leftRight('VALOR A PAGAR R$', brMoney(pl.valor_total)), LINE, leftRight('FORMA PAGAMENTO', 'VALOR PAGO R$'));
   const formaNome: Record<string, string> = { '01': 'Dinheiro', '03': 'Cartao de Credito', '04': 'Cartao de Debito', '10': 'Vale Alimentacao', '17': 'PIX' };
-  for (const f of pl.formas_pagamento) top.push(leftRight(formaNome[f.forma_pagamento] ?? f.forma_pagamento, f.valor_pagamento.toFixed(2)));
+  for (const f of pl.formas_pagamento) top.push(leftRight(formaNome[f.forma_pagamento] ?? f.forma_pagamento, brMoney(f.valor_pagamento)));
   if (params.showTributos !== false) {
     top.push(
       LINE,
       ...wrap(
-        `Tributos Totais Incidentes (Lei Federal 12.741/2012): Federal R$ ${doc.tributos_federais.toFixed(2)} Estadual R$ ${doc.tributos_estaduais.toFixed(2)} Fonte: IBPT`,
+        `Tributos Totais Incidentes (Lei Federal 12.741/2012): Federal R$ ${brMoney(doc.tributos_federais)} Estadual R$ ${brMoney(doc.tributos_estaduais)} Fonte: IBPT`,
       ),
     );
   }
@@ -212,14 +245,13 @@ export function danfeLines(params: {
     ...(homologacao ? [center('EMITIDA EM AMBIENTE DE HOMOLOGACAO'), center('SEM VALOR FISCAL')] : []),
     ...(params.contingency ? [center('EMITIDA EM CONTINGENCIA'), center('Pendente de autorizacao')] : []),
     LINE,
-    center('Consulte pela Chave de Acesso em'),
-    center(CONSULTA_URL_RS),
+    ...consultaLines(doc.access_key),
     ...wrap(formatAccessKey(doc.access_key)).map(center),
     LINE,
     center(pl.cpf_destinatario ? `CONSUMIDOR CPF ${pl.cpf_destinatario.replace(/^(\d{3})(\d{3})(\d{3})(\d{2})$/, '$1.$2.$3-$4')}` : 'CONSUMIDOR NAO IDENTIFICADO'),
     LINE,
   );
-  if (!params.contingency && doc.protocol) top.push(center('Protocolo de Autorizacao'), center(doc.protocol), center(fmtDate(doc.issued_at)));
-  const bottom = ['', center('Tche Food SmartPOS - tpIntegra 1'), '', ''];
+  if (!params.contingency && doc.protocol) top.push(center('Protocolo de Autorizacao'), center(doc.protocol), center(fmtDate(doc.authorized_at ?? doc.issued_at)));
+  const bottom = ['', '', ''];
   return { top: top.map(ascii), bottom };
 }

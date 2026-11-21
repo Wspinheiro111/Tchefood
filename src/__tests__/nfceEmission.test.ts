@@ -1,15 +1,16 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { useTcheStore, type CloudSession } from '../store/useTcheStore';
-import { dueNfceCalls, dueNfceOrders, nextNfceRecord, nfceCallNow, parseDanfePayload, parseEmitResponse, requestNfceEmission, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
+import { inferCloudTenantId, useTcheStore, type CloudSession } from '../store/useTcheStore';
+import { DEMO_TENANT_ID } from '../data/seed';
+import { dueNfceCalls, dueNfceOrders, nextNfceRecord, nfceCall, nfceCallNow, parseDanfePayload, parseEmitResponse, requestNfceEmission, type NfceEmitOutcome } from '../lib/sync/nfceEmission';
 import { syncOnce } from '../lib/sync/useCloudSync';
-import { serverNfceDocument } from '../lib/nfce';
+import { accessKeyCheckDigit, isValidAccessKey, isValidNfceQrCodeContent, serverNfceDocument } from '../lib/nfce';
 import { danfeLines } from '../lib/receipts';
 import type { FetchLike } from '../lib/sync/supabaseSync';
 import { beginLocalClaim, resetClaimLedger } from '../lib/payments/claimLedger';
 
 const st = () => useTcheStore.getState();
-const KEY = '43261112345678000195650010000000421000000427';
-const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF`;
+const KEY = '43261112345678000195650010000000421000000420';
+const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
 const ISSUED = '2026-11-14T10:00:00-03:00';
 
 const PAYLOAD = {
@@ -25,6 +26,9 @@ const PAYLOAD = {
 };
 const ISSUER = { name: 'Flip', legal_name: 'FLIP LTDA', cnpj: '12345678000195', state_registration: '0960000000', city: 'Santo Angelo', state: 'RS' };
 
+const ADDRESS = { street: 'Rua das Missoes', number: '123', complement: 'Sala 2', district: 'Centro', city: 'Santo Angelo', state: 'RS', zip: '98800000' };
+const AUTHORIZED_AT = '2026-11-14T10:03:00-03:00';
+
 const authorizedBody = (over: Record<string, unknown> = {}) => ({
   status: 'authorized',
   authorized: true,
@@ -36,10 +40,12 @@ const authorizedBody = (over: Record<string, unknown> = {}) => ({
   number: 42,
   series: '1',
   qrcode_url: QR,
-  danfe_path: '/notas_fiscais_consumidor/NFe43261112345678000195650010000000421000000427.html',
+  danfe_path: '/notas_fiscais_consumidor/NFe43261112345678000195650010000000421000000420.html',
   issued_at: ISSUED,
   payload: PAYLOAD,
   issuer: ISSUER,
+  issuer_address: ADDRESS,
+  authorized_at: AUTHORIZED_AT,
   message: null,
   ...over,
 });
@@ -82,7 +88,9 @@ function closeOrder(): string {
 }
 
 const order = (id: string) => st().orders.find((o) => o.id === id)!;
-const doc = (body: unknown): NfceEmitOutcome => parseEmitResponse(200, JSON.stringify(body));
+// HTTP que a emit-nfce devolve para cada situação (processamento 202, rejeitada 422, demais 200).
+const HTTP_OF: Record<string, number> = { processing: 202, rejected: 422 };
+const doc = (body: unknown): NfceEmitOutcome => parseEmitResponse(HTTP_OF[(body as { status?: string }).status ?? ''] ?? 200, JSON.stringify(body));
 
 beforeEach(() => {
   resetClaimLedger();
@@ -286,6 +294,8 @@ describe('DANFE da nota real', () => {
     issued_at: ISSUED,
     payload: PAYLOAD,
     issuer: ISSUER,
+    issuer_address: ADDRESS,
+    authorized_at: AUTHORIZED_AT,
   });
 
   it('sai só do que o servidor devolveu (payload transmitido, chave, protocolo, QR)', () => {
@@ -503,8 +513,8 @@ describe('achados da auditoria (rodada 8b171a7)', () => {
 
 describe('achados da auditoria (rodada 68cf69a)', () => {
   const ready = () => useTcheStore.setState({ outbox: [], syncRejected: [], pullStatus: { last_pull_at: new Date().toISOString(), last_error: null, cloud_staff_unknown: 0 } });
-  const KEY2 = `${KEY.slice(0, 25)}000000043${KEY.slice(34)}`;
-  const QR2 = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY2}|2|2|1|ABCDEF`;
+  const KEY2 = '43261112345678000195650010000000431000000435';
+  const QR2 = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY2}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
 
   it('P0-01: comanda que volta a ter evento na fila durante a chamada anterior não é pedida', async () => {
     useTcheStore.setState({ cloud: session(st().tenant.id) });
@@ -604,5 +614,299 @@ describe('achados da auditoria (rodada 68cf69a)', () => {
     // 0,347 kg × R$ 59,90 = 20,7853 → R$ 20,79 (mesma conta da emit-nfce).
     expect(one({ quantidade_comercial: 0.347, valor_unitario_comercial: 59.9, valor_bruto: 20.79 })).not.toBeNull();
     expect(one({ quantidade_comercial: 0.347, valor_unitario_comercial: 59.9, valor_bruto: 20.78 })).toBeNull();
+  });
+});
+
+describe('achados da auditoria (rodada 8c07a77, PR de correção do #55)', () => {
+  const server = (over: Record<string, unknown> = {}) => ({
+    status: 'authorized' as const, access_key: KEY, protocol: '143260000000042', number: 42, series: '1', qrcode_url: QR,
+    issued_at: ISSUED, payload: PAYLOAD, issuer: ISSUER, issuer_address: ADDRESS, authorized_at: AUTHORIZED_AT, environment: 'homologacao' as const, ...over,
+  });
+  const printed = (d: NonNullable<ReturnType<typeof serverNfceDocument>>) => danfeLines({ tenant: st().tenant, doc: d, environment: 'homologacao', showTributos: false }).top.join('\n');
+
+  it('P1-01: IE ausente em tenants não vira "ISENTO" na bobina; IE presente e isento declarado imprimem como são', () => {
+    // IE nula (Focus pode ter a IE; o cadastro não): não imprime, fica o DANFE oficial da Focus.
+    expect(serverNfceDocument(server({ issuer: { ...ISSUER, state_registration: null } }))).toBeNull();
+    expect(missingPrintOf(server({ issuer: { ...ISSUER, state_registration: null } }))).toBe(true);
+    const withIe = serverNfceDocument(server())!;
+    expect(printed(withIe)).toContain('IE 0960000000');
+    expect(printed(withIe)).not.toContain('ISENTO');
+    // Emitente efetivamente isento: declarado como ISENTO no cadastro, imprime assim.
+    const isento = serverNfceDocument(server({ issuer: { ...ISSUER, state_registration: 'ISENTO' } }))!;
+    expect(printed(isento)).toContain('IE ISENTO');
+  });
+
+  it('P2-01: chave com dígito verificador errado é recusada; a válida passa', () => {
+    const bad = '43261112345678000195650010000000421000000427';
+    expect(isValidAccessKey(bad)).toBe(false);
+    expect(isValidAccessKey(KEY)).toBe(true);
+    const r = doc(authorizedBody({ access_key: bad, qrcode_url: `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${bad}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01` })) as { status: string; access_key: string | null; qrcode_url: string | null };
+    expect(r.access_key).toBeNull();
+    expect(r.qrcode_url).toBeNull();
+    expect(r.status).toBe('processing'); // "autorizada" sem chave válida não vale
+    expect((doc(authorizedBody()) as { access_key: string | null }).access_key).toBe(KEY);
+    // DV de chave com CNPJ alfanumérico (NT 2025.001): letra vale código ASCII - 48.
+    const alpha43 = '4326111234567800019565001000000042100000042'.replace('12345678000195', '12ABC45678AB95');
+    const dv = accessKeyCheckDigit(alpha43);
+    expect(isValidAccessKey(alpha43 + dv)).toBe(true);
+    expect(isValidAccessKey(alpha43 + ((Number(dv) + 1) % 10))).toBe(false);
+  });
+
+  it('P2-02: QR Code com tpAmb de outro ambiente é descartado', () => {
+    const qrProd = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|1|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
+    expect(doc(authorizedBody({ qrcode_url: qrProd }))).toMatchObject({ environment: 'homologacao', qrcode_url: null });
+    expect(doc(authorizedBody({ environment: 'producao', qrcode_url: qrProd }))).toMatchObject({ environment: 'producao', qrcode_url: qrProd });
+    expect(doc(authorizedBody({ environment: 'producao' }))).toMatchObject({ qrcode_url: null }); // QR de homologação em produção
+    expect(doc(authorizedBody())).toMatchObject({ qrcode_url: QR });
+    // QR 3.0 (chave|3|tpAmb): mesma regra.
+    const q3 = (amb: string) => `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|3|${amb}`;
+    expect(doc(authorizedBody({ qrcode_url: q3('1') }))).toMatchObject({ qrcode_url: null });
+    expect(doc(authorizedBody({ qrcode_url: q3('2') }))).toMatchObject({ qrcode_url: q3('2') });
+    // Na hora de imprimir também: QR de produção numa nota de homologação não imprime.
+    expect(serverNfceDocument(server({ qrcode_url: qrProd }))).toBeNull();
+  });
+
+  it('P2-03: HTTP de erro com corpo "autorizada" não vira documento nem muda a situação fiscal', () => {
+    for (const code of [500, 502, 503, 401, 404]) {
+      const out = parseEmitResponse(code, JSON.stringify(authorizedBody()));
+      expect(out.kind).toBe('error');
+    }
+    const prev = nextNfceRecord('o', undefined, doc(authorizedBody({ status: 'processing', authorized: false })), 0);
+    const after = nextNfceRecord('o', prev, parseEmitResponse(503, JSON.stringify(authorizedBody())), 0);
+    expect(after.status).toBe('processing');
+    expect(after.protocol).toBeNull();
+    // Os HTTP do contrato continuam valendo.
+    expect(parseEmitResponse(200, JSON.stringify(authorizedBody())).kind).toBe('document');
+    expect(parseEmitResponse(202, JSON.stringify(authorizedBody({ status: 'processing', authorized: false }))).kind).toBe('document');
+    expect(parseEmitResponse(422, JSON.stringify(authorizedBody({ status: 'rejected', authorized: false }))).kind).toBe('document');
+    expect(parseEmitResponse(200, JSON.stringify(authorizedBody({ status: 'rejected', authorized: false }))).kind).toBe('error');
+  });
+
+  it('P2-05: orientação de consulta no DANFE é a da UF da chave; fora do RS não imprime URL do RS', () => {
+    const rs = serverNfceDocument(server())!;
+    expect(printed(rs)).toMatch(/sefaz\.rs\.gov\.br\/nfce\/consul/);
+    const sp = { ...rs, access_key: `35${KEY.slice(2)}` };
+    const text = printed(sp);
+    expect(text).not.toContain('rs.gov.br');
+    expect(text).toContain('SEFAZ do estado');
+  });
+});
+
+function missingPrintOf(rec: Parameters<typeof serverNfceDocument>[0]): boolean {
+  return serverNfceDocument(rec) === null;
+}
+
+
+describe('achados da auditoria (2ª rodada em 8c07a77, PR de correção do #55)', () => {
+  const server = (over: Record<string, unknown> = {}) => ({
+    status: 'authorized' as const, access_key: KEY, protocol: '143260000000042', number: 42, series: '1', qrcode_url: QR,
+    issued_at: ISSUED, payload: PAYLOAD, issuer: ISSUER, issuer_address: ADDRESS, authorized_at: AUTHORIZED_AT, environment: 'homologacao' as const, ...over,
+  });
+  const lines = (d: NonNullable<ReturnType<typeof serverNfceDocument>>, contingency = false) =>
+    danfeLines({ tenant: st().tenant, doc: d, environment: 'homologacao', contingency, showTributos: false }).top;
+  const REAL_TENANT = '99999999-9999-4999-8999-999999999999';
+
+  it('P0-01: estado da versão anterior (cloud null, sem cloudTenantId, loja real) fecha pendente, sem chave simulada; só a demonstração simula', () => {
+    // Estado persistido antes do cloudTenantId existir: desconectado, loja que a nuvem trouxe.
+    useTcheStore.setState({ cloud: null, cloudTenantId: undefined as unknown as null, tenant: { ...st().tenant, id: REAL_TENANT } });
+    expect(inferCloudTenantId(st())).toBe(REAL_TENANT);
+    useTcheStore.setState({ cloudTenantId: inferCloudTenantId(st()) }); // o que a hidratação faz
+    const seq = st().nfceSeq;
+    const id = closeOrder();
+    expect(order(id)).toMatchObject({ nfce_status: 'PENDING', nfce_key: null });
+    expect(st().nfceSeq).toBe(seq);
+    // Reconectar permite a emissão real.
+    expect(st().setCloudSession(session(REAL_TENANT)).ok).toBe(true);
+    useTcheStore.setState({ outbox: [] });
+    expect(dueNfceOrders(st(), Date.now())).toContain(id);
+  });
+
+  it('P0-01: instalação genuinamente de demonstração continua simulando', () => {
+    useTcheStore.setState({ cloud: null, cloudTenantId: undefined as unknown as null, tenant: { ...st().tenant, id: DEMO_TENANT_ID } });
+    expect(inferCloudTenantId(st())).toBeNull();
+    useTcheStore.setState({ cloudTenantId: null });
+    const id = closeOrder();
+    expect(order(id).nfce_status).toBe('AUTORIZADA');
+    expect(order(id).nfce_key).toHaveLength(44);
+  });
+
+  it('P1-01: rejeitada vista em outro aparelho (sem registro local) só consulta; reenviar exige o botão', () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const id = closeOrder();
+    useTcheStore.setState({
+      outbox: [], nfceCloud: {}, nfceForced: [],
+      orders: st().orders.map((o) => (o.id === id ? { ...o, nfce_status: 'REJEITADA' as const, nfce_key: null } : o)),
+    });
+    expect(nfceCallNow(st(), id, Date.now())).toBe('consult');
+    expect(dueNfceCalls(st(), Date.now())).toEqual([{ orderId: id, mode: 'consult' }]);
+    // Depois de conhecer o documento rejeitado, nada automático: o operador decide.
+    const known = nextNfceRecord(id, undefined, doc(authorizedBody({ status: 'rejected', authorized: false, protocol: null, message: 'Rejeicao' })), Date.now());
+    useTcheStore.setState({ nfceCloud: { [id]: known } });
+    expect(dueNfceCalls(st(), Date.now() + 3_600_000)).toEqual([]);
+    // Ação explícita (botão): aí sim emite.
+    expect(st().requestNfceNow(id).ok).toBe(true);
+    expect(nfceCallNow(st(), id, Date.now())).toBe('emit');
+  });
+
+  it('P1-02: DANFE da bobina traz o endereço completo do documento autorizado, não muda com o cadastro da loja e sem endereço não imprime', () => {
+    const d = serverNfceDocument(server())!;
+    const text = lines(d).join('\n');
+    expect(text).toContain('Rua das Missoes');
+    expect(text).toContain('123');
+    expect(text).toContain('Sala 2');
+    expect(text).toContain('Centro');
+    expect(text).toContain('98800-000');
+    expect(text).toContain('Santo Angelo');
+    // Mudar o cadastro da loja depois da nota não muda a reimpressão.
+    useTcheStore.setState({ tenant: { ...st().tenant, city: 'Outra Cidade', name: 'Outro Nome' } });
+    expect(lines(d).join('\n')).toBe(text);
+    // Sem endereço completo (ou malformado) a impressão própria fica indisponível.
+    expect(serverNfceDocument(server({ issuer_address: null }))).toBeNull();
+    expect(serverNfceDocument(server({ issuer_address: { ...ADDRESS, street: '' } }))).toBeNull();
+    expect(serverNfceDocument(server({ issuer_address: { ...ADDRESS, zip: '9880' } }))).toBeNull();
+    expect(serverNfceDocument(server({ issuer_address: undefined }))).toBeNull();
+    // A resposta do servidor sem endereço mantém a nota consultável (para o servidor completar).
+    const noAddr = nextNfceRecord('o', undefined, doc(authorizedBody({ issuer_address: null })), Date.now());
+    expect(serverNfceDocument(noAddr)).toBeNull();
+    expect(nfceCall({ ...st().orders[0]!, status: 'CLOSED', total_amount: 10, paid_amount: 10, nfce_status: 'AUTORIZADA' } as never, { ...noAddr, next_attempt_at: new Date(0).toISOString() }, new Set(), false, Date.now())).toBe('consult');
+  });
+
+  it('P1-03: emissão às 10h00 e autorização às 10h03 saem nos dois campos, em Brasília; sem authorized_at não inventa nem imprime', () => {
+    const d = serverNfceDocument(server())!;
+    const text = lines(d);
+    const iEmi = text.findIndex((l) => l.includes('10:00'));
+    const iAut = text.findIndex((l) => l.includes('10:03'));
+    expect(iEmi).toBeGreaterThanOrEqual(0);
+    expect(iAut).toBeGreaterThan(iEmi);
+    expect(text.slice(iAut - 2, iAut + 1).join('\n')).toContain('Protocolo de Autorizacao');
+    // UTC no servidor: mesma hora em Brasília.
+    const utc = serverNfceDocument(server({ authorized_at: '2026-11-14T13:03:00Z' }))!;
+    expect(lines(utc).join('\n')).toContain('10:03');
+    // Ausente: a nota não imprime pela bobina (nunca reconstruída a partir da emissão).
+    expect(serverNfceDocument(server({ authorized_at: null }))).toBeNull();
+    expect(serverNfceDocument(server({ authorized_at: 'ontem' }))).toBeNull();
+    const rec = nextNfceRecord('o', undefined, doc(authorizedBody({ authorized_at: null })), Date.now());
+    expect(rec.authorized_at ?? null).toBeNull();
+    expect(serverNfceDocument(rec)).toBeNull();
+    // Contingência ainda sem autorização imprime sem data de autorização (não existe).
+    const cont = serverNfceDocument(server({ status: 'contingency', protocol: null, authorized_at: null }))!;
+    expect(lines(cont, true).join('\n')).not.toContain('Protocolo de Autorizacao');
+  });
+
+  it('P2-01: aviso de contingência aparece abaixo do cabeçalho e junto da identificação da nota (duas vezes), sem protocolo', () => {
+    const cont = serverNfceDocument(server({ status: 'contingency', protocol: null, authorized_at: null }))!;
+    const text = lines(cont, true);
+    expect(text.filter((l) => l.includes('EMITIDA EM CONTINGENCIA'))).toHaveLength(2);
+    expect(text.filter((l) => l.includes('Pendente de autorizacao'))).toHaveLength(2);
+    const header = text.findIndex((l) => l.includes('DANFE NFC-e'));
+    expect(text.findIndex((l) => l.includes('EMITIDA EM CONTINGENCIA'))).toBeLessThan(header);
+    expect(text.join('\n')).not.toContain('Protocolo de Autorizacao');
+    // Nota autorizada normal não tem o aviso.
+    expect(lines(serverNfceDocument(server())!).join('\n')).not.toContain('CONTINGENCIA');
+  });
+
+  it('P2-02: rodapé não fixa tpIntegra 1 e valores saem como R$ 1.234,50 (milhar com ponto, centavos com vírgula)', () => {
+    const big = { ...PAYLOAD, items: [{ ...PAYLOAD.items[0]!, valor_unitario_comercial: 1234.5, valor_bruto: 1234.5 }], valor_produtos: 1234.5, valor_total: 1234.5, formas_pagamento: [{ forma_pagamento: '01', valor_pagamento: 1234.5 }] };
+    const d = serverNfceDocument(server({ payload: big }))!;
+    const text = lines(d).join('\n');
+    expect(text).toContain('1.234,50');
+    expect(text).not.toMatch(/\d\.\d{2}(\s|$)/); // nenhum 1234.50 com ponto decimal
+    expect(text.toLowerCase()).not.toContain('tpintegra');
+  });
+
+  it('P2-03: QR Code só em https e só no portal da SEFAZ da UF da chave (outro .gov.br, http, porta ou UF diferente não valem)', () => {
+    const ok = (u: string, env: 'homologacao' | 'producao' = 'homologacao') => isValidNfceQrCodeContent(u, KEY, env);
+    expect(ok(QR)).toBe(true);
+    expect(ok(QR.replace('https:', 'http:'))).toBe(false);
+    expect(ok(QR.replace('www.sefaz.rs.gov.br', 'evil.gov.br'))).toBe(false);
+    expect(ok(QR.replace('www.sefaz.rs.gov.br', 'www.sefaz.rs.gov.br.evil.gov.br'))).toBe(false);
+    expect(ok(QR.replace('www.sefaz.rs.gov.br', 'www.sefaz.rs.gov.br:8443'))).toBe(false);
+    expect(ok(QR.replace('/NFCE/NFCE-COM.aspx', '/outra/pagina'))).toBe(false);
+    // Chave de SP com o portal do RS (ou o contrário): recusado.
+    const sp = `35${KEY.slice(2)}`;
+    expect(isValidNfceQrCodeContent(QR.replace(KEY, sp), sp, 'homologacao')).toBe(false);
+    // Na resposta e na impressão.
+    expect(doc(authorizedBody({ qrcode_url: QR.replace('https:', 'http:') }))).toMatchObject({ qrcode_url: null });
+    expect(serverNfceDocument(server({ qrcode_url: QR.replace('www.sefaz.rs.gov.br', 'evil.gov.br') }))).toBeNull();
+  });
+
+  it('Codex P2: registro autorizado salvo antes dos campos novos, sem consulta agendada, consulta sozinho uma vez e depois respeita o limite', () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const id = closeOrder();
+    useTcheStore.setState({ outbox: [] });
+    const old = nextNfceRecord(id, undefined, doc(authorizedBody({ issuer_address: undefined, authorized_at: undefined })), Date.now());
+    // Como o aparelho antigo gravou: sem os campos novos, sem agendamento.
+    const legacy = { ...old, issuer_address: null, authorized_at: null, next_attempt_at: null, print_attempts: 0, problem: null };
+    expect(serverNfceDocument(legacy)).toBeNull();
+    useTcheStore.setState({ nfceCloud: { [id]: legacy } });
+    expect(nfceCallNow(st(), id, Date.now())).toBe('consult');
+    // Consulta que falha (erro) não repete sozinha em laço.
+    const failed = nextNfceRecord(id, legacy, { kind: 'error', httpStatus: 500, message: 'x' }, Date.now());
+    useTcheStore.setState({ nfceCloud: { [id]: { ...failed, next_attempt_at: null } } });
+    expect(nfceCallNow(st(), id, Date.now())).toBeNull();
+    // Nota completa não consulta.
+    const full = nextNfceRecord(id, undefined, doc(authorizedBody()), Date.now());
+    useTcheStore.setState({ nfceCloud: { [id]: full } });
+    expect(nfceCallNow(st(), id, Date.now())).toBeNull();
+  });
+
+  it('Codex: contingência rejeitada e reenviada com endereço corrigido imprime o endereço novo; depois de autorizada não muda mais', () => {
+    const OLD = { ...ADDRESS, street: 'Rua Antiga' };
+    const cont = nextNfceRecord('o', undefined, doc(authorizedBody({ status: 'contingency', authorized: false, contingency: true, protocol: null, authorized_at: null, issuer_address: OLD })), Date.now());
+    expect(cont.issuer_address?.street).toBe('Rua Antiga');
+    const rejected = nextNfceRecord('o', cont, doc(authorizedBody({ status: 'rejected', authorized: false, protocol: null, authorized_at: null, issuer_address: null })), Date.now());
+    const auth = nextNfceRecord('o', rejected, doc(authorizedBody()), Date.now());
+    expect(auth.issuer_address?.street).toBe('Rua das Missoes');
+    expect(serverNfceDocument(auth)?.issuer_address?.street).toBe('Rua das Missoes');
+    // Autorizada com o endereço ainda ausente (XML não buscado): não herda o da contingência.
+    const noAddr = nextNfceRecord('o', rejected, doc(authorizedBody({ issuer_address: null })), Date.now());
+    expect(noAddr.issuer_address).toBeNull();
+    // Depois de autorizada, resposta com outro endereço não troca o gravado.
+    const again = nextNfceRecord('o', auth, doc(authorizedBody({ issuer_address: OLD })), Date.now());
+    expect(again.issuer_address?.street).toBe('Rua das Missoes');
+  });
+
+  it('Codex: registro local em processamento/contingência que não soube da rejeição de outro aparelho consulta (só leitura) e o botão não reenvia antes do motivo', () => {
+    useTcheStore.setState({ cloud: session(st().tenant.id) });
+    const id = closeOrder();
+    for (const status of ['processing', 'contingency'] as const) {
+      const local = nextNfceRecord(id, undefined, doc(authorizedBody({ status, authorized: false, contingency: status === 'contingency', protocol: null, authorized_at: null })), Date.now());
+      useTcheStore.setState({
+        outbox: [], nfceForced: [], nfceCloud: { [id]: { ...local, next_attempt_at: new Date(Date.now() - 1000).toISOString() } },
+        orders: st().orders.map((o) => (o.id === id ? { ...o, nfce_status: 'REJEITADA' as const, nfce_key: null } : o)),
+      });
+      expect(nfceCallNow(st(), id, Date.now())).toBe('consult'); // antes: nada, a tela ficava em processamento
+      useTcheStore.setState({ nfceForced: [id] });
+      expect(nfceCallNow(st(), id, Date.now())).toBe('consult'); // botão: consulta, não reenvia
+      // A consulta traz a rejeição: para as chamadas automáticas e só então o botão reenvia.
+      const learned = nextNfceRecord(id, st().nfceCloud[id], doc(authorizedBody({ status: 'rejected', authorized: false, protocol: null, authorized_at: null, issuer_address: null })), Date.now());
+      useTcheStore.setState({ nfceCloud: { [id]: learned }, nfceForced: [] });
+      expect(nfceCallNow(st(), id, Date.now() + 3_600_000)).toBeNull();
+      useTcheStore.setState({ nfceForced: [id] });
+      expect(nfceCallNow(st(), id, Date.now())).toBe('emit');
+    }
+  });
+});
+
+describe('auditoria do #63 (r16): reenvio da rejeitada não mantém a chave da tentativa anterior', () => {
+  const KEY_B = '43261112345678000195650010000000431000000435';
+  const QR_B = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY_B}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
+
+  it('P2-03: rejected (chave A) → processing com chave nula não mostra a chave A; a autorização seguinte (chave B) preenche só os dados novos', () => {
+    const rejected = nextNfceRecord('o', undefined, doc(authorizedBody({ status: 'rejected', authorized: false, protocol: null, authorized_at: null, issuer_address: null })), 1000);
+    expect(rejected).toMatchObject({ status: 'rejected', access_key: KEY });
+    const processing = nextNfceRecord('o', rejected, doc(authorizedBody({ status: 'processing', authorized: false, access_key: null, protocol: null, qrcode_url: null, danfe_path: null, authorized_at: null, issuer_address: null })), 2000);
+    expect(processing.status).toBe('processing');
+    expect(processing.access_key).toBeNull();
+    expect(processing.qrcode_url).toBeNull();
+    expect(processing.protocol).toBeNull();
+    const authorized = nextNfceRecord('o', processing, doc(authorizedBody({ access_key: KEY_B, qrcode_url: QR_B, number: 43, protocol: '143260000000099', authorized_at: AUTHORIZED_AT, issuer_address: ADDRESS })), 3000);
+    expect(authorized).toMatchObject({ status: 'authorized', access_key: KEY_B, protocol: '143260000000099', qrcode_url: QR_B });
+  });
+
+  it('P2-03: consulta de nota autorizada com chave ausente (resposta incompleta) não apaga a chave gravada', () => {
+    const auth = nextNfceRecord('o', undefined, doc(authorizedBody()), 1000);
+    const again = nextNfceRecord('o', auth, doc(authorizedBody({ status: 'processing', authorized: false, access_key: null, protocol: null })), 2000);
+    expect(again.access_key).toBe(KEY);
   });
 });
