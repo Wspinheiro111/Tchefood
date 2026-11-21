@@ -1,4 +1,4 @@
-# idbStorage: invariantes das cópias de emergência (PR #54, rodada 27)
+# idbStorage: invariantes das cópias de emergência (PR #54, rodada 28)
 
 Arquivo: `src/lib/idbStorage.ts`. Testes: `src/__tests__/gptR18Persist.test.tsx`.
 
@@ -6,8 +6,11 @@ Arquivo: `src/lib/idbStorage.ts`. Testes: `src/__tests__/gptR18Persist.test.tsx`
 
 A. **Um único escritor por aparelho.** Só a instância que obtém o lock exclusivo `navigator.locks` (`tchefood-idb-writer`)
    grava, recupera ou apaga. Outra aba/instância do app no mesmo aparelho só **lê** (devolve o mais novo que vê, sem mudar
-   nada); a gravação dela é ignorada com aviso no console. Sem `navigator.locks` (jsdom, navegadores antigos), a instância é
-   a escritora. No APK há uma WebView por aparelho. Isso fecha a classe de concorrência entre escritores do app novo; sobram
+   nada); `setItem` **lança** `StorageNotWritableError` (o `awaitPersisted` devolve false e a operação que depende da
+   persistência não sai) e `StorageGuard` cobre a tela inteira (alertdialog, só o botão Recarregar) enquanto o estado não
+   puder ser gravado. **Rejeição do pedido do lock não autoriza escrita** (só quem obteve o lock grava). Sem
+   `navigator.locks` (contexto sem a API), a instância é a escritora: no APK (Chromium 69+, contexto seguro) o Web Locks
+   existe e há uma WebView por aparelho; se faltasse, vale só a regra de conflito/leitura estável das rodadas anteriores. Isso fecha a classe de concorrência entre escritores do app novo; sobram
    só o texto que uma **versão anterior** do app deixa (foreign) e a chave antiga `<nome>::copia`.
 B. **Nenhum conteúdo é apagado sem estar provado incluído no estado que fica, ou guardado em `::conflito`.** Único caminho
    de exclusão: `retire`. Sai sem registro só a cópia de mesmo conteúdo do estado que vale ou de gravação **anterior do mesmo
@@ -19,15 +22,16 @@ C. **`select` (getItem) só conclui numa seleção estável**: depois de qualque
    confere se mudou cópia **ou o próprio IndexedDB** e escolhe de novo (até 6 vezes). Esgotadas as tentativas, ou com o
    IndexedDB ilegível depois de uma recuperação recusada, o resultado é **provisório**: devolve o mais novo visto (nunca
    null), não apaga nada e **toda gravação é recusada** até uma nova seleção estável devolver exatamente o que foi hidratado
-   (se devolver outra coisa, a gravação segue recusada e a próxima abertura do app hidrata o estado certo).
+   (se devolver outra coisa, o estado continua marcado provisório: toda gravação seguinte também lança, a tela fica
+   bloqueada e só reabrir o app hidrata o estado certo).
 
 ## Todo caminho que apaga, sobrescreve ou ignora uma cópia
 
 | Caminho | O que faz | Por que não se perde conteúdo | Teste |
 |---|---|---|---|
-| Instância sem o lock | `getItem` só lê; `setItem`/`removeItem` não fazem nada | não muda disco nem cópias | r26 segunda instância |
+| Instância sem o lock (ou pedido do lock rejeitado) | `getItem` só lê; `setItem` lança; `removeItem` não faz nada; tela bloqueada | não muda disco nem cópias; nada aparenta gravado | r26 segunda instância, **r27 P1-01, P1-02** |
 | `setItem`, IndexedDB bom (`writeDb`) | `retire` das cópias lidas | mesmo escritor anterior: sem registro; outras: conflito; chave antiga: fica | r24 P2-02/P2-03, r26 P3-01 |
-| `setItem` com seleção provisória | recusado (a menos que a seleção estável devolva o hidratado) | provisório nunca vira definitivo | **r26 P2-02** |
+| `setItem` com seleção provisória | lança (a menos que a seleção estável devolva o hidratado); se devolver outra coisa, segue provisório | provisório nunca vira definitivo; tela bloqueada | r26 P2-02, **r27 P1-02** |
 | `setItem`, IndexedDB recusando | grava chave nova `{seq,id,v,base}`; `retire` das lidas | chave por gravação; tamanho constante, sem histórico | r23 vizinho, r24 P2-03, **r26 P2-04** |
 | `setItem`, as duas recusando | guarda na memória (com `base`) | memória só desta instância; cópias ficam | falha total devolve false |
 | `select` escolhe o IndexedDB | `retire` das cópias lidas | conflito para as de conteúdo diferente | r24 P2-03, r25 P2-01 |
@@ -46,4 +50,5 @@ C. **`select` (getItem) só conclui numa seleção estável**: depois de qualque
   (chaves por gravação, exclusão pela chave exata, conferência do texto lido).
 - Se a instância escritora morre, outra só vira escritora ao recarregar (o lock é solto ao fechar a página; há 4 tentativas
   de 200 ms ao abrir).
+- A tela bloqueada cobre todas as telas (App); o fluxo do totem e do login também ficam atrás dela.
 - Os testes usam IndexedDB e localStorage simulados no mesmo processo.

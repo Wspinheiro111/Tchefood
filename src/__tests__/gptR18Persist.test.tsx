@@ -584,7 +584,7 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
       const hydrated = await idbStorage.getItem(name);
       onPut = null;
       expect(hydrated).toBe(`C${n - 1}`); // C106; C107 ficou fora
-      await idbStorage.setItem(name, 'DERIVADO-DE-C106');
+      await expect(idbStorage.setItem(name, 'DERIVADO-DE-C106')).rejects.toThrow(); // recusa visível, não retorno silencioso
       await tick();
       expect(where(name)).not.toContain('DERIVADO-DE-C106'); // antes: promovido a estado definitivo por cima de C107
       vi.resetModules();
@@ -634,6 +634,72 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
       expect(copies(name)).toEqual([]);
     });
 
+    const withLocks = async (request: (n: string, o: unknown, cb: (l: null) => unknown) => Promise<unknown>, body: () => Promise<void>) => {
+      Object.defineProperty(navigator, 'locks', { configurable: true, value: { request } });
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        await body();
+      } finally {
+        delete (navigator as { locks?: unknown }).locks;
+      }
+    };
+
+    it('P1-01 (r27): navigator.locks.request rejeitando NÃO autoriza escrita: nem grava, nem recupera, nem apaga', async () => {
+      await withLocks(() => Promise.reject(new DOMException('negado', 'SecurityError')), async () => {
+        const { idbStorage, fingerprint: fp, isStorageWriter } = await seed('tchefood-r27a');
+        const name = 'tchefood-r27a';
+        localStorage.setItem(name + '::copia::5.a', JSON.stringify({ seq: 101, id: 'a', v: 'S1', base: fp('S0') }));
+        expect(await isStorageWriter()).toBe(false); // antes: true
+        expect(await idbStorage.getItem(name)).toBe('S1');
+        await expect(idbStorage.setItem(name, 'S2')).rejects.toThrow();
+        await tick();
+        expect(disk.get(name)).toBe('S0');
+        expect(copies(name).map((c) => c.v)).toEqual(['S1']);
+        expect(conflicts(name)).toEqual([]);
+      });
+    }, 10_000);
+
+    it('P1-02 (r27): a instância sem lock mostra a tela bloqueada e awaitPersisted não aparenta sucesso', async () => {
+      await withLocks((_n, _o, cb) => Promise.resolve(cb(null)), async () => {
+        vi.resetModules();
+        const store = await import('../store/useTcheStore');
+        const idb = await import('../lib/idbStorage');
+        const { StorageGuard } = await import('../components/StorageGuard');
+        const view = render(createElement(StorageGuard));
+        expect(view.container.innerHTML).toBe(''); // antes de saber: nada
+        await act(async () => { await idb.isStorageWriter(); });
+        expect(idb.getStorageStatus()).toBe('readonly');
+        expect(screen.getByRole('alertdialog').textContent).toContain('NÃO grava');
+        store.useTcheStore.setState({ courierSettlePending: [{ id: 'acerto-X' } as never] });
+        expect(await store.awaitPersisted()).toBe(false); // a operação que depende da persistência não sai
+        cleanup();
+      });
+    }, 15_000);
+
+    it('P1-02 (r27): hidratação provisória bloqueia a tela, e a recusa continua depois da seleção estável (nunca vira estado definitivo)', async () => {
+      const { idbStorage, fingerprint: fp, getStorageStatus } = await seed('tchefood-r27c');
+      const name = 'tchefood-r27c';
+      const { StorageGuard } = await import('../components/StorageGuard');
+      const view = render(createElement(StorageGuard));
+      localStorage.setItem(name + '::copia::0.a', JSON.stringify({ seq: 101, id: 'a', v: 'C101', base: fp('S0') }));
+      let n = 101;
+      onPut = (key) => {
+        if (key !== name) return;
+        n++;
+        localStorage.setItem(`${name}::copia::${n.toString(36)}.z${n}`, JSON.stringify({ seq: n, id: `z${n}`, v: `C${n}`, base: fp('S0') }));
+      };
+      await act(async () => { await idbStorage.getItem(name); });
+      onPut = null;
+      expect(getStorageStatus()).toBe('blocked');
+      expect(screen.getByRole('alertdialog').textContent).toContain('Reabra');
+      await expect(idbStorage.setItem(name, 'X1')).rejects.toThrow();
+      await expect(idbStorage.setItem(name, 'X2')).rejects.toThrow(); // segunda tentativa também: o estado em memória continua velho
+      expect(getStorageStatus()).toBe('blocked');
+      expect(where(name)).not.toContain('X1');
+      expect(where(name)).not.toContain('X2');
+      view.unmount();
+    });
+
     it('segunda instância (sem o lock): só lê, não grava, não recupera e não apaga nada', async () => {
       Object.defineProperty(navigator, 'locks', { configurable: true, value: { request: (_n: string, _o: unknown, cb: (l: null) => void) => Promise.resolve(cb(null)) } });
       try {
@@ -641,7 +707,7 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
         const name = 'tchefood-r26g';
         localStorage.setItem(name + '::copia::5.a', JSON.stringify({ seq: 101, id: 'a', v: 'S1', base: fp('S0') }));
         expect(await idbStorage.getItem(name)).toBe('S1'); // vê o mais novo
-        await idbStorage.setItem(name, 'S2');
+        await expect(idbStorage.setItem(name, 'S2')).rejects.toThrow(); // a recusa chega ao chamador
         await tick();
         expect(disk.get(name)).toBe('S0'); // não recuperou nem gravou
         expect(copies(name).map((c) => c.v)).toEqual(['S1']); // não apagou

@@ -151,13 +151,53 @@ const seenCopies = new Map<string, Entry[]>();
 /** Seleção não concluída: o que foi hidratado e que nenhuma gravação pode promover a estado definitivo. */
 const provisional = new Set<string>();
 const provisionalValue = new Map<string, string>();
+/**
+ * Situação do armazenamento, para a tela (GPT, rodada 27 do PR #54, P1-02): 'ok'; 'readonly' (outra instância é a
+ * escritora: esta não pode gravar); 'blocked' (a hidratação foi provisória: gravar poderia cobrir um estado mais novo).
+ * Fora de 'ok' a tela fica bloqueada (StorageGuard) até recarregar; nada pode parecer gravado.
+ */
+export type StorageStatus = 'ok' | 'readonly' | 'blocked';
+let writerKnown: boolean | null = null;
+let status: StorageStatus = 'ok';
+const statusListeners = new Set<() => void>();
+export const getStorageStatus = (): StorageStatus => status;
+export function subscribeStorageStatus(f: () => void): () => void {
+  statusListeners.add(f);
+  return () => statusListeners.delete(f);
+}
+function refreshStatus() {
+  const next: StorageStatus = writerKnown === false ? 'readonly' : provisional.size > 0 ? 'blocked' : 'ok';
+  if (next === status) return;
+  status = next;
+  for (const f of [...statusListeners]) f();
+}
+/** Erro de `setItem` quando esta instância não pode gravar: o chamador (ex.: `awaitPersisted`) vê a falha. */
+export class StorageNotWritableError extends Error {
+  constructor(reason: 'readonly' | 'blocked') {
+    super(reason === 'readonly' ? 'Outra instância do app é a escritora neste aparelho: esta só lê.' : 'O estado hidratado não era o mais novo: reabra o app.');
+    this.name = 'StorageNotWritableError';
+  }
+}
+function markProvisional(k: string, v: string) {
+  provisional.add(k);
+  provisionalValue.set(k, v);
+  refreshStatus();
+}
 const WRITER_LOCK = 'tchefood-idb-writer';
 let writerPromise: Promise<boolean> | null = null;
-/** Esta instância é a única escritora do aparelho? (lock exclusivo; sem `navigator.locks`, é.) */
+/**
+ * Esta instância é a única escritora do aparelho? Lock exclusivo `navigator.locks`. Rejeição do pedido do lock NÃO
+ * autoriza escrita (GPT, rodada 27, P1-01): só quem obteve o lock grava. Sem `navigator.locks` (contexto sem a API), a
+ * instância é a escritora: no APK há uma WebView por aparelho (Chromium 69+ tem Web Locks em contexto seguro); em
+ * navegador sem a API vale só a regra de conflito/leitura estável das rodadas anteriores.
+ */
 export function isStorageWriter(): Promise<boolean> {
   if (writerPromise) return writerPromise;
   const locks = typeof navigator !== 'undefined' ? (navigator as { locks?: LockManager }).locks : undefined;
-  if (!locks) return (writerPromise = Promise.resolve(true));
+  if (!locks) {
+    writerKnown = true;
+    return (writerPromise = Promise.resolve(true));
+  }
   writerPromise = (async () => {
     for (let i = 0; i < 4; i++) {
       const got = await new Promise<boolean>((resolve) => {
@@ -170,13 +210,20 @@ export function isStorageWriter(): Promise<boolean> {
             resolve(true);
             return new Promise<void>(() => undefined); // segura o lock até a página fechar
           })
-          .catch(() => resolve(true));
+          .catch((e: unknown) => {
+            console.error('[idbStorage] o pedido do lock de escritor foi rejeitado; esta instância não grava', e);
+            resolve(false);
+          });
       });
       if (got) return true;
       await new Promise((r) => setTimeout(r, 200)); // a instância anterior pode estar fechando
     }
     return false;
-  })();
+  })().then((ok) => {
+    writerKnown = ok;
+    refreshStatus();
+    return ok;
+  });
   return writerPromise;
 }
 
@@ -293,6 +340,7 @@ function dropMemory(k: string) {
 function clearProvisional(k: string) {
   provisional.delete(k);
   provisionalValue.delete(k);
+  refreshStatus();
 }
 async function writeDb(k: string, v: string, seq: number) {
   await tx('readwrite', (s) => {
@@ -418,8 +466,7 @@ async function select(k: string): Promise<string | null> {
           again = null;
         }
         if (again === null) {
-          provisional.add(k);
-          provisionalValue.set(k, best.v);
+          markProvisional(k, best.v);
           return best.v;
         }
         if (!same(again.text, snap.text) || !same(again.seqRaw, snap.seqRaw) || copiesChanged(k, entries)) continue;
@@ -444,8 +491,7 @@ async function select(k: string): Promise<string | null> {
   }
   // Seleção que não ficou estável: devolve o mais novo visto (null hidrataria uma loja vazia), sem apagar nada,
   // e nenhuma gravação é aceita até uma seleção estável devolver exatamente isto.
-  provisional.add(k);
-  if (last) provisionalValue.set(k, last.v);
+  if (last) markProvisional(k, last.v);
   return last?.v ?? null;
 }
 
@@ -453,17 +499,15 @@ export const idbStorage: StateStorage = hasIndexedDB
   ? {
       getItem: (k) => select(k),
       setItem: async (k, v) => {
-        if (!(await isStorageWriter())) {
-          console.warn('[idbStorage] outra instância do app é a escritora neste aparelho: esta só lê');
-          return;
-        }
+        if (!(await isStorageWriter())) throw new StorageNotWritableError('readonly');
         if (provisional.has(k)) {
           // O estado hidratado não veio de uma seleção estável: só grava se agora a seleção estável devolve o mesmo.
-          const expected = provisionalValue.get(k);
+          const expected = provisionalValue.get(k) ?? '';
           const now = await select(k);
           if (provisional.has(k) || now !== expected) {
-            console.warn('[idbStorage] gravação recusada: o estado hidratado não era o mais novo; reabra o app');
-            return;
+            // O que está em memória não é o mais novo: continua bloqueado até reabrir (o estado hidratado nunca será igual).
+            markProvisional(k, expected);
+            throw new StorageNotWritableError('blocked');
           }
         }
         const seq = nextSeq();

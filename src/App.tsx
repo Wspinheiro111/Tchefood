@@ -22,6 +22,7 @@ import { useCloudSync } from './lib/sync/useCloudSync';
 import { setClaimAlertHandler } from './lib/payments/claimSupervisor';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
 import { UnsavedStorageBanner } from './components/UnsavedStorageBanner';
+import { StorageGuard } from './components/StorageGuard';
 import { PrintSimulatorModal } from './components/PrintSimulator';
 import { ToastHost, toast } from './components/ui';
 import { CloudStaleBanner } from './components/CloudStaleBanner';
@@ -81,6 +82,15 @@ function useStickyTopHeight() {
 }
 
 export default function App() {
+  return (
+    <>
+      <AppBody />
+      <StorageGuard />
+    </>
+  );
+}
+
+function AppBody() {
   const hydrated = useTcheStore((s) => s.hydrated);
   const user = useTcheStore(selectCurrentUser);
   const logout = useTcheStore((s) => s.logout);
