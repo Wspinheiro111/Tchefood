@@ -58,7 +58,7 @@ describe('NfceViewer › aviso de estorno na nota real (P2-04, rodada 8c07a77)',
   };
   const real = rec({
     status: 'authorized', environment: 'homologacao', access_key: REAL_KEY, protocol: '143260000000042', number: 42, series: '1',
-    qrcode_url: `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${REAL_KEY}|2|2|1|ABCDEF`, issued_at: '2026-11-14T10:00:00-03:00', payload,
+    qrcode_url: `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${REAL_KEY}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`, issued_at: '2026-11-14T10:00:00-03:00', payload,
     issuer: { name: 'Flip', legal_name: 'FLIP LTDA', cnpj: '12345678000195', state_registration: '0960000000', city: 'Santo Angelo', state: 'RS' },
     issuer_address: { street: 'Rua das Missoes', number: '123', complement: null, district: 'Centro', city: 'Santo Angelo', state: 'RS', zip: '98800000' },
     authorized_at: '2026-11-14T10:03:00-03:00',

@@ -10,7 +10,7 @@ import { beginLocalClaim, resetClaimLedger } from '../lib/payments/claimLedger';
 
 const st = () => useTcheStore.getState();
 const KEY = '43261112345678000195650010000000421000000420';
-const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF`;
+const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
 const ISSUED = '2026-11-14T10:00:00-03:00';
 
 const PAYLOAD = {
@@ -514,7 +514,7 @@ describe('achados da auditoria (rodada 8b171a7)', () => {
 describe('achados da auditoria (rodada 68cf69a)', () => {
   const ready = () => useTcheStore.setState({ outbox: [], syncRejected: [], pullStatus: { last_pull_at: new Date().toISOString(), last_error: null, cloud_staff_unknown: 0 } });
   const KEY2 = '43261112345678000195650010000000431000000435';
-  const QR2 = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY2}|2|2|1|ABCDEF`;
+  const QR2 = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY2}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
 
   it('P0-01: comanda que volta a ter evento na fila durante a chamada anterior não é pedida', async () => {
     useTcheStore.setState({ cloud: session(st().tenant.id) });
@@ -640,7 +640,7 @@ describe('achados da auditoria (rodada 8c07a77, PR de correção do #55)', () =>
     const bad = '43261112345678000195650010000000421000000427';
     expect(isValidAccessKey(bad)).toBe(false);
     expect(isValidAccessKey(KEY)).toBe(true);
-    const r = doc(authorizedBody({ access_key: bad, qrcode_url: `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${bad}|2|2|1|ABCDEF` })) as { status: string; access_key: string | null; qrcode_url: string | null };
+    const r = doc(authorizedBody({ access_key: bad, qrcode_url: `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${bad}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01` })) as { status: string; access_key: string | null; qrcode_url: string | null };
     expect(r.access_key).toBeNull();
     expect(r.qrcode_url).toBeNull();
     expect(r.status).toBe('processing'); // "autorizada" sem chave válida não vale
@@ -653,7 +653,7 @@ describe('achados da auditoria (rodada 8c07a77, PR de correção do #55)', () =>
   });
 
   it('P2-02: QR Code com tpAmb de outro ambiente é descartado', () => {
-    const qrProd = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|1|1|ABCDEF`;
+    const qrProd = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|1|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
     expect(doc(authorizedBody({ qrcode_url: qrProd }))).toMatchObject({ environment: 'homologacao', qrcode_url: null });
     expect(doc(authorizedBody({ environment: 'producao', qrcode_url: qrProd }))).toMatchObject({ environment: 'producao', qrcode_url: qrProd });
     expect(doc(authorizedBody({ environment: 'producao' }))).toMatchObject({ qrcode_url: null }); // QR de homologação em produção

@@ -124,6 +124,23 @@ export function buildConsultaQrUrl(key: string, tenant: Pick<Tenant, 'csc_id' | 
 export const CONSULTA_URL_RS = 'www.sefaz.rs.gov.br/nfce/consulta';
 
 /**
+ * Estrutura do parâmetro p do QR Code NFC-e (sem recalcular assinatura/CSC): versão 2 online
+ * chave|2|tpAmb|cIdToken|cHashQRCode (5 campos, hash hexadecimal de 40), versão 2 offline (contingência)
+ * chave|2|tpAmb|dia|vNF|digVal|cIdToken|cHashQRCode (8), versão 3 chave|3|tpAmb (3). Sem campos extras.
+ */
+function qrParamsStructureOk(parts: string[]): boolean {
+  const hash = (v: string | undefined) => /^[0-9A-Fa-f]{40}$/.test(v ?? '');
+  if (parts[1] === '2') {
+    if (parts.length === 5) return /^\d{1,6}$/.test(parts[3] ?? '') && hash(parts[4]);
+    if (parts.length === 8) {
+      return /^\d{2}$/.test(parts[3] ?? '') && /^\d+(\.\d{1,2})?$/.test(parts[4] ?? '') && /^[0-9A-Fa-f]+$/.test(parts[5] ?? '') && /^\d{1,6}$/.test(parts[6] ?? '') && hash(parts[7]);
+    }
+    return false;
+  }
+  return parts[1] === '3' && parts.length === 3 && /^[12]$/.test(parts[2] ?? '');
+}
+
+/**
  * Portais de consulta NFC-e (destino do QR Code) por cUF da chave. Só entra UF com endereço oficial
  * conferido; as demais não imprimem QR próprio (o DANFE oficial da Focus cobre). RS é a UF do piloto.
  */
@@ -163,7 +180,8 @@ export function isValidNfceQrCodeContent(
   if (parts[0] !== key) return false;
   // Nas versões do QR Code com tpAmb (chave|versão|tpAmb|...), o ambiente do QR precisa ser o da nota.
   // Versão 2: chave|2|tpAmb|cIdToken|hash (5 campos); versão 3: chave|3|tpAmb (3). QR sem versão ou tpAmb (p=CHAVE|2) não vale quando o ambiente da nota é conhecido.
-  if (environment && (parts.length < (parts[1] === '2' ? 5 : 3) || !/^[23]$/.test(parts[1] ?? '') || parts[2] !== (environment === 'producao' ? '1' : '2'))) return false;
+  if (!qrParamsStructureOk(parts)) return false;
+  if (environment && parts[2] !== (environment === 'producao' ? '1' : '2')) return false;
   return true;
 }
 

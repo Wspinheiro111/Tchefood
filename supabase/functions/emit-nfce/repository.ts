@@ -85,7 +85,7 @@ export function supabaseNfceRepository(db: SupabaseLike): NfceRepository {
       return check(
         await db
           .from('nfce_documents')
-          .update({ status: 'processing', payload_hash: payloadHash, payload, issuer, transmissions: expectedTransmissions + 1, sefaz_message: null, authorized_at: null, issuer_address: null })
+          .update({ status: 'processing', payload_hash: payloadHash, payload, issuer, transmissions: expectedTransmissions + 1, sefaz_message: null, authorized_at: null, issuer_address: null, access_key: null, protocol: null, qrcode_url: null })
           .eq('id', id)
           .eq('status', 'rejected')
           .eq('transmissions', expectedTransmissions)

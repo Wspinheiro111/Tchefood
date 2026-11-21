@@ -200,10 +200,11 @@ function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict
 }
 
 function providerFields(doc: NfceDocumentRow, next: NfceDocumentStatus, response: FocusNfceResponse): ProviderFields {
-  // Chave com DV errado não é gravada (nem reconstruída): vale a que o documento já tem, e "autorizado"
-  // sem chave válida fica em processamento para reconciliação (o aparelho aplica a mesma regra).
+  // Chave com DV errado não é gravada nem trocada pela chave de outra tentativa: a resposta que traz uma chave
+  // explicitamente inválida nunca confirma autorização (ver apply). Sem chave na resposta vale a do documento.
   const rawKey = response.accessKey?.replace(/^NFe/i, '') ?? null;
-  const accessKey = rawKey === null ? doc.access_key : isValidAccessKey(rawKey) ? rawKey : doc.access_key;
+  const invalidKey = rawKey !== null && !isValidAccessKey(rawKey);
+  const accessKey = rawKey === null ? doc.access_key : invalidKey ? doc.access_key : rawKey;
   // QR Code só se for a URL assinada da SEFAZ para ESTA chave; url_danfe nunca é QR Code.
   const qr = response.qrCodeUrl && isValidQrCodeUrl(response.qrCodeUrl, accessKey, doc.environment)
     ? response.qrCodeUrl
@@ -232,7 +233,11 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
     return respond(doc, `Retorno da Focus ignorado: transição ${doc.status} → ${next} não permitida.`);
   }
   let fields = providerFields(doc, next, response);
-  if (next === 'authorized' && (!fields.protocol || !fields.access_key)) {
+  const rawKeyInResponse = response.accessKey?.replace(/^NFe/i, '') ?? null;
+  if ((next === 'authorized' || next === 'contingency') && rawKeyInResponse !== null && !isValidAccessKey(rawKeyInResponse)) {
+    // Chave inválida na resposta: não autoriza com a chave de uma tentativa anterior; fica para reconciliar.
+    fields = { ...fields, status: 'processing', sefaz_message: 'Focus respondeu autorizado com chave de acesso inválida (DV). Consulte novamente; a nota não foi confirmada.' };
+  } else if (next === 'authorized' && (!fields.protocol || !fields.access_key)) {
     // "autorizado" sem protocolo/chave não é prova de autorização: fica em processamento.
     fields = { ...fields, status: 'processing', sefaz_message: 'Focus respondeu autorizado sem protocolo ou com chave ausente/inválida. Consulte novamente.' };
   }

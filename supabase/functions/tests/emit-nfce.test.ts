@@ -23,7 +23,7 @@ import { parseDanfePayload, parseNfceIssuer } from '../../../src/lib/sync/nfceEm
 const TENANT = '11111111-1111-4111-8111-111111111111';
 const ORDER = '22222222-2222-4222-8222-222222222222';
 const KEY = '43261112345678000195650010000000421000000420';
-const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF`;
+const QR = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
 
 function source(overrides: Partial<NfceSource> = {}): NfceSource {
   return {
@@ -206,7 +206,7 @@ class MemoryRepo implements NfceRepository {
   }
   async claimRejected(id: string, expectedTransmissions: number, payloadHash: string, payload: unknown = {}, issuer: unknown = null) {
     if (!this.doc || this.doc.id !== id || this.doc.status !== 'rejected' || this.doc.transmissions !== expectedTransmissions) return null;
-    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, payload, issuer, authorized_at: null, issuer_address: null, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
+    this.doc = { ...this.doc, status: 'processing', payload_hash: payloadHash, transmissions: this.doc.transmissions + 1, payload, issuer, authorized_at: null, issuer_address: null, access_key: null, protocol: null, qrcode_url: null, issued_at: (payload as { data_emissao?: string }).data_emissao ?? null };
     return { ...this.doc };
   }
   async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
@@ -575,24 +575,26 @@ describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no apa
 
   it('P2-01: QR sem versão/tpAmb, com tpAmb vazio ou de outro ambiente é recusado; o correto passa (versões 2 e 3), nos dois validadores', async () => {
     const { isValidNfceQrCodeContent } = await import('../../../src/lib/nfce.ts');
+    const H = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
     const cases: Array<[string, boolean, 'homologacao' | 'producao']> = [
-      [`${KEY}`, false, 'homologacao'],
-      [`${KEY}|2`, false, 'homologacao'],
-      [`${KEY}|3`, false, 'homologacao'],
-      [`${KEY}|2|2`, false, 'homologacao'],
-      [`${KEY}|2|2|1`, false, 'homologacao'],
-      [`${KEY}|9|2|1|ABCDEF`, false, 'homologacao'],
-      [`${KEY}||2|1|ABCDEF`, false, 'homologacao'],
-      [`${KEY}|2||1|ABCDEF`, false, 'homologacao'],
-      [`${KEY}|3|`, false, 'homologacao'],
-      [`${KEY}|2|1|1|ABCDEF`, false, 'homologacao'],
-      [`${KEY}|3|1`, false, 'homologacao'],
-      [`${KEY}|4|2|1|ABCDEF`, false, 'homologacao'],
-      [`${KEY}|2|2|1|ABCDEF`, true, 'homologacao'],
-      [`${KEY}|3|2`, true, 'homologacao'],
-      [`${KEY}|2|1|1|ABCDEF`, true, 'producao'],
-      [`${KEY}|3|1`, true, 'producao'],
-      [`${KEY}|2`, false, 'producao'],
+      // Inválidos: ausentes, vazios, extras, hash curto/não hexadecimal, versão desconhecida, ambiente divergente.
+      [`${KEY}`, false, 'homologacao'], [`${KEY}|2`, false, 'homologacao'], [`${KEY}|3`, false, 'homologacao'],
+      [`${KEY}|2|2`, false, 'homologacao'], [`${KEY}|2|2|1`, false, 'homologacao'],
+      [`${KEY}|2||1|${H}`, false, 'homologacao'], [`${KEY}|3|`, false, 'homologacao'],
+      [`${KEY}|2|1|1|${H}`, false, 'homologacao'], [`${KEY}|3|1`, false, 'homologacao'],
+      [`${KEY}|9|2|1|${H}`, false, 'homologacao'], [`${KEY}||2|1|${H}`, false, 'homologacao'],
+      [`${KEY}|2|2|1|ABCDEF`, false, 'homologacao'], // hash curto
+      [`${KEY}|2|2|1|${'Z'.repeat(40)}`, false, 'homologacao'], // hash não hexadecimal
+      [`${KEY}|2|2|1|${H}|EXTRA`, false, 'homologacao'], // campo extra (6)
+      [`${KEY}|2|2||${H}`, false, 'homologacao'], // cIdToken vazio
+      [`${KEY}|3|2|EXTRA`, false, 'homologacao'], // v3 com extra
+      [`${KEY}|3|2|`, false, 'homologacao'],
+      [`${KEY}|2|2|9|15.50|${H}|1|${H}`, false, 'homologacao'], // dia com 1 dígito
+      // Válidos.
+      [`${KEY}|2|2|1|${H}`, true, 'homologacao'], [`${KEY}|3|2`, true, 'homologacao'],
+      [`${KEY}|2|1|1|${H}`, true, 'producao'], [`${KEY}|3|1`, true, 'producao'],
+      [`${KEY}|2|2|09|15.50|${H}|1|${H}`, true, 'homologacao'], // v2 offline (contingência), 8 campos
+      [`${KEY}|2|2|1|${H}`, false, 'producao'], // ambiente da nota é outro
     ];
     for (const [p, expected, env] of cases) {
       expect(isValidQrCodeUrl(qr(p), KEY, env), `servidor ${p} ${env}`).toBe(expected);
@@ -614,7 +616,7 @@ describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no apa
 
   it('P2-02: resposta autorizada da Focus com chave de DV errado não vira autorizada nem grava a chave; com DV certo autoriza, e o aparelho entende igual', async () => {
     const repoBad = new MemoryRepo(source());
-    const bad = fakeFocus([{ status: 201, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD_DV}`, qrcode_url: qr(`${BAD_DV}|2|2|1|ABCDEF`) } }]);
+    const bad = fakeFocus([{ status: 201, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD_DV}`, qrcode_url: qr(`${BAD_DV}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`) } }]);
     const r = await emitNfce(deps(repoBad, bad.focus), { tenantId: TENANT, orderId: ORDER });
     expect(r.body).toMatchObject({ status: 'processing', authorized: false, access_key: null, qrcode_url: null });
     expect(repoBad.doc).toMatchObject({ status: 'processing', access_key: null });
@@ -629,7 +631,7 @@ describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no apa
 
   it('P2-03: Focus de homologação devolvendo QR de produção: o QR não é gravado e o documento autorizado não perde o estado', async () => {
     const repo = new MemoryRepo(source());
-    const prodQr = qr(`${KEY}|2|1|1|ABCDEF`);
+    const prodQr = qr(`${KEY}|2|1|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`);
     const first = fakeFocus([{ status: 201, body: { ...AUTHORIZED, qrcode_url: prodQr } }]);
     const r = await emitNfce(deps(repo, first.focus), { tenantId: TENANT, orderId: ORDER });
     expect(r.body).toMatchObject({ status: 'authorized', authorized: true, qrcode_url: null });
@@ -665,12 +667,12 @@ describe('Codex #63: endereço de contingência rejeitada não sobrevive ao reen
     const chain = { eq: () => chain, select: () => chain, maybeSingle: async () => ({ data: { id: 'd1' }, error: null }) };
     const db = { from: () => ({ update: (v: Record<string, unknown>) => { updated = v; return chain; } }) };
     await supabaseNfceRepository(db).claimRejected('d1', 1, 'h', {}, {});
-    expect(updated).toMatchObject({ status: 'processing', transmissions: 2, authorized_at: null, issuer_address: null });
+    expect(updated).toMatchObject({ status: 'processing', transmissions: 2, authorized_at: null, issuer_address: null, access_key: null, protocol: null, qrcode_url: null });
   });
 });
 
 describe('P2-04 (auditoria do #63): QR legado inválido nunca deixa o documento "recuperado"', () => {
-  const HTTP_QR = `http://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF`;
+  const HTTP_QR = `http://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
   const legacyRepo = () => {
     const repo = new MemoryRepo(source());
     repo.doc = {
@@ -702,5 +704,54 @@ describe('P2-04 (auditoria do #63): QR legado inválido nunca deixa o documento 
     noToken.doc = { ...legacyRepo().doc! };
     const again = await emitNfce(deps(noToken, fakeFocus([]).focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
     expect(again.body.qrcode_url).toBeNull();
+  });
+});
+
+
+describe('P0 (auditoria do #63, r14): resposta com chave inválida nunca autoriza com a chave de outra tentativa', () => {
+  const BAD = `${KEY.slice(0, 43)}7`;
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+
+  it('rejeição (chave A) → claimRejected → reenvio autorizado com chave B de DV inválido: não vira authorized com a chave A; reconcilia depois com resposta válida', async () => {
+    const repo = new MemoryRepo(source());
+    const rejected = fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', chave_nfe: `NFe${KEY}`, mensagem_sefaz: 'Rejeicao' } }]);
+    const r1 = await emitNfce(deps(repo, rejected.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r1.body).toMatchObject({ status: 'rejected', access_key: KEY });
+    // Reenvio: a Focus devolve protocolo novo e chave nova com DV errado.
+    const resend = fakeFocus([{ status: 201, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD}`, protocolo: '143260000000099', qrcode_url: null } }]);
+    const r2 = await emitNfce(deps(repo, resend.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r2.body).toMatchObject({ status: 'processing', authorized: false, access_key: null, protocol: null });
+    expect(repo.doc).toMatchObject({ status: 'processing', access_key: null });
+    expect(repo.doc?.access_key).not.toBe(KEY); // a chave da tentativa rejeitada não volta
+    // O aparelho não vê nota autorizada nem chave (nada a espelhar em orders).
+    expect(parseEmitResponse(r2.httpStatus, JSON.stringify(r2.body))).toMatchObject({ kind: 'document', status: 'processing', access_key: null });
+    // Consulta posterior com resposta válida reconcilia.
+    const ok = fakeFocus([{ status: 200, body: AUTHORIZED }]);
+    const r3 = await emitNfce(deps(repo, ok.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r3.body).toMatchObject({ status: 'authorized', authorized: true, access_key: KEY });
+  });
+
+  it('resposta sem chave, em reenvio de rejeitada, também não autoriza com a chave anterior', async () => {
+    const repo = new MemoryRepo(source());
+    await emitNfce(deps(repo, fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', chave_nfe: `NFe${KEY}` } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    const r = await emitNfce(deps(repo, fakeFocus([{ status: 201, body: { status: 'autorizado', protocolo: '143260000000099', numero: '42', serie: '1' } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'processing', authorized: false, access_key: null });
+  });
+
+  it('mesmo que o repositório preserve a chave antiga no reenvio, a resposta com chave inválida não confirma a autorização', async () => {
+    class KeepKeyRepo extends MemoryRepo {
+      override async claimRejected(id: string, expected: number, hash: string, payload: unknown = {}, issuer: unknown = null) {
+        const key = this.doc?.access_key ?? null;
+        const claimed = await super.claimRejected(id, expected, hash, payload, issuer);
+        if (claimed && this.doc) this.doc = { ...this.doc, access_key: key };
+        return claimed && this.doc ? { ...this.doc } : null;
+      }
+    }
+    const repo = new KeepKeyRepo(source());
+    await emitNfce(deps(repo, fakeFocus([{ status: 422, body: { status: 'erro_autorizacao', chave_nfe: `NFe${KEY}` } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(repo.doc?.access_key).toBe(KEY);
+    const r = await emitNfce(deps(repo, fakeFocus([{ status: 201, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD}`, protocolo: '143260000000099' } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'processing', authorized: false, protocol: null });
+    expect(repo.doc).toMatchObject({ status: 'processing' });
   });
 });
