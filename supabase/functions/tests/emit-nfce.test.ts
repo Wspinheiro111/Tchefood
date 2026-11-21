@@ -218,7 +218,7 @@ const XML_PATH = '/arquivos_development/x/NFe.xml';
 /** XML autorizado como a Focus devolve (trecho): Id da chave, emitente com endereço, dhRecbto do protocolo. */
 function authorizedXml(key = KEY, over: { cnpj?: string; id?: string; ender?: string; dh?: string } = {}) {
   const ender = over.ender ?? '<enderEmit><xLgr>Rua das Flores</xLgr><nro>120</nro><xBairro>Centro</xBairro><cMun>4317103</cMun><xMun>Santo Angelo</xMun><UF>RS</UF><CEP>98800000</CEP></enderEmit>';
-  return `<nfeProc><NFe><infNFe versao="4.00" Id="NFe${over.id ?? key}"><emit><CNPJ>${over.cnpj ?? key.slice(6, 18)}</CNPJ><xNome>FLIP</xNome>${ender}<IE>0960000000</IE></emit></infNFe></NFe><protNFe><infProt><dhRecbto>${over.dh ?? '2026-11-09T03:00:07-03:00'}</dhRecbto><nProt>143260000000001</nProt></infProt></protNFe></nfeProc>`;
+  return `<nfeProc><NFe><infNFe versao="4.00" Id="NFe${over.id ?? key}"><emit><CNPJ>${over.cnpj ?? key.slice(6, 20)}</CNPJ><xNome>FLIP</xNome>${ender}<IE>0960000000</IE></emit></infNFe></NFe><protNFe><infProt><dhRecbto>${over.dh ?? '2026-11-09T03:00:07-03:00'}</dhRecbto><nProt>143260000000001</nProt></infProt></protNFe></nfeProc>`;
 }
 
 function fakeFocus(responses: Array<{ status: number; body: unknown } | 'network'>, xml: string | null = authorizedXml()) {
@@ -544,5 +544,23 @@ describe('P1-02 e P1-03 (2ª auditoria do #55): endereço do emitente e dhRecbto
     expect(isValidQrCodeUrl(QR.replace('https:', 'http:'), KEY, 'homologacao')).toBe(false);
     expect(isValidQrCodeUrl(QR.replace('www.sefaz.rs.gov.br', 'evil.gov.br'), KEY, 'homologacao')).toBe(false);
     expect(isValidQrCodeUrl(QR.replace('/NFCE/NFCE-COM.aspx', '/x'), KEY, 'homologacao')).toBe(false);
+  });
+});
+
+
+describe('achados do Codex no #63', () => {
+  it('P1: o CNPJ do emitente no XML tem 14 caracteres e é comparado inteiro com o da chave', () => {
+    const xml = authorizedXml().replace(/<CNPJ>\d+<\/CNPJ>/, '<CNPJ>12345678000195</CNPJ>');
+    expect(parseAuthorizedXml(xml, KEY).address).toMatchObject({ street: 'Rua das Flores', zip: '98800000' });
+    expect(parseAuthorizedXml(xml.replace('12345678000195', '12345678000196'), KEY).address).toBeNull();
+    expect(parseAuthorizedXml(xml.replace('<CNPJ>12345678000195', '<CNPJ>123456780001'), KEY).address).toBeNull();
+  });
+
+  it('P2: nota em contingência também devolve o endereço do emitente (sem data de autorização, que ainda não existe)', async () => {
+    const repo = new MemoryRepo(source());
+    const { focus } = fakeFocus([{ status: 201, body: { ...AUTHORIZED, contingencia_offline: true, contingencia_offline_efetivada: false } }]);
+    const r = await emitNfce({ repo, environment: 'homologacao' as const, focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'contingency', contingency: true, authorized_at: null });
+    expect(r.body.issuer_address).toMatchObject({ street: 'Rua das Flores', zip: '98800000' });
   });
 });

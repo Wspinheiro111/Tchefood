@@ -207,7 +207,7 @@ export function parseAuthorizedXml(xml: string | null, accessKey: string | null)
   if (id !== key) return none;
   const emit = /<emit>([\s\S]*?)<\/emit>/.exec(xml)?.[1] ?? '';
   const cnpj = xmlTag(emit, 'CNPJ');
-  if (cnpj !== key.slice(6, 18)) return none;
+  if (cnpj !== key.slice(6, 20)) return none;
   const ender = /<enderEmit>([\s\S]*?)<\/enderEmit>/.exec(emit)?.[1];
   let address: IssuerAddress | null = null;
   if (ender) {

@@ -166,7 +166,7 @@ function respond(doc: NfceDocumentRow, message?: string | null): EmitResponse {
       issued_at: doc.issued_at,
       payload: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.payload ?? null : null,
       issuer: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.issuer ?? null : null,
-      issuer_address: doc.status === 'authorized' || doc.status === 'cancelled' ? doc.issuer_address ?? null : null,
+      issuer_address: doc.status === 'authorized' || doc.status === 'contingency' || doc.status === 'cancelled' ? doc.issuer_address ?? null : null,
       authorized_at: doc.status === 'authorized' || doc.status === 'cancelled' ? doc.authorized_at ?? null : null,
       message: message ?? doc.sefaz_message,
     },
@@ -228,17 +228,20 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
     // "autorizado" sem protocolo/chave não é prova de autorização: fica em processamento.
     fields = { ...fields, status: 'processing', sefaz_message: 'Focus respondeu autorizado sem protocolo ou chave. Consulte novamente.' };
   }
-  if (fields.status === 'authorized' && token && (!doc.authorized_at || !doc.issuer_address)) {
+  const printable = fields.status === 'authorized' || fields.status === 'contingency';
+  const needsAuthorizedAt = fields.status === 'authorized' && !doc.authorized_at;
+  if (printable && token && (needsAuthorizedAt || !doc.issuer_address)) {
     // Endereço e dhRecbto só do XML autorizado (conferido com a chave e o CNPJ); nunca do aparelho.
     const xml = await deps.focus(token).fetchXml?.(fields.xml_path ?? null);
     const parsed = parseAuthorizedXml(xml ?? null, fields.access_key);
     fields = {
       ...fields,
-      authorized_at: doc.authorized_at ?? parsed.authorizedAt ?? response.authorizedAt,
+      // Contingência ainda não tem autorização: só o endereço (a data nasce com a autorização).
+      authorized_at: fields.status === 'authorized' ? doc.authorized_at ?? parsed.authorizedAt ?? response.authorizedAt : doc.authorized_at ?? null,
       issuer_address: doc.issuer_address ?? parsed.address,
     };
-  } else if (fields.status === 'authorized') {
-    fields = { ...fields, authorized_at: doc.authorized_at ?? response.authorizedAt, issuer_address: doc.issuer_address ?? null };
+  } else if (printable) {
+    fields = { ...fields, authorized_at: fields.status === 'authorized' ? doc.authorized_at ?? response.authorizedAt : doc.authorized_at ?? null, issuer_address: doc.issuer_address ?? null };
   }
   const saved = await deps.repo.saveProviderResult(doc.id, doc.status, doc.transmissions, fields);
   if (!saved) {
