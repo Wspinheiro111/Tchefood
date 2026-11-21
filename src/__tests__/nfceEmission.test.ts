@@ -849,4 +849,20 @@ describe('achados da auditoria (2ª rodada em 8c07a77, PR de correção do #55)'
     useTcheStore.setState({ nfceCloud: { [id]: full } });
     expect(nfceCallNow(st(), id, Date.now())).toBeNull();
   });
+
+  it('Codex: contingência rejeitada e reenviada com endereço corrigido imprime o endereço novo; depois de autorizada não muda mais', () => {
+    const OLD = { ...ADDRESS, street: 'Rua Antiga' };
+    const cont = nextNfceRecord('o', undefined, doc(authorizedBody({ status: 'contingency', authorized: false, contingency: true, protocol: null, authorized_at: null, issuer_address: OLD })), Date.now());
+    expect(cont.issuer_address?.street).toBe('Rua Antiga');
+    const rejected = nextNfceRecord('o', cont, doc(authorizedBody({ status: 'rejected', authorized: false, protocol: null, authorized_at: null, issuer_address: null })), Date.now());
+    const auth = nextNfceRecord('o', rejected, doc(authorizedBody()), Date.now());
+    expect(auth.issuer_address?.street).toBe('Rua das Missoes');
+    expect(serverNfceDocument(auth)?.issuer_address?.street).toBe('Rua das Missoes');
+    // Autorizada com o endereço ainda ausente (XML não buscado): não herda o da contingência.
+    const noAddr = nextNfceRecord('o', rejected, doc(authorizedBody({ issuer_address: null })), Date.now());
+    expect(noAddr.issuer_address).toBeNull();
+    // Depois de autorizada, resposta com outro endereço não troca o gravado.
+    const again = nextNfceRecord('o', auth, doc(authorizedBody({ issuer_address: OLD })), Date.now());
+    expect(again.issuer_address?.street).toBe('Rua das Missoes');
+  });
 });

@@ -316,6 +316,8 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
   const carry = keyChanged
     ? { protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, issued_at: null, payload: null, issuer: null, issuer_address: null, authorized_at: null }
     : base;
+  const frozenAuth = (base.status === 'authorized' || base.status === 'cancelled') && !keyChanged;
+  const printableStatus = outcome.status === 'authorized' || outcome.status === 'contingency' || outcome.status === 'cancelled';
   const merged = {
     status: outcome.status,
     environment: outcome.environment,
@@ -329,9 +331,11 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
     payload: outcome.payload ?? carry.payload,
     // Emitente de nota já autorizada (mesma chave) fica como chegou: o servidor também não o deixa mudar.
     issuer: (base.status === 'authorized' || base.status === 'cancelled') && !keyChanged && carry.issuer ? carry.issuer : (outcome.issuer ?? carry.issuer ?? null),
-    // Endereço e hora da autorização: vêm do documento autorizado; depois de gravados não mudam.
-    issuer_address: carry.issuer_address ?? outcome.issuer_address ?? null,
-    authorized_at: carry.authorized_at ?? outcome.authorized_at ?? null,
+    // Endereço e hora da autorização: depois de autorizada (mesma chave) ficam como chegaram, como no servidor.
+    // Antes disso (contingência rejeitada e reenviada com o cadastro corrigido) vale só o que o servidor
+    // devolve agora; nunca um endereço da tentativa anterior.
+    issuer_address: frozenAuth ? carry.issuer_address ?? outcome.issuer_address ?? null : printableStatus ? outcome.issuer_address ?? null : carry.issuer_address ?? null,
+    authorized_at: frozenAuth ? carry.authorized_at ?? outcome.authorized_at ?? null : printableStatus ? outcome.authorized_at ?? null : carry.authorized_at ?? null,
   };
   // Autorizada sem DANFE imprimível (falta dado ou o dado não confere com a chave): consulta (só leitura)
   // com intervalo crescente, até um limite. Contador próprio, a partir da primeira autorização.
