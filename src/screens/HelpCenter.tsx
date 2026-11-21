@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, ChevronRight, Info, Search, TriangleAlert, X } from 'lucide-react';
 import type { StaffUser, UserRole } from '../types';
 import { ROLE_LABEL } from '../lib/catalog';
@@ -132,6 +132,14 @@ export function HelpCenter({ user, onClose }: { user?: Pick<StaffUser, 'role'> |
   const [query, setQuery] = useState('');
   const [audience, setAudience] = useState<Audience | 'ALL'>(initial);
   const [openId, setOpenId] = useState<string | null>(null);
+
+  // As telas do app ficam montadas (escondidas) sob a ajuda e têm atalhos de teclado na janela (F2 cobra no PDV,
+  // F8 tira item, dígitos no PIN). Enquanto a ajuda está aberta, nenhuma tecla chega a elas; digitar na busca segue normal.
+  useEffect(() => {
+    const stop = (e: KeyboardEvent) => e.stopPropagation();
+    window.addEventListener('keydown', stop, true);
+    return () => window.removeEventListener('keydown', stop, true);
+  }, []);
 
   const results = useMemo(() => searchArticles(HELP_ARTICLES, query, audience), [query, audience]);
   const article = openId ? HELP_ARTICLES.find((a) => a.id === openId) : undefined;

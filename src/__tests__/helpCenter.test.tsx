@@ -93,6 +93,20 @@ describe('tela', () => {
     expect(closed).toBe(true);
   });
 
+  it('bloqueia os atalhos de teclado das telas escondidas (F2 do PDV) enquanto aberta', () => {
+    const seen: string[] = [];
+    const onKey = (e: KeyboardEvent) => seen.push(e.key);
+    window.addEventListener('keydown', onKey);
+    const { unmount } = render(<HelpCenter onClose={() => undefined} />);
+    fireEvent.keyDown(document.body, { key: 'F2' });
+    fireEvent.change(screen.getByPlaceholderText(/Buscar/), { target: { value: 'pin' } });
+    expect(seen).toEqual([]);
+    unmount();
+    fireEvent.keyDown(document.body, { key: 'F2' });
+    expect(seen).toEqual(['F2']);
+    window.removeEventListener('keydown', onKey);
+  });
+
   it('todo artigo renderiza sem erro', () => {
     for (const a of HELP_ARTICLES) {
       const { unmount } = render(<HelpCenter onClose={() => undefined} />);
