@@ -84,7 +84,7 @@ import {
 import { can, PERMISSION_LABEL } from '../lib/permissions';
 import { nowISO, stableUuid, uuid } from '../lib/ids';
 import { MAX_REVIEW_COMMENT } from '../lib/reviews';
-import { idbStorage, storedOnlyInMemory } from '../lib/idbStorage';
+import { idbPersistStorage, storedOnlyInMemory } from '../lib/idbStorage';
 import { createSeedData, DEMO_TENANT_ID, isQrSelfService, KIOSK_TABLE_ID, QR_SELF_SERVICE_PIN, SEED_STAFF, SEED_TENANT } from '../data/seed';
 import { nextPickupNumber, sanitizePickupName } from '../lib/kiosk';
 import { clearReviewHold, getReviewHold, getReviewHoldByKey, reviewHoldKey } from '../lib/payments/reviewHolds';
@@ -7013,7 +7013,7 @@ export const useTcheStore = create<TcheState>()(
       // v10 = entrega própria; v11 = avaliações dos clientes; v12 = resgate de cashback pela função do servidor.
       version: 12,
       migrate: (persisted, version) => migratePersisted(persisted, version) as TcheState,
-      storage: createJSONStorage(() => idbStorage),
+      storage: createJSONStorage(() => idbPersistStorage),
       partialize: (s) => {
         // Persistimos dados + estado do aparelho; funções e flag de hidratação ficam de fora.
         const { hydrated: _h, ...rest } = s;

@@ -558,3 +558,21 @@ export const idbStorage: StateStorage = hasIndexedDB
       },
     }
   : fallback;
+
+/**
+ * Armazenamento do persist do Zustand: a gravação automática que o `idbStorage` recusa (instância sem lock ou hidratação
+ * provisória) não vira rejeição solta (`void setItem()` do persist). A recusa já está publicada em `getStorageStatus`
+ * (tela bloqueada) e quem precisa saber antes de uma operação que não pode se perder confere por `awaitPersisted`, que lê
+ * de volta e só aceita o que voltou igual.
+ */
+export const idbPersistStorage: StateStorage = {
+  getItem: (k) => idbStorage.getItem(k),
+  removeItem: (k) => idbStorage.removeItem(k),
+  setItem: async (k, v) => {
+    try {
+      await idbStorage.setItem(k, v);
+    } catch (e) {
+      if (!(e instanceof StorageNotWritableError)) throw e;
+    }
+  },
+};

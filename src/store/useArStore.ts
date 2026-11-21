@@ -7,7 +7,7 @@
  */
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
-import { idbStorage } from '../lib/idbStorage';
+import { idbPersistStorage } from '../lib/idbStorage';
 import { nowISO, uuid } from '../lib/ids';
 import { AR_EVENTS_KEEP, normalizeComponents, validateArModel, type ArModelDraft } from '../lib/ar/arModels';
 import { PIZZA_DEMO_COMPONENTS, PIZZA_DEMO_DIAMETER_CM, PIZZA_DEMO_EXPLODE_ANIMATION, PIZZA_DEMO_GLB } from '../lib/ar/pizzaDemo';
@@ -152,7 +152,7 @@ export const useArStore = create<ArState>()(
     {
       name: 'tchefood-ar',
       version: 1,
-      storage: createJSONStorage(() => idbStorage),
+      storage: createJSONStorage(() => idbPersistStorage),
       partialize: (s) => ({ arModels: s.arModels, arEvents: s.arEvents, demoSeededTenants: s.demoSeededTenants }),
     },
   ),
