@@ -303,6 +303,24 @@ export function classifyTransmission(result: FocusResult): FocusNfceResponse {
   };
 }
 
+/** DV da chave: módulo 11, pesos 2..9; CNPJ alfanumérico (NT 2025.001): valor = ASCII - 48. Mesma conta de src/lib/nfce.ts. */
+export function accessKeyCheckDigit(key43: string): string {
+  let weight = 2;
+  let sum = 0;
+  for (let i = key43.length - 1; i >= 0; i--) {
+    sum += (key43.charCodeAt(i) - 48) * weight;
+    weight = weight === 9 ? 2 : weight + 1;
+  }
+  const mod = sum % 11;
+  return (mod < 2 ? 0 : 11 - mod).toString();
+}
+
+/** Chave de 44 posições com DV conferido; não corrige nem reconstrói a chave. */
+export function isValidAccessKey(key: string | null | undefined): key is string {
+  if (!key || !/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return false;
+  return accessKeyCheckDigit(key.slice(0, 43)) === key[43];
+}
+
 const QR_PORTALS: Readonly<Record<string, { host: string; path: string }>> = {
   '43': { host: 'www.sefaz.rs.gov.br', path: '/nfce/nfce-com.aspx' },
 };
@@ -314,7 +332,7 @@ const QR_PORTALS: Readonly<Record<string, { host: string; path: string }>> = {
 export function isValidQrCodeUrl(content: string | null, accessKey: string | null, environment?: 'homologacao' | 'producao' | null): boolean {
   if (!content || content.length > 1000 || /[\s<>"']/.test(content)) return false;
   const key = (accessKey ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '').replace(/^NFE/, '');
-  if (!/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return false;
+  if (!isValidAccessKey(key)) return false;
   let url: URL;
   try {
     url = new URL(content);
@@ -330,6 +348,7 @@ export function isValidQrCodeUrl(content: string | null, accessKey: string | nul
   const parts = p.split('|');
   if (parts[0] !== key) return false;
   // Versões do QR Code com tpAmb (chave|versão|tpAmb|...): o ambiente do QR precisa ser o da nota.
-  if (environment && parts.length >= 3 && parts[2] !== (environment === 'producao' ? '1' : '2')) return false;
+  // QR sem versão ou tpAmb (p=CHAVE|2) não é aceito quando o ambiente da nota é conhecido.
+  if (environment && (parts.length < 3 || !/^[23]$/.test(parts[1] ?? '') || parts[2] !== (environment === 'producao' ? '1' : '2'))) return false;
   return true;
 }

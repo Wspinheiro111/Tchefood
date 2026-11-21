@@ -14,7 +14,8 @@ import {
   type NfceSource,
   type PaymentRow,
 } from '../emit-nfce/payload.ts';
-import { classifyTransmission, createFocusClient, focusEnvironment, isValidQrCodeUrl, normalizeProviderStatus, parseAuthorizedXml, type FetchLike } from '../emit-nfce/focus.ts';
+import { classifyTransmission, createFocusClient, focusEnvironment, isValidAccessKey, isValidQrCodeUrl, normalizeProviderStatus, parseAuthorizedXml, type FetchLike } from '../emit-nfce/focus.ts';
+import { parseEmitResponse } from '../../../src/lib/sync/nfceEmission.ts';
 import { emitNfce, type NfceDocumentRow, type NfceRepository } from '../emit-nfce/emit.ts';
 import { parseDanfePayload, parseNfceIssuer } from '../../../src/lib/sync/nfceEmission.ts';
 
@@ -562,5 +563,78 @@ describe('achados do Codex no #63', () => {
     const r = await emitNfce({ repo, environment: 'homologacao' as const, focus, sha256Hex }, { tenantId: TENANT, orderId: ORDER });
     expect(r.body).toMatchObject({ status: 'contingency', contingency: true, authorized_at: null });
     expect(r.body.issuer_address).toMatchObject({ street: 'Rua das Flores', zip: '98800000' });
+  });
+});
+
+
+describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no aparelho', () => {
+  const BAD_DV = `${KEY.slice(0, 43)}7`; // DV certo é 0
+  const qr = (p: string) => `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${p}`;
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+
+  it('P2-01: QR sem versão/tpAmb, com tpAmb vazio ou de outro ambiente é recusado; o correto passa (versões 2 e 3), nos dois validadores', async () => {
+    const { isValidNfceQrCodeContent } = await import('../../../src/lib/nfce.ts');
+    const cases: Array<[string, boolean, 'homologacao' | 'producao']> = [
+      [`${KEY}`, false, 'homologacao'],
+      [`${KEY}|2`, false, 'homologacao'],
+      [`${KEY}|3`, false, 'homologacao'],
+      [`${KEY}|2||1|ABCDEF`, false, 'homologacao'],
+      [`${KEY}|3|`, false, 'homologacao'],
+      [`${KEY}|2|1|1|ABCDEF`, false, 'homologacao'],
+      [`${KEY}|3|1`, false, 'homologacao'],
+      [`${KEY}|4|2|1|ABCDEF`, false, 'homologacao'],
+      [`${KEY}|2|2|1|ABCDEF`, true, 'homologacao'],
+      [`${KEY}|3|2`, true, 'homologacao'],
+      [`${KEY}|2|1|1|ABCDEF`, true, 'producao'],
+      [`${KEY}|3|1`, true, 'producao'],
+      [`${KEY}|2`, false, 'producao'],
+    ];
+    for (const [p, expected, env] of cases) {
+      expect(isValidQrCodeUrl(qr(p), KEY, env), `servidor ${p} ${env}`).toBe(expected);
+      expect(isValidNfceQrCodeContent(qr(p), KEY, env), `aparelho ${p} ${env}`).toBe(expected);
+    }
+  });
+
+  it('P2-02: DV da chave: `...427` recusada e `...420` aceita, também com CNPJ alfanumérico, igual ao aparelho', async () => {
+    const dev = await import('../../../src/lib/nfce.ts');
+    expect(isValidAccessKey(KEY)).toBe(true);
+    expect(isValidAccessKey(BAD_DV)).toBe(false);
+    const alpha43 = `${KEY.slice(0, 6)}12ABC45678AB95${KEY.slice(20, 43)}`;
+    const good = alpha43 + dev.accessKeyCheckDigit(alpha43);
+    const bad = alpha43 + ((Number(dev.accessKeyCheckDigit(alpha43)) + 1) % 10);
+    for (const k of [KEY, BAD_DV, good, bad]) expect(isValidAccessKey(k), k).toBe(dev.isValidAccessKey(k));
+    expect(isValidAccessKey(good)).toBe(true);
+    expect(isValidAccessKey(bad)).toBe(false);
+  });
+
+  it('P2-02: resposta autorizada da Focus com chave de DV errado não vira autorizada nem grava a chave; com DV certo autoriza, e o aparelho entende igual', async () => {
+    const repoBad = new MemoryRepo(source());
+    const bad = fakeFocus([{ status: 201, body: { ...AUTHORIZED, chave_nfe: `NFe${BAD_DV}`, qrcode_url: qr(`${BAD_DV}|2|2|1|ABCDEF`) } }]);
+    const r = await emitNfce(deps(repoBad, bad.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'processing', authorized: false, access_key: null, qrcode_url: null });
+    expect(repoBad.doc).toMatchObject({ status: 'processing', access_key: null });
+    // O aparelho interpreta o retorno do servidor do mesmo jeito (sem desacordo).
+    expect(parseEmitResponse(r.httpStatus, JSON.stringify(r.body))).toMatchObject({ kind: 'document', status: 'processing', access_key: null });
+    const repoOk = new MemoryRepo(source());
+    const ok = fakeFocus([{ status: 201, body: AUTHORIZED }]);
+    const r2 = await emitNfce(deps(repoOk, ok.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r2.body).toMatchObject({ status: 'authorized', authorized: true, access_key: KEY });
+    expect(parseEmitResponse(r2.httpStatus, JSON.stringify(r2.body))).toMatchObject({ kind: 'document', status: 'authorized', access_key: KEY });
+  });
+
+  it('P2-03: Focus de homologação devolvendo QR de produção: o QR não é gravado e o documento autorizado não perde o estado', async () => {
+    const repo = new MemoryRepo(source());
+    const prodQr = qr(`${KEY}|2|1|1|ABCDEF`);
+    const first = fakeFocus([{ status: 201, body: { ...AUTHORIZED, qrcode_url: prodQr } }]);
+    const r = await emitNfce(deps(repo, first.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ status: 'authorized', authorized: true, qrcode_url: null });
+    expect(repo.doc?.qrcode_url).toBeNull();
+    // Consulta posterior com o QR certo completa; um QR de produção depois não sobrescreve o bom.
+    const second = fakeFocus([{ status: 200, body: AUTHORIZED }]);
+    await emitNfce(deps(repo, second.focus), { tenantId: TENANT, orderId: ORDER });
+    expect(repo.doc).toMatchObject({ status: 'authorized', qrcode_url: QR });
+    const third = fakeFocus([{ status: 200, body: { ...AUTHORIZED, qrcode_url: prodQr } }]);
+    const r3 = await emitNfce(deps(repo, third.focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r3.body).toMatchObject({ status: 'authorized', qrcode_url: QR });
   });
 });

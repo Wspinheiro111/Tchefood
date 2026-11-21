@@ -162,7 +162,8 @@ export function isValidNfceQrCodeContent(
   const parts = p.split('|');
   if (parts[0] !== key) return false;
   // Nas versões do QR Code com tpAmb (chave|versão|tpAmb|...), o ambiente do QR precisa ser o da nota.
-  if (environment && parts.length >= 3 && parts[2] !== (environment === 'producao' ? '1' : '2')) return false;
+  // QR sem versão ou tpAmb (p=CHAVE|2) não vale quando o ambiente da nota é conhecido.
+  if (environment && (parts.length < 3 || !/^[23]$/.test(parts[1] ?? '') || parts[2] !== (environment === 'producao' ? '1' : '2'))) return false;
   return true;
 }
 

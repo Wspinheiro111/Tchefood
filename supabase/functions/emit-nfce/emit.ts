@@ -23,6 +23,7 @@ import {
   type NfceDocumentStatus,
   type IssuerAddress,
   parseAuthorizedXml,
+  isValidAccessKey,
 } from './focus.ts';
 import { NfceValidationError, buildNfcePayload, canonicalJson, fiscalIssuedAt, issuerSnapshot, nfceReference, type NfceSource } from './payload.ts';
 
@@ -199,7 +200,10 @@ function failure(httpStatus: number, status: 'invalid' | 'not_found' | 'conflict
 }
 
 function providerFields(doc: NfceDocumentRow, next: NfceDocumentStatus, response: FocusNfceResponse): ProviderFields {
-  const accessKey = response.accessKey?.replace(/^NFe/i, '') ?? doc.access_key;
+  // Chave com DV errado não é gravada (nem reconstruída): vale a que o documento já tem, e "autorizado"
+  // sem chave válida fica em processamento para reconciliação (o aparelho aplica a mesma regra).
+  const rawKey = response.accessKey?.replace(/^NFe/i, '') ?? null;
+  const accessKey = rawKey === null ? doc.access_key : isValidAccessKey(rawKey) ? rawKey : doc.access_key;
   // QR Code só se for a URL assinada da SEFAZ para ESTA chave; url_danfe nunca é QR Code.
   const qr = response.qrCodeUrl && isValidQrCodeUrl(response.qrCodeUrl, accessKey, doc.environment) ? response.qrCodeUrl : doc.qrcode_url;
   return {
@@ -226,7 +230,7 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
   let fields = providerFields(doc, next, response);
   if (next === 'authorized' && (!fields.protocol || !fields.access_key)) {
     // "autorizado" sem protocolo/chave não é prova de autorização: fica em processamento.
-    fields = { ...fields, status: 'processing', sefaz_message: 'Focus respondeu autorizado sem protocolo ou chave. Consulte novamente.' };
+    fields = { ...fields, status: 'processing', sefaz_message: 'Focus respondeu autorizado sem protocolo ou com chave ausente/inválida. Consulte novamente.' };
   }
   const printable = fields.status === 'authorized' || fields.status === 'contingency';
   const needsAuthorizedAt = fields.status === 'authorized' && !doc.authorized_at;
