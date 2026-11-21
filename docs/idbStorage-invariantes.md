@@ -89,9 +89,16 @@ C. **`select` (getItem) só conclui numa seleção estável**: depois de qualque
   com o IndexedDB ilegível de forma permanente, a seleção seguinte devolve o mesmo valor pelas cópias e encerra o provisório
   (as gravações seguem só nas cópias); é o comportamento desenhado, não foi alterado.
 
-## Rodada 32: estorno por pagamento (SQL, não é IndexedDB)
+## Rodada 33: ciclo de vida de `payment_items` (SQL, não é IndexedDB)
 
-- Nenhuma mudança em IndexedDB. O servidor passa a saber quais itens cada pagamento quitou (`payment_items`), e só o item ligado a
-  pagamento estornado (e a nenhum aprovado) pode voltar a não pago pela cópia de um aparelho. Item sem vínculo (pagamento antigo,
-  lista ausente) nunca é desmarcado pela cópia: é o lado conservador. Limite conhecido: um aparelho que mente na lista pode
-  desmarcar item que ele mesmo declarou pago; item ligado a pagamento aprovado fica protegido.
+Nenhuma mudança em IndexedDB. Regras (ver o comentário da seção 6 de `db/schema_contas_aparelhos.sql`):
+
+1. Nenhuma atualização de aparelho desmarca item pago (gatilho sem exceção).
+2. A única desmarcação é do servidor, no estorno verificado da Point, só na transição APROVADO→ESTORNADO, só para itens ligados ao
+   pagamento estornado e não cobertos por outro pagamento aprovado. Repetir o estorno não desmarca de novo.
+3. `payment_items` só é gravada na criação do pagamento; reenvios (maior, menor, vazio, depois de estornado, concorrentes) não mudam vínculos.
+4. Pagamento sem vínculo (dinheiro sem lista, acerto de entregador, antigo) nunca desmarca item.
+
+Limites conhecidos: um aparelho que mente na lista na CRIAÇÃO só consegue ligar item da própria conta ao pagamento dele (e esse item só
+desmarca se aquele pagamento for estornado pelo Mercado Pago); a sinalização `tchefood.refund_unpay` só é gravada por funções do servidor
+(PostgREST não expõe `set_config`). Ordem de aplicação: a migração de contas vai depois das de pagamento.

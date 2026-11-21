@@ -4172,8 +4172,8 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(st().orderItems.find((i) => i.id === item.id)!.is_paid).toBe(true);
     });
 
-    /** Conta com dois itens, pagos por dois pagamentos em dinheiro (um item cada). */
-    async function twoItemsTwoPayments(tableN: number) {
+    /** Conta com dois itens ainda não pagos. */
+    async function twoItemsOrder(tableN: number) {
       login(CASHIER_PIN);
       const mesa = tableNo(tableN);
       await expectSynced(`mesa ${tableN}`);
@@ -4184,93 +4184,164 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       await expectSynced(`conta ${tableN}`);
       const [i1, i2] = st().orderItems.filter((i) => i.order_id === order.id);
       const total = st().orders.find((o) => o.id === order.id)!.remaining_balance;
-      const pay = async (amount: number, itemIds: string[]) => {
-        const key = `k-${crypto.randomUUID()}`;
-        await claimHere(order.id, key, 'CASH', 'CASH_DESK', amount);
-        const r = ok(st().registerPayment({
-          orderId: order.id, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null,
-          nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: key, item_ids: itemIds,
-        }));
-        await expectSynced(`pagamento ${tableN}`);
-        return r.payment;
-      };
       const half = Math.round(total * 50) / 100;
-      const payA = await pay(half, [i1!.id]);
-      const payB = await pay(Math.round((total - half) * 100) / 100, [i2!.id]);
-      expect(sql(`SELECT string_agg(is_paid::text, ',' ORDER BY id) FROM order_items WHERE order_id = '${order.id}'`)).toBe('true,true');
-      return { order, i1: i1!, i2: i2!, payA, payB };
+      const rest = Math.round((total - half) * 100) / 100;
+      return { order, i1: i1!, i2: i2!, half, rest };
     }
-    /** O que o servidor faz no estorno verificado da Point: pagamento REFUNDED e conta reaberta (sem os gatilhos, que exigem a Edge Function). */
-    function serverRefund(orderId: string, paymentId: string) {
+    /** Um pagamento em dinheiro pelo aparelho A, com a lista de itens que ele quita. */
+    async function payItems(tableN: number, orderId: string, amount: number, itemIds: string[]) {
+      const key = `k-${crypto.randomUUID()}`;
+      await claimHere(orderId, key, 'CASH', 'CASH_DESK', amount);
+      const r = ok(st().registerPayment({
+        orderId, amount, method: 'CASH', status: 'APPROVED', terminal_id: null, acquirer: 'CASH_DESK', acquirer_cnpj: null, card_brand: null,
+        nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: key, item_ids: itemIds,
+      }));
+      await expectSynced(`pagamento ${tableN}`);
+      return r.payment;
+    }
+    /** Conta com dois itens, pagos por dois pagamentos em dinheiro (um item cada). */
+    async function twoItemsTwoPayments(tableN: number) {
+      const { order, i1, i2, half, rest } = await twoItemsOrder(tableN);
+      const payA = await payItems(tableN, order.id, half, [i1.id]);
+      const payB = await payItems(tableN, order.id, rest, [i2.id]);
+      expect(sql(`SELECT string_agg(is_paid::text, ',' ORDER BY id) FROM order_items WHERE order_id = '${order.id}'`)).toBe('true,true');
+      return { order, i1, i2, payA, payB };
+    }
+    /**
+     * O que o servidor faz no estorno verificado da Point, menos a Edge Function (que o teste do estorno real, em
+     * paymentClaims.pg.test.ts, cobre): pagamento REFUNDED, conta reaberta e a desmarcação dos itens do pagamento
+     * pela função do servidor. Devolve quantos itens ela desmarcou.
+     */
+    function serverRefund(orderId: string, paymentId: string): number {
       sql(`ALTER TABLE payments DISABLE TRIGGER USER; UPDATE payments SET status = 'REFUNDED' WHERE id = '${paymentId}'; ALTER TABLE payments ENABLE TRIGGER USER;`);
       sql(`ALTER TABLE orders DISABLE TRIGGER USER; UPDATE orders SET status = 'PAYING', closed_at = NULL, paid_amount = (SELECT COALESCE(sum(amount), 0) FROM payments WHERE order_id = '${orderId}' AND status = 'APPROVED'), remaining_balance = total_amount - (SELECT COALESCE(sum(amount), 0) FROM payments WHERE order_id = '${orderId}' AND status = 'APPROVED') WHERE id = '${orderId}'; ALTER TABLE orders ENABLE TRIGGER USER;`);
+      return Number(sql(`SELECT tchefood_unpay_payment_items('${paymentId}')`));
     }
     const itemPaid = (id: string) => sql(`SELECT is_paid FROM order_items WHERE id = '${id}'`);
+    const pairs = (paymentId: string) => sql(`SELECT COALESCE(string_agg(item_id::text, ',' ORDER BY item_id), '') FROM payment_items WHERE payment_id = '${paymentId}'`);
     const unpayAs = async (id: string) => {
       const res = await rawB('PATCH', `order_items?id=eq.${id}`, { is_paid: false });
       expect(res.status, res.body).toBeLessThan(300);
     };
+    /** Reenvio (ou envio concorrente) do pagamento ao servidor com a lista dada, como a fila de um aparelho faria. */
+    const resend = (pay: { id: string; amount: number; idempotency_key: string | null }, orderId: string, itemIds: unknown[], status = 'APPROVED') =>
+      rawRpcA('tchefood_register_payment', { p_payment: { id: pay.id, tenant_id: TENANT, order_id: orderId, waiter_id: st().currentUserId, amount: pay.amount, status, method: 'CASH', acquirer: 'CASH_DESK', idempotency_key: pay.idempotency_key, item_ids: itemIds } });
 
     it('o pagamento grava os itens que quitou (payment_items), só da mesma conta (GPT r31 P0-01)', async () => {
-      const { payA, payB, i1, i2 } = await twoItemsTwoPayments(310);
-      expect(sql(`SELECT string_agg(payment_id || '>' || item_id, ',' ORDER BY item_id) FROM payment_items WHERE payment_id IN ('${payA.id}', '${payB.id}')`))
-        .toBe([[payA.id, i1.id], [payB.id, i2.id]].sort((a, b) => (a[1]! < b[1]! ? -1 : 1)).map(([p, i]) => `${p}>${i}`).join(','));
+      const { payA, payB, i1, i2 } = await twoItemsTwoPayments(330);
+      expect(pairs(payA.id)).toBe(i1.id);
+      expect(pairs(payB.id)).toBe(i2.id);
     });
 
-    it('estorna só o primeiro pagamento e manda is_paid=false para os dois itens: só o primeiro desmarca (GPT r31 P0-01)', async () => {
-      const { order, i1, i2, payA } = await twoItemsTwoPayments(311);
-      serverRefund(order.id, payA.id);
+    it('matriz 1: sem estorno, nenhuma atualização de aparelho desmarca item pago (regra única, sem exceção)', async () => {
+      const { i1, i2 } = await twoItemsTwoPayments(331);
       await unpayAs(i1.id);
       await unpayAs(i2.id);
-      expect(itemPaid(i1.id)).toBe('f');
-      expect(itemPaid(i2.id)).toBe('t'); // o pagamento B continua aprovado: o item continua pago
+      expect([itemPaid(i1.id), itemPaid(i2.id)]).toEqual(['t', 't']);
     });
 
-    it('atualização velha de cozinha do item que o pagamento aprovado ainda cobre não o desmarca, com estorno de outro pagamento na conta (GPT r31 P0-01)', async () => {
-      const { order, i1, i2, payA } = await twoItemsTwoPayments(312);
+    it('matriz 2: estorna só o pagamento A; o servidor desmarca só o item 1, e is_paid=false velho para os dois não muda o resto (GPT r31 P0-01)', async () => {
+      const { order, i1, i2, payA } = await twoItemsTwoPayments(332);
+      expect(serverRefund(order.id, payA.id)).toBe(1);
+      expect([itemPaid(i1.id), itemPaid(i2.id)]).toEqual(['f', 't']);
+      await unpayAs(i1.id);
+      await unpayAs(i2.id);
+      expect([itemPaid(i1.id), itemPaid(i2.id)]).toEqual(['f', 't']);
+    });
+
+    it('matriz 3: atualização velha de cozinha do item 2 (is_paid=false, andamento novo) mantém pago e aplica o andamento', async () => {
+      const { order, i2, payA } = await twoItemsTwoPayments(333);
       serverRefund(order.id, payA.id);
-      // A cozinha de B manda o item inteiro com a cópia velha (is_paid=false e andamento novo).
       const res = await rawB('PATCH', `order_items?id=eq.${i2.id}`, { is_paid: false, status: 'PREPARING' });
       expect(res.status, res.body).toBeLessThan(300);
       expect(sql(`SELECT is_paid || ' ' || status FROM order_items WHERE id = '${i2.id}'`)).toBe('true PREPARING');
-      // O item do pagamento estornado, pelo mesmo caminho, volta a não pago.
-      await unpayAs(i1.id);
-      expect(itemPaid(i1.id)).toBe('f');
     });
 
-    it('item coberto por dois pagamentos (um estornado, outro aprovado) continua pago; item pago de novo depois do estorno também (GPT r31 P0-01)', async () => {
-      const { order, i1, payA, payB } = await twoItemsTwoPayments(313);
+    it('matriz 4: item coberto por dois pagamentos (um estornado, outro aprovado) fica pago no estorno', async () => {
+      const { order, i1, payA, payB } = await twoItemsTwoPayments(334);
       sql(`INSERT INTO payment_items (payment_id, item_id) VALUES ('${payB.id}', '${i1.id}')`); // B também cobre o item 1
-      serverRefund(order.id, payA.id);
+      expect(serverRefund(order.id, payA.id)).toBe(0);
       await unpayAs(i1.id);
       expect(itemPaid(i1.id)).toBe('t');
     });
 
-    it('pagamento sem a lista de itens (antigo) ou com lista de outro pagamento: o estorno não desmarca nada (GPT r31 P0-01)', async () => {
-      login(CASHIER_PIN);
-      const mesa = tableNo(316);
-      await expectSynced('mesa 316');
-      const order = ok(st().openTable(mesa.id, 1, null));
-      const p = st().products.find((x) => x.id === productId)!;
-      ok(st().addToTray({ order_id: order.id, product_id: p.id, half_product_ids: [], quantity: 1, unit_price: p.price, modifiers: [], modifiers_unit_price: 0, meat_doneness: null, quick_tags: [], free_notes: '', sector: p.sector }));
-      ok(st().dispatchTray(order.id));
-      await expectSynced('conta 57');
-      const item = st().orderItems.find((i) => i.order_id === order.id)!;
-      const paid = await payCash(order.id); // item_ids: [] — nada ligado
-      await expectSynced('pagamento 57');
-      expect(sql(`SELECT count(*) FROM payment_items WHERE payment_id = '${paid.payment.id}'`)).toBe('0');
-      serverRefund(order.id, paid.payment.id);
-      await unpayAs(item.id);
-      expect(itemPaid(item.id)).toBe('t');
+    it('matriz 5 (GPT r32 P0-02): A estornado, o item volta a ser pago por recebimento SEM vínculo (dinheiro, acerto, antigo): atualização velha não o desmarca', async () => {
+      const { order, i1, payA } = await twoItemsTwoPayments(335);
+      expect(serverRefund(order.id, payA.id)).toBe(1);
+      expect(itemPaid(i1.id)).toBe('f');
+      // O caixa recebe de novo o item em dinheiro, pagamento aprovado sem lista (o que o fechamento da conta faz com o item).
+      sql(`UPDATE order_items SET is_paid = TRUE WHERE id = '${i1.id}'`);
+      expect(pairs(payA.id)).toBe(i1.id); // o vínculo histórico do A continua; ele não autoriza mais nada
+      await unpayAs(i1.id);
+      expect(itemPaid(i1.id)).toBe('t');
     });
 
-    it('aparelho que lista como seu um item de conta alheia ou cancelado: nada é ligado (GPT r31 P0-01)', async () => {
-      const { order, payA } = await twoItemsTwoPayments(314);
-      const other = await twoItemsTwoPayments(315);
-      // Reenvio do pagamento A (mesmo id) com itens de outra conta na lista: a função ignora o que não é da conta do pagamento.
-      const res = await rawRpcA('tchefood_register_payment', { p_payment: { id: payA.id, tenant_id: TENANT, order_id: order.id, waiter_id: st().currentUserId, amount: payA.amount, status: 'APPROVED', method: 'CASH', acquirer: 'CASH_DESK', idempotency_key: payA.idempotency_key, item_ids: [other.i1.id, 'nao-e-uuid'] } });
+    it('matriz 6: pagamento sem lista (antigo, dinheiro sem lista, acerto de entregador): o estorno não desmarca nada', async () => {
+      const { order, i1, i2 } = await twoItemsOrder(336);
+      const payAll = await payItems(336, order.id, st().orders.find((o) => o.id === order.id)!.remaining_balance, []);
+      expect(pairs(payAll.id)).toBe('');
+      expect(serverRefund(order.id, payAll.id)).toBe(0);
+      await unpayAs(i1.id);
+      await unpayAs(i2.id);
+      expect([itemPaid(i1.id), itemPaid(i2.id)]).toEqual(['t', 't']);
+    });
+
+    it('matriz 7: lista com item de conta alheia ou texto que não é UUID na criação: só o item válido é ligado', async () => {
+      const { order, i1, i2, half } = await twoItemsOrder(337);
+      const other = await twoItemsOrder(338);
+      const key = `k-${crypto.randomUUID()}`;
+      const pay = { id: crypto.randomUUID(), amount: half, idempotency_key: key };
+      await claimHere(order.id, key, 'CASH', 'CASH_DESK', half);
+      const res = await resend(pay, order.id, [i1.id, other.i1.id, 'nao-e-uuid', 42]);
       expect(res.status, res.body).toBeLessThan(300);
-      expect(sql(`SELECT count(*) FROM payment_items WHERE payment_id = '${payA.id}' AND item_id = '${other.i1.id}'`)).toBe('0');
+      expect(pairs(pay.id)).toBe(i1.id);
+      expect(itemPaid(i2.id)).toBe('f');
+    });
+
+    it('matriz 8 (GPT r32 P0-01): reenvio do pagamento com lista maior, menor ou vazia nunca acrescenta nem troca vínculos', async () => {
+      const { order, i1, i2, half } = await twoItemsOrder(339);
+      const pay = await payItems(339, order.id, half, [i1.id]);
+      expect(pairs(pay.id)).toBe(i1.id);
+      for (const list of [[i1.id, i2.id], [i2.id], [], [i1.id, i2.id, i2.id]]) {
+        const res = await resend(pay, order.id, list);
+        expect(res.status, res.body).toBeLessThan(300);
+        expect(pairs(pay.id)).toBe(i1.id);
+      }
+    });
+
+    it('matriz 9 (GPT r32 P0-01): reenvio depois de o pagamento estar REFUNDED também não acrescenta vínculo', async () => {
+      const { order, i1, i2, half } = await twoItemsOrder(340);
+      const pay = await payItems(340, order.id, half, [i1.id]);
+      serverRefund(order.id, pay.id);
+      for (const status of ['APPROVED', 'REFUNDED']) {
+        await resend(pay, order.id, [i1.id, i2.id], status); // aceito como reenvio ou recusado: o que importa é o vínculo
+        expect(pairs(pay.id)).toBe(i1.id);
+      }
+      // O item 2 nunca foi ligado: com o item pago por outro recebimento, o estorno não o alcança.
+      sql(`UPDATE order_items SET is_paid = TRUE WHERE id = '${i2.id}'`);
+      await unpayAs(i2.id);
+      expect(itemPaid(i2.id)).toBe('t');
+    });
+
+    it('matriz 10 (GPT r32 P0-01): dois envios ao mesmo tempo do MESMO pagamento com listas diferentes: uma lista só é gravada', async () => {
+      const { order, i1, i2, half } = await twoItemsOrder(341);
+      const key = `k-${crypto.randomUUID()}`;
+      const id = crypto.randomUUID();
+      await claimHere(order.id, key, 'CASH', 'CASH_DESK', half);
+      const pay = { id, amount: half, idempotency_key: key };
+      const [r1, r2] = await Promise.all([resend(pay, order.id, [i1.id]), resend(pay, order.id, [i2.id])]);
+      expect([r1.status < 300, r2.status < 300], `${r1.body} | ${r2.body}`).toEqual([true, true]);
+      expect(sql(`SELECT count(*) FROM payments WHERE id = '${id}'`)).toBe('1');
+      expect([i1.id, i2.id]).toContain(pairs(id));
+      // Repetir com a lista que perdeu não a acrescenta.
+      await resend(pay, order.id, [i1.id, i2.id]);
+      expect([i1.id, i2.id]).toContain(pairs(id));
+    });
+
+    it('o servidor não ganha nada com o estorno de pagamento que não está REFUNDED: a função de desmarcar recusa (devolve 0)', async () => {
+      const { i1, payA } = await twoItemsTwoPayments(342);
+      expect(Number(sql(`SELECT tchefood_unpay_payment_items('${payA.id}')`))).toBe(0);
+      expect(itemPaid(i1.id)).toBe('t');
     });
 
     it('pagamento em A com a cópia velha do item não devolve à cozinha o item que B já entregou (Codex no PR #54)', async () => {

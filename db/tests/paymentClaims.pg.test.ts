@@ -2094,9 +2094,9 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
     });
   });
 
-  it('as duas migrations rodam de novo sem erro', () => {
+  it('as migrations de pagamento (e a de contas, que embrulha register_payment e o estorno) rodam de novo sem erro, nessa ordem', () => {
     const dir = join(ROOT, 'supabase', 'migrations');
-    for (const f of readdirSync(dir).filter((x) => x.includes('mercado_pago') || x.includes('point_reserva')).sort()) {
+    for (const f of readdirSync(dir).filter((x) => x.includes('mercado_pago') || x.includes('point_reserva') || x.includes('contas_aparelhos')).sort()) {
       expect(() => psqlFile(target!, join(dir, f), DB), f).not.toThrow();
     }
     const order = withItems(100);
@@ -2526,6 +2526,117 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       }
       expect(asDevice(`SELECT tchefood_point_charge_in_wait('${TENANT}', '${fresh.id}')`)).toMatchObject({ ok: false, sqlstate: '42501' });
       expect(sql(`SELECT p.provolatile::text || '|' || p.prosecdef FROM pg_proc p WHERE p.proname = 'tchefood_point_charge_in_wait'`)).toBe('s|true');
+    });
+  });
+
+  describe('GPT r32: o estorno verificado desmarca só os itens do pagamento estornado (payment_items), e mais nada desmarca item pago', () => {
+    /** Conta de R$ 100 com dois itens de R$ 50 (gravada direto, sem os gatilhos), ainda sem pagamento. */
+    function twoItems(): { order: string; i1: string; i2: string } {
+      const order = crypto.randomUUID();
+      const i1 = crypto.randomUUID();
+      const i2 = crypto.randomUUID();
+      sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${order}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}');
+           BEGIN; SET LOCAL session_replication_role = replica;
+           INSERT INTO order_items (id, order_id, product_id, waiter_id, quantity, unit_price, total_item_price, sector)
+           VALUES ('${i1}', '${order}', gen_random_uuid(), '${STAFF}', 1, 50, 50, 'NONE'), ('${i2}', '${order}', gen_random_uuid(), '${STAFF}', 1, 50, 50, 'NONE');
+           UPDATE orders SET charge_service_fee = false, subtotal_items = 100, total_amount = 100, paid_amount = 0, remaining_balance = 100 WHERE id = '${order}';
+           COMMIT;`);
+      return { order, i1, i2 };
+    }
+    /** Cobrança aprovada da Point com o pagamento registrado; `items` são os itens que ele quitou (vínculo gravado na criação). */
+    function paidBy(order: string, cents: number, items: string[]): { ch: { id: string; key: string }; payment: string } {
+      const ch = charge(order, 'approved', cents);
+      const r = mpPayment(ch.id);
+      expect(r.ok, r.message ?? '').toBe(true);
+      const payment = sql(`SELECT id FROM payments WHERE idempotency_key = '${ch.key}'`);
+      for (const it of items) sql(`UPDATE order_items SET is_paid = TRUE WHERE id = '${it}'; INSERT INTO payment_items (payment_id, item_id) VALUES ('${payment}', '${it}');`);
+      return { ch, payment };
+    }
+    const paidFlags = (...ids: string[]) => ids.map((id) => sql(`SELECT is_paid FROM order_items WHERE id = '${id}'`)).join(',');
+    const orderStatus = (order: string) => sql(`SELECT status FROM orders WHERE id = '${order}'`);
+    const deviceUnpay = (id: string) => {
+      const r = psql(target!, deviceQ(`UPDATE order_items SET is_paid = FALSE WHERE id = '${id}'`), DB);
+      expect(r.ok, r.message ?? '').toBe(true);
+    };
+
+    it('dois itens, dois pagamentos: estornar A desmarca só o item 1 (o 2 continua pago), a conta reabre e atualização velha de aparelho não muda nada', () => {
+      const { order, i1, i2 } = twoItems();
+      const a = paidBy(order, 5000, [i1]);
+      const b = paidBy(order, 5000, [i2]);
+      expect(orderStatus(order)).toBe('CLOSED');
+      expect(paidFlags(i1, i2)).toBe('t,t');
+      // Antes do estorno nenhum aparelho desmarca.
+      deviceUnpay(i1);
+      deviceUnpay(i2);
+      expect(paidFlags(i1, i2)).toBe('t,t');
+      const r = refundPoint(a.ch.id);
+      expect(r.ok, r.message ?? '').toBe(true);
+      expect(orderStatus(order)).toBe('PAYING');
+      expect(paidFlags(i1, i2)).toBe('f,t');
+      // O PATCH que o aparelho sobe depois do estorno (is_paid=false nos dois) é absorvido.
+      deviceUnpay(i1);
+      deviceUnpay(i2);
+      expect(paidFlags(i1, i2)).toBe('f,t');
+      expect(sql(`SELECT status FROM payments WHERE id = '${b.payment}'`)).toBe('APPROVED');
+    });
+
+    it('P0-02: item pago de novo por recebimento sem vínculo depois do estorno: atualização velha não o desmarca, e repetir o estorno não desmarca de novo', () => {
+      const { order, i1, i2 } = twoItems();
+      const a = paidBy(order, 5000, [i1]);
+      paidBy(order, 5000, [i2]);
+      const auth = authorized(a.ch.key);
+      expect(refundPoint(a.ch.id, {}, auth).ok).toBe(true);
+      expect(paidFlags(i1)).toBe('f');
+      // O caixa recebe o item de novo em dinheiro (pagamento aprovado sem lista) e a conta fecha: o item volta a pago.
+      sql(`UPDATE order_items SET is_paid = TRUE WHERE id = '${i1}'`);
+      deviceUnpay(i1);
+      expect(paidFlags(i1)).toBe('t');
+      // Repetição do mesmo estorno (cobrança já estornada) não grava nada nem desmarca.
+      for (const again of [refundPoint(a.ch.id, {}, auth), refundPoint(a.ch.id, {}, crypto.randomUUID())]) {
+        expect(again.ok, again.message ?? '').toBe(true);
+      }
+      expect(paidFlags(i1, i2)).toBe('t,t');
+    });
+
+    it('pagamento sem vínculo (antigo, dinheiro sem lista, acerto de entregador): o estorno não desmarca nada', () => {
+      const { order, i1, i2 } = twoItems();
+      const a = paidBy(order, 10000, []);
+      sql(`UPDATE order_items SET is_paid = TRUE WHERE order_id = '${order}'`);
+      expect(refundPoint(a.ch.id).ok).toBe(true);
+      expect(paidFlags(i1, i2)).toBe('t,t');
+      deviceUnpay(i1);
+      expect(paidFlags(i1, i2)).toBe('t,t');
+    });
+
+    it('item coberto por dois pagamentos (um estornado, outro aprovado): continua pago', () => {
+      const { order, i1, i2 } = twoItems();
+      const a = paidBy(order, 5000, [i1]);
+      const b = paidBy(order, 5000, [i2]);
+      sql(`INSERT INTO payment_items (payment_id, item_id) VALUES ('${b.payment}', '${i1}')`);
+      expect(refundPoint(a.ch.id).ok).toBe(true);
+      expect(paidFlags(i1, i2)).toBe('t,t');
+    });
+
+    it('o estorno recusado (prova do Mercado Pago não confere) não desmarca item algum', () => {
+      const { order, i1, i2 } = twoItems();
+      const a = paidBy(order, 5000, [i1]);
+      paidBy(order, 5000, [i2]);
+      const bad = refundPoint(a.ch.id, { mp_status: 'approved' });
+      expect(bad.ok).toBe(false);
+      expect(paidFlags(i1, i2)).toBe('t,t');
+      expect(sql(`SELECT status FROM payments WHERE id = '${a.payment}'`)).toBe('APPROVED');
+    });
+
+    it('o miolo do estorno (_core) e a função de desmarcar não são chamáveis por aparelho nem pela service role direta', () => {
+      for (const q of [
+        `SELECT 1 FROM tchefood_refund_point_payment_core('${TENANT}', gen_random_uuid(), '${STAFF}', 'motivo de teste ok', '{}'::jsonb, '{}'::jsonb)`,
+        `SELECT tchefood_unpay_payment_items(gen_random_uuid())`,
+      ]) {
+        const asDevice = psql(target!, deviceQ(q), DB);
+        expect(asDevice.out, q).toMatch(/recusado 42501/);
+        const asService = psql(target!, `${tryFn} BEGIN; SET LOCAL ROLE service_role; SELECT pg_temp.t($q$${q}$q$); COMMIT;`, DB);
+        expect(asService.out, q).toMatch(/recusado 42501/);
+      }
     });
   });
 
