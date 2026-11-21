@@ -887,3 +887,26 @@ describe('achados da auditoria (2ª rodada em 8c07a77, PR de correção do #55)'
     }
   });
 });
+
+describe('auditoria do #63 (r16): reenvio da rejeitada não mantém a chave da tentativa anterior', () => {
+  const KEY_B = '43261112345678000195650010000000431000000435';
+  const QR_B = `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${KEY_B}|2|2|1|ABCDEF0123456789ABCDEF0123456789ABCDEF01`;
+
+  it('P2-03: rejected (chave A) → processing com chave nula não mostra a chave A; a autorização seguinte (chave B) preenche só os dados novos', () => {
+    const rejected = nextNfceRecord('o', undefined, doc(authorizedBody({ status: 'rejected', authorized: false, protocol: null, authorized_at: null, issuer_address: null })), 1000);
+    expect(rejected).toMatchObject({ status: 'rejected', access_key: KEY });
+    const processing = nextNfceRecord('o', rejected, doc(authorizedBody({ status: 'processing', authorized: false, access_key: null, protocol: null, qrcode_url: null, danfe_path: null, authorized_at: null, issuer_address: null })), 2000);
+    expect(processing.status).toBe('processing');
+    expect(processing.access_key).toBeNull();
+    expect(processing.qrcode_url).toBeNull();
+    expect(processing.protocol).toBeNull();
+    const authorized = nextNfceRecord('o', processing, doc(authorizedBody({ access_key: KEY_B, qrcode_url: QR_B, number: 43, protocol: '143260000000099', authorized_at: AUTHORIZED_AT, issuer_address: ADDRESS })), 3000);
+    expect(authorized).toMatchObject({ status: 'authorized', access_key: KEY_B, protocol: '143260000000099', qrcode_url: QR_B });
+  });
+
+  it('P2-03: consulta de nota autorizada com chave ausente (resposta incompleta) não apaga a chave gravada', () => {
+    const auth = nextNfceRecord('o', undefined, doc(authorizedBody()), 1000);
+    const again = nextNfceRecord('o', auth, doc(authorizedBody({ status: 'processing', authorized: false, access_key: null, protocol: null })), 2000);
+    expect(again.access_key).toBe(KEY);
+  });
+});

@@ -196,10 +196,11 @@ function xmlTag(xml: string, tag: string): string | null {
 
 /**
  * Lê do XML AUTORIZADO o endereço do emitente (enderEmit) e a data de recebimento (dhRecbto),
- * conferindo que o XML é desta nota: Id do infNFe = chave e CNPJ do emitente = o da chave.
+ * conferindo que o XML é desta nota: Id do infNFe = chave, CNPJ do emitente = o da chave e, para a data,
+ * infProt com chNFe = chave e nProt = protocolo conhecido.
  * Qualquer divergência devolve null nos dois campos (o aparelho então não imprime pela bobina).
  */
-export function parseAuthorizedXml(xml: string | null, accessKey: string | null): { address: IssuerAddress | null; authorizedAt: string | null } {
+export function parseAuthorizedXml(xml: string | null, accessKey: string | null, protocol?: string | null): { address: IssuerAddress | null; authorizedAt: string | null } {
   const none = { address: null, authorizedAt: null };
   const key = (accessKey ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '').replace(/^NFE/, '');
   if (!xml || !/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return none;
@@ -221,7 +222,12 @@ export function parseAuthorizedXml(xml: string | null, accessKey: string | null)
       address = { street, number, complement: xmlTag(ender, 'xCpl'), district, city, state, zip };
     }
   }
-  const received = xmlTag(xml, 'dhRecbto');
+  // dhRecbto só do protocolo (infProt) DESTA nota: chNFe igual à chave e nProt igual ao protocolo conhecido.
+  const infProt = /<infProt\b[^>]*>([\s\S]*?)<\/infProt>/.exec(xml)?.[1] ?? '';
+  const protKey = xmlTag(infProt, 'chNFe');
+  const protNumber = xmlTag(infProt, 'nProt');
+  const protocolOk = protKey === key && (!protocol || protNumber === protocol.trim());
+  const received = protocolOk ? xmlTag(infProt, 'dhRecbto') : null;
   const ms = received && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(received) ? Date.parse(received) : NaN;
   return { address, authorizedAt: Number.isNaN(ms) ? null : new Date(ms).toISOString() };
 }
@@ -326,16 +332,25 @@ export function isValidAccessKey(key: string | null | undefined): key is string 
  * chave|2|tpAmb|cIdToken|cHashQRCode (5 campos, hash hexadecimal de 40), versão 2 offline (contingência)
  * chave|2|tpAmb|dia|vNF|digVal|cIdToken|cHashQRCode (8), versão 3 chave|3|tpAmb (3). Sem campos extras.
  */
-function qrParamsStructureOk(parts: string[]): boolean {
+function qrParamsStructureOk(parts: string[], accessKey: string): boolean {
   const hash = (v: string | undefined) => /^[0-9A-Fa-f]{40}$/.test(v ?? '');
+  // tpEmis da chave (posição 34): 1 = normal (online), 9 = contingência offline. A modalidade do QR tem de combinar.
+  const tpEmis = accessKey[34];
+  const online = parts.length === 5 || (parts[1] === '3' && parts.length === 3);
+  if (online ? tpEmis !== '1' : tpEmis !== '9') return false;
   if (parts[1] === '2') {
     if (parts.length === 5) return /^\d{1,6}$/.test(parts[3] ?? '') && hash(parts[4]);
     if (parts.length === 8) {
-      return /^\d{2}$/.test(parts[3] ?? '') && /^\d+(\.\d{1,2})?$/.test(parts[4] ?? '') && /^[0-9A-Fa-f]+$/.test(parts[5] ?? '') && /^\d{1,6}$/.test(parts[6] ?? '') && hash(parts[7]);
+      // digVal = DigestValue (28 caracteres base64) em hexadecimal: exatamente 56 hex.
+      return /^\d{2}$/.test(parts[3] ?? '') && /^\d+(\.\d{1,2})?$/.test(parts[4] ?? '') && /^[0-9A-Fa-f]{56}$/.test(parts[5] ?? '') && /^\d{1,6}$/.test(parts[6] ?? '') && hash(parts[7]);
     }
     return false;
   }
-  return parts[1] === '3' && parts.length === 3 && /^[12]$/.test(parts[2] ?? '');
+  if (parts[1] !== '3' || !/^[12]$/.test(parts[2] ?? '')) return false;
+  if (parts.length === 3) return true;
+  // 3.0 offline (NT 2025.001): 8 campos, com identificação do destinatário e assinatura. O leiaute exato dos campos
+  // extras não foi conferido com fixture oficial: aqui só se exige presença, charset seguro e tamanho.
+  return parts.length === 8 && parts.slice(3).every((v) => /^[A-Za-z0-9+/=_.-]{1,400}$/.test(v));
 }
 
 const QR_PORTALS: Readonly<Record<string, { host: string; path: string }>> = {
@@ -360,13 +375,20 @@ export function isValidQrCodeUrl(content: string | null, accessKey: string | nul
   // Portal da SEFAZ da UF da chave (mesma lista de src/lib/nfce.ts NFCE_QR_PORTALS); outro domínio .gov.br não vale.
   const portal = QR_PORTALS[key.slice(0, 2)];
   if (!portal || url.hostname.toLowerCase() !== portal.host || url.pathname.toLowerCase() !== portal.path) return false;
-  const p = url.searchParams.get('p');
+  // p lido cru: searchParams decodificaria '+' (válido em assinatura base64) como espaço.
+  const rawP = /[?&]p=([^&#]*)/.exec(url.search)?.[1];
+  let p: string | null = null;
+  try {
+    p = rawP ? decodeURIComponent(rawP) : null;
+  } catch {
+    return false;
+  }
   if (!p) return false;
   const parts = p.split('|');
   if (parts[0] !== key) return false;
   // Versões do QR Code com tpAmb (chave|versão|tpAmb|...): o ambiente do QR precisa ser o da nota.
   // Versão 2: chave|2|tpAmb|cIdToken|hash (5 campos); versão 3: chave|3|tpAmb (3). QR sem versão ou tpAmb (p=CHAVE|2) não é aceito quando o ambiente da nota é conhecido.
-  if (!qrParamsStructureOk(parts)) return false;
+  if (!qrParamsStructureOk(parts, key)) return false;
   if (environment && parts[2] !== (environment === 'producao' ? '1' : '2')) return false;
   return true;
 }

@@ -312,7 +312,10 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
     return { ...base, attempts, next_attempt_at: done ? null : retryAt, updated_at: ts };
   }
   // Chave nova (ex.: rejeitada e corrigida com outra numeração): nada da nota anterior completa esta.
-  const keyChanged = !!outcome.access_key && !!base.access_key && outcome.access_key !== base.access_key;
+  // Rejeitada que volta a andar (reenvio: o servidor zerou chave/protocolo/QR/endereço da tentativa anterior):
+  // nada da tentativa rejeitada vale para a nova, nem a chave quando o servidor ainda não devolveu outra.
+  const reopened = base.status === 'rejected' && outcome.status !== 'rejected';
+  const keyChanged = reopened || (!!outcome.access_key && !!base.access_key && outcome.access_key !== base.access_key);
   const carry = keyChanged
     ? { protocol: null, number: null, series: null, qrcode_url: null, danfe_path: null, issued_at: null, payload: null, issuer: null, issuer_address: null, authorized_at: null }
     : base;
@@ -321,7 +324,7 @@ export function nextNfceRecord(orderId: string, prev: NfceCloudRecord | undefine
   const merged = {
     status: outcome.status,
     environment: outcome.environment,
-    access_key: outcome.access_key ?? base.access_key,
+    access_key: outcome.access_key ?? (reopened ? null : base.access_key),
     protocol: outcome.protocol ?? (outcome.status === 'authorized' || outcome.status === 'cancelled' ? carry.protocol : null),
     number: outcome.number ?? carry.number,
     series: outcome.series ?? carry.series,

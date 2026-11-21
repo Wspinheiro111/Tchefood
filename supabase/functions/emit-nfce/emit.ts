@@ -235,6 +235,10 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
   let fields = providerFields(doc, next, response);
   const rawKeyInResponse = response.accessKey?.replace(/^NFe/i, '') ?? null;
   if ((next === 'authorized' || next === 'contingency') && rawKeyInResponse !== null && !isValidAccessKey(rawKeyInResponse)) {
+    // Nota já autorizada/cancelada não volta a processing (o trigger do banco proíbe): descarta o retorno inválido sem gravar.
+    if (!canTransition(doc.status, 'processing')) {
+      return respond(doc, 'Consulta inconclusiva: a Focus devolveu chave de acesso inválida (DV); o registro gravado foi mantido.');
+    }
     // Chave inválida na resposta: não autoriza com a chave de uma tentativa anterior; fica para reconciliar.
     fields = { ...fields, status: 'processing', sefaz_message: 'Focus respondeu autorizado com chave de acesso inválida (DV). Consulte novamente; a nota não foi confirmada.' };
   } else if (next === 'authorized' && (!fields.protocol || !fields.access_key)) {
@@ -246,7 +250,7 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
   if (printable && token && (needsAuthorizedAt || !doc.issuer_address)) {
     // Endereço e dhRecbto só do XML autorizado (conferido com a chave e o CNPJ); nunca do aparelho.
     const xml = await deps.focus(token).fetchXml?.(fields.xml_path ?? null);
-    const parsed = parseAuthorizedXml(xml ?? null, fields.access_key);
+    const parsed = parseAuthorizedXml(xml ?? null, fields.access_key, fields.protocol);
     fields = {
       ...fields,
       // Contingência ainda não tem autorização: só o endereço (a data nasce com a autorização).
