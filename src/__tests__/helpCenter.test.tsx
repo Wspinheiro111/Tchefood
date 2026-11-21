@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /** Central de ajuda: conteúdo válido, tabelas de acesso iguais ao código e tela funcionando. */
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { act, cleanup, fireEvent, render, renderHook, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { HelpCenter, searchArticles } from '../screens/HelpCenter';
@@ -33,6 +33,12 @@ describe('conteúdo', () => {
         expect(b.alt.length).toBeGreaterThan(5);
       }
     }
+  });
+
+  it('não sobra imagem sem uso em public/ajuda', () => {
+    const used = new Set(HELP_ARTICLES.flatMap((a) => a.blocks.flatMap((b) => (b.t === 'img' ? [b.src] : []))));
+    const files = readdirSync('public/ajuda').filter((f) => f.endsWith('.jpg'));
+    expect(files.filter((f) => !used.has(f))).toEqual([]);
   });
 
   it('cobre cadastro de pessoa, PIN e permissões', () => {
