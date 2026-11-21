@@ -2627,16 +2627,103 @@ describe.skipIf(!target)('auditoria r5: reserva de pagamento e fim verificado da
       expect(sql(`SELECT status FROM payments WHERE id = '${a.payment}'`)).toBe('APPROVED');
     });
 
-    it('o miolo do estorno (_core) e a função de desmarcar não são chamáveis por aparelho nem pela service role direta', () => {
+    it('os miolos (_core) do estorno e do registro e a função de desmarcar não são chamáveis por aparelho nem pela service role direta', () => {
       for (const q of [
         `SELECT 1 FROM tchefood_refund_point_payment_core('${TENANT}', gen_random_uuid(), '${STAFF}', 'motivo de teste ok', '{}'::jsonb, '{}'::jsonb)`,
         `SELECT tchefood_unpay_payment_items(gen_random_uuid())`,
+        `SELECT tchefood_register_payment_core('{}'::jsonb)`,
       ]) {
         const asDevice = psql(target!, deviceQ(q), DB);
         expect(asDevice.out, q).toMatch(/recusado 42501/);
         const asService = psql(target!, `${tryFn} BEGIN; SET LOCAL ROLE service_role; SELECT pg_temp.t($q$${q}$q$); COMMIT;`, DB);
         expect(asService.out, q).toMatch(/recusado 42501/);
       }
+    });
+
+    /** Pagamento da Point pelo caminho real do aparelho (tchefood_register_payment) para a cobrança aprovada, com a lista de itens que ele quitou. */
+    const mpRegisterJson = (order: string, ch: { id: string; key: string }, cents: number, itemIds: string[]) => payment(order, cents / 100, {
+      method: 'CREDIT', acquirer: 'MERCADO_PAGO', acquirer_cnpj: '10573521000191', terminal_id: TERMINAL, terminal_serial: MP_ID, card_brand: 'VISA',
+      nsu: chargeField(ch.id, 'external_payment_id'), authorization_code: chargeField(ch.id, 'authorization_code'), idempotency_key: ch.key, item_ids: itemIds,
+    });
+    const markPaidAsDevice = (id: string) => {
+      const r = psql(target!, deviceQ(`UPDATE order_items SET is_paid = TRUE WHERE id = '${id}'`), DB);
+      expect(r.ok, r.message ?? '').toBe(true);
+    };
+    const refundSession = (chId: string, authorization: string) =>
+      `BEGIN; SET LOCAL ROLE service_role; ${refundQ(chId, refundEvidence(chId, authorization))}; COMMIT;`;
+    const pinLockQ = `SELECT pg_advisory_xact_lock(hashtext('tchefood_manager_pin:' || '${TENANT}'))`;
+
+    it('GPT r33 P1-01 (sessões independentes): o pagamento chega enquanto o estorno espera a trava do PIN; o estorno o encontra, estorna e desmarca os itens dele; repetir não desmarca de novo', async () => {
+      const { order, i1, i2 } = twoItems();
+      const ch = charge(order, 'approved', 5000); // aprovada na Point, ainda SEM linha em payments
+      const auth = authorized(ch.key);
+      expect(sql(`SELECT count(*) FROM payments WHERE idempotency_key = '${ch.key}'`)).toBe('0');
+      const holder = session();
+      holder.send(`BEGIN; ${pinLockQ}; SELECT 'held';`);
+      await until('trava do PIN segura', () => holder.output().includes('held'));
+      const before = waiting();
+      const refund = session();
+      refund.end(refundSession(ch.id, auth));
+      await until('estorno esperando a trava do PIN dentro do miolo', () => waiting() === before + 1);
+      // Outro aparelho registra o pagamento (RPC real, com os itens) e marca o item pago, enquanto o estorno espera.
+      const reg = register(mpRegisterJson(order, ch, 5000, [i1]));
+      expect(reg.ok, reg.message ?? '').toBe(true);
+      markPaidAsDevice(i1);
+      expect(paidFlags(i1, i2)).toBe('t,f');
+      holder.end('COMMIT;');
+      await holder.done;
+      await refund.done;
+      const payId = sql(`SELECT id FROM payments WHERE idempotency_key = '${ch.key}'`);
+      expect(sql(`SELECT status FROM payments WHERE id = '${payId}'`)).toBe('REFUNDED');
+      expect(sql(`SELECT remaining_balance FROM orders WHERE id = '${order}'`)).toBe('100.00');
+      expect(sql(`SELECT item_id FROM payment_items WHERE payment_id = '${payId}'`)).toBe(i1);
+      expect(paidFlags(i1, i2)).toBe('f,f');
+      // Repetir o estorno (já concluído) não desmarca de novo o item que voltou a ser pago.
+      sql(`UPDATE order_items SET is_paid = TRUE WHERE id = '${i1}'`);
+      const again = psql(target!, refundSession(ch.id, auth), DB);
+      expect(again.ok, again.message ?? '').toBe(true);
+      expect(paidFlags(i1)).toBe('t');
+    }, 60_000);
+
+    it('GPT r33 item 4: fluxo da Point só por RPC real (registro com item_ids, estorno autorizado, recebimento B sem vínculo pela RPC real): atualização velha não desmarca', () => {
+      const { order, i1, i2 } = twoItems();
+      const ch = charge(order, 'approved', 5000);
+      const reg = register(mpRegisterJson(order, ch, 5000, [i1]));
+      expect(reg.ok, reg.message ?? '').toBe(true);
+      markPaidAsDevice(i1);
+      const payA = sql(`SELECT id FROM payments WHERE idempotency_key = '${ch.key}'`);
+      expect(sql(`SELECT string_agg(item_id::text, ',') FROM payment_items WHERE payment_id = '${payA}'`)).toBe(i1);
+      expect(refundPoint(ch.id).ok).toBe(true);
+      expect(paidFlags(i1, i2)).toBe('f,f');
+      expect(orderStatus(order)).toBe('OPEN');
+      // O caixa recebe de novo, em dinheiro, pela RPC real, sem lista de itens: a conta fecha e os itens ficam pagos.
+      const cash = payment(order, 100, { idempotency_key: key('b-sem-vinculo') });
+      expect(pay(cash).ok).toBe(true);
+      expect(orderStatus(order)).toBe('CLOSED');
+      expect(paidFlags(i1, i2)).toBe('t,t');
+      const payB = (JSON.parse(cash) as { id: string }).id;
+      expect(sql(`SELECT count(*) FROM payment_items WHERE payment_id = '${payB}'`)).toBe('0');
+      deviceUnpay(i1);
+      deviceUnpay(i2);
+      expect(paidFlags(i1, i2)).toBe('t,t');
+    });
+
+    it('reenvio real do pagamento (RPC) com lista idêntica, maior, menor ou vazia, também depois do estorno: os vínculos da criação não mudam', () => {
+      const { order, i1, i2 } = twoItems();
+      const ch = charge(order, 'approved', 5000);
+      const first = mpRegisterJson(order, ch, 5000, [i1]);
+      expect(register(first).ok).toBe(true);
+      const payA = sql(`SELECT id FROM payments WHERE idempotency_key = '${ch.key}'`);
+      const links = () => sql(`SELECT COALESCE(string_agg(item_id::text, ',' ORDER BY item_id), '') FROM payment_items WHERE payment_id = '${payA}'`);
+      const resend = (items: string[]) => register(JSON.stringify({ ...JSON.parse(first), item_ids: items }));
+      for (const list of [[i1], [i1, i2], [i2], []]) {
+        expect(resend(list).ok).toBe(true);
+        expect(sql(`SELECT count(*) FROM payments WHERE idempotency_key = '${ch.key}'`)).toBe('1');
+        expect(links()).toBe(i1);
+      }
+      expect(refundPoint(ch.id).ok).toBe(true);
+      resend([i1, i2]); // aceito como reenvio de estornado ou recusado: o vínculo é o que importa
+      expect(links()).toBe(i1);
     });
   });
 

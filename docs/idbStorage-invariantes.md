@@ -102,3 +102,13 @@ Nenhuma mudança em IndexedDB. Regras (ver o comentário da seção 6 de `db/sch
 Limites conhecidos: um aparelho que mente na lista na CRIAÇÃO só consegue ligar item da própria conta ao pagamento dele (e esse item só
 desmarca se aquele pagamento for estornado pelo Mercado Pago); a sinalização `tchefood.refund_unpay` só é gravada por funções do servidor
 (PostgREST não expõe `set_config`). Ordem de aplicação: a migração de contas vai depois das de pagamento.
+
+## Rodada 34: quem decide o desmarcar e o vínculo é a transição do miolo (SQL, não é IndexedDB)
+
+Nenhuma mudança em IndexedDB. As regras 1 a 4 da rodada 33 continuam; muda como os wrappers sabem o que aconteceu:
+
+5. Os wrappers `tchefood_register_payment` e `tchefood_refund_point_payment` não pegam trava nenhuma e não leem `payments` antes do
+   miolo. O gatilho `trg_payments_transition_note` anota, em variável local da transação, o pagamento que ESTA transação inseriu e o que
+   ela passou de APROVADO para ESTORNADO; o wrapper lê só essa anotação, depois do miolo.
+6. Ordem única de travas dos caminhos financeiros: ver `docs/travas-financeiras.md` (antes/depois da r33, e a inversão pré-existente
+   item → conta, que fica registrada para outro PR).

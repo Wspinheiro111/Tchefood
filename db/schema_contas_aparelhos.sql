@@ -347,13 +347,13 @@ CREATE TRIGGER trg_order_items_000_keg_order_lock BEFORE UPDATE OF status ON ord
 --     tchefood_unpay_payment_items desmarca os itens LIGADOS ao pagamento estornado (payment_items) que
 --     nenhum outro pagamento APROVADO também cobre. A função sinaliza o gatilho (tchefood.refund_unpay =
 --     id do pagamento) só durante o UPDATE, e o gatilho confere que o pagamento é REFUNDED e liga o item.
---     Só roda na transição APROVADO -> ESTORNADO: repetir o estorno (já estornado) não desmarca de novo.
+--     Só roda na transição APROVADO -> ESTORNADO que o gatilho de payments anotou NESTA transação: repetir o estorno não desmarca de novo.
 --     O PATCH is_paid=false que o aparelho sobe depois do estorno (mirrorServerPointRefund) é absorvido.
 --  3. payment_items é IMUTÁVEL: só é preenchida quando o pagamento é CRIADO (tchefood_register_payment,
 --     com item_ids do aparelho, só itens da própria conta e não cancelados). Reenvio do mesmo
 --     pagamento (igual, com lista maior ou menor, depois de estornado, ou dois ao mesmo tempo com
---     listas diferentes) nunca acrescenta nem troca vínculos: a trava por pagamento serializa os envios
---     e só quem cria o pagamento grava a lista.
+--     listas diferentes) nunca acrescenta nem troca vínculos: a trava da conta do miolo serializa os envios
+--     e só a chamada em que o gatilho anotou o INSERT grava a lista. Nenhuma trava nova: ver docs/travas-financeiras.md.
 --  4. Pagamento sem vínculo (dinheiro sem lista, acerto do entregador, antigo): nunca desmarca item
 --     por atualização de aparelho nem pelo estorno de outro pagamento. É o lado conservador.
 -- Caminhos legítimos que dependiam de desmarcar fora do estorno: nenhum no servidor (nenhuma função grava
@@ -385,31 +385,50 @@ BEGIN
         ALTER FUNCTION tchefood_register_payment(JSONB) RENAME TO tchefood_register_payment_core;
     END IF;
 END $$;
+-- Quem fez a transição, sem trava nenhuma: dois gatilhos de payments anotam, numa variável da TRANSAÇÃO (set_config local, desfeita
+-- junto com o rollback), o id do pagamento que ESTA transação inseriu e o que ela passou de APPROVED para REFUNDED. Os wrappers
+-- abaixo só leem essa anotação depois que o miolo terminou: nenhuma leitura de status antes das travas do miolo e nenhuma trava
+-- nova (GPT r33 P1-01 e P2-01).
+CREATE OR REPLACE FUNCTION tchefood_payment_transition_note()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        PERFORM set_config('tchefood.payments_created', COALESCE(current_setting('tchefood.payments_created', true), '') || NEW.id::text || ',', true);
+    ELSIF OLD.status::text = 'APPROVED' AND NEW.status::text = 'REFUNDED' THEN
+        PERFORM set_config('tchefood.payments_refunded', COALESCE(current_setting('tchefood.payments_refunded', true), '') || NEW.id::text || ',', true);
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_payments_transition_note ON payments;
+CREATE TRIGGER trg_payments_transition_note AFTER INSERT OR UPDATE OF status ON payments
+    FOR EACH ROW EXECUTE FUNCTION tchefood_payment_transition_note();
+
 CREATE OR REPLACE FUNCTION tchefood_register_payment(p_payment JSONB)
 RETURNS UUID
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
     v_id UUID;
     v_tenant UUID := tchefood_tenant();
-    v_pid TEXT := p_payment ->> 'id';
-    v_existed BOOLEAN := FALSE;
+    v_created TEXT;
 BEGIN
-    IF v_pid IS NOT NULL AND v_pid ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
-        -- Dois envios do mesmo pagamento (listas diferentes) passam um de cada vez: o segundo já encontra o pagamento criado.
-        PERFORM pg_advisory_xact_lock(hashtext('tchefood_payment_items:' || lower(v_pid)));
-        v_existed := EXISTS (SELECT 1 FROM payments WHERE id = v_pid::uuid);
-    END IF;
+    -- Nenhuma trava aqui: a ordem de travas é a do miolo (a conta, FOR UPDATE), a mesma do acerto do entregador.
     v_id := tchefood_register_payment_core(p_payment);
-    -- Só quem CRIOU o pagamento grava os vínculos; reenvio nunca acrescenta (a lista aceita na criação é a única).
-    IF NOT v_existed AND jsonb_typeof(p_payment -> 'item_ids') = 'array' THEN
-        INSERT INTO payment_items (payment_id, item_id)
-        SELECT p.id, i.id
-          FROM payments p
-          JOIN order_items i ON i.order_id = p.order_id AND i.status <> 'CANCELED'
-         WHERE p.id = v_id AND p.tenant_id = v_tenant
-           AND i.id IN (SELECT e::uuid FROM jsonb_array_elements_text(p_payment -> 'item_ids') AS e
-                         WHERE e ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
-        ON CONFLICT DO NOTHING;
+    v_created := COALESCE(current_setting('tchefood.payments_created', true), '');
+    -- Só a chamada em que o pagamento foi CRIADO (o gatilho anotou o INSERT desta transação) grava os vínculos, uma vez
+    -- (a anotação é consumida); reenvio, de outra transação ou da mesma, nunca acrescenta (a lista aceita na criação é a única).
+    IF v_id IS NOT NULL AND position(v_id::text || ',' IN v_created) > 0 THEN
+        PERFORM set_config('tchefood.payments_created', replace(v_created, v_id::text || ',', ''), true);
+        IF jsonb_typeof(p_payment -> 'item_ids') = 'array' AND NOT EXISTS (SELECT 1 FROM payment_items WHERE payment_id = v_id) THEN
+            INSERT INTO payment_items (payment_id, item_id)
+            SELECT p.id, i.id
+              FROM payments p
+              JOIN order_items i ON i.order_id = p.order_id AND i.status <> 'CANCELED'
+             WHERE p.id = v_id AND p.tenant_id = v_tenant
+               AND i.id IN (SELECT e::uuid FROM jsonb_array_elements_text(p_payment -> 'item_ids') AS e
+                             WHERE e ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+            ON CONFLICT DO NOTHING;
+        END IF;
     END IF;
     RETURN v_id;
 END;
@@ -439,8 +458,9 @@ END;
 $$;
 
 -- O estorno verificado da Point (a versão de db/schema_point_reserva.sql vira _core; o nome de sempre chama o miolo e,
--- só na transição APROVADO -> ESTORNADO desta chamada, desmarca os itens do pagamento). A trava por cobrança serializa
--- duas chamadas: a segunda encontra o pagamento já estornado e não desmarca de novo.
+-- só nos pagamentos que o gatilho de payments anotou como APROVADO -> ESTORNADO NESTA transação, desmarca os itens). Sem trava
+-- nem leitura própria: duas chamadas se serializam nas travas do miolo, e a segunda encontra o pagamento já estornado, não executa
+-- o UPDATE, não anota nada e não desmarca de novo.
 DO $$
 BEGIN
     IF to_regprocedure('tchefood_refund_point_payment_core(uuid, uuid, uuid, text, jsonb, jsonb)') IS NULL THEN
@@ -453,17 +473,19 @@ RETURNS terminal_charges
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
     v_charge terminal_charges%ROWTYPE;
-    v_pay UUID;
-    v_before TEXT;
+    v_refunded TEXT;
+    v_pay TEXT;
 BEGIN
-    PERFORM pg_advisory_xact_lock(hashtext('tchefood_refund_items:' || p_id::text));
-    SELECT p.id, p.status::text INTO v_pay, v_before
-      FROM terminal_charges c
-      JOIN payments p ON p.tenant_id = c.tenant_id AND p.idempotency_key = c.idempotency_key AND p.acquirer::text = 'MERCADO_PAGO'
-     WHERE c.id = p_id AND c.tenant_id = p_tenant;
+    -- Nenhuma trava nem leitura de status antes do miolo: ele trava (PIN da loja, conta, cobrança, pagamento) e só ele decide a
+    -- transição. O gatilho de payments anotou os pagamentos que ESTA transação passou de APPROVED para REFUNDED; repetir um
+    -- estorno já concluído não executa o UPDATE e, portanto, não anota nada (não desmarca de novo).
     v_charge := tchefood_refund_point_payment_core(p_tenant, p_id, p_staff, p_reason, p_patch, p_evidence);
-    IF v_pay IS NOT NULL AND v_before = 'APPROVED' THEN
-        PERFORM tchefood_unpay_payment_items(v_pay);
+    v_refunded := COALESCE(current_setting('tchefood.payments_refunded', true), '');
+    IF v_refunded <> '' THEN
+        PERFORM set_config('tchefood.payments_refunded', '', true);
+        FOREACH v_pay IN ARRAY string_to_array(trim(trailing ',' FROM v_refunded), ',') LOOP
+            PERFORM tchefood_unpay_payment_items(v_pay::uuid);
+        END LOOP;
     END IF;
     RETURN v_charge;
 END;
@@ -475,8 +497,12 @@ BEGIN
         REVOKE ALL ON FUNCTION tchefood_register_payment(JSONB) FROM PUBLIC, anon;
         GRANT EXECUTE ON FUNCTION tchefood_register_payment(JSONB) TO authenticated;
         REVOKE ALL ON FUNCTION tchefood_unpay_payment_items(UUID) FROM PUBLIC, anon, authenticated;
+        REVOKE ALL ON FUNCTION tchefood_payment_transition_note() FROM PUBLIC, anon, authenticated;
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
             REVOKE ALL ON FUNCTION tchefood_unpay_payment_items(UUID) FROM service_role;
+            REVOKE ALL ON FUNCTION tchefood_payment_transition_note() FROM service_role;
+            -- O servidor também entra pelo wrapper: o miolo sozinho registraria sem a anotação dos vínculos.
+            REVOKE ALL ON FUNCTION tchefood_register_payment_core(JSONB) FROM service_role;
         END IF;
         REVOKE ALL ON FUNCTION tchefood_refund_point_payment_core(UUID, UUID, UUID, TEXT, JSONB, JSONB) FROM PUBLIC, anon, authenticated;
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN

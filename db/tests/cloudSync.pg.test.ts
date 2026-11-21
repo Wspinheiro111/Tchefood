@@ -2575,6 +2575,15 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
     }
   }
 
+  /** Espera uma sessão (application_name) parada numa trava de linha ou de aviso; sem dormir um tempo fixo. */
+  const lockWaiting = (app: string) => `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = '${app}' AND wait_event_type = 'Lock')`;
+  const HOLDER_IDLE = `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = 'tchefood_holder' AND state = 'idle in transaction')`;
+  /** Segura a trava da conta (FOR UPDATE) numa sessão à parte: tudo que mexe na conta espera até o release. */
+  const holdOrder = (orderId: string) => holdLock(`SELECT 1 FROM orders WHERE id = '${orderId}' FOR UPDATE;`, HOLDER_IDLE);
+  /** Pagamento em dinheiro pelo caminho do aparelho (RPC), como texto SQL. */
+  const registerSql = (pay: { id: string; amount: number; idempotency_key: string | null }, orderId: string, itemIds: unknown[], waiter: string) =>
+    `SELECT tchefood_register_payment('${JSON.stringify({ id: pay.id, tenant_id: TENANT, order_id: orderId, waiter_id: waiter, amount: pay.amount, status: 'APPROVED', method: 'CASH', acquirer: 'CASH_DESK', idempotency_key: pay.idempotency_key, item_ids: itemIds, created_at: new Date().toISOString() })}'::jsonb);`;
+
   const AUDIT_SHARE_HELD = `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity s ON s.pid = l.pid
     WHERE s.application_name = 'tchefood_holder' AND l.locktype = 'relation' AND l.relation = 'audit_logs'::regclass AND l.mode = 'ShareLock' AND l.granted)`;
 
@@ -4323,19 +4332,25 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(itemPaid(i2.id)).toBe('t');
     });
 
-    it('matriz 10 (GPT r32 P0-01): dois envios ao mesmo tempo do MESMO pagamento com listas diferentes: uma lista só é gravada', async () => {
+    it('matriz 10 (GPT r32 P0-01, r33: sessões e barreira): dois envios do MESMO pagamento com listas diferentes, os dois esperando a conta: uma lista só é gravada', async () => {
       const { order, i1, i2, half } = await twoItemsOrder(341);
       const key = `k-${crypto.randomUUID()}`;
       const id = crypto.randomUUID();
       await claimHere(order.id, key, 'CASH', 'CASH_DESK', half);
       const pay = { id, amount: half, idempotency_key: key };
-      const [r1, r2] = await Promise.all([resend(pay, order.id, [i1.id]), resend(pay, order.id, [i2.id])]);
-      expect([r1.status < 300, r2.status < 300], `${r1.body} | ${r2.body}`).toEqual([true, true]);
+      const hold = await holdOrder(order.id);
+      const first = pinSession(registerSql(pay, order.id, [i1.id], st().currentUserId!), 'tf_envio_1');
+      await waitFor(lockWaiting('tf_envio_1'));
+      const second = pinSession(registerSql(pay, order.id, [i2.id], st().currentUserId!), 'tf_envio_2');
+      await waitFor(lockWaiting('tf_envio_2'));
+      await hold.release();
+      const [r1, r2] = await Promise.allSettled([first, second]);
+      expect([r1.status, r2.status], JSON.stringify([r1, r2])).toEqual(['fulfilled', 'fulfilled']);
       expect(sql(`SELECT count(*) FROM payments WHERE id = '${id}'`)).toBe('1');
-      expect([i1.id, i2.id]).toContain(pairs(id));
+      expect(pairs(id)).toBe(i1.id); // quem chegou primeiro na conta cria e grava a lista; o segundo é reenvio
       // Repetir com a lista que perdeu não a acrescenta.
       await resend(pay, order.id, [i1.id, i2.id]);
-      expect([i1.id, i2.id]).toContain(pairs(id));
+      expect(pairs(id)).toBe(i1.id);
     });
 
     it('o servidor não ganha nada com o estorno de pagamento que não está REFUNDED: a função de desmarcar recusa (devolve 0)', async () => {
@@ -5516,6 +5531,49 @@ async function raw(method: 'POST' | 'PATCH' | 'GET', path: string, body: unknown
       expect(a.status, a.body).toBe(200);
       expect(sql(`SELECT count(*) FROM payments WHERE order_id = '${cod.orderId}' AND status = 'APPROVED'`)).toBe('1');
     });
+
+    /**
+     * GPT r33 P2-01 (barreiras, as duas ordens de chegada): o acerto do entregador (que trava a conta e registra o recebimento da
+     * senha) e o envio do MESMO pagamento (mesmo id, chave entrega-<id>) por outro aparelho. Uma sessão segura a conta; as duas
+     * chamadas esperam nela em ordem controlada; ao soltar, sem 40P01, um pagamento só, sem vínculo duplicado e acerto gravado.
+     */
+    for (const settleFirst of [true, false]) {
+      it(`acerto do entregador × envio do mesmo pagamento (${settleFirst ? 'acerto chega primeiro' : 'envio chega primeiro'}): sem deadlock (40P01), um pagamento, acerto gravado`, async () => {
+        forgetPinFailures();
+        const cod = await nicoDelivers(`Rua 313, ${settleFirst ? 1 : 2}`, true);
+        const owed = owedOf(cod.orderId);
+        const terms = nicoTerms([cod.d.id], owed, CASHIER_PIN);
+        const payId = terms.p_payments[0]!.payment_id;
+        const settleSql = `SELECT tchefood_settle_courier('${terms.p_id}', '${terms.p_courier}', ARRAY['${cod.d.id}']::uuid[], ${owed}, ${terms.p_courier_fees}, '${terms.p_staff}', '${CASHIER_PIN}', '${JSON.stringify(terms.p_payments)}'::jsonb);`;
+        const sendSql = registerSql({ id: payId, amount: owed, idempotency_key: `entrega-${cod.d.id}` }, cod.orderId, [], cashierId());
+        const hold = await holdOrder(cod.orderId);
+        // Devolve a sessão embrulhada: devolver a promessa direto de uma função async a faria esperar o fim da sessão.
+        const start = async (app: string, body: string) => {
+          const run = pinSession(body, app);
+          run.catch(() => undefined); // o resultado é lido no allSettled abaixo
+          try {
+            await waitFor(lockWaiting(app));
+          } catch (e) {
+            await hold.release();
+            throw e;
+          }
+          return { run };
+        };
+        const settle = settleFirst ? await start('tf_acerto', settleSql) : null;
+        const send = await start('tf_envio', sendSql);
+        const settle2 = settle ?? (await start('tf_acerto', settleSql));
+        await hold.release();
+        const results = await Promise.allSettled([settle2.run, send.run]);
+        const text = JSON.stringify(results.map((r) => (r.status === 'rejected' ? `rejeitada: ${String(r.reason)}` : r.value)));
+        expect(text, text).not.toMatch(/40P01|deadlock/i);
+        expect(results.map((r) => r.status), text).toEqual(['fulfilled', 'fulfilled']);
+        expect(sql(`SELECT count(*) FROM payments WHERE id = '${payId}'`)).toBe('1');
+        expect(sql(`SELECT count(*) FROM payment_items WHERE payment_id = '${payId}'`)).toBe('0');
+        expect(sql(`SELECT count(*) FROM courier_settlements WHERE id = '${terms.p_id}'`)).toBe('1');
+        expect(unsettled([cod.d.id])).toBe('0');
+        expect(sql(`SELECT status || ' ' || remaining_balance FROM orders WHERE id = '${cod.orderId}'`)).toBe('CLOSED 0.00');
+      }, 60_000);
+    }
 
     it('acerto pela nuvem sem o recebimento de uma senha (app antigo) ou com outro valor: recusado, nada gravado (GPT, rodada 11 do PR #54)', async () => {
       forgetPinFailures();
