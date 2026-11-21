@@ -65,6 +65,7 @@ export function sanitizeFocusResponse(value: unknown): FocusNfceResponse {
     ? (r.protocolo_nota_fiscal as Record<string, unknown>)
     : null;
   const nested = str(details?.numero_protocolo, 80);
+  const topProtocol = str(r.protocolo, 80);
   const receivedRaw = str(details?.data_recebimento, 40);
   const receivedMs = receivedRaw && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(receivedRaw) ? Date.parse(receivedRaw) : NaN;
   return {
@@ -79,7 +80,8 @@ export function sanitizeFocusResponse(value: unknown): FocusNfceResponse {
     danfePath: str(r.caminho_danfe, 512),
     // QR Code de consulta assinado; url_danfe NÃO é o QR Code.
     qrCodeUrl: str(r.qrcode_url ?? r.url_qrcode, 2048),
-    authorizedAt: Number.isNaN(receivedMs) ? null : new Date(receivedMs).toISOString(),
+    // A data aninhada só vale para o protocolo a que pertence: se o topo e o aninhado divergem, não é aproveitada.
+    authorizedAt: Number.isNaN(receivedMs) || (topProtocol && nested && topProtocol !== nested) ? null : new Date(receivedMs).toISOString(),
     offlineContingency: typeof r.contingencia_offline === 'boolean' ? r.contingencia_offline : null,
     offlineContingencyEffective: typeof r.contingencia_offline_efetivada === 'boolean' ? r.contingencia_offline_efetivada : null,
   };
@@ -348,9 +350,18 @@ function qrParamsStructureOk(parts: string[], accessKey: string): boolean {
   }
   if (parts[1] !== '3' || !/^[12]$/.test(parts[2] ?? '')) return false;
   if (parts.length === 3) return true;
-  // 3.0 offline (NT 2025.001): 8 campos, com identificação do destinatário e assinatura. O leiaute exato dos campos
-  // extras não foi conferido com fixture oficial: aqui só se exige presença, charset seguro e tamanho.
-  return parts.length === 8 && parts.slice(3).every((v) => /^[A-Za-z0-9+/=_.-]{1,400}$/.test(v));
+  // 3.0 offline (Manual DANFE NFC-e 6.0), por posição: chave|3|tpAmb|dia|vNF|tp_idDest|idDest|assinatura.
+  // tp_idDest e idDest ficam ambos vazios (consumidor não identificado) ou ambos preenchidos
+  // (1 CNPJ, 2 CPF, 3 identificação estrangeira); a assinatura é Base64 (estrutura apenas, sem recalcular).
+  if (parts.length !== 8) return false;
+  const [, , , day, value, idType, id, signature] = parts;
+  if (!/^\d{2}$/.test(day ?? '') || !/^\d+(\.\d{1,2})?$/.test(value ?? '')) return false;
+  if (!(idType === '' && id === '')) {
+    const idOk = idType === '1' ? /^[0-9A-Z]{14}$/.test(id ?? '') : idType === '2' ? /^\d{11}$/.test(id ?? '') : idType === '3' ? /^[0-9A-Za-z]{5,20}$/.test(id ?? '') : false;
+    if (!idOk) return false;
+  }
+  const sig = signature ?? '';
+  return sig.length >= 40 && sig.length <= 400 && sig.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(sig);
 }
 
 const QR_PORTALS: Readonly<Record<string, { host: string; path: string }>> = {

@@ -234,6 +234,10 @@ async function apply(deps: EmitDeps, doc: NfceDocumentRow, response: FocusNfceRe
   }
   let fields = providerFields(doc, next, response);
   const rawKeyInResponse = response.accessKey?.replace(/^NFe/i, '') ?? null;
+  if (next === 'cancelled' && rawKeyInResponse !== null && !isValidAccessKey(rawKeyInResponse)) {
+    // Cancelamento sem chave válida não prova a identidade da nota (a chave gravada não pode ser reaproveitada como prova).
+    return respond(doc, 'Consulta inconclusiva: a Focus devolveu cancelamento com chave de acesso inválida (DV); o estado gravado foi mantido.');
+  }
   if ((next === 'authorized' || next === 'contingency') && rawKeyInResponse !== null && !isValidAccessKey(rawKeyInResponse)) {
     // Nota já autorizada/cancelada não volta a processing (o trigger do banco proíbe): descarta o retorno inválido sem gravar.
     if (!canTransition(doc.status, 'processing')) {

@@ -602,7 +602,7 @@ describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no apa
     const key9 = (() => { const k = `${KEY.slice(0, 34)}9${KEY.slice(35, 43)}`; return k + dev.accessKeyCheckDigit(k); })();
     expect(key9[34]).toBe('9');
     expect(isValidAccessKey(key9)).toBe(true);
-    const SIG = 'MEUCIQDabc123+/=xyz';
+    const SIG = `${'A+b/'.repeat(42)}Zg==`; // 172 caracteres Base64 (RSA 1024 → 128 bytes)
     const cases: Array<[string, string, boolean]> = [
       // [chave, p depois da chave, esperado] (ambiente homologação = tpAmb 2)
       [KEY, `|2|2|1|${H}`, true], // 2.0 online, tpEmis 1
@@ -615,12 +615,22 @@ describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no apa
       [KEY, `|2|2|09|15.50|${DIG56}|1|${H}`, false], // 2.0 offline com chave de emissão normal
       [KEY, `|3|2`, true], // 3.0 online
       [key9, `|3|2`, false], // 3.0 online com chave de contingência
-      [key9, `|3|2|09|15.50|12345678901|1|${SIG}`, true], // 3.0 offline (8 campos, destinatário e assinatura)
+      [key9, `|3|2|09|15.50|1|12345678000195|${SIG}`, true], // CNPJ
+      [key9, `|3|2|09|15.50|2|12345678901|${SIG}`, true], // CPF
+      [key9, `|3|2|09|15.50|3|AB12345|${SIG}`, true], // estrangeiro
+      [key9, `|3|2|09|15.50|||${SIG}`, true], // consumidor não identificado (campos 6 e 7 vazios), como no manual 6.0
+      [key9, `|3|2|09|15.50|12345678901|1|${SIG}`, false], // campos invertidos (CPF no lugar do tipo)
+      [key9, `|3|2|09|15.50|2||${SIG}`, false], // tipo sem identificação
+      [key9, `|3|2|09|15.50||12345678901|${SIG}`, false], // identificação sem tipo
+      [key9, `|3|2|09|15.50|2|1234567890|${SIG}`, false], // CPF com 10 dígitos
+      [key9, `|3|2|09|15.50|4|12345678901|${SIG}`, false], // tipo desconhecido
+      [key9, `|3|2|09|15.50|2|12345678901|${SIG.slice(0, 170)}`, false], // assinatura malformada (tamanho não múltiplo de 4)
+      [key9, `|3|2|09|15.50|2|12345678901|${'!'.repeat(172)}`, false], // assinatura fora do Base64
+      [key9, `|3|2|09|15.50|2|12345678901|`, false], // assinatura ausente
       [key9, `|3|2|09|15.50|12345678901|1`, false], // 7 campos
-      [key9, `|3|2|09||12345678901|1|${SIG}`, false], // campo vazio
-      [key9, `|3|2|09|15.50|123 456|1|${SIG}`, false], // charset inseguro
-      [KEY, `|3|2|09|15.50|12345678901|1|${SIG}`, false], // 3.0 offline com chave normal
-      [key9, `|3|1|09|15.50|12345678901|1|${SIG}`, false], // tpAmb de outro ambiente
+      [key9, `|3|2|9|15.50|2|12345678901|${SIG}`, false], // dia com 1 dígito
+      [KEY, `|3|2|09|15.50|2|12345678901|${SIG}`, false], // 3.0 offline com chave normal
+      [key9, `|3|1|09|15.50|2|12345678901|${SIG}`, false], // tpAmb de outro ambiente
     ];
     for (const [k, rest, expected] of cases) {
       const url = qr(`${k}${rest}`);
@@ -841,5 +851,56 @@ describe('auditoria do #63 (r16): consulta de nota autorizada com chave inválid
     repo.doc = { ...repo.doc!, status: 'rejected' };
     await repo.claimRejected('d1', repo.doc.transmissions, 'h2');
     expect(repo.doc).toMatchObject({ danfe_path: null, xml_path: null });
+  });
+});
+
+
+describe('auditoria do #63 (r17): cancelamento com chave inválida e data de protocolo divergente', () => {
+  class GuardedRepo extends MemoryRepo {
+    override async saveProviderResult(id: string, expected: string, expectedTransmissions: number, fields: Partial<NfceDocumentRow>) {
+      // Reproduz o gatilho: cancelamento só de nota com chave e protocolo; processing não vem de authorized.
+      if (this.doc?.status === 'authorized' && fields.status === 'processing') throw new Error('trigger');
+      return super.saveProviderResult(id, expected, expectedTransmissions, fields);
+    }
+  }
+  const deps = (repo: MemoryRepo, focus: ReturnType<typeof fakeFocus>['focus']) => ({ repo, environment: 'homologacao' as const, focus, sha256Hex });
+  const BAD = `${KEY.slice(0, 43)}7`;
+  const INCOMPLETE = { ...AUTHORIZED, qrcode_url: null }; // autorizada sem QR: precisa de consulta de reconciliação
+  const CANCELLED = { ...AUTHORIZED, status: 'cancelado' };
+
+  it('P1-01: retorno cancelado com chave de DV inválido não cancela nota autorizada nem em processamento', async () => {
+    const auth = new GuardedRepo(source());
+    await emitNfce(deps(auth, fakeFocus([{ status: 201, body: INCOMPLETE }], null).focus), { tenantId: TENANT, orderId: ORDER });
+    const before = { ...auth.doc! };
+    const r = await emitNfce(deps(auth, fakeFocus([{ status: 200, body: { ...CANCELLED, chave_nfe: `NFe${BAD}` } }]).focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r.body).toMatchObject({ status: 'authorized', access_key: KEY });
+    expect(String(r.body.message)).toMatch(/inconclusiva/i);
+    expect(auth.doc).toEqual(before);
+    const proc = new GuardedRepo(source());
+    await emitNfce(deps(proc, fakeFocus([{ status: 201, body: { status: 'processando_autorizacao' } }]).focus), { tenantId: TENANT, orderId: ORDER });
+    const r2 = await emitNfce(deps(proc, fakeFocus([{ status: 200, body: { ...CANCELLED, chave_nfe: `NFe${BAD}` } }]).focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+    expect(r2.body.status).toBe('processing');
+    expect(proc.doc?.status).toBe('processing');
+  });
+
+  it('P1-01 (contraprova): cancelado com chave válida (ou sem chave) continua cancelando', async () => {
+    for (const body of [CANCELLED, { ...CANCELLED, chave_nfe: undefined }]) {
+      const repo = new GuardedRepo(source());
+      await emitNfce(deps(repo, fakeFocus([{ status: 201, body: INCOMPLETE }], null).focus), { tenantId: TENANT, orderId: ORDER });
+      await emitNfce(deps(repo, fakeFocus([{ status: 200, body }]).focus), { tenantId: TENANT, orderId: ORDER, consultOnly: true });
+      expect(repo.doc?.status).toBe('cancelled');
+    }
+  });
+
+  it('P2-02: protocolo principal A com número aninhado B e data de B: authorized_at fica nulo; com protocolos iguais a data é gravada', async () => {
+    const nestedBody = (nested: string) => ({ ...AUTHORIZED, protocolo: '111', protocolo_nota_fiscal: { numero_protocolo: nested, data_recebimento: '2026-11-09T03:03:00-03:00' } });
+    const xmlOther = authorizedXml(KEY, { nprot: '222', dh: '2026-11-09T03:03:00-03:00' }); // XML não confirma o protocolo 111
+    const diverge = new MemoryRepo(source());
+    const r = await emitNfce(deps(diverge, fakeFocus([{ status: 201, body: nestedBody('222') }], xmlOther).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(r.body).toMatchObject({ protocol: '111', authorized_at: null });
+    expect(parseAuthorizedXml(xmlOther, KEY, '111').authorizedAt).toBeNull();
+    const same = new MemoryRepo(source());
+    const ok = await emitNfce(deps(same, fakeFocus([{ status: 201, body: nestedBody('111') }], authorizedXml(KEY, { nprot: '111', dh: '2026-11-09T03:03:00-03:00' })).focus), { tenantId: TENANT, orderId: ORDER });
+    expect(ok.body).toMatchObject({ protocol: '111', authorized_at: '2026-11-09T06:03:00.000Z' });
   });
 });
