@@ -123,6 +123,11 @@ export function buildConsultaQrUrl(key: string, tenant: Pick<Tenant, 'csc_id' | 
 
 export const CONSULTA_URL_RS = 'www.sefaz.rs.gov.br/nfce/consulta';
 
+/** cIdToken (ID do CSC): até 6 dígitos, sem zeros não significativos (manual DANFE NFC-e 6.0, Tabela 2). */
+const CSC_ID = /^[1-9]\d{0,5}$/;
+/** vNF do QR offline: até 15 bytes, ponto decimal e até 2 casas, sem zeros à esquerda não significativos (Tabela 3). */
+const vNfOk = (v: string | undefined): boolean => !!v && v.length <= 15 && /^(0|[1-9]\d*)(\.\d{1,2})?$/.test(v);
+
 /**
  * Estrutura do parâmetro p do QR Code NFC-e (sem recalcular assinatura/CSC): versão 2 online
  * chave|2|tpAmb|cIdToken|cHashQRCode (5 campos, hash hexadecimal de 40), versão 2 offline (contingência)
@@ -135,10 +140,10 @@ function qrParamsStructureOk(parts: string[], accessKey: string): boolean {
   const online = parts.length === 5 || (parts[1] === '3' && parts.length === 3);
   if (online ? tpEmis !== '1' : tpEmis !== '9') return false;
   if (parts[1] === '2') {
-    if (parts.length === 5) return /^\d{1,6}$/.test(parts[3] ?? '') && hash(parts[4]);
+    if (parts.length === 5) return CSC_ID.test(parts[3] ?? '') && hash(parts[4]);
     if (parts.length === 8) {
       // digVal = DigestValue (28 caracteres base64) em hexadecimal: exatamente 56 hex.
-      return /^(0[1-9]|[12]\d|3[01])$/.test(parts[3] ?? '') && /^\d+(\.\d{1,2})?$/.test(parts[4] ?? '') && /^[0-9A-Fa-f]{56}$/.test(parts[5] ?? '') && /^\d{1,6}$/.test(parts[6] ?? '') && hash(parts[7]);
+      return /^(0[1-9]|[12]\d|3[01])$/.test(parts[3] ?? '') && vNfOk(parts[4]) && /^[0-9A-Fa-f]{56}$/.test(parts[5] ?? '') && CSC_ID.test(parts[6] ?? '') && hash(parts[7]);
     }
     return false;
   }
@@ -146,13 +151,13 @@ function qrParamsStructureOk(parts: string[], accessKey: string): boolean {
   if (parts.length === 3) return true;
   // 3.0 offline (Manual DANFE NFC-e 6.0), por posição: chave|3|tpAmb|dia|vNF|tp_idDest|idDest|assinatura.
   // tp_idDest e idDest ficam ambos vazios (consumidor não identificado) ou ambos preenchidos
-  // (1 CNPJ, 2 CPF, 3 estrangeiro, cujo idDest pode ficar vazio); a assinatura é Base64 ou Base64 URL-safe (`_` e `-`),
+  // (1 CNPJ, 2 CPF; 3 estrangeiro exige idDest vazio, Tabela 7); a assinatura é Base64 ou Base64 URL-safe (`_` e `-`),
   // só estrutura e tamanho, sem recalcular.
   if (parts.length !== 8) return false;
   const [, , , day, value, idType, id, signature] = parts;
-  if (!/^(0[1-9]|[12]\d|3[01])$/.test(day ?? '') || !/^\d+(\.\d{1,2})?$/.test(value ?? '')) return false;
+  if (!/^(0[1-9]|[12]\d|3[01])$/.test(day ?? '') || !vNfOk(value)) return false;
   if (!(idType === '' && id === '')) {
-    const idOk = idType === '1' ? /^[0-9A-Z]{14}$/.test(id ?? '') : idType === '2' ? /^\d{11}$/.test(id ?? '') : idType === '3' ? id === '' || /^[0-9A-Za-z]{5,20}$/.test(id ?? '') : false;
+    const idOk = idType === '1' ? /^[0-9A-Z]{14}$/.test(id ?? '') : idType === '2' ? /^\d{11}$/.test(id ?? '') : idType === '3' ? id === '' : false;
     if (!idOk) return false;
   }
   const sig = signature ?? '';

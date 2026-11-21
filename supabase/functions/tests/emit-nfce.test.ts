@@ -617,7 +617,7 @@ describe('auditoria do #63 (r8): QR e chave validados igual no servidor e no apa
       [key9, `|3|2`, false], // 3.0 online com chave de contingência
       [key9, `|3|2|09|15.50|1|12345678000195|${SIG}`, true], // CNPJ
       [key9, `|3|2|09|15.50|2|12345678901|${SIG}`, true], // CPF
-      [key9, `|3|2|09|15.50|3|AB12345|${SIG}`, true], // estrangeiro
+      [key9, `|3|2|09|15.50|3|AB12345|${SIG}`, false], // estrangeiro com idDest preenchido (Tabela 7 exige vazio)
       [key9, `|3|2|09|15.50|||${SIG}`, true], // consumidor não identificado (campos 6 e 7 vazios), como no manual 6.0
       [key9, `|3|2|09|15.50|12345678901|1|${SIG}`, false], // campos invertidos (CPF no lugar do tipo)
       [key9, `|3|2|09|15.50|2||${SIG}`, false], // tipo sem identificação
@@ -917,7 +917,7 @@ describe('auditoria do #63 (r18): QR 3.0 offline (estrangeiro, assinatura URL-sa
     const base = `|3|2|09|15.50`;
     const cases: Array<[string, boolean]> = [
       [`${base}|3||${URLSAFE}`, true], // estrangeiro, idDest vazio (manual 6.0 §4.4.2)
-      [`${base}|3|AB12345|${SIG}`, true], // estrangeiro com identificação
+      [`${base}|3|AB12345|${SIG}`, false], // estrangeiro com idDest preenchido: Tabela 7 exige vazio
       [`${base}|||${URLSAFE}`, true], // consumidor não identificado
       [`${base}|1|12345678000195|${SIG}`, true], // CNPJ
       [`${base}|2|12345678901|${SIG}`, true], // CPF
@@ -926,7 +926,6 @@ describe('auditoria do #63 (r18): QR 3.0 offline (estrangeiro, assinatura URL-sa
       [`${base}|1||${SIG}`, false], // CNPJ sem número
       [`${base}|2||${SIG}`, false], // CPF sem número
       [`${base}||12345678901|${SIG}`, false], // identificação sem tipo
-      [`${base}|3|AB1|${SIG}`, false], // estrangeiro com id curto demais
       [`${base}|3||${SIG.slice(0, 170)}`, false], // assinatura truncada
       [`${base}|3||`, false], // assinatura vazia
       [`${base}|3||${'A'.repeat(171)}!`, false], // caractere proibido
@@ -966,5 +965,47 @@ describe('auditoria do #63 (r18): QR 3.0 offline (estrangeiro, assinatura URL-sa
       .replace('<protNFe>', `<protNFe><infProt><chNFe>${other}</chNFe><dhRecbto>2026-02-02T00:00:00-03:00</dhRecbto><nProt>143260000000001</nProt></infProt></protNFe><protNFe>`);
     expect(parseAuthorizedXml(xml, KEY, '143260000000001').authorizedAt).toBe('2026-11-09T06:00:07.000Z');
     expect(parseAuthorizedXml(xml, KEY, '143260000000555').authorizedAt).toBeNull();
+  });
+});
+
+
+describe('auditoria do #63 (r19): matriz única do QR Code (Tabelas 2, 3, 6 e 7 do manual 6.0), idêntica no servidor e no aparelho', () => {
+  const qr = (p: string) => `https://www.sefaz.rs.gov.br/NFCE/NFCE-COM.aspx?p=${p}`;
+  const H = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
+  const DIG = 'AB'.repeat(28);
+  const SIG = `${'A-b_'.repeat(42)}Zg==`;
+
+  it('aceita/recusa por campo: cIdToken, hash, digVal, dia, vNF, tpAmb, tp_idDest/idDest e assinatura', async () => {
+    const dev = await import('../../../src/lib/nfce.ts');
+    const key9 = (() => { const k = `${KEY.slice(0, 34)}9${KEY.slice(35, 43)}`; return k + dev.accessKeyCheckDigit(k); })();
+    // [chave, resto do p, esperado]
+    const rows: Array<[string, string, boolean]> = [
+      // 2.0 online: chave|2|tpAmb|cIdToken|hash
+      [KEY, `|2|2|1|${H}`, true], [KEY, `|2|2|999999|${H}`, true], [KEY, `|2|2|000001|${H}`, false], [KEY, `|2|2|01|${H}`, false],
+      [KEY, `|2|2|0|${H}`, false], [KEY, `|2|2|1000000|${H}`, false], [KEY, `|2|2|1a|${H}`, false], [KEY, `|2|2|1|${H.slice(0, 39)}`, false],
+      [KEY, `|2|2|1|${H}0`, false], [KEY, `|2|0|1|${H}`, false], [KEY, `|2|3|1|${H}`, false],
+      // 2.0 offline: chave|2|tpAmb|dia|vNF|digVal|cIdToken|hash
+      [key9, `|2|2|09|15.50|${DIG}|1|${H}`, true], [key9, `|2|2|09|15.50|${DIG}|000001|${H}`, false], [key9, `|2|2|09|0.00|${DIG}|1|${H}`, true],
+      [key9, `|2|2|09|100|${DIG}|1|${H}`, true], [key9, `|2|2|09|015.50|${DIG}|1|${H}`, false], [key9, `|2|2|09|15.5|${DIG}|1|${H}`, true],
+      [key9, `|2|2|09|15.505|${DIG}|1|${H}`, false], [key9, `|2|2|09|-1.00|${DIG}|1|${H}`, false],
+      [key9, `|2|2|09|123456789012.34|${DIG}|1|${H}`, true], // 15 bytes (limite)
+      [key9, `|2|2|09|1234567890123.45|${DIG}|1|${H}`, false], // 16 bytes
+      [key9, `|2|2|00|15.50|${DIG}|1|${H}`, false], [key9, `|2|2|32|15.50|${DIG}|1|${H}`, false], [key9, `|2|2|9|15.50|${DIG}|1|${H}`, false],
+      [key9, `|2|2|09|15.50|${'AB'.repeat(27)}|1|${H}`, false], [key9, `|2|2|09|15.50|${'ZZ'.repeat(28)}|1|${H}`, false],
+      // 3.0 online e offline
+      [KEY, `|3|2`, true], [KEY, `|3|1`, false], [KEY, `|3|0`, false], [KEY, `|3|2|`, false],
+      [key9, `|3|2|09|15.50|||${SIG}`, true], [key9, `|3|2|09|15.50|3||${SIG}`, true], [key9, `|3|2|09|15.50|3|AB12345|${SIG}`, false],
+      [key9, `|3|2|09|15.50|1|12345678000195|${SIG}`, true], [key9, `|3|2|09|15.50|1|1234567800019|${SIG}`, false],
+      [key9, `|3|2|09|15.50|2|12345678901|${SIG}`, true], [key9, `|3|2|09|15.50|2|1234567890|${SIG}`, false],
+      [key9, `|3|2|09|15.50|2||${SIG}`, false], [key9, `|3|2|09|15.50||12345678901|${SIG}`, false], [key9, `|3|2|09|15.50|4||${SIG}`, false],
+      [key9, `|3|2|09|15.50|12345678901|1|${SIG}`, false], // campos invertidos
+      [key9, `|3|2|09|015.50|||${SIG}`, false], [key9, `|3|2|09|15.50|||${SIG.slice(0, 170)}`, false], [key9, `|3|2|09|15.50|||`, false],
+      [key9, `|3|2|09|15.50|||${'A'.repeat(171)}!`, false],
+    ];
+    for (const [k, rest, expected] of rows) {
+      const url = qr(`${k}${rest}`);
+      expect(isValidQrCodeUrl(url, k, 'homologacao'), `servidor ${rest}`).toBe(expected);
+      expect(dev.isValidNfceQrCodeContent(url, k, 'homologacao'), `aparelho ${rest}`).toBe(expected);
+    }
   });
 });
