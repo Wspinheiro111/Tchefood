@@ -1,4 +1,5 @@
 import { useEffect, useSyncExternalStore } from 'react';
+import { createPortal } from 'react-dom';
 import { getStorageStatus, onWriterAvailable, subscribeStorageStatus } from '../lib/idbStorage';
 
 export const STORAGE_READONLY_MESSAGE =
@@ -43,7 +44,8 @@ export function StorageGuard() {
     return () => window.removeEventListener('pageshow', onShow);
   }, []);
   if (status === 'ok') return null;
-  return (
+  // Fora do #root: o root fica inerte e o diálogo precisa continuar clicável e acessível (Codex, rodada 29 do PR #54).
+  return createPortal(
     <div role="alertdialog" aria-modal="true" aria-label="Armazenamento bloqueado" className="fixed inset-0 z-[100] grid place-items-center bg-black/80 p-6">
       <div className="max-w-md rounded-2xl bg-white p-6 text-center shadow-xl">
         <h2 className="mb-2 text-lg font-black text-brasa">{status === 'readonly' ? 'Outra janela está em uso' : 'Reabra o app'}</h2>
@@ -52,6 +54,7 @@ export function StorageGuard() {
           Recarregar
         </button>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

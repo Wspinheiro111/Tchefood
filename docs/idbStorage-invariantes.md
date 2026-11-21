@@ -1,4 +1,4 @@
-# idbStorage: invariantes das cópias de emergência (PR #54, rodada 29)
+# idbStorage: invariantes das cópias de emergência (PR #54, rodada 30)
 
 Arquivo: `src/lib/idbStorage.ts`. Testes: `src/__tests__/gptR18Persist.test.tsx`.
 
@@ -53,7 +53,7 @@ C. **`select` (getItem) só conclui numa seleção estável**: depois de qualque
 | `removeItem` na instância sem lock ou no provisório | lança; o persist engole só esse erro (a tela já está bloqueada) |
 | `awaitPersisted` com a instância bloqueada | devolve false de antemão e depois de gravar |
 | Rodadas em segundo plano (envio da fila, reservas, acertos) na instância bloqueada | `syncOnce` e o laço de `useCloudSync` não rodam enquanto o status não for ok |
-| Foco/teclado/leitor de código atrás da tela cheia | `StorageGuard` põe `inert` no `#root` |
+| Foco/teclado/leitor de código atrás da tela cheia | `StorageGuard` põe `inert` no `#root` e renderiza o diálogo por portal em `document.body` (fora do subtree inerte, para o botão Recarregar continuar clicável e acessível; Codex, r29) |
 | A escritora fecha com a segunda aba aberta | a segunda entra na fila do lock e, ao receber, recarrega sozinha para assumir |
 | Lock demora a soltar ao recarregar (> 4 x 200 ms) | a instância entra só leitura, mas a fila do lock a recarrega assim que ele soltar |
 | Página restaurada do bfcache (lock solto ao congelar) | `pageshow` com `persisted` recarrega |

@@ -771,9 +771,10 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
       try {
         const mod = await unstable(name);
         const { StorageGuard } = await import('../components/StorageGuard');
-        const view = render(createElement(StorageGuard));
+        const view = render(createElement(StorageGuard), { container: root }); // montado dentro do #root, como no app
         expect(mod.getStorageStatus()).toBe('blocked');
         expect(root.hasAttribute('inert')).toBe(true);
+        expect(root.contains(screen.getByRole('alertdialog'))).toBe(false); // o diálogo fica fora do subtree inerte (Recarregar clicável)
         view.unmount();
         expect(root.hasAttribute('inert')).toBe(false);
       } finally {
