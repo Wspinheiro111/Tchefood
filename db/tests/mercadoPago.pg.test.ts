@@ -184,6 +184,10 @@ function pay(key: string, over: Record<string, string | number | null> = {}) {
 describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
   beforeAll(() => {
     applySchema(target!, DB);
+    // Uma mesa nova por conta (PR #54): duas contas abertas na mesma mesa são recusadas (TCHEFOOD_MESA_OCUPADA).
+    sql(`CREATE SEQUENCE IF NOT EXISTS test_table_seq START 1000;
+         CREATE OR REPLACE FUNCTION test_fresh_table(p_tenant UUID) RETURNS UUID LANGUAGE sql AS $$
+           INSERT INTO dining_tables (tenant_id, number, label) SELECT p_tenant, n, 'Mesa ' || n FROM (SELECT nextval('test_table_seq')::int AS n) s RETURNING id $$;`);
     sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT}', 'Loja', 'Loja Ltda', '11222333000181'), ('${OTHER}', 'Outra', 'Outra Ltda', '11444777000161');
          INSERT INTO staff_users (id, tenant_id, name, role, pin_code) VALUES ('${STAFF}', '${TENANT}', 'Caixa', 'CASHIER', '5162'),
                 ('${MANAGER}', '${TENANT}', 'Gerente', 'MANAGER', '${MANAGER_PIN}'), ('${OTHER_STAFF}', '${OTHER}', 'Caixa da outra', 'CASHIER', '5162');
@@ -193,11 +197,11 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
                 ('${STONE_TERMINAL}', '${TENANT}', 'Stone 01', 'STONE-01', 'STONE'), ('${OTHER_TERMINAL}', '${OTHER}', 'Point da outra', '${OTHER_MP_ID}', 'MERCADO_PAGO');
          INSERT INTO staff_users (id, tenant_id, name, role, pin_code, active) VALUES ('${EX_MANAGER}', '${TENANT}', 'Gerente que saiu', 'MANAGER', '3197', false),
                 ('${OTHER_MANAGER}', '${OTHER}', 'Gerente da outra', 'MANAGER', '9753', true);
-         INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER}', '${TENANT}', '${TABLE}', '${STAFF}');
+         INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}');
          INSERT INTO payment_provider_secrets (tenant_id, provider, access_token) VALUES ('${TENANT}', 'mercado_pago_point', 'APP_USR-segredo');
-         INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER2}', '${TENANT}', '${TABLE}', '${STAFF}'), ('${CLOSED}', '${TENANT}', '${TABLE}', '${STAFF}'),
-                ('${ORDER3}', '${TENANT}', '${TABLE}', '${STAFF}'), ('${ORDER4}', '${TENANT}', '${TABLE}', '${STAFF}'), ('${ORDER5}', '${TENANT}', '${TABLE}', '${STAFF}'),
-                ('${ORDER6}', '${TENANT}', '${TABLE}', '${STAFF}');`);
+         INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER2}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}'), ('${CLOSED}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}'),
+                ('${ORDER3}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}'), ('${ORDER4}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}'), ('${ORDER5}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}'),
+                ('${ORDER6}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}');`);
     // ORDER3 tem saldo folgado: dezenas de cobranças de teste ficam em andamento nela, reservando.
     // Saldo de R$ 50,00 na ORDER2 com um item do mesmo valor (o recálculo do banco mantém o total: desde o fuzzer,
     // item 1, o total não desce abaixo do pago, e a conta sem itens desceria a zero no primeiro pagamento).
@@ -759,7 +763,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
 
     it('auditoria r3 P0-01: enviada sem resposta, encerrada com PIN de gerente: revisão manual (nunca cancelada) e segue reservando o saldo', () => {
       const ORDER4 = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
-      sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER4}', '${TENANT}', '${TABLE}', '${STAFF}');
+      sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${ORDER4}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}');
            BEGIN; SET LOCAL session_replication_role = replica; ${seedTotal(ORDER4, 100)} COMMIT;`);
       const open4 = (key: string, cents: number) =>
         psql(target!, `SELECT tchefood_open_terminal_charge('${TENANT}', '${key}', '${ORDER4}', '${TERMINAL}', '${MP_ID}', 'CREDIT', ${cents}, '${STAFF}', ${bal(ORDER4)});`, DB);
@@ -1425,7 +1429,7 @@ describe.skipIf(!target)('Mercado Pago Point no banco real', () => {
     const fresh = (balance: number): string => {
       seq += 1;
       const id = `f0f0f0f0-0000-4000-8000-${String(seq).padStart(12, '0')}`;
-      sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${id}', '${TENANT}', '${TABLE}', '${STAFF}');
+      sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${id}', '${TENANT}', test_fresh_table('${TENANT}'), '${STAFF}');
            BEGIN; SET LOCAL session_replication_role = replica; ${seedTotal(id, balance)} COMMIT;`);
       return id;
     };

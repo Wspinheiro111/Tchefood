@@ -31,11 +31,18 @@ export function OrderScreen({ orderId, onBack, onCheckout }: { orderId: string; 
   const order = useTcheStore((s) => s.orders.find((o) => o.id === orderId));
   const table = useTcheStore((s) => s.tables.find((t) => t.id === order?.table_id));
   const [tab, setTab] = useState<'menu' | 'statement'>('menu');
+  // Conta que a leitura da nuvem deixou de lado (valor que esta versão do app não conhece):
+  // a mesa aparece ocupada, mas a conta não está neste aparelho (auditoria interna, rodada 8 do PR #54).
+  const skipped = useTcheStore((s) => (s.cloudSkippedOrderIds ?? []).includes(orderId));
 
   if (!order || !table) {
     return (
       <div className="p-6 text-center">
-        <p className="mb-4">Comanda não encontrada ou já encerrada.</p>
+        <p className="mb-4">
+          {skipped
+            ? 'Esta conta tem um valor que esta versão do app não conhece e não foi baixada neste aparelho: atualize o app.'
+            : 'Comanda não encontrada ou já encerrada.'}
+        </p>
         <Btn onClick={onBack}>Voltar ao mapa</Btn>
       </div>
     );
@@ -45,7 +52,9 @@ export function OrderScreen({ orderId, onBack, onCheckout }: { orderId: string; 
 
   return (
     <div className="mx-auto flex min-h-full max-w-5xl flex-col">
-      <div className="sticky top-[56px] z-20 border-b border-slate-200 bg-base/95 px-3 py-2 backdrop-blur">
+      {/* Abaixo do topo fixo do App (cabeçalho + faixa de contas paradas, que muda de altura):
+          --equipe-topo é medido no App (auditoria interna, rodada 8 do PR #54). */}
+      <div className="sticky top-[var(--equipe-topo,56px)] z-20 border-b border-slate-200 bg-base/95 px-3 py-2 backdrop-blur">
         <div className="flex items-center gap-2">
           <button aria-label="Voltar" onClick={onBack} className="grid h-12 w-12 place-items-center rounded-xl bg-surface active:bg-slate-200">
             <ArrowLeft className="h-6 w-6" />
@@ -67,6 +76,7 @@ export function OrderScreen({ orderId, onBack, onCheckout }: { orderId: string; 
         </div>
       </div>
 
+      {closed && <StrandedTray orderId={orderId} />}
       {tab === 'menu' && !closed ? <MenuPanel orderId={orderId} /> : <StatementPanel orderId={orderId} onCheckout={() => onCheckout(orderId)} />}
     </div>
   );
@@ -249,6 +259,41 @@ function DispatchTray({ orderId }: { orderId: string }) {
           <Send className="h-5 w-5" /> Enviar para produção
         </Btn>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Bandeja de uma conta encerrada (em outro aparelho, pela leitura da nuvem) com itens ainda nela:
+ * eles não podem mais ser enviados. Nunca foram à produção nem ao servidor, então nada foi
+ * cobrado: o garçom descarta e lança de novo na conta nova do cliente, se for o caso. Fica fora
+ * da aba Lançar, que some com a conta encerrada: antes o aviso ficava dentro dela e nunca
+ * aparecia, e os itens ficavam guardados na bandeja sem ninguém ver (auditoria interna, rodada 8
+ * do PR #54).
+ */
+function StrandedTray({ orderId }: { orderId: string }) {
+  const allTray = useTcheStore((s) => s.tray);
+  const tray = useMemo(() => allTray.filter((t) => t.order_id === orderId), [allTray, orderId]);
+  const clearTray = useTcheStore((s) => s.clearTray);
+  if (tray.length === 0) return null;
+  const count = tray.reduce((a, t) => a + (t.weight ? 1 : t.quantity), 0);
+  return (
+    <div className="px-3 pt-3">
+      <div role="alert" className="mb-2 rounded-xl border border-brasa/60 bg-brasa/10 p-2 text-sm text-rose-700">
+        Esta conta já foi encerrada (talvez em outro aparelho) com {count} item(ns) na bandeja. Eles não foram para a produção nem foram cobrados, e não podem mais ser enviados para esta conta. Descarte e, se o cliente ainda quiser, lance numa conta aberta.
+      </div>
+      <Btn
+        block
+        size="lg"
+        variant="danger"
+        onClick={() => {
+          if (!window.confirm(`Descartar ${count} item(ns) da bandeja desta conta encerrada? Eles não foram para a produção nem cobrados.`)) return;
+          clearTray(orderId);
+          toast.info('Itens da bandeja descartados.');
+        }}
+      >
+        <Trash2 className="h-5 w-5" /> Descartar itens da bandeja
+      </Btn>
     </div>
   );
 }

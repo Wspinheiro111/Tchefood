@@ -22,8 +22,10 @@ import { useCloudSync } from './lib/sync/useCloudSync';
 import { setClaimAlertHandler } from './lib/payments/claimSupervisor';
 import { SmartPosSimulator } from './components/SmartPosSimulator';
 import { UnsavedStorageBanner } from './components/UnsavedStorageBanner';
+import { StorageGuard } from './components/StorageGuard';
 import { PrintSimulatorModal } from './components/PrintSimulator';
 import { ToastHost, toast } from './components/ui';
+import { CloudStaleBanner } from './components/CloudStaleBanner';
 import type { UserRole } from './types';
 
 type View =
@@ -56,7 +58,39 @@ const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: U
   { key: 'backoffice', label: 'Retaguarda', icon: BarChart3, roles: [] },
 ];
 
+/**
+ * Mede o topo fixo (cabeçalho + faixa de contas paradas) e grava a altura em --equipe-topo no
+ * <html>, para as barras fixas das telas ficarem logo abaixo dele (auditoria interna, rodada 8 do
+ * PR #54). Sem ResizeObserver (testes), fica o valor padrão de 56 px de quem usa a variável.
+ */
+function useStickyTopHeight() {
+  // Ref de função: o topo só existe depois do login, então o elemento chega e sai com a tela.
+  const [el, setEl] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const root = document.documentElement;
+    const medir = () => root.style.setProperty('--equipe-topo', `${Math.round(el.getBoundingClientRect().height)}px`);
+    medir();
+    const ro = new ResizeObserver(medir);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      root.style.removeProperty('--equipe-topo');
+    };
+  }, [el]);
+  return setEl;
+}
+
 export default function App() {
+  return (
+    <>
+      <AppBody />
+      <StorageGuard />
+    </>
+  );
+}
+
+function AppBody() {
   const hydrated = useTcheStore((s) => s.hydrated);
   const user = useTcheStore(selectCurrentUser);
   const logout = useTcheStore((s) => s.logout);
@@ -66,6 +100,7 @@ export default function App() {
   const backOfficeTabs = useBackOfficeTabs();
   // Etapa 0: envia a fila para o Supabase quando há internet e o aparelho está conectado.
   useCloudSync(online);
+  const topRef = useStickyTopHeight();
   // Reserva liberada pelo gerente antes do pagamento chegar ao servidor (laço de sincronização): alerta na tela.
   useEffect(() => {
     setClaimAlertHandler((text) => toast.alert(`⚠️ ${text}`));
@@ -111,30 +146,36 @@ export default function App() {
 
   return (
     <div className="min-h-full pb-[72px] sm:pb-0">
-      <header className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b border-slate-200 bg-base/95 px-3 shadow-sm backdrop-blur">
-        {/* Faixa com as três cores da marca no topo de todas as telas da equipe */}
-        <div aria-hidden className="absolute inset-x-0 top-0 flex h-1"><span className="flex-1 bg-brasa" /><span className="flex-1 bg-amarelo" /><span className="flex-1 bg-verde" /></div>
-        <BrandMark className="h-9 w-9 2xl:hidden" />
-        <BrandLogo className="hidden h-11 w-auto 2xl:block" />
-        <div className="mr-auto leading-tight">
-          <div className="font-black 2xl:hidden">Tchê<span className="text-brasa">Food</span></div>
-          <div className="text-[11px] text-slate-500">{user.name} · {user.role === 'WAITER' ? 'Garçom' : user.role === 'MANAGER' ? 'Gerente' : user.role === 'OWNER' ? 'Proprietário' : user.role === 'KITCHEN' ? 'Cozinha' : 'Caixa'}</div>
-        </div>
-        <nav className="hidden gap-1 sm:flex">
-          {nav.map((n) => (
-            <button key={n.key} onClick={() => setView({ name: n.key } as View)} className={`flex min-h-touch items-center gap-2 rounded-xl px-3 text-sm font-bold ${activeKey === n.key ? 'bg-brasa text-white shadow' : 'text-slate-700 hover:bg-slate-100'}`}>
-              <n.icon className="h-4 w-4" /> {n.label}
-            </button>
-          ))}
-        </nav>
-        <button aria-label="Abrir maquininha" onClick={() => useTerminalBus.getState().openSimulator()} className="grid h-11 w-11 place-items-center rounded-xl bg-surface text-verde" title="Maquininha / bobina">
-          <Smartphone className="h-5 w-5" />
-        </button>
-        <span title={online ? `${outbox} evento(s) na fila de sincronização` : 'Offline: operando pela fila local'} className={`hidden items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold md:inline-flex ${online ? 'bg-stone/15 text-verde' : 'bg-ouro/20 text-brasa'}`}>
-          {online ? '●' : <CloudOff className="h-3 w-3" />} {online ? 'Online' : 'Offline'} · fila {outbox}
-        </span>
-        <button aria-label="Sair" onClick={() => { const r = logout(); if (!r.ok) toast.error(r.error); }}className="grid h-11 w-11 place-items-center rounded-xl bg-surface"><LogOut className="h-5 w-5" /></button>
-      </header>
+      {/* Topo fixo: cabeçalho e, abaixo dele, a faixa de contas paradas (auditoria interna, rodada
+          8 do PR #54). A altura vai para --equipe-topo, que a barra fixa da comanda usa para não
+          ficar por baixo da faixa. */}
+      <div ref={topRef} className="sticky top-0 z-30">
+        <header className="relative flex h-14 items-center gap-2 border-b border-slate-200 bg-base/95 px-3 shadow-sm backdrop-blur">
+          {/* Faixa com as três cores da marca no topo de todas as telas da equipe */}
+          <div aria-hidden className="absolute inset-x-0 top-0 flex h-1"><span className="flex-1 bg-brasa" /><span className="flex-1 bg-amarelo" /><span className="flex-1 bg-verde" /></div>
+          <BrandMark className="h-9 w-9 2xl:hidden" />
+          <BrandLogo className="hidden h-11 w-auto 2xl:block" />
+          <div className="mr-auto leading-tight">
+            <div className="font-black 2xl:hidden">Tchê<span className="text-brasa">Food</span></div>
+            <div className="text-[11px] text-slate-500">{user.name} · {user.role === 'WAITER' ? 'Garçom' : user.role === 'MANAGER' ? 'Gerente' : user.role === 'OWNER' ? 'Proprietário' : user.role === 'KITCHEN' ? 'Cozinha' : 'Caixa'}</div>
+          </div>
+          <nav className="hidden gap-1 sm:flex">
+            {nav.map((n) => (
+              <button key={n.key} onClick={() => setView({ name: n.key } as View)} className={`flex min-h-touch items-center gap-2 rounded-xl px-3 text-sm font-bold ${activeKey === n.key ? 'bg-brasa text-white shadow' : 'text-slate-700 hover:bg-slate-100'}`}>
+                <n.icon className="h-4 w-4" /> {n.label}
+              </button>
+            ))}
+          </nav>
+          <button aria-label="Abrir maquininha" onClick={() => useTerminalBus.getState().openSimulator()} className="grid h-11 w-11 place-items-center rounded-xl bg-surface text-verde" title="Maquininha / bobina">
+            <Smartphone className="h-5 w-5" />
+          </button>
+          <span title={online ? `${outbox} evento(s) na fila de sincronização` : 'Offline: operando pela fila local'} className={`hidden items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold md:inline-flex ${online ? 'bg-stone/15 text-verde' : 'bg-ouro/20 text-brasa'}`}>
+            {online ? '●' : <CloudOff className="h-3 w-3" />} {online ? 'Online' : 'Offline'} · fila {outbox}
+          </span>
+          <button aria-label="Sair" onClick={() => { const r = logout(); if (!r.ok) toast.error(r.error); }}className="grid h-11 w-11 place-items-center rounded-xl bg-surface"><LogOut className="h-5 w-5" /></button>
+        </header>
+        <CloudStaleBanner />
+      </div>
       <UnsavedStorageBanner />
 
       <main>

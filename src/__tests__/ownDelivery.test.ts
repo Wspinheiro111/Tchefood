@@ -174,7 +174,7 @@ describe('entrega própria — fluxo', () => {
     expect(sum.withdrawals).toBe(preview.courierFees);
     expect(sum.expected).toBe(100 + preview.netFromCourier);
     // Nada mais a acertar.
-    expect(st().settleCourier(courier.id, { payFromDrawer: false, auth: null }).ok).toBe(false);
+    expect(st().settleCourier(courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' } }).ok).toBe(false);
     const tables = st().outbox.map((e) => e.table);
     expect(tables.lastIndexOf('cash_movements')).toBeLessThan(tables.indexOf('courier_settlements'));
     expect(tables.indexOf('courier_settlements')).toBeLessThan(tables.lastIndexOf('own_deliveries'));
@@ -189,7 +189,7 @@ describe('entrega própria — fluxo', () => {
     st().dispatchOwnDeliveries([d.id], courier.id);
     st().setOwnDeliveryStatus(d.id, 'DELIVERED');
     expect(st().settleCourier(courier.id, { payFromDrawer: true, auth: MANAGER }).ok).toBe(false); // caixa fechado
-    const s = st().settleCourier(courier.id, { payFromDrawer: false, auth: null });
+    const s = st().settleCourier(courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' } });
     expect(s.ok && s.data.cash_movement_id).toBeNull();
     expect(st().cashMovements).toHaveLength(0);
   });
@@ -234,7 +234,7 @@ describe('entrega própria — fluxo', () => {
       acquirer_cnpj: null, card_brand: null, nsu: null, authorization_code: null, terminal_serial: null, idempotency_key: `entrega-${d.id}`, item_ids: [],
     });
     expect(r.ok).toBe(true);
-    const s = st().settleCourier(courier.id, { payFromDrawer: false, auth: null });
+    const s = st().settleCourier(courier.id, { payFromDrawer: false, auth: { managerPin: '9999', reason: 'Pago em pix pela loja' } });
     expect(s.ok && s.data.cash_collected).toBe(o.total_amount);
   });
 

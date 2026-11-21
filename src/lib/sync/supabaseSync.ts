@@ -80,10 +80,20 @@ const SET_PERMISSION_RPC = 'tchefood_set_role_permission';
 const START_STORE_RPC = 'tchefood_start_store';
 const REGISTER_PAYMENT_RPC = 'tchefood_register_payment';
 const CASHBACK_REDEEM_RPC = 'tchefood_register_cashback_redeem';
+// Pendência do acerto com o entregador (GPT, rodada 10 do PR #54): "pago por fora" e senha
+// resolvida com o gerente. A função confere o PIN e grava o audit_log; o banco recusa o INSERT direto.
+const COURIER_FOLLOWUP_RPC = 'tchefood_courier_followup_audit';
+const COURIER_FOLLOWUP_ACTIONS: ReadonlyArray<string> = ['COURIER_PAID_OUTSIDE', 'COURIER_PAYMENT_RESOLVED'];
+
+/** Registro da pendência do acerto com o entregador: sobe por tchefood_courier_followup_audit. */
+export function isCourierFollowUpAudit(event: SyncEvent): boolean {
+  return event.table === 'audit_logs' && event.op === 'INSERT' && COURIER_FOLLOWUP_ACTIONS.includes(String(event.payload.action_type))
+    && event.payload.authorized_by_manager_id != null;
+}
 
 /** Eventos que sobem por função do servidor que confere PIN e responde null quando ele não confere. */
 export function isPinCheckedRpc(event: SyncEvent): boolean {
-  return isManagerAuthorization(event) || isKegChange(event) || event.table === 'staff_users' || event.table === 'role_permissions';
+  return isManagerAuthorization(event) || isKegChange(event) || isCourierFollowUpAudit(event) || event.table === 'staff_users' || event.table === 'role_permissions';
 }
 
 /** Barril encerrado de uma troca de barril que sobe por tchefood_change_keg. */
@@ -246,7 +256,11 @@ function buildPermissionRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest 
  */
 function buildPaymentRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   if (event.op !== 'INSERT') throw new Error('Pagamento gravado não muda: estorno é um pagamento novo.');
-  return rpcRequest(cfg, REGISTER_PAYMENT_RPC, { p_payment: sanitizePayload(event) });
+  // A lista dos itens que o pagamento quitou vai ao servidor (item_ids, não é coluna de payments): é ela que liga o
+  // estorno do pagamento aos itens que voltam a não pagos (payment_items; GPT r31 P0-01).
+  const items = event.payload.paid_item_ids;
+  const itemIds = Array.isArray(items) ? items.filter((x): x is string => typeof x === 'string') : [];
+  return rpcRequest(cfg, REGISTER_PAYMENT_RPC, { p_payment: itemIds.length > 0 ? { ...sanitizePayload(event), item_ids: itemIds } : sanitizePayload(event) });
 }
 
 /**
@@ -269,8 +283,26 @@ function buildCashbackRedeemRequest(event: SyncEvent, cfg: SyncConfig): SyncRequ
   });
 }
 
+function buildCourierFollowUpRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
+  if (!event.manager_pin) {
+    throw new Error('Pendência do acerto sem PIN para o servidor conferir. Em Nuvem, digite o PIN do gerente neste evento recusado e toque em Reenviar recusados.');
+  }
+  const p = event.payload;
+  const metadata = (p.metadata as Record<string, unknown> | null | undefined) ?? {};
+  return rpcRequest(cfg, COURIER_FOLLOWUP_RPC, {
+    p_audit_id: event.row_id,
+    p_action: p.action_type,
+    p_settlement_id: metadata.courier_settlement_id ?? null,
+    p_performed_by: p.performed_by_user_id,
+    p_manager_pin: event.manager_pin,
+    p_reason: p.reason,
+    p_metadata: metadata,
+  });
+}
+
 export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest {
   if (isManagerAuthorization(event)) return buildAuthorizeRequest(event, cfg);
+  if (isCourierFollowUpAudit(event)) return buildCourierFollowUpRequest(event, cfg);
   if (isCashbackRedeem(event)) return buildCashbackRedeemRequest(event, cfg);
   if (event.table === 'payments') return buildPaymentRequest(event, cfg);
   if (isKegChange(event)) return buildKegChangeRequest(event, cfg);
@@ -440,6 +472,44 @@ export function recordKeys(event: SyncEvent): string[] {
 }
 
 /**
+ * O evento espera (não sobe nesta rodada) quando toca um registro segurado (`blocked`) ou
+ * depende de um evento que ainda não subiu (`unsent`). O segurado também segura o que vem
+ * depois dele em QUALQUER registro que ele toca: a liberação da mesa da comanda A, segurada
+ * pelo pagamento recusado de A, não pode ser ultrapassada pela ocupação da mesma mesa pela
+ * comanda B (senão, ao reenviar A, a liberação antiga sobrescreveria a mesa ocupada na nuvem).
+ * Acrescenta as chaves dele a `blocked`. Usada por flushOutbox e por heldRecordKeys.
+ */
+function holdIfBlocked(
+  event: SyncEvent,
+  blocked: Set<string>,
+  unsent: ReadonlySet<string>,
+  waitFor: (event: SyncEvent) => boolean = () => false,
+): boolean {
+  const keys = recordKeys(event);
+  if (!keys.some((k) => blocked.has(k)) && !(event.depends_on_event_ids ?? []).some((id) => unsent.has(id)) && !waitFor(event)) return false;
+  // O segurado também segura o que vem depois dele em QUALQUER registro que ele toca.
+  for (const k of keys) blocked.add(k);
+  return true;
+}
+
+/**
+ * Registros (`${tabela}:${id}`) que ficam segurados pelos recusados guardados (`held`): os que
+ * eles tocam e os de cada evento da fila que espera atrás deles, pela mesma regra do envio
+ * (flushOutbox), supondo que o resto da fila suba. Sem rede e sem mudar nada. Ex.: um evento
+ * da mesa T segurado por um recusado da mesa leva junto a conta que ele mostra (orders:Y), e
+ * tudo dessa conta passa a esperar (auditoria interna, rodada 8 do PR #54).
+ */
+export function heldRecordKeys(events: ReadonlyArray<SyncEvent>, held: ReadonlyArray<SyncEvent>): Set<string> {
+  const blocked = new Set(held.flatMap(recordKeys));
+  if (held.length === 0) return blocked;
+  const unsent = new Set([...held, ...events].map((e) => e.id));
+  for (const event of serverOrder([...events])) {
+    if (!holdIfBlocked(event, blocked, unsent)) unsent.delete(event.id);
+  }
+  return blocked;
+}
+
+/**
  * Envia a fila em ordem até acabar, até um erro de rede/servidor, ou até `limit` envios
  * (eventos segurados não contam).
  * Um evento recusado (4xx) não para o envio: vai para `rejected` e o próximo segue.
@@ -477,13 +547,7 @@ export async function flushOutbox(
   for (const event of serverOrder(events)) {
     // Eventos segurados não contam no limite: senão um bloco segurado no começo da fila
     // impediria para sempre que registros sem relação subissem.
-    const keys = recordKeys(event);
-    if (keys.some((k) => blocked.has(k)) || (event.depends_on_event_ids ?? []).some((id) => unsent.has(id)) || waitFor(event)) {
-      // O segurado também segura o que vem depois dele em QUALQUER registro que ele
-      // toca: a liberação da mesa da comanda A, segurada pelo pagamento recusado de A,
-      // não pode ser ultrapassada pela ocupação da mesma mesa pela comanda B (senão,
-      // ao reenviar A, a liberação antiga sobrescreveria a mesa ocupada na nuvem).
-      for (const k of keys) blocked.add(k);
+    if (holdIfBlocked(event, blocked, unsent, waitFor)) {
       unsent.add(event.id);
       continue;
     }
@@ -512,7 +576,7 @@ export async function flushOutbox(
     if (res.ok) {
       // A RPC responde null quando o PIN não confere no servidor (ou está bloqueado):
       // nada foi autorizado, e a atualização da comanda que vem depois seria recusada.
-      if ((isManagerAuthorization(event) || isKegChange(event)) && !isUuidResponse(text)) {
+      if ((isManagerAuthorization(event) || isKegChange(event) || isCourierFollowUpAudit(event)) && !isUuidResponse(text)) {
         reject(event, res.status, 'O servidor não confirmou o PIN do gerente (PIN alterado ou bloqueado por tentativas).');
         continue;
       }
@@ -661,3 +725,35 @@ export function refreshDevice(url: string, anonKey: string, refreshToken: string
 export function needsRefresh(expiresAt: number, nowMs = Date.now()): boolean {
   return expiresAt * 1000 - nowMs < 120_000;
 }
+
+/**
+ * GPT r17 (a verificar): tempo máximo de cada pedido à nuvem. Um pedido que nunca responde (rede parada, servidor
+ * mudo) segurava a rodada inteira para sempre, e com ela a fila e a leitura dos estornos. Passado o prazo o pedido é
+ * abortado e vira "sem conexão": a rodada termina e a seguinte tenta de novo (o envio é idempotente, como em qualquer
+ * queda de rede). Vale também para o acerto com o entregador (Codex no PR #54): sem prazo, o acerto preso deixava
+ * o entregador, a troca de loja e o PIN do gerente travados até reiniciar o app.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
+export function withRequestTimeout(fetchFn: FetchLike, ms: number = REQUEST_TIMEOUT_MS): FetchLike {
+  return (url, init) => {
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        ctrl?.abort();
+        reject(new Error('A nuvem não respondeu a tempo.'));
+      }, ms);
+    });
+    expired.catch(() => undefined);
+    const stop = () => clearTimeout(timer);
+    const call = fetchFn(url, ctrl ? { ...init, signal: ctrl.signal } : init).then(
+      (res) => ({ ok: res.ok, status: res.status, text: () => Promise.race([res.text(), expired]).finally(stop) }),
+      (e) => {
+        stop();
+        throw e;
+      },
+    );
+    return Promise.race([call, expired]);
+  };
+}
+

@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { ShieldAlert } from 'lucide-react';
 import { Btn, Sheet, toast } from './ui';
 import { PinPad } from './PinPad';
@@ -33,6 +33,13 @@ interface Props<T> {
   minReason?: number;
 }
 
+/** Texto da recusa de qualquer valor (Error, texto, null, undefined; GPT, rodada 18 do PR #54, P2-02). */
+export function rejectionMessage(e: unknown): string {
+  if (e instanceof Error && e.message) return e.message;
+  if (typeof e === 'string' && e.trim()) return e;
+  return 'Não foi possível confirmar. Tente de novo.';
+}
+
 /**
  * Modal de PIN do Gerente + Motivo Obrigatório.
  * A validação real do PIN acontece no store (authorizeManager); aqui só coletamos.
@@ -43,14 +50,29 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
   const [reason, setReason] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Trava síncrona: o toque duplo (ou o último dígito e o botão no mesmo instante) chega antes de
+  // a tela redesenhar com busy, e mandaria o acerto duas vezes (auditoria interna, rodada 8 do PR #54).
+  const busyRef = useRef(false);
+  // Cada abertura tem um número: a resposta de uma confirmação de uma abertura anterior não mexe na de agora
+  // (GPT, rodada 18 do PR #54, P2-01).
+  const openGen = useRef(0);
 
   useEffect(() => {
     if (open) {
+      openGen.current += 1;
       setPin('');
       setReason('');
       setError(null);
+      // Confirmação de antes ainda esperando: a trava fica até ela responder (nada sai duas vezes).
+      setBusy(busyRef.current);
     }
   }, [open]);
+
+  // Com a confirmação esperando, o modal não fecha (botão, fundo, Esc).
+  const close = () => {
+    if (busyRef.current) return;
+    onClose();
+  };
 
   const reasonOk = reason.trim().length >= minReason;
 
@@ -60,22 +82,37 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
       setError(`Informe o motivo (mínimo ${minReason} caracteres) antes do PIN.`);
       return;
     }
-    if (busy) return;
-    const out = onSubmit(pinValue, reason);
+    // Conferido antes de chamar onSubmit: com a confirmação ainda esperando, nada sai de novo.
+    if (busyRef.current) return;
+    busyRef.current = true;
+    let out: ActionResult<T> | Promise<ActionResult<T>>;
+    try {
+      out = onSubmit(pinValue, reason);
+    } catch (e) {
+      busyRef.current = false;
+      throw e;
+    }
+    const gen = openGen.current;
     if (out instanceof Promise) {
       setBusy(true);
-      void out
-        .catch((e: unknown): ActionResult<T> => ({ ok: false, error: e instanceof Error ? e.message : String(e) }))
-        .then((res) => {
-          setBusy(false);
-          finish(res);
-        });
+      void out.then(
+        (res) => finish(res, gen),
+        (e: unknown) => finish({ ok: false, error: rejectionMessage(e) }, gen),
+      );
       return;
     }
-    finish(out);
+    finish(out, gen);
   };
 
-  const finish = (res: ActionResult<T>) => {
+  const finish = (res: ActionResult<T>, gen: number) => {
+    busyRef.current = false;
+    setBusy(false);
+    if (gen !== openGen.current) {
+      // Resposta de uma abertura anterior: só avisa, sem fechar nem escrever no modal de agora.
+      if (res.ok) toast.alert(successMessage ?? '🔔 Registrado em audit_logs e alerta enviado ao WhatsApp do proprietário.');
+      else toast.error(res.error);
+      return;
+    }
     if (!res.ok) {
       setError(res.error);
       setPin('');
@@ -91,7 +128,7 @@ export function ManagerAuthSheet<T>({ open, onClose, title, summary, confirmLabe
   return (
     <Sheet
       open={open}
-      onClose={onClose}
+      onClose={close}
       tone="danger"
       title={
         <span className="flex items-center gap-2 text-rose-600">

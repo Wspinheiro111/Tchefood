@@ -6,7 +6,19 @@ import { formatPickupNumber } from '../lib/kiosk';
 import { MAX_ROUTE_STOPS, OWN_DELIVERY_STATUS_LABEL, outForDeliveryMessageUrl, routeUrl, settlementPreview } from '../lib/ownDelivery';
 import { Badge, Btn, Sheet, toast } from '../components/ui';
 import { ManagerAuthSheet } from '../components/ManagerAuthSheet';
-import type { Order, OwnDelivery } from '../types';
+import type { ActionResult, CourierSettlement, Order, OwnDelivery } from '../types';
+import type { CourierSettleFollowUp, CourierSettlePendingEntry } from '../lib/sync/courierSettle';
+
+const NO_PENDING: CourierSettlePendingEntry[] = [];
+const NO_FOLLOW_UPS: CourierSettleFollowUp[] = [];
+
+/**
+ * O acerto que o operador abriu, com os valores que ele viu: a tela fica presa a ele até fechar,
+ * mesmo quando o entregador sai da lista do acerto (auditoria interna, rodada 8 do PR #54).
+ */
+type SettleTarget =
+  | { kind: 'new'; courierId: string; courierName: string; deliveryIds: string[]; cash: number; fees: number }
+  | { kind: 'pending'; entry: CourierSettlePendingEntry };
 
 const COLUMNS: OwnDelivery['status'][] = ['PREPARING', 'READY', 'OUT', 'DELIVERED'];
 const CANCEL_REASONS = ['Cliente desistiu', 'Endereço não encontrado', 'Cliente não atendeu', 'Erro de lançamento'];
@@ -21,8 +33,17 @@ export function OwnDeliveryBoard() {
   const [selected, setSelected] = useState<string[]>([]);
   const [courierId, setCourierId] = useState('');
   const [cancelFor, setCancelFor] = useState<OwnDelivery | null>(null);
-  const [settleFor, setSettleFor] = useState<string | null>(null);
+  const [target, setTarget] = useState<SettleTarget | null>(null);
   const [payAuthOpen, setPayAuthOpen] = useState(false);
+  // Ganho pago por fora no próprio acerto: PIN de gerente e motivo (GPT, rodada 11 do PR #54).
+  const [outsideAuthOpen, setOutsideAuthOpen] = useState(false);
+  const [followPinFor, setFollowPinFor] = useState<CourierSettleFollowUp | null>(null);
+  // "Pago por fora" pede PIN de gerente e motivo (GPT, rodada 10 do PR #54).
+  const [paidOutsideFor, setPaidOutsideFor] = useState<CourierSettleFollowUp | null>(null);
+  // Senha presa na pendência: sai só com PIN de gerente e registro (GPT, rodada 10 do PR #54).
+  const [resolveFor, setResolveFor] = useState<{ f: CourierSettleFollowUp; m: CourierSettleFollowUp['missing_payments'][number] } | null>(null);
+  const pendingList = useTcheStore((s) => s.courierSettlePending ?? NO_PENDING);
+  const followUps = useTcheStore((s) => s.courierSettleFollowUps ?? NO_FOLLOW_UPS);
   const [sentOut, setSentOut] = useState<OwnDelivery[] | null>(null);
 
   const orderById = useMemo(() => new Map(orders.map((o) => [o.id, o])), [orders]);
@@ -31,8 +52,10 @@ export function OwnDeliveryBoard() {
   const visible = deliveries.filter((d) => d.status !== 'CANCELED' && (d.status !== 'DELIVERED' || new Date(d.delivered_at ?? d.created_at).toDateString() === today));
   const activeCouriers = couriers.filter((c) => c.active);
   const canSettle = user ? CASH_ROLES.includes(user.role) : false;
+  // As entregas de um acerto sem resposta da nuvem ficam no cartão dele, nunca num acerto novo.
+  const inPending = new Set(pendingList.flatMap((p) => p.delivery_ids));
   const toSettle = couriers
-    .map((c) => ({ courier: c, preview: settlementPreview(c.id, deliveries, orders) }))
+    .map((c) => ({ courier: c, preview: settlementPreview(c.id, deliveries.filter((d) => !inPending.has(d.id)), orders) }))
     .filter((x) => x.preview.deliveries.length > 0);
 
   const act = (r: { ok: boolean; error?: string }, ok: string) => (r.ok ? toast.success(ok) : toast.error(r.error ?? 'Não deu certo.'));
@@ -49,9 +72,42 @@ export function OwnDeliveryBoard() {
     toast.success(`${r.data.length} entrega(s) saíram com ${couriers.find((c) => c.id === courierId)?.name ?? 'o entregador'}.`);
   };
 
-  const settling = toSettle.find((x) => x.courier.id === settleFor);
-  const settle = (payFromDrawer: boolean, auth: { managerPin: string; reason: string } | null) =>
-    useTcheStore.getState().settleCourier(settleFor!, { payFromDrawer, auth });
+  // Com a loja ligada à nuvem, a nuvem confirma o acerto antes de sair dinheiro da gaveta
+  // (sem internet não acerta); sem nuvem, acerta neste aparelho (auditoria interna, rodada 8 do PR #54).
+  const cloudStore = useTcheStore((s) => s.cloud !== null);
+  const [settlingBusy, setSettlingBusy] = useState(false);
+  const shown = target === null ? null
+    : target.kind === 'new'
+      ? { name: target.courierName, count: target.deliveryIds.length, cash: target.cash, fees: target.fees }
+      : { name: target.entry.courier_name, count: target.entry.delivery_ids.length, cash: target.entry.cash_collected, fees: target.entry.courier_fees };
+  const settle = (t: SettleTarget, payFromDrawer: boolean, auth: { managerPin: string; reason: string } | null) =>
+    t.kind === 'new'
+      ? useTcheStore.getState().settleCourierOnline(t.courierId, { payFromDrawer, auth, deliveryIds: t.deliveryIds, expected: { cash: t.cash, fees: t.fees } })
+      : useTcheStore.getState().settleCourierOnline(t.entry.courier_id, { payFromDrawer, auth, pendingId: t.entry.id });
+  const closeSettle = () => {
+    setPayAuthOpen(false);
+    setOutsideAuthOpen(false);
+    setTarget(null);
+  };
+  /**
+   * O acerto foi para o quadro (gravado na nuvem com pendência, ou sem resposta da nuvem): o
+   * erro vai para o aviso e as telas fecham; o cartão do quadro mostra o que falta.
+   */
+  const settleLanded = (t: SettleTarget, r: ActionResult<CourierSettlement>): boolean => {
+    if (r.ok) return false;
+    const ids = t.kind === 'new' ? t.deliveryIds : t.entry.delivery_ids;
+    const s = useTcheStore.getState();
+    const covers = (list: readonly { delivery_ids: string[] }[]) => list.some((x) => x.delivery_ids.some((id) => ids.includes(id)));
+    if (!covers(s.courierSettleFollowUps ?? []) && !covers(s.courierSettlePending ?? [])) return false;
+    toast.error(r.error);
+    closeSettle();
+    return true;
+  };
+  const finishFollowUp = (f: CourierSettleFollowUp, step: { kind: 'payments' }) => {
+    const r = useTcheStore.getState().finishCourierSettleFollowUp(f.settlement_id, step);
+    if (!r.ok) return toast.error(r.error);
+    toast.success(r.data === null ? `Acerto de ${f.courier_name} terminado.` : 'Senhas recebidas.');
+  };
 
   return (
     <div className="mx-auto max-w-6xl p-3">
@@ -59,6 +115,45 @@ export function OwnDeliveryBoard() {
         <h1 className="mr-auto flex items-center gap-2 text-xl font-black"><MapPin className="h-6 w-6 text-brasa" /> Entrega própria</h1>
         <span className="text-xs text-slate-500">Lance o pedido em Balcão › Entrega.</span>
       </div>
+
+      {(followUps.length > 0 || pendingList.length > 0) && (
+        <section className="mb-4 space-y-2 rounded-2xl border border-brasa/50 bg-brasa/10 p-3" aria-label="Acertos a terminar">
+          {followUps.map((f) => (
+            <div key={f.settlement_id} className="rounded-xl bg-surface p-3 text-sm">
+              <h3 className="font-black text-rose-700">Acerto gravado na nuvem com pendência · {f.courier_name}</h3>
+              <p className="text-slate-600">{f.delivery_ids.length} entrega(s) · dinheiro {formatBRL(f.cash_collected)} · ganho {formatBRL(f.courier_fees)}</p>
+              <ul className="my-1 list-disc pl-5 text-slate-700">
+                {f.missing_payments.map((m) => (
+                  <li key={m.delivery_id}>
+                    Senha {formatPickupNumber(m.pickup_number)}: {formatBRL(m.amount)} não recebido. {m.error}
+                    {canSettle && (
+                      <Btn variant="secondary" className="ml-2" onClick={() => setResolveFor({ f, m })}>Resolver com gerente</Btn>
+                    )}
+                  </li>
+                ))}
+                {f.missing_withdrawal && <li>Sangria de {formatBRL(f.missing_withdrawal.amount)} para o entregador não feita. {f.missing_withdrawal.error}</li>}
+              </ul>
+              {canSettle && (
+                <div className="flex flex-wrap gap-2">
+                  {f.missing_payments.length > 0 && <Btn variant="gold" onClick={() => finishFollowUp(f, { kind: 'payments' })}>Receber as senhas</Btn>}
+                  {f.missing_withdrawal && <Btn variant="success" onClick={() => setFollowPinFor(f)}>Fazer a sangria (PIN do gerente)</Btn>}
+                  {f.missing_withdrawal && <Btn variant="secondary" onClick={() => setPaidOutsideFor(f)}>Pago por fora</Btn>}
+                </div>
+              )}
+            </div>
+          ))}
+          {pendingList.map((p) => (
+            <div key={p.id} className="rounded-xl bg-surface p-3 text-sm">
+              <h3 className="font-black text-rose-700">Acerto sem resposta da nuvem · {p.courier_name}</h3>
+              <p className="text-slate-600">
+                {p.delivery_ids.length} entrega(s) · dinheiro {formatBRL(p.cash_collected)} · ganho {formatBRL(p.courier_fees)}. A nuvem pode ter gravado:
+                tente de novo (o mesmo acerto, com os mesmos valores). Nada saiu da gaveta por ele.
+              </p>
+              {canSettle && <Btn variant="gold" className="mt-2" onClick={() => setTarget({ kind: 'pending', entry: p })}>Tentar de novo</Btn>}
+            </div>
+          ))}
+        </section>
+      )}
 
       {toSettle.length > 0 && (
         <section className="mb-4 rounded-2xl border border-ouro/50 bg-ouro/10 p-3">
@@ -71,7 +166,17 @@ export function OwnDeliveryBoard() {
                   <div className="text-slate-600">{preview.deliveries.length} entrega(s) · ganho {formatBRL(preview.courierFees)}</div>
                   <div className="text-slate-600">Dinheiro com ele: <b>{formatBRL(preview.cashToCollect)}</b> ({preview.cashOrders} conta(s))</div>
                 </div>
-                {canSettle && <Btn variant="gold" onClick={() => setSettleFor(courier.id)}>Acertar</Btn>}
+                {canSettle && (
+                  <Btn
+                    variant="gold"
+                    onClick={() => setTarget({
+                      kind: 'new', courierId: courier.id, courierName: courier.name,
+                      deliveryIds: preview.deliveries.map((d) => d.id), cash: preview.cashToCollect, fees: preview.courierFees,
+                    })}
+                  >
+                    Acertar
+                  </Btn>
+                )}
               </div>
             ))}
           </div>
@@ -79,7 +184,7 @@ export function OwnDeliveryBoard() {
       )}
 
       {selected.length > 0 && (
-        <div className="sticky top-0 z-10 mb-3 flex flex-wrap items-center gap-2 rounded-2xl bg-slate-900 p-3 text-white">
+        <div className="sticky top-[var(--equipe-topo,56px)] z-10 mb-3 flex flex-wrap items-center gap-2 rounded-2xl bg-slate-900 p-3 text-white">
           <span className="font-bold">{selected.length} na rota</span>
           <select value={courierId} onChange={(e) => setCourierId(e.target.value)} aria-label="Entregador" className="min-h-touch rounded-xl bg-white px-3 text-slate-900">
             <option value="">Entregador…</option>
@@ -142,29 +247,46 @@ export function OwnDeliveryBoard() {
         )}
       </Sheet>
 
-      <Sheet open={settling !== undefined && !payAuthOpen} onClose={() => setSettleFor(null)} title={`Acerto · ${settling?.courier.name ?? ''}`}>
-        {settling && (
+      <Sheet open={target !== null && !payAuthOpen && !outsideAuthOpen} onClose={closeSettle} title={`Acerto · ${shown?.name ?? ''}`}>
+        {target && shown && (
           <div className="space-y-3 text-sm">
+            {target.kind === 'pending' && (
+              <p className="rounded-xl bg-brasa/10 p-2 text-slate-700">
+                Tentativa de novo do acerto sem resposta da nuvem: as mesmas entregas e os mesmos valores. Se a nuvem gravou, ela devolve o mesmo acerto.
+              </p>
+            )}
             <dl className="grid grid-cols-2 gap-1">
-              <dt>Entregas</dt><dd className="text-right font-bold">{settling.preview.deliveries.length}</dd>
-              <dt>Dinheiro recebido dos clientes</dt><dd className="text-right font-bold">{formatBRL(settling.preview.cashToCollect)}</dd>
-              <dt>Ganho do entregador</dt><dd className="text-right font-bold">{formatBRL(settling.preview.courierFees)}</dd>
+              <dt>Entregas</dt><dd className="text-right font-bold">{shown.count}</dd>
+              <dt>Dinheiro recebido dos clientes</dt><dd className="text-right font-bold">{formatBRL(shown.cash)}</dd>
+              <dt>Ganho do entregador</dt><dd className="text-right font-bold">{formatBRL(shown.fees)}</dd>
             </dl>
             <p className="rounded-xl bg-base p-2 text-slate-700">
               O dinheiro das contas pagas na entrega entra no caixa como recebimento em dinheiro. O ganho do entregador pode sair da gaveta
               (sangria com PIN do gerente) ou ser pago por fora.
             </p>
-            <Btn block variant="success" onClick={() => setPayAuthOpen(true)} disabled={settling.preview.courierFees <= 0}>
-              Receber e pagar {formatBRL(settling.preview.courierFees)} pela gaveta
+            {cloudStore && (
+              <p className="rounded-xl bg-ouro/15 p-2 text-slate-700">
+                Loja na nuvem: o acerto precisa da internet. A nuvem confirma que nenhuma destas entregas já foi acertada em outro aparelho
+                antes de sair dinheiro da gaveta.
+              </p>
+            )}
+            <Btn block variant="success" onClick={() => setPayAuthOpen(true)} disabled={shown.fees <= 0 || settlingBusy}>
+              Receber e pagar {formatBRL(shown.fees)} pela gaveta
             </Btn>
             <Btn
               block
               variant="secondary"
-              onClick={() => {
-                const r = settle(false, null);
+              disabled={settlingBusy}
+              onClick={async () => {
+                const t = target;
+                if (shown.fees > 0) return setOutsideAuthOpen(true);
+                setSettlingBusy(true);
+                const r = await settle(t, false, null);
+                setSettlingBusy(false);
+                if (settleLanded(t, r)) return;
                 if (!r.ok) return toast.error(r.error);
                 toast.success(`Acerto feito: ${formatBRL(r.data.cash_collected)} recebidos.`);
-                setSettleFor(null);
+                closeSettle();
               }}
             >
               Só receber o dinheiro (pago o entregador por fora)
@@ -174,15 +296,73 @@ export function OwnDeliveryBoard() {
       </Sheet>
 
       <ManagerAuthSheet
-        open={payAuthOpen && settling !== undefined}
+        open={payAuthOpen && target !== null}
         onClose={() => setPayAuthOpen(false)}
         title="Pagar entregador pela gaveta"
-        summary={<span>Sangria de <b>{formatBRL(settling?.preview.courierFees ?? 0)}</b> para {settling?.courier.name}.</span>}
+        summary={<span>Sangria de <b>{formatBRL(shown?.fees ?? 0)}</b> para {shown?.name}.</span>}
         confirmLabel="Autorizar e acertar"
-        quickReasons={[`Acerto do entregador ${settling?.courier.name ?? ''}`.trim()]}
+        quickReasons={[`Acerto do entregador ${shown?.name ?? ''}`.trim()]}
         successMessage="Acerto feito."
-        onSubmit={(managerPin, reason) => settle(true, { managerPin, reason })}
-        onSuccess={() => { setPayAuthOpen(false); setSettleFor(null); }}
+        onSubmit={async (managerPin, reason) => {
+          const t = target!;
+          const r = await settle(t, true, { managerPin, reason });
+          settleLanded(t, r);
+          return r;
+        }}
+        onSuccess={closeSettle}
+      />
+
+      <ManagerAuthSheet
+        open={outsideAuthOpen && target !== null}
+        onClose={() => setOutsideAuthOpen(false)}
+        title="Ganho do entregador pago por fora"
+        summary={<span>Receber o dinheiro das senhas e marcar o ganho de <b>{formatBRL(shown?.fees ?? 0)}</b> para {shown?.name} como pago sem sair da gaveta. Fica registrado na auditoria; diga no motivo como foi pago.</span>}
+        confirmLabel="Autorizar e acertar"
+        quickReasons={['Pago em pix pela loja', 'Pago em dinheiro fora do caixa']}
+        successMessage="Acerto feito."
+        onSubmit={async (managerPin, reason) => {
+          const t = target!;
+          const r = await settle(t, false, { managerPin, reason });
+          settleLanded(t, r);
+          return r;
+        }}
+        onSuccess={closeSettle}
+      />
+
+      <ManagerAuthSheet
+        open={followPinFor !== null}
+        onClose={() => setFollowPinFor(null)}
+        title="Sangria do acerto com pendência"
+        summary={<span>Sangria de <b>{formatBRL(followPinFor?.missing_withdrawal?.amount ?? 0)}</b> para {followPinFor?.courier_name} (acerto já gravado na nuvem).</span>}
+        confirmLabel="Autorizar sangria"
+        quickReasons={[`Acerto do entregador ${followPinFor?.courier_name ?? ''}`.trim()]}
+        successMessage="Sangria feita."
+        onSubmit={(managerPin, reason) => useTcheStore.getState().finishCourierSettleFollowUp(followPinFor!.settlement_id, { kind: 'withdrawal', auth: { managerPin, reason } })}
+        onSuccess={() => setFollowPinFor(null)}
+      />
+
+      <ManagerAuthSheet
+        open={paidOutsideFor !== null}
+        onClose={() => setPaidOutsideFor(null)}
+        title="Ganho do entregador pago por fora"
+        summary={<span>Ganho de <b>{formatBRL(paidOutsideFor?.missing_withdrawal?.amount ?? 0)}</b> para {paidOutsideFor?.courier_name} pago sem sair da gaveta. Fica registrado na auditoria; diga no motivo como foi pago.</span>}
+        confirmLabel="Autorizar pago por fora"
+        quickReasons={['Pago em pix pela loja', 'Pago em dinheiro fora do caixa']}
+        successMessage="Ganho marcado como pago por fora."
+        onSubmit={(managerPin, reason) => useTcheStore.getState().finishCourierSettleFollowUp(paidOutsideFor!.settlement_id, { kind: 'paid_outside', auth: { managerPin, reason } })}
+        onSuccess={() => setPaidOutsideFor(null)}
+      />
+
+      <ManagerAuthSheet
+        open={resolveFor !== null}
+        onClose={() => setResolveFor(null)}
+        title="Senha resolvida com o gerente"
+        summary={<span>Senha {formatPickupNumber(resolveFor?.m.pickup_number ?? null)} de {resolveFor?.f.courier_name}: <b>{formatBRL(resolveFor?.m.amount ?? 0)}</b> sai da pendência sem ser recebida aqui. Fica registrado na auditoria; diga no motivo o que aconteceu.</span>}
+        confirmLabel="Autorizar"
+        quickReasons={['Recebido no caixa por outro meio', 'Conta desfeita pelo cliente']}
+        successMessage="Senha resolvida."
+        onSubmit={(managerPin, reason) => useTcheStore.getState().finishCourierSettleFollowUp(resolveFor!.f.settlement_id, { kind: 'payment_resolved', delivery_id: resolveFor!.m.delivery_id, auth: { managerPin, reason } })}
+        onSuccess={() => setResolveFor(null)}
       />
 
       <ManagerAuthSheet

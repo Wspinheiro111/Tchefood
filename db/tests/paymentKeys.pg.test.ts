@@ -71,8 +71,8 @@ let seq = 0;
 function order(balance = 100, tenant = TENANT): string {
   seq += 1;
   const id = `f0f0f0f0-0000-4000-8000-${String(seq).padStart(12, '0')}`;
-  const [table, staff] = tenant === TENANT ? [TABLE, STAFF] : [OTHER_TABLE, OTHER_STAFF];
-  sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${id}', '${tenant}', '${table}', '${staff}');
+  const staff = tenant === TENANT ? STAFF : OTHER_STAFF;
+  sql(`INSERT INTO orders (id, tenant_id, table_id, opened_by_user_id) VALUES ('${id}', '${tenant}', test_fresh_table('${tenant}'), '${staff}');
        BEGIN; SET LOCAL session_replication_role = replica;
        INSERT INTO order_items (order_id, product_id, waiter_id, quantity, unit_price, total_item_price, sector)
        VALUES ('${id}', gen_random_uuid(), '${staff}', 1, ${balance}, ${balance}, 'NONE');
@@ -393,6 +393,10 @@ async function race(first: string, second: string): Promise<{ first: string; sec
 describe.skipIf(!target)('chaves de pagamento: cobrança da Point, reserva e pagamento no mesmo espaço de chaves', () => {
   beforeAll(() => {
     applySchema(target!, DB);
+    // Uma mesa nova por conta (PR #54): duas contas abertas na mesma mesa são recusadas (TCHEFOOD_MESA_OCUPADA).
+    sql(`CREATE SEQUENCE IF NOT EXISTS test_table_seq START 1000;
+         CREATE OR REPLACE FUNCTION test_fresh_table(p_tenant UUID) RETURNS UUID LANGUAGE sql AS $$
+           INSERT INTO dining_tables (tenant_id, number, label) SELECT p_tenant, n, 'Mesa ' || n FROM (SELECT nextval('test_table_seq')::int AS n) s RETURNING id $$;`);
     sql(`INSERT INTO tenants (id, name, legal_name, cnpj) VALUES ('${TENANT}', 'Loja', 'Loja Ltda', '11222333000181'), ('${OTHER}', 'Outra', 'Outra Ltda', '11444777000161');
          INSERT INTO staff_users (id, tenant_id, name, role, pin_code) VALUES ('${STAFF}', '${TENANT}', 'Caixa', 'CASHIER', '5162'),
                 ('${OTHER_STAFF}', '${OTHER}', 'Caixa da outra', 'CASHIER', '5162');
