@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
-import { BarChart3, Beer, Bike, ChefHat, CloudOff, LayoutGrid, LogOut, MonitorPlay, QrCode as QrIcon, RefreshCw, ShoppingBag, Smartphone, Ticket, Wallet } from 'lucide-react';
+import { BarChart3, Beer, Bike, ChefHat, CloudOff, HelpCircle, LayoutGrid, LogOut, MonitorPlay, QrCode as QrIcon, RefreshCw, ShoppingBag, Smartphone, Ticket, Wallet } from 'lucide-react';
 import { BrandLogo, BrandMark } from './components/Brand';
 import { selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
 import { useTerminalBus } from './lib/payments/drivers';
 import { LoginScreen } from './screens/LoginScreen';
+import { HelpCenter } from './screens/HelpCenter';
 import { TableMap } from './screens/TableMap';
 import { OrderScreen } from './screens/OrderScreen';
 import { CheckoutScreen } from './screens/CheckoutScreen';
@@ -27,6 +28,7 @@ import { PrintSimulatorModal } from './components/PrintSimulator';
 import { ToastHost, toast } from './components/ui';
 import { CloudStaleBanner } from './components/CloudStaleBanner';
 import type { UserRole } from './types';
+import { NAV_ACCESS, type NavKey } from './lib/navAccess';
 
 type View =
   | { name: 'map' }
@@ -42,21 +44,10 @@ type View =
   | { name: 'caixa' }
   | { name: 'backoffice' };
 
-type NavKey = 'map' | 'kds' | 'caixa' | 'pickup' | 'ficha' | 'chopp' | 'qr' | 'delivery' | 'board' | 'backoffice';
-
-const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: UserRole[] }> = [
-  { key: 'map', label: 'Mesas', icon: LayoutGrid, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
-  { key: 'kds', label: 'KDS', icon: ChefHat, roles: ['KITCHEN', 'MANAGER', 'OWNER'] },
-  { key: 'caixa', label: 'Caixa', icon: Wallet, roles: ['CASHIER', 'MANAGER', 'OWNER'] },
-  { key: 'pickup', label: 'PDV / Caixa', icon: ShoppingBag, roles: ['CASHIER', 'MANAGER', 'OWNER'] },
-  { key: 'ficha', label: 'Ficha Rápida', icon: Ticket, roles: ['WAITER', 'CASHIER', 'MANAGER', 'OWNER'] },
-  { key: 'chopp', label: 'Chopp', icon: Beer, roles: ['KITCHEN', 'CASHIER', 'MANAGER', 'OWNER'] },
-  { key: 'qr', label: 'QR Cliente', icon: QrIcon, roles: ['WAITER', 'MANAGER', 'OWNER', 'CASHIER'] },
-  { key: 'delivery', label: 'Delivery', icon: Bike, roles: ['MANAGER', 'OWNER', 'CASHIER'] },
-  { key: 'board', label: 'Painel TV', icon: MonitorPlay, roles: ['MANAGER', 'OWNER', 'CASHIER', 'KITCHEN'] },
-  // Retaguarda: aparece para quem tem ao menos uma aba liberada (perfil ou permissão).
-  { key: 'backoffice', label: 'Retaguarda', icon: BarChart3, roles: [] },
-];
+const NAV_ICON: Record<NavKey, typeof LayoutGrid> = {
+  map: LayoutGrid, kds: ChefHat, caixa: Wallet, pickup: ShoppingBag, ficha: Ticket, chopp: Beer, qr: QrIcon, delivery: Bike, board: MonitorPlay, backoffice: BarChart3,
+};
+const NAV: Array<{ key: NavKey; label: string; icon: typeof LayoutGrid; roles: ReadonlyArray<UserRole> }> = NAV_ACCESS.map((n) => ({ ...n, icon: NAV_ICON[n.key] }));
 
 /**
  * Mede o topo fixo (cabeçalho + faixa de contas paradas) e grava a altura em --equipe-topo no
@@ -97,6 +88,8 @@ function AppBody() {
   const outbox = useTcheStore((s) => s.outbox.length);
   const online = useOnline();
   const [view, setView] = useState<View>({ name: 'map' });
+  // Central de Ajuda aberta por cima da tela atual (a tela e o estado dela ficam como estavam).
+  const [helpOpen, setHelpOpen] = useState(false);
   const backOfficeTabs = useBackOfficeTabs();
   // Etapa 0: envia a fila para o Supabase quando há internet e o aparelho está conectado.
   useCloudSync(online);
@@ -124,7 +117,7 @@ function AppBody() {
   if (!user) {
     return (
       <>
-        <LoginScreen />
+        {helpOpen ? <HelpCenter onClose={() => setHelpOpen(false)} /> : <LoginScreen onHelp={() => setHelpOpen(true)} />}
         <ToastHost />
       </>
     );
@@ -161,11 +154,14 @@ function AppBody() {
           </div>
           <nav className="hidden gap-1 sm:flex">
             {nav.map((n) => (
-              <button key={n.key} onClick={() => setView({ name: n.key } as View)} className={`flex min-h-touch items-center gap-2 rounded-xl px-3 text-sm font-bold ${activeKey === n.key ? 'bg-brasa text-white shadow' : 'text-slate-700 hover:bg-slate-100'}`}>
+              <button key={n.key} onClick={() => { setHelpOpen(false); setView({ name: n.key } as View); }} className={`flex min-h-touch items-center gap-2 rounded-xl px-3 text-sm font-bold ${activeKey === n.key ? 'bg-brasa text-white shadow' : 'text-slate-700 hover:bg-slate-100'}`}>
                 <n.icon className="h-4 w-4" /> {n.label}
               </button>
             ))}
           </nav>
+          <button aria-label="Central de ajuda" onClick={() => setHelpOpen(true)} className="grid h-11 w-11 place-items-center rounded-xl bg-surface text-slate-700" title="Central de ajuda">
+            <HelpCircle className="h-5 w-5" />
+          </button>
           <button aria-label="Abrir maquininha" onClick={() => useTerminalBus.getState().openSimulator()} className="grid h-11 w-11 place-items-center rounded-xl bg-surface text-verde" title="Maquininha / bobina">
             <Smartphone className="h-5 w-5" />
           </button>
@@ -179,6 +175,9 @@ function AppBody() {
       <UnsavedStorageBanner />
 
       <main>
+        {helpOpen && <HelpCenter user={user} onClose={() => setHelpOpen(false)} />}
+        {/* Escondida, não desmontada: abrir a ajuda no meio de uma cobrança não perde a tela. */}
+        <div hidden={helpOpen}>
         {view.name === 'map' && <TableMap onOpenOrder={(orderId) => setView({ name: 'order', orderId })} />}
         {view.name === 'order' && (
           <OrderScreen orderId={view.orderId} onBack={() => setView({ name: 'map' })} onCheckout={(orderId) => setView({ name: 'checkout', orderId })} />
@@ -195,12 +194,13 @@ function AppBody() {
         {view.name === 'delivery' && <DeliveryScreen />}
         {view.name === 'board' && <OrderBoardScreen />}
         {view.name === 'backoffice' && <BackOffice onExit={(name) => setView({ name } as View)} onOpenCheckout={(orderId) => setView({ name: 'checkout', orderId })} />}
+        </div>
       </main>
 
       {nav.length > 1 && (
         <nav className="fixed inset-x-0 bottom-0 z-20 grid border-t border-slate-200 bg-base sm:hidden" style={{ gridTemplateColumns: `repeat(${nav.length}, 1fr)` }}>
           {nav.map((n) => (
-            <button key={n.key} onClick={() => setView({ name: n.key } as View)} className={`flex min-h-[64px] flex-col items-center justify-center gap-1 text-xs font-bold ${activeKey === n.key ? 'text-brasa' : 'text-slate-500'}`}>
+            <button key={n.key} onClick={() => { setHelpOpen(false); setView({ name: n.key } as View); }} className={`flex min-h-[64px] flex-col items-center justify-center gap-1 text-xs font-bold ${activeKey === n.key ? 'text-brasa' : 'text-slate-500'}`}>
               <n.icon className="h-6 w-6" /> {n.label}
             </button>
           ))}

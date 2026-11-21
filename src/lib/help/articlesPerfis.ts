@@ -1,0 +1,120 @@
+import type { HelpArticle } from './types';
+
+/** "Me coloquei no lugar de cada perfil": as dúvidas que cada um tem no dia a dia, com a resposta e onde fica. */
+export const ARTICLES_PERFIS: HelpArticle[] = [
+  {
+    id: 'ajuda-dono',
+    title: 'Dúvidas do dono',
+    summary: 'Resultado do dia, equipe, permissões, loja e fechamento.',
+    category: 'Dúvidas de cada perfil',
+    audience: ['OWNER'],
+    related: ['cadastrar-pessoa', 'permissoes-por-perfil', 'relatorios-dia', 'auditoria-antifraude'],
+    blocks: [
+      { t: 'faq', items: [
+        { q: 'Quanto vendi hoje?', a: 'Retaguarda › Painel do dono mostra o faturamento de hoje e permite trocar o período (Hoje, Ontem, 7 dias, 30 dias). Retaguarda › Turno mostra o turno atual: faturamento, ticket médio, taxa de 10% e mesas atendidas.' },
+        { q: 'Como sei se alguém cancelou ou deu desconto?', a: 'Retaguarda › Anti-Fraude lista cada cancelamento de item enviado, remoção dos 10%, desconto e PIN de gerente errado, com a mesa, quem pediu, quem autorizou, o valor e o motivo.' },
+        { q: 'Como dou acesso a um funcionário novo?', a: 'Retaguarda › Equipe › Nova pessoa. Veja "Cadastrar uma nova pessoa na equipe".' },
+        { q: 'Quero que só eu mexa no cardápio. Dá?', a: 'Dá. Em Retaguarda › Loja › Permissões por perfil, deixe "Editar cardápio, preços e adicionais" como Não para o gerente.' },
+        { q: 'Como mudo a taxa de serviço ou os dados da loja?', a: 'Retaguarda › Loja. A taxa padrão vale para contas abertas daqui em diante. Só o proprietário vê essa aba, a menos que você libere "Dados da loja e taxa de serviço" para outro perfil.' },
+        { q: 'O gerente pode cadastrar outro gerente?', a: 'Não. Só o proprietário cadastra, edita ou promove gerentes e proprietários.' },
+        { q: 'O que o fechamento anual mostra?', a: 'Retaguarda › Fechamento anual reúne os relatórios que a contabilidade pede, com exportação em Excel (CSV) e PDF. Só dono e gerente veem. Ele considera só o que está registrado neste aparelho: se a loja usa mais de um aparelho, gere o relatório em cada um.' },
+        { q: 'Esqueci meu PIN.', a: 'Outro proprietário ativo pode trocar. Veja "Esqueci meu PIN".' },
+      ] },
+    ],
+  },
+  {
+    id: 'ajuda-gerente',
+    title: 'Dúvidas do gerente',
+    summary: 'Autorizações, caixa, equipe, entrega, taxas e compras.',
+    category: 'Dúvidas de cada perfil',
+    audience: ['MANAGER'],
+    related: ['autorizacao-gerente', 'caixa', 'entrega-propria'],
+    blocks: [
+      { t: 'faq', items: [
+        { q: 'O garçom pediu para cancelar um item. O que faço?', a: 'Ele toca em Cancelar no extrato, escolhe o motivo e entrega o aparelho para você digitar o seu PIN. O item não some: fica como cancelado, com registro na auditoria.' },
+        { q: 'Errei o PIN três vezes. E agora?', a: 'O PIN de gerente fica bloqueado por 60 segundos e o dono é alertado. Espere o tempo acabar e digite o PIN certo.' },
+        { q: 'Como cadastro um garçom, caixa ou cozinha?', a: 'Retaguarda › Equipe › Nova pessoa. Você não cadastra gerente nem proprietário.' },
+        { q: 'O caixa contou a gaveta e não bateu. O que faço?', a: 'Você vê a diferença na tela do caixa e fecha com a diferença usando PIN e motivo. O caixa comum não vê o valor esperado (fechamento cego).' },
+        { q: 'Como cadastro bairros e entregadores?', a: 'Retaguarda › Entrega própria. Só gerente e proprietário editam.' },
+        { q: 'Quem altera a taxa da maquininha e o prazo de recebimento?', a: 'Retaguarda › Taxas e recebíveis. Gerente e proprietário editam; o caixa só consulta.' },
+        { q: 'Como dou entrada em uma nota de compra?', a: 'Retaguarda › Compras / Estoque: envie o XML da NF-e do fornecedor. Os itens viram estoque e o custo vai para o CMV. Só gerente e proprietário.' },
+        { q: 'Uma pessoa nova não consegue entrar em outro aparelho.', a: 'Retaguarda › Nuvem › Atualizar equipe (com internet) traz as pessoas novas e os PINs trocados.' },
+      ] },
+    ],
+  },
+  {
+    id: 'ajuda-caixa',
+    title: 'Dúvidas do caixa',
+    summary: 'Abrir e fechar o caixa, PDV, ficha, entrega e quando chamar o gerente.',
+    category: 'Dúvidas de cada perfil',
+    audience: ['CASHIER'],
+    related: ['caixa', 'pdv-ficha', 'entrega-propria'],
+    blocks: [
+      { t: 'faq', items: [
+        { q: 'Como abro o caixa?', a: 'Menu Caixa › digite o fundo de troco da gaveta › "Abrir caixa". Detalhes em "Caixa: abrir, sangria e fechar".' },
+        { q: 'Por que não vejo quanto deveria ter na gaveta?', a: 'É o fechamento cego: você conta e digita o total; o esperado só aparece para o gerente. Se a contagem não bater, conte de novo ou chame o gerente.' },
+        { q: 'Preciso tirar dinheiro da gaveta.', a: 'Use "Sangria". Ela pede o valor, um motivo e o PIN do gerente.' },
+        { q: 'O cliente quer pagar e a maquininha não respondeu.', a: 'Não cobre de novo. A tela avisa "Há uma cobrança sem confirmação: confira o extrato da maquininha antes de cobrar de novo". Se a maquininha aprovou, use "Maquininha aprovou: registrar comprovante".' },
+        { q: 'Como marco um produto como esgotado?', a: 'Retaguarda › Cardápio. O caixa tem a permissão de marcar esgotado, mas não de mudar preços.' },
+        { q: 'Como acerto com o entregador?', a: 'Menu Delivery › Entrega própria › "Acerto com entregador". Veja "Entrega própria e acerto com o entregador".' },
+        { q: 'Quero editar a equipe ou o cardápio inteiro.', a: 'Isso é do gerente ou do dono, a menos que o dono libere essa permissão para o caixa.' },
+      ] },
+    ],
+  },
+  {
+    id: 'ajuda-garcom',
+    title: 'Dúvidas do garçom',
+    summary: 'Mesa, comanda, item errado, conta, divisão e limpeza.',
+    category: 'Dúvidas de cada perfil',
+    audience: ['WAITER'],
+    related: ['abrir-mesa-pedido', 'cancelar-desconto', 'fechar-conta'],
+    blocks: [
+      { t: 'faq', items: [
+        { q: 'Como abro uma mesa?', a: 'Toque numa mesa "Livre", informe quantas pessoas são e toque em "Abrir mesa". O CPF na nota é opcional.' },
+        { q: 'Lancei um item errado. E agora?', a: 'Se ainda está na bandeja (não enviou), toque na lixeira ou em "−". Se já foi enviado para a produção, toque em Cancelar no extrato: precisa do motivo e do PIN do gerente.' },
+        { q: 'O cliente quer tirar os 10% ou pediu desconto.', a: 'Só com o PIN do gerente: no extrato, "Remover" (taxa de serviço) ou "Aplicar" (desconto).' },
+        { q: 'Como divido a conta?', a: 'Extrato › Fechar / Cobrar. Há três jeitos: por pessoa, valor livre e por item. Veja "Fechar a conta e dividir".' },
+        { q: 'A mesa ficou em "Limpeza".', a: 'Depois que a conta fecha, a mesa fica em Limpeza. Toque nela para liberar.' },
+        { q: 'Por que não vejo Caixa, Delivery ou KDS?', a: 'O menu do garçom tem Mesas, Ficha Rápida e QR Cliente. As outras telas são de outros perfis.' },
+        { q: 'O cliente pediu pelo QR Code da mesa.', a: 'O pedido cai direto na comanda da mesa e na cozinha, com o selo "Pedido via QR Code". Você acompanha no extrato.' },
+        { q: 'Não consigo entrar / esqueci o PIN.', a: 'Peça ao gerente ou ao dono para trocar o seu PIN. Veja "Esqueci meu PIN".' },
+      ] },
+    ],
+  },
+  {
+    id: 'ajuda-cozinha',
+    title: 'Dúvidas da cozinha',
+    summary: 'KDS, cores do tempo, esgotado e chopp.',
+    category: 'Dúvidas de cada perfil',
+    audience: ['KITCHEN'],
+    related: ['kds', 'chopp'],
+    blocks: [
+      { t: 'faq', items: [
+        { q: 'Onde vejo os pedidos?', a: 'No KDS, que abre assim que você entra. Use os filtros Todos, Parrilla, Cozinha e Bar / Copa para ver só a sua praça.' },
+        { q: 'O que as cores do tempo querem dizer?', a: 'Menos de 10 minutos: verde (no prazo). De 10 a 19: amarelo (atenção). 20 ou mais: vermelho piscando (atrasado).' },
+        { q: 'Como aviso que o prato está pronto?', a: 'No item, "Iniciar Preparo" e depois "Marcar Pronto". Quando o garçom entrega, aparece "Entregue na Mesa". Há também o botão do pedido completo.' },
+        { q: 'Acabou um produto.', a: 'No KDS, toque em "Esgotados" e marque o produto. Ele aparece como "EM FALTA" para o garçom.' },
+        { q: 'Onde vejo o ponto da carne e as observações?', a: 'Aparecem em destaque no item (por exemplo "AO PONTO MENOS", adicionais e "Sem cebola").' },
+        { q: 'Posso mexer em chopp?', a: 'Sim: em Chopp você registra desperdício e leitura do barril. Trocar o barril pede o PIN do gerente.' },
+        { q: 'Por que não vejo Mesas ou Caixa?', a: 'O menu da cozinha tem KDS, Chopp e Painel TV.' },
+      ] },
+    ],
+  },
+  {
+    id: 'ajuda-entregador',
+    title: 'Dúvidas do entregador',
+    summary: 'O entregador não usa o app: como funciona o cadastro e o acerto.',
+    category: 'Dúvidas de cada perfil',
+    audience: ['COURIER', 'CASHIER', 'MANAGER', 'OWNER'],
+    related: ['cadastrar-entregador', 'entrega-propria'],
+    blocks: [
+      { t: 'faq', items: [
+        { q: 'Preciso de PIN ou de login?', a: 'Não. O entregador não entra no sistema. O gerente ou o dono cadastra o nome, o telefone e o ganho por entrega em Retaguarda › Entrega própria.' },
+        { q: 'Como o sistema sabe que a entrega é minha?', a: 'O caixa escolhe o seu nome quando o pedido "sai para entrega" e informa o aviso opcional ao cliente pelo WhatsApp.' },
+        { q: 'Como funciona o acerto no fim da rota?', a: 'O caixa abre "Acerto com entregador", escolhe o seu nome e a tela mostra o dinheiro recebido dos clientes e o seu ganho. O dinheiro que você entrega no caixa é o recebido menos o seu ganho.' },
+        { q: 'E se o meu ganho for pago de outro jeito?', a: 'Existe "Pago em dinheiro fora do caixa". Ele pede o PIN do gerente e fica registrado na auditoria.' },
+        { q: 'Uma senha ficou pendente no acerto.', a: 'O caixa chama o gerente em "Resolver com gerente". Ele resolve com PIN e motivo, e isso fica na auditoria.' },
+      ] },
+    ],
+  },
+];
