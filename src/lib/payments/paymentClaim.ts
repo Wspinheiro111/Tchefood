@@ -9,6 +9,7 @@
  * Sem internet, sem sessão ou sem resposta no prazo: não recebe (nunca cai para "cobra assim mesmo").
  * Aparelho sem nuvem nenhuma (demonstração local): nenhuma chamada.
  */
+import { getStorageStatus } from '../idbStorage';
 import type { UUID } from '../../types';
 import type { FetchLike, SyncConfig } from '../sync/supabaseSync';
 import type { OrderSyncCheck } from '../sync/useCloudSync';
@@ -373,6 +374,7 @@ let lastRetry = 0;
 
 /** Tenta de novo as liberações pendentes deste aparelho (abrir o app e laço de sincronização). */
 export async function retryPendingClaimReleases(deps: ClaimDeps = defaultClaimDeps(), nowMs = Date.now(), force = false): Promise<number> {
+  if (getStorageStatus() !== 'ok') return 0; // instância sem lock de escrita ou hidratação provisória: não mexe em reservas
   const list = pendingReleases();
   if (list.length === 0 || (!force && nowMs - lastRetry < RETRY_EVERY_MS)) return 0;
   lastRetry = nowMs;

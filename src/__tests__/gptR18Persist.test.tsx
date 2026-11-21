@@ -763,6 +763,31 @@ describe('GPT r18 P1-01: o acerto só sai com o estado que volta depois de reini
       });
     }, 10_000);
 
+    it('P2-01 (r29): o lock é concedido ANTES de alguém se inscrever: o listener tardio é avisado na hora (a notificação não se perde)', async () => {
+      let queued: (() => unknown) | null = null;
+      await withLocks((_n, optsOrCb, cb) => {
+        if (typeof optsOrCb === 'function') { queued = optsOrCb as () => unknown; return new Promise(() => undefined); }
+        return Promise.resolve(cb(null));
+      }, async () => {
+        const { isStorageWriter, onWriterAvailable } = await seed('tchefood-r29a');
+        expect(await isStorageWriter()).toBe(false);
+        queued!(); // a escritora fechou e a fila recebeu o lock, ainda sem nenhum listener
+        const late = vi.fn();
+        onWriterAvailable(late); // o StorageGuard monta depois
+        expect(late).toHaveBeenCalledTimes(1); // antes: nunca
+      });
+    }, 10_000);
+
+    it('GPT r29 (verificar 2): com o estado provisório, a recuperação de pagamento recusado não pede nada à nuvem', async () => {
+      const mod = await unstable('tchefood-r29b');
+      expect(mod.getStorageStatus()).toBe('blocked');
+      const { recoverRejectedPayment } = await import('../lib/payments/claimRecovery');
+      const r = await recoverRejectedPayment('qualquer');
+      expect(r.ok).toBe(false);
+      expect(r.ok === false && r.transient).toBe(true);
+      expect(r.ok === false && r.error).toContain('não pode gravar agora'); // antes: seguia para a conferência do recusado
+    });
+
     it('antecipado: com a tela bloqueada o app fica inerte (foco e teclado/leitor de código não alcançam o que está atrás) e volta ao normal', async () => {
       const name = 'tchefood-r27h';
       const root = document.createElement('div');

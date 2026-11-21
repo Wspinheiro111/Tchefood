@@ -14,6 +14,7 @@
  * uso…): nada some sozinho; o gerente retira o pagamento daqui com PIN ("não aceito pela nuvem") e a trava diz
  * ao caixa para devolver ou estornar e cobrar de novo.
  */
+import { getStorageStatus } from '../idbStorage';
 import { useTcheStore } from '../../store/useTcheStore';
 import type { Payment, RejectedSyncEvent, SyncEvent } from '../../types';
 import { fetchServerOrderBalance } from '../sync/cloudPull';
@@ -106,6 +107,7 @@ const inFlight = new Set<string>();
 
 /** Recupera um recusado (por id do evento). Nunca lança. */
 export async function recoverRejectedPayment(eventId: string, deps: RecoveryDeps = defaultRecoveryDeps()): Promise<RecoveryResult> {
+  if (getStorageStatus() !== 'ok') return { ok: false, transient: true, error: 'Este aparelho não pode gravar agora (outra janela está em uso ou o estado precisa ser recarregado). Nada foi pedido à nuvem.' };
   const r = (useTcheStore.getState().syncRejected ?? []).find((x) => x.event.id === eventId);
   if (!r || !isRecoverableRejectedPayment(r)) return { ok: false, transient: false, error: 'Este recusado não é um pagamento sem reserva.' };
   const p = paymentOf(r.event)!;

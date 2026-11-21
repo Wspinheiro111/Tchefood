@@ -193,8 +193,17 @@ function settleProvisional(k: string, v: string | null) {
   clearProvisional(k);
 }
 const writerAvailableListeners = new Set<() => void>();
-/** Chamado quando a instância escritora fechou e esta (só leitura) pode assumir: quem escuta recarrega o app. */
+/** A fila do lock já recebeu o lock (a escritora fechou): guardado para quem se inscrever DEPOIS (GPT, rodada 29, P2-01). */
+let writerFreed = false;
+/**
+ * Chamado quando a instância escritora fechou e esta (só leitura) pode assumir: quem escuta recarrega o app. Quem se
+ * inscreve depois de o lock já ter sido concedido é avisado na hora (a notificação não se perde).
+ */
 export function onWriterAvailable(f: () => void): () => void {
+  if (writerFreed) {
+    f();
+    return () => undefined;
+  }
   writerAvailableListeners.add(f);
   return () => writerAvailableListeners.delete(f);
 }
@@ -242,6 +251,7 @@ export function isStorageWriter(): Promise<boolean> {
       try {
         void locks
           .request(WRITER_LOCK, () => {
+            writerFreed = true;
             for (const f of [...writerAvailableListeners]) f();
             return new Promise<void>(() => undefined);
           })

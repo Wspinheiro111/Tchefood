@@ -52,14 +52,18 @@ C. **`select` (getItem) só conclui numa seleção estável**: depois de qualque
 | Leitura estável qualquer durante o provisório liberava a gravação do estado velho | provisório é pegajoso (`settleProvisional`); teste |
 | `removeItem` na instância sem lock ou no provisório | lança; o persist engole só esse erro (a tela já está bloqueada) |
 | `awaitPersisted` com a instância bloqueada | devolve false de antemão e depois de gravar |
-| Rodadas em segundo plano (envio da fila, reservas, acertos) na instância bloqueada | `syncOnce` e o laço de `useCloudSync` não rodam enquanto o status não for ok |
+| Rodadas em segundo plano (envio da fila, reservas, acertos) na instância bloqueada | `startRound` (porta de `syncOnce`, do laço e do `ensure` de cobrança), as etapas seguintes da rodada (reembolsos, NFC-e), `superviseSettledClaims`, `retryPendingClaimReleases` e `recoverRejectedPayment`/`resendRejected` não rodam enquanto o status não for ok. Rodada JÁ em andamento: o status só muda na hidratação (início) ou na releitura do `setItem`; a rodada para na próxima etapa e o que ela já enviou à nuvem é idempotente pelos ids do outbox |
 | Foco/teclado/leitor de código atrás da tela cheia | `StorageGuard` põe `inert` no `#root` e renderiza o diálogo por portal em `document.body` (fora do subtree inerte, para o botão Recarregar continuar clicável e acessível; Codex, r29) |
-| A escritora fecha com a segunda aba aberta | a segunda entra na fila do lock e, ao receber, recarrega sozinha para assumir |
+| A escritora fecha com a segunda aba aberta | a segunda entra na fila do lock e, ao receber, recarrega sozinha para assumir; o fato "lock concedido" é guardado, então quem se inscreve DEPOIS (o `StorageGuard` monta depois) é avisado na hora (GPT r29, P2-01) |
 | Lock demora a soltar ao recarregar (> 4 x 200 ms) | a instância entra só leitura, mas a fila do lock a recarrega assim que ele soltar |
 | Página restaurada do bfcache (lock solto ao congelar) | `pageshow` com `persisted` recarrega |
 | APK suspenso/morto | a WebView solta o lock ao morrer; a abertura seguinte pede o lock de novo e hidrata do disco |
 | Armazenamento cheio (IndexedDB e localStorage recusam) | já tratado antes: estado só em memória, `storedOnlyInMemory`, faixa de aviso e `awaitPersisted` false |
 | Sem `navigator.locks` na WebView | instância escritora sem exclusão; vale a regra das rodadas anteriores. Confirmar no aparelho do piloto |
+
+## Verificação em navegador real
+
+`scripts/e2e-storage-guard.mjs` (Chromium via Playwright, `vite preview`, duas abas do mesmo contexto, Web Locks e IndexedDB reais): a segunda aba mostra o bloqueio; `#root` fica inerte; o diálogo fica fora do `#root`; nenhum botão de `#root` recebe foco; Recarregar é focável por Tab e clicável; o centro da tela pertence ao diálogo; com a escritora fechada a segunda aba recarrega sozinha e assume. Passa no código novo; no build do d1835c0 falha no clique de Recarregar (o bug do P1-01). Não coberto: estado `blocked` em navegador real, suspensão/retomada e morte abrupta da WebView do APK (só no aparelho).
 
 ## Limitações conhecidas
 

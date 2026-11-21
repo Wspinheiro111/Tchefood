@@ -476,6 +476,7 @@ export async function syncOnce(fetchFn: FetchLike = browserFetch, opts: { forceP
 
 /** pull: 'due' = lê a nuvem se passou um minuto; 'force' = lê sempre; 'never' = só sobe a fila (cobrança na Point). */
 async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): Promise<void> {
+  if (getStorageStatus() !== 'ok') return; // todo caminho com efeito na nuvem passa por aqui (syncOnce, ensure de cobrança, laço)
   if (running) return;
   const state = useTcheStore.getState();
   const session = state.cloud;
@@ -507,8 +508,10 @@ async function runRound(session: NonNullable<ReturnType<typeof useTcheStore.getS
   try {
     const cfg = await sendAndPull(session, fetchFn, due, force);
     // À parte da fila e dos cadastros: roda mesmo com evento preso na fila ou com a leitura dos cadastros falhando.
+    if (getStorageStatus() !== 'ok') return; // o armazenamento ficou bloqueado durante a rodada: não segue para as próximas etapas
     if (cfg && wantsRefunds) await pullRefunds(tenantId, session, cfg, fetchFn);
     // NFC-e real das contas que já subiram inteiras (conta com evento na fila ou recusado fica de fora).
+    if (getStorageStatus() !== 'ok') return;
     if (cfg && nfce) await emitDueNfce(cfg, session, fetchFn);
   } finally {
     running = false;

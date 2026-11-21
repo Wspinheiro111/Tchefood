@@ -19,6 +19,7 @@
  * de 3 leituras ausentes espaçadas por 2 min ou mais (a reserva pode ainda ser gravada por uma chamada que se
  * perdeu, r7 P2-F).
  */
+import { getStorageStatus } from '../idbStorage';
 import { useTcheStore } from '../../store/useTcheStore';
 import type { Payment } from '../../types';
 import { endLocalClaim, inFlightClaims, isClaimActiveHere, markClaimAbsent, settledClaims, type LocalClaim } from './claimLedger';
@@ -131,6 +132,7 @@ async function openKeysWithin(deps: SupervisorDeps, orderId: string): Promise<Re
 
 /** Uma volta do supervisor. Devolve quantas reservas saíram do registro. */
 export async function superviseSettledClaims(deps: SupervisorDeps = defaultDeps(), nowMs = Date.now(), force = false): Promise<number> {
+  if (getStorageStatus() !== 'ok') return 0; // instância sem lock de escrita ou hidratação provisória: não mexe em reservas
   if (running || (!force && nowMs - lastRun < CLAIM_HEARTBEAT_MS)) return 0;
   const settled = settledClaims();
   const stale = inFlightClaims().filter((c) => c.state !== 'settled' && !isClaimActiveHere(c.key));
