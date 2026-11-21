@@ -455,6 +455,15 @@ export type AuditActionType =
   | 'CASH_CLOSE_DIFFERENCE'
   // Item com preço diferente do cadastro aceito com PIN de gerente (db/schema_preco_gerente.sql)
   | 'PRICE_OVERRIDE'
+  // Conta de itens atrasados descartada com mesa ocupada por outro cliente (auditoria interna,
+  // rodada 8 do PR #54): sem PIN de gerente, só o registro dos itens que saíram do aparelho.
+  | 'LATE_ITEMS_DISCARDED'
+  // Ganho do entregador pago por fora da gaveta, com PIN de gerente conferido no aparelho
+  // (GPT, rodada 10 do PR #54). Sobe por tchefood_courier_followup_audit, que confere o PIN.
+  | 'COURIER_PAID_OUTSIDE'
+  // Senha presa na pendência do acerto resolvida com PIN de gerente, sem receber nada aqui
+  // (GPT, rodada 10 do PR #54). Sobe pela mesma função da nuvem.
+  | 'COURIER_PAYMENT_RESOLVED'
   // Reserva liberada pelo gerente com a maquininha aprovada: o caixa estornou na maquininha (só local;
   // o servidor ainda não aceita este tipo em audit_logs).
   | 'CLAIM_RELEASED_REFUNDED'
@@ -686,6 +695,12 @@ export interface CourierSettlement {
   courier_fees: number;
   /** Sangria do caixa que pagou o entregador (null = pago por fora). */
   cash_movement_id: UUID | null;
+  /**
+   * Entregas deste acerto. O banco trava e marca as entregas na gravação do acerto e
+   * recusa o acerto se alguma já foi acertada (outro aparelho). Ausente nos acertos
+   * gravados antes desta versão (auditoria interna, rodada 8 do PR #54).
+   */
+  delivery_ids?: UUID[];
   settled_by_user_id: UUID;
   created_at: ISODateTime;
 }
@@ -850,6 +865,9 @@ export interface NfceCloudRecord {
 }
 
 /** Evento da fila offline-first, pronto para ser enviado ao Supabase. */
+/** Campos do cadastro da mesa que a pessoa edita (saveTable). */
+export type TableEditField = 'number' | 'label' | 'area' | 'capacity' | 'active';
+
 export interface SyncEvent {
   id: UUID;
   table:
@@ -936,6 +954,20 @@ export interface SyncEvent {
    * recusada da mesma torneira (recordKeys). Não vai para o banco.
    */
   keg_tap_id?: UUID;
+  /**
+   * Só na atualização da mesa feita no cadastro (saveTable): os campos do cadastro que a pessoa
+   * mudou. Quando a ocupação velha sai do evento (recuperação de conta recusada ou de itens
+   * atrasados), só esses campos sobem; os outros eram cópia e regravariam o que outro aparelho
+   * mudou depois (GPT, rodada 8 do PR #54). Não vai para o banco.
+   */
+  table_edit_fields?: TableEditField[];
+  /**
+   * Mudança da mesa gravada por uma versão anterior (sem table_edit_fields) que perdeu a ocupação
+   * numa recuperação: não dá para saber o que a pessoa mudou, então ela não sobe sozinha. Vai para
+   * os recusados com o aviso, e só sobe (o cadastro inteiro, como este aparelho viu) quando a
+   * pessoa reenvia (GPT, rodada 11 do PR #54). Não vai para o banco.
+   */
+  legacy_table_review?: true;
   /** Só no proprietário da loja nova: sobe por tchefood_start_store, com o usuário do QR. */
   store_start?: StoreStartSync;
   /**

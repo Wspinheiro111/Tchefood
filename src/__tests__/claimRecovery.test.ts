@@ -36,7 +36,7 @@ function openTable(n = 1): string {
 }
 
 /** Pagamento da versão anterior (sem reserva) recusado com TF010 ao subir. */
-function legacyRejected(orderId: string, amount: number, key: string, over: { method?: 'CASH' | 'CREDIT'; acquirer?: 'CASH_DESK' | 'STONE' } = {}) {
+function legacyRejected(orderId: string, amount: number, key: string, over: { method?: 'CASH' | 'CREDIT'; acquirer?: 'CASH_DESK' | 'STONE'; keepQueued?: boolean } = {}) {
   const method = over.method ?? 'CASH';
   const acquirer = over.acquirer ?? 'CASH_DESK';
   const r = st().registerPayment({
@@ -45,7 +45,7 @@ function legacyRejected(orderId: string, amount: number, key: string, over: { me
   });
   if (!r.ok) throw new Error(r.error);
   const ev = st().outbox.find((e) => e.table === 'payments' && e.row_id === r.data.payment.id)!;
-  st().rejectSyncEvents([{ eventId: ev.id, status: 400, message: TF010 }]);
+  if (!over.keepQueued) st().rejectSyncEvents([{ eventId: ev.id, status: 400, message: TF010 }]);
   return { ev, payment: r.data.payment };
 }
 
@@ -141,8 +141,10 @@ describe('recuperação do pagamento recusado sem reserva', () => {
 
   it('"Reenviar recusados": o recuperado volta; o que não deu fica; os demais recusados voltam para a fila', async () => {
     const id = openTable();
-    const a = legacyRejected(id, 10, 'k-a');
-    const b = legacyRejected(id, 10, 'k-b');
+    // Os dois sobem e são recusados juntos: com um recusado na conta, nada mais é recebido nela (PR #54).
+    const a = legacyRejected(id, 10, 'k-a', { keepQueued: true });
+    const b = legacyRejected(id, 10, 'k-b', { keepQueued: true });
+    st().rejectSyncEvents([a, b].map((x) => ({ eventId: x.ev.id, status: 400, message: TF010 })));
     const other: SyncEvent = { id: 'e-other', table: 'products', op: 'UPDATE', row_id: 'p1', payload: { id: 'p1' }, created_at: '2026-11-14T10:00:00Z' };
     useTcheStore.setState((s) => ({ syncRejected: [...s.syncRejected, { event: other, status: 403, message: 'permissão', rejected_at: '' }] }));
     const { d } = deps((body) => (body.p_key === 'k-a' ? opened(body) : { status: 400, body: { code: 'TF003', message: 'x' } }));

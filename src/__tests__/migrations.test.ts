@@ -26,7 +26,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_mercado_pago.sql', 'schema_point_reserva.sql', 'schema_pin_equipe_trava.sql', 'schema_pin_gerente_trava.sql', 'schema_delivery_servidor.sql', 'schema_painel_admin.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_mercado_pago.sql', 'schema_point_reserva.sql', 'schema_pin_equipe_trava.sql', 'schema_pin_gerente_trava.sql', 'schema_delivery_servidor.sql', 'schema_contas_aparelhos.sql', 'schema_painel_admin.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -97,8 +97,7 @@ describe('supabase/migrations', () => {
     }
     // O painel administrativo (lojas e mensalidades) vem depois da última já publicada na main (a do
     // delivery pelo servidor, #57): data anterior fica fora do `supabase db push` normal.
-    // Só a migration do emitente da NFC-e (PR #55) vem depois dele, por ser mais nova.
-    expect(idx('schema_painel_admin.sql')).toBe(files.length - 2);
+    expect(idx('schema_painel_admin.sql')).toBeGreaterThan(idx('schema_delivery_servidor.sql'));
     expect(idx('schema_pin_gerente_trava.sql')).toBeGreaterThan(idx('schema_pin_equipe_trava.sql'));
     // A trava do PIN da equipe refaz tchefood_check_pin, tchefood_save_staff e tchefood_start_store
     // (versão de schema_equipe.sql) e usa a mesma chave da conciliação do cashback: é a última que as define.
@@ -114,6 +113,18 @@ describe('supabase/migrations', () => {
     // data anterior à última aplicada fica fora do `supabase db push` normal.
     expect(idx('schema_mercado_pago.sql')).toBeGreaterThan(idx('schema_pin_gerente_trava.sql'));
     expect(idx('schema_point_reserva.sql')).toBeGreaterThan(idx('schema_mercado_pago.sql'));
+    // As contas descem depois de todas as colunas de orders, order_items e payments que a leitura devolve.
+    for (const db of ['schema_kiosk.sql', 'schema_entrega.sql', 'schema_combos.sql', 'schema_dinheiro_servidor.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_pin_equipe_trava.sql']) {
+      expect(idx('schema_contas_aparelhos.sql'), db).toBeGreaterThan(idx(db));
+    }
+    // Data depois da última migration publicada na main (o delivery pelo servidor, #57): uma
+    // migration com data anterior à última aplicada fica fora do `supabase db push` normal.
+    expect(idx('schema_contas_aparelhos.sql')).toBe(files.length - 1);
+    expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_pin_gerente_trava.sql'));
+    expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_delivery_servidor.sql'));
+    expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_point_reserva.sql'));
+    // Depois do painel administrativo (#56, 20261119090000), também já publicado na main.
+    expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_painel_admin.sql'));
   });
 
   it('permissões padrão do banco iguais às do app (src/lib/permissions.ts)', async () => {
@@ -136,7 +147,8 @@ describe('supabase/migrations', () => {
     for (const rule of ["TG_OP = 'DELETE'", "(OLD.status = 'authorized'  AND NEW.status = 'cancelled')", 'NEW.reference IS DISTINCT FROM OLD.reference', 'NEW.payload IS DISTINCT FROM OLD.payload OR NEW.access_key IS DISTINCT FROM OLD.access_key']) {
       expect(sql, rule).toContain(rule);
     }
-    // Vem depois da última já publicada na main.
-    expect(files.at(-1)).toBe('20261119100000_nfce_emitente.sql');
+    // Vem depois da última já publicada antes dela (o painel, #56); só a das contas (PR #54), mais nova, vem depois.
+    expect(files.at(-2)).toBe('20261119100000_nfce_emitente.sql');
+    expect(files.at(-1)).toBe('20261119110000_contas_aparelhos.sql');
   });
 });

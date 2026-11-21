@@ -7,7 +7,7 @@
  */
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
-import { idbStorage } from '../lib/idbStorage';
+import { idbPersistStorage } from '../lib/idbStorage';
 import { round2 } from '../lib/money';
 import { validateFeeRule, type FeeRule } from '../lib/cardFees';
 import { nowISO, uuid } from '../lib/ids';
@@ -294,7 +294,7 @@ export const useOwnerSettings = create<OwnerSettingsState>()(
     }),
     {
       name: 'tchefood-owner-settings',
-      storage: createJSONStorage(() => idbStorage),
+      storage: createJSONStorage(() => idbPersistStorage),
       // v2 = taxas da maquininha e comissão dos apps; v3 = campanha do cliente sumido;
       // v4 = taxas e comissões separadas por loja (as antigas ficam sem loja até confirmar).
       version: 4,

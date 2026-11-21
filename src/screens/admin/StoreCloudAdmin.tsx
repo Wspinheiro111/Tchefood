@@ -1,7 +1,7 @@
 /** Etapa 0 — Loja (dados, permissões, loja nova) e Nuvem (login do aparelho e envio da fila). */
 import { useEffect, useState } from 'react';
 import { Cloud, CloudDownload, CloudOff, RefreshCw, Store, Users } from 'lucide-react';
-import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, revertibleRejectedDiscount, selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
+import { ADOPT_CLOUD_DISCOUNT_NEEDS_MANAGER, isRejectedItemPrice, REJECTED_ORDER_ONLY_CPF, revertibleRejectedDiscount, selectCan, selectCurrentUser, useTcheStore, type CloudSession, type TenantDraft } from '../../store/useTcheStore';
 import type { Permission, SyncEvent, UserRole } from '../../types';
 import { CONFIGURABLE_ROLES, PERMISSIONS, PERMISSION_LABEL, can } from '../../lib/permissions';
 import { ROLE_LABEL } from '../../lib/catalog';
@@ -700,6 +700,50 @@ function RejectedAuthPin({ eventId }: { eventId: string }) {
 }
 
 /**
+ * Conta recusada porque a mesa já tinha outra conta aberta (dois aparelhos abriram a mesma
+ * mesa): os itens passam para a conta que ficou na mesa, que a nuvem já tem.
+ */
+function RejectedTableTaken({ eventId }: { eventId: string }) {
+  const move = useTcheStore((s) => s.moveRejectedOrderToTableOrder);
+  // Só a conta recusada tem CPF na nota: o caixa decide passar os itens sem ele.
+  const [onlyCpf, setOnlyCpf] = useState(false);
+  const run = (dropCpf: boolean) => {
+    const r = move(eventId, { dropCpf });
+    if (r.ok) {
+      setOnlyCpf(false);
+      toast.success(`${r.data.items} item(ns) passados para a conta aberta da mesa.`);
+      void syncOnce();
+    } else {
+      setOnlyCpf(r.error.startsWith(REJECTED_ORDER_ONLY_CPF));
+      toast.error(r.error);
+    }
+  };
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2">
+      <Btn
+        onClick={() => {
+          if (!window.confirm('Passar os itens desta conta para a conta aberta da mesa? Confira com o garçom que é a mesma mesa.')) return;
+          run(false);
+        }}
+      >
+        Passar os itens para a conta da mesa
+      </Btn>
+      {onlyCpf && (
+        <Btn
+          variant="danger"
+          onClick={() => {
+            if (!window.confirm('O CPF desta conta não vai para a conta da mesa: a nota sai sem CPF. Passar os itens mesmo assim?')) return;
+            run(true);
+          }}
+        >
+          Passar os itens sem o CPF
+        </Btn>
+      )}
+    </span>
+  );
+}
+
+/**
  * Pagamento recusado sem reserva (fila da versão anterior): "Reenviar recusados" pede a reserva sozinho. Se o
  * servidor recusar de vez, o gerente retira o pagamento daqui com PIN e motivo (nada some sem ele).
  */
@@ -750,6 +794,65 @@ function RejectedPaymentRecovery({ eventId, result, busy, managerOnly }: { event
           Retirar pagamento (não aceito pela nuvem)
         </Btn>
       </span>
+    </span>
+  );
+}
+
+/** Item lançado numa conta que outro aparelho já encerrou: vai para uma conta nova da mesa. */
+function RejectedLateItem({ eventId }: { eventId: string }) {
+  const move = useTcheStore((s) => s.moveLateItemsToNewOrder);
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2">
+      <Btn
+        onClick={() => {
+          if (!window.confirm('A conta já foi encerrada em outro aparelho. Abrir uma conta nova da mesma mesa com os itens que não entraram nela?')) return;
+          const r = move(eventId);
+          if (r.ok) {
+            // A conta nova ocupa a mesa com os itens do cliente anterior: se outro cliente sentar
+            // antes da cobrança, ele veria esses itens como a conta da mesa (auditoria interna,
+            // rodada 8 do PR #54).
+            toast.alert(`${r.data.items} item(ns) atrasado(s) do cliente anterior numa conta nova aberta na mesa. Cobre essa conta agora, antes de outro cliente sentar nesta mesa.`);
+            void syncOnce();
+          } else toast.error(r.error);
+        }}
+      >
+        Abrir conta nova da mesa com os itens
+      </Btn>
+    </span>
+  );
+}
+
+/**
+ * Conta de itens atrasados (aberta por "Abrir conta nova da mesa com os itens") recusada porque a
+ * mesa já é de outro cliente na nuvem: ela não passa para a conta dele e nunca sobe. A saída é
+ * descartá-la aqui e lançar os itens com o caixa; nada foi cobrado, a nuvem nunca a gravou
+ * (auditoria interna, rodada 8 do PR #54).
+ */
+function RejectedLateTableTaken({ eventId }: { eventId: string }) {
+  const discard = useTcheStore((s) => s.discardLateItemsOrder);
+  const listOf = (items: Array<{ name: string; quantity: number }>) =>
+    items.length > 0 ? items.map((i) => `• ${i.name} × ${i.quantity}`).join('\n') : '(nenhum item)';
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2">
+      <Btn
+        variant="danger"
+        onClick={() => {
+          const preview = discard(eventId, { preview: true });
+          if (!preview.ok) return toast.error(preview.error);
+          const msg =
+            'A mesa já é de outro cliente: esta conta dos itens atrasados não sobe e não passa para a conta dele. ' +
+            'Ela sai deste aparelho (nada foi cobrado, a nuvem nunca a gravou). Anote os itens para lançar de novo com o caixa, ' +
+            `na conta do cliente anterior:\n\n${listOf(preview.data.items)}\n\nDescartar a conta?`;
+          if (!window.confirm(msg)) return;
+          const r = discard(eventId);
+          if (r.ok) {
+            toast.alert(`Conta descartada. Lance com o caixa: ${r.data.items.map((i) => `${i.name} × ${i.quantity}`).join(', ') || 'nenhum item'}.`);
+            void syncOnce();
+          } else toast.error(r.error);
+        }}
+      >
+        Descartar a conta dos itens atrasados
+      </Btn>
     </span>
   );
 }
@@ -830,6 +933,8 @@ function CloudStatus() {
   const online = useOnline();
   const [busy, setBusy] = useState(false);
   const rejected = useTcheStore((s) => s.syncRejected) ?? [];
+  // Contas de itens atrasados: recusadas com mesa ocupada, são descartadas (não juntadas).
+  const lateIds = useTcheStore((s) => s.lateItemsOrderIds) ?? [];
   const [recovery, setRecovery] = useState<Map<string, RecoveryResult>>(new Map());
   const [resending, setResending] = useState(false);
   const resend = async () => {
@@ -855,6 +960,7 @@ function CloudStatus() {
       const st = useTcheStore.getState();
       if (st.syncStatus.last_error) toast.error(st.syncStatus.last_error);
       else if (st.pullStatus?.last_error) toast.error(st.pullStatus.last_error);
+      else if (st.pullStatus?.refund_error) toast.error(st.pullStatus.refund_error);
       else toast.success(st.outbox.length === 0 ? 'Tudo enviado para a nuvem.' : `${st.outbox.length} evento(s) ainda na fila.`);
     } finally {
       setBusy(false);
@@ -871,6 +977,7 @@ function CloudStatus() {
         <dt className="text-slate-500">Fila</dt><dd>{outbox.length} evento(s){outbox.length > 0 && ` · ${Object.entries(byTable).map(([t, n]) => `${t} ${n}`).join(', ')}`}</dd>
         <dt className="text-slate-500">Último envio</dt><dd>{status.last_success_at ? new Date(status.last_success_at).toLocaleString('pt-BR') : 'ainda não'}</dd>
         <dt className="text-slate-500">Cadastros da nuvem</dt><dd>{pull?.last_pull_at ? `lidos ${new Date(pull.last_pull_at).toLocaleString('pt-BR')}` : 'ainda não lidos'} <span className="text-xs text-slate-500">(a cada minuto, com a fila vazia)</span></dd>
+        <dt className="text-slate-500">Contas e mesas</dt><dd>{pull?.last_orders_pull_at ? `lidas ${new Date(pull.last_orders_pull_at).toLocaleString('pt-BR')}` : 'ainda não lidas'} <span className="text-xs text-slate-500">(a cada 10 s, mesmo com a fila cheia; depois de falha, espera até 2 min)</span></dd>
         {!online && (<><dt className="text-slate-500">Conexão</dt><dd className="text-brasa">Sem internet: a fila espera e sobe sozinha quando voltar.</dd></>)}
       </dl>
       {status.last_error && (
@@ -881,6 +988,9 @@ function CloudStatus() {
       )}
       {pull?.last_error && (
         <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm text-brasa">Leitura da nuvem: {pull.last_error}</div>
+      )}
+      {pull?.refund_error && (
+        <div className="mb-3 rounded-xl border border-ouro/60 bg-ouro/10 p-3 text-sm text-brasa">Leitura da nuvem: {pull.refund_error}</div>
       )}
       <RefreshStaffPanel />
       <CashbackReconcilePanel />
@@ -896,6 +1006,10 @@ function CloudStatus() {
                 <b>{r.event.table}</b> {r.event.op} (registro {r.event.row_id.slice(0, 8)}…) · HTTP {r.status}: {r.message}
                 {needsManagerPin(r.event) && <RejectedAuthPin eventId={r.event.id} />}
                 {isRejectedItemPrice(r) && <RejectedItemPrice eventId={r.event.id} />}
+                {r.event.table === 'orders' && r.event.op === 'INSERT' && /TCHEFOOD_MESA_OCUPADA/.test(r.message ?? '') && (
+                  lateIds.includes(r.event.row_id) ? <RejectedLateTableTaken eventId={r.event.id} /> : <RejectedTableTaken eventId={r.event.id} />
+                )}
+                {r.event.table === 'order_items' && r.event.op === 'INSERT' && /TCHEFOOD_CONTA_ENCERRADA/.test(r.message ?? '') && <RejectedLateItem eventId={r.event.id} />}
                 {r.event.table === 'orders' && cloudDiscountOf(r.message) !== null && (
                   <AdoptCloudDiscount eventId={r.event.id} value={cloudDiscountOf(r.message)!} />
                 )}

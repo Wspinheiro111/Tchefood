@@ -158,7 +158,7 @@ function SellPanel() {
         <RecentCounterSales />
       </div>
 
-      <aside className="h-fit rounded-2xl border-2 border-ouro/60 bg-surface p-3 lg:sticky lg:top-[72px]">
+      <aside className="h-fit rounded-2xl border-2 border-ouro/60 bg-surface p-3 lg:sticky lg:top-[calc(var(--equipe-topo,56px)+16px)]">
         <div className="mb-2 flex items-center justify-between font-black"><span>Venda de balcão</span><span className="text-sm text-slate-500">{units} ficha(s)</span></div>
         {cart.length === 0 ? (
           <p className="py-6 text-center text-sm text-slate-500">Toque nos produtos. Cada unidade sai numa ficha separada.</p>

@@ -13,8 +13,9 @@
  * produtos, adicionais e vínculos, preços por horário, mesas (sem a ocupação),
  * permissões, fornecedores e vínculos de compra, e o cashback (clientes e extrato:
  * o banco decide de quais créditos sai cada resgate e grava os estornos, então o saldo
- * daqui é acertado pelo da nuvem). Contas, pagamentos e barris ficam em cada aparelho
- * (a nuvem recebe, mas ainda não manda de volta).
+ * daqui é acertado pelo da nuvem). Contas, itens, pagamentos e a ocupação das mesas
+ * descem por outra leitura, a cada 10 s (src/lib/sync/orderPull.ts). Barris ficam em
+ * cada aparelho (a nuvem recebe, mas ainda não manda de volta).
  */
 import type {
   CashbackLedgerEntry,
@@ -362,7 +363,7 @@ export function mergeRows<T>(local: readonly T[], cloud: readonly T[], pending: 
   return out;
 }
 
-/** A mesa vem da nuvem só com o cadastro: a ocupação é de cada aparelho (contas ainda não descem). */
+/** A mesa vem desta leitura só com o cadastro: a ocupação vem da leitura das contas (src/lib/sync/orderPull.ts). */
 export function adaptTable(cloud: DiningTable, local: DiningTable | undefined): DiningTable {
   // Mesa com conta aberta aqui continua ativa mesmo que outro aparelho a tenha desativado
   // (lá estava livre): senão ela some do mapa e a conta fica sem entrada para cobrar.

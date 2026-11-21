@@ -268,7 +268,7 @@ describe('GPT r16 P2-01: leitura parcial dos estornos não aparece como servidor
     expect(await pullRefundOrders(deps)).toMatchObject({ ok: false, changesOk: false, reopened: [] });
     // No laço da nuvem a mesma falha fica registrada no estado da nuvem.
     await syncOnce(deps.fetch as never, { forcePull: true });
-    expect(st().pullStatus?.last_error ?? '').toMatch(/estornos e encerramentos/);
+    expect(st().pullStatus?.refund_error ?? '').toMatch(/estornos e encerramentos/);
     render(<RefundReopenedOrders deps={deps} />);
     const note = await screen.findByTestId('reopened-read-failed');
     expect(note.textContent).toContain(READ_PARTIAL);
