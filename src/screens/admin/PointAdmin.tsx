@@ -9,7 +9,7 @@ import { Btn, toast } from '../../components/ui';
 import { selectCan, useTcheStore } from '../../store/useTcheStore';
 import { useOnline } from '../../lib/useOnline';
 import { freshCloudConfig } from '../../lib/sync/useCloudSync';
-import { cloudKey, trackCloudReachability } from '../../lib/sync/cloudReachability';
+import { cloudGeneration, trackCloudReachability } from '../../lib/sync/cloudReachability';
 import { fetchPointTerminals, PAIRING_TEXT, pairingState, type PairingState, type PointListing } from '../../lib/payments/pointTerminals';
 import type { PosTerminal } from '../../types';
 import { Field, FormError, Panel, TextInput, Toggle } from './fields';
@@ -59,7 +59,9 @@ export function PointAdmin() {
   const check = async () => {
     const mine = ++gen.current;
     setBusy(true);
-    const result = await fetchPointTerminals({ config: () => freshCloudConfig(), fetch: trackCloudReachability((u: string, init: RequestInit) => fetch(u, init), cloud ? cloudKey(cloud) : '') });
+    // A conexão da loja de agora, lida antes de qualquer espera: a resposta só conta para o aviso se ela ainda for a mesma.
+    const connection = cloudGeneration();
+    const result = await fetchPointTerminals({ config: () => freshCloudConfig(), fetch: trackCloudReachability((u: string, init: RequestInit) => fetch(u, init), connection) });
     if (mine !== gen.current) return;
     setListing(result);
     setBusy(false);

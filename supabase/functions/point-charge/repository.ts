@@ -19,7 +19,7 @@ const FINAL_LIST = '(approved,rejected,cancelled,expired,refunded)';
 
 /** Códigos das funções de db/schema_mercado_pago.sql. */
 const REFUSALS: Record<string, ChargeRefusedError['code']> = {
-  TF001: 'order_not_found', TF002: 'order_closed', TF003: 'over_balance', TF004: 'invalid_staff', TF005: 'not_found', TF006: 'invalid_reason', TF007: 'not_applicable', TF008: 'balance_mismatch', TF009: 'key_in_use',
+  TF001: 'order_not_found', TF002: 'order_closed', TF003: 'over_balance', TF004: 'invalid_staff', TF005: 'not_found', TF006: 'invalid_reason', TF007: 'not_applicable', TF008: 'balance_mismatch', TF009: 'key_in_use', TF010: 'terminal_inactive',
 };
 
 function refusal(error: { message: string; code?: string } | null): ChargeRefusedError | null {

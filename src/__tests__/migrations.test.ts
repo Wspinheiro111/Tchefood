@@ -26,7 +26,7 @@ describe('supabase/migrations', () => {
       expect(body, `${f} difere de db/${m[1]}`).toBe(readFileSync(join(ROOT, 'db', m[1]!), 'utf8'));
       copies.set(m[1]!, f);
     }
-    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_mercado_pago.sql', 'schema_point_reserva.sql', 'schema_pin_equipe_trava.sql', 'schema_pin_gerente_trava.sql', 'schema_delivery_servidor.sql', 'schema_contas_aparelhos.sql', 'schema_painel_admin.sql']) {
+    for (const db of ['schema_expansion.sql', 'schema_kiosk.sql', 'schema_purchases.sql', 'schema_equipe.sql', 'schema_autorizacao.sql', 'schema_gerente_nuvem.sql', 'schema_combos.sql', 'schema_baixar_loja.sql', 'schema_dinheiro_servidor.sql', 'schema_ar.sql', 'schema_caixa.sql', 'schema_entrega.sql', 'schema_avaliacoes.sql', 'schema_cartao.sql', 'schema_segredos.sql', 'schema_preco_gerente.sql', 'schema_cashback_servidor.sql', 'schema_desconto_uso_unico.sql', 'schema_cashback_conciliacao.sql', 'schema_mercado_pago.sql', 'schema_point_reserva.sql', 'schema_pin_equipe_trava.sql', 'schema_pin_gerente_trava.sql', 'schema_delivery_servidor.sql', 'schema_contas_aparelhos.sql', 'schema_painel_admin.sql', 'schema_point_ativa.sql']) {
       expect(copies.has(db), `falta a migration de db/${db}`).toBe(true);
     }
   });
@@ -120,8 +120,14 @@ describe('supabase/migrations', () => {
     // Data depois da última migration publicada na main (o delivery pelo servidor, #57): uma
     // migration com data anterior à última aplicada fica fora do `supabase db push` normal.
     // A única depois dela é a data/endereço de autorização da NFC-e (PR #63), que só mexe em nfce_documents.
-    expect(idx('schema_contas_aparelhos.sql')).toBe(files.length - 2);
-    expect(files.at(-1)).toBe('20261121100000_nfce_autorizacao.sql');
+    // Depois dela só vêm a autorização da NFC-e (#63, sem cópia em db/) e a trava da Point desativada (#59 r6).
+    expect(idx('schema_contas_aparelhos.sql')).toBe(files.length - 3);
+    // A conferência da Point ativa refaz tchefood_open_terminal_charge (versão de schema_mercado_pago.sql) e é a última a defini-la.
+    expect(idx('schema_point_ativa.sql')).toBe(files.length - 1);
+    expect(idx('schema_point_ativa.sql')).toBeGreaterThan(idx('schema_point_reserva.sql'));
+    expect(idx('schema_point_ativa.sql')).toBeGreaterThan(idx('schema_contas_aparelhos.sql'));
+    expect(files.filter((f) => readFileSync(join(MIGRATIONS, f), 'utf8').includes('CREATE OR REPLACE FUNCTION tchefood_open_terminal_charge(')).at(-1)).toBe(files[idx('schema_point_ativa.sql')]);
+    expect(files.at(-2)).toBe('20261121100000_nfce_autorizacao.sql');
     expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_pin_gerente_trava.sql'));
     expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_delivery_servidor.sql'));
     expect(idx('schema_contas_aparelhos.sql')).toBeGreaterThan(idx('schema_point_reserva.sql'));
@@ -152,7 +158,7 @@ describe('supabase/migrations', () => {
     }
     // Vem depois da última já publicada antes dela (o painel, #56); só a das contas (PR #54), mais nova, vem depois.
     expect(files.indexOf('20261119100000_nfce_emitente.sql')).toBeGreaterThan(files.indexOf('20261119090000_painel_admin.sql'));
-    expect(files.at(-2)).toBe('20261119110000_contas_aparelhos.sql');
+    expect(files.at(-3)).toBe('20261119110000_contas_aparelhos.sql'); // depois dela: a autorização da NFC-e (#63) e a trava da Point (#59 r6)
   });
   it('autorização da NFC-e (PR #63): data de recebimento e endereço do emitente, preenchidos uma vez e imutáveis, mantendo todas as regras do guarda', () => {
     const sql = readFileSync(join(MIGRATIONS, '20261121100000_nfce_autorizacao.sql'), 'utf8');

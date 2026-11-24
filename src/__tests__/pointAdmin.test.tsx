@@ -8,7 +8,7 @@ import { useTcheStore } from '../store/useTcheStore';
 import { PointAdmin } from '../screens/admin/PointAdmin';
 import { OFFLINE_OLD_SYSTEM_TEXT, OfflineCloudBanner } from '../components/OfflineCloudBanner';
 import { fetchPointTerminals, pairingState, parseTerminalsReply, type PointListing } from '../lib/payments/pointTerminals';
-import { cloudUnreachable, resetCloudReachability, trackCloudReachability } from '../lib/sync/cloudReachability';
+import { cloudUnreachable, lastCloudContactAt, resetCloudReachability, trackCloudReachability } from '../lib/sync/cloudReachability';
 import { PROBE_EVERY_MS, probeCloudIfIdle, syncOnce, useCloudSync } from '../lib/sync/useCloudSync';
 
 // Estado do armazenamento controlável (auditoria #59 r5 P2-02): 'ok' por padrão, como nos outros testes.
@@ -358,8 +358,8 @@ describe('aviso de loja em nuvem sem internet', () => {
     // Mesma loja: o pedido mais antigo termina por último, falhando; o mais novo já mostrou a nuvem no ar.
     const oldReq = pending();
     const newReq = pending();
-    const fOld = trackCloudReachability(() => oldReq.p, 'loja-a');
-    const fNew = trackCloudReachability(() => newReq.p, 'loja-a');
+    const fOld = trackCloudReachability(() => oldReq.p);
+    const fNew = trackCloudReachability(() => newReq.p);
     const a = fOld().catch(() => undefined);
     const b = fNew();
     newReq.resolve({ status: 200 });
@@ -372,8 +372,8 @@ describe('aviso de loja em nuvem sem internet', () => {
     resetCloudReachability();
     const o2 = pending();
     const n2 = pending();
-    const p1 = trackCloudReachability(() => o2.p, 'loja-a')().catch(() => undefined);
-    const p2 = trackCloudReachability(() => n2.p, 'loja-a')().catch(() => undefined);
+    const p1 = trackCloudReachability(() => o2.p)().catch(() => undefined);
+    const p2 = trackCloudReachability(() => n2.p)().catch(() => undefined);
     n2.reject(new TypeError('Failed to fetch'));
     await p2;
     expect(cloudUnreachable()).toBe(true);
@@ -382,23 +382,105 @@ describe('aviso de loja em nuvem sem internet', () => {
     expect(cloudUnreachable()).toBe(true);
     // Troca de loja: pedido pendente da A falha depois de a B responder 200.
     resetCloudReachability();
+    const conectar = (tenant: string) => act(() => { useTcheStore.setState({ cloud: { ...CLOUD, tenant_id: tenant } } as never); });
+    const LOJA_A = st().tenant.id;
+    const LOJA_B = '0b0b0b0b-0b0b-40b0-80b0-0b0b0b0b0b0b';
+    conectar(LOJA_A);
     const a3 = pending();
-    const b3 = pending();
-    const pa = trackCloudReachability(() => a3.p, 'loja-a')().catch(() => undefined);
-    const pb = trackCloudReachability(() => b3.p, 'loja-b')();
-    b3.resolve({ status: 200 });
+    const pa = trackCloudReachability(() => a3.p)().catch(() => undefined);
+    conectar(LOJA_B);
+    const pb = trackCloudReachability(async () => ({ status: 200 }))();
     await pb;
     a3.reject(new TypeError('Failed to fetch'));
     await pa;
     expect(cloudUnreachable()).toBe(false);
     // E o pedido pendente da A que termina com 503 depois também não acende o aviso da B.
+    resetCloudReachability();
+    conectar(LOJA_A);
     const a4 = pending();
-    const pa4 = trackCloudReachability(() => a4.p, 'loja-a')().catch(() => undefined);
-    const pb4 = trackCloudReachability(async () => ({ status: 200 }), 'loja-b')();
+    const pa4 = trackCloudReachability(() => a4.p)().catch(() => undefined);
+    conectar(LOJA_B);
+    const pb4 = trackCloudReachability(async () => ({ status: 200 }))();
     await pb4;
     a4.resolve({ status: 503 });
     await pa4;
     expect(cloudUnreachable()).toBe(false);
+    resetCloudReachability();
+  });
+
+  it('o monitor segue a conexão ativa da loja: troca de loja, pedido atrasado, reconexão e horário do último contato (auditoria #59 r6 P2-01)', async () => {
+    const LOJA_A = st().tenant.id;
+    const LOJA_B = '0b0b0b0b-0b0b-40b0-80b0-0b0b0b0b0b0b';
+    const connect = (tenant: string, token = 'jwt') => act(() => { useTcheStore.setState({ cloud: { ...CLOUD, access_token: token, tenant_id: tenant } } as never); });
+    const disconnect = () => act(() => { useTcheStore.setState({ cloud: null } as never); });
+    const pending = () => {
+      let resolve!: (r: { status: number }) => void;
+      let reject!: (e: unknown) => void;
+      const p = new Promise<{ status: number }>((res, rej) => { resolve = res; reject = rej; });
+      return { p, resolve, reject };
+    };
+
+    // (1) A tem um pedido pendente; o aparelho troca para B, que ainda não pediu nada; o pedido da A termina fora do ar.
+    connect(LOJA_A);
+    const reqA = pending();
+    const doneA = trackCloudReachability(() => reqA.p)().catch(() => undefined);
+    connect(LOJA_B);
+    reqA.reject(new TypeError('Failed to fetch'));
+    await doneA;
+    expect(cloudUnreachable()).toBe(false);
+    expect(lastCloudContactAt()).toBe(0);
+
+    // (2) Um fluxo da A que só dispara o fetch depois de B já ter respondido não vira a loja atual de novo.
+    resetCloudReachability();
+    connect(LOJA_A);
+    const lateA = trackCloudReachability(async () => { throw new TypeError('Failed to fetch'); });
+    connect(LOJA_B);
+    await trackCloudReachability(async () => ({ status: 200 }))();
+    expect(cloudUnreachable()).toBe(false);
+    await lateA().catch(() => undefined);
+    expect(cloudUnreachable()).toBe(false);
+    // ...e a B continua valendo: uma falha dela agora acende o aviso.
+    await trackCloudReachability(async () => ({ status: 503 }))();
+    expect(cloudUnreachable()).toBe(true);
+
+    // (3) Desconecta e reconecta na mesma loja com outra sessão: o pedido da sessão antiga não vale mais.
+    resetCloudReachability();
+    connect(LOJA_A, 'sessao-antiga');
+    const old = pending();
+    const oldDone = trackCloudReachability(() => old.p)().catch(() => undefined);
+    disconnect();
+    connect(LOJA_A, 'sessao-nova');
+    old.reject(new TypeError('Failed to fetch'));
+    await oldDone;
+    expect(cloudUnreachable()).toBe(false);
+    // Renovar o token (mesma conexão) não troca de conexão: o pedido em andamento continua valendo.
+    const renewing = pending();
+    const renewDone = trackCloudReachability(() => renewing.p)();
+    connect(LOJA_A, 'token-renovado');
+    renewing.resolve({ status: 503 });
+    await renewDone;
+    expect(cloudUnreachable()).toBe(true);
+
+    // (4) A loja nova não herda o horário do último contato da anterior (a primeira verificação não é adiada).
+    resetCloudReachability();
+    connect(LOJA_A);
+    await trackCloudReachability(async () => ({ status: 200 }))();
+    expect(lastCloudContactAt()).toBeGreaterThan(0);
+    connect(LOJA_B);
+    expect(lastCloudContactAt()).toBe(0);
+    const probe = vi.fn(async () => ({ status: 503 }));
+    await probeCloudIfIdle(probe as never);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(cloudUnreachable()).toBe(true);
+
+    // (5) Verificação da loja anterior pendurada não atrasa a primeira da loja nova.
+    resetCloudReachability();
+    connect(LOJA_A);
+    void probeCloudIfIdle((() => new Promise(() => undefined)) as never);
+    connect(LOJA_B);
+    const probeB = vi.fn(async () => ({ status: 200 }));
+    await probeCloudIfIdle(probeB as never);
+    expect(probeB).toHaveBeenCalledTimes(1);
     resetCloudReachability();
   });
 

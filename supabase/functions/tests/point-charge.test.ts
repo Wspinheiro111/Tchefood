@@ -474,6 +474,80 @@ describe('point-charge: criação', () => {
     expect(store.rows).toHaveLength(1);
   });
 
+  it('mesma chave em duas requisições juntas: recusa por conferência só vale com a chave presa no banco; no máximo uma ordem externa (auditoria #59 r6 P1-02)', async () => {
+    const ready: PaymentTerminalInfo[] = [{ provider: 'mercado_pago_point', externalTerminalId: MP_TERMINAL, operatingMode: 'pdv', externalStoreId: null, externalPosId: null }];
+    const deferred = <T,>() => {
+      let resolve!: (v: T) => void;
+      let reject!: (e: unknown) => void;
+      const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    };
+    const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+    const settled = <T,>(p: Promise<T>) => p.then((value) => ({ value, error: null as unknown }), (error: unknown) => ({ value: null as T | null, error }));
+
+    // (a) A confere primeiro e a conferência dela fica pendurada; B confere, grava e envia. A falha por prazo DEPOIS:
+    // não pode dizer "nada foi cobrado": devolve o estado da cobrança que B criou. Uma só ordem no Mercado Pago.
+    {
+      const gate = deferred<PaymentTerminalInfo[]>();
+      let n = 0;
+      const { ctx, store, calls } = setup({ terminals: () => (++n === 1 ? gate.promise : Promise.resolve(ready)) });
+      const a = settled(startCharge(ctx, terminal, input()));
+      await tick();
+      const b = await startCharge(ctx, terminal, input());
+      expect(calls.create).toHaveLength(1);
+      gate.reject(new Error('timeout'));
+      const aRes = await a;
+      expect(aRes.error).toBeNull();
+      expect(aRes.value).toEqual(b);
+      expect(calls.create).toHaveLength(1);
+      expect(store.rows).toHaveLength(1);
+    }
+
+    // (b) Ordem invertida: B confere primeiro e fica pendurada; a conferência de A falha na hora. A recusa de A só vale
+    // se a chave ficou presa: B, ao voltar, não cria nem envia nada, e as duas respostas dizem a mesma coisa.
+    {
+      const gate = deferred<PaymentTerminalInfo[]>();
+      let n = 0;
+      const { ctx, store, calls } = setup({ terminals: () => (++n === 1 ? gate.promise : Promise.reject(new Error('mp fora'))) });
+      const b = settled(startCharge(ctx, terminal, input()));
+      await tick();
+      const aRes = await settled(startCharge(ctx, terminal, input()));
+      expect(aRes.error).toMatchObject({ code: 'mp_unavailable', httpStatus: 424 });
+      gate.resolve(ready);
+      const bRes = await b;
+      expect(bRes.error).toBeNull();
+      expect(bRes.value).toMatchObject({ status: 'DECLINED' });
+      expect(calls.create).toHaveLength(0);
+      expect(store.rows).toHaveLength(1);
+      expect(store.rows[0]).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send', external_order_id: null });
+    }
+  });
+
+  it('recusa da conferência sem operador, com a chave já usada por outra cobrança ou com o banco fora: nunca vira "nada foi cobrado" sem a chave presa (auditoria #59 r6 P1-02)', async () => {
+    // Sem operador identificado não há como prender a chave: recusa antes de qualquer conferência.
+    {
+      const { ctx, store, calls } = setup({ terminals: async () => [] });
+      await expect(startCharge(ctx, terminal, input({ staff_id: undefined }))).rejects.toMatchObject({ code: 'invalid_staff', httpStatus: 403 });
+      expect(calls.create).toHaveLength(0);
+      expect(store.rows).toHaveLength(0);
+    }
+    // Banco fora na hora de prender: erro interno (resultado desconhecido para o aparelho), nunca a recusa definitiva.
+    {
+      const { ctx, store } = setup({ terminals: async () => { throw new Error('mp fora'); } });
+      store.insertVoid = async () => { throw new Error('banco fora'); };
+      await expect(startCharge(ctx, terminal, input())).rejects.toThrow('banco fora');
+    }
+    // Chave já gravada como outra cobrança (valor diferente): conflito de chave, não "nada foi cobrado".
+    {
+      const { ctx, store } = setup();
+      await startCharge(ctx, terminal, input());
+      store.rows[0]!.status = 'pending';
+      const other = setup({ terminals: async () => [] });
+      other.store.rows.push({ ...store.rows[0]!, amount_cents: 999 });
+      await expect(startCharge(other.ctx, terminal, input())).rejects.toMatchObject({ code: 'idempotency_conflict' });
+    }
+  });
+
   it('Point fora da conta, fora do modo PDV ou lista indisponível: nada reserva nem envia (auditoria #59 r1 P1-01)', async () => {
     const cases: [() => Promise<PaymentTerminalInfo[]>, string, number][] = [
       [async () => [], 'terminal_not_ready', 409],
@@ -486,7 +560,9 @@ describe('point-charge: criação', () => {
       const { ctx, store, calls } = setup({ terminals });
       await expect(startCharge(ctx, terminal, input())).rejects.toMatchObject({ code, httpStatus });
       expect(calls.create).toHaveLength(0);
-      expect(store.rows).toHaveLength(0);
+      // Nada reservado nem enviado: só a chave presa (cancelada antes do envio), para outra requisição igual não cobrar depois (r6 P1-02).
+      expect(store.rows).toHaveLength(1);
+      expect(store.rows[0]).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send', external_order_id: null, dispatched_at: null });
     }
   });
 
@@ -494,7 +570,8 @@ describe('point-charge: criação', () => {
     const { ctx, store, calls } = setup({ terminals: () => new Promise(() => undefined) });
     await expect(startCharge({ ...ctx, terminalCheckTimeoutMs: 20 }, terminal, input())).rejects.toMatchObject({ code: 'mp_unavailable', httpStatus: 424 });
     expect(calls.create).toHaveLength(0);
-    expect(store.rows).toHaveLength(0);
+    expect(store.rows).toHaveLength(1);
+    expect(store.rows[0]).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send' });
   });
 
   it('repetição de chave já gravada não depende da lista (a cobrança já está na Point)', async () => {

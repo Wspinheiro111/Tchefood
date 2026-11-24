@@ -328,7 +328,8 @@ async function otherDeviceCashIsRefused(orderId: string) {
     try {
       await chargeOnPoint();
       await waitFor(() => expect(toastLog.join(' | ')).toMatch(/fora do modo PDV/), { timeout: 10_000 });
-      expect(serverCharges(id)).toEqual([]);
+      // Nada reservado nem enviado: só a chave presa (cancelada antes do envio, auditoria #59 r6 P1-02), que não reserva saldo.
+      expect(serverCharges(id).map((c) => c.status)).toEqual(['cancelled']);
       expect(mp.calls.filter((c) => c.startsWith('create:'))).toHaveLength(creates);
       expect(localApproved(id)).toEqual([]);
     } finally {

@@ -66,6 +66,7 @@ import type {
 } from '../types';
 import { applyOrderTotals, computeItemTotal, formatBRL, halfAndHalfPrice, round2, round3, toCents } from '../lib/money';
 import { cloudDiscountOf } from '../lib/sync/cloudDiscount';
+import { cloudConnectionChanged } from '../lib/sync/cloudReachability';
 import {
   effectivePrice,
   validateCategory,
@@ -7103,6 +7104,18 @@ export const useTcheStore = create<TcheState>()(
     },
   ),
 );
+
+// Conexão da loja que o monitor da nuvem (cloudReachability) serve: muda, na mesma hora em que o estado muda, quando a
+// loja conectada (url + loja) troca ou o aparelho desconecta e conecta de novo (auditoria #59 r6 P2-01). Renovar o
+// token (mesma url e loja, sem passar por "desconectado") não é outra conexão.
+const connectionOf = (cloud: CloudSession | null): string | null => (cloud ? `${cloud.url}|${cloud.tenant_id}` : null);
+let activeConnection = connectionOf(useTcheStore.getState().cloud);
+useTcheStore.subscribe((state) => {
+  const next = connectionOf(state.cloud);
+  if (next === activeConnection) return;
+  activeConnection = next;
+  cloudConnectionChanged();
+});
 
 /**
  * Grava agora o estado atual no aparelho (IndexedDB) e espera a gravação terminar. O persist
