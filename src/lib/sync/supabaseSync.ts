@@ -142,6 +142,12 @@ export function sanitizePayload(event: SyncEvent): Record<string, unknown> {
   return out;
 }
 
+function pickFields(row: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of fields) if (k in row) out[k] = row[k];
+  return out;
+}
+
 function baseHeaders(cfg: SyncConfig): Record<string, string> {
   return {
     apikey: cfg.anonKey,
@@ -354,7 +360,9 @@ export function buildSyncRequest(event: SyncEvent, cfg: SyncConfig): SyncRequest
       url: `${root}?id=eq.${encodeURIComponent(event.row_id)}`,
       method: 'PATCH',
       headers: { ...headers, Prefer: 'return=representation' },
-      body: upsert.body,
+      // Point: só os campos que a pessoa mudou (renomear não regrava `online` de outro aparelho). A linha inteira fica
+      // no reenvio por upsert, para a Point cujo INSERT foi recusado.
+      body: event.table === 'pos_terminals' && event.terminal_edit_fields ? JSON.stringify(pickFields(sanitizePayload(event), event.terminal_edit_fields)) : upsert.body,
       fallback: upsert,
     };
   }
