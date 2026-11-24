@@ -8,7 +8,7 @@
  * - Cada pagamento aprovado da rachadinha vira uma entrada em formas_pagamento
  *   com tipo_integracao = 1 (tpIntegra — pagamento integrado TEF/SmartPOS).
  */
-import type { NfceDanfePayload, NfceIssuer, Order, OrderItem, Payment, Product, Tenant } from '../types';
+import type { NfceDanfePayload, NfceIssuer, NfceIssuerAddress, Order, OrderItem, Payment, Product, Tenant } from '../types';
 import type { DanfeDoc } from './receipts';
 import { allocateCents, fromCents, toCents } from './money';
 import { sha1Hex } from './sha1';
@@ -55,12 +55,22 @@ export function accessKeyCheckDigit(key43: string): string {
   let weight = 2;
   let sum = 0;
   for (let i = key43.length - 1; i >= 0; i--) {
-    sum += Number(key43[i]) * weight;
+    // CNPJ alfanumérico (NT 2025.001): valor do caractere = código ASCII - 48 (0-9 → 0-9, A-Z → 17-42).
+    sum += (key43.charCodeAt(i) - 48) * weight;
     weight = weight === 9 ? 2 : weight + 1;
   }
   const mod = sum % 11;
   const dv = mod < 2 ? 0 : 11 - mod;
   return dv.toString();
+}
+
+/**
+ * Chave de acesso de 44 posições com o DV (módulo 11) conferido. Não corrige nem reconstrói a chave:
+ * só diz se ela é aceitável. Aceita letras só nas posições do CNPJ (NT 2025.001).
+ */
+export function isValidAccessKey(key: string | null | undefined): key is string {
+  if (!key || !/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return false;
+  return accessKeyCheckDigit(key.slice(0, 43)) === key[43];
 }
 
 export function buildAccessKey(params: { cnpj: string; issuedAt: Date; number: number; cNF?: string }): string {
@@ -113,27 +123,97 @@ export function buildConsultaQrUrl(key: string, tenant: Pick<Tenant, 'csc_id' | 
 
 export const CONSULTA_URL_RS = 'www.sefaz.rs.gov.br/nfce/consulta';
 
+/** cIdToken (ID do CSC): até 6 dígitos, sem zeros não significativos (manual DANFE NFC-e 6.0, Tabela 2). */
+const CSC_ID = /^[1-9]\d{0,5}$/;
+/** vNF do QR offline: até 15 bytes, ponto decimal e até 2 casas, sem zeros à esquerda não significativos (Tabela 3). */
+const vNfOk = (v: string | undefined): boolean => !!v && v.length <= 15 && /^(0|[1-9]\d*)(\.\d{1,2})?$/.test(v);
+
+/**
+ * Estrutura do parâmetro p do QR Code NFC-e (sem recalcular assinatura/CSC): versão 2 online
+ * chave|2|tpAmb|cIdToken|cHashQRCode (5 campos, hash hexadecimal de 40), versão 2 offline (contingência)
+ * chave|2|tpAmb|dia|vNF|digVal|cIdToken|cHashQRCode (8), versão 3 chave|3|tpAmb (3). Sem campos extras.
+ */
+function qrParamsStructureOk(parts: string[], accessKey: string): boolean {
+  const hash = (v: string | undefined) => /^[0-9A-Fa-f]{40}$/.test(v ?? '');
+  // tpEmis da chave (posição 34): 1 = normal (online), 9 = contingência offline. A modalidade do QR tem de combinar.
+  const tpEmis = accessKey[34];
+  const online = parts.length === 5 || (parts[1] === '3' && parts.length === 3);
+  if (online ? tpEmis !== '1' : tpEmis !== '9') return false;
+  if (parts[1] === '2') {
+    if (parts.length === 5) return CSC_ID.test(parts[3] ?? '') && hash(parts[4]);
+    if (parts.length === 8) {
+      // digVal = DigestValue (28 caracteres base64) em hexadecimal: exatamente 56 hex.
+      return /^(0[1-9]|[12]\d|3[01])$/.test(parts[3] ?? '') && vNfOk(parts[4]) && /^[0-9A-Fa-f]{56}$/.test(parts[5] ?? '') && CSC_ID.test(parts[6] ?? '') && hash(parts[7]);
+    }
+    return false;
+  }
+  if (parts[1] !== '3' || !/^[12]$/.test(parts[2] ?? '')) return false;
+  if (parts.length === 3) return true;
+  // 3.0 offline (Manual DANFE NFC-e 6.0), por posição: chave|3|tpAmb|dia|vNF|tp_idDest|idDest|assinatura.
+  // tp_idDest e idDest ficam ambos vazios (consumidor não identificado) ou ambos preenchidos
+  // (1 CNPJ, 2 CPF; 3 estrangeiro exige idDest vazio, Tabela 7); a assinatura é Base64 ou Base64 URL-safe (`_` e `-`),
+  // só estrutura e tamanho, sem recalcular.
+  if (parts.length !== 8) return false;
+  const [, , , day, value, idType, id, signature] = parts;
+  if (!/^(0[1-9]|[12]\d|3[01])$/.test(day ?? '') || !vNfOk(value)) return false;
+  if (!(idType === '' && id === '')) {
+    const idOk = idType === '1' ? /^[0-9A-Z]{14}$/.test(id ?? '') : idType === '2' ? /^\d{11}$/.test(id ?? '') : idType === '3' ? id === '' : false;
+    if (!idOk) return false;
+  }
+  const sig = signature ?? '';
+  return sig.length >= 40 && sig.length <= 400 && sig.length % 4 === 0 && /^[A-Za-z0-9+/_-]+={0,2}$/.test(sig);
+}
+
+/**
+ * Portais de consulta NFC-e (destino do QR Code) por cUF da chave. Só entra UF com endereço oficial
+ * conferido; as demais não imprimem QR próprio (o DANFE oficial da Focus cobre). RS é a UF do piloto.
+ */
+export const NFCE_QR_PORTALS: Readonly<Record<string, { host: string; path: string }>> = {
+  '43': { host: 'www.sefaz.rs.gov.br', path: '/nfce/nfce-com.aspx' },
+};
+
 /**
  * Portado do Tchê Vendas (server/danfceQrCode.ts): só aceita como QR Code do
  * DANFE uma URL http(s) de SEFAZ (.gov.br) cujo parâmetro p começa pela chave
  * de acesso DESTA NFC-e. Um endereço de consulta (sem p), de outra nota ou de
  * outro domínio nunca vira QR Code impresso.
  */
-export function isValidNfceQrCodeContent(content: string | null | undefined, accessKey: string | null | undefined): content is string {
+export function isValidNfceQrCodeContent(
+  content: string | null | undefined,
+  accessKey: string | null | undefined,
+  environment?: 'homologacao' | 'producao' | null,
+): content is string {
   if (!content || content.length > 1000 || /[\s<>"']/.test(content)) return false;
   // Chave pode ter letras nas posições do CNPJ alfanumérico do emitente (NT 2025.001).
   const key = (accessKey ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '').replace(/^NFE/, '');
-  if (!/^\d{6}[0-9A-Z]{12}\d{26}$/.test(key)) return false;
+  if (!isValidAccessKey(key)) return false;
   let url: URL;
   try {
     url = new URL(content);
   } catch {
     return false;
   }
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
-  if (url.username || url.password || !/(^|\.)gov\.br$/i.test(url.hostname)) return false;
-  const p = url.searchParams.get('p');
-  return Boolean(p) && p!.split('|')[0] === key;
+  // Só o portal de consulta NFC-e da UF da chave (HTTPS, host e caminho exatos). Conferência de endereço
+  // e de estrutura, não prova criptográfica da assinatura do QR Code.
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return false;
+  const portal = NFCE_QR_PORTALS[key.slice(0, 2)];
+  if (!portal || url.hostname.toLowerCase() !== portal.host || url.pathname.toLowerCase() !== portal.path) return false;
+  // p lido cru: searchParams decodificaria '+' (válido em assinatura base64) como espaço.
+  const rawP = /[?&]p=([^&#]*)/.exec(url.search)?.[1];
+  let p: string | null = null;
+  try {
+    p = rawP ? decodeURIComponent(rawP) : null;
+  } catch {
+    return false;
+  }
+  if (!p) return false;
+  const parts = p.split('|');
+  if (parts[0] !== key) return false;
+  // Nas versões do QR Code com tpAmb (chave|versão|tpAmb|...), o ambiente do QR precisa ser o da nota.
+  // Versão 2: chave|2|tpAmb|cIdToken|hash (5 campos); versão 3: chave|3|tpAmb (3). QR sem versão ou tpAmb (p=CHAVE|2) não vale quando o ambiente da nota é conhecido.
+  if (!qrParamsStructureOk(parts, key)) return false;
+  if (environment && parts[2] !== (environment === 'producao' ? '1' : '2')) return false;
+  return true;
 }
 
 /** Extrai o QR Code assinado do XML autorizado (infNFeSupl/qrCode), quando a Focus devolver o XML. */
@@ -335,6 +415,9 @@ export interface ServerNfceFields {
   issued_at: string | null;
   payload: NfceDanfePayload | null;
   issuer?: NfceIssuer | null;
+  issuer_address?: NfceIssuerAddress | null;
+  authorized_at?: string | null;
+  environment?: 'homologacao' | 'producao' | null;
 }
 
 /**
@@ -349,7 +432,7 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
   const authorized = server.status === 'authorized';
   if (!authorized && server.status !== 'contingency') return null;
   const key = server.access_key;
-  if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key) || !server.issued_at || !server.payload) return null;
+  if (!key || !isValidNfceQrCodeContent(server.qrcode_url, key, server.environment) || !server.issued_at || !server.payload) return null;
   if (authorized && !server.protocol) return null;
   const parsed = parseAccessKey(key);
   // Número, série e modelo devolvidos precisam ser os da chave (modelo 65 = NFC-e).
@@ -358,6 +441,13 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
   if (server.series !== null && (!/^\d{1,3}$/.test(server.series) || Number(server.series) !== parsed.serie)) return null;
   // Emitente: o CNPJ transmitido e o congelado precisam ser os da chave; senão, só o DANFE da Focus.
   if (!server.issuer || server.issuer.cnpj !== parsed.cnpj || server.payload.cnpj_emitente !== parsed.cnpj) return null;
+  // IE ausente no cadastro não prova "ISENTO": sem a IE comprovada a bobina não imprime (DANFE oficial da Focus).
+  if (!server.issuer.state_registration) return null;
+  // Endereço completo do emitente (XML autorizado) e hora real da autorização: sem eles não imprime,
+  // fica o DANFE oficial da Focus. Nada é reconstruído a partir do cadastro ou da data de emissão.
+  const address = server.issuer_address;
+  if (!address || !address.street || !address.number || !address.district || !address.city || !address.state || !/^\d{8}$/.test(address.zip)) return null;
+  if (authorized && (!server.authorized_at || Number.isNaN(Date.parse(server.authorized_at)))) return null;
   return {
     access_key: key,
     protocol: authorized ? server.protocol! : '',
@@ -366,6 +456,8 @@ export function serverNfceDocument(server: ServerNfceFields): (DanfeDoc & { qr_u
     tributos_federais: 0,
     tributos_estaduais: 0,
     issuer: server.issuer,
+    issuer_address: address,
+    ...(authorized ? { authorized_at: server.authorized_at! } : {}),
     payload: {
       ...server.payload,
       numero: parsed.numero,

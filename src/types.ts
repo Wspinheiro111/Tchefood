@@ -830,6 +830,18 @@ export interface NfceIssuer {
   state: string;
 }
 
+/** Endereço do emitente como consta no XML autorizado (o servidor o grava junto da autorização). */
+export interface NfceIssuerAddress {
+  street: string;
+  number: string;
+  complement: string | null;
+  district: string;
+  city: string;
+  state: string;
+  /** 8 dígitos. */
+  zip: string;
+}
+
 export interface NfceCloudRecord {
   order_id: UUID;
   /** Status do documento no servidor; null enquanto não houve documento. */
@@ -852,6 +864,10 @@ export interface NfceCloudRecord {
    * apareceu pela primeira vez. O cabeçalho do DANFE sai daqui, não do cadastro atual.
    */
   issuer?: NfceIssuer | null;
+  /** Endereço completo do emitente (XML autorizado). Sem ele a bobina própria não imprime. */
+  issuer_address?: NfceIssuerAddress | null;
+  /** Data/hora da autorização na SEFAZ (dhRecbto), nunca derivada da emissão. */
+  authorized_at?: ISODateTime | null;
   /** Consultas feitas depois da autorização para buscar QR/data/payload que faltavam. */
   print_attempts?: number;
   message: string | null;

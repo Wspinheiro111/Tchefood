@@ -1402,7 +1402,22 @@ export function isValidCnpj(cnpj: string): boolean {
  * quando os dados do aparelho são de uma loja da nuvem que só foi desconectada.
  */
 export function isRealFiscalStore(s: { cloud: CloudSession | null; cloudTenantId?: UUID | null; tenant: { id: UUID } }): boolean {
-  return s.cloud !== null || (s.cloudTenantId != null && s.cloudTenantId === s.tenant.id);
+  if (s.cloud !== null) return true;
+  if (s.cloudTenantId != null && s.cloudTenantId === s.tenant.id) return true;
+  // Só a instalação genuinamente de demonstração (loja de exemplo, nunca ligada à nuvem) simula NFC-e.
+  // Qualquer outra loja (id diferente do exemplo) veio da nuvem ou é loja própria: mesmo sem o vínculo
+  // gravado (aparelho de versão anterior, desconectado antes da atualização), nunca gera chave simulada.
+  return s.tenant.id !== DEMO_TENANT_ID;
+}
+
+/**
+ * Vínculo com a nuvem de um estado salvo por versão anterior: a sessão que sai, ou, sem sessão e sem
+ * vínculo gravado, a loja dos dados quando ela não é a de demonstração (só a nuvem a trouxe para cá).
+ */
+export function inferCloudTenantId(s: { cloud: CloudSession | null; cloudTenantId?: UUID | null; tenant: { id: UUID } }): UUID | null {
+  if (s.cloudTenantId != null) return s.cloudTenantId;
+  if (s.cloud && s.cloud.tenant_id === s.tenant.id) return s.cloud.tenant_id;
+  return s.tenant.id !== DEMO_TENANT_ID ? s.tenant.id : null;
 }
 
 /** A inclusão deste pagamento ainda na fila ou nos recusados deste aparelho (o servidor não a tem). */
@@ -7080,7 +7095,7 @@ export const useTcheStore = create<TcheState>()(
         queueMicrotask(() =>
           useTcheStore.setState((s) => ({
             hydrated: true,
-            cloudTenantId: s.cloudTenantId ?? (s.cloud && s.cloud.tenant_id === s.tenant.id ? s.cloud.tenant_id : null),
+            cloudTenantId: inferCloudTenantId(s),
             ...(s.cloud && s.cloudLinkedTenantId === undefined ? { cloudLinkedTenantId: s.cloud.tenant_id } : {}),
           })),
         );
