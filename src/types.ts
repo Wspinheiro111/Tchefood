@@ -881,8 +881,9 @@ export interface NfceCloudRecord {
 }
 
 /** Evento da fila offline-first, pronto para ser enviado ao Supabase. */
-/** Campos do cadastro da mesa que a pessoa edita (saveTable). */
+/** Campos do cadastro da Point que a pessoa edita (savePointTerminal). */
 export type PointEditField = 'name' | 'online';
+/** Campos do cadastro da mesa que a pessoa edita (saveTable). */
 export type TableEditField = 'number' | 'label' | 'area' | 'capacity' | 'active';
 
 export interface SyncEvent {
