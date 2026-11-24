@@ -3,6 +3,7 @@ import { BarChart3, Beer, Bike, ChefHat, CloudOff, HelpCircle, LayoutGrid, LogOu
 import { BrandLogo, BrandMark } from './components/Brand';
 import { selectCurrentUser, useTcheStore } from './store/useTcheStore';
 import { useOnline } from './lib/useOnline';
+import { OfflineCloudBanner } from './components/OfflineCloudBanner';
 import { useTerminalBus } from './lib/payments/drivers';
 import { LoginScreen } from './screens/LoginScreen';
 import { HelpCenter } from './screens/HelpCenter';
@@ -117,6 +118,7 @@ function AppBody() {
   if (!user) {
     return (
       <>
+        <OfflineCloudBanner online={online} />
         {helpOpen ? <HelpCenter onClose={() => setHelpOpen(false)} /> : <LoginScreen onHelp={() => setHelpOpen(true)} />}
         <ToastHost />
       </>
@@ -173,6 +175,7 @@ function AppBody() {
         <CloudStaleBanner />
       </div>
       <UnsavedStorageBanner />
+      <OfflineCloudBanner online={online} underHeader />
 
       <main>
         {helpOpen && <HelpCenter user={user} onClose={() => setHelpOpen(false)} />}

@@ -27,6 +27,7 @@ export const BACKOFFICE_HELP: ReadonlyArray<{ label: string; about: string; role
   { label: 'Equipe', about: 'Pessoas e PINs', roles: ['OWNER', 'MANAGER'] },
   { label: 'Loja', about: 'Dados da loja e permissões', roles: ['OWNER'] },
   { label: 'Nuvem', about: 'Conexão e sincronização', roles: ['OWNER', 'MANAGER'] },
+  { label: 'Point Smart', about: 'Cadastro e conferência da maquininha Mercado Pago Point', roles: ['OWNER'] },
   { label: 'Impressoras', about: 'Impressoras por praça', roles: ['OWNER', 'MANAGER', 'CASHIER'] },
   { label: 'Ajustes', about: 'Meio a meio, som, fila offline', roles: ['OWNER', 'MANAGER', 'CASHIER'] },
 ];

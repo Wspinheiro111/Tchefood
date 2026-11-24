@@ -96,7 +96,7 @@ export type NewChargeRow = Omit<TerminalChargeRow, 'id' | 'created_at'>;
 export type ChargePatch = Partial<Pick<TerminalChargeRow,
   'status' | 'external_order_id' | 'external_payment_id' | 'raw_status' | 'raw_status_detail' | 'paid_amount_cents' | 'card_brand' | 'authorization_code' | 'last_four'>>;
 
-export type ChargeRefusal = 'order_not_found' | 'order_closed' | 'over_balance' | 'invalid_staff' | 'not_found' | 'invalid_reason' | 'not_applicable' | 'balance_mismatch' | 'key_in_use';
+export type ChargeRefusal = 'order_not_found' | 'order_closed' | 'over_balance' | 'invalid_staff' | 'not_found' | 'invalid_reason' | 'not_applicable' | 'balance_mismatch' | 'key_in_use' | 'terminal_inactive';
 
 /** Recusa do banco (conta inexistente, fechada, acima do saldo, operador fora da equipe). Nada foi gravado. */
 export class ChargeRefusedError extends Error {
@@ -246,6 +246,8 @@ export interface TerminalRecord {
   tenant_id: string;
   serial_number: string;
   acquirer: string;
+  /** Ativa no caixa (pos_terminals.online): quem desativa a Point na Retaguarda não cobra mais nela (auditoria #59 r5 P1-01). */
+  online: boolean;
 }
 
 export interface ChargeContext {
@@ -254,6 +256,8 @@ export interface ChargeContext {
   payments: PaymentDetailsSource;
   /** Relógio monotônico local (ms), só para medir quanto a barreira demorou a responder. Padrão: performance.now(). */
   monotonicMs?: () => number;
+  /** Prazo da conferência da Point na lista do Mercado Pago (padrão TERMINAL_CHECK_TIMEOUT_MS). */
+  terminalCheckTimeoutMs?: number;
 }
 
 export interface CreateInput {
@@ -683,6 +687,31 @@ async function applyOrder(ctx: ChargeContext, row: TerminalChargeRow, order: Pay
 }
 
 /** Cria (ou retoma, com a mesma chave) a cobrança e devolve o estado atual. */
+/**
+ * A maquininha da cobrança nova precisa estar, pela lista lida agora no Mercado Pago, na conta da loja e no modo PDV.
+ * Recusa antes de reservar o saldo e de enviar: nada foi cobrado. As respostas 409/424 o aparelho trata como recusa.
+ */
+/** Prazo da lista inteira (cada página já tem o seu no provedor): a criação não fica esperando o Mercado Pago. */
+export const TERMINAL_CHECK_TIMEOUT_MS = 10_000;
+
+async function assertTerminalReady(provider: ChargeContext['provider'], serial: string, timeoutMs = TERMINAL_CHECK_TIMEOUT_MS): Promise<void> {
+  let list: Awaited<ReturnType<ChargeContext['provider']['listTerminals']>>;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    list = await Promise.race([
+      provider.listTerminals(),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), timeoutMs); }),
+    ]);
+  } catch {
+    throw new ChargeInputError('mp_unavailable', 'O Mercado Pago não confirmou a maquininha agora. Nada foi cobrado: tente de novo.', 424);
+  } finally {
+    clearTimeout(timer);
+  }
+  const found = list.find((t) => t.externalTerminalId === serial);
+  if (!found) throw new ChargeInputError('terminal_not_ready', 'Esta Point não está na conta do Mercado Pago da loja. Nada foi cobrado: confira na aba Point Smart.', 409);
+  if (found.operatingMode !== 'pdv') throw new ChargeInputError('terminal_not_ready', 'Esta Point está fora do modo PDV. Nada foi cobrado: ative o modo PDV e confira na aba Point Smart.', 409);
+}
+
 export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, input: CreateInput): Promise<ChargeReply> {
   const req = validateCreate(input);
   if (terminal.acquirer !== 'MERCADO_PAGO') throw new ChargeInputError('not_mercado_pago', 'Esta maquininha não é Mercado Pago Point.');
@@ -692,6 +721,23 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
     if (!sameRequest(existing, req, terminal)) throw new ChargeInputError('idempotency_conflict', 'Esta chave já foi usada em outra cobrança.', 409);
     // Repetição do pedido de criação (resposta anterior perdida): este pode mandar o primeiro envio.
     return replyFor(await resume(ctx, existing, true));
+  }
+  // Cobrança nova: só reserva e envia se a Point está ativa na loja (o banco manda, não a cópia do aparelho) e agora na
+  // conta do Mercado Pago da loja e no modo PDV. Cobrança já criada (ramo acima), consulta, conciliação e cancelamento
+  // seguem mesmo com a Point desativada.
+  // Toda recusa de cobrança nova passa por refuseBeforeReserve (auditoria #59 r6 P1-02 e r7 P1-01): outra requisição com a
+  // MESMA chave pode estar em andamento (por exemplo, esperando a conferência no Mercado Pago com a Point ainda ativa), e
+  // "nada foi cobrado" só é verdade com a chave presa no banco. Prender exige o operador identificado (o banco confere
+  // que é da equipe ativa da loja).
+  if (!req.staff_id) throw new ChargeInputError('invalid_staff', 'Informe quem está cobrando.', 403);
+  const staffId = req.staff_id;
+  const inactive = () => new ChargeInputError('terminal_inactive', 'Esta Point está desativada na loja. Nada foi cobrado: ative na aba Point Smart ou use outra maquininha.', 409);
+  if (terminal.online !== true) return refuseBeforeReserve(ctx, terminal, req, staffId, inactive());
+  try {
+    await assertTerminalReady(ctx.provider, terminal.serial_number, ctx.terminalCheckTimeoutMs);
+  } catch (error) {
+    if (error instanceof ChargeInputError) return refuseBeforeReserve(ctx, terminal, req, staffId, error);
+    throw error;
   }
   const fresh = {
     tenant_id: terminal.tenant_id,
@@ -734,12 +780,73 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
   try {
     inserted = await ctx.store.insert(fresh, req.expected_balance_cents);
   } catch (error) {
+    // O banco recusou a Point desativada no momento da reserva (TF010): a mesma regra das recusas acima.
+    if (error instanceof ChargeRefusedError && error.code === 'terminal_inactive') return refuseBeforeReserve(ctx, terminal, req, staffId, new ChargeInputError('terminal_inactive', error.message, 409));
     if (error instanceof ChargeRefusedError) throw new ChargeInputError(error.code, error.message, 409);
     throw error;
   }
   // Corrida: outro envio com a mesma chave gravou primeiro.
   if (!sameRequest(inserted, req, terminal)) throw new ChargeInputError('idempotency_conflict', 'Esta chave já foi usada em outra cobrança.', 409);
   return replyFor(await resume(ctx, inserted, true));
+}
+
+/**
+ * Auditoria #59 r6 P1-02: a conferência da Point no Mercado Pago (assertTerminalReady) acontece depois de ler a chave e
+ * antes de gravá-la. Duas requisições com a mesma chave podem estar nela ao mesmo tempo: uma falha (prazo, lista sem a
+ * Point, fora do PDV) e a outra passa, grava e envia. "Nada foi cobrado" só é verdade se a chave deixar de poder criar
+ * cobrança, e isso só o banco garante. Então a recusa passa antes pelo bloqueio da chave (insertVoid, o mesmo do
+ * encerramento sem cobrança gravada, com registro POINT_KEY_BLOCKED):
+ *  - a chave ainda livre fica bloqueada: nenhuma requisição da mesma chave grava ou envia depois, e a recusa vale;
+ *  - a chave já gravada (outra requisição chegou primeiro) devolve a cobrança que ficou, com o estado dela (consulta,
+ *    nunca um primeiro envio): nenhuma recusa definitiva sobre uma cobrança que existe.
+ * Falha do banco aqui não prova nada: sobe como erro interno (o aparelho trata como resultado desconhecido).
+ */
+async function refuseBeforeReserve(
+  ctx: ChargeContext,
+  terminal: TerminalRecord,
+  req: { idempotency_key: string; order_id: string; amount_cents: number; method: PointMethod },
+  staffId: string,
+  refusal: ChargeInputError,
+): Promise<ChargeReply> {
+  let row: TerminalChargeRow;
+  try {
+    row = await ctx.store.insertVoid({
+      tenant_id: terminal.tenant_id,
+      idempotency_key: req.idempotency_key,
+      order_id: req.order_id,
+      terminal_id: terminal.id,
+      provider: 'mercado_pago_point',
+      external_terminal_id: terminal.serial_number,
+      method: req.method,
+      amount_cents: req.amount_cents,
+      status: 'cancelled',
+      external_order_id: null,
+      external_payment_id: null,
+      raw_status: 'voided_before_send',
+      raw_status_detail: null,
+      paid_amount_cents: null,
+      card_brand: null,
+      authorization_code: null,
+      last_four: null,
+      created_by: null,
+      dispatched_at: null,
+      dispatch_lease_until: null,
+      dispatch_attempts: 0,
+      cancel_reason: 'void',
+      cancel_requested_by: staffId,
+      cancel_requested_at: null, // a hora é a do banco, gravada pela função do bloqueio
+      cancel_authorized_by: null,
+      cancel_audit_id: null,
+    });
+  } catch (error) {
+    if (error instanceof ChargeRefusedError) throw new ChargeInputError(error.code, error.message, error.code === 'key_in_use' ? 409 : 403);
+    throw error;
+  }
+  if (!sameRequest(row, req, terminal)) throw new ChargeInputError('idempotency_conflict', 'Esta chave já foi usada em outra cobrança.', 409);
+  // Chave bloqueada sem cobrança: nada vai à maquininha com ela. A recusa é verdadeira.
+  if (row.status === 'cancelled' && row.raw_status === 'voided_before_send') throw refusal;
+  // Outra requisição gravou primeiro: o que existe é a cobrança dela.
+  return replyFor(await resume(ctx, row, false));
 }
 
 async function settleSibling(ctx: ChargeContext, row: TerminalChargeRow): Promise<void> {

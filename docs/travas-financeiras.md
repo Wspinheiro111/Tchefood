@@ -24,6 +24,7 @@ no comentário). Regra: **uma ordem só**; nenhuma função financeira pega trav
 | `tchefood_resolve_point_charge` (fim verificado) | B → D → E (cobrança, pagamento) | inalterado |
 | `tchefood_release_payment_claim` / `_manager` | (B, só a do gerente) → D → E (reserva) | inalterado |
 | `tchefood_claim_payment` / `tchefood_open_terminal_charge` | (B na cobrança) → D → E | inalterado |
+| `tchefood_open_terminal_charge`, cobrança NOVA (#59 r6) | — | (B na cobrança) → D → **maquininha** (`pos_terminals`, `FOR SHARE`, só se a Point está ativa) → E. A maquininha vem depois da conta e nenhuma função financeira pega a conta com a maquininha já travada (desativar a Point é um UPDATE simples, sem gatilho que trave conta), então não há ciclo. A desativação espera a reserva gravar. |
 | Gatilhos de `payments` (`trg_payments_recalc`, gatilho do Mercado Pago, `trg_payments_transition_note`) | rodam dentro do registro/estorno: D já tida; cobrança com `FOR SHARE` (E) | `trg_payments_transition_note` (novo) não trava: só anota numa variável local da transação |
 | Gatilhos de `order_items` (recálculo, `tchefood_item_paid_stays`) | o recálculo trava D depois da linha do item | inalterado |
 

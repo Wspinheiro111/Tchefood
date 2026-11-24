@@ -14,6 +14,7 @@ import { fetchCloudOrders, missingCatalog, orderIdsToReconcile, missingHalves, m
 import { dueNfceCalls, dueNfceOrders, nfceCallNow, requestNfceEmission } from './nfceEmission';
 import type { CloudSession } from '../../store/useTcheStore';
 import { pendingRelease } from '../payments/claimLedger';
+import { cloudGeneration, cloudUnreachable, lastCloudContactAt, trackCloudReachability } from './cloudReachability';
 import type { SyncEvent, UUID } from '../../types';
 
 const INTERVAL_MS = 5_000;
@@ -481,6 +482,9 @@ async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): 
   const state = useTcheStore.getState();
   const session = state.cloud;
   if (!session) return;
+  // A conexão em que esta rodada nasce (lida junto com a sessão): o monitor da nuvem só aceita o que ela observar
+  // enquanto a loja conectada for a mesma (auditoria #59 r6 P2-01).
+  const generation = cloudGeneration();
   const nowMs = Date.now();
   const force = pull === 'force';
   const due = {
@@ -495,7 +499,7 @@ async function startRound(fetchFn: FetchLike, pull: 'due' | 'force' | 'never'): 
   const wantsNfce = pull !== 'never' && dueNfceOrders(state, Date.now(), 1).length > 0;
   if (state.outbox.length === 0 && !wantsPull && !wantsRefunds && !wantsNfce) return;
   running = true;
-  const round = runRound(session, withRequestTimeout(fetchFn), due, force, wantsRefunds, tenantId, pull !== 'never');
+  const round = runRound(session, trackCloudReachability(withRequestTimeout(fetchFn), generation), due, force, wantsRefunds, tenantId, pull !== 'never');
   current = round;
   try {
     await round;
@@ -652,6 +656,40 @@ export async function ensureOrderSynced(orderId: UUID, fetchFn: FetchLike = brow
   }
 }
 
+/** Sem nenhum pedido à nuvem há este tempo (fila vazia, leitura recente), o laço faz a verificação leve. */
+export const PROBE_EVERY_MS = 15_000;
+const PROBE_TIMEOUT_MS = 10_000;
+/** Conexão (cloudGeneration) da verificação em andamento; null = nenhuma. Uma loja nova não espera a da loja anterior. */
+let probing: number | null = null;
+
+/**
+ * Auditoria #59 r2 P2-01: com a fila vazia e a leitura recente o laço não pede nada à nuvem, e uma queda do Supabase
+ * passava sem aviso. Aqui, sem contato há PROBE_EVERY_MS, uma leitura mínima da linha da própria loja (GET em
+ * tenants com a sessão atual, RLS; não grava nada) diz se a nuvem responde. Resposta HTTP qualquer = no ar (até 401);
+ * queda, prazo de 10 s ou 502/503/504 = fora (ver cloudReachability).
+ */
+export async function probeCloudIfIdle(fetchFn: FetchLike = browserFetch, now: number = Date.now()): Promise<void> {
+  // Não espera a rodada: uma rodada pendurada num pedido (até 30 s) também não pode atrasar o aviso.
+  const session = useTcheStore.getState().cloud;
+  if (!session) return;
+  const generation = cloudGeneration();
+  if (probing === generation) return;
+  if (now - lastCloudContactAt() < PROBE_EVERY_MS) return;
+  probing = generation;
+  try {
+    const get = trackCloudReachability(withRequestTimeout(fetchFn, PROBE_TIMEOUT_MS), generation);
+    // Só o status importa: o corpo não é lido (auditoria #59 r3 P2-01: corpo pendurado não segura a verificação).
+    await get(`${session.url.replace(/\/+$/, '')}/rest/v1/tenants?select=id&limit=1`, {
+      method: 'GET',
+      headers: { apikey: session.anon_key, Authorization: `Bearer ${session.access_token}` },
+    });
+  } catch {
+    // a falha já ficou registrada em cloudReachability
+  } finally {
+    if (probing === generation) probing = null;
+  }
+}
+
 export function useCloudSync(online: boolean): void {
   const hasSession = useTcheStore((s) => s.cloud !== null);
   useEffect(() => {
@@ -668,8 +706,15 @@ export function useCloudSync(online: boolean): void {
     // Instância sem lock de escrita ou hidratação provisória: nenhuma rodada em segundo plano (envio da fila, trocas
     // de reserva, acertos) sai de um estado que não pode ser gravado (GPT, rodada 27 do PR #54).
     const run = () => {
-      if (getStorageStatus() !== 'ok') return;
-      void syncOnce();
+      if (getStorageStatus() !== 'ok') {
+        // A verificação do aviso é uma leitura (GET) e não grava nada no aparelho: segue mesmo sem lock de escrita
+        // (auditoria #59 r5 P2-02). Fila, leituras de conta, NFC-e e liberações continuam barradas acima.
+        void probeCloudIfIdle();
+        return;
+      }
+      // Nuvem sem responder: lê a cada volta (não só a cada minuto), para o aviso sumir assim que ela voltar.
+      // A verificação não depende de a rodada terminar bem.
+      void syncOnce(browserFetch, { forcePull: cloudUnreachable() }).catch(() => undefined).then(() => probeCloudIfIdle());
       retryReleases();
     };
     run();
