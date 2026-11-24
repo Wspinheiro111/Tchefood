@@ -457,21 +457,23 @@ describe('point-charge: criação', () => {
     expect(calls.create).toHaveLength(0);
   });
 
-  it('Point desativada na loja: cobrança nova recusada sem reservar nem enviar; cobrança já criada segue pela mesma chave (auditoria #59 r5 P1-01)', async () => {
+  it('Point desativada na loja: cobrança nova recusada sem reservar nem enviar (só a chave presa); cobrança já criada segue pela mesma chave (auditoria #59 r5 P1-01)', async () => {
     const { ctx, store, calls } = setup();
-    await expect(startCharge(ctx, { ...terminal, online: false }, input())).rejects.toMatchObject({ code: 'terminal_inactive', httpStatus: 409 });
+    await expect(startCharge(ctx, { ...terminal, online: false }, input({ idempotency_key: 'inativa-1' }))).rejects.toMatchObject({ code: 'terminal_inactive', httpStatus: 409 });
     expect(calls.create).toHaveLength(0);
-    expect(store.rows).toHaveLength(0);
+    expect(store.rows).toHaveLength(1);
+    expect(store.rows[0]).toMatchObject({ idempotency_key: 'inativa-1', status: 'cancelled', raw_status: 'voided_before_send' });
     // Criada com a Point ativa; depois a loja desativa. A repetição da mesma chave não cria outra, e consulta/cancelamento seguem.
     const first = await startCharge(ctx, terminal, input());
     expect(calls.create).toHaveLength(1);
     const again = await startCharge(ctx, { ...terminal, online: false }, input());
     expect(again.status).toBe(first.status);
     expect(calls.create).toHaveLength(1);
-    expect(store.rows).toHaveLength(1);
+    expect(store.rows).toHaveLength(2);
     // Outra chave com a Point desativada continua recusada.
     await expect(startCharge(ctx, { ...terminal, online: false }, input({ idempotency_key: 'outra-chave-1' }))).rejects.toMatchObject({ code: 'terminal_inactive' });
-    expect(store.rows).toHaveLength(1);
+    expect(calls.create).toHaveLength(1);
+    expect(store.rows.filter((r) => r.status !== 'cancelled')).toHaveLength(1);
   });
 
   it('mesma chave em duas requisições juntas: recusa por conferência só vale com a chave presa no banco; no máximo uma ordem externa (auditoria #59 r6 P1-02)', async () => {
@@ -520,6 +522,55 @@ describe('point-charge: criação', () => {
       expect(calls.create).toHaveLength(0);
       expect(store.rows).toHaveLength(1);
       expect(store.rows[0]).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send', external_order_id: null });
+    }
+  });
+
+  it('recusa por Point desativada (atalho da Edge Function e TF010 do banco) também prende a chave: se uma recusa definitiva saiu, nenhuma requisição da chave envia (auditoria #59 r7 P1-01)', async () => {
+    const ready: PaymentTerminalInfo[] = [{ provider: 'mercado_pago_point', externalTerminalId: MP_TERMINAL, operatingMode: 'pdv', externalStoreId: null, externalPosId: null }];
+    const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+    const hold = () => {
+      let release!: (v: PaymentTerminalInfo[]) => void;
+      const promise = new Promise<PaymentTerminalInfo[]>((res) => { release = res; });
+      return { promise, release };
+    };
+    const settled = <T,>(p: Promise<T>) => p.then((value) => ({ value, error: null as unknown }), (error: unknown) => ({ value: null as T | null, error }));
+    for (const via of ['atalho', 'TF010'] as const) {
+      const gate = hold();
+      let n = 0;
+      const { ctx, store, calls } = setup({ terminals: () => (++n === 1 ? gate.promise : Promise.resolve(ready)) });
+      // A: Point ativa, conferência no Mercado Pago pendurada.
+      const a = settled(startCharge(ctx, terminal, input()));
+      await tick();
+      // B, mesma chave, com a Point já desativada (atalho: a cópia lida diz online=false; TF010: a cópia diz true, o banco recusa).
+      if (via === 'TF010') store.refuse = new ChargeRefusedError('terminal_inactive', 'esta Point está desativada na loja.');
+      const b = await settled(startCharge(ctx, via === 'atalho' ? { ...terminal, online: false } : terminal, input()));
+      expect(b.error).toMatchObject({ code: 'terminal_inactive', httpStatus: 409 });
+      store.refuse = null;
+      // A Point volta a ficar ativa e a conferência pendurada de A termina bem: A não pode enviar depois da recusa de B.
+      gate.release(ready);
+      const aRes = await a;
+      expect(aRes.error, via).toBeNull();
+      expect(aRes.value, via).toMatchObject({ status: 'DECLINED' });
+      expect(calls.create, via).toHaveLength(0);
+      expect(store.rows, via).toHaveLength(1);
+      expect(store.rows[0], via).toMatchObject({ status: 'cancelled', raw_status: 'voided_before_send', external_order_id: null });
+    }
+    // Chave já gravada por outra requisição: a recusa por Point desativada devolve a cobrança que existe, não "nada foi cobrado".
+    {
+      const { ctx, store, calls } = setup();
+      const first = await startCharge(ctx, terminal, input());
+      expect(calls.create).toHaveLength(1);
+      const again = await startCharge(ctx, { ...terminal, online: false }, input());
+      expect(again).toEqual(first);
+      store.refuse = new ChargeRefusedError('terminal_inactive', 'x');
+      expect(await startCharge(ctx, terminal, input())).toEqual(first);
+      expect(calls.create).toHaveLength(1);
+    }
+    // Banco fora na hora de prender a chave: erro interno, nunca a recusa definitiva.
+    {
+      const { ctx, store } = setup();
+      store.insertVoid = async () => { throw new Error('banco fora'); };
+      await expect(startCharge(ctx, { ...terminal, online: false }, input())).rejects.toThrow('banco fora');
     }
   });
 

@@ -9,7 +9,7 @@ import { Btn, toast } from '../../components/ui';
 import { selectCan, useTcheStore } from '../../store/useTcheStore';
 import { useOnline } from '../../lib/useOnline';
 import { freshCloudConfig } from '../../lib/sync/useCloudSync';
-import { cloudGeneration, trackCloudReachability } from '../../lib/sync/cloudReachability';
+import { cloudGeneration, trackCloudReachability, useCloudGeneration } from '../../lib/sync/cloudReachability';
 import { fetchPointTerminals, PAIRING_TEXT, pairingState, type PairingState, type PointListing } from '../../lib/payments/pointTerminals';
 import type { PosTerminal } from '../../types';
 import { Field, FormError, Panel, TextInput, Toggle } from './fields';
@@ -48,21 +48,24 @@ export function PointAdmin() {
   const gen = useRef(0);
   const points = terminals.filter((t) => t.acquirer === 'MERCADO_PAGO');
 
+  // A conexão da loja (muda também ao desconectar e reconectar na mesma loja, mesmo agrupado pelo React: auditoria #59 r7 P2-01).
+  const connection = useCloudGeneration();
   useEffect(() => {
     // Trocou de loja ou de sessão da nuvem: a lista anterior não é desta loja.
     gen.current += 1;
     setListing(null);
     setBusy(false);
-  }, [tenantId, cloud?.tenant_id, cloud?.email, cloud?.url]);
+  }, [tenantId, cloud?.tenant_id, cloud?.email, cloud?.url, connection]);
   useEffect(() => () => { gen.current += 1; }, []);
 
   const check = async () => {
     const mine = ++gen.current;
     setBusy(true);
     // A conexão da loja de agora, lida antes de qualquer espera: a resposta só conta para o aviso se ela ainda for a mesma.
-    const connection = cloudGeneration();
-    const result = await fetchPointTerminals({ config: () => freshCloudConfig(), fetch: trackCloudReachability((u: string, init: RequestInit) => fetch(u, init), connection) });
-    if (mine !== gen.current) return;
+    const started = cloudGeneration();
+    const result = await fetchPointTerminals({ config: () => freshCloudConfig(), fetch: trackCloudReachability((u: string, init: RequestInit) => fetch(u, init), started) });
+    // Resposta de uma conexão que já acabou não mostra lista nem libera o botão da conexão de agora.
+    if (mine !== gen.current || started !== cloudGeneration()) return;
     setListing(result);
     setBusy(false);
   };

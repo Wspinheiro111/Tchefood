@@ -725,15 +725,18 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
   // Cobrança nova: só reserva e envia se a Point está ativa na loja (o banco manda, não a cópia do aparelho) e agora na
   // conta do Mercado Pago da loja e no modo PDV. Cobrança já criada (ramo acima), consulta, conciliação e cancelamento
   // seguem mesmo com a Point desativada.
-  if (terminal.online !== true) throw new ChargeInputError('terminal_inactive', 'Esta Point está desativada na loja. Nada foi cobrado: ative na aba Point Smart ou use outra maquininha.', 409);
-  // A conferência no Mercado Pago é uma espera externa: outra requisição com a MESMA chave pode gravar e enviar a
-  // cobrança enquanto esta espera. Por isso a recusa por ela só sai depois de prender a chave no banco (ver
-  // refuseBeforeReserve). Prender exige o operador identificado (o banco confere que é da equipe ativa da loja).
+  // Toda recusa de cobrança nova passa por refuseBeforeReserve (auditoria #59 r6 P1-02 e r7 P1-01): outra requisição com a
+  // MESMA chave pode estar em andamento (por exemplo, esperando a conferência no Mercado Pago com a Point ainda ativa), e
+  // "nada foi cobrado" só é verdade com a chave presa no banco. Prender exige o operador identificado (o banco confere
+  // que é da equipe ativa da loja).
   if (!req.staff_id) throw new ChargeInputError('invalid_staff', 'Informe quem está cobrando.', 403);
+  const staffId = req.staff_id;
+  const inactive = () => new ChargeInputError('terminal_inactive', 'Esta Point está desativada na loja. Nada foi cobrado: ative na aba Point Smart ou use outra maquininha.', 409);
+  if (terminal.online !== true) return refuseBeforeReserve(ctx, terminal, req, staffId, inactive());
   try {
     await assertTerminalReady(ctx.provider, terminal.serial_number, ctx.terminalCheckTimeoutMs);
   } catch (error) {
-    if (error instanceof ChargeInputError) return refuseBeforeReserve(ctx, terminal, req, req.staff_id, error);
+    if (error instanceof ChargeInputError) return refuseBeforeReserve(ctx, terminal, req, staffId, error);
     throw error;
   }
   const fresh = {
@@ -777,6 +780,8 @@ export async function startCharge(ctx: ChargeContext, terminal: TerminalRecord, 
   try {
     inserted = await ctx.store.insert(fresh, req.expected_balance_cents);
   } catch (error) {
+    // O banco recusou a Point desativada no momento da reserva (TF010): a mesma regra das recusas acima.
+    if (error instanceof ChargeRefusedError && error.code === 'terminal_inactive') return refuseBeforeReserve(ctx, terminal, req, staffId, new ChargeInputError('terminal_inactive', error.message, 409));
     if (error instanceof ChargeRefusedError) throw new ChargeInputError(error.code, error.message, 409);
     throw error;
   }

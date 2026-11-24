@@ -267,6 +267,34 @@ describe('tela Point Smart', () => {
     expect((screen.getByRole('button', { name: /Conferir no Mercado Pago/ }) as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it('desconectar e reconectar na mesma loja (mesma url e e-mail, outra sessão) dentro de um só act invalida a conferência em andamento (auditoria #59 r7 P2-01)', async () => {
+    withCloud();
+    expect(st().login('8888').ok).toBe(true);
+    const row = st().savePointTerminal({ name: 'Point', serial_number: MP_ID, active: false });
+    if (!row.ok) throw new Error(row.error);
+    let answer: (v: { status: number; text: () => Promise<string> }) => void = () => undefined;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((r) => { answer = r; })));
+    render(<PointAdmin />);
+    fireEvent.click(screen.getByRole('button', { name: /Conferir no Mercado Pago/ }));
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalled());
+    expect((screen.getByRole('button', { name: /Conferindo|Conferir no Mercado Pago/ }) as HTMLButtonElement).disabled).toBe(true);
+    // Uma atualização só: o React agrupa e as dependências finais (url, e-mail, loja) ficam iguais.
+    act(() => {
+      useTcheStore.setState({ cloud: null } as never);
+      useTcheStore.setState({ cloud: { ...CLOUD, access_token: 'sessao-nova', refresh_token: 'r2', tenant_id: st().tenant.id } } as never);
+    });
+    await act(async () => {
+      answer({ status: 200, text: async () => JSON.stringify({ terminals: [{ id: MP_ID, operating_mode: 'pdv' }] }) });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    // A lista da conexão anterior não aparece, ativar pede nova conferência e o botão está livre.
+    const r = screen.getByTestId(`point-${MP_ID}`);
+    expect(within(r).queryByTestId('mp-state')).toBeNull();
+    fireEvent.click(within(r).getByRole('switch', { name: /Ativa no caixa/ }));
+    expect(within(r).getByText(/Antes de ativar/)).toBeTruthy();
+    expect((screen.getByRole('button', { name: /Conferir no Mercado Pago/ }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it('loja sem Access Token do Mercado Pago: aviso claro', async () => {
     withCloud();
     expect(st().login('8888').ok).toBe(true);

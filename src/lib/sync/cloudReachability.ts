@@ -48,10 +48,9 @@ export function cloudConnectionChanged(): void {
   generation += 1;
   appliedSeq = startedSeq; // pedidos que já estavam no ar não valem mais
   lastContactAt = 0;
-  if (unreachable) {
-    unreachable = false;
-    for (const l of listeners) l();
-  }
+  unreachable = false;
+  // Quem acompanha o aviso e quem acompanha a conexão (useCloudGeneration) são avisados da mudança.
+  for (const l of listeners) l();
 }
 
 /** Só para os testes: volta ao estado inicial, de uma conexão nova. */
@@ -92,6 +91,18 @@ export function trackCloudReachability<A extends unknown[], R extends { status: 
     observe(seq, gen, GATEWAY_DOWN.has(res.status));
     return res;
   };
+}
+
+/** A conexão da loja de agora (cloudGeneration) como estado do React: a tela refaz o que dependia da conexão anterior. */
+export function useCloudGeneration(): number {
+  return useSyncExternalStore(
+    (l) => {
+      listeners.add(l);
+      return () => listeners.delete(l);
+    },
+    () => generation,
+    () => 0,
+  );
 }
 
 export function useCloudUnreachable(): boolean {

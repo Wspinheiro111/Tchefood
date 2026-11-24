@@ -189,7 +189,9 @@ function sql(q: string): string {
     // A lista do Mercado Pago mostra a Point (CONTA_A_2 está na conta A, no PDV): só o online=false do banco barra.
     expect((await call('Bearer jwt-a', { action: 'terminals' })).body.terminals).toContainEqual({ id: 'NEWLAND_N950__CONTA_A_2', operating_mode: 'pdv' });
     expect(await call('Bearer jwt-a', body)).toMatchObject({ status: 409, body: { error: 'terminal_inactive' } });
-    expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = 'chave-off-1'`)).toBe('0');
+    // Só a chave presa (cancelada antes do envio, r7 P1-01): nada reservado, nada enviado.
+    expect(sql(`SELECT status || '/' || raw_status FROM terminal_charges WHERE idempotency_key = 'chave-off-1'`)).toBe('cancelled/voided_before_send');
+    expect(mp.creates.filter((c) => c.idempotencyKey === 'chave-off-1')).toEqual([]);
     // Religada no banco, a mesma chamada passa da verificação (e só então esbarra no teste, que não cria cobrança).
     sql(`UPDATE pos_terminals SET online = true WHERE id = '${TERMINAL_A_OFF}'`);
     const on = await call('Bearer jwt-a', body);
@@ -230,8 +232,9 @@ function sql(q: string): string {
     sql(`UPDATE pos_terminals SET online = false WHERE id = '${TERMINAL_A_OFF}'`);
     held.release();
     expect(await racing).toMatchObject({ status: 409, body: { error: 'terminal_inactive' } });
-    expect(sql(`SELECT count(*) FROM terminal_charges WHERE idempotency_key = 'chave-r6-race'`)).toBe('0');
-    expect(sql(`SELECT count(*) FROM terminal_charges WHERE order_id = '${ORDER_R1}'`)).toBe('0');
+    // Só a chave presa (cancelada antes do envio): nenhuma cobrança reservando a conta.
+    expect(sql(`SELECT status || '/' || raw_status FROM terminal_charges WHERE idempotency_key = 'chave-r6-race'`)).toBe('cancelled/voided_before_send');
+    expect(sql(`SELECT count(*) FROM terminal_charges WHERE order_id = '${ORDER_R1}' AND status <> 'cancelled'`)).toBe('0');
     expect(mp.creates.map((c) => c.idempotencyKey)).toEqual(['chave-r6-prev']);
     // A cobrança reservada antes continua consultável e a repetição da mesma chave devolve a mesma cobrança, sem outra ordem.
     const status = await call('Bearer jwt-a', { action: 'status', idempotency_key: 'chave-r6-prev' });
@@ -301,6 +304,46 @@ function sql(q: string): string {
     expect(mp.creates.filter((c) => c.idempotencyKey === 'chave-r6-b')).toHaveLength(0);
     expect(sql(`SELECT status || '/' || raw_status FROM terminal_charges WHERE idempotency_key = 'chave-r6-b'`)).toBe('cancelled/voided_before_send');
     sql(`UPDATE pos_terminals SET online = false WHERE id = '${TERMINAL_A_OFF}'`);
+  });
+
+  it('recusa por Point desativada também prende a chave: com uma requisição da mesma chave pendurada na conferência, se a outra recebeu recusa definitiva nenhuma envia (atalho e TF010, auditoria #59 r7 P1-01)', async () => {
+    mp.creates.length = 0;
+    const SERIAL = 'NEWLAND_N950__CONTA_A_2';
+    mp.create = async (r) => { const o = atTerminal(r.idempotencyKey, SERIAL, `ORD-${r.idempotencyKey}`); placed.set(o.externalOrderId, o); return o; };
+    const setOnline = (v: boolean) => sql(`UPDATE pos_terminals SET online = ${v} WHERE id = '${TERMINAL_A_OFF}'`);
+    // Atalho da Edge Function: B já lê a Point desativada.
+    {
+      setOnline(true);
+      const heldA = holdNextList();
+      const a = call('Bearer jwt-a', chargeBody(TERMINAL_A_OFF, 'chave-r7-atalho', ORDER_R3));
+      await heldA.entered;
+      setOnline(false);
+      expect(await call('Bearer jwt-a', chargeBody(TERMINAL_A_OFF, 'chave-r7-atalho', ORDER_R3))).toMatchObject({ status: 409, body: { error: 'terminal_inactive' } });
+      setOnline(true);
+      heldA.release();
+      expect(await a).toMatchObject({ status: 200, body: { status: 'DECLINED' } });
+      expect(mp.creates.filter((c) => c.idempotencyKey === 'chave-r7-atalho')).toHaveLength(0);
+      expect(sql(`SELECT status || '/' || raw_status FROM terminal_charges WHERE idempotency_key = 'chave-r7-atalho'`)).toBe('cancelled/voided_before_send');
+    }
+    // TF010: B leu a Point ativa, esperou a conferência, e o banco recusa na reserva porque foi desativada nesse meio tempo.
+    {
+      setOnline(true);
+      const heldA = holdNextList();
+      const a = call('Bearer jwt-a', chargeBody(TERMINAL_A_OFF, 'chave-r7-tf010', ORDER_R3));
+      await heldA.entered;
+      const heldB = holdNextList();
+      const b = call('Bearer jwt-a', chargeBody(TERMINAL_A_OFF, 'chave-r7-tf010', ORDER_R3));
+      await heldB.entered;
+      setOnline(false);
+      heldB.release();
+      expect(await b).toMatchObject({ status: 409, body: { error: 'terminal_inactive' } });
+      setOnline(true);
+      heldA.release();
+      expect(await a).toMatchObject({ status: 200, body: { status: 'DECLINED' } });
+      expect(mp.creates.filter((c) => c.idempotencyKey === 'chave-r7-tf010')).toHaveLength(0);
+      expect(sql(`SELECT status || '/' || raw_status FROM terminal_charges WHERE idempotency_key = 'chave-r7-tf010'`)).toBe('cancelled/voided_before_send');
+    }
+    setOnline(false);
   });
 
   it('Mercado Pago fora do ar na lista: 424 mp_unavailable, e o aviso de falta de internet não aparece com o Supabase respondendo (auditoria #59 r5 P2-01)', async () => {
