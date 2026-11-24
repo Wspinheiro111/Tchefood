@@ -882,6 +882,7 @@ export interface NfceCloudRecord {
 
 /** Evento da fila offline-first, pronto para ser enviado ao Supabase. */
 /** Campos do cadastro da mesa que a pessoa edita (saveTable). */
+export type PointEditField = 'name' | 'online';
 export type TableEditField = 'number' | 'label' | 'area' | 'capacity' | 'active';
 
 export interface SyncEvent {
@@ -977,6 +978,12 @@ export interface SyncEvent {
    * mudou depois (GPT, rodada 8 do PR #54). Não vai para o banco.
    */
   table_edit_fields?: TableEditField[];
+  /**
+   * Só na atualização da Point (savePointTerminal): os campos que a pessoa mudou. O PATCH leva só eles; a linha
+   * inteira (com `online` como este aparelho a viu) regravaria a desativação feita em outro aparelho quando esta
+   * tela só renomeou. Sem a lista (fila de versão anterior), sobe a linha inteira como antes. Não vai para o banco.
+   */
+  terminal_edit_fields?: PointEditField[];
   /**
    * Mudança da mesa gravada por uma versão anterior (sem table_edit_fields) que perdeu a ocupação
    * numa recuperação: não dá para saber o que a pessoa mudou, então ela não sobe sozinha. Vai para

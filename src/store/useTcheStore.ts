@@ -31,6 +31,7 @@ import type {
   Category,
   DiningTable,
   TableEditField,
+  PointEditField,
   EventTicket,
   KegHistory,
   KegTap,
@@ -1158,6 +1159,14 @@ function pickRow(row: Record<string, unknown>, keys: readonly string[]): Record<
     const v = row[k];
     out[k] = NUMERIC_KEYS.has(k) ? Number(v ?? 0) : k === 'half_product_ids' || k === 'modifier_option_ids' ? (Array.isArray(v) ? v : []) : v ?? null;
   }
+  return out;
+}
+
+/** Campos da Point que a pessoa mudou (nome e ativação): só eles sobem no UPDATE (terminal_edit_fields). */
+function pointEditFields(before: PosTerminal, after: PosTerminal): PointEditField[] {
+  const out: PointEditField[] = [];
+  if (before.name !== after.name) out.push('name');
+  if (before.online !== after.online) out.push('online');
   return out;
 }
 
@@ -6353,9 +6362,17 @@ export const useTcheStore = create<TcheState>()(
             online: draft.active,
             battery_level: existing?.battery_level ?? null,
           };
+          // Nada mudou: não sobe evento (um PATCH sem campos voltaria vazio e o reenvio gravaria a linha inteira).
+          const changed = existing ? pointEditFields(existing, row) : [];
+          if (existing && changed.length === 0) return { ok: true, data: existing };
           set((s) => ({
             terminals: existing ? s.terminals.map((t) => (t.id === row.id ? row : t)) : [...s.terminals, row],
-            outbox: [...s.outbox, syncEvent('pos_terminals', existing ? 'UPDATE' : 'INSERT', row)],
+            outbox: [
+              ...s.outbox,
+              existing
+                ? { ...syncEvent('pos_terminals', 'UPDATE', row), terminal_edit_fields: changed }
+                : syncEvent('pos_terminals', 'INSERT', row),
+            ],
           }));
           return { ok: true, data: row };
         },
