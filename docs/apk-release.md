@@ -143,7 +143,8 @@ O que você precisa saber:
   dessa chave. Quem a tem confere o número, grava a linha e troca `apk/`; outro release com a mesma chave, mesmo em
   outra cópia do projeto, espera até 30 segundos e, se o primeiro não terminar, para sem gravar nem publicar (rode
   de novo). A compilação não segura a trava. Esse arquivo não precisa de cópia de segurança: se sumir, o script
-  cria outro.
+  cria outro. Só não o apague (nem deixe um sincronizador de pasta trocá-lo) enquanto um release estiver rodando:
+  quem abrir o arquivo novo não enxerga a trava do antigo.
 - **A pasta da chave precisa aceitar escrita e trava de arquivo.** O script testa a trava antes de compilar: se a
   pasta (uma pasta de rede, por exemplo) não travar de verdade, o release para e pede para usar a chave numa
   pasta do próprio computador. O teste vale para processos da mesma máquina; ele não prova que a trava funciona
