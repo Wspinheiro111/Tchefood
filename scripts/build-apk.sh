@@ -36,7 +36,7 @@ export -n SHELLOPTS 2>/dev/null || true
 # (a senha, o caminho da chave) seguiria para todo programa filho. Por isso esses nomes são apagados antes de
 # serem usados: daqui em diante são variáveis só deste script.
 builtin unset chave_arquivo chave_alias chave_senha_arquivo chave_senha senha_no_ambiente registro motivo cert_chave \
-  chave_pasta tty_antes
+  chave_pasta tty_antes trava_chave
 
 # --- Chave de release: o que veio pelo ambiente sai do ambiente antes de qualquer outro comando -------------
 # Daqui para baixo o script chama curl, unzip, sdkmanager, npm e Gradle, que rodam código de terceiros e herdam o
@@ -66,6 +66,8 @@ CERT_OFICIAL_SHA256="a247689aa296179b31e45b67679c8194609c4d93f41e554bc6644b28896
 # Último versionCode publicado com a chave oficial antes de existir o registro de releases (mais abaixo): os APKs
 # 0.1.364, de 26/11/2026. Nenhum release novo sai com número igual ou menor, mesmo se o registro se perder.
 RELEASE_PISO=364
+# Quanto um release espera (em segundos) outro release com a mesma chave terminar de publicar.
+ESPERA_TRAVA_CHAVE=30
 
 # SHA-256 de cada download: o arquivo que não confere é apagado antes de descompactar e o build para. Trocar a
 # versão exige trocar o SHA-256 junto. De onde vem cada valor (também em docs/apk-release.md):
@@ -348,18 +350,20 @@ baixar() { # url destino sha256
 #  - número novo: tem de ser maior que RELEASE_PISO, e a linha é gravada ANTES da publicação.
 # A linha gravada amarra o número ao APK. Se a publicação falhar depois (ou o processo morrer), a linha fica: o
 # mesmo APK ainda passa, e um diferente pede um número maior. Release publicado sem linha não existe.
-# Conferir e gravar acontecem num processo só (perl), com o arquivo travado (flock): duas cópias do projeto que
-# publiquem com a mesma chave ao mesmo tempo não gravam o mesmo número para APKs diferentes. A gravação é uma
-# escrita só, levada ao disco e relida; se falhar no meio (disco cheio), o arquivo volta ao tamanho de antes.
-# É uma trava contra engano de quem gera o release, não contra quem tem a chave e edita o arquivo.
+# Quem lê ou grava o registro já está com a trava dos releases desta chave (trava_pl, logo abaixo); na gravação
+# ela só é solta depois da troca de apk/: entre conferir o número, gravar a linha e publicar, nenhum outro
+# release com a mesma chave lê, grava nem publica. Este programa não trava nada e não apaga nada: o arquivo do
+# registro só é aberto para escrita quando há linha para gravar, sempre para acrescentar, e nunca é removido (um
+# registro vazio vale o mesmo que nenhum). A gravação é uma escrita só, levada ao disco e relida; se falhar no
+# meio (disco cheio), o arquivo volta ao tamanho que tinha, medido pelo mesmo descritor que gravou. É uma regra
+# contra engano de quem gera o release, não contra quem tem a chave e edita o arquivo.
 #   uso: conferir|gravar <registro> <primeiro 0|1> <piso> [variante versionCode versionName sha256]...
-#   saída 0 = aceito; 3 = recusado por uma regra; 4 = registro fora do formato; 5 = trava ou gravação.
+#   saída 0 = aceito; 3 = recusado por uma regra; 4 = registro fora do formato; 5 = leitura ou gravação.
 #   O motivo da recusa sai em uma linha, na saída padrão.
 registro_pl='
-use strict; use warnings; use Fcntl qw(:flock :seek); use IO::Handle; use POSIX ();
+use strict; use warnings; use IO::Handle; use POSIX ();
 my ($modo, $arq, $primeiro, $piso, @novo) = @ARGV;
-my $criou = 0;
-sub sair { my ($c, $m) = @_; unlink($arq) if $criou && -z $arq; print "$m\n"; exit $c }
+sub sair { my ($c, $m) = @_; print "$m\n"; exit $c }
 defined $piso && $piso =~ /\A[0-9]+\z/ && defined $modo
   && ($modo eq "conferir" ? !@novo : $modo eq "gravar" && @novo && @novo % 4 == 0)
   or sair(5, "uso incorreto do registro de releases");
@@ -393,14 +397,18 @@ sub primeiro_ou_nao {
 }
 my $existia = (-e $arq || -l $arq) ? 1 : 0;
 if ($existia) { -f $arq && !-l $arq or sair(4, "o registro de releases está fora do formato ($arq): não é um arquivo comum.") }
+sub conteudo {
+  return "" unless $existia;
+  open(my $r, "<", $arq) or sair(5, "não consigo ler o registro de releases ($arq): $!.");
+  binmode($r); my $t = do { local $/; <$r> }; close($r);
+  return defined $t ? $t : "";
+}
 if ($modo eq "conferir") {
   # -w perguntando ao sistema (access): um pendrive ou pasta montados só para leitura respondem que não, e o
   # release para aqui, em segundos, em vez de só descobrir na hora de gravar, depois do build inteiro.
   use filetest "access";
-  my $txt = "";
+  my $txt = conteudo();
   if ($existia) {
-    open(my $r, "<", $arq) or sair(5, "não consigo ler o registro de releases ($arq): $!.");
-    binmode($r); { local $/; $txt = <$r>; } $txt = "" unless defined $txt; close($r);
     -w $arq or sair(5, "o registro de releases não aceita escrita ($arq).");
   } else {
     my ($pasta) = $arq =~ m{\A(.*)/[^/]*\z};
@@ -410,33 +418,9 @@ if ($modo eq "conferir") {
   ler($txt); primeiro_ou_nao();
   exit 0;
 }
-open(my $fh, "+>>", $arq) or sair(5, "não consegui abrir o registro de releases ($arq) para gravar: $!.");
-binmode($fh);
-$criou = !$existia;
-my $pegou = 0;
-for (1 .. 300) {   # até 30 s: a parte travada dura milissegundos
-  if (flock($fh, LOCK_EX | LOCK_NB)) { $pegou = 1; last }
-  $!{EWOULDBLOCK} || $!{EAGAIN} or sair(5, "a pasta do registro de releases não aceita trava de arquivo (flock: $!): $arq.");
-  select(undef, undef, undef, 0.1);
-}
-$pegou or sair(5, "outro release com esta chave está usando o registro há mais de 30 s ($arq).");
-# O arquivo travado tem de ser o que está no caminho agora: outro release (o primeiro com esta chave, recusado por
-# uma regra) pode ter apagado o registro vazio que criou enquanto este esperava a trava. Gravar no arquivo apagado
-# perderia a linha; aqui para, sem tocar em nada, e a próxima execução segue normalmente.
-{
-  my @meu = stat($fh); my @la = stat($arq);
-  unless (@meu && @la && $meu[0] == $la[0] && $meu[1] == $la[1]) {
-    $criou = 0;
-    sair(5, "o registro de releases foi trocado por outro release enquanto este esperava a vez ($arq). Rode de novo.");
-  }
-}
-# A trava tem de excluir outro processo de verdade: há pastas (de rede) onde o flock responde que sim e não trava.
-my $pid = fork(); defined $pid or sair(5, "não consegui conferir a trava do registro de releases (fork: $!).");
-if ($pid == 0) { open(my $t, "<", $arq) or POSIX::_exit(2); POSIX::_exit(flock($t, LOCK_EX | LOCK_NB) ? 0 : 1) }
-waitpid($pid, 0);
-($? >> 8) == 1 or sair(5, "a trava do registro de releases não exclui outro processo nesta pasta ($arq).");
-seek($fh, 0, SEEK_SET) or sair(5, "não consegui ler o registro de releases ($arq): $!.");
-my $txt = do { local $/; <$fh> }; $txt = "" unless defined $txt;
+# gravar: quem chama já está com a trava dos releases desta chave, então o que é lido aqui continua valendo até a
+# linha ser gravada.
+my $txt = conteudo();
 my $tam = length $txt;
 ler($txt); primeiro_ou_nao();
 my $agora = POSIX::strftime("%Y-%m-%dT%H:%M:%SZ", gmtime());
@@ -451,7 +435,7 @@ while (my ($v, $c, $nm, $s) = splice(@novo, 0, 4)) {
     and sair(3, "o release $c já foi registrado com esta chave como $nome{$c}, e o APK de agora é $nm (outro commit com o mesmo número). Gere com TCHEFOOD_VERSION_CODE=$proximo ou maior.");
   if (exists $sha{"$v\t$c"}) {
     my $reg = $sha{"$v\t$c"};
-    $reg eq $s or sair(3, "já existe um release $c da variante $v publicado com esta chave, e o APK de agora é outro (SHA-256 $s, registrado $reg). Dois APKs diferentes com o mesmo número não se atualizam um pelo outro. Gere com TCHEFOOD_VERSION_CODE=$proximo ou maior.");
+    $reg eq $s or sair(3, "já existe um release $c da variante $v publicado com esta chave, e o APK de agora é outro (SHA-256 $s, registrado $reg). O Tchê Food não publica dois APKs diferentes com o mesmo número de versão (não daria para saber qual deles está em cada aparelho). Gere com TCHEFOOD_VERSION_CODE=$proximo ou maior.");
     push @feito, "$v $c: já registrado, APK idêntico";
   } else {
     $c > $piso or sair(3, "o release $c da variante $v não é maior que o último publicado antes de existir o registro ($piso), e o registro não tem esse APK. Gere com TCHEFOOD_VERSION_CODE=$proximo ou maior.");
@@ -461,6 +445,13 @@ while (my ($v, $c, $nm, $s) = splice(@novo, 0, 4)) {
 }
 if (length $acrescimo) {
   $acrescimo = $cab . $acrescimo if $tam == 0;
+  # Abre para ler e acrescentar (cria se não existe) e confere, por este mesmo descritor, que o arquivo é o que
+  # foi conferido acima: é este descritor que grava e, se a gravação falhar, é o tamanho lido por ele que volta.
+  open(my $fh, "+>>", $arq) or sair(5, "não consegui abrir o registro de releases ($arq) para gravar: $!.");
+  binmode($fh);
+  seek($fh, 0, 0) or sair(5, "não consegui ler o registro de releases ($arq): $!.");
+  my $visto = do { local $/; <$fh> }; $visto = "" unless defined $visto;
+  $visto eq $txt or sair(5, "o registro de releases mudou enquanto era conferido ($arq). Nada foi gravado; rode de novo.");
   my $ok = eval {
     my $w = syswrite($fh, $acrescimo);
     defined $w && $w == length($acrescimo) or die(($! || "escrita incompleta") . "\n");
@@ -479,11 +470,83 @@ if (length $acrescimo) {
     truncate($fh, $tam);
     sair(5, "o registro de releases relido não confere com o gravado ($arq).");
   }
+  close($fh) or sair(5, "não consegui fechar o registro de releases ($arq): $!.");
 }
-close($fh) or sair(5, "não consegui fechar o registro de releases ($arq): $!.");
 print "$_\n" for @feito;
 exit 0;
 '
+
+# Trava dos releases de uma chave: o arquivo <chave>.releases.lock, ao lado da chave, que o script cria vazio e
+# nunca apaga, trunca nem troca. O release abre esse arquivo no descritor 8 deste bash; o flock fica com o
+# descritor, isto é, com este bash, até ele fechar o descritor ou terminar (se o processo morrer, o sistema solta).
+# Ela é pega duas vezes, e nunca durante a compilação:
+#  - no começo, só para ler o registro e parar em segundos se o número não serve ou a pasta não trava;
+#  - na publicação, da conferência definitiva do número até a troca de apk/: quem chega depois só confere, grava
+#    e publica quando o primeiro publicou ou desistiu. Esperou mais que ESPERA_TRAVA_CHAVE: para, sem tocar em nada.
+# A trava tem de excluir outro processo de verdade: há pastas (de rede) em que o flock responde que sim e não
+# trava, ou em que a trava some quando sai o processo que a pediu. Por isso são dois passos, em dois processos:
+#   pegar     pede o flock sobre o descritor 8 herdado, espera a vez e sai (a trava fica com o bash);
+#   conferir  roda depois, SEM o descritor 8, como um outro release rodaria: abre o arquivo pelo caminho, para
+#             leitura e escrita, e tenta a mesma trava. Só uma resposta prova a exclusão: trava ocupada
+#             (EWOULDBLOCK/EAGAIN). Conseguir a trava, não conseguir abrir o arquivo ou qualquer outro erro é falha.
+# Cada passo só vale com saída 0 E a palavra esperada (obtida / ocupada): processo morto, erro do perl ou
+# resposta diferente param o release (pegar_trava_chave, mais abaixo).
+#   uso: pegar <arquivo, já aberto no descritor 8> <segundos de espera> | conferir <arquivo>
+#   saída 0 e a palavra = certo; 5 = não pegou ou não conferiu, com o motivo em uma linha.
+trava_pl='
+use strict; use warnings; use Fcntl qw(:flock);
+my ($modo, $arq, $espera) = @ARGV;
+sub sair { print "$_[1]\n"; exit $_[0] }
+defined $modo && defined $arq or sair(5, "uso incorreto da trava dos releases");
+if ($modo eq "pegar") {
+  defined $espera && $espera =~ /\A[0-9]{1,4}\z/ or sair(5, "uso incorreto da trava dos releases");
+  open(my $fh, ">&=", 8) or sair(5, "não consegui usar a trava dos releases desta chave ($arq): $!.");
+  for (0 .. $espera * 10) {
+    if (flock($fh, LOCK_EX | LOCK_NB)) { print "obtida\n"; exit 0 }
+    $!{EWOULDBLOCK} || $!{EAGAIN}
+      or sair(5, "a pasta da chave não aceita trava de arquivo ($arq): $!. Use a chave numa pasta do próprio computador.");
+    select(undef, undef, undef, 0.1);
+  }
+  sair(5, "outro release com esta chave está publicando há mais de $espera s (trava $arq). Espere ele terminar e rode de novo.");
+}
+if ($modo eq "conferir") {
+  open(my $t, "+<", $arq) or sair(5, "não consegui abrir a trava dos releases para conferi-la ($arq): $!.");
+  flock($t, LOCK_EX | LOCK_NB)
+    and sair(5, "a trava dos releases não exclui outro processo nesta pasta, ou o arquivo dela foi trocado durante o release ($arq). Use a chave numa pasta do próprio computador.");
+  if ($!{EWOULDBLOCK} || $!{EAGAIN}) { print "ocupada\n"; exit 0 }
+  sair(5, "a conferência da trava dos releases falhou com um erro que não é o de trava ocupada ($arq): $!. Use a chave numa pasta do próprio computador.");
+}
+sair(5, "uso incorreto da trava dos releases");
+'
+# Pega a trava dos releases desta chave no descritor 8 deste bash e confere que ela exclui outro processo.
+# Devolve 0 com a trava na mão; devolve 1, com o motivo em $motivo e o descritor fechado, em qualquer outro caso.
+# O descritor só fica aberto em trechos sem compilação nem download: nenhum processo demorado o herda.
+pegar_trava_chave() {
+  local rc=0
+  if [ -L "$trava_chave" ] || { [ -e "$trava_chave" ] && [ ! -f "$trava_chave" ]; }; then
+    motivo="a trava dos releases desta chave não é um arquivo comum ($trava_chave)."
+    return 1
+  fi
+  { exec 8>>"$trava_chave"; } 2>/dev/null || {
+    motivo="não consegui abrir a trava dos releases desta chave ($trava_chave). A pasta da chave precisa aceitar escrita: copie a chave para uma pasta onde você possa escrever."
+    return 1
+  }
+  # Só a saída padrão é a resposta: um aviso do perl na saída de erro (idioma do sistema mal configurado, por
+  # exemplo) vai para a tela e não se mistura com ela.
+  motivo="$(perl -e "$trava_pl" pegar "$trava_chave" "$ESPERA_TRAVA_CHAVE")" || rc=$?
+  if [ "$rc" = 0 ] && [ "$motivo" = "obtida" ]; then
+    motivo="$(perl -e "$trava_pl" conferir "$trava_chave" 8>&-)" || rc=$?
+    if [ "$rc" = 0 ] && [ "$motivo" = "ocupada" ]; then
+      motivo=""
+      return 0
+    fi
+  fi
+  exec 8>&-
+  case "$motivo" in
+    ""|obtida|ocupada) motivo="a trava dos releases desta chave não respondeu como esperado (código $rc, $trava_chave)." ;;
+  esac
+  return 1
+}
 
 tipo="debug"
 if [ -n "$chave_arquivo" ]; then
@@ -504,11 +567,16 @@ if [ -n "$chave_arquivo" ]; then
   case "$-" in *x*) falha "release não roda com rastro de comandos (bash -x / set -x): a senha da chave apareceria no rastro. Rode sem -x." ;; esac
   command -v keytool >/dev/null 2>&1 || falha "keytool não encontrado (vem com o JDK; usado para conferir a chave antes de compilar)."
 
-  # Registro de releases: formato e primeiro release conferidos já aqui, antes de pedir a senha e de compilar.
+  # Registro de releases: a trava da chave, o formato do registro e o primeiro release são conferidos já aqui,
+  # antes de pedir a senha e de compilar. A leitura acontece com a trava, que é solta em seguida (a compilação
+  # não a segura); a conferência que vale é a da publicação, de novo com a trava.
   registro="$chave_arquivo.releases.tsv"
+  trava_chave="$chave_arquivo.releases.lock"
   primeiro=0; [ "${TCHEFOOD_PRIMEIRO_RELEASE:-}" = "1" ] && primeiro=1
+  pegar_trava_chave || falha "$motivo Nada foi compilado."
   motivo="$(perl -e "$registro_pl" conferir "$registro" "$primeiro" "$RELEASE_PISO" 2>&1)" \
     || falha "$motivo Nada foi alterado."
+  exec 8>&-
 
   # Senha: de um arquivo (automação) ou perguntada no terminal sem aparecer na tela. `read` é do próprio bash
   # (`builtin`: nem uma função de mesmo nome herdada do ambiente entra no lugar): nenhum outro programa participa,
@@ -785,11 +853,15 @@ prontos="$(ls -A "$staging" | LC_ALL=C sort | tr '\n' ' ')"
 # Release: o número da versão tem de subir em relação ao último release publicado com esta chave (regras junto de
 # registro_pl, acima). É a última conferência, e a única que grava alguma coisa fora do projeto: a linha de cada
 # APK novo entra no registro aqui, antes de qualquer passo da publicação. Recusou, apk/ fica como estava.
+# A trava dos releases desta chave é pega aqui e só é solta depois da troca de apk/, lá embaixo (ou quando este
+# processo terminar, se parar antes): outro release com a mesma chave, em qualquer cópia do projeto, não confere
+# o número dele, não grava e não publica enquanto este não publicar ou desistir.
 if [ "$tipo" = "release" ]; then
   dados=()
   for r in "${resumos[@]}"; do
     dados+=("${r%% *}" "$codigo_versao" "$nome_versao" "${r#* }")
   done
+  pegar_trava_chave || falha "$motivo apk/ ficou como estava."
   motivo="$(perl -e "$registro_pl" gravar "$registro" "$primeiro" "$RELEASE_PISO" "${dados[@]}" 2>&1)" \
     || falha "$motivo apk/ ficou como estava."
   echo "-> registro de releases: $(printf '%s\n' "$motivo" | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
@@ -834,6 +906,8 @@ perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$link_novo" "$raiz/apk" \
 set +eu
 set +o pipefail
 trap '' PIPE
+# A troca de apk/ aconteceu: a trava dos releases desta chave é solta aqui.
+if [ "$tipo" = "release" ]; then exec 8>&-; fi
 link_novo=""
 staging=""
 if [ -n "$antes" ]; then

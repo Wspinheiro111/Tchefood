@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -369,10 +369,9 @@ function rodarEmSegundoPlano(raiz: string, variante: string, o: Opcoes) {
   return { filho, fim, saiu, saida: () => saida, terminou: () => terminou };
 }
 
-// Processos que têm aberto o arquivo da trava (Linux: /proc/<pid>/fd); fora do Linux devolve null.
-function donosDaTrava(raiz: string): number[] | null {
+// Processos que têm um arquivo aberto (Linux: /proc/<pid>/fd); fora do Linux devolve null.
+function quemTemAberto(alvo: string): number[] | null {
   if (process.platform !== 'linux') return null;
-  const alvo = join(raiz, '.apk-build.flock');
   const donos: number[] = [];
   for (const p of readdirSync('/proc')) {
     if (!/^\d+$/.test(p)) continue;
@@ -384,6 +383,8 @@ function donosDaTrava(raiz: string): number[] | null {
   }
   return donos;
 }
+// Processos que têm aberto o arquivo da trava do build.
+const donosDaTrava = (raiz: string) => quemTemAberto(join(raiz, '.apk-build.flock'));
 
 function pidDe(arquivo: string) {
   return existsSync(arquivo) ? Number(readFileSync(arquivo, 'utf8')) : 0;
@@ -431,7 +432,8 @@ function apks(raiz: string) {
 }
 
 // Chave de mentira (id "oficial" = a do Tchê Food) com o arquivo da senha ao lado. `env` são as variáveis de um
-// release; `registro` é o registro de releases que o script mantém junto da chave.
+// release; `registro` é o registro de releases que o script mantém junto da chave, e `trava` o arquivo da trava
+// dos releases dessa chave.
 function chaveFalsa(raiz: string, id = 'oficial', o: { senha?: string; alias?: string; conteudoSenha?: string } = {}) {
   const pasta = join(raiz, 'chaves');
   mkdirSync(pasta, { recursive: true });
@@ -441,7 +443,7 @@ function chaveFalsa(raiz: string, id = 'oficial', o: { senha?: string; alias?: s
   const arquivoSenha = join(pasta, `${id}.senha`);
   writeFileSync(arquivoSenha, o.conteudoSenha ?? `${senha}\n`);
   return {
-    chave, arquivoSenha, senha, registro: `${chave}.releases.tsv`,
+    chave, arquivoSenha, senha, registro: `${chave}.releases.tsv`, trava: `${chave}.releases.lock`,
     env: { TCHEFOOD_KEYSTORE: chave, TCHEFOOD_KEYSTORE_PASSWORD_FILE: arquivoSenha } as Record<string, string>,
   };
 }
@@ -931,7 +933,7 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
     // nem as variáveis que entram pelo ambiente, nem as internas do script (que `bash -a` exportaria)
     const PROIBIDAS = ['TCHEFOOD_KEYSTORE=', 'TCHEFOOD_KEYSTORE_PASSWORD_FILE=', 'TCHEFOOD_KEY_ALIAS=', 'TCHEFOOD_KEYSTORE_PASSWORD=',
       'TCHEFOOD_KEY_PASSWORD=', 'ORG_GRADLE_PROJECT_TCHEFOOD_KEY', 'chave_senha=', 'chave_arquivo=', 'chave_senha_arquivo=', 'chave_alias=',
-      'chave_pasta=', 'registro=', 'motivo=', 'senha_no_ambiente='];
+      'chave_pasta=', 'registro=', 'motivo=', 'senha_no_ambiente=', 'trava_chave='];
 
     // Confere, em TODAS as ferramentas que rodaram: nenhuma recebeu a senha (nem no ambiente, nem na linha de
     // comando), nenhuma herdou as variáveis da chave, e o caminho da chave e do arquivo da senha só aparece na
@@ -945,9 +947,10 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
         for (const proibida of PROIBIDAS) {
           expect(ambiente.filter((l) => l.startsWith(proibida)), `${c.nome} herdou ${proibida}`).toEqual([]);
         }
-        // o caminho da chave só vai para quem abre a chave (o registro de releases, ao lado dela, não é a chave)
+        // o caminho da chave só vai para quem abre a chave (o registro de releases e a trava, ao lado dela, não
+        // são a chave)
         if (c.nome !== 'keytool' && c.nome !== 'apksigner') {
-          expect(c.texto.split(k.registro).join('<registro>'), `${c.nome} recebeu o caminho da chave`).not.toContain(k.chave);
+          expect(c.texto.split(k.registro).join('<registro>').split(k.trava).join('<trava>'), `${c.nome} recebeu o caminho da chave`).not.toContain(k.chave);
         }
       }
       expect(entradaDe(raiz, 'keytool')).toBe(`${k.senha}\n`);
@@ -1000,7 +1003,7 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       const r = rodar(raiz, 'all', { gerar: 'pagbank tablet', extra: {
         ...k.env, TCHEFOOD_PRIMEIRO_RELEASE: '1',
         chave_senha: 'herdada', chave_arquivo: 'herdada', chave_senha_arquivo: 'herdada', chave_alias: 'herdada',
-        chave_pasta: 'herdada', registro: 'herdada', motivo: 'herdada', senha_no_ambiente: 'herdada',
+        chave_pasta: 'herdada', registro: 'herdada', motivo: 'herdada', senha_no_ambiente: 'herdada', trava_chave: 'herdada',
       } });
       expect(r.codigo).toBe(0);
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank.apk': assinado('A-pagbank'), 'tchefood-tablet.apk': assinado('A-tablet') });
@@ -1321,6 +1324,9 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       const igualDiferente = release(raiz, k, 'all', 'B', 400);
       expect(igualDiferente.codigo).not.toBe(0);
       expect(igualDiferente.saida).toContain('já existe um release 400 da variante pagbank publicado com esta chave, e o APK de agora é outro');
+      // a regra é do Tchê Food, e a mensagem diz isso (o Android em si aceita instalar por cima com o mesmo número)
+      expect(igualDiferente.saida).toContain('O Tchê Food não publica dois APKs diferentes com o mesmo número de versão');
+      expect(igualDiferente.saida).not.toContain('não se atualizam');
       expect(apks(raiz)).toEqual(publicado);
       expect(readFileSync(k.registro, 'utf8')).toBe(registrado);
       expect(readdirSync(join(raiz, '.apk-releases'))).toHaveLength(1);
@@ -1512,24 +1518,25 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       expect(apks(fa.codigo === 0 ? b : a)).toEqual(fa.codigo === 0 ? {} : { 'tchefood-pagbank.apk': assinado('A-pagbank') });
     }, 30000);
 
-    // Um processo à parte segura a trava (flock) do registro, como um release rodando em outra cópia do projeto.
-    // soltar() faz esse processo sair; com apagar, ele apaga o registro antes de sair (o que faz um primeiro
-    // release recusado por uma regra, com o registro vazio que criou).
-    async function segurarTravaDoRegistro(raiz: string, registro: string, apagar = false) {
+    // --- Trava dos releases da chave (rodada 2 da auditoria: P2-01, P2-02 e P2-03) -----------------------------
+    // A trava é o arquivo <chave>.releases.lock, ao lado da chave. O registro nunca é travado nem apagado.
+
+    // Um processo à parte segura a trava (flock) de um arquivo, como um release rodando em outra cópia do projeto.
+    // soltar() faz esse processo sair.
+    async function segurarTrava(raiz: string, arquivo: string) {
       const solta = join(raiz, `solta-a-trava-${Math.random().toString(36).slice(2)}`);
       const travou = `${solta}.travou`;
       writeFileSync(solta, '');
       const dono = spawn(PERL_REAL, ['-e',
-        'use Fcntl qw(:flock); open(my $f, "+>>", $ARGV[0]) or die "abrir: $!"; flock($f, LOCK_EX) or die "trava: $!"; ' +
-        'open(my $m, ">", $ARGV[2]) or die; close($m); select(undef, undef, undef, 0.05) while -e $ARGV[1]; ' +
-        'unlink($ARGV[0]) if $ARGV[3];',
-        registro, solta, travou, apagar ? '1' : ''], { stdio: 'ignore' });
+        'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die "abrir: $!"; flock($f, LOCK_EX) or die "trava: $!"; ' +
+        'open(my $m, ">", $ARGV[2]) or die; close($m); select(undef, undef, undef, 0.05) while -e $ARGV[1];',
+        arquivo, solta, travou], { stdio: 'ignore' });
       const saiu = new Promise((ok) => dono.on('close', ok));
       await esperar(() => existsSync(travou));
       return { soltar: async () => { rmSync(solta, { force: true }); await saiu; } };
     }
-    // O release compila, assina e confere; ao chegar no registro, fica esperando a trava. Devolve quando o APK
-    // assinado já está na pasta da versão nova e passou um tempo sem o script terminar.
+    // O release compila, assina e confere; ao chegar na publicação, fica esperando a trava da chave. Devolve quando
+    // o APK assinado já está na pasta da versão nova e passou um tempo sem o script terminar.
     async function esperarNaTrava(raiz: string, r: ReturnType<typeof rodarEmSegundoPlano>, conteudo: string) {
       const novaAssinada = () => existsSync(join(raiz, '.apk-releases')) && readdirSync(join(raiz, '.apk-releases'))
         .some((d) => { try { return readFileSync(join(raiz, '.apk-releases', d, 'tchefood-pagbank.apk'), 'utf8') === conteudo; } catch { return false; } });
@@ -1537,49 +1544,489 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       await new Promise((ok) => setTimeout(ok, 1500));
       expect(r.terminou(), r.saida()).toBe(false);
     }
+    // Troca, na cópia do script do repositório de mentira, o tempo que um release espera a trava da chave. A troca
+    // só acontece se a constante do script de verdade for 30 (segundos).
+    function fixarEspera(raiz: string, segundos: number) {
+      const arquivo = join(raiz, 'scripts', 'build-apk.sh');
+      let trocas = 0;
+      const texto = readFileSync(arquivo, 'utf8').replace(/^ESPERA_TRAVA_CHAVE=30$/gm, () => { trocas += 1; return `ESPERA_TRAVA_CHAVE=${segundos}`; });
+      if (trocas !== 1) throw new Error(`esperava trocar ESPERA_TRAVA_CHAVE=30 uma vez e troquei ${trocas}`);
+      writeFileSync(arquivo, texto);
+    }
+    // O que identifica um arquivo: se existe, o inode, a hora da última gravação, o tamanho e o conteúdo.
+    const estadoDe = (arquivo: string) => {
+      if (!existsSync(arquivo)) return 'ausente';
+      const st = statSync(arquivo);
+      return `inode ${st.ino}, gravado em ${st.mtimeMs}, ${st.size} bytes, sha256 ${sha256(readFileSync(arquivo))}`;
+    };
+    const PRIMEIRO = { TCHEFOOD_PRIMEIRO_RELEASE: '1' };
+    // Duas cópias do projeto (a, b) com a mesma chave. O release de b passa da conferência do começo e para no
+    // Gradle, já compilando; o de a compila inteiro nesse meio-tempo (a trava não cobre a compilação), grava a
+    // linha dele no registro e para logo antes de trocar apk/, com a trava da chave na mão. soltarB() deixa o de b
+    // seguir até onde conseguir; soltarA() deixa o de a publicar.
+    async function aParadoNaTrocaEBCompilando(o: { inicial: boolean; vcA: number; vcB: number; extra?: Record<string, string>; esperaB?: number }) {
+      const a = criarRepo();
+      const b = criarRepo();
+      const k = chaveFalsa(a);
+      if (o.inicial) expect(release(a, k, 'pagbank', 'A', 400, PRIMEIRO).codigo).toBe(0);
+      if (o.esperaB !== undefined) fixarEspera(b, o.esperaB);
+      const pausaB = join(b, 'pausa-gradle');
+      const marcaB = join(b, 'no-gradle');
+      writeFileSync(pausaB, '');
+      const rb = rodarEmSegundoPlano(b, 'pagbank', { gerar: 'pagbank', build: 'XB', pausa: pausaB, marca: marcaB, extra: { ...k.env, ...(o.extra ?? {}), FAKE_VC: String(o.vcB) } });
+      await esperar(() => existsSync(marcaB) || rb.terminou());
+      expect(rb.terminou(), rb.saida()).toBe(false);
+      const trocaPausa = join(a, 'pausa-troca');
+      const trocaMarca = join(a, 'na-troca');
+      writeFileSync(trocaPausa, '');
+      const ra = rodarEmSegundoPlano(a, 'pagbank', { gerar: 'pagbank', build: 'XA', trocaPausa, trocaMarca, trocaAlvo: 'apk', extra: { ...k.env, ...(o.extra ?? {}), FAKE_VC: String(o.vcA) } });
+      await esperar(() => existsSync(trocaMarca) || ra.terminou());
+      expect(ra.terminou(), ra.saida()).toBe(false);
+      return { a, b, k, ra, rb, soltarA: () => rmSync(trocaPausa, { force: true }), soltarB: () => rmSync(pausaB, { force: true }) };
+    }
 
-    it('enquanto outro processo segura a trava do registro, o release espera: nada é gravado nem publicado antes de a trava sair', async () => {
+    it('P2-01 (rodada 2): duas cópias do projeto, 401 e 402, mesma chave; o 401 para depois de gravar a linha e antes de trocar apk/. O 402 não grava nem publica enquanto o 401 não publica', async () => {
+      const t = await aParadoNaTrocaEBCompilando({ inicial: true, vcA: 401, vcB: 402 });
+      try {
+        expect(resumo(t.k)).toEqual(['pagbank 400', 'pagbank 401']);
+        expect(apks(t.a)).toEqual({ 'tchefood-pagbank.apk': assinado('A-pagbank') });
+        // o 402 termina de compilar, assina, confere e chega à publicação: fica esperando a trava da chave
+        t.soltarB();
+        await esperarNaTrava(t.b, t.rb, assinado('XB-pagbank'));
+        expect(apks(t.b)).toEqual({});
+        expect(resumo(t.k)).toEqual(['pagbank 400', 'pagbank 401']);
+        expect(apks(t.a)).toEqual({ 'tchefood-pagbank.apk': assinado('A-pagbank') });
+        // o 401 publica; só depois o 402 confere o número dele, grava e publica
+        t.soltarA();
+        const [fa, fb] = await Promise.all([t.ra.saiu, t.rb.saiu]);
+        expect(fa.codigo, t.ra.saida()).toBe(0);
+        expect(fb.codigo, t.rb.saida()).toBe(0);
+        expect(resumo(t.k)).toEqual(['pagbank 400', 'pagbank 401', 'pagbank 402']);
+        expect(apks(t.a)).toEqual({ 'tchefood-pagbank.apk': assinado('XA-pagbank') });
+        expect(apks(t.b)).toEqual({ 'tchefood-pagbank.apk': assinado('XB-pagbank') });
+      } finally {
+        t.soltarA(); t.soltarB();
+      }
+    }, 40000);
+
+    it('P2-01 (rodada 2): na ordem inversa (o 402 com a trava, o 401 esperando), o 401 é recusado ao pegar a trava: o registro já tem o 402', async () => {
+      const t = await aParadoNaTrocaEBCompilando({ inicial: true, vcA: 402, vcB: 401 });
+      try {
+        t.soltarB();
+        await esperarNaTrava(t.b, t.rb, assinado('XB-pagbank'));
+        expect(resumo(t.k)).toEqual(['pagbank 400', 'pagbank 402']);
+        t.soltarA();
+        const [fa, fb] = await Promise.all([t.ra.saiu, t.rb.saiu]);
+        expect(fa.codigo, t.ra.saida()).toBe(0);
+        expect(fb.codigo).not.toBe(0);
+        expect(t.rb.saida()).toContain('o release 401 da variante pagbank é mais antigo que o último publicado com esta chave (402)');
+        expect(resumo(t.k)).toEqual(['pagbank 400', 'pagbank 402']);
+        expect(apks(t.a)).toEqual({ 'tchefood-pagbank.apk': assinado('XA-pagbank') });
+        expect(apks(t.b)).toEqual({});
+      } finally {
+        t.soltarA(); t.soltarB();
+      }
+    }, 40000);
+
+    it('P2-01 (rodada 2): o 401 morre (SIGKILL) com a trava na mão, sem publicar: o 402 que esperava segue e publica, e a linha do 401 fica no registro', async () => {
+      const t = await aParadoNaTrocaEBCompilando({ inicial: true, vcA: 401, vcB: 402 });
+      try {
+        t.soltarB();
+        await esperarNaTrava(t.b, t.rb, assinado('XB-pagbank'));
+        process.kill(-(t.ra.filho.pid as number), 'SIGKILL');
+        await t.ra.fim;
+        const fb = await t.rb.saiu;
+        expect(fb.codigo, t.rb.saida()).toBe(0);
+        expect(resumo(t.k)).toEqual(['pagbank 400', 'pagbank 401', 'pagbank 402']);
+        expect(apks(t.a)).toEqual({ 'tchefood-pagbank.apk': assinado('A-pagbank') }); // o 401 nunca chegou a apk/
+        expect(apks(t.b)).toEqual({ 'tchefood-pagbank.apk': assinado('XB-pagbank') });
+      } finally {
+        t.soltarA(); t.soltarB();
+      }
+    }, 40000);
+
+    it('P2-01 (rodada 2): a trava da chave é solta logo depois da troca de apk/. Enquanto o 401 ainda arruma a versão anterior, outro release com a mesma chave publica sem esperar', async () => {
+      const a = criarRepo();
+      const b = criarRepo();
+      const k = chaveFalsa(a);
+      expect(release(a, k, 'pagbank', 'A', 400, PRIMEIRO).codigo).toBe(0);
+      fixarEspera(b, 1);
+      // o 401 troca apk/ e para logo antes de registrar a versão anterior (a arrumação depois de publicar)
+      const trocaPausa = join(a, 'pausa-depois');
+      const trocaMarca = join(a, 'depois-da-troca');
+      writeFileSync(trocaPausa, '');
+      const ra = rodarEmSegundoPlano(a, 'pagbank', { gerar: 'pagbank', build: 'XA', trocaPausa, trocaMarca, trocaAlvo: '.apk-anterior', extra: { ...k.env, FAKE_VC: '401' } });
+      try {
+        await esperar(() => existsSync(trocaMarca) || ra.terminou());
+        expect(ra.terminou(), ra.saida()).toBe(false);
+        expect(apks(a)).toEqual({ 'tchefood-pagbank.apk': assinado('XA-pagbank') }); // já publicado
+        const rb = release(b, k, 'pagbank', 'XB', 402);
+        expect(rb.codigo, rb.saida).toBe(0);
+        expect(apks(b)).toEqual({ 'tchefood-pagbank.apk': assinado('XB-pagbank') });
+        expect(ra.terminou()).toBe(false);
+        rmSync(trocaPausa);
+        expect((await ra.saiu).codigo, ra.saida()).toBe(0);
+        expect(resumo(k)).toEqual(['pagbank 400', 'pagbank 401', 'pagbank 402']);
+      } finally {
+        rmSync(trocaPausa, { force: true });
+      }
+    }, 40000);
+
+    it('P2-02 (rodada 2): dois primeiros releases ao mesmo tempo, um com a trava além do prazo do outro. Quem ficou sem a trava para sem criar, apagar nem modificar o registro', async () => {
+      // nenhum registro ainda: os dois passaram da conferência do começo como primeiro release; o de a gravou a
+      // linha dele (criou o registro) e está parado com a trava; o de b espera 2 s e desiste
+      const t = await aParadoNaTrocaEBCompilando({ inicial: false, vcA: 400, vcB: 401, extra: PRIMEIRO, esperaB: 2 });
+      try {
+        const registroDoA = estadoDe(t.k.registro);
+        expect(resumo(t.k)).toEqual(['pagbank 400']);
+        t.soltarB();
+        const fb = await t.rb.saiu;
+        expect(fb.codigo).not.toBe(0);
+        expect(t.rb.saida()).toContain('outro release com esta chave está publicando há mais de 2 s');
+        expect(t.rb.saida()).toContain('apk/ ficou como estava.');
+        expect(estadoDe(t.k.registro)).toBe(registroDoA);
+        expect(apks(t.b)).toEqual({});
+        expect(readdirSync(join(t.b, '.apk-releases'))).toEqual([]);
+        expect(t.ra.terminou()).toBe(false);
+        t.soltarA();
+        expect((await t.ra.saiu).codigo, t.ra.saida()).toBe(0);
+        expect(estadoDe(t.k.registro)).toBe(registroDoA);
+        expect(apks(t.a)).toEqual({ 'tchefood-pagbank.apk': assinado('XA-pagbank') });
+      } finally {
+        t.soltarA(); t.soltarB();
+      }
+    }, 40000);
+
+    it('P2-02 (rodada 2): sem a trava da chave dentro do prazo o release para, e o registro fica exatamente como estava (ausente, vazio ou com releases), no começo e na publicação', async () => {
+      for (const estado of ['ausente', 'vazio', 'com releases'] as const) {
+        for (const fase of ['começo', 'publicação'] as const) {
+          const nome = `registro ${estado}, ${fase}`;
+          const raiz = criarRepo();
+          const k = chaveFalsa(raiz);
+          fixarEspera(raiz, 1);
+          const primeiro = estado === 'com releases' ? {} : PRIMEIRO;
+          const vc = estado === 'com releases' ? 401 : 400;
+          if (estado === 'com releases') expect(release(raiz, k, 'pagbank', 'A', 400, PRIMEIRO).codigo, nome).toBe(0);
+          if (estado === 'vazio') writeFileSync(k.registro, '');
+          const publicado = apks(raiz);
+          const pastas0 = existsSync(join(raiz, '.apk-releases')) ? readdirSync(join(raiz, '.apk-releases')) : [];
+          const senhas = entradaDe(raiz, 'keytool');
+          const antes = estadoDe(k.registro);
+          const args = join(raiz, 'args');
+          const pausa = join(raiz, 'pausa-gradle');
+          const marca = join(raiz, 'no-gradle');
+          const extra = { ...k.env, ...primeiro, FAKE_VC: String(vc), FAKE_ARGS: args };
+          let trava: Awaited<ReturnType<typeof segurarTrava>>;
+          let r: ReturnType<typeof rodarEmSegundoPlano>;
+          if (fase === 'começo') {
+            trava = await segurarTrava(raiz, k.trava);
+            r = rodarEmSegundoPlano(raiz, 'pagbank', { gerar: 'pagbank', build: 'B', extra });
+          } else {
+            // passa da conferência do começo, para no Gradle, e só então o outro processo pega a trava
+            writeFileSync(pausa, '');
+            r = rodarEmSegundoPlano(raiz, 'pagbank', { gerar: 'pagbank', build: 'B', pausa, marca, extra });
+            await esperar(() => existsSync(marca) || r.terminou());
+            trava = await segurarTrava(raiz, k.trava);
+            rmSync(pausa);
+          }
+          try {
+            const fim = await r.saiu;
+            expect(fim.codigo, nome).not.toBe(0);
+            expect(r.saida(), nome).toContain('outro release com esta chave está publicando há mais de 1 s');
+            expect(r.saida(), nome).toContain(fase === 'começo' ? 'Nada foi compilado.' : 'apk/ ficou como estava.');
+            expect(existsSync(args), nome).toBe(fase === 'publicação');
+            if (fase === 'começo') expect(entradaDe(raiz, 'keytool'), nome).toBe(senhas); // nem leu a senha
+            expect(estadoDe(k.registro), nome).toBe(antes);
+            expect(apks(raiz), nome).toEqual(publicado);
+            expect(existsSync(join(raiz, '.apk-releases')) ? readdirSync(join(raiz, '.apk-releases')) : [], nome).toEqual(pastas0);
+          } finally {
+            rmSync(pausa, { force: true });
+            await trava.soltar();
+          }
+          // com a trava livre, o mesmo release sai
+          expect(release(raiz, k, 'pagbank', 'B', vc, primeiro).codigo, nome).toBe(0);
+          expect(resumo(k), nome).toEqual(estado === 'com releases' ? ['pagbank 400', 'pagbank 401'] : ['pagbank 400']);
+        }
+      }
+    }, 120000);
+
+    it('P2-02 (rodada 2): release recusado não cria nem apaga o registro (ausente continua ausente; um vazio que já existia continua, o mesmo arquivo), e a trava da chave é um arquivo vazio que fica', () => {
       const raiz = criarRepo();
       const k = chaveFalsa(raiz);
-      expect(release(raiz, k, 'pagbank', 'A', 400, { TCHEFOOD_PRIMEIRO_RELEASE: '1' }).codigo).toBe(0);
-      const trava = await segurarTravaDoRegistro(raiz, k.registro);
-      try {
-        const r = rodarEmSegundoPlano(raiz, 'pagbank', { gerar: 'pagbank', build: 'B', extra: { ...k.env, FAKE_VC: '401' } });
-        await esperarNaTrava(raiz, r, assinado('B-pagbank'));
-        expect(apks(raiz)).toEqual({ 'tchefood-pagbank.apk': assinado('A-pagbank') });
-        expect(resumo(k)).toEqual(['pagbank 400']);
-        await trava.soltar();
-        const fim = await r.saiu;
-        expect(fim.codigo, r.saida()).toBe(0);
-        expect(resumo(k)).toEqual(['pagbank 400', 'pagbank 401']);
-        expect(apks(raiz)).toEqual({ 'tchefood-pagbank.apk': assinado('B-pagbank') });
-      } finally {
-        await trava.soltar();
-      }
-    }, 30000);
+      const recusa = 'não é maior que o último publicado antes de existir o registro (364)';
+      const r1 = release(raiz, k, 'pagbank', 'A', 364, PRIMEIRO);
+      expect(r1.codigo).not.toBe(0);
+      expect(r1.saida).toContain(recusa);
+      expect(existsSync(k.registro)).toBe(false);
+      const trava = estadoDe(k.trava);
+      expect(trava).toContain(', 0 bytes,');
+      writeFileSync(k.registro, '');
+      const vazio = estadoDe(k.registro);
+      const r2 = release(raiz, k, 'pagbank', 'A', 364, PRIMEIRO);
+      expect(r2.codigo).not.toBe(0);
+      expect(r2.saida).toContain(recusa);
+      expect(estadoDe(k.registro)).toBe(vazio);
+      expect(release(raiz, k, 'pagbank', 'A', 365, PRIMEIRO).codigo).toBe(0);
+      expect(resumo(k)).toEqual(['pagbank 365']);
+      expect(estadoDe(k.trava)).toBe(trava); // nunca apagada, trocada nem escrita
+    });
 
-    it('registro apagado por outro release enquanto este esperava a trava: para sem gravar nem publicar, e rodar de novo funciona', async () => {
+    // Módulo perl carregado em todo perl do build (PERL5OPT), para imitar o que não dá para provocar de fora.
+    function comModuloPerl(raiz: string, nome: string, texto: string) {
+      mkdirSync(join(raiz, 'perl5'), { recursive: true });
+      writeFileSync(join(raiz, 'perl5', `${nome}.pm`), texto);
+      return { PERL5LIB: join(raiz, 'perl5'), PERL5OPT: `-M${nome}` };
+    }
+
+    it('alguém acrescenta uma linha ao registro entre a conferência e a gravação: nada é gravado por cima nem cortado, e o release para', () => {
       const raiz = criarRepo();
       const k = chaveFalsa(raiz);
-      // o outro release criou o registro (vazio), está com a trava e vai apagá-lo ao sair
-      const trava = await segurarTravaDoRegistro(raiz, k.registro, true);
-      try {
-        const r = rodarEmSegundoPlano(raiz, 'pagbank', { gerar: 'pagbank', build: 'A', extra: { ...k.env, TCHEFOOD_PRIMEIRO_RELEASE: '1', FAKE_VC: '400' } });
-        await esperarNaTrava(raiz, r, assinado('A-pagbank'));
-        await trava.soltar();
-        const fim = await r.saiu;
-        expect(fim.codigo, r.saida()).not.toBe(0);
-        expect(r.saida()).toContain('o registro de releases foi trocado por outro release enquanto este esperava a vez');
-        expect(r.saida()).toContain('Rode de novo');
-        expect(apks(raiz)).toEqual({});
-        expect(existsSync(k.registro)).toBe(false);
-      } finally {
-        await trava.soltar();
-      }
-      expect(release(raiz, k, 'pagbank', 'A', 400, { TCHEFOOD_PRIMEIRO_RELEASE: '1' }).codigo).toBe(0);
-      expect(resumo(k)).toEqual(['pagbank 400']);
+      expect(release(raiz, k, 'pagbank', 'A', 400, PRIMEIRO).codigo).toBe(0);
+      const antes = readFileSync(k.registro, 'utf8');
+      const intrusa = `tablet\t400\t0.1.400-abc1234\t${'a'.repeat(64)}\t2026-01-01T00:00:00Z\n`;
+      // o seek do programa do registro só existe na gravação, logo depois de abrir o arquivo para acrescentar
+      const modulo = comModuloPerl(raiz, 'MexeNoRegistro', `package MexeNoRegistro;
+use strict; use warnings;
+my $feito;
+BEGIN {
+  *CORE::GLOBAL::seek = sub (*$$) {
+    my ($fh, $pos, $de) = @_;
+    if (defined $ARGV[0] && $ARGV[0] eq "gravar" && !$feito++) {
+      open(my $x, ">>", $ARGV[1]) or die "intrusa: $!"; print $x $ENV{MEXE_LINHA}; close($x);
+    }
+    return CORE::seek($fh, $pos, $de);
+  };
+}
+1;
+`);
+      const r = release(raiz, k, 'pagbank', 'B', 401, { ...modulo, MEXE_LINHA: intrusa });
+      expect(r.codigo).not.toBe(0);
+      expect(r.saida).toContain('o registro de releases mudou enquanto era conferido');
+      expect(readFileSync(k.registro, 'utf8')).toBe(antes + intrusa);
       expect(apks(raiz)).toEqual({ 'tchefood-pagbank.apk': assinado('A-pagbank') });
-    }, 30000);
+      // sem a intromissão, o mesmo release entra depois da linha que apareceu
+      expect(release(raiz, k, 'pagbank', 'B', 401).codigo).toBe(0);
+      expect(readFileSync(k.registro, 'utf8').startsWith(antes + intrusa)).toBe(true);
+      expect(resumo(k)).toEqual(['pagbank 400', 'tablet 400', 'pagbank 401']);
+    });
+
+    it('gravação do registro que falha (disco cheio no meio da linha, sincronização que falha, releitura que não confere): o arquivo volta ao tamanho que tinha, nada é publicado, e o mesmo release sai depois', () => {
+      // GRAVA_MAL, só no programa do registro em modo gravar: disco-cheio (10 bytes entram e a escrita falha),
+      // sync-falha (a linha entra e levar ao disco falha), relido-diferente (aparece lixo depois da linha gravada)
+      const GRAVA_MAL = `package GravaMal;
+use strict; use warnings; use Errno (); use IO::Handle ();
+sub ligado { defined $ENV{GRAVA_MAL} && $ENV{GRAVA_MAL} eq $_[0] && defined $ARGV[0] && $ARGV[0] eq "gravar" }
+BEGIN {
+  *CORE::GLOBAL::syswrite = sub (*$;$$) {
+    if (ligado("disco-cheio")) { CORE::syswrite($_[0], $_[1], 10); $! = Errno::ENOSPC(); return undef }
+    return @_ == 2 ? CORE::syswrite($_[0], $_[1]) : @_ == 3 ? CORE::syswrite($_[0], $_[1], $_[2]) : CORE::syswrite($_[0], $_[1], $_[2], $_[3]);
+  };
+}
+{
+  no warnings "redefine";
+  my $de_verdade = \\&IO::Handle::sync;
+  *IO::Handle::sync = sub {
+    if (ligado("sync-falha")) { $! = Errno::EIO(); return undef }
+    my $r = $de_verdade->(@_);
+    if (ligado("relido-diferente")) { open(my $x, ">>", $ARGV[1]) or die "lixo: $!"; print $x "lixo\\n"; close($x) }
+    return $r;
+  };
+}
+1;
+`;
+      const mensagem: Record<string, string> = {
+        'disco-cheio': 'não consegui gravar o registro de releases',
+        'sync-falha': 'não consegui gravar o registro de releases',
+        'relido-diferente': 'o registro de releases relido não confere com o gravado',
+      };
+      for (const modo of Object.keys(mensagem)) {
+        for (const estado of ['com releases', 'ausente'] as const) {
+          const nome = `${modo}, registro ${estado}`;
+          const raiz = criarRepo();
+          const k = chaveFalsa(raiz);
+          const primeiro = estado === 'ausente' ? PRIMEIRO : {};
+          const vc = estado === 'ausente' ? 400 : 401;
+          if (estado === 'com releases') expect(release(raiz, k, 'pagbank', 'A', 400, PRIMEIRO).codigo, nome).toBe(0);
+          const antes = estado === 'ausente' ? '' : readFileSync(k.registro, 'utf8');
+          const publicado = apks(raiz);
+          const r = release(raiz, k, 'pagbank', 'B', vc, { ...primeiro, ...comModuloPerl(raiz, 'GravaMal', GRAVA_MAL), GRAVA_MAL: modo });
+          expect(r.codigo, nome).not.toBe(0);
+          expect(r.saida, nome).toContain(mensagem[modo]);
+          expect(r.saida, nome).toContain('apk/ ficou como estava.');
+          // voltou ao que era: com releases, o conteúdo de antes; ausente, um arquivo vazio (vale como nenhum)
+          expect(readFileSync(k.registro, 'utf8'), nome).toBe(antes);
+          expect(apks(raiz), nome).toEqual(publicado);
+          expect(release(raiz, k, 'pagbank', 'B', vc, primeiro).codigo, nome).toBe(0);
+          expect(resumo(k), nome).toEqual(estado === 'ausente' ? ['pagbank 400'] : ['pagbank 400', 'pagbank 401']);
+        }
+      }
+    }, 60000);
+
+    // Troca o flock do perl só no programa da trava dos releases (passos "pegar" e "conferir") e só para o arquivo
+    // de FALSA_TRAVA_ARQUIVO, para imitar pastas onde a trava não funciona:
+    //   FALSA_TRAVA_PASSO     pegar | conferir | ambos: em que passo a falha acontece
+    //   FALSA_TRAVA_MODO      sem-efeito (o flock responde que travou e não trava); EBADF, ENOLCK, EIO (o flock
+    //                         falha com esse erro); morre (o processo é morto com SIGKILL); sai-zero (o processo sai
+    //                         com 0 sem responder); solta-ao-sair (a trava some quando sai o processo que a pediu)
+    //   FALSA_TRAVA_DESDE     a partir de qual vez que a trava é pega (1 = começo do release, 2 = publicação)
+    //   FALSA_TRAVA_CONTADOR  arquivo onde o módulo conta as vezes
+    //   FALSA_TRAVA_RUIDO     1 = todo perl escreve um aviso na saída de erro ao começar
+    const TRAVA_FALSA = `package TravaFalsa;
+use strict; use warnings; use Errno (); use POSIX ();
+my ($contei, $soltar);
+sub vez {
+  my $n = 0;
+  if (defined $ENV{FALSA_TRAVA_CONTADOR} && open(my $c, "<", $ENV{FALSA_TRAVA_CONTADOR})) { $n = <$c>; close($c) }
+  return ($n || 0) + 0;
+}
+BEGIN {
+  print STDERR "perl: warning: Setting locale failed.\\n" if $ENV{FALSA_TRAVA_RUIDO};
+  *CORE::GLOBAL::flock = sub (*$) {
+    my ($fh, $op) = @_;
+    my $eu = defined $ARGV[0] ? $ARGV[0] : "";
+    my $modo = defined $ENV{FALSA_TRAVA_MODO} ? $ENV{FALSA_TRAVA_MODO} : "";
+    my $passo = defined $ENV{FALSA_TRAVA_PASSO} ? $ENV{FALSA_TRAVA_PASSO} : "";
+    my $alvo = defined $ENV{FALSA_TRAVA_ARQUIVO} ? $ENV{FALSA_TRAVA_ARQUIVO} : "";
+    if ($alvo ne "" && ($eu eq "pegar" || $eu eq "conferir") && defined $ARGV[1] && $ARGV[1] eq $alvo) {
+      if ($eu eq "pegar" && !$contei++) {
+        my $n = vez() + 1;
+        open(my $c, ">", $ENV{FALSA_TRAVA_CONTADOR}) or die "contador: $!"; print $c $n; close($c);
+      }
+      if ($modo ne "" && vez() >= ($ENV{FALSA_TRAVA_DESDE} || 1) && ($passo eq $eu || $passo eq "ambos")) {
+        return 1 if $modo eq "sem-efeito";
+        if ($modo =~ /\\AE[A-Z]+\\z/) { $! = Errno->can($modo)->(); return 0 }
+        if ($modo eq "morre") { kill "KILL", $$; sleep 5 }
+        POSIX::_exit(0) if $modo eq "sai-zero";
+        if ($modo eq "solta-ao-sair") { my $r = CORE::flock($fh, $op); $soltar = $fh if $r; return $r }
+      }
+    }
+    return CORE::flock($fh, $op);
+  };
+}
+END { CORE::flock($soltar, 8) if $soltar }
+1;
+`;
+    const travaFalsa = (raiz: string, k: ReturnType<typeof chaveFalsa>, o: { passo?: string; modo?: string; desde?: number; ruido?: boolean }) => ({
+      ...comModuloPerl(raiz, 'TravaFalsa', TRAVA_FALSA),
+      FALSA_TRAVA_ARQUIVO: k.trava, FALSA_TRAVA_CONTADOR: join(raiz, 'vezes-da-trava'),
+      FALSA_TRAVA_PASSO: o.passo ?? '', FALSA_TRAVA_MODO: o.modo ?? '', FALSA_TRAVA_DESDE: String(o.desde ?? 1), FALSA_TRAVA_RUIDO: o.ruido ? '1' : '',
+    });
+    // [passo, modo, o que o release responde]
+    const NAO_EXCLUI = 'a trava dos releases não exclui outro processo nesta pasta';
+    const OUTRO_ERRO = 'a conferência da trava dos releases falhou com um erro que não é o de trava ocupada';
+    const FALHAS_DA_TRAVA: [string, string, string][] = [
+      ['conferir', 'sem-efeito', NAO_EXCLUI], // o segundo processo consegue a trava que o primeiro já tem
+      ['conferir', 'EBADF', OUTRO_ERRO],      // descritor inválido
+      ['conferir', 'ENOLCK', OUTRO_ERRO],     // a pasta não tem como travar
+      ['conferir', 'EIO', OUTRO_ERRO],        // falha de leitura ou escrita
+      ['conferir', 'morre', 'não respondeu como esperado (código 137'],
+      ['conferir', 'sai-zero', 'não respondeu como esperado (código 0'],
+      ['pegar', 'ENOLCK', 'a pasta da chave não aceita trava de arquivo'],
+      ['pegar', 'EIO', 'a pasta da chave não aceita trava de arquivo'],
+      ['pegar', 'sem-efeito', NAO_EXCLUI],    // o flock responde que travou e não trava
+      ['pegar', 'solta-ao-sair', NAO_EXCLUI], // a trava não sobrevive ao processo que a pediu
+      ['pegar', 'morre', 'não respondeu como esperado (código 137'],
+      ['pegar', 'sai-zero', 'não respondeu como esperado (código 0'],
+      ['ambos', 'sem-efeito', NAO_EXCLUI],
+    ];
+
+    it('P2-03 (rodada 2): no começo do release, só a trava ocupada de verdade vale como prova de exclusão. Qualquer outra resposta da conferência para antes de ler o registro, de pedir a senha e de compilar', () => {
+      for (const [passo, modo, resposta] of FALHAS_DA_TRAVA) {
+        const nome = `${passo} / ${modo}`;
+        const raiz = criarRepo();
+        const k = chaveFalsa(raiz);
+        writeFileSync(k.registro, 'isto não é um registro\n'); // se fosse lido, a recusa seria outra
+        const antes = estadoDe(k.registro);
+        const args = join(raiz, 'args');
+        const r = release(raiz, k, 'pagbank', 'A', 400, { ...PRIMEIRO, FAKE_ARGS: args, ...travaFalsa(raiz, k, { passo, modo }) });
+        expect(r.codigo, nome).not.toBe(0);
+        expect(r.saida, nome).toContain(resposta);
+        expect(r.saida, nome).toContain('Nada foi compilado.');
+        expect(r.saida, nome).not.toContain('fora do formato');
+        expect(existsSync(args), nome).toBe(false);
+        expect(entradaDe(raiz, 'keytool'), nome).toBe('');
+        expect(estadoDe(k.registro), nome).toBe(antes);
+        expect(apks(raiz), nome).toEqual({});
+      }
+    }, 60000);
+
+    it('P2-03 (rodada 2): na publicação, a mesma coisa. Sem prova de exclusão o release para depois de compilar, sem gravar no registro e sem trocar apk/', () => {
+      for (const [passo, modo, resposta] of FALHAS_DA_TRAVA) {
+        const nome = `${passo} / ${modo}`;
+        const raiz = criarRepo();
+        const k = chaveFalsa(raiz);
+        expect(release(raiz, k, 'pagbank', 'A', 400, PRIMEIRO).codigo, nome).toBe(0);
+        const antes = estadoDe(k.registro);
+        const args = join(raiz, 'args');
+        // a falha só começa na segunda vez que a trava é pega: a conferência do começo passa
+        const r = release(raiz, k, 'pagbank', 'B', 401, { FAKE_ARGS: args, ...travaFalsa(raiz, k, { passo, modo, desde: 2 }) });
+        expect(r.codigo, nome).not.toBe(0);
+        expect(r.saida, nome).toContain(resposta);
+        expect(r.saida, nome).toContain('apk/ ficou como estava.');
+        expect(existsSync(args), nome).toBe(true); // compilou: a falha foi na publicação
+        expect(readFileSync(join(raiz, 'vezes-da-trava'), 'utf8'), nome).toBe('2');
+        expect(estadoDe(k.registro), nome).toBe(antes);
+        expect(apks(raiz), nome).toEqual({ 'tchefood-pagbank.apk': assinado('A-pagbank') });
+        expect(readdirSync(join(raiz, '.apk-releases')), nome).toHaveLength(1);
+        // a trava de verdade funciona nesta pasta: sem a falha, o mesmo release sai
+        expect(release(raiz, k, 'pagbank', 'B', 401).codigo, nome).toBe(0);
+        expect(resumo(k), nome).toEqual(['pagbank 400', 'pagbank 401']);
+      }
+    }, 120000);
+
+    it('P2-03 (rodada 2): contenção legítima passa. Com o módulo carregado e sem falha, com aviso do perl na saída de erro, ou com a falha marcada para uma vez que não chega, o release sai e a trava é pega duas vezes (começo e publicação)', () => {
+      for (const [nome, o] of [
+        ['sem falha', {}],
+        ['aviso do perl na saída de erro', { ruido: true }],
+        ['falha marcada para a terceira vez', { passo: 'ambos', modo: 'sem-efeito', desde: 3 }],
+      ] as [string, Parameters<typeof travaFalsa>[2]][]) {
+        const raiz = criarRepo();
+        const k = chaveFalsa(raiz);
+        const r = release(raiz, k, 'pagbank', 'A', 400, { ...PRIMEIRO, ...travaFalsa(raiz, k, o) });
+        expect(r.codigo, `${nome}: ${r.saida}`).toBe(0);
+        if (o.ruido) expect(r.saida).toContain('perl: warning: Setting locale failed.');
+        expect(readFileSync(join(raiz, 'vezes-da-trava'), 'utf8'), nome).toBe('2');
+        expect(resumo(k), nome).toEqual(['pagbank 400']);
+        expect(apks(raiz), nome).toEqual({ 'tchefood-pagbank.apk': assinado('A-pagbank') });
+      }
+    }, 60000);
+
+    it('trava da chave que não é um arquivo comum (link ou pasta): o release para antes de compilar, e nada é criado no destino do link', () => {
+      for (const tipo of ['link', 'pasta'] as const) {
+        const raiz = criarRepo();
+        const k = chaveFalsa(raiz);
+        const destino = join(raiz, 'outro-lugar');
+        if (tipo === 'link') symlinkSync(destino, k.trava); else mkdirSync(k.trava);
+        const args = join(raiz, 'args');
+        const r = release(raiz, k, 'pagbank', 'A', 400, { ...PRIMEIRO, FAKE_ARGS: args });
+        expect(r.codigo, tipo).not.toBe(0);
+        expect(r.saida, tipo).toContain('a trava dos releases desta chave não é um arquivo comum');
+        expect(r.saida, tipo).toContain('Nada foi compilado.');
+        expect(existsSync(args), tipo).toBe(false);
+        expect(existsSync(destino), tipo).toBe(false);
+        expect(existsSync(k.registro), tipo).toBe(false);
+      }
+    });
+
+    it('a trava da chave não fica aberta durante a compilação: um processo que o Gradle deixa para trás não a herda, e o release seguinte não espera', () => {
+      const raiz = criarRepo();
+      const k = chaveFalsa(raiz);
+      const fundo = join(raiz, 'fundo.pid');
+      // espera curta: se o processo deixado para trás (vivo por 30 s) herdasse a trava do começo do release, a
+      // publicação deste mesmo release não a conseguiria
+      fixarEspera(raiz, 1);
+      try {
+        const r = rodar(raiz, 'pagbank', { gerar: 'pagbank', fundo, extra: { ...k.env, ...PRIMEIRO, FAKE_VC: '400' } });
+        expect(r.codigo, r.saida).toBe(0);
+        expect(vivo(pidDe(fundo))).toBe(true);
+        const donos = quemTemAberto(k.trava);
+        if (donos) expect(donos).toEqual([]);
+        expect(release(raiz, k, 'pagbank', 'B', 401).codigo).toBe(0);
+        expect(resumo(k)).toEqual(['pagbank 400', 'pagbank 401']);
+      } finally {
+        matarFundo(fundo);
+      }
+    });
 
     it('TCHEFOOD_VERSION_CODE vai para o Gradle como propriedade; valor que não é número de 1 a 2100000000 para antes de tudo', () => {
       const raiz = criarRepo();
@@ -1603,6 +2050,7 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
       expect(rodar(raiz, 'pagbank', { gerar: 'pagbank', extra: { FAKE_VC: '5' } }).codigo).toBe(0);
       expect(rodar(raiz, 'pagbank', { gerar: 'pagbank', build: 'B', extra: { FAKE_VC: '4' } }).codigo).toBe(0);
       expect(existsSync(k.registro)).toBe(false);
+      expect(existsSync(k.trava)).toBe(false);
     });
   });
 

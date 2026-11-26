@@ -121,7 +121,8 @@ A cada release, para cada APK:
 - número **menor** que o maior já registrado (de qualquer variante): recusa;
 - número **igual** a um já registrado para a variante: só passa se o APK for idêntico ao registrado, byte a byte
   (o build é reprodutível: o mesmo commit, na mesma máquina, dá o mesmo arquivo). Conteúdo diferente com o mesmo
-  número: recusa;
+  número: recusa. Essa é uma regra do Tchê Food, para cada número identificar um único APK (o Android em si
+  aceitaria instalar um por cima do outro);
 - o mesmo número com outro `versionName` (outro commit): recusa;
 - número **novo**: tem de ser maior que 364 (o último publicado antes de o registro existir), e a linha é gravada
   antes da publicação.
@@ -137,6 +138,16 @@ O que você precisa saber:
 - **O registro é guardado junto da chave.** Toda cópia de segurança da chave leva o registro junto, refeita depois
   de cada release. Gere releases sempre a partir da mesma cópia da chave, numa máquina de cada vez: duas cópias
   da chave em lugares diferentes têm dois registros, e um não sabe do outro.
+- **Dois releases com a mesma chave não publicam ao mesmo tempo.** Ao lado da chave fica também
+  `<arquivo da chave>.releases.lock`, um arquivo vazio que o script cria e nunca apaga: é a trava dos releases
+  dessa chave. Quem a tem confere o número, grava a linha e troca `apk/`; outro release com a mesma chave, mesmo em
+  outra cópia do projeto, espera até 30 segundos e, se o primeiro não terminar, para sem gravar nem publicar (rode
+  de novo). A compilação não segura a trava. Esse arquivo não precisa de cópia de segurança: se sumir, o script
+  cria outro.
+- **A pasta da chave precisa aceitar escrita e trava de arquivo.** O script testa a trava antes de compilar: se a
+  pasta (uma pasta de rede, por exemplo) não travar de verdade, o release para e pede para usar a chave numa
+  pasta do próprio computador. O teste vale para processos da mesma máquina; ele não prova que a trava funciona
+  entre duas máquinas que abrem a mesma pasta de rede, por isso a regra de gerar numa máquina de cada vez continua.
 - **Se a publicação falhar depois de a linha ser gravada** (ou o processo for morto nesse instante), a linha
   fica: o número está amarrado àquele APK. Rodar de novo no mesmo commit publica normalmente; para publicar outro
   conteúdo, use um número maior.
@@ -155,8 +166,8 @@ O que você precisa saber:
 
 ## Guardar a chave
 
-- O arquivo `.jks`, a senha e o arquivo da senha **nunca** vão para o repositório (`*.jks`, `*.keystore` e
-  `*.releases.tsv` estão no `.gitignore`), nem para o chat.
+- O arquivo `.jks`, a senha e o arquivo da senha **nunca** vão para o repositório (`*.jks`, `*.keystore`,
+  `*.releases.tsv` e `*.releases.lock` estão no `.gitignore`), nem para o chat.
 - Guarde duas cópias fora do computador (por exemplo, um pendrive e uma pasta privada na nuvem), com a senha
   separada do arquivo, e o registro de releases junto da chave.
 - **Perder a chave impede atualizar os aparelhos**: um APK com chave nova só instala depois de desinstalar o antigo,
