@@ -1,0 +1,57 @@
+# CI do Tchê Food no CircleCI (o GitHub Actions da conta está travado por cobrança).
+#
+# - verificar: npm ci, npm test, npm run typecheck e npm run build (os mesmos comandos exigidos antes de push).
+# - apk-debug: gera os APKs de DEBUG (pagbank e tablet) com `bash scripts/build-apk.sh` e guarda em
+#   Artifacts. Não usa chave nem segredo: o script baixa o SDK Android e o Gradle conferindo SHA-256.
+#   O APK de release assinado NÃO sai daqui: a chave oficial nunca vai para o CircleCI (veja docs/ci/circleci.md).
+version: 2.1
+
+executors:
+  android:
+    docker:
+      # Imagem com Java 17, Android SDK e Node 20 (o script exige Java 17 a 21 e Node 20+).
+      - image: cimg/android:2024.01.1-node
+    resource_class: large
+
+jobs:
+  verificar:
+    executor: android
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - npm-v1-{{ checksum "package-lock.json" }}
+      - run: npm ci
+      - save_cache:
+          key: npm-v1-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+
+  apk-debug:
+    executor: android
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - android-v1-{{ checksum "scripts/build-apk.sh" }}
+            - android-v1-
+      - run:
+          name: Gerar APKs de debug (pagbank e tablet)
+          command: bash scripts/build-apk.sh
+          no_output_timeout: 30m
+      - save_cache:
+          key: android-v1-{{ checksum "scripts/build-apk.sh" }}
+          paths:
+            - ~/.cache/tchefood-android
+      - store_artifacts:
+          path: apk
+          destination: apk
+
+workflows:
+  ci:
+    jobs:
+      - verificar
+      - apk-debug
