@@ -70,14 +70,15 @@ Também serve em Linux, no Mac e no WSL do Windows. O script aceita as licenças
 
 ### 3. GitHub Actions
 
-A action **APK Android** roda em todo PR que mexe no app e deixa os dois APKs (debug) em *Artifacts*
-(`tchefood-apk`); também dá para rodar à mão em Actions → APK Android → Run workflow. Só funciona com a
-cobrança da conta GitHub em dia.
+A action **APK Android** roda só à mão (Actions → APK Android → Run workflow) e deixa os dois APKs (debug) em
+*Artifacts* (`tchefood-apk`). Só funciona com a cobrança da conta GitHub em dia.
 
 Instalar na maquininha para teste: ativar instalação de fontes desconhecidas (ou `adb install`). Publicar na loja
-PagBank exige cadastro de desenvolvedor PagBank e APK de release assinado (ainda não configurado).
+PagBank exige cadastro de desenvolvedor PagBank e APK de release assinado com a chave oficial
+(`docs/apk-release.md`).
 
 ## Ainda não feito
 
 - Stone embarcado (`window.StoneBridge`, deeplink `stone-sdk://pay`): a Stone hoje vai pelo Connect 2.0, pela nuvem.
-- Assinatura de release e publicação nas lojas (PagBank, Play).
+- Publicação nas lojas (PagBank, Play). O APK de release assinado já sai do `scripts/build-apk.sh`
+  (`docs/apk-release.md`).

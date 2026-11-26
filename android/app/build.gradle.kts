@@ -12,6 +12,37 @@ val bundleWebApp = appUrl.isEmpty()
 val webDist = rootProject.layout.projectDirectory.dir("../dist")
 val webAssetsRoot = layout.buildDirectory.dir("generated/webapp")
 
+// Versão: o Android só instala por cima um APK com versionCode maior ou igual ao instalado. O número padrão é
+// a quantidade de commits até o HEAD, e TCHEFOOD_VERSION_CODE substitui a contagem. A contagem sozinha não
+// garante que o número suba (outro branch pode ter menos commits): quem garante, no release, é o registro de
+// releases do scripts/build-apk.sh (docs/apk-release.md).
+// Clone raso (--depth) daria um número menor que o real: aí o build para, em vez de gerar um APK que não instala.
+fun git(vararg args: String): String =
+    providers.exec {
+        commandLine("git", "-C", rootProject.projectDir.parentFile.absolutePath, *args)
+    }.standardOutput.asText.get().trim()
+
+val versionCodeOverride = providers.gradleProperty("TCHEFOOD_VERSION_CODE").orNull?.trim().orEmpty()
+val appVersionCode: Int = if (versionCodeOverride.isNotEmpty()) {
+    versionCodeOverride.toIntOrNull()?.takeIf { it in 1..2_100_000_000 }
+        ?: throw GradleException("TCHEFOOD_VERSION_CODE precisa ser um número inteiro de 1 a 2100000000")
+} else {
+    val shallow = try { git("rev-parse", "--is-shallow-repository") } catch (e: Exception) {
+        throw GradleException("não consegui ler o git para numerar a versão; rode dentro do repositório ou passe -PTCHEFOOD_VERSION_CODE=N", e)
+    }
+    if (shallow == "true") {
+        throw GradleException("clone raso do git: a contagem de commits sairia menor que a real. Rode `git fetch --unshallow` ou passe -PTCHEFOOD_VERSION_CODE=N")
+    }
+    git("rev-list", "--count", "HEAD").toInt()
+}
+val appCommit: String = try { git("rev-parse", "--short=7", "HEAD") } catch (e: Exception) { "sem-git" }
+val appVersionName = "0.1.$appVersionCode-$appCommit"
+
+// Assinatura de release: fica FORA do Gradle. `assemble*Release` gera app-<variante>-release-unsigned.apk, que o
+// Android não instala. Quem assina com a chave oficial, confere o certificado e publica é o scripts/build-apk.sh
+// (docs/apk-release.md). Assim nenhuma senha passa pelo Gradle, pelos plugins nem pelas dependências do build, e
+// este arquivo não tem signingConfig de release de propósito.
+
 android {
     namespace = "food.tche.smartpos"
     compileSdk = 34
@@ -20,8 +51,8 @@ android {
         applicationId = "food.tche.smartpos"
         minSdk = 25
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
         buildConfigField("String", "TCHEFOOD_APP_URL", "\"$appUrl\"")
     }
 
