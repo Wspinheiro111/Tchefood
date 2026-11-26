@@ -31,10 +31,13 @@ function executavel(caminho: string, conteudo: string) {
 const GRADLE_FALSO = `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "Gradle 8.7"; exit 0; fi
 [ -n "$FAKE_PID" ] && echo $$ > "$FAKE_PID"
+[ -n "$FAKE_ARGS" ] && { printf '%s\n' "$*"; env | grep '^ORG_GRADLE_PROJECT_' | sort; } > "$FAKE_ARGS"
+tipo=debug
+case "$*" in *Release*) tipo=release ;; esac
 for v in $FAKE_GERAR; do
-  d="android/app/build/outputs/apk/$v/debug"
+  d="android/app/build/outputs/apk/$v/$tipo"
   mkdir -p "$d"
-  if [ "$FAKE_VAZIO" = "$v" ]; then : > "$d/app-$v-debug.apk"; else printf '%s' "$FAKE_BUILD-$v" > "$d/app-$v-debug.apk"; fi
+  if [ "$FAKE_VAZIO" = "$v" ]; then : > "$d/app-$v-$tipo.apk"; else printf '%s' "$FAKE_BUILD-$v" > "$d/app-$v-$tipo.apk"; fi
 done
 if [ -n "$FAKE_FUNDO" ]; then
   perl -e 'setpgrp(0, 0); sleep 30' </dev/null >/dev/null 2>&1 &
@@ -105,6 +108,21 @@ fi
 mkdir -p "$ANDROID_HOME/platforms/android-34" "$ANDROID_HOME/build-tools/34.0.0"
 exit 0
 `;
+// apksigner falso: "verify --print-certs" responde como o de verdade. FAKE_SEM_ASSINATURA = conteúdo de APK que
+// falha na verificação; FAKE_CERT_DN = dono do certificado (padrão: uma chave própria; "debug" = chave de debug).
+const APKSIGNER_FALSO = `#!/bin/sh
+for apk; do :; done
+if [ -n "$FAKE_SEM_ASSINATURA" ] && [ "$(cat "$apk")" = "$FAKE_SEM_ASSINATURA" ]; then
+  echo "DOES NOT VERIFY" >&2; exit 1
+fi
+if [ "$FAKE_CERT_DN" = "debug" ]; then dn="C=US, O=Android, CN=Android Debug"; else dn="CN=Tche Food"; fi
+echo "Signer #1 certificate DN: $dn"
+echo "Signer #1 certificate SHA-256 digest: cafe0123"
+exit 0
+`;
+const AAPT2_FALSO = `#!/bin/sh
+echo "package: name='food.tche.smartpos' versionCode='412' versionName='0.1.412-abc1234' platformBuildVersionName='14'"
+`;
 const PERL_REAL = spawnSync('sh', ['-c', 'command -v perl'], { encoding: 'utf8' }).stdout.trim();
 
 function criarRepo() {
@@ -118,7 +136,8 @@ function criarRepo() {
   const sdk = join(raiz, 'sdk');
   executavel(join(sdk, 'cmdline-tools', 'latest', 'bin', 'sdkmanager'), SDKMANAGER_FALSO);
   mkdirSync(join(sdk, 'platforms', 'android-34'), { recursive: true });
-  mkdirSync(join(sdk, 'build-tools', '34.0.0'), { recursive: true });
+  executavel(join(sdk, 'build-tools', '34.0.0', 'apksigner'), APKSIGNER_FALSO);
+  executavel(join(sdk, 'build-tools', '34.0.0', 'aapt2'), AAPT2_FALSO);
 
   const bin = join(raiz, 'bin');
   executavel(join(bin, 'java'), '#!/bin/sh\necho \'openjdk version "17.0.9" 2023-10-17\' >&2\n');
@@ -359,6 +378,113 @@ describe.skipIf(process.platform === 'win32')('scripts/build-apk.sh', () => {
     const r = rodar(raiz, 'all', { gerar: 'pagbank' });
     expect(r.codigo).not.toBe(0);
     expect(r.saida).not.toContain('cloudshell download');
+  });
+
+  describe('downloads conferidos por SHA-256', () => {
+    // Sem o sdkmanager, o script baixa as ferramentas do Android; o curl falso grava um conteúdo qualquer.
+    function semSdk(raiz: string, conteudo: string) {
+      rmSync(join(raiz, 'sdk', 'cmdline-tools'), { recursive: true, force: true });
+      executavel(join(raiz, 'bin', 'curl'), `#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && saida="$2"; shift; done\nprintf '%s' '${conteudo}' > "$saida"\n`);
+      executavel(join(raiz, 'bin', 'unzip'), '#!/bin/sh\necho "unzip chamado" > "$HOME/unzip-chamado"\nexit 1\n');
+    }
+
+    it('arquivo baixado que não confere: para antes de descompactar e não deixa o arquivo no cache', () => {
+      const raiz = criarRepo();
+      semSdk(raiz, 'conteudo-trocado');
+      const r = rodar(raiz, 'pagbank', { gerar: 'pagbank' });
+      expect(r.codigo).not.toBe(0);
+      expect(r.saida).toContain('não confere');
+      expect(existsSync(join(raiz, 'unzip-chamado'))).toBe(false);
+      expect(readdirSync(join(raiz, 'cache'))).toEqual([]);
+      expect(apks(raiz)).toEqual({});
+    });
+
+    it('os SHA-256 do script são os publicados para as versões fixadas', () => {
+      const texto = readFileSync(SCRIPT, 'utf8');
+      expect(texto).toContain('CMDLINE_TOOLS_VERSION="11076708"');
+      expect(texto).toContain('CMDLINE_TOOLS_SHA256_LINUX="2d2d50857e4eb553af5a6dc3ad507a17adf43d115264b1afc116f95c92e5e258"');
+      expect(texto).toContain('CMDLINE_TOOLS_SHA256_MAC="7bc5c72ba0275c80a8f19684fb92793b83a6b5c94d4d179fc5988930282d7e64"');
+      expect(texto).toContain('GRADLE_VERSION="8.7"');
+      expect(texto).toContain('GRADLE_SHA256="544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d"');
+    });
+  });
+
+  describe('assinatura', () => {
+    it('sem chave: debug, com versão e certificado no fim', () => {
+      const raiz = criarRepo();
+      const args = join(raiz, 'args');
+      const r = rodar(raiz, 'pagbank', { gerar: 'pagbank', extra: { FAKE_ARGS: args } });
+      expect(r.codigo).toBe(0);
+      expect(readFileSync(args, 'utf8')).toContain('assemblePagbankDebug');
+      expect(readFileSync(args, 'utf8')).not.toContain('ORG_GRADLE_PROJECT_TCHEFOOD_KEYSTORE');
+      expect(r.saida).toContain('Versão: 0.1.412-abc1234 (código 412) (debug)');
+      expect(r.saida).toContain('pagbank: cafe0123');
+    });
+
+    it('com a chave: release, nome sem -debug e senha só pelo ambiente, nunca na linha de comando', () => {
+      const raiz = criarRepo();
+      const chave = join(raiz, 'chave.jks');
+      writeFileSync(chave, 'x');
+      const args = join(raiz, 'args');
+      const r = rodar(raiz, 'all', { gerar: 'pagbank tablet', extra: {
+        FAKE_ARGS: args, TCHEFOOD_KEYSTORE: chave, TCHEFOOD_KEYSTORE_PASSWORD: 'senha-secreta-1',
+      } });
+      expect(r.codigo).toBe(0);
+      expect(apks(raiz)).toEqual({ 'tchefood-pagbank.apk': 'A-pagbank', 'tchefood-tablet.apk': 'A-tablet' });
+      const [linha, ...ambienteGradle] = readFileSync(args, 'utf8').trim().split('\n');
+      expect(linha).toContain('assemblePagbankRelease');
+      expect(linha).toContain('assembleTabletRelease');
+      expect(linha).not.toContain('senha-secreta-1');
+      expect(ambienteGradle).toEqual([
+        `ORG_GRADLE_PROJECT_TCHEFOOD_KEYSTORE_FILE=${chave}`,
+        'ORG_GRADLE_PROJECT_TCHEFOOD_KEYSTORE_PASSWORD=senha-secreta-1',
+        'ORG_GRADLE_PROJECT_TCHEFOOD_KEY_ALIAS=tchefood',
+        'ORG_GRADLE_PROJECT_TCHEFOOD_KEY_PASSWORD=senha-secreta-1',
+      ]);
+      expect(r.saida).not.toContain('senha-secreta-1');
+      expect(r.saida).toContain('cloudshell download apk/tchefood-pagbank.apk');
+    });
+
+    it('release que saiu com a chave de debug: falha e não publica', () => {
+      const raiz = criarRepo();
+      const chave = join(raiz, 'chave.jks');
+      writeFileSync(chave, 'x');
+      const r = rodar(raiz, 'pagbank', { gerar: 'pagbank', extra: {
+        TCHEFOOD_KEYSTORE: chave, TCHEFOOD_KEYSTORE_PASSWORD: 's', FAKE_CERT_DN: 'debug',
+      } });
+      expect(r.codigo).not.toBe(0);
+      expect(r.saida).toContain('chave de debug');
+      expect(apks(raiz)).toEqual({});
+    });
+
+    it('APK sem assinatura válida: falha e o conjunto anterior fica', () => {
+      const raiz = criarRepo();
+      expect(rodar(raiz, 'pagbank', { gerar: 'pagbank', build: 'A' }).codigo).toBe(0);
+      const antes = apks(raiz);
+      const r = rodar(raiz, 'pagbank', { gerar: 'pagbank', build: 'B', extra: { FAKE_SEM_ASSINATURA: 'B-pagbank' } });
+      expect(r.codigo).not.toBe(0);
+      expect(r.saida).toContain('assinatura válida');
+      expect(apks(raiz)).toEqual(antes);
+    });
+
+    it('chave que não existe, ou senha sem chave: para antes do Gradle', () => {
+      const raiz = criarRepo();
+      const args = join(raiz, 'args');
+      const r1 = rodar(raiz, 'pagbank', { gerar: 'pagbank', extra: {
+        FAKE_ARGS: args, TCHEFOOD_KEYSTORE: join(raiz, 'nao-existe.jks'), TCHEFOOD_KEYSTORE_PASSWORD: 's',
+      } });
+      expect(r1.codigo).not.toBe(0);
+      expect(r1.saida).toContain('TCHEFOOD_KEYSTORE não existe');
+      const r2 = rodar(raiz, 'pagbank', { gerar: 'pagbank', extra: { FAKE_ARGS: args, TCHEFOOD_KEYSTORE_PASSWORD: 's' } });
+      expect(r2.codigo).not.toBe(0);
+      expect(r2.saida).toContain('sem TCHEFOOD_KEYSTORE');
+      const chave = join(raiz, 'chave.jks');
+      writeFileSync(chave, 'x');
+      const r3 = rodar(raiz, 'pagbank', { gerar: 'pagbank', extra: { FAKE_ARGS: args, TCHEFOOD_KEYSTORE: chave } });
+      expect(r3.codigo).not.toBe(0);
+      expect(r3.saida).toContain('falta TCHEFOOD_KEYSTORE_PASSWORD');
+      expect(existsSync(args)).toBe(false);
+    });
   });
 
   describe('publicação atômica (apk/ é um link trocado de uma vez)', () => {

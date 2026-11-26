@@ -14,3 +14,7 @@ android/local.properties
 /.apk-anterior
 /.apk-pendente
 /dist-ifood
+
+# Chave de assinatura do APK: nunca no repositório
+*.jks
+*.keystore

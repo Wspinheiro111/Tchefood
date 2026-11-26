@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Gera o APK (debug) do app Android do Tchê Food sem depender do GitHub Actions.
+# Gera o APK do app Android do Tchê Food sem depender do GitHub Actions.
 # Serve no Google Cloud Shell (grátis), em Linux, no Mac e no WSL do Windows.
 #
 #   bash scripts/build-apk.sh              # os dois APKs: pagbank e tablet
@@ -7,16 +7,27 @@
 #   bash scripts/build-apk.sh tablet       # só celular/tablet
 #   TCHEFOOD_APP_URL=https://app.exemplo.com.br bash scripts/build-apk.sh
 #
+# Sem chave, o APK é debug (tchefood-<variante>-debug.apk). Com a chave do Tchê Food, é release assinado
+# (tchefood-<variante>.apk), que instala por cima do anterior em qualquer máquina que gere com a mesma chave:
+#   TCHEFOOD_KEYSTORE=~/chave/tchefood.jks TCHEFOOD_KEYSTORE_PASSWORD=... bash scripts/build-apk.sh
+#   (opcionais: TCHEFOOD_KEY_ALIAS, padrão "tchefood"; TCHEFOOD_KEY_PASSWORD, padrão = senha do arquivo.
+#    Detalhes em docs/apk-release.md.)
+#
 # Faz, nessa ordem: confere Java e Node, baixa o SDK Android e o Gradle se faltarem
-# (em ~/.cache/tchefood-android, nunca dentro do projeto), roda `npm ci && npm run build`,
-# compila e deixa os APKs em ./apk/ (só os desta execução: os antigos saem, e se o build falhar a
-# pasta fica como estava; apk/ é um link para a versão atual, trocado de uma vez, e a versão anterior fica até a
-# publicação seguinte). O APK é debug: instala direto na maquininha ou no
-# tablet (fontes desconhecidas ou `adb install`). Release assinado e loja ficam fora daqui.
+# (em ~/.cache/tchefood-android, nunca dentro do projeto) e confere o SHA-256 de cada download, roda
+# `npm ci && npm run build`, compila, confere a assinatura e deixa os APKs em ./apk/ (só os desta execução: os
+# antigos saem, e se o build falhar a pasta fica como estava; apk/ é um link para a versão atual, trocado de uma
+# vez, e a versão anterior fica até a publicação seguinte). O APK instala direto na maquininha ou no
+# tablet (fontes desconhecidas ou `adb install`). A versão (versionCode) é a contagem de commits do git.
 set -euo pipefail
 
 CMDLINE_TOOLS_VERSION="11076708"   # commandline-tools 12.0
+# SHA-256 publicados pelo Google (developer.android.com/studio) e pelo Gradle (gradle.org/release-checksums).
+# Trocar a versão exige trocar o SHA-256 junto: download que não confere para o build antes de descompactar.
+CMDLINE_TOOLS_SHA256_LINUX="2d2d50857e4eb553af5a6dc3ad507a17adf43d115264b1afc116f95c92e5e258"
+CMDLINE_TOOLS_SHA256_MAC="7bc5c72ba0275c80a8f19684fb92793b83a6b5c94d4d179fc5988930282d7e64"
 GRADLE_VERSION="8.7"
+GRADLE_SHA256="544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d"
 PLATFORM="android-34"
 BUILD_TOOLS="34.0.0"
 CACHE="${TCHEFOOD_ANDROID_CACHE:-$HOME/.cache/tchefood-android}"
@@ -208,11 +219,44 @@ if [ -n "${TCHEFOOD_APP_URL:-}" ]; then
   esac
 fi
 
-baixar() { # url destino
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256_de() { sem_trava sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256_de() { sem_trava shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  falha "sha256sum ou shasum não encontrado (usado para conferir os downloads)."
+fi
+
+baixar() { # url destino sha256
   echo "-> baixando $1"
+  rm -f "$2.part"
   supervisionado curl -fL --retry 3 --retry-delay 2 -o "$2.part" "$1" || falha "falha ao baixar $1"
+  local achado
+  achado="$(sha256_de "$2.part")"
+  if [ "$achado" != "$3" ]; then
+    rm -f "$2.part"
+    falha "o arquivo baixado de $1 não confere (SHA-256 $achado, esperado $3); nada foi instalado"
+  fi
   mv "$2.part" "$2"
 }
+
+# --- Chave de release (opcional) ---------------------------------------------------------------
+# As senhas vão para o Gradle pelo ambiente (ORG_GRADLE_PROJECT_*), nunca na linha de comando, que outros
+# processos da máquina conseguem ler.
+tipo="debug"
+if [ -n "${TCHEFOOD_KEYSTORE:-}" ]; then
+  [ -f "$TCHEFOOD_KEYSTORE" ] || falha "TCHEFOOD_KEYSTORE não existe: $TCHEFOOD_KEYSTORE"
+  [ -n "${TCHEFOOD_KEYSTORE_PASSWORD:-}" ] || falha "falta TCHEFOOD_KEYSTORE_PASSWORD (a senha do arquivo da chave)"
+  tipo="release"
+  ORG_GRADLE_PROJECT_TCHEFOOD_KEYSTORE_FILE="$(cd "$(dirname "$TCHEFOOD_KEYSTORE")" && pwd)/$(basename "$TCHEFOOD_KEYSTORE")"
+  ORG_GRADLE_PROJECT_TCHEFOOD_KEYSTORE_PASSWORD="$TCHEFOOD_KEYSTORE_PASSWORD"
+  ORG_GRADLE_PROJECT_TCHEFOOD_KEY_ALIAS="${TCHEFOOD_KEY_ALIAS:-tchefood}"
+  ORG_GRADLE_PROJECT_TCHEFOOD_KEY_PASSWORD="${TCHEFOOD_KEY_PASSWORD:-$TCHEFOOD_KEYSTORE_PASSWORD}"
+  export ORG_GRADLE_PROJECT_TCHEFOOD_KEYSTORE_FILE ORG_GRADLE_PROJECT_TCHEFOOD_KEYSTORE_PASSWORD \
+    ORG_GRADLE_PROJECT_TCHEFOOD_KEY_ALIAS ORG_GRADLE_PROJECT_TCHEFOOD_KEY_PASSWORD
+elif [ -n "${TCHEFOOD_KEYSTORE_PASSWORD:-}" ]; then
+  falha "TCHEFOOD_KEYSTORE_PASSWORD sem TCHEFOOD_KEYSTORE: diga onde está o arquivo da chave"
+fi
 
 mkdir -p "$CACHE"
 
@@ -227,12 +271,12 @@ export ANDROID_SDK_ROOT="$ANDROID_HOME"
 sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 if [ ! -x "$sdkmanager" ]; then
   case "$(uname -s)" in
-    Linux) so="linux" ;;
-    Darwin) so="mac" ;;
+    Linux) so="linux"; sha_cmdline="$CMDLINE_TOOLS_SHA256_LINUX" ;;
+    Darwin) so="mac"; sha_cmdline="$CMDLINE_TOOLS_SHA256_MAC" ;;
     *) falha "sistema não suportado: $(uname -s). No Windows use o WSL ou o Android Studio." ;;
   esac
   zip="$CACHE/cmdline-tools-$so.zip"
-  baixar "https://dl.google.com/android/repository/commandlinetools-$so-${CMDLINE_TOOLS_VERSION}_latest.zip" "$zip"
+  baixar "https://dl.google.com/android/repository/commandlinetools-$so-${CMDLINE_TOOLS_VERSION}_latest.zip" "$zip" "$sha_cmdline"
   rm -rf "$CACHE/cmdline-tools-extract"
   supervisionado unzip -q "$zip" -d "$CACHE/cmdline-tools-extract"
   mkdir -p "$ANDROID_HOME/cmdline-tools"
@@ -256,7 +300,7 @@ else
   gradle_dir="$CACHE/gradle-$GRADLE_VERSION"
   if [ ! -x "$gradle_dir/bin/gradle" ]; then
     zip="$CACHE/gradle-$GRADLE_VERSION-bin.zip"
-    baixar "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" "$zip"
+    baixar "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" "$zip" "$GRADLE_SHA256"
     supervisionado unzip -q "$zip" -d "$CACHE"
     rm -f "$zip"
   fi
@@ -272,35 +316,54 @@ if [ -z "${TCHEFOOD_APP_URL:-}" ]; then
 fi
 
 # --- APK -------------------------------------------------------------------------------------
+Tipo="Debug"; [ "$tipo" = "release" ] && Tipo="Release"
 case "$variante" in
-  pagbank) variantes=(pagbank); tarefas=(assemblePagbankDebug) ;;
-  tablet) variantes=(tablet); tarefas=(assembleTabletDebug) ;;
-  all) variantes=(pagbank tablet); tarefas=(assemblePagbankDebug assembleTabletDebug) ;;
+  pagbank) variantes=(pagbank) ;;
+  tablet) variantes=(tablet) ;;
+  all) variantes=(pagbank tablet) ;;
 esac
+tarefas=()
+for v in "${variantes[@]}"; do
+  V="$(printf '%s' "${v:0:1}" | tr '[:lower:]' '[:upper:]')${v:1}"
+  tarefas+=("assemble$V$Tipo")
+done
+sufixo=""; [ "$tipo" = "debug" ] && sufixo="-debug"
 
 # Apaga a saída antiga das variantes pedidas: um APK de um build anterior nunca pode passar por novo.
 for v in "${variantes[@]}"; do
-  rm -rf "android/app/build/outputs/apk/$v/debug"
+  rm -rf "android/app/build/outputs/apk/$v/$tipo"
 done
 
-echo "-> compilando: ${tarefas[*]}"
+echo "-> compilando ($tipo): ${tarefas[*]}"
 codigo_gradle=0
 supervisionado "$gradle_cmd" -p android --no-daemon ${gradle_props[@]+"${gradle_props[@]}"} "${tarefas[@]}" || codigo_gradle=$?
 [ "$codigo_gradle" -eq 0 ] || falha "o Gradle falhou (código $codigo_gradle); apk/ ficou como estava"
 
-# Cada variante pedida precisa ter exatamente um APK, não vazio, antes de qualquer coisa ir para apk/.
-# Os arquivos vão primeiro para uma pasta de versão nova em .apk-releases/, que ainda não aparece em apk/.
+apksigner="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
+[ -x "$apksigner" ] || falha "apksigner não encontrado em $apksigner; apk/ ficou como estava"
+
+# Cada variante pedida precisa ter exatamente um APK, não vazio e com assinatura válida, antes de qualquer coisa ir
+# para apk/. Os arquivos vão primeiro para uma pasta de versão nova em .apk-releases/, que ainda não aparece em apk/.
 mkdir -p "$raiz/.apk-releases"
 staging="$(mktemp -d "$raiz/.apk-releases/r.XXXXXX")"
+certificados=()
 for v in "${variantes[@]}"; do
-  saida="android/app/build/outputs/apk/$v/debug"
+  saida="android/app/build/outputs/apk/$v/$tipo"
   achados=()
   for f in "$saida"/*.apk; do
     [ -f "$f" ] && achados+=("$f")
   done
   [ "${#achados[@]}" -eq 1 ] || falha "esperava 1 APK da variante $v em $saida e achei ${#achados[@]}; apk/ ficou como estava"
   [ -s "${achados[0]}" ] || falha "o APK da variante $v está vazio (${achados[0]}); apk/ ficou como estava"
-  cp "${achados[0]}" "$staging/tchefood-$v-debug.apk"
+  certs="$(sem_trava "$apksigner" verify --print-certs "${achados[0]}" 2>/dev/null)" \
+    || falha "o APK da variante $v não tem assinatura válida (${achados[0]}); apk/ ficou como estava"
+  cert="$(printf '%s\n' "$certs" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1)"
+  [ -n "$cert" ] || falha "não consegui ler o certificado do APK da variante $v; apk/ ficou como estava"
+  if [ "$tipo" = "release" ] && printf '%s\n' "$certs" | grep -q "^Signer #1 certificate DN: C=US, O=Android, CN=Android Debug$"; then
+    falha "o APK de release da variante $v saiu com a chave de debug; apk/ ficou como estava"
+  fi
+  certificados+=("$v: $cert")
+  cp "${achados[0]}" "$staging/tchefood-$v$sufixo.apk"
 done
 
 # Tudo validado: apk/ é um link simbólico para a pasta da versão atual e a troca é uma única renomeação
@@ -342,12 +405,19 @@ if [ -n "$antes" ]; then
 fi
 # Ficam a versão nova e a anterior; as mais velhas saem.
 manter_so_atual_e_anterior
+versao="$(sem_trava "$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2" dump badging "$raiz/apk/tchefood-${variantes[0]}$sufixo.apk" 2>/dev/null \
+  | sed -n "s/^package: .*versionCode='\([0-9]*\)'.*versionName='\([^']*\)'.*/\2 (código \1)/p" | head -1)"
 for v in "${variantes[@]}"; do
-  echo "OK: apk/tchefood-$v-debug.apk"
+  echo "OK: apk/tchefood-$v$sufixo.apk"
+done
+echo "Versão: ${versao:-desconhecida} ($tipo)"
+echo "Certificado (SHA-256), igual em todo build com a mesma chave:"
+for c in "${certificados[@]}"; do
+  echo "  $c"
 done
 
 echo
 echo "Pronto. No Cloud Shell, baixe com:"
 for v in "${variantes[@]}"; do
-  echo "  cloudshell download apk/tchefood-$v-debug.apk"
+  echo "  cloudshell download apk/tchefood-$v$sufixo.apk"
 done
