@@ -12,8 +12,10 @@ val bundleWebApp = appUrl.isEmpty()
 val webDist = rootProject.layout.projectDirectory.dir("../dist")
 val webAssetsRoot = layout.buildDirectory.dir("generated/webapp")
 
-// Versão: o Android só instala por cima um APK com versionCode maior ou igual ao instalado, então o número
-// sobe sozinho a cada commit (quantidade de commits até o HEAD). TCHEFOOD_VERSION_CODE substitui a contagem.
+// Versão: o Android só instala por cima um APK com versionCode maior ou igual ao instalado. O número padrão é
+// a quantidade de commits até o HEAD, e TCHEFOOD_VERSION_CODE substitui a contagem. A contagem sozinha não
+// garante que o número suba (outro branch pode ter menos commits): quem garante, no release, é o registro de
+// releases do scripts/build-apk.sh (docs/apk-release.md).
 // Clone raso (--depth) daria um número menor que o real: aí o build para, em vez de gerar um APK que não instala.
 fun git(vararg args: String): String =
     providers.exec {
@@ -36,15 +38,10 @@ val appVersionCode: Int = if (versionCodeOverride.isNotEmpty()) {
 val appCommit: String = try { git("rev-parse", "--short=7", "HEAD") } catch (e: Exception) { "sem-git" }
 val appVersionName = "0.1.$appVersionCode-$appCommit"
 
-// Assinatura de release: a chave nunca fica no repositório. Arquivo e senhas vêm de propriedades do Gradle
-// (o build-apk.sh passa as senhas pelo ambiente, ORG_GRADLE_PROJECT_*, nunca na linha de comando).
-// Sem a chave, só o build de release falha; o debug continua como antes.
-val keystorePath = providers.gradleProperty("TCHEFOOD_KEYSTORE_FILE").orNull?.trim().orEmpty()
-val keystorePassword = providers.gradleProperty("TCHEFOOD_KEYSTORE_PASSWORD").orNull.orEmpty()
-val releaseKeyAlias = providers.gradleProperty("TCHEFOOD_KEY_ALIAS").orNull?.trim().orEmpty()
-val releaseKeyPassword = providers.gradleProperty("TCHEFOOD_KEY_PASSWORD").orNull.orEmpty()
-val releaseSigningReady = keystorePath.isNotEmpty() && keystorePassword.isNotEmpty() &&
-    releaseKeyAlias.isNotEmpty() && releaseKeyPassword.isNotEmpty()
+// Assinatura de release: fica FORA do Gradle. `assemble*Release` gera app-<variante>-release-unsigned.apk, que o
+// Android não instala. Quem assina com a chave oficial, confere o certificado e publica é o scripts/build-apk.sh
+// (docs/apk-release.md). Assim nenhuma senha passa pelo Gradle, pelos plugins nem pelas dependências do build, e
+// este arquivo não tem signingConfig de release de propósito.
 
 android {
     namespace = "food.tche.smartpos"
@@ -57,19 +54,6 @@ android {
         versionCode = appVersionCode
         versionName = appVersionName
         buildConfigField("String", "TCHEFOOD_APP_URL", "\"$appUrl\"")
-    }
-
-    signingConfigs {
-        if (releaseSigningReady) {
-            create("tchefood") {
-                val file = rootProject.file(keystorePath)
-                if (!file.isFile) throw GradleException("TCHEFOOD_KEYSTORE_FILE não existe: $keystorePath")
-                storeFile = file
-                storePassword = keystorePassword
-                keyAlias = releaseKeyAlias
-                keyPassword = releaseKeyPassword
-            }
-        }
     }
 
     // pagbank: Moderninha Smart / SmartPOS PagBank, cobra pelo PlugPag dentro da máquina.
@@ -90,7 +74,6 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            if (releaseSigningReady) signingConfig = signingConfigs.getByName("tchefood")
         }
     }
 
@@ -117,16 +100,6 @@ val copyWebApp by tasks.registering(Copy::class) {
         }
     }
 }
-
-// Release sem a chave nunca sai como APK sem assinatura (que não instala) nem com a chave de debug.
-tasks.matching { it.name.startsWith("assemble") && it.name.endsWith("Release") || it.name.startsWith("package") && it.name.endsWith("Release") }
-    .configureEach {
-        doFirst {
-            if (!releaseSigningReady) {
-                throw GradleException("release precisa da chave do Tchê Food: TCHEFOOD_KEYSTORE_FILE, TCHEFOOD_KEYSTORE_PASSWORD, TCHEFOOD_KEY_ALIAS e TCHEFOOD_KEY_PASSWORD (veja docs/apk-release.md)")
-            }
-        }
-    }
 
 tasks.named("preBuild") { dependsOn(copyWebApp) }
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach { dependsOn(copyWebApp) }

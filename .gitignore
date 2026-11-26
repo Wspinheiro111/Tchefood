@@ -15,6 +15,7 @@ android/local.properties
 /.apk-pendente
 /dist-ifood
 
-# Chave de assinatura do APK: nunca no repositório
+# Chave de assinatura do APK e o registro de releases que fica ao lado dela: nunca no repositório
 *.jks
 *.keystore
+*.releases.tsv
